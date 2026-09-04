@@ -8,12 +8,15 @@ import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { AgentSession, CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {
+  rootDir: "/tmp",
+  sessionsDir: "/tmp",
   srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
+  loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 
 // r41/r42: the admissionEpochStale probe is a session-level backstop for
@@ -32,6 +35,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
 
     const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
     const aiService = Object.assign(new EventEmitter(), {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],

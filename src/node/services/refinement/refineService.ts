@@ -1,3 +1,4 @@
+import * as path from "path";
 /**
  * /refine orchestration (RLM track, phase r11): user-invokable trajectory
  * distillation with a paper trail.
@@ -438,7 +439,7 @@ export class RefineService {
   ): Promise<Result<RefineRecord, string>> {
     const workspace = this.config.findWorkspace(workspaceId);
     if (!workspace) return Err(`workspace not found: ${workspaceId}`);
-    const sessionDir = this.config.getSessionDir(workspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     // r32: the in-process inFlight map cannot see a second backend over the
     // same root (XUM_ALLOW_MULTIPLE_INSTANCES=1). Hold a cross-process lock
     // across staged-state load, recovery, execution, and progress persistence
@@ -1029,7 +1030,7 @@ export class RefineService {
         projectPath,
       };
 
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       // The pass only STAGES edits (see refineStaging.ts) — journal-baseline
       // bookkeeping happens at apply time. Skill-tool availability is still
       // resolved here so the model only sees agent_skill_write when a later

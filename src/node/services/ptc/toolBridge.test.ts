@@ -42,6 +42,7 @@ function createMockRuntime(overrides: Partial<IJSRuntime> = {}): IJSRuntime {
     onEvent: mock((_handler: (event: PTCEvent) => void) => undefined),
     abort: mock(() => undefined),
     getAbortSignal: mock(() => undefined),
+    takeActiveHostCallId: mock(() => undefined),
     dispose: mock(() => undefined),
     [Symbol.dispose]: mock(() => undefined),
     ...overrides,

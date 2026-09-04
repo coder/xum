@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createServer } from "http";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -12,6 +12,7 @@ import {
   resolveOAuthScope,
 } from "./mcpOauthService";
 import type { OAuthDiscoveryState } from "@modelcontextprotocol/client";
+import { Ok } from "@/common/types/result";
 import type {
   MCPOAuthClientInformation,
   MCPOAuthStoredCredentials,
@@ -620,6 +621,29 @@ describe("McpOauthService OAuth flows", () => {
     await service.dispose();
     await fs.rm(xumHome, { recursive: true, force: true });
     await fs.rm(projectPath, { recursive: true, force: true });
+  });
+
+  test("API helpers default global scope and derive callback origins", async () => {
+    const flow = { flowId: "id", authorizeUrl: "https://auth", redirectUri: "https://callback" };
+    const startServerFlow = spyOn(service, "startServerFlow").mockResolvedValue(Ok(flow));
+
+    await service.startServerFlowForApi(
+      { serverName: "server" },
+      { origin: "https://app.example.com/settings" }
+    );
+    expect(startServerFlow).toHaveBeenCalledWith({
+      projectPath: xumHome,
+      serverName: "server",
+      redirectUri: "https://app.example.com/auth/mcp-oauth/callback",
+    });
+
+    await service.startServerFlowForApi(
+      { projectPath, serverName: "server" },
+      { "x-forwarded-host": "proxy.example.com", "x-forwarded-proto": "https" }
+    );
+    expect(startServerFlow).toHaveBeenLastCalledWith(
+      expect.objectContaining({ redirectUri: "https://proxy.example.com/auth/mcp-oauth/callback" })
+    );
   });
 
   test("generates an authorizeUrl with PKCE S256 + RFC 8707 resource", async () => {

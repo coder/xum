@@ -63,6 +63,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "toolPolicy"
   | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
@@ -73,21 +74,39 @@ type PreservedSendOptions = Pick<
  * Use this helper to avoid duplicating the field list when building CompactionFollowUpRequest.
  */
 export function pickPreservedSendOptions(options: SendMessageOptions): PreservedSendOptions {
+  // Unset fields are OMITTED, not emitted as explicit undefined: compaction recovery spreads
+  // this pick over an already-persisted follow-up, and an undefined key would clobber the
+  // original preserved value (e.g. a restricted turn's toolPolicy) instead of leaving it.
   return {
-    thinkingLevel: options.thinkingLevel,
-    reasoningMode: options.reasoningMode,
-    additionalSystemInstructions: options.additionalSystemInstructions,
-    providerOptions: options.providerOptions,
+    ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
+    ...(options.reasoningMode !== undefined ? { reasoningMode: options.reasoningMode } : {}),
+    ...(options.additionalSystemInstructions !== undefined
+      ? { additionalSystemInstructions: options.additionalSystemInstructions }
+      : {}),
+    ...(options.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
     // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
     // can persist across restarts and build versions.
-    experiments: withLegacyPtcExclusiveMirror(options.experiments),
-    disableWorkspaceAgents: options.disableWorkspaceAgents,
+    ...(options.experiments !== undefined
+      ? { experiments: withLegacyPtcExclusiveMirror(options.experiments) }
+      : {}),
+    ...(options.disableWorkspaceAgents !== undefined
+      ? { disableWorkspaceAgents: options.disableWorkspaceAgents }
+      : {}),
+    // Security: a restricted turn (including a terminal-wake send restoring the caller's
+    // policy) that triggers on-send compaction must not redispatch its follow-up allow-all.
+    ...(options.toolPolicy !== undefined ? { toolPolicy: options.toolPolicy } : {}),
     // Delegated turns with explicit agent overrides must stay loud across the
     // compaction replay too — dropping this would let the follow-up silently
     // fall back to exec if the agent vanished in the meantime.
-    strictAgentResolution: options.strictAgentResolution,
-    allowAgentSetGoal: options.allowAgentSetGoal,
-    skipAiSettingsPersistence: options.skipAiSettingsPersistence,
+    ...(options.strictAgentResolution !== undefined
+      ? { strictAgentResolution: options.strictAgentResolution }
+      : {}),
+    ...(options.allowAgentSetGoal !== undefined
+      ? { allowAgentSetGoal: options.allowAgentSetGoal }
+      : {}),
+    ...(options.skipAiSettingsPersistence !== undefined
+      ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
+      : {}),
   };
 }
 
@@ -552,6 +571,8 @@ export interface DisplayStatus {
   message: string;
 }
 
+export type BashMonitorFailedOperation = "readOutput" | "getExitCode";
+
 /**
  * Compact per-record summary attached to bash monitor wake turns so the
  * transcript can render a small card (process + filter) while keeping the full
@@ -563,6 +584,8 @@ export interface BashMonitorWakeDisplayRecord {
   /** Persisted wake snapshot version; paired with processId for accepted-delivery recovery. */
   wakeUpdatedAt?: string;
   kind: "match" | "monitor-lost";
+  /** Missing on legacy monitor-lost records, which represent restart losses. */
+  lostReason?: "restart" | "runtime-failure";
   displayName: string;
   filter: string;
   filterExclude: boolean;
@@ -826,6 +849,29 @@ export interface PersistedToolModelUsage {
   metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
+}
+
+/**
+ * PersistedToolModelUsage.toolName marker for a refused fallback attempt.
+ * Analytics keys on this exact string (events.tool_name), the sidecar flatten
+ * path uses it to relabel refusal usage as "refused_stream", and the session
+ * ledger rebuild uses it to skip zero-usage refusal markers (which exist only
+ * so analytics can count refused attempts, never as ledger entries).
+ */
+export const MODEL_FALLBACK_REFUSAL_TOOL_NAME = "model_fallback_refusal";
+
+/** True when any token counter on the usage payload is positive. */
+export function hasTokenUsage(
+  usage: LanguageModelV2Usage | undefined
+): usage is LanguageModelV2Usage {
+  return (
+    usage !== undefined &&
+    ((usage.inputTokens ?? 0) > 0 ||
+      (usage.outputTokens ?? 0) > 0 ||
+      (usage.totalTokens ?? 0) > 0 ||
+      (usage.cachedInputTokens ?? 0) > 0 ||
+      (usage.reasoningTokens ?? 0) > 0)
+  );
 }
 
 /**
@@ -1190,6 +1236,8 @@ export type DisplayedMessage =
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;
         timestamp?: number;
+        /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
+        workflowRun?: MuxToolPart["workflowRun"];
       }>;
     }
   | {

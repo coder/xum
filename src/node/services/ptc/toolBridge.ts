@@ -22,6 +22,7 @@ import {
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import {
@@ -35,6 +36,7 @@ import {
 import {
   retainExemptKernelRecordResult,
   retainPersistenceCriticalArgsFields,
+  retainWorkflowResultIdentityFields,
   sanitizeMediaRecordCapture,
 } from "./types";
 
@@ -149,27 +151,14 @@ function parseLoadArgs(args: unknown): { path: string; key: string } {
   return { path, key };
 }
 
-/** Tools excluded from sandbox - UI-specific or would cause recursion */
-const EXCLUDED_TOOLS = new Set([
-  "code_execution", // Prevent recursive sandbox creation
-  "ask_user_question", // Requires UI interaction
-  "propose_plan", // Mode-specific, call directly
-  "todo_write", // UI-specific
-  "todo_read", // UI-specific
-  "status_set", // UI-specific
-  "agent_report", // Must be top-level for taskService to read args from history
-  // Context-coupled tools: AIService keys system-prompt context off their
-  // top-level presence (memory index / hot-set block for `memory`, proactive
-  // guidance for `advisor`). Bridging them would silently drop that context
-  // in the exclusive posture.
-  "memory",
-  "advisor",
-  // Media-producing built-ins (attach_file, desktop_screenshot) are
-  // deliberately bridgeable: stripAttachmentParts removes their base64 from
-  // sandbox-visible values and the code_execution attachments carrier delivers
-  // the real bytes to request-time extraction, so guest code like
-  // xum.attach_file(...) works without retaining media in QuickJS memory.
-]);
+const ptcExcludedTools = new Set(
+  Object.entries(TOOL_DEFINITIONS).flatMap(([name, definition]) =>
+    "ptcExcluded" in definition ? [name] : []
+  )
+);
+
+// Media-producing built-ins (attach_file, desktop_screenshot) are deliberately
+// bridgeable because attachment bytes stay outside QuickJS memory.
 
 /**
  * Bridge that exposes Xum tools in the QuickJS sandbox under canonical `xum.*` and legacy `mux.*` namespaces.
@@ -204,7 +193,9 @@ export class ToolBridge {
       // code_execution is the tool that uses the bridge, not a candidate for bridging
       if (name === "code_execution") continue;
 
-      const isBridgeable = !EXCLUDED_TOOLS.has(name) && this.hasExecute(tool);
+      // status_set is dynamic and UI-specific, so it has no catalog entry.
+      const isBridgeable =
+        name !== "status_set" && !ptcExcludedTools.has(name) && this.hasExecute(tool);
       if (!isBridgeable) {
         this.nonBridgeableTools.set(name, tool);
       } else if (isBridgeToolGranted(this.grants, name)) {
@@ -279,6 +270,7 @@ export class ToolBridge {
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
             captureRetained: retainExemptKernelRecordResult,
             captureArgsRetained: retainPersistenceCriticalArgsFields,
+            captureResultRetained: retainWorkflowResultIdentityFields,
           }
         : undefined
     );
@@ -304,6 +296,13 @@ export class ToolBridge {
       const toolName = name;
 
       xumObj[name] = async (args: unknown) => {
+        // MUST be the first operation: the runtime hands over the nested
+        // record's callId through a synchronous window (see
+        // IJSRuntime.takeActiveHostCallId). Using it as the execute
+        // toolCallId lets tool-emitted UI events (workflow-run-attached,
+        // task-created, live bash output) target the transcript's nested
+        // tool call instead of an id no rendered card carries.
+        const bridgedToolCallId = runtime.takeActiveHostCallId() ?? syntheticToolCallId(toolName);
         // Defense in depth: re-check the grant at call time so a stale or
         // mutated bridge can never invoke a non-granted tool.
         if (!isBridgeToolGranted(this.grants, toolName)) {
@@ -329,10 +328,10 @@ export class ToolBridge {
         }
 
         // Execute tool with full options (toolCallId and messages are required by type
-        // but not used by most tools - generate synthetic values for sandbox context)
+        // but not used by most tools; messages stay synthetic for sandbox context)
         const result: unknown = await boundTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: syntheticToolCallId(toolName),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
         });
@@ -371,6 +370,10 @@ export class ToolBridge {
     const taskTool = this.bridgeableTools.get("task");
     if (taskTool !== undefined) {
       xumObj.task_spawn = async (args: unknown) => {
+        // First operation, same synchronous-window contract as the regular
+        // bridged tools above.
+        const bridgedToolCallId =
+          runtime.takeActiveHostCallId() ?? syntheticToolCallId("task_spawn");
         // task_spawn is subject to the same grant as task (defense in depth,
         // mirroring the per-call re-check on regular bridged tools).
         if (!isBridgeToolGranted(this.grants, "task")) {
@@ -394,7 +397,7 @@ export class ToolBridge {
         }
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: syntheticToolCallId("task_spawn"),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
         });

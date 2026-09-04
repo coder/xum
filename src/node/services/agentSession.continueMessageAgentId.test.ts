@@ -4,6 +4,7 @@ import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/messa
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
@@ -104,6 +105,7 @@ function createAiService(): AIService {
     off() {
       return this;
     },
+    ...createStreamLifecycleMocks(),
     isStreaming: () => false,
     stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
   } as unknown as AIService;
@@ -129,8 +131,10 @@ function createBackgroundProcessManager(): BackgroundProcessManager {
 
 function createConfig(): Config {
   return {
+    rootDir: "/tmp",
+    sessionsDir: "/tmp",
     srcDir: "/tmp",
-    getSessionDir: mock(() => "/tmp"),
+    loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }
 
@@ -146,7 +150,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     historyCleanup = undefined;
   });
 
-  const createSession = async (messages: MuxMessage[] = []) => {
+  const createSession = async (messages: MuxMessage[] = [], config = createConfig()) => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     for (const message of messages) {
@@ -155,7 +159,7 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     const session = new AgentSession({
       workspaceId: "ws",
-      config: createConfig(),
+      config,
       historyService,
       aiService: createAiService(),
       initStateManager: createInitStateManager(),
@@ -283,6 +287,44 @@ describe("AgentSession continue-message agentId fallback", () => {
     // the resumed turn must stay loud instead of silently falling back to exec.
     expect(dispatchedOptions?.agentId).toBe("plan");
     expect(dispatchedOptions?.strictAgentResolution).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp leaves the follow-up pending when the workspace is archived on disk", async () => {
+    const archivedConfig = {
+      ...createConfig(),
+      loadConfigOrDefault: () => ({
+        projects: new Map([
+          [
+            "/tmp",
+            {
+              workspaces: [{ id: "ws", path: "/tmp/ws", archivedAt: "2026-01-01T00:00:00.000Z" }],
+            },
+          ],
+        ]),
+      }),
+    } as unknown as Config;
+    const { historyService, internals } = await createSession(
+      [
+        compactionSummaryMessage("summary-archived", {
+          text: "resume after compaction",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+        }),
+      ],
+      archivedConfig
+    );
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+    // Still pending for the next startup after an unarchive.
+    const lastMessages = await historyService.getLastMessages("ws", 1);
+    expect(lastMessages.success && lastMessages.data[0]?.metadata?.muxMetadata).toMatchObject({
+      type: "compaction-summary",
+      pendingFollowUp: { text: "resume after compaction" },
+    });
   });
 
   test("dispatchPendingFollowUp skips idle-only follow-ups when queued user input exists", async () => {

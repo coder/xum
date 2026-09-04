@@ -1,6 +1,6 @@
+import * as path from "path";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import * as path from "path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -11,8 +11,11 @@ import {
   type MuxMessage,
   type MuxMetadata,
 } from "@/common/types/message";
-import type { Config } from "@/node/config";
-import { ensurePrivateDir } from "@/node/utils/fs";
+import type { WorkspaceSessionLocator } from "@/node/config";
+import type { AIService } from "@/node/services/aiService";
+import type { TaskService } from "@/node/services/taskService";
+import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -29,6 +32,11 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  readSubagentTranscriptArtifactsFile,
+  type SubagentTranscriptArtifactIndexEntry,
+} from "@/node/services/subagentTranscriptArtifacts";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
@@ -169,6 +177,9 @@ export function hasCommitWorthyParts(parts: MuxMessage["parts"] | undefined): bo
   });
 }
 
+type HistorySessionLocation = Pick<WorkspaceSessionLocator, "rootDir"> &
+  (Pick<WorkspaceSessionLocator, "sessionsDir"> | Pick<WorkspaceSessionLocator, "getSessionDir">);
+
 /**
  * HistoryService - Manages chat history persistence and sequence numbering
  *
@@ -190,6 +201,11 @@ export function hasCommitWorthyParts(parts: MuxMessage["parts"] | undefined): bo
  * reads and full-file rewrites (updateHistory on every stream end) scale with
  * the active epoch instead of lifetime history.
  */
+interface SubagentTranscriptDependencies {
+  taskService: Pick<TaskService, "isDescendantAgentTask" | "listDescendantAgentTasks">;
+  aiService: Pick<AIService, "getWorkspaceMetadata">;
+}
+
 export class HistoryService {
   private readonly CHAT_FILE = CHAT_FILE_NAME;
   private readonly CHAT_ARCHIVE_FILE = CHAT_ARCHIVE_FILE_NAME;
@@ -203,18 +219,284 @@ export class HistoryService {
   // Shared file operation lock across all workspace file services
   // This prevents deadlocks when operations compose while touching the same workspace files.
   private readonly fileLocks = workspaceFileLocks;
-  private readonly config: Pick<Config, "getSessionDir" | "rootDir">;
+  private readonly config: HistorySessionLocation;
 
-  constructor(config: Pick<Config, "getSessionDir" | "rootDir">) {
+  constructor(config: HistorySessionLocation) {
     this.config = config;
   }
 
+  private getSessionDir(workspaceId: string): string {
+    return "getSessionDir" in this.config
+      ? this.config.getSessionDir(workspaceId)
+      : path.join(this.config.sessionsDir, workspaceId);
+  }
+
+  async getSubagentTranscript(
+    input: { taskId: string; requestingWorkspaceId?: string | null },
+    dependencies: SubagentTranscriptDependencies
+  ): Promise<{ messages: MuxMessage[]; model?: string; thinkingLevel?: ThinkingLevel }> {
+    const taskId = input.taskId.trim();
+    assert(taskId.length > 0, "workspace.getSubagentTranscript: taskId must be non-empty");
+    const trimmedRequestingId = input.requestingWorkspaceId?.trim() ?? "";
+    const requestingWorkspaceId = trimmedRequestingId.length > 0 ? trimmedRequestingId : null;
+    const tryLoadFromWorkspace = async (
+      workspaceId: string
+    ): Promise<{
+      workspaceId: string;
+      entry: SubagentTranscriptArtifactIndexEntry;
+    } | null> => {
+      const artifacts = await readSubagentTranscriptArtifactsFile(this.getSessionDir(workspaceId));
+      const entry = artifacts.artifactsByChildTaskId[taskId] ?? null;
+      return entry ? { workspaceId, entry } : null;
+    };
+
+    let isDescendant = false;
+    if (requestingWorkspaceId) {
+      try {
+        isDescendant = await dependencies.taskService.isDescendantAgentTask(
+          requestingWorkspaceId,
+          taskId
+        );
+      } catch (error: unknown) {
+        log.warn("workspace.getSubagentTranscript: descendant check failed", {
+          requestingWorkspaceId,
+          taskId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+
+    let resolved: {
+      workspaceId: string;
+      entry: SubagentTranscriptArtifactIndexEntry;
+    } | null = null;
+    let hasArtifactInRequestingTree = false;
+
+    if (requestingWorkspaceId !== null) {
+      resolved = await tryLoadFromWorkspace(requestingWorkspaceId);
+      if (!resolved) {
+        // Grandchild transcripts may still live in the immediate parent session until cleanup
+        // rolls them into the requesting workspace. Prefer shallower owners first.
+        const descendants = dependencies.taskService
+          .listDescendantAgentTasks(requestingWorkspaceId)
+          .sort((a, b) => a.depth - b.depth);
+        for (const descendant of descendants) {
+          resolved = await tryLoadFromWorkspace(descendant.taskId);
+          if (resolved) break;
+        }
+      }
+      hasArtifactInRequestingTree = resolved !== null;
+    } else {
+      resolved = await this.findSubagentTranscriptByScanningSessions(taskId);
+    }
+
+    // Pending artifacts still have a live task session, so read it directly while it exists.
+    if (!resolved) {
+      if (requestingWorkspaceId && isDescendant) {
+        const taskSessionDir = this.getSessionDir(taskId);
+        const messages = await this.readTranscriptFromPaths({
+          workspaceId: taskId,
+          chatPath: path.join(taskSessionDir, CHAT_FILE_NAME),
+          chatArchivePath: path.join(taskSessionDir, CHAT_ARCHIVE_FILE_NAME),
+          partialPath: path.join(taskSessionDir, this.PARTIAL_FILE),
+          logLabel: taskId + "/chat.jsonl",
+        });
+        const metaResult = await dependencies.aiService.getWorkspaceMetadata(taskId);
+        const model =
+          metaResult.success &&
+          typeof metaResult.data.taskModelString === "string" &&
+          metaResult.data.taskModelString.trim().length > 0
+            ? metaResult.data.taskModelString.trim()
+            : undefined;
+        const thinkingLevel = metaResult.success
+          ? coerceThinkingLevel(metaResult.data.taskThinkingLevel)
+          : undefined;
+        return { messages, model, thinkingLevel };
+      }
+
+      throw new Error(
+        requestingWorkspaceId
+          ? "No transcript found for task " + taskId + " in workspace " + requestingWorkspaceId
+          : "No transcript found for task " + taskId
+      );
+    }
+
+    if (requestingWorkspaceId && !isDescendant && !hasArtifactInRequestingTree) {
+      throw new Error("Task is not a descendant of this workspace");
+    }
+
+    const messages = await this.readTranscriptFromPaths({
+      workspaceId: resolved.workspaceId,
+      chatPath: resolved.entry.chatPath,
+      partialPath: resolved.entry.partialPath,
+      logLabel: resolved.workspaceId + "/subagent-transcripts/" + taskId + "/chat.jsonl",
+    });
+    const model =
+      typeof resolved.entry.model === "string" && resolved.entry.model.trim().length > 0
+        ? resolved.entry.model.trim()
+        : undefined;
+    const thinkingLevel = coerceThinkingLevel(resolved.entry.thinkingLevel);
+    return { messages, model, thinkingLevel };
+  }
+
+  private normalizeTranscriptMessage(value: unknown): MuxMessage | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const obj = value as { createdAt?: unknown };
+    if (typeof obj.createdAt === "string") {
+      const parsed = new Date(obj.createdAt);
+      if (Number.isFinite(parsed.getTime())) {
+        obj.createdAt = parsed;
+      } else {
+        delete obj.createdAt;
+      }
+    }
+
+    return normalizeLegacyMuxMetadata(value as MuxMessage);
+  }
+
+  private parseMessages(
+    data: string,
+    logLabel: string,
+    normalize: (value: unknown) => MuxMessage | null
+  ): MuxMessage[] {
+    const lines = data.split("\n").filter((line) => line.trim());
+    const messages: MuxMessage[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        const message = normalize(JSON.parse(lines[i]) as unknown);
+        if (message) messages.push(message);
+      } catch (parseError) {
+        log.warn(
+          "Skipping malformed JSON at line " + (i + 1) + " in " + logLabel + ":",
+          getErrorMessage(parseError),
+          "\nLine content:",
+          lines[i].substring(0, 100) + (lines[i].length > 100 ? "..." : "")
+        );
+      }
+    }
+    return messages;
+  }
+
+  private async readTranscriptMessages(
+    chatPath: string,
+    logLabel: string
+  ): Promise<MuxMessage[] | null> {
+    const data = await this.readExistingFile(chatPath);
+    return data === null
+      ? null
+      : this.parseMessages(data, logLabel, (value) => this.normalizeTranscriptMessage(value));
+  }
+
+  private async readTranscriptPartial(partialPath: string): Promise<MuxMessage | null> {
+    try {
+      const raw = await fs.readFile(partialPath, "utf-8");
+      return this.normalizeTranscriptMessage(JSON.parse(raw) as unknown);
+    } catch (error: unknown) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      log.warn("Failed to read partial.json for transcript", {
+        partialPath,
+        error: getErrorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private mergeTranscriptPartial(messages: MuxMessage[], partial: MuxMessage | null): MuxMessage[] {
+    if (!partial) return messages;
+
+    const partialSeq = partial.metadata?.historySequence;
+    if (partialSeq === undefined) return [...messages, partial];
+
+    const existingIndex = messages.findIndex(
+      (message) => message.metadata?.historySequence === partialSeq
+    );
+    if (existingIndex >= 0) {
+      const existing = messages[existingIndex];
+      if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
+      const next = [...messages];
+      next[existingIndex] = partial;
+      return next;
+    }
+
+    const insertIndex = messages.findIndex((message) => {
+      const sequence = message.metadata?.historySequence;
+      return typeof sequence === "number" && sequence > partialSeq;
+    });
+    if (insertIndex < 0) return [...messages, partial];
+
+    const next = [...messages];
+    next.splice(insertIndex, 0, partial);
+    return next;
+  }
+
+  private async readTranscriptFromPaths(params: {
+    workspaceId: string;
+    chatPath?: string;
+    chatArchivePath?: string;
+    partialPath?: string;
+    logLabel: string;
+  }): Promise<MuxMessage[]> {
+    const workspaceSessionDir = this.getSessionDir(params.workspaceId);
+    // Refuse path traversal from a corrupted transcript index.
+    if (params.chatPath && !isPathInsideDir(workspaceSessionDir, params.chatPath)) {
+      throw new Error("Refusing to read transcript outside workspace session dir");
+    }
+    if (params.chatArchivePath && !isPathInsideDir(workspaceSessionDir, params.chatArchivePath)) {
+      throw new Error("Refusing to read transcript archive outside workspace session dir");
+    }
+    if (params.partialPath && !isPathInsideDir(workspaceSessionDir, params.partialPath)) {
+      throw new Error("Refusing to read partial outside workspace session dir");
+    }
+
+    const [archivedMessages, messages, partial] = await Promise.all([
+      params.chatArchivePath
+        ? this.readTranscriptMessages(params.chatArchivePath, params.logLabel + " (archive)")
+        : null,
+      params.chatPath ? this.readTranscriptMessages(params.chatPath, params.logLabel) : null,
+      params.partialPath ? this.readTranscriptPartial(params.partialPath) : null,
+    ]);
+    if (!messages && !archivedMessages && !partial) {
+      throw new Error("Transcript not found (missing " + params.logLabel + ")");
+    }
+    return this.mergeTranscriptPartial([...(archivedMessages ?? []), ...(messages ?? [])], partial);
+  }
+
+  private async findSubagentTranscriptByScanningSessions(taskId: string): Promise<{
+    workspaceId: string;
+    entry: SubagentTranscriptArtifactIndexEntry;
+  } | null> {
+    const sessionsDir = path.join(this.config.rootDir, "sessions");
+    let dirents: Array<{ name: string; isDirectory: () => boolean }>;
+    try {
+      dirents = await fs.readdir(sessionsDir, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+
+    let best: { workspaceId: string; entry: SubagentTranscriptArtifactIndexEntry } | null = null;
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory() || !dirent.name) continue;
+      const artifacts = await readSubagentTranscriptArtifactsFile(
+        path.join(sessionsDir, dirent.name)
+      );
+      const entry = artifacts.artifactsByChildTaskId[taskId];
+      if (entry && (!best || entry.updatedAtMs > best.entry.updatedAtMs)) {
+        best = { workspaceId: dirent.name, entry };
+      }
+    }
+    return best;
+  }
+
   private getChatHistoryPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.CHAT_FILE);
+    return path.join(this.getSessionDir(workspaceId), this.CHAT_FILE);
   }
 
   private getChatArchivePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.CHAT_ARCHIVE_FILE);
+    return path.join(this.getSessionDir(workspaceId), this.CHAT_ARCHIVE_FILE);
   }
 
   private getTruncateTransactionPath(workspaceId: string): string {
@@ -479,7 +761,7 @@ export class HistoryService {
   }
 
   private getPartialPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.PARTIAL_FILE);
+    return path.join(this.getSessionDir(workspaceId), this.PARTIAL_FILE);
   }
 
   // ── Reverse-read infrastructure ─────────────────────────────────────────────
@@ -735,33 +1017,12 @@ export class HistoryService {
    * Skips malformed JSON lines to prevent data loss from corruption.
    */
   private async readMessagesFromFile(filePath: string, logLabel: string): Promise<MuxMessage[]> {
-    try {
-      const data = await fs.readFile(filePath, "utf-8");
-      const lines = data.split("\n").filter((line) => line.trim());
-      const messages: MuxMessage[] = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        try {
-          const message = JSON.parse(lines[i]) as MuxMessage;
-          messages.push(normalizeLegacyMuxMetadata(message));
-        } catch (parseError) {
-          // Skip malformed lines but log error for debugging
-          log.warn(
-            `Skipping malformed JSON at line ${i + 1} in ${logLabel}:`,
-            getErrorMessage(parseError),
-            "\nLine content:",
-            lines[i].substring(0, 100) + (lines[i].length > 100 ? "..." : "")
-          );
-        }
-      }
-
-      return messages;
-    } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return []; // No history yet
-      }
-      throw error; // Re-throw non-ENOENT errors
-    }
+    const data = await this.readExistingFile(filePath);
+    return data === null
+      ? []
+      : this.parseMessages(data, logLabel, (value) =>
+          normalizeLegacyMuxMetadata(value as MuxMessage)
+        );
   }
 
   /**
@@ -1047,7 +1308,7 @@ export class HistoryService {
     }
 
     try {
-      await ensurePrivateDir(this.config.getSessionDir(targetWorkspaceId));
+      await ensurePrivateDir(this.getSessionDir(targetWorkspaceId));
       for (const [targetPath, contents] of [
         [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
         [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
@@ -1376,58 +1637,63 @@ export class HistoryService {
    * that only needs the active compaction epoch.
    */
   async getHistoryFromLatestBoundary(workspaceId: string, skip = 0): Promise<Result<MuxMessage[]>> {
-    const operation = async (): Promise<Result<MuxMessage[]>> => {
-      // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
-      // by older builds so this read (and every later one) stays O(active epoch).
-      await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
-
-      const chatPath = this.getChatHistoryPath(workspaceId);
-      const archivePath = this.getChatArchivePath(workspaceId);
-
-      // Try the requested boundary in chat.jsonl, falling back to less-skipped boundaries.
-      let chatBoundaryCount = 0;
-      let chatFallbackOffset: number | null = null;
-      for (let s = skip; s >= 0; s--) {
-        const offset = await this.findLastBoundaryByteOffset(chatPath, s);
-        if (offset !== null) {
-          if (s === skip) {
-            return Ok(await this.readHistoryFromOffset(chatPath, offset));
-          }
-          // chat.jsonl has fewer boundaries than requested; remember its oldest
-          // boundary as a fallback and keep counting into the archive.
-          chatBoundaryCount = s + 1;
-          chatFallbackOffset = offset;
-          break;
-        }
-      }
-
-      // Boundaries older than chat.jsonl live in the sealed archive. A window that
-      // starts at an archive boundary spans the archive tail plus all of chat.jsonl.
-      for (let s = skip - chatBoundaryCount; s >= 0; s--) {
-        const offset = await this.findLastBoundaryByteOffset(archivePath, s);
-        if (offset !== null) {
-          const archived = await this.readHistoryFromOffset(archivePath, offset);
-          const active = await this.readChatHistory(workspaceId);
-          return Ok([...archived, ...active]);
-        }
-      }
-
-      if (chatFallbackOffset !== null) {
-        return Ok(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
-      }
-
-      // No boundaries at all — workspace is uncompacted, full read is the only option
-      const archived = await this.readArchivedHistory(workspaceId);
-      const active = await this.readChatHistory(workspaceId);
-      return Ok([...archived, ...active]);
-    };
-
     try {
-      return await this.withRecoveredHistoryLock(workspaceId, operation);
+      return await this.withRecoveredHistoryLock(workspaceId, () =>
+        this.getHistoryFromLatestBoundaryUnlocked(workspaceId, skip)
+      );
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  private async getHistoryFromLatestBoundaryUnlocked(
+    workspaceId: string,
+    skip: number
+  ): Promise<Result<MuxMessage[]>> {
+    // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
+    // by older builds so this read (and every later one) stays O(active epoch).
+    await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+
+    const chatPath = this.getChatHistoryPath(workspaceId);
+    const archivePath = this.getChatArchivePath(workspaceId);
+
+    // Try the requested boundary in chat.jsonl, falling back to less-skipped boundaries.
+    let chatBoundaryCount = 0;
+    let chatFallbackOffset: number | null = null;
+    for (let s = skip; s >= 0; s--) {
+      const offset = await this.findLastBoundaryByteOffset(chatPath, s);
+      if (offset !== null) {
+        if (s === skip) {
+          return Ok(await this.readHistoryFromOffset(chatPath, offset));
+        }
+        // chat.jsonl has fewer boundaries than requested; remember its oldest
+        // boundary as a fallback and keep counting into the archive.
+        chatBoundaryCount = s + 1;
+        chatFallbackOffset = offset;
+        break;
+      }
+    }
+
+    // Boundaries older than chat.jsonl live in the sealed archive. A window that
+    // starts at an archive boundary spans the archive tail plus all of chat.jsonl.
+    for (let s = skip - chatBoundaryCount; s >= 0; s--) {
+      const offset = await this.findLastBoundaryByteOffset(archivePath, s);
+      if (offset !== null) {
+        const archived = await this.readHistoryFromOffset(archivePath, offset);
+        const active = await this.readChatHistory(workspaceId);
+        return Ok([...archived, ...active]);
+      }
+    }
+
+    if (chatFallbackOffset !== null) {
+      return Ok(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
+    }
+
+    // No boundaries at all — workspace is uncompacted, full read is the only option
+    const archived = await this.readArchivedHistory(workspaceId);
+    const active = await this.readChatHistory(workspaceId);
+    return Ok([...archived, ...active]);
   }
 
   // ── Sealed-history rotation ─────────────────────────────────────────────
@@ -1607,60 +1873,111 @@ export class HistoryService {
    * Write a partial message to disk.
    */
   async writePartial(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.fileLocks.withLock(workspaceId, async () => {
-      try {
-        // r66: partial flushes ride the cross-process history lock with an
-        // in-lock removal-tombstone gate — a foreign backend's active stream
-        // survives the remover's process-local cancellation, and its next
-        // delta's ensurePrivateDir would otherwise recreate the deleted
-        // session directory (removal holds this same lock across its
-        // tombstone+delete critical section). Truncation recovery is skipped:
-        // partial.json is not part of the archive/chat transaction.
-        return await this.withHistoryWriteFileLock(workspaceId, async () => {
-          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
-            return Err(`workspace ${workspaceId} was removed; refusing partial write`);
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.writePartialUnlocked(workspaceId, message)
+    );
+  }
+
+  /**
+   * Read-modify-write the partial while it still belongs to `messageId`. Returns false (writing
+   * nothing) when the partial is missing, belongs to another message, or `updater` declines.
+   * Callers that assembled an update from an earlier read use this so a stream started in
+   * between (commit of that partial, then a new one under the fresh message id) is never
+   * resurrected or overwritten. The read and the write happen under the workspace mutex AND the
+   * cross-process history write lock, the same pair commitPartial holds for its whole
+   * transaction, so neither this process nor a foreign backend can commit the partial between
+   * them.
+   */
+  async updatePartialIfMessageIdMatches(
+    workspaceId: string,
+    messageId: string,
+    updater: (current: MuxMessage) => MuxMessage | null
+  ): Promise<Result<boolean>> {
+    try {
+      return await this.fileLocks.withLock(workspaceId, () =>
+        this.withHistoryWriteFileLock(workspaceId, async () => {
+          const current = await this.readPartial(workspaceId);
+          if (current?.id !== messageId) {
+            return Ok(false);
           }
-          const workspaceDir = this.config.getSessionDir(workspaceId);
-          await ensurePrivateDir(workspaceDir);
-          const partialPath = this.getPartialPath(workspaceId);
+          const updated = updater(current);
+          if (updated == null) {
+            return Ok(false);
+          }
+          const writeResult = await this.writePartialUnderWriteLock(workspaceId, updated);
+          return writeResult.success ? Ok(true) : writeResult;
+        })
+      );
+    } catch (error) {
+      return Err(`Failed to update partial: ${getErrorMessage(error)}`);
+    }
+  }
 
-          const partialMessage: MuxMessage = {
-            ...message,
-            metadata: {
-              ...message.metadata,
-              partial: true,
-            },
-          };
+  private async writePartialUnlocked(
+    workspaceId: string,
+    message: MuxMessage
+  ): Promise<Result<void>> {
+    try {
+      // r66: partial flushes ride the cross-process history lock with an
+      // in-lock removal-tombstone gate — a foreign backend's active stream
+      // survives the remover's process-local cancellation, and its next
+      // delta's ensurePrivateDir would otherwise recreate the deleted
+      // session directory (removal holds this same lock across its
+      // tombstone+delete critical section). Truncation recovery is skipped:
+      // partial.json is not part of the archive/chat transaction.
+      return await this.withHistoryWriteFileLock(workspaceId, () =>
+        this.writePartialUnderWriteLock(workspaceId, message)
+      );
+    } catch (error) {
+      const errorMessage = getErrorMessage(error);
+      return Err(`Failed to write partial: ${errorMessage}`);
+    }
+  }
 
-          // Atomic write: writes to temp file then renames, preventing corruption
-          // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
-          await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
-          return Ok(undefined);
-        });
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-        return Err(`Failed to write partial: ${errorMessage}`);
-      }
-    });
+  private async writePartialUnderWriteLock(
+    workspaceId: string,
+    message: MuxMessage
+  ): Promise<Result<void>> {
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      return Err(`workspace ${workspaceId} was removed; refusing partial write`);
+    }
+    const workspaceDir = this.getSessionDir(workspaceId);
+    await ensurePrivateDir(workspaceDir);
+    const partialPath = this.getPartialPath(workspaceId);
+
+    const partialMessage: MuxMessage = {
+      ...message,
+      metadata: {
+        ...message.metadata,
+        partial: true,
+      },
+    };
+
+    // Atomic write: writes to temp file then renames, preventing corruption
+    // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
+    await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
+    return Ok(undefined);
   }
 
   /**
    * Delete the partial message file for a workspace.
    */
   async deletePartial(workspaceId: string): Promise<Result<void>> {
-    return this.fileLocks.withLock(workspaceId, async () => {
-      try {
-        const partialPath = this.getPartialPath(workspaceId);
-        await fs.unlink(partialPath);
+    return this.fileLocks.withLock(workspaceId, () => this.deletePartialUnlocked(workspaceId));
+  }
+
+  private async deletePartialUnlocked(workspaceId: string): Promise<Result<void>> {
+    try {
+      const partialPath = this.getPartialPath(workspaceId);
+      await fs.unlink(partialPath);
+      return Ok(undefined);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return Ok(undefined);
-      } catch (error) {
-        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-          return Ok(undefined);
-        }
-        const errorMessage = getErrorMessage(error);
-        return Err(`Failed to delete partial: ${errorMessage}`);
       }
-    });
+      const errorMessage = getErrorMessage(error);
+      return Err(`Failed to delete partial: ${errorMessage}`);
+    }
   }
 
   /**
@@ -1698,8 +2015,25 @@ export class HistoryService {
    * This is idempotent:
    * - If the partial has already been finalized in history, it is not committed again.
    * - After committing (or if already finalized), partial.json is deleted.
+   *
+   * Snapshot, history append/update/delete, and partial delete run as ONE transaction under the
+   * workspace mutex and the cross-process history write lock: a partial write landing between
+   * the snapshot and the delete (updatePartialIfMessageIdMatches here, or a foreign backend's
+   * commit of the same partial) would otherwise be appended pre-update and then dropped, or
+   * resurrect an already committed partial.
    */
   async commitPartial(workspaceId: string): Promise<Result<void>> {
+    // Lock-free probe: most stream starts have no partial to commit, and a reader observes either
+    // the old or the new atomically written file, never a torn one.
+    if ((await this.readPartial(workspaceId)) == null) {
+      return Ok(undefined);
+    }
+    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to commit partial", () =>
+      this.commitPartialUnderWriteLock(workspaceId)
+    );
+  }
+
+  private async commitPartialUnderWriteLock(workspaceId: string): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
       if (!partial) {
@@ -1719,7 +2053,7 @@ export class HistoryService {
         return Err("Partial message has no historySequence");
       }
 
-      const historyResult = await this.getHistoryFromLatestBoundary(workspaceId);
+      const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(workspaceId, 0);
       if (!historyResult.success) {
         return Err(`Failed to read history: ${historyResult.error}`);
       }
@@ -1754,7 +2088,7 @@ export class HistoryService {
           partialSeq,
           maxExistingSequence,
         });
-        return this.deletePartial(workspaceId);
+        return this.deletePartialUnlocked(workspaceId);
       }
 
       const shouldCommit =
@@ -1772,18 +2106,18 @@ export class HistoryService {
 
       if (shouldCommit) {
         if (existingMessage) {
-          const updateResult = await this.updateHistory(workspaceId, partial);
+          const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
           if (!updateResult.success) {
             return updateResult;
           }
         } else {
-          const appendResult = await this.appendToHistory(workspaceId, partial);
+          const appendResult = await this.appendToHistoryUnderWriteLock(workspaceId, partial);
           if (!appendResult.success) {
             return appendResult;
           }
         }
       } else if (shouldDeleteErroredPlaceholder) {
-        const deleteMessageResult = await this.deleteMessage(workspaceId, partial.id);
+        const deleteMessageResult = await this.deleteMessageUnderWriteLock(workspaceId, partial.id);
         if (
           !deleteMessageResult.success &&
           !deleteMessageResult.error.includes("not found in history")
@@ -1792,7 +2126,7 @@ export class HistoryService {
         }
       }
 
-      return this.deletePartial(workspaceId);
+      return this.deletePartialUnlocked(workspaceId);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       return Err(`Failed to commit partial: ${errorMessage}`);
@@ -1829,7 +2163,7 @@ export class HistoryService {
     message: MuxMessage
   ): Promise<Result<void>> {
     try {
-      const workspaceDir = this.config.getSessionDir(workspaceId);
+      const workspaceDir = this.getSessionDir(workspaceId);
       await ensurePrivateDir(workspaceDir);
       const historyPath = this.getChatHistoryPath(workspaceId);
 
@@ -1956,7 +2290,7 @@ export class HistoryService {
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
-    const sessionDir = this.config.getSessionDir(workspaceId);
+    const sessionDir = this.getSessionDir(workspaceId);
     // Lock BEFORE any directory creation (r63): the lockfile lives outside
     // the session dir, and removal holds this same lock while it tombstones
     // and deletes — so a mutation serializes with removal instead of racing
@@ -2042,20 +2376,23 @@ export class HistoryService {
   }
 
   async appendToHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(
-      workspaceId,
-      "Failed to append history",
-      async () => {
-        await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-        const result = await this._appendToHistoryUnlocked(workspaceId, message);
-        if (result.success) {
-          // A new durable boundary seals the previous epoch — rotate it out of
-          // chat.jsonl so subsequent reads/rewrites stay O(active epoch).
-          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
-        }
-        return result;
-      }
+    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to append history", () =>
+      this.appendToHistoryUnderWriteLock(workspaceId, message)
     );
+  }
+
+  private async appendToHistoryUnderWriteLock(
+    workspaceId: string,
+    message: MuxMessage
+  ): Promise<Result<void>> {
+    await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+    const result = await this._appendToHistoryUnlocked(workspaceId, message);
+    if (result.success) {
+      // A new durable boundary seals the previous epoch — rotate it out of
+      // chat.jsonl so subsequent reads/rewrites stay O(active epoch).
+      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+    }
+    return result;
   }
 
   /**
@@ -2075,7 +2412,7 @@ export class HistoryService {
       async () => {
         try {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          const workspaceDir = this.config.getSessionDir(workspaceId);
+          const workspaceDir = this.getSessionDir(workspaceId);
           await ensurePrivateDir(workspaceDir);
           const historyPath = this.getChatHistoryPath(workspaceId);
           for (const message of messages) {
@@ -2175,80 +2512,83 @@ export class HistoryService {
    * never in the sealed archive.
    */
   async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(
-      workspaceId,
-      "Failed to update history",
-      async () => {
-        try {
-          const historyPath = this.getChatHistoryPath(workspaceId);
+    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
+      this.updateHistoryUnderWriteLock(workspaceId, message)
+    );
+  }
 
-          // Read the active epoch — structural rewrite requires full file content
-          const messages = await this.readChatHistory(workspaceId);
-          const targetSequence = message.metadata?.historySequence;
+  private async updateHistoryUnderWriteLock(
+    workspaceId: string,
+    message: MuxMessage
+  ): Promise<Result<void>> {
+    try {
+      const historyPath = this.getChatHistoryPath(workspaceId);
 
-          if (targetSequence === undefined) {
-            return Err("Cannot update message without historySequence");
-          }
+      // Read the active epoch — structural rewrite requires full file content
+      const messages = await this.readChatHistory(workspaceId);
+      const targetSequence = message.metadata?.historySequence;
 
-          assert(
-            isNonNegativeInteger(targetSequence),
-            "updateHistory requires historySequence to be a non-negative integer"
+      if (targetSequence === undefined) {
+        return Err("Cannot update message without historySequence");
+      }
+
+      assert(
+        isNonNegativeInteger(targetSequence),
+        "updateHistory requires historySequence to be a non-negative integer"
+      );
+
+      // Find and replace the message with matching historySequence
+      let found = false;
+      let persistedMessage: MuxMessage | undefined;
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].metadata?.historySequence === targetSequence) {
+          const existingMessage = messages[i];
+          assert(existingMessage, "updateHistory matched message must exist");
+
+          // Preserve compaction boundary metadata during late in-place rewrites.
+          // Compaction may update an assistant row first, then a late stream rewrite can
+          // update that same historySequence and accidentally drop compaction markers.
+          const preservedCompactionMetadata = getCompactionMetadataToPreserve(
+            workspaceId,
+            existingMessage,
+            message
           );
 
-          // Find and replace the message with matching historySequence
-          let found = false;
-          let persistedMessage: MuxMessage | undefined;
-          for (let i = 0; i < messages.length; i++) {
-            if (messages[i].metadata?.historySequence === targetSequence) {
-              const existingMessage = messages[i];
-              assert(existingMessage, "updateHistory matched message must exist");
-
-              // Preserve compaction boundary metadata during late in-place rewrites.
-              // Compaction may update an assistant row first, then a late stream rewrite can
-              // update that same historySequence and accidentally drop compaction markers.
-              const preservedCompactionMetadata = getCompactionMetadataToPreserve(
-                workspaceId,
-                existingMessage,
-                message
-              );
-
-              // Preserve the historySequence, update everything else.
-              messages[i] = {
-                ...message,
-                metadata: {
-                  ...message.metadata,
-                  ...(preservedCompactionMetadata ?? {}),
-                  historySequence: targetSequence,
-                },
-              };
-              persistedMessage = messages[i];
-              found = true;
-              break;
-            }
-          }
-
-          if (!found || !persistedMessage) {
-            return Err(`No message found with historySequence ${targetSequence}`);
-          }
-
-          // Rewrite entire file
-          const historyEntries = this.serializeHistoryEntries(messages, workspaceId);
-
-          // Atomic write prevents corruption if app crashes mid-write
-          await writeFileAtomic(historyPath, historyEntries);
-
-          // Compaction updates the streamed summary row in-place with boundary
-          // metadata — seal the previous epoch once that lands. Check the persisted
-          // row (not the incoming message) so preserved boundary metadata counts.
-          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedMessage);
-
-          return Ok(undefined);
-        } catch (error) {
-          const message = getErrorMessage(error);
-          return Err(`Failed to update history: ${message}`);
+          // Preserve the historySequence, update everything else.
+          messages[i] = {
+            ...message,
+            metadata: {
+              ...message.metadata,
+              ...(preservedCompactionMetadata ?? {}),
+              historySequence: targetSequence,
+            },
+          };
+          persistedMessage = messages[i];
+          found = true;
+          break;
         }
       }
-    );
+
+      if (!found || !persistedMessage) {
+        return Err(`No message found with historySequence ${targetSequence}`);
+      }
+
+      // Rewrite entire file
+      const historyEntries = this.serializeHistoryEntries(messages, workspaceId);
+
+      // Atomic write prevents corruption if app crashes mid-write
+      await writeFileAtomic(historyPath, historyEntries);
+
+      // Compaction updates the streamed summary row in-place with boundary
+      // metadata — seal the previous epoch once that lands. Check the persisted
+      // row (not the incoming message) so preserved boundary metadata counts.
+      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedMessage);
+
+      return Ok(undefined);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      return Err(`Failed to update history: ${message}`);
+    }
   }
 
   /**
@@ -2287,7 +2627,7 @@ export class HistoryService {
           // duplicate a foreign backend's sequences and let a later
           // updateHistory() replace an unrelated row.
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          await ensurePrivateDir(this.config.getSessionDir(workspaceId));
+          await ensurePrivateDir(this.getSessionDir(workspaceId));
           const historyPath = this.getChatHistoryPath(workspaceId);
           const messages = await this.readChatHistory(workspaceId);
 
@@ -2437,83 +2777,86 @@ export class HistoryService {
    * messages may already have been appended.
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(
-      workspaceId,
-      "Failed to delete message",
-      async () => {
-        try {
-          // Structural rewrite requires full file content
-          const messages = await this.readChatHistory(workspaceId);
-          const filteredMessages = messages.filter((msg) => msg.id !== messageId);
-
-          if (filteredMessages.length === messages.length) {
-            // Not in the active epoch — the row may live in the sealed archive
-            // (rare: cleanup paths almost always target recent rows).
-            const archiveMessages = await this.readArchivedHistory(workspaceId);
-            const filteredArchive = archiveMessages.filter((msg) => msg.id !== messageId);
-            if (filteredArchive.length === archiveMessages.length) {
-              return Err(`Message with ID ${messageId} not found in history`);
-            }
-
-            // Archived rows are strictly older than active rows, so deleting one
-            // can never affect the sequence counter.
-            await writeFileAtomic(
-              this.getChatArchivePath(workspaceId),
-              this.serializeHistoryEntries(filteredArchive, workspaceId)
-            );
-            return Ok(undefined);
-          }
-
-          const historyPath = this.getChatHistoryPath(workspaceId);
-          const historyEntries = this.serializeHistoryEntries(filteredMessages, workspaceId);
-
-          // Atomic write prevents corruption if app crashes mid-write
-          await writeFileAtomic(historyPath, historyEntries);
-
-          // Keep the in-memory sequence counter monotonic. It's okay to reuse deleted sequence
-          // numbers on restart, but we must not regress within a running process.
-          const maxSeq = filteredMessages.reduce((max, msg) => {
-            const seq = msg.metadata?.historySequence;
-            if (seq === undefined) {
-              return max;
-            }
-
-            if (!isNonNegativeInteger(seq)) {
-              log.warn(
-                "Ignoring malformed persisted historySequence while updating sequence counter after delete",
-                {
-                  workspaceId,
-                  messageId: msg.id,
-                  historySequence: seq,
-                }
-              );
-              return max;
-            }
-
-            return seq > max ? seq : max;
-          }, -1);
-          // Sealed archive rows keep their sequences across active-file deletes.
-          // Without this floor, deleting the last sequenced active row in a fresh
-          // process would cache a counter below archived rows and reuse their
-          // historySequence values on the next append.
-          const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
-          const nextSeq = Math.max(maxSeq, archiveMaxSeq) + 1;
-          assert(
-            isNonNegativeInteger(nextSeq),
-            "next history sequence counter after delete must be a non-negative integer"
-          );
-          const currentCounter = this.sequenceCounters.get(workspaceId);
-          if (currentCounter === undefined || currentCounter < nextSeq) {
-            this.sequenceCounters.set(workspaceId, nextSeq);
-          }
-
-          return Ok(undefined);
-        } catch (error) {
-          const message = getErrorMessage(error);
-          return Err(`Failed to delete message: ${message}`);
-        }
-      }
+    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
+      this.deleteMessageUnderWriteLock(workspaceId, messageId)
     );
+  }
+
+  private async deleteMessageUnderWriteLock(
+    workspaceId: string,
+    messageId: string
+  ): Promise<Result<void>> {
+    try {
+      // Structural rewrite requires full file content
+      const messages = await this.readChatHistory(workspaceId);
+      const filteredMessages = messages.filter((msg) => msg.id !== messageId);
+
+      if (filteredMessages.length === messages.length) {
+        // Not in the active epoch — the row may live in the sealed archive
+        // (rare: cleanup paths almost always target recent rows).
+        const archiveMessages = await this.readArchivedHistory(workspaceId);
+        const filteredArchive = archiveMessages.filter((msg) => msg.id !== messageId);
+        if (filteredArchive.length === archiveMessages.length) {
+          return Err(`Message with ID ${messageId} not found in history`);
+        }
+
+        // Archived rows are strictly older than active rows, so deleting one
+        // can never affect the sequence counter.
+        await writeFileAtomic(
+          this.getChatArchivePath(workspaceId),
+          this.serializeHistoryEntries(filteredArchive, workspaceId)
+        );
+        return Ok(undefined);
+      }
+
+      const historyPath = this.getChatHistoryPath(workspaceId);
+      const historyEntries = this.serializeHistoryEntries(filteredMessages, workspaceId);
+
+      // Atomic write prevents corruption if app crashes mid-write
+      await writeFileAtomic(historyPath, historyEntries);
+
+      // Keep the in-memory sequence counter monotonic. It's okay to reuse deleted sequence
+      // numbers on restart, but we must not regress within a running process.
+      const maxSeq = filteredMessages.reduce((max, msg) => {
+        const seq = msg.metadata?.historySequence;
+        if (seq === undefined) {
+          return max;
+        }
+
+        if (!isNonNegativeInteger(seq)) {
+          log.warn(
+            "Ignoring malformed persisted historySequence while updating sequence counter after delete",
+            {
+              workspaceId,
+              messageId: msg.id,
+              historySequence: seq,
+            }
+          );
+          return max;
+        }
+
+        return seq > max ? seq : max;
+      }, -1);
+      // Sealed archive rows keep their sequences across active-file deletes.
+      // Without this floor, deleting the last sequenced active row in a fresh
+      // process would cache a counter below archived rows and reuse their
+      // historySequence values on the next append.
+      const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
+      const nextSeq = Math.max(maxSeq, archiveMaxSeq) + 1;
+      assert(
+        isNonNegativeInteger(nextSeq),
+        "next history sequence counter after delete must be a non-negative integer"
+      );
+      const currentCounter = this.sequenceCounters.get(workspaceId);
+      if (currentCounter === undefined || currentCounter < nextSeq) {
+        this.sequenceCounters.set(workspaceId, nextSeq);
+      }
+
+      return Ok(undefined);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      return Err(`Failed to delete message: ${message}`);
+    }
   }
 
   /**
@@ -2688,9 +3031,71 @@ export class HistoryService {
    * @param percentage Percentage to truncate (0.0 to 1.0). 1.0 = delete all
    * @returns Result containing array of deleted historySequence numbers
    */
-  async truncateHistory(
+  /**
+   * Token-proportional prefix length that truncateHistory removes at this percentage. Messages
+   * are stringified whole for counting; only relative weights matter.
+   */
+  private async computeTruncationRemoveCount(
+    messages: MuxMessage[],
+    percentage: number
+  ): Promise<number> {
+    const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
+    const messageTokens = await Promise.all(
+      messages.map((msg) => tokenizer.countTokens(safeStringifyForCounting(msg)))
+    );
+    const totalTokens = messageTokens.reduce((sum, tokens) => sum + tokens, 0);
+    const tokensToRemove = Math.floor(totalTokens * percentage);
+    let tokensRemoved = 0;
+    let removeCount = 0;
+    for (const tokens of messageTokens) {
+      if (tokensRemoved >= tokensToRemove) {
+        break;
+      }
+      tokensRemoved += tokens;
+      removeCount++;
+    }
+    return removeCount;
+  }
+
+  /**
+   * Preflight for truncateHistory: whether this percentage removes no rows, a proper prefix,
+   * or every message (the full-delete fast path). The requested percentage alone cannot
+   * distinguish these, and callers that must apply per-scope semantics before the rewrite
+   * commits (workspaceService retires kernel workflow run references only when rows will
+   * actually be removed, and applies full-clear guards when everything will) need the answer
+   * up front.
+   */
+  async classifyTruncationRemoval(
     workspaceId: string,
     percentage: number
+  ): Promise<"none" | "partial" | "all"> {
+    if (percentage >= 1.0) {
+      return "all";
+    }
+    if (percentage <= 0) {
+      return "none";
+    }
+    const archivedMessages = await this.readArchivedHistory(workspaceId);
+    const chatMessages = await this.readChatHistory(workspaceId);
+    const messages = [...archivedMessages, ...chatMessages];
+    if (messages.length === 0) {
+      return "none";
+    }
+    const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
+    if (removeCount === 0) {
+      return "none";
+    }
+    return removeCount >= messages.length ? "all" : "partial";
+  }
+
+  async truncateHistory(
+    workspaceId: string,
+    percentage: number,
+    options?: {
+      refuseFullDelete?: boolean;
+      refuseRowRemoval?: boolean;
+      requireFullDelete?: boolean;
+    }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -2717,31 +3122,28 @@ export class HistoryService {
             return Ok([]); // Nothing to truncate
           }
 
-          // Get tokenizer for counting (use a default model)
-          const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
+          const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
 
-          // Count tokens for each message
-          // We stringify the entire message for simplicity - only relative weights matter
-          const messageTokens: Array<{ message: MuxMessage; tokens: number }> = await Promise.all(
-            messages.map(async (msg) => {
-              const tokens = await tokenizer.countTokens(safeStringifyForCounting(msg));
-              return { message: msg, tokens };
-            })
-          );
+          // Mirror of refuseFullDelete for the opposite drift direction: the caller
+          // classified this request as a no-op (and so skipped its row-removal guards, e.g.
+          // kernel workflow reference retirement), but history grew enough between that
+          // unserialized read and this locked rewrite for the budget to reach real rows.
+          // Refuse instead of removing them unguarded; a retry re-classifies.
+          if (options?.refuseRowRemoval === true && removeCount > 0) {
+            return Err(
+              "Truncation classified as a no-op would remove messages; retry to re-run it."
+            );
+          }
 
-          // Calculate total tokens and target to remove
-          const totalTokens = messageTokens.reduce((sum, mt) => sum + mt.tokens, 0);
-          const tokensToRemove = Math.floor(totalTokens * percentage);
-
-          // Remove messages from beginning until we've removed enough tokens
-          let tokensRemoved = 0;
-          let removeCount = 0;
-          for (const mt of messageTokens) {
-            if (tokensRemoved >= tokensToRemove) {
-              break;
-            }
-            tokensRemoved += mt.tokens;
-            removeCount++;
+          // Third drift direction: the caller classified this request as emptying (and will
+          // apply full-clear-only side effects after the rewrite: context epoch advance,
+          // goal/plan/retry discards), but history grew between that unserialized read and
+          // this locked rewrite so rows would survive. Refuse instead of leaving survivors
+          // behind a "full clear"; a retry re-classifies.
+          if (options?.requireFullDelete === true && removeCount < messages.length) {
+            return Err(
+              "Truncation classified as a full clear would leave messages; retry to re-run it."
+            );
           }
 
           // No-op truncation (percentage 0 or rounding to zero tokens) must not
@@ -2753,6 +3155,17 @@ export class HistoryService {
 
           // If we're removing all messages, use fast path
           if (removeCount >= messages.length) {
+            // Serialized revalidation of the caller's emptiness preflight: an overlapping
+            // truncation can shrink history between that unserialized read and this locked
+            // rewrite, turning a partial-classified request into a full delete that skipped
+            // the caller's full-clear guards (most critically kernel workflow reference
+            // retirement). Refuse instead of emptying; a retry re-runs the preflight against
+            // the settled history and routes through the full-clear path.
+            if (options?.refuseFullDelete === true) {
+              return Err(
+                "Truncation would remove every remaining message; retry to run it as a full clear."
+              );
+            }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);

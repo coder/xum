@@ -24,6 +24,7 @@ import {
   emitChatEventBestEffort,
   parseToolResult,
   requireTaskService,
+  requireWorkspaceTurnManager,
   requireWorkspaceId,
 } from "./toolUtils";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -409,6 +410,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task");
 
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
@@ -417,7 +419,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       if (kind === "workspace") {
-        const created = await taskService.createWorkspaceTurn({
+        const created = await workspaceTurnManager.createWorkspaceTurn({
           ownerWorkspaceId: workspaceId,
           prompt,
           title,
@@ -446,19 +448,33 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           throw new Error(created.error);
         }
 
+        // Announce the probable quiet supersession at creation time so the
+        // owner is not surprised when its old handle settles interrupted
+        // without a separate wake. Pending (queued/running) results carry the
+        // forward-looking note; the foreground terminal result carries a
+        // past-tense equivalent because the old handle's suppressed wake means
+        // this result is the owner's only notification about that handle.
+        const supersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? ` Queued behind your active turn ${created.data.maySupersedeTaskId}; at the target's next tool boundary this follow-up may supersede it — if so, ${created.data.maySupersedeTaskId} settles as interrupted quietly (no separate wake) and this new handle carries the workspace's continuation.`
+            : "";
+        const completedSupersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? `This follow-up was queued behind your earlier turn ${created.data.maySupersedeTaskId}; if it cut that turn at a tool boundary, ${created.data.maySupersedeTaskId} settled as interrupted quietly (no separate wake) and this result carries the workspace's continuation.`
+            : undefined;
         const pendingResult = {
           status: created.data.status,
           taskId: created.data.taskId,
           workspaceId: created.data.workspaceId,
           handleKind: "workspace_turn" as const,
-          note: buildBackgroundStartNote(1),
+          note: buildBackgroundStartNote(1) + supersedeNote,
         };
         if (run_in_background) {
           return parseToolResult(TaskToolResultSchema, pendingResult, "task");
         }
 
         try {
-          const report = await taskService.waitForWorkspaceTurn(created.data.taskId, {
+          const report = await workspaceTurnManager.waitForWorkspaceTurn(created.data.taskId, {
             abortSignal,
             requestingWorkspaceId: workspaceId,
             backgroundOnMessageQueued: true,
@@ -474,6 +490,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
+              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
             },
             "task"
           );
@@ -486,7 +503,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               TaskToolResultSchema,
               {
                 ...pendingResult,
-                note: buildForegroundContinuationNote(1, "backgrounded"),
+                note: buildForegroundContinuationNote(1, "backgrounded") + supersedeNote,
               },
               "task"
             );
@@ -504,7 +521,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               TaskToolResultSchema,
               {
                 ...pendingResult,
-                note: buildForegroundContinuationNote(1, "timed_out"),
+                note: buildForegroundContinuationNote(1, "timed_out") + supersedeNote,
               },
               "task"
             );

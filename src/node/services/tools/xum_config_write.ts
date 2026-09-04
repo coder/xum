@@ -5,6 +5,10 @@ import type { XumConfigWriteToolArgs, XumConfigWriteToolResult } from "@/common/
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import {
+  withProjectRegistrationFileLock,
+  type ProjectRegistrationLockHandle,
+} from "@/node/config/projectRegistrationLock";
 import { applyMutations } from "@/node/services/tools/shared/configMutationEngine";
 import { REDACTED_SECRET_VALUE } from "@/node/services/tools/shared/configRedaction";
 import {
@@ -49,39 +53,55 @@ export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration)
         }
 
         const xumHome = config.xumScope!.xumHome;
-        const currentDocument = await readConfigDocumentUnvalidated(xumHome, args.file);
         const registryEntry = CONFIG_FILE_REGISTRY[args.file];
-        const mutationResult = applyMutations(
-          currentDocument,
-          args.operations,
-          registryEntry.schema,
-          { rootContainer: registryEntry.rootContainer }
-        );
+        const rewrite = async (
+          lock: ProjectRegistrationLockHandle | null
+        ): Promise<XumConfigWriteToolResult> => {
+          const currentDocument = await readConfigDocumentUnvalidated(xumHome, args.file);
+          const mutationResult = applyMutations(
+            currentDocument,
+            args.operations,
+            registryEntry.schema,
+            { rootContainer: registryEntry.rootContainer }
+          );
 
-        if (!mutationResult.success) {
+          if (!mutationResult.success) {
+            return {
+              success: false,
+              error: mutationResult.error,
+              validationIssues: mutationResult.validationIssues?.map((issue) => ({
+                path: issue.path.filter(
+                  (segment): segment is string | number => typeof segment !== "symbol"
+                ),
+                message: issue.message,
+              })),
+            };
+          }
+
+          await lock?.assertStillOwned();
+          await writeConfigDocument(xumHome, args.file, mutationResult.document);
           return {
-            success: false,
-            error: mutationResult.error,
-            validationIssues: mutationResult.validationIssues?.map((issue) => ({
-              path: issue.path.filter(
-                (segment): segment is string | number => typeof segment !== "symbol"
-              ),
-              message: issue.message,
-            })),
+            success: true,
+            file: args.file,
+            appliedOps: mutationResult.appliedOps,
+            summary: `Applied ${mutationResult.appliedOps} operation(s) to ${args.file}`,
           };
-        }
-
-        await writeConfigDocument(xumHome, args.file, mutationResult.document);
-
-        // Notify services that config has changed (triggers hot-reload for providers)
-        config.onConfigChanged?.();
-
-        return {
-          success: true,
-          file: args.file,
-          appliedOps: mutationResult.appliedOps,
-          summary: `Applied ${mutationResult.appliedOps} operation(s) to ${args.file}`,
         };
+        // config.json carries the project set, and this rewrites the whole document from the
+        // bytes it read: like every Config.editConfig save it has to happen under the project
+        // registration lock, or a value-only edit here would drop a project a settings-backup
+        // import registered meanwhile, or change registrations while the import writes that
+        // project's memory (see projectRegistrationLock.ts). Read and written under one hold,
+        // verified immediately before the write.
+        const result =
+          args.file === "config"
+            ? await withProjectRegistrationFileLock(xumHome, rewrite)
+            : await rewrite(null);
+        if (result.success) {
+          // Notify services that config has changed (triggers hot-reload for providers)
+          config.onConfigChanged?.();
+        }
+        return result;
       } catch (error) {
         const message = getErrorMessage(error);
         return {

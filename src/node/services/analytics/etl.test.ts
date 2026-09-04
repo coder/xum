@@ -9,14 +9,17 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  CURRENT_ETL_SEMANTICS_VERSION,
   deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   parseWorkspaceFromDisk,
   readPersistedWorkspaceHeadSignature,
+  readStoredEtlSemanticsVersion,
   readStoredPricingFingerprint,
   rebuildAll,
   statSessionChatHistory,
+  storeEtlSemanticsVersion,
   storePricingFingerprint,
 } from "./etl";
 import {
@@ -29,12 +32,23 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 
 const SUBAGENT_TRANSCRIPTS_DIR_NAME = "subagent-transcripts";
 
+// Pre-tool_name table shape: strips every column added by
+// EVENTS_COLUMN_MIGRATIONS_SQL so migration tests replay the real upgrade
+// path (ALTERs append columns in migration-list order).
 const CREATE_EVENTS_TABLE_WITHOUT_TOOL_NAME_SQL = CREATE_EVENTS_TABLE_SQL.replace(
   "\n  tool_name TEXT,",
   ""
 )
-  .replace("\n  tool_name TEXT", "")
+  .replace("\n  requested_model VARCHAR,", "")
+  .replace("\n  refused_models_json VARCHAR", "")
   .replace(",\n)", "\n)");
+
+// Pre-refusal-columns table shape (tool_name already migrated): the upgrade
+// path current installs take when the refusal-downgrade columns land.
+const CREATE_EVENTS_TABLE_WITHOUT_REFUSAL_COLUMNS_SQL = CREATE_EVENTS_TABLE_SQL.replace(
+  ",\n  requested_model VARCHAR,\n  refused_models_json VARCHAR",
+  ""
+);
 
 const tempDirsToClean: string[] = [];
 const duckDbHandlesToClose: Array<{ instance: DuckDBInstance; conn: DuckDBConnection }> = [];
@@ -80,6 +94,8 @@ function makeAssistantLine(
     ttftMs?: number;
     providerMetadata?: Record<string, unknown>;
     toolModelUsages?: unknown[];
+    modelFallback?: unknown;
+    partial?: boolean;
   } = {}
 ): string {
   return JSON.stringify({
@@ -98,6 +114,8 @@ function makeAssistantLine(
       ...(opts.ttftMs != null ? { ttftMs: opts.ttftMs } : {}),
       ...(opts.providerMetadata != null ? { providerMetadata: opts.providerMetadata } : {}),
       ...(opts.toolModelUsages != null ? { toolModelUsages: opts.toolModelUsages } : {}),
+      ...(opts.modelFallback != null ? { modelFallback: opts.modelFallback } : {}),
+      ...(opts.partial != null ? { partial: opts.partial } : {}),
     },
   });
 }
@@ -437,7 +455,13 @@ describe("appendEvents", () => {
     const freshConn = await createTestConn();
     const migratedConn = await createTestConn({
       createEventsTableSql: CREATE_EVENTS_TABLE_WITHOUT_TOOL_NAME_SQL,
-      postCreateEventsSql: ["ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT"],
+      // Mirror EVENTS_COLUMN_MIGRATIONS_SQL order so the migrated physical
+      // column order matches a fresh table (the appender relies on it).
+      postCreateEventsSql: [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
+      ],
     });
     const sessionDir = await createTempSessionDir();
     const workspaceId = "ws-tool-column-order";
@@ -498,6 +522,242 @@ describe("appendEvents", () => {
       },
     ]);
     expect(migratedRows).toEqual(freshRows);
+  });
+
+  test("keeps downgrade columns aligned across fresh and refusal-column-migrated tables", async () => {
+    const freshConn = await createTestConn();
+    const migratedConn = await createTestConn({
+      createEventsTableSql: CREATE_EVENTS_TABLE_WITHOUT_REFUSAL_COLUMNS_SQL,
+      postCreateEventsSql: [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
+      ],
+    });
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-column-order";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    const parsed = await parseWorkspaceFromDisk(workspaceId, sessionDir, {});
+    expect(parsed).not.toBeNull();
+    assert(
+      parsed,
+      "downgrade column-order test expected parseWorkspaceFromDisk to parse workspace"
+    );
+
+    await appendEvents(freshConn, parsed.events);
+    await appendEvents(migratedConn, parsed.events);
+
+    const selectedSql =
+      "SELECT model, tool_name, requested_model, refused_models_json FROM events WHERE workspace_id = ?";
+    const freshRows = await queryRows(freshConn, selectedSql, [workspaceId]);
+    const migratedRows = await queryRows(migratedConn, selectedSql, [workspaceId]);
+
+    expect(freshRows).toEqual([
+      {
+        model: "openai:gpt-4",
+        tool_name: null,
+        requested_model: "anthropic:fable-1",
+        refused_models_json: '["anthropic:fable-1"]',
+      },
+    ]);
+    expect(migratedRows).toEqual(freshRows);
+  });
+
+  test("populates downgrade columns on the main turn row only", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", "openai:gpt-4-mini"],
+        },
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: 1_700_000_000_025,
+            model: "anthropic:fable-1",
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+        ],
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT tool_name, model, requested_model, refused_models_json, input_tokens, total_cost_usd FROM events WHERE workspace_id = ? ORDER BY tool_name NULLS FIRST",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(2);
+    // Main turn row: answering model + downgrade metadata.
+    expect(rows[0].tool_name).toBeNull();
+    expect(rows[0].model).toBe("openai:gpt-4");
+    expect(rows[0].requested_model).toBe("anthropic:fable-1");
+    expect(rows[0].refused_models_json).toBe('["anthropic:fable-1","openai:gpt-4-mini"]');
+    // Refusal hop row: zero-usage refusals still produce a countable row,
+    // with downgrade metadata left NULL (main-row-only semantics).
+    expect(rows[1].tool_name).toBe("model_fallback_refusal");
+    expect(rows[1].model).toBe("anthropic:fable-1");
+    expect(rows[1].requested_model).toBeNull();
+    expect(rows[1].refused_models_json).toBeNull();
+    expect(parseInteger(rows[1].input_tokens, "hop input_tokens")).toBe(0);
+    expect(Number(rows[1].total_cost_usd)).toBe(0);
+
+    // Delete+reinsert idempotency holds for downgrade rows.
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+    expect(await queryEventCount(conn, workspaceId)).toBe(2);
+  });
+
+  test("malformed modelFallback yields NULL downgrade columns without dropping the row", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-malformed";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Non-record modelFallback.
+      makeAssistantLine({ sequence: 1, modelFallback: "bogus" }),
+      // Wrong field types / empty refusedModels after string filtering.
+      makeAssistantLine({
+        sequence: 2,
+        modelFallback: { requestedModel: 42, refusedModels: ["anthropic:fable-1"] },
+      }),
+      makeAssistantLine({
+        sequence: 3,
+        modelFallback: { requestedModel: "anthropic:fable-1", refusedModels: [17, null] },
+      }),
+      // Partially malformed arrays are rejected wholesale: dropping bad hops
+      // would emit a truncated chain that reads as valid history.
+      makeAssistantLine({
+        sequence: 4,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", 42],
+        },
+      }),
+      makeAssistantLine({
+        sequence: 5,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", "  "],
+        },
+      }),
+      // ModelFallbackRecord invariant violation: the requested model must be
+      // the first refused entry, so a mismatched chain is corrupted history.
+      makeAssistantLine({
+        sequence: 6,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:other-model"],
+        },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(6);
+    for (const row of rows) {
+      expect(row.requested_model).toBeNull();
+      expect(row.refused_models_json).toBeNull();
+    }
+  });
+
+  test("interrupted (partial) fallback turns do not count as answered downgrades", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-partial";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Valid downgrade record, but the turn committed as an interrupted
+      // partial: billed attempt, not an answered downgrade.
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        partial: true,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, requested_model, refused_models_json FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe("openai:gpt-4"); // usage still ingested
+    expect(rows[0].requested_model).toBeNull();
+    expect(rows[0].refused_models_json).toBeNull();
+  });
+
+  test("events.model uses the shared attribution key for coder and gateway identities", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-attribution-key";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Coder route: answered main row and tool row must key by the pinned
+      // metadata identity so they group with headless sidecar rows (which
+      // recordHeadlessUsageLocked already writes canonically).
+      makeAssistantLine({
+        sequence: 1,
+        model: "coder:prod/claude-opus-4-5",
+        metadataModel: "anthropic:claude-opus-4-5",
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: 1_700_000_000_025,
+            model: "coder:prod/claude-opus-4-5",
+            metadataModel: "anthropic:claude-opus-4-5",
+            usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          },
+        ],
+      }),
+      // Gateway route canonicalizes; coder without a pinned identity keeps
+      // its raw (only durable) key.
+      makeAssistantLine({ sequence: 2, model: "mux-gateway:anthropic/claude-opus-4-5" }),
+      makeAssistantLine({ sequence: 3, model: "coder:unmapped/some-model" }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, tool_name FROM events WHERE workspace_id = ? ORDER BY model, tool_name NULLS FIRST",
+      [workspaceId]
+    );
+    expect(rows.map((row) => [row.model, row.tool_name])).toEqual([
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", "model_fallback_refusal"],
+      ["coder:unmapped/some-model", null],
+    ]);
   });
 
   test("emits one assistant row plus one row per tool model usage with inherited context", async () => {
@@ -1430,6 +1690,35 @@ describe("headless usage ingestion", () => {
     expect(await queryEventCount(conn, workspaceId)).toBe(3);
   });
 
+  test("ingests zero-usage refused_stream sidecar rows as countable refusal events", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-refused-ws";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+    await writeHeadlessUsageJsonl(sessionDir, [
+      // Terminal refusal the provider billed nothing for: the row must still
+      // exist so refusal counts include zero-usage refusals.
+      makeHeadlessLine({ source: "refused_stream", inputTokens: 0, outputTokens: 0 }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    const refusedRows = await queryRows(
+      conn,
+      "SELECT tool_name, model, input_tokens, output_tokens, total_cost_usd FROM events WHERE workspace_id = ? AND tool_name = 'headless:refused_stream'",
+      [workspaceId]
+    );
+    expect(refusedRows).toHaveLength(1);
+    expect(refusedRows[0].model).toBe("anthropic:claude-sonnet-4-20250514");
+    expect(parseInteger(refusedRows[0].input_tokens, "input_tokens")).toBe(0);
+    expect(parseInteger(refusedRows[0].output_tokens, "output_tokens")).toBe(0);
+    expect(Number(refusedRows[0].total_cost_usd)).toBe(0);
+
+    // Delete+reinsert idempotency holds for refused_stream rows.
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(2); // 1 chat + 1 refused
+  });
+
   test("clears stale headless rows when the sidecar disappears", async () => {
     const conn = await createTestConn();
     const workspaceId = "headless-ws-removed";
@@ -1655,6 +1944,48 @@ describe("pricing fingerprint", () => {
     // Idempotent upsert: storing again keeps a single row with the same value.
     await storePricingFingerprint(conn);
     expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
+  });
+});
+
+describe("etl semantics version", () => {
+  test("round-trips through ingest_meta and starts unset", async () => {
+    const conn = await createTestConn();
+
+    // Missing on pre-upgrade DBs: the sync check treats null as changed and
+    // schedules the one-time backfill rebuild (see decideSyncPlan tests).
+    expect(await readStoredEtlSemanticsVersion(conn)).toBeNull();
+
+    await storeEtlSemanticsVersion(conn);
+    expect(await readStoredEtlSemanticsVersion(conn)).toBe(CURRENT_ETL_SEMANTICS_VERSION);
+  });
+
+  test("full rebuild backfills downgrade columns from pre-existing chat.jsonl", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+    const workspaceDir = path.join(sessionsDir, "ws-backfill");
+    await fs.mkdir(workspaceDir);
+    // Historical committed downgrade turn written before this feature existed.
+    await writeChatJsonl(workspaceDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    await rebuildAll(conn, sessionsDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ? AND tool_name IS NULL",
+      ["ws-backfill"]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requested_model).toBe("anthropic:fable-1");
+    expect(rows[0].refused_models_json).toBe('["anthropic:fable-1"]');
   });
 });
 

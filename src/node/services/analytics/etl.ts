@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { DuckDBAppender, DuckDBDateValue, type DuckDBConnection } from "@duckdb/node-api";
 import { EventRowSchema, type EventRow } from "@/common/orpc/schemas/analytics";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import modelsData from "@/common/utils/tokens/models.json";
@@ -135,11 +136,13 @@ INSERT INTO events (
   tool_execution_ms,
   output_tps,
   response_index,
-  is_sub_agent
+  is_sub_agent,
+  requested_model,
+  refused_models_json
 ) VALUES (
   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-  ?, ?, ?, ?, ?, ?
+  ?, ?, ?, ?, ?, ?, ?, ?
 )
 `;
 
@@ -196,6 +199,8 @@ async function insertEventRow(
     row.output_tps,
     row.response_index,
     row.is_sub_agent,
+    row.requested_model,
+    row.refused_models_json,
   ]);
 }
 
@@ -290,6 +295,8 @@ export async function appendEvents(conn: DuckDBConnection, events: IngestEvent[]
       appendIntegerOrNull(appender, row.response_index);
       appender.appendBoolean(row.is_sub_agent);
       appendVarcharOrNull(appender, row.tool_name);
+      appendVarcharOrNull(appender, row.requested_model);
+      appendVarcharOrNull(appender, row.refused_models_json);
       appender.endRow();
     }
 
@@ -349,6 +356,9 @@ function buildIngestEventRow(params: {
   durationMs: number | null;
   ttftMs: number | null;
   outputTps: number | null;
+  /** Refusal-fallback downgrade metadata; main turn rows only. */
+  requestedModel?: string | null;
+  refusedModelsJson?: string | null;
 }): {
   parsed: ReturnType<typeof EventRowSchema.safeParse>;
   date: string | null;
@@ -372,7 +382,7 @@ function buildIngestEventRow(params: {
       parent_workspace_id: params.inheritedContext.workspaceMeta.parentWorkspaceId ?? null,
       agent_id: params.inheritedContext.agentId,
       timestamp: params.timestamp,
-      model: params.model,
+      model: analyticsAttributionModel(params.model, params.metadataModel),
       tool_name: params.toolName,
       thinking_level: params.inheritedContext.thinkingLevel,
       input_tokens: displayUsage.input.tokens,
@@ -396,6 +406,8 @@ function buildIngestEventRow(params: {
       output_tps: params.outputTps,
       response_index: params.inheritedContext.responseIndex,
       is_sub_agent: params.inheritedContext.isSubAgent,
+      requested_model: params.requestedModel ?? null,
+      refused_models_json: params.refusedModelsJson ?? null,
     }),
     date: dateBucketFromTimestamp(params.timestamp),
   };
@@ -482,6 +494,75 @@ function toOptionalString(value: unknown): string | undefined {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Parse metadata.modelFallback (ModelFallbackRecord: { requestedModel,
+ * refusedModels }) into the events downgrade columns. Populated only when
+ * requestedModel is a non-empty string AND refusedModels is a non-empty array
+ * whose EVERY entry is a trimmed non-empty string; any malformed record or
+ * entry yields nulls for both columns (the row is still ingested). Partially
+ * valid arrays are rejected wholesale — silently dropping bad hops would emit
+ * a truncated chain that reads as valid history.
+ */
+function parseModelFallback(rawModelFallback: unknown): {
+  requestedModel: string | null;
+  refusedModelsJson: string | null;
+} {
+  const MALFORMED = { requestedModel: null, refusedModelsJson: null };
+  if (!isRecord(rawModelFallback)) {
+    return MALFORMED;
+  }
+
+  const requestedModel = toOptionalString(rawModelFallback.requestedModel);
+  const rawRefusedModels = rawModelFallback.refusedModels;
+  if (!requestedModel || !Array.isArray(rawRefusedModels) || rawRefusedModels.length === 0) {
+    return MALFORMED;
+  }
+
+  const refusedModels: string[] = [];
+  for (const entry of rawRefusedModels) {
+    const refusedModel = toOptionalString(entry);
+    if (!refusedModel) {
+      return MALFORMED;
+    }
+    refusedModels.push(refusedModel);
+  }
+
+  // ModelFallbackRecord invariant: the requested model is always the first
+  // refused entry (the writer canonicalizes both with the same helper). A
+  // mismatch means corrupted history — reject the record rather than report
+  // an A→answered downgrade while the stored chain claims B refused.
+  if (refusedModels[0] !== requestedModel) {
+    return MALFORMED;
+  }
+
+  return { requestedModel, refusedModelsJson: JSON.stringify(refusedModels) };
+}
+
+/**
+ * Analytics attribution key for events.model, mirroring
+ * SessionUsageService.recordHeadlessUsageLocked (and StreamManager's
+ * usageAttributionModel): Coder identities use the record-time pinned
+ * metadata identity — the raw coder: string is a mutable instance route the
+ * ETL cannot re-resolve — and every other identity canonicalizes gateway
+ * strings. Without one shared key, answered main rows, refusal hop rows, and
+ * headless sidecar rows would split a single configured model across several
+ * buckets in GROUP BY model queries (e.g. coder:prod/opus vs anthropic:opus).
+ * Coder rows without a persisted metadataModel keep the raw identity — it is
+ * their only durable key.
+ */
+function analyticsAttributionModel(
+  model: string | null,
+  metadataModel: string | undefined
+): string | null {
+  if (model === null) {
+    return null;
+  }
+  if (model.startsWith("coder:")) {
+    return metadataModel ?? model;
+  }
+  return normalizeToCanonical(model);
 }
 
 function parseCreatedAtTimestamp(value: unknown): number | null {
@@ -717,6 +798,14 @@ function extractIngestEvents(params: {
   // Tool usage snapshots can survive even when the parent assistant usage payload is missing.
   // Keep ingesting those rows so malformed or partial history does not drop tool costs.
   if (usage) {
+    // Downgrade metadata rides the main turn row only (tool rows stay null):
+    // the `model` column is the answering model, requested_model the original.
+    // Interrupted fallback turns commit with partial: true — they are billed
+    // attempts but not answered downgrades, so the columns stay null there.
+    const modelFallback =
+      metadata.partial === true
+        ? { requestedModel: null, refusedModelsJson: null }
+        : parseModelFallback(metadata.modelFallback);
     const parentRow = buildIngestEventRow({
       inheritedContext,
       model: toOptionalString(metadata.model) ?? null,
@@ -728,6 +817,8 @@ function extractIngestEvents(params: {
       durationMs,
       ttftMs: extractTtftMs(metadata),
       outputTps: null,
+      requestedModel: modelFallback.requestedModel,
+      refusedModelsJson: modelFallback.refusedModelsJson,
     });
     if (!parentRow.parsed.success) {
       log.warn("[analytics-etl] Skipping invalid analytics row", {
@@ -1851,6 +1942,41 @@ export async function storePricingFingerprint(conn: DuckDBConnection): Promise<v
   await conn.run("INSERT OR REPLACE INTO ingest_meta (key, value) VALUES (?, ?)", [
     PRICING_FINGERPRINT_META_KEY,
     getCurrentPricingFingerprint(),
+  ]);
+}
+
+const ETL_SEMANTICS_META_KEY = "etl_semantics_version";
+
+/**
+ * Bump when the ETL starts deriving NEW columns/semantics from data that
+ * already exists in chat.jsonl: previously ingested rows lack the new fields,
+ * so a version mismatch forces one full rebuild to backfill them from the
+ * durable source. Same read → decide → store-after-success flow as the
+ * pricing fingerprint above.
+ *
+ * refusal-analytics-v1: requested_model / refused_models_json columns from
+ * metadata.modelFallback.
+ * refusal-analytics-v2: events.model keyed by analyticsAttributionModel,
+ * downgrade columns gated on non-partial turns, strict modelFallback chain
+ * validation.
+ */
+export const CURRENT_ETL_SEMANTICS_VERSION = "refusal-analytics-v2";
+
+export async function readStoredEtlSemanticsVersion(
+  conn: DuckDBConnection
+): Promise<string | null> {
+  const result = await conn.run("SELECT value FROM ingest_meta WHERE key = ?", [
+    ETL_SEMANTICS_META_KEY,
+  ]);
+  const rows = await result.getRowObjectsJS();
+  const value = rows[0]?.value;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export async function storeEtlSemanticsVersion(conn: DuckDBConnection): Promise<void> {
+  await conn.run("INSERT OR REPLACE INTO ingest_meta (key, value) VALUES (?, ?)", [
+    ETL_SEMANTICS_META_KEY,
+    CURRENT_ETL_SEMANTICS_VERSION,
   ]);
 }
 

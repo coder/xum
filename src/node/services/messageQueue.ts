@@ -91,7 +91,26 @@ function hasReviews(meta: unknown): meta is MetadataWithReviews {
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
-type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
+export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
+
+/** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
+export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
+  return typeof signal.reason === "string"
+    ? signal.reason
+    : "Queued message canceled before acceptance.";
+}
+
+/**
+ * Input poised to take over a session at a queue cut (see
+ * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
+ * engaged stage is reported even when its metadata is undefined (manual
+ * message) so callers cannot misattribute the cut to an entry queued behind
+ * the engaged one.
+ */
+export type QueueCutCutter =
+  | { stage: "preparing"; muxMetadata: unknown }
+  | { stage: "dispatching"; muxMetadata: unknown }
+  | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
@@ -253,6 +272,15 @@ export class MessageQueue {
   }
 
   /**
+   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
+   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
+   * onCanceled), but they are not pending work and must not arm a tool-end stop.
+   */
+  getNextDispatchableMode(): QueueDispatchMode | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
+  }
+
+  /**
    * Whether every queued entry continues the exact workspace turn correlation.
    *
    * The caller uses this for a new continuation that has not entered the queue.
@@ -292,6 +320,25 @@ export class MessageQueue {
       metadata.ownerWorkspaceId === ownerWorkspaceId &&
       metadata.turnId === turnId
     );
+  }
+
+  /**
+   * FIFO head entry's cut-attribution view: its first muxMetadata plus dispatch mode.
+   *
+   * Soundness of metadata-based cut attribution rests on the sealing invariant
+   * (see class docblock): workspace-turn entries are sealed at add time and
+   * batching additionally requires matching userAuthored, so a manual user
+   * message can never hide inside an entry whose muxMetadata is workspace-turn
+   * metadata.
+   */
+  getNextQueueCutCandidate():
+    | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
+    | undefined {
+    const head = this.entries[0];
+    if (head == null) {
+      return undefined;
+    }
+    return { muxMetadata: head.muxMetadata, dispatchMode: head.dispatchMode };
   }
 
   /**

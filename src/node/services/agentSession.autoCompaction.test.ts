@@ -1,11 +1,7 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
-import type {
-  ProvidersConfigMap,
-  SendMessageOptions,
-  WorkspaceChatMessage,
-} from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -13,13 +9,17 @@ import {
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 describe("AgentSession on-send auto-compaction snapshot deferral", () => {
@@ -48,12 +48,16 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("does not persist or emit snapshots before forced on-send compaction", async () => {
     const workspaceId = "ws-auto-compaction-snapshot-deferral";
 
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
-    const { session, historyService, events } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      captureEvents: true,
-    });
+    const streamMessage = mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
+    const { session, historyService, events, backgroundProcessManager } =
+      await createSessionHarness({
+        workspaceId,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        captureEvents: true,
+      });
+    const cleanupSpy = spyOn(backgroundProcessManager, "cleanup");
 
     const syntheticSnapshot = createMuxMessage(
       "file-snapshot-1",
@@ -93,10 +97,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
     const result = await session.sendMessage("please inspect @foo.ts", {
       model: "openai:gpt-4o",
       agentId: "exec",
       disableWorkspaceAgents: true,
+      toolPolicy: restrictedPolicy,
     });
 
     expect(result.success).toBe(true);
@@ -118,6 +124,15 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionMessage).toBeDefined();
     expect(persistedCompactionMessage?.metadata?.disableWorkspaceAgents).toBe(true);
+    // The durable follow-up must keep the caller's restrictions: the redispatched turn
+    // reconstructs its options from this persisted request, and dropping the policy there
+    // would resume the conversation allow-all after compaction.
+    const followUpContent =
+      persistedCompactionMessage?.metadata?.muxMetadata?.type === "compaction-request"
+        ? persistedCompactionMessage.metadata.muxMetadata.parsed.followUpContent
+        : undefined;
+    expect(followUpContent?.toolPolicy).toEqual(restrictedPolicy);
+    expect(followUpContent?.disableWorkspaceAgents).toBe(true);
 
     const emittedSnapshot = events.some(
       (message) =>
@@ -127,6 +142,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         message.id === "file-snapshot-1"
     );
     expect(emittedSnapshot).toBe(false);
+    expect(cleanupSpy).not.toHaveBeenCalled();
 
     session.dispose();
   });
@@ -179,11 +195,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("does not materialize skill snapshots (or run their directives) on deferred on-send compaction turns", async () => {
     const workspaceId = "ws-auto-compaction-skill-snapshot-deferral";
 
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const internals = session as unknown as {
       materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
@@ -231,10 +243,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       workspaceId: string;
       experiments?: SendMessageOptions["experiments"];
     }) => {
-      const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
       const { session, historyService } = await createSessionHarness({
         workspaceId: args.workspaceId,
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
       });
 
       // Seed a prior turn so the keep-recent selector has a safe user boundary
@@ -339,7 +349,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session } = await createSessionHarness({
       workspaceId,
@@ -383,12 +393,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const compactionModel = "openai:gpt-4o-mini";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -437,7 +448,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -500,7 +511,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -559,11 +570,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("compaction model inherit uses caller-provided baseOptions.model when no preferred model configured", async () => {
     const workspaceId = "ws-auto-compaction-inherit-base-options-model";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const inheritedModel = "anthropic:claude-sonnet-4-6";
     const baseOptions: SendMessageOptions = {
@@ -608,11 +615,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("clears strictAgentResolution on the internal compact request", async () => {
     const workspaceId = "ws-auto-compaction-clears-strict";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     // A strict explicit-agent workspace turn hitting auto-compaction: the internal
     // request intentionally runs the hidden compact agent, so the strict gate must not
@@ -651,20 +654,16 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("compaction model explicit override takes priority over baseOptions.model", async () => {
     const workspaceId = "ws-auto-compaction-explicit-model-overrides-base-model";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
     const compactionModel = "openai:gpt-5.5";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
     } as unknown as Config;
-    const { session } = await createSessionHarness({
-      workspaceId,
-      config,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId, config });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -708,21 +707,17 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("compaction thinking level prefers compact agent default over baseOptions", async () => {
     const workspaceId = "ws-auto-compaction-compact-thinking-default";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: {
           compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
         },
       }),
     } as unknown as Config;
-    const { session } = await createSessionHarness({
-      workspaceId,
-      config,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId, config });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -761,11 +756,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("compaction thinking level falls back to baseOptions when compact default is unset", async () => {
     const workspaceId = "ws-auto-compaction-base-thinking-fallback";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -802,7 +793,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("threads providers config into pre-send and mid-stream compaction checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { config, historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const providersConfig = {
@@ -814,7 +805,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
           },
         ],
       },
-    } as unknown as ProvidersConfigMap;
+    };
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -843,10 +835,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         },
       });
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -862,12 +855,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         void _queued;
       }),
     } as unknown as BackgroundProcessManager;
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-      loadProvidersConfig: () => providersConfig,
-    } as unknown as Config;
 
     const session = new AgentSession({
       workspaceId,
@@ -963,8 +950,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(appendCurrentEpochUser.success).toBe(true);
 
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -982,8 +972,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1059,7 +1051,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const stopStream = mock((_workspaceId: string) => {
@@ -1074,6 +1066,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1091,8 +1084,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1207,7 +1202,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const stopStream = mock((_workspaceId: string) => {
@@ -1222,6 +1217,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1239,8 +1235,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1383,7 +1381,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         },
       });
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const harness = await createAgentSessionHarness({

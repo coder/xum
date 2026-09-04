@@ -1,19 +1,164 @@
+import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { Context, Duration, Effect, Layer } from "effect";
+import { TestClock } from "effect/testing";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { Config } from "@/node/config";
+import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
+import type { ORPCContext } from "@/node/orpc/context";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { isInteractiveHostKeyApprovalAvailable } from "@/node/runtime/sshConnectionPool";
+import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
+import * as appLayers from "@/node/services/di/layers/app";
+import { CoreOptionsTag } from "@/node/services/di/layers/core";
+import {
+  AgentBrowserSessionDiscovery,
+  AgentPluginInstall,
+  AI,
+  Analytics,
+  Backup,
+  BrowserBridgeServerTag,
+  BrowserBridgeTokenManagerTag,
+  BrowserControl,
+  BrowserSessionStateHubTag,
+  Coder,
+  CoderOauth,
+  CodexOauth,
+  ConfigTag,
+  CopilotOauth,
+  DesktopBridgeServerTag,
+  DesktopSessionManagerTag,
+  DesktopTokenManagerTag,
+  DevTools,
+  Editor,
+  Experiments,
+  FileLeaseManagerTag,
+  History,
+  IdleDispatcherTag,
+  InitStateManagerTag,
+  Instructions,
+  MCPConfig,
+  McpOauth,
+  MCPServerManagerTag,
+  Memory,
+  MemoryConsolidation,
+  MemoryMeta,
+  MenuEvent,
+  MuxGatewayOauth,
+  MuxGovernorOauth,
+  Policy,
+  Project,
+  Provider,
+  ProvidersConfigStoreTag,
+  QuickJSRuntimeFactoryTag,
+  Refine,
+  SecretsStoreTag,
+  Server,
+  ServerAuth,
+  SessionLocatorTag,
+  SessionTiming,
+  SessionUsage,
+  SshPrompt,
+  StreamManagerTag,
+  Task,
+  Telemetry,
+  Terminal,
+  Timeline,
+  Tokenizer,
+  TurnRequestBuilderBindingsTag,
+  Update,
+  Voice,
+  WindowTag,
+  Workspace,
+  WorkspaceGoal,
+  WorkspaceLifecycleHooksTag,
+  WorkspaceMcpOverrides,
+  WorktreeArchiveSnapshot,
+  type AppTags,
+} from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
+
+/**
+ * Independent field → tag listing for every ORPC context field (the production
+ * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
+ * a field added to `ORPCContext` without a tag fails to compile here.
+ */
+const ORPC_FIELD_TAGS: Record<
+  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  Context.Key<AppTags, unknown>
+> = {
+  config: ConfigTag,
+  sessionLocator: SessionLocatorTag,
+  providersConfigStore: ProvidersConfigStoreTag,
+  secretsStore: SecretsStoreTag,
+  fileLeaseManager: FileLeaseManagerTag,
+  aiService: AI,
+  historyService: History,
+  streamManager: StreamManagerTag,
+  initStateManager: InitStateManagerTag,
+  projectService: Project,
+  workspaceService: Workspace,
+  taskService: Task,
+  providerService: Provider,
+  muxGatewayOauthService: MuxGatewayOauth,
+  muxGovernorOauthService: MuxGovernorOauth,
+  codexOauthService: CodexOauth,
+  coderOauthService: CoderOauth,
+  copilotOauthService: CopilotOauth,
+  backupService: Backup,
+  terminalService: Terminal,
+  editorService: Editor,
+  windowService: WindowTag,
+  updateService: Update,
+  tokenizerService: Tokenizer,
+  serverService: Server,
+  menuEventService: MenuEvent,
+  voiceService: Voice,
+  mcpConfigService: MCPConfig,
+  mcpOauthService: McpOauth,
+  workspaceMcpOverridesService: WorkspaceMcpOverrides,
+  mcpServerManager: MCPServerManagerTag,
+  agentPluginInstallService: AgentPluginInstall,
+  sessionTimingService: SessionTiming,
+  timelineService: Timeline,
+  telemetryService: Telemetry,
+  experimentsService: Experiments,
+  memoryService: Memory,
+  memoryMetaService: MemoryMeta,
+  memoryConsolidationService: MemoryConsolidation,
+  refineService: Refine,
+  sessionUsageService: SessionUsage,
+  instructionsService: Instructions,
+  workspaceGoalService: WorkspaceGoal,
+  devToolsService: DevTools,
+  browserSessionDiscoveryService: AgentBrowserSessionDiscovery,
+  browserBridgeTokenManager: BrowserBridgeTokenManagerTag,
+  browserBridgeServer: BrowserBridgeServerTag,
+  browserControlService: BrowserControl,
+  browserSessionStateHub: BrowserSessionStateHubTag,
+  policyService: Policy,
+  coderService: Coder,
+  serverAuthService: ServerAuth,
+  sshPromptService: SshPrompt,
+  analyticsService: Analytics,
+  desktopSessionManager: DesktopSessionManagerTag,
+  desktopTokenManager: DesktopTokenManagerTag,
+  desktopBridgeServer: DesktopBridgeServerTag,
+  workflowRuntimeFactory: QuickJSRuntimeFactoryTag,
+};
 
 describe("ServiceContainer", () => {
   let tempDir: string;
   let config: Config;
+  let stores: ConfigStores;
   let services: ServiceContainer | undefined;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-service-container-test-"));
-    config = new Config(tempDir);
+    stores = createConfigStores(tempDir);
+    config = stores.config;
   });
 
   afterEach(async () => {
@@ -51,7 +196,7 @@ describe("ServiceContainer", () => {
       return cfg;
     });
 
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const ingestWorkspaceSpy = spyOn(
       services.analyticsService,
       "ingestWorkspace"
@@ -67,7 +212,7 @@ describe("ServiceContainer", () => {
 
     expect(ingestWorkspaceSpy).toHaveBeenCalledWith(
       workspaceId,
-      config.getSessionDir(workspaceId),
+      path.join(config.sessionsDir, workspaceId),
       {
         projectPath: primaryProjectPath,
         projectName: path.basename(primaryProjectPath),
@@ -77,8 +222,131 @@ describe("ServiceContainer", () => {
     );
   });
 
+  it("initializeCore completes task recovery and leaves housekeeping to runStartupHousekeeping", async () => {
+    services = new ServiceContainer(stores);
+    const callOrder: string[] = [];
+    let releaseTaskRecovery: (() => void) | undefined;
+    let taskRecoveryCalled: (() => void) | undefined;
+    const taskRecoveryCalledPromise = new Promise<void>((resolve) => {
+      taskRecoveryCalled = resolve;
+    });
+    const recoverTasksSpy = spyOn(
+      services.taskService,
+      "recoverInterruptedTasks"
+    ).mockImplementation(() => {
+      callOrder.push("recoverTasks");
+      taskRecoveryCalled?.();
+      return new Promise<void>((resolve) => {
+        releaseTaskRecovery = resolve;
+      });
+    });
+    const workspaceInitializeSpy = spyOn(
+      services.workspaceService,
+      "initialize"
+    ).mockImplementation(() => {
+      callOrder.push("workspace");
+      return Promise.resolve();
+    });
+    const taskHousekeepingSpy = spyOn(
+      services.taskService,
+      "runStartupHousekeeping"
+    ).mockImplementation(() => {
+      callOrder.push("taskHousekeeping");
+      return Promise.resolve();
+    });
+
+    let coreSettled = false;
+    const core = services.initializeCore().then(() => {
+      coreSettled = true;
+    });
+    await taskRecoveryCalledPromise;
+    // The listener must wait for task recovery (clients may otherwise race its transitions)...
+    expect(recoverTasksSpy).toHaveBeenCalledTimes(1);
+    expect(coreSettled).toBe(false);
+    releaseTaskRecovery?.();
+    await core;
+    // ...but not for the O(workspaces) housekeeping, which runs only when the caller asks for it.
+    expect(workspaceInitializeSpy).not.toHaveBeenCalled();
+    expect(taskHousekeepingSpy).not.toHaveBeenCalled();
+
+    await services.runStartupHousekeeping();
+    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    expect(workspaceInitializeSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("dispose cancels in-flight startup housekeeping before the periodic services start", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    let releaseTaskHousekeeping: (() => void) | undefined;
+    let housekeepingSignal: AbortSignal | undefined;
+    let taskHousekeepingCalled: (() => void) | undefined;
+    const taskHousekeepingCalledPromise = new Promise<void>((resolve) => {
+      taskHousekeepingCalled = resolve;
+    });
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation((options) => {
+      housekeepingSignal = options?.signal;
+      taskHousekeepingCalled?.();
+      return new Promise<void>((release) => {
+        releaseTaskHousekeeping = release;
+      });
+    });
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const beginShutdown = spyOn(
+      (services as unknown as { backgroundProcessManager: { beginShutdown: () => void } })
+        .backgroundProcessManager,
+      "beginShutdown"
+    );
+    const disposeRecoverySessions = spyOn(services.workspaceService, "beginShutdown");
+
+    await services.initializeCore();
+    const housekeeping = services.runStartupHousekeeping();
+    await taskHousekeepingCalledPromise;
+    // Task housekeeping is mid-flight when the process shuts down.
+    const disposed = services.dispose();
+    expect(housekeepingSignal?.aborted).toBe(true);
+    // Both latches are set synchronously, ahead of the join: no session disposed during shutdown
+    // can erase registry records, and no recovery chain still running under the join can start a
+    // stream. Only then does teardown wait for the in-flight housekeeping step to settle.
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
+    releaseTaskHousekeeping?.();
+    await housekeeping;
+    await disposed;
+
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).not.toHaveBeenCalled();
+    expect(idleCompactionStart).not.toHaveBeenCalled();
+  });
+
+  it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation(() =>
+      Promise.reject(new Error("terminal-attention store unreadable"))
+    );
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const agentStatusStart = spyOn(services.agentStatusService, "start");
+
+    await services.initializeCore();
+    await services.runStartupHousekeeping();
+
+    expect(idleCompactionStart).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+    expect(agentStatusStart).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes desktopSessionManager in the ORPC context", () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
 
     const context = services.toORPCContext();
 
@@ -86,7 +354,7 @@ describe("ServiceContainer", () => {
   });
 
   it("closes desktop sessions during shutdown", async () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const closeAllSpy = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -97,7 +365,7 @@ describe("ServiceContainer", () => {
   });
 
   it("closes desktop sessions during dispose", async () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const closeAllSpy = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -105,5 +373,417 @@ describe("ServiceContainer", () => {
     await services.dispose();
 
     expect(closeAllSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("serves the layer-built MemoryMetaService through both the field and the Effect context", () => {
+    services = new ServiceContainer(stores);
+
+    const effectContext = services.toORPCContext()["effect/context"];
+
+    // One instance: constructor-wired consumers (memoryService, refineService)
+    // and Effect-native oRPC handlers (`yield* MemoryMeta`) must share state.
+    expect(Context.get(effectContext, MemoryMeta)).toBe(services.memoryMetaService);
+    expect(services.runtime.get(MemoryMeta)).toBe(services.memoryMetaService);
+  });
+
+  it("closes the Effect runtime as the last dispose step", async () => {
+    services = new ServiceContainer(stores);
+    const container = services;
+    let runtimeAliveAtLastExplicitStep: boolean | undefined;
+    // timelineService.flush() is the final explicit teardown step; the runtime
+    // must still be alive when it runs and gone once dispose() resolves.
+    const flushSpy = spyOn(services.timelineService, "flush").mockImplementation(() => {
+      runtimeAliveAtLastExplicitStep = container.runtime.managed.cachedContext !== undefined;
+      return Promise.resolve(undefined);
+    });
+
+    await services.dispose();
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    expect(runtimeAliveAtLastExplicitStep).toBe(true);
+    // ManagedRuntime clears its cached context when its scope closes.
+    expect(services.runtime.managed.cachedContext).toBeUndefined();
+    // The afterEach dispose()+shutdown() pair then exercises the latched path.
+  });
+
+  it("exposes the runtime seams through the field and the Effect context", () => {
+    services = new ServiceContainer(stores);
+
+    const effectContext = services.toORPCContext()["effect/context"];
+
+    expect(Context.get(effectContext, AppFiberScopeTag)).toBe(services.appFiberScope);
+    expect(services.appFiberScope.state._tag).not.toBe("Closed");
+    expect(Context.get(effectContext, EffectRunnerTag)).toBe(services.runtime.get(EffectRunnerTag));
+  });
+
+  it("closes the AppFiberScope (interrupt + await) before the explicit teardown steps", async () => {
+    services = new ServiceContainer(stores);
+    const steps: string[] = [];
+    // An I/O-suspended occupant: never resolves on its own, records its cancel
+    // path and finalizer. Supervised fibers must be gone before any explicit
+    // teardown step so they can still use their dependencies while finalizing.
+    services.runtime.managed.runSync(
+      Effect.forkIn(
+        Effect.callback<void>(() =>
+          Effect.sync(() => {
+            steps.push("occupant-cancelled");
+          })
+        ).pipe(Effect.ensuring(Effect.sync(() => steps.push("occupant-finalized")))),
+        services.appFiberScope
+      )
+    );
+    // desktopBridgeServer.stop() is the first explicit teardown step after the
+    // shutdown latch.
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    await services.dispose();
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["occupant-cancelled", "occupant-finalized", "bridge-stop"]);
+    expect(services.appFiberScope.state._tag).toBe("Closed");
+  });
+
+  it("dispose() aborts and awaits an in-flight stream before desktopBridgeServer.stop()", async () => {
+    // The AppFiberScope occupant end to end: a real stream on the container's
+    // StreamManager (wired with the runtime's scope), its provider stubbed to
+    // flow one delta and then block until the stream's AbortSignal fires.
+    // dispose() must abort it as "system", let AIService commit the partial
+    // into chat.jsonl and delete partial.json, and only then stop the bridge.
+    services = new ServiceContainer(stores);
+    const workspaceId = "dispose-in-flight-stream-workspace";
+    const messageId = "dispose-in-flight-stream-message";
+    const steps: string[] = [];
+    Reflect.set(services.streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(
+      services.streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) => ({
+        fullStream: (async function* () {
+          yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
+          await new Promise<void>((resolve) => {
+            if (abortController.signal.aborted) return resolve();
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        })(),
+        totalUsage: Promise.resolve(undefined),
+        usage: Promise.resolve(undefined),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      })
+    );
+    Reflect.set(services.streamManager, "createTempDirForStream", () =>
+      Promise.resolve(path.join(tempDir, "stream-tempdir"))
+    );
+    Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
+    services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
+      steps.push(`stream-abort:${event.abortReason ?? "none"}`);
+    });
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    const historyService = services.runtime.get(History);
+    const appendResult = await historyService.appendToHistory(workspaceId, {
+      id: messageId,
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
+      parts: [],
+    });
+    expect(appendResult.success).toBe(true);
+    const started = await services.streamManager.startStream({
+      workspaceId,
+      messageId,
+      model: {
+        specificationVersion: "v3",
+        provider: "test",
+        modelId: "dispose-model",
+        supportedUrls: {},
+        doGenerate: () => Promise.reject(new Error("unused")),
+        doStream: () => Promise.reject(new Error("unused")),
+      },
+      messages: [{ role: "user", content: "hello" }],
+      modelString: "openai:gpt-4.1-mini",
+      historySequence: 1,
+      system: "system",
+      runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
+      providedRuntimeTempDir: "",
+    });
+    expect(started.success).toBe(true);
+    if (!started.success) throw new Error("expected the stream to start");
+    // Wait for the delta to reach partial.json so there is something to commit.
+    const deadline = Date.now() + 5_000;
+    while ((await historyService.readPartial(workspaceId)) === null) {
+      if (Date.now() > deadline) throw new Error("partial never written");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
+
+    await services.dispose();
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["stream-abort:system", "bridge-stop"]);
+    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
+    // Durable outcome at the moment the bridge stopped: partial.json gone, the
+    // interrupted assistant message (still flagged partial, as every
+    // interrupted turn is) committed to chat.jsonl with its streamed text —
+    // instead of an empty placeholder row plus an orphan partial.json that only
+    // the next load would reconcile.
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((message) => message.id === messageId);
+    expect(
+      committed?.parts.some(
+        (part) => part.type === "text" && part.text === "hello from a stream shutdown must not lose"
+      )
+    ).toBe(true);
+  });
+
+  it("shares one teardown across concurrent dispose() calls", async () => {
+    services = new ServiceContainer(stores);
+    const steps: string[] = [];
+    // An occupant whose finalization is asynchronous: the first dispose() is
+    // still awaiting it when the second dispose() arrives. Without a shared
+    // teardown the second call would find the scope already marked closed and
+    // proceed to the explicit steps while this finalizer is still running.
+    services.runtime.managed.runSync(
+      Effect.forkIn(
+        Effect.callback<void>(() => Effect.void).pipe(
+          Effect.ensuring(
+            Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 30))).pipe(
+              Effect.andThen(Effect.sync(() => steps.push("occupant-finalized")))
+            )
+          )
+        ),
+        services.appFiberScope
+      )
+    );
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    await Promise.all([services.dispose(), services.dispose()]);
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["occupant-finalized", "bridge-stop"]);
+  });
+
+  it("runs the clock-driven workers on the runtime's clock", async () => {
+    // Inject a TestClock beneath the real graph: EffectRunnerLive captures it,
+    // so the workers' lifecycle fibers sleep on virtual time if (and only if)
+    // the container hands them the runtime's runner.
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    // IdleCompactionService.checkAllWorkspaces reads the config synchronously
+    // at the start of every check.
+    const loadConfigSpy = spyOn(services.config, "loadConfigOrDefault");
+    // HeartbeatService's observable lifecycle contract: the scheduler fiber is
+    // held in `startupTimeout` during the startup delay and moves to
+    // `checkInterval` once ticking (same shape heartbeatService.test.ts pins).
+    const heartbeatInternals = services.heartbeatService as unknown as {
+      startupTimeout: unknown;
+      checkInterval: unknown;
+    };
+
+    services.idleCompactionService.start();
+    services.heartbeatService.start();
+    expect(loadConfigSpy).not.toHaveBeenCalled();
+    expect(heartbeatInternals.startupTimeout).not.toBeNull();
+    expect(heartbeatInternals.checkInterval).toBeNull();
+
+    // Both workers wait one minute before their first tick.
+    await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
+
+    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+    expect(heartbeatInternals.startupTimeout).toBeNull();
+    expect(heartbeatInternals.checkInterval).not.toBeNull();
+
+    services.heartbeatService.stop();
+    services.idleCompactionService.stop();
+  });
+
+  it("serves every ORPC context field through its tag (one instance each)", () => {
+    services = new ServiceContainer(stores);
+    const orpcContext = services.toORPCContext();
+    const effectContext = orpcContext["effect/context"];
+
+    for (const [field, tag] of Object.entries(ORPC_FIELD_TAGS) as Array<
+      [keyof typeof ORPC_FIELD_TAGS, Context.Key<AppTags, unknown>]
+    >) {
+      expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
+    }
+    expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
+    expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
+      services.runtime.get(EffectRunnerTag)
+    );
+    // The core graph's options are derived from the layer-built cross-cutting
+    // instances, so core constructors received the same objects the fields expose.
+    const coreOptions = services.runtime.get(CoreOptionsTag);
+    expect(coreOptions.policyService).toBe(services.policyService);
+    expect(coreOptions.experimentsService).toBe(services.experimentsService);
+  });
+
+  it("wires the desktop services like the constructor did (each line has an observable effect)", () => {
+    services = new ServiceContainer(stores);
+
+    // turnRequestBuilderBindings: the desktop-only collaborators.
+    const bindings = services.runtime.get(TurnRequestBuilderBindingsTag);
+    expect(bindings.analyticsService).toBe(services.analyticsService);
+    expect(bindings.desktopSessionManager).toBe(services.desktopSessionManager);
+    expect(bindings.timelineService).toBe(services.timelineService);
+    expect(bindings.codexOauthService).toBe(services.codexOauthService);
+    expect(bindings.coderOauthService).toBe(services.coderOauthService);
+
+    // Setter-provided collaborators (the former `set*` lines).
+    const workspaceInternals = services.workspaceService as unknown as {
+      terminalService?: unknown;
+      desktopSessionManager?: unknown;
+      refinePassCanceller?: unknown;
+      timelineRecorder?: unknown;
+      worktreeArchiveSnapshotService?: unknown;
+      workspaceLifecycleHooks?: unknown;
+    };
+    expect(workspaceInternals.terminalService).toBe(services.terminalService);
+    expect(workspaceInternals.desktopSessionManager).toBe(services.desktopSessionManager);
+    expect(workspaceInternals.refinePassCanceller).toBe(services.refineService);
+    expect(workspaceInternals.timelineRecorder).toBe(services.timelineService);
+    expect(workspaceInternals.worktreeArchiveSnapshotService).toBe(
+      services.runtime.get(WorktreeArchiveSnapshot)
+    );
+    expect(workspaceInternals.workspaceLifecycleHooks).toBe(
+      services.runtime.get(WorkspaceLifecycleHooksTag)
+    );
+    for (const recorderOwner of [
+      services.taskService,
+      services.heartbeatService,
+      services.workspaceGoalService,
+    ]) {
+      expect((recorderOwner as unknown as { timelineRecorder?: unknown }).timelineRecorder).toBe(
+        services.timelineService
+      );
+    }
+    const projectInternals = services.projectService as unknown as {
+      workspaceService?: unknown;
+      workspaceMetadataRefresher?: unknown;
+      mcpServerManager?: unknown;
+    };
+    expect(projectInternals.workspaceService).toBe(services.workspaceService);
+    expect(projectInternals.workspaceMetadataRefresher).toBe(services.workspaceService);
+    expect(projectInternals.mcpServerManager).toBe(services.mcpServerManager);
+    expect(
+      (services.mcpServerManager as unknown as { mcpOauthService?: unknown }).mcpOauthService
+    ).toBe(services.mcpOauthService);
+    const backupInternals = services.backupService as unknown as {
+      projectRegistrar?: unknown;
+      memoryNotifier?: unknown;
+    };
+    expect(backupInternals.projectRegistrar).toBe(services.projectService);
+    expect(backupInternals.memoryNotifier).toBe(services.memoryService);
+
+    // Idle-compaction outcomes reach the idle compaction service.
+    const recordOutcomeSpy = spyOn(services.idleCompactionService, "recordOutcome");
+    const outcomeListener = (
+      services.workspaceService as unknown as {
+        idleCompactionOutcomeListener?: (workspaceId: string, outcome: unknown) => void;
+      }
+    ).idleCompactionOutcomeListener;
+    outcomeListener?.("ws-1", { success: true });
+    expect(recordOutcomeSpy).toHaveBeenCalledWith("ws-1", { success: true });
+
+    // Global registrations: the SSH connection pools consult this container's
+    // prompt service for interactive host-key approval.
+    const responderSpy = spyOn(services.sshPromptService, "hasInteractiveResponder");
+    responderSpy.mockReturnValue(true);
+    expect(isInteractiveHostKeyApprovalAvailable()).toBe(true);
+    responderSpy.mockReturnValue(false);
+    expect(isInteractiveHostKeyApprovalAvailable()).toBe(false);
+
+    // Timeline subscribed to the workspace service, and the workers' timing
+    // listeners registered: a stream-start reaches the session timing service.
+    const timingSpy = spyOn(services.sessionTimingService, "handleStreamStart").mockImplementation(
+      () => undefined
+    );
+    services.aiService.emit("stream-start", {
+      type: "stream-start",
+      workspaceId: "ws-1",
+      messageId: "m-1",
+      model: "openai:gpt-4o",
+      historySequence: 1,
+      startTime: Date.now(),
+      mode: "exec",
+    });
+    expect(timingSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("tears down in the fixed dispose() and shutdown() order", async () => {
+    const order: string[] = [];
+    const record = (step: string) => () => {
+      order.push(step);
+      return Promise.resolve(undefined);
+    };
+    services = new ServiceContainer(stores);
+    spyOn(services.desktopBridgeServer, "stop").mockImplementation(record("bridge.stop"));
+    spyOn(services.desktopSessionManager, "closeAll").mockImplementation(
+      record("sessions.closeAll")
+    );
+    spyOn(services.browserBridgeServer, "stop").mockImplementation(record("browserBridge.stop"));
+    spyOn(services.analyticsService, "dispose").mockImplementation(record("analytics.dispose"));
+    spyOn(services.timelineService, "flush").mockImplementation(record("timeline.flush"));
+    spyOn(services.telemetryService, "shutdown").mockImplementation(record("telemetry.shutdown"));
+
+    await services.dispose();
+    // §5: bridge before sessions; browser bridge before analytics; timeline flush last.
+    expect(order).toEqual([
+      "bridge.stop",
+      "sessions.closeAll",
+      "browserBridge.stop",
+      "analytics.dispose",
+      "timeline.flush",
+    ]);
+
+    order.length = 0;
+    await services.shutdown();
+    expect(order).toEqual([
+      "bridge.stop",
+      "sessions.closeAll",
+      "browserBridge.stop",
+      "timeline.flush",
+      "analytics.dispose",
+      "telemetry.shutdown",
+    ]);
+  });
+
+  it("surfaces a throwing layer as a synchronous constructor throw", () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      Layer.sync(MemoryMeta, () => {
+        throw new Error("layer boom");
+      }).pipe(Layer.provideMerge(realAppLive(appStores)))
+    );
+    try {
+      // Same shape as a throwing service constructor, so the entry points'
+      // existing startup catch paths (dialog / log-and-exit) apply unchanged.
+      expect(() => new ServiceContainer(stores)).toThrow("layer boom");
+    } finally {
+      appLiveSpy.mockRestore();
+    }
   });
 });

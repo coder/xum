@@ -1,3 +1,4 @@
+import { ProvidersConfigStore } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type Tool } from "ai";
 import { xai } from "@ai-sdk/xai";
@@ -27,6 +28,7 @@ import {
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
+  type OauthServiceBindings,
 } from "./providerModelFactory";
 import { hasLanguageModelCleanup } from "./languageModelCleanup";
 import type { DevToolsService } from "./devToolsService";
@@ -40,22 +42,22 @@ const LOCAL_VLLM_MODEL = "qwen3-coder";
 const COPILOT_TOKEN = "copilot-token";
 
 function saveLocalVllmConfig(config: Config, overrides: Record<string, unknown> = {}): void {
-  config.saveProvidersConfig({
+  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
     "local-vllm": {
       providerType: "openai-compatible",
       baseUrl: LOCAL_VLLM_BASE_URL,
       ...overrides,
     },
-  } as Parameters<Config["saveProvidersConfig"]>[0]);
+  } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
 }
 
 function saveCopilotConfig(config: Config, models: unknown): void {
-  config.saveProvidersConfig({
+  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
     "github-copilot": {
       apiKey: COPILOT_TOKEN,
       models,
     },
-  } as Parameters<Config["saveProvidersConfig"]>[0]);
+  } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
 }
 
 async function saveRoutePriority(
@@ -95,15 +97,29 @@ function expectSuccessfulRouteResult(
 }
 
 async function withTempConfig(
-  run: (config: Config, factory: ProviderModelFactory) => Promise<void> | void
+  run: (
+    config: Config,
+    factory: ProviderModelFactory,
+    oauth: OauthServiceBindings,
+    providersConfigStore: ProvidersConfigStore
+  ) => Promise<void> | void
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
 
   try {
     const config = new Config(tmpDir);
-    const providerService = new ProviderService(config);
-    const factory = new ProviderModelFactory(config, providerService);
-    await run(config, factory);
+    const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+    const providerService = new ProviderService(config, undefined, providersConfigStore);
+    const oauth: OauthServiceBindings = {};
+    const factory = new ProviderModelFactory(
+      config,
+      providerService,
+      undefined,
+      oauth,
+      undefined,
+      providersConfigStore
+    );
+    await run(config, factory, oauth, providersConfigStore);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -135,7 +151,8 @@ async function withTempPolicyProviderFactory(
   run: (
     config: Config,
     factory: ProviderModelFactory,
-    policyService: PolicyService
+    policyService: PolicyService,
+    oauth: OauthServiceBindings
   ) => Promise<void> | void
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
@@ -151,8 +168,9 @@ async function withTempPolicyProviderFactory(
     policyService = new PolicyService(config);
     await policyService.initialize();
     const providerService = new ProviderService(config, policyService);
-    const factory = new ProviderModelFactory(config, providerService, policyService);
-    await run(config, factory, policyService);
+    const oauth: OauthServiceBindings = {};
+    const factory = new ProviderModelFactory(config, providerService, policyService, oauth);
+    await run(config, factory, policyService, oauth);
   } finally {
     policyService?.dispose();
     if (prevPolicyFileEnv === undefined) {
@@ -301,7 +319,7 @@ describe("normalizeCodexResponsesBody", () => {
 describe("ProviderModelFactory.createModel", () => {
   it("returns provider_disabled when a non-gateway provider is disabled", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -322,7 +340,7 @@ describe("ProviderModelFactory.createModel", () => {
 
   it("does not return provider_disabled when provider is enabled and credentials exist", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -338,7 +356,7 @@ describe("ProviderModelFactory.createModel", () => {
 
   it("routes allowlisted models through gateway automatically", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -432,7 +450,7 @@ describe("ProviderModelFactory.createModel", () => {
     await withTempConfig(async (config, factory) => {
       // The request goes directly to the custom endpoint, so gateway
       // attribution and quota handling must not engage.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:8000/v1",
@@ -454,10 +472,10 @@ describe("ProviderModelFactory.createModel", () => {
       // ZDR: providers.openai.store applies to every Responses-wire route,
       // including custom Responses adapters.
       saveLocalVllmConfig(config, { providerType: "openai-responses" });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         openai: { store: false },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
@@ -473,10 +491,10 @@ describe("ProviderModelFactory.createModel", () => {
       // never merges and cache_control is injected despite the user
       // disabling beta features.
       saveLocalVllmConfig(config, { providerType: "anthropic-messages" });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         anthropic: { disableBetaFeatures: true },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
@@ -492,7 +510,7 @@ describe("ProviderModelFactory.createModel", () => {
         provider_access: [{ id: "local-vllm" }],
       },
       async (config, factory) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           "local-vllm": {
             providerType: "openai-compatible",
             baseUrl: "http://localhost:8000/v1",
@@ -517,7 +535,7 @@ describe("ProviderModelFactory.createModel", () => {
         provider_access: [{ id: "openai" }],
       },
       async (config, factory) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           "local-vllm": {
             providerType: "openai-compatible",
             baseUrl: "http://localhost:8000/v1",
@@ -553,7 +571,7 @@ describe("ProviderModelFactory.createModel", () => {
 
   it("returns a clear missing_base_url error for custom OpenAI-compatible providers without a base URL", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": {
           providerType: "openai-compatible",
           models: ["qwen3-coder"],
@@ -594,7 +612,7 @@ describe("ProviderModelFactory.createModel", () => {
 
   it("returns provider_not_supported for unknown provider entries without a custom provider type", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": { baseUrl: LOCAL_VLLM_BASE_URL, models: [LOCAL_VLLM_MODEL] },
       });
 
@@ -614,7 +632,9 @@ describe("ProviderModelFactory.createModel", () => {
 describe("ProviderModelFactory xAI API selection", () => {
   it("uses Responses for frontier Grok so exact billed cost metadata is available", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({ xai: { apiKey: "xai-test-key" } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        xai: { apiKey: "xai-test-key" },
+      });
 
       for (const model of ["xai:grok-4.6", "xai:grok-4.5"]) {
         const result = await factory.createModel(model);
@@ -629,7 +649,9 @@ describe("ProviderModelFactory xAI API selection", () => {
   it("surfaces exact xAI billed cost metadata through the installed Responses SDK", async () => {
     await withTempConfig(async (config, factory) => {
       const originalXaiRegistry = PROVIDER_REGISTRY.xai;
-      config.saveProvidersConfig({ xai: { apiKey: "xai-test-key" } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        xai: { apiKey: "xai-test-key" },
+      });
 
       PROVIDER_REGISTRY.xai = async () => {
         const module = await originalXaiRegistry();
@@ -696,7 +718,9 @@ describe("ProviderModelFactory xAI API selection", () => {
 
   it("uses Responses for Grok 4.5 aliases", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({ xai: { apiKey: "xai-test-key" } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        xai: { apiKey: "xai-test-key" },
+      });
 
       const result = await factory.createModel("xai:grok-4.5-latest");
 
@@ -708,7 +732,7 @@ describe("ProviderModelFactory xAI API selection", () => {
 
   it("uses Responses for mapped aliases that target Grok 4.5", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         xai: {
           apiKey: "xai-test-key",
           models: [{ id: "team-grok", mappedToModel: "xai:grok-4.5" }],
@@ -725,7 +749,9 @@ describe("ProviderModelFactory xAI API selection", () => {
 
   it("keeps legacy custom Grok model strings on Chat Completions", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({ xai: { apiKey: "xai-test-key" } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        xai: { apiKey: "xai-test-key" },
+      });
 
       const result = await factory.createModel("xai:grok-4-1-fast");
 
@@ -738,7 +764,9 @@ describe("ProviderModelFactory xAI API selection", () => {
   it("defaults Grok 4.5 Responses requests to store=false for ZDR parity", async () => {
     await withTempConfig(async (config, factory) => {
       const originalXaiRegistry = PROVIDER_REGISTRY.xai;
-      config.saveProvidersConfig({ xai: { apiKey: "xai-test-key" } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        xai: { apiKey: "xai-test-key" },
+      });
 
       let capturedBody: Record<string, unknown> | undefined;
 
@@ -1036,7 +1064,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 
   it("normalizes Request bodies for the Codex OAuth responses endpoint", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (_config, factory, oauth, providersConfigStore) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       const requests: Array<{
         input: Parameters<typeof fetch>[0];
@@ -1085,7 +1113,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         );
       };
 
-      config.loadProvidersConfig = () => ({
+      spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
         openai: {
           codexOauth: auth,
           fetch: baseFetch,
@@ -1094,7 +1122,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
 
       const codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
       codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
-      factory.codexOauthService = codexOauthService;
+      oauth.codexOauthService = codexOauthService;
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -1180,7 +1208,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
 
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "github-copilot": {
           models: ["gpt-4.1"],
         },
@@ -1265,7 +1293,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   it("attaches cleanup when enabled for Responses models", async () => {
     await withOpenAIBaseUrlEnvUnset(async () =>
       withTempConfig(async (config, factory) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           openai: {
             apiKey: "sk-test",
             webSocketTransportEnabled: true,
@@ -1285,7 +1313,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("does not attach cleanup for Codex OAuth routed models", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           webSocketTransportEnabled: true,
           codexOauth: {
@@ -1311,7 +1339,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("attaches cleanup when a custom OpenAI base URL is configured", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           baseURL: "https://proxy.openai.test/v1",
@@ -1332,7 +1360,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   it("preserves cleanup when DevTools wraps an OpenAI WebSocket model", async () => {
     await withOpenAIBaseUrlEnvUnset(async () =>
       withTempConfig(async (config) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           openai: {
             apiKey: "sk-test",
             webSocketTransportEnabled: true,
@@ -1363,7 +1391,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("does not attach cleanup when Chat Completions is selected", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           wireFormat: "chatCompletions",
@@ -1383,12 +1411,16 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("ignores invalid persisted WebSocket transport values", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
-          webSocketTransportEnabled: "true",
-        },
-      } as unknown as Parameters<Config["saveProvidersConfig"]>[0]);
+      // eslint-disable-next-line local/no-sync-fs-methods -- Test setup writes intentionally invalid config bytes.
+      fs.writeFileSync(
+        path.join(config.rootDir, "providers.jsonc"),
+        JSON.stringify({
+          openai: {
+            apiKey: "sk-test",
+            webSocketTransportEnabled: "true",
+          },
+        })
+      );
 
       const result = await factory.createModel("openai:gpt-4.1-mini");
 
@@ -1404,7 +1436,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 describe("ProviderModelFactory modelCostsIncluded", () => {
   it("marks gpt-5.3-codex as subscription-covered when routed through Codex OAuth", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           codexOauth: {
             type: "oauth",
@@ -1428,7 +1460,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
 
   it("routes a custom OpenAI model through Codex OAuth when it inherits from a compatible model", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           codexOauth: {
             type: "oauth",
@@ -1453,7 +1485,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
 
   it("does not mark gpt-5.3-codex as subscription-covered when routed through API key", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -1472,7 +1504,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
 describe("ProviderModelFactory routing", () => {
   it("honors non-mux gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -1501,7 +1533,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("passes gateway model accessibility to routing by skipping inaccessible Copilot models", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -1524,7 +1556,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("does not treat custom gateway model entries as an exhaustive routed catalog", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openrouter: {
           apiKey: "or-test",
           models: ["team-only-model"],
@@ -1547,7 +1579,7 @@ describe("ProviderModelFactory routing", () => {
       const originalOpenRouterRegistry = PROVIDER_REGISTRY.openrouter;
       let capturedExtraBody: unknown;
 
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openrouter: {
           apiKey: "or-test",
           models: [
@@ -1583,7 +1615,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("routes Anthropic models through Bedrock when Bedrock is configured and prioritized", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: { apiKey: "ant-test", enabled: false },
         bedrock: { region: "us-east-1" },
       });
@@ -1600,7 +1632,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("skips disabled gateway providers even when credentials exist", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -1625,7 +1657,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("keeps shadowed custom OpenAI-compatible providers on the direct route", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:8000/v1",
@@ -1650,7 +1682,7 @@ describe("ProviderModelFactory routing", () => {
       // the new gateway definition into openai:foo — that would silently
       // bypass the user's custom endpoint. The shadow check must inspect the
       // RAW prefix before gateway canonicalization.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:9000/v1",
@@ -1684,7 +1716,7 @@ describe("ProviderModelFactory routing", () => {
       // restoration can never recover the custom model either:
       // coder:google/gemini-2.5-pro would be rewritten to
       // google:gemini-2.5-pro and bypass the user's custom endpoint.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:9000/v1",
@@ -1709,7 +1741,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("falls back deterministically to the next configured route", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -1731,7 +1763,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("preserves explicit OpenRouter model strings when OpenRouter is configured", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -1764,7 +1796,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("falls back from explicit OpenRouter model strings when OpenRouter is unavailable", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -1800,7 +1832,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("honors explicit mux-gateway prefixes for compatibility", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "test-coupon",
         },
@@ -1834,7 +1866,7 @@ describe("ProviderModelFactory routing", () => {
     delete process.env.OPENAI_API_KEY;
     try {
       await withTempConfig(async (config, factory) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           openai: {
             // No apiKey — only Codex OAuth credentials.
             codexOauth: {
@@ -1869,7 +1901,7 @@ describe("ProviderModelFactory routing", () => {
 
   it("leaves direct-provider model strings unchanged when direct routing wins", async () => {
     await withTempConfig(async (config, factory) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -2276,7 +2308,7 @@ describe("ProviderModelFactory Coder", () => {
   const CODER_DEPLOYMENT_URL = "https://coder.example.com";
 
   function saveCoderConfig(config: Config, overrides: Record<string, unknown> = {}): void {
-    config.saveProvidersConfig({
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
       coder: {
         deploymentUrl: CODER_DEPLOYMENT_URL,
         coderOauth: {
@@ -2291,7 +2323,7 @@ describe("ProviderModelFactory Coder", () => {
         },
         ...overrides,
       },
-    } as Parameters<Config["saveProvidersConfig"]>[0]);
+    } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
   }
 
   function stubCoderOauthService(
@@ -2316,12 +2348,12 @@ describe("ProviderModelFactory Coder", () => {
   }
 
   it("creates Anthropic-origin models against the deployment's AI Bridge", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       let capturedBaseURL: string | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -2351,12 +2383,12 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("creates OpenAI-origin models via the bridge's Responses endpoint", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       let capturedBaseURL: string | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -2386,7 +2418,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("routes custom-named provider instances using the discovered type", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       let capturedBaseURL: string | undefined;
 
@@ -2395,7 +2427,7 @@ describe("ProviderModelFactory Coder", () => {
       saveCoderConfig(config, {
         discoveredProviders: [{ name: "prod-openai", type: "openai" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -2425,14 +2457,14 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("speaks chat completions to OpenAI-compatible provider types and honors additionalProviders", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // additionalProviders is the user-managed escape hatch for deployments
       // where the member cannot list providers; openai-compat upstreams only
       // guarantee /chat/completions, not the Responses API.
       saveCoderConfig(config, {
         additionalProviders: [{ name: "llm-proxy", type: "openai-compat" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:llm-proxy/llama-3.3-70b");
       expect(result.success).toBe(true);
@@ -2445,10 +2477,10 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("speaks the Anthropic wire protocol to bedrock-type provider instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The gateway serves Bedrock through its Anthropic client (/v1/messages).
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:bedrock/claude-sonnet-4-5");
       expect(result.success).toBe(true);
@@ -2460,7 +2492,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("keeps instances named after other direct providers routed through Coder", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // A default-named google instance: canonicalization must NOT rewrite
       // coder:google/x to google:x (which would route to the direct Google
       // provider, bypassing the gateway the user selected — or fail without
@@ -2471,12 +2503,12 @@ describe("ProviderModelFactory Coder", () => {
         models: ["google/gemini-3-pro"],
         discoveredModels: ["google/gemini-3-pro"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         // Direct Google credentials exist: they must NOT capture the request.
         google: { apiKey: "g-key" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:google/gemini-3-pro", "off");
       expect(result.success).toBe(true);
@@ -2494,7 +2526,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("reports the wire provider from instance metadata, not the instance name", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "openai", type: "anthropic"}: the request speaks Anthropic on
       // the wire, so message preparation (reasoning transforms, PDF-filename
       // sanitization) must key on anthropic even though the name says openai.
@@ -2503,7 +2535,7 @@ describe("ProviderModelFactory Coder", () => {
         models: ["openai/claude-opus-4-5"],
         discoveredModels: ["openai/claude-opus-4-5"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:openai/claude-opus-4-5", "off");
       expect(result.success).toBe(true);
@@ -2521,7 +2553,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("merges backend disableBetaFeatures for custom-named Anthropic-wire instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The wire (instance type), not the route name, classifies the request
       // as Anthropic: without wire-based classification the authoritative
       // providers.anthropic.disableBetaFeatures never merges and cache_control
@@ -2531,11 +2563,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["prod-anthropic/claude-opus-4-5"],
         discoveredModels: ["prod-anthropic/claude-opus-4-5"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         anthropic: { disableBetaFeatures: true },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:prod-anthropic/claude-opus-4-5", muxOptions);
@@ -2545,7 +2577,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not merge Anthropic beta config for cross-typed anthropic-named instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "anthropic", type: "openai-compat"}: the model ID starts with
       // "anthropic/" but the wire is NOT Anthropic — name-based classification
       // would wrongly merge Anthropic-only config into the request options.
@@ -2554,11 +2586,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["anthropic/gpt-5"],
         discoveredModels: ["anthropic/gpt-5"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         anthropic: { disableBetaFeatures: true },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:anthropic/gpt-5", muxOptions);
@@ -2568,7 +2600,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("merges the OpenAI ZDR store setting for custom-named openai-typed instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Type "openai" = the real OpenAI Responses upstream, where the ZDR
       // store flag applies. Name-based classification (modelId startsWith
       // "openai/") misses custom names entirely.
@@ -2577,11 +2609,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["prod-openai/gpt-5.2"],
         discoveredModels: ["prod-openai/gpt-5.2"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         openai: { store: false },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:prod-openai/gpt-5.2", muxOptions);
@@ -2591,7 +2623,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not merge the OpenAI store setting for cross-typed openai-named instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "openai", type: "openai-compat"}: the model ID starts with
       // "openai/" but the upstream is NOT the real OpenAI — the ZDR store
       // flag must not leak onto arbitrary compat upstreams.
@@ -2600,11 +2632,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["openai/gpt-5"],
         discoveredModels: ["openai/gpt-5"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         openai: { store: false },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:openai/gpt-5", muxOptions);
@@ -2614,7 +2646,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("falls back to the type-derived provider when the catalog excludes the model", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Cross-typed instance {name: "openai", type: "anthropic"} whose
       // catalog does NOT contain the requested model: the explicit coder
       // route cannot be restored, and the fallback identity comes from the
@@ -2625,14 +2657,14 @@ describe("ProviderModelFactory Coder", () => {
         models: ["openai/claude-opus-4-5"],
         discoveredModels: ["openai/claude-opus-4-5"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         // Both direct providers configured: the NAME-alike (openai) must
         // not capture the request; the TYPE-derived provider wins.
         openai: { apiKey: "sk-openai" },
         anthropic: { apiKey: "sk-anthropic" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:openai/claude-sonnet-4-5", "off");
       expect(result.success).toBe(true);
@@ -2649,7 +2681,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("creates the SDK model from the same config snapshot as the wire report", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Another Xum process rewrites providers.jsonc between route/wire
       // resolution and model creation (an authoritative refresh changing the
       // instance's type). The created SDK model must follow the SAME
@@ -2661,11 +2693,16 @@ describe("ProviderModelFactory Coder", () => {
         models: ["prod/claude-opus-4-5"],
         discoveredModels: ["prod/claude-opus-4-5"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
-      const realLoad = config.loadProvidersConfig.bind(config);
+      const realLoad = ProvidersConfigStore.prototype.loadProvidersConfig.bind(
+        new ProvidersConfigStore(config.rootDir)
+      );
       let loads = 0;
-      const loadSpy = spyOn(config, "loadProvidersConfig").mockImplementation(() => {
+      const loadSpy = spyOn(
+        ProvidersConfigStore.prototype,
+        "loadProvidersConfig"
+      ).mockImplementation(() => {
         loads++;
         // realLoad parses a fresh object per call, so mutating it here never
         // leaks into other reads.
@@ -2695,7 +2732,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("canonicalizes gateway-scoped type-derived fallback seeds for the wire identity", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // A bedrock-typed instance whose catalog excludes the requested model
       // seeds its fallback from the instance type: bedrock:anthropic.<model>.
       // The seed is itself gateway-scoped — the wire identity must be its
@@ -2707,11 +2744,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["bedrock/anthropic.claude-opus-4-5"],
         discoveredModels: ["bedrock/anthropic.claude-opus-4-5"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         bedrock: { region: "us-east-1" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel(
         "coder:bedrock/anthropic.claude-sonnet-4-5",
@@ -2728,7 +2765,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects catalog-excluded models on instances without a canonical fallback", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // openai-compat fronts an arbitrary upstream, so a catalog-excluded
       // model has NO distinct canonical identity to fall back to. Feeding the
       // rejected coder: string back into routing would resolve the last-resort
@@ -2738,7 +2775,7 @@ describe("ProviderModelFactory Coder", () => {
         models: ["llm-proxy/allowed-model"],
         discoveredModels: ["llm-proxy/allowed-model"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:llm-proxy/excluded-model", "off");
       expect(result.success).toBe(false);
@@ -2754,7 +2791,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects catalog-excluded models on canonical-named instances without a canonical fallback", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "anthropic", type: "openai-compat"}: metadata resolution is
       // null (arbitrary upstream), so the fallback must not adopt the
       // name-derived anthropic:<model> identity — the rejection applies
@@ -2766,11 +2803,11 @@ describe("ProviderModelFactory Coder", () => {
       });
       // Direct Anthropic credentials exist: a name-derived fallback would
       // silently send the rejected gateway selection to direct Anthropic.
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:anthropic/excluded-model", "off");
       expect(result.success).toBe(false);
@@ -2786,7 +2823,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects disconnected unmappable canonical-named instances instead of name-canonicalizing", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Coder disconnected (no coderOauth) + {name: "anthropic",
       // type: "openai-compat"} + direct Anthropic credentials: the seed has
       // no canonical fallback identity, so the request must fail on the
@@ -2798,11 +2835,11 @@ describe("ProviderModelFactory Coder", () => {
         models: ["anthropic/some-model"],
         discoveredModels: ["anthropic/some-model"],
       });
-      config.saveProvidersConfig({
-        ...config.loadProvidersConfig(),
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        ...new ProvidersConfigStore(config.rootDir).loadProvidersConfig(),
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:anthropic/some-model", "off");
       expect(result.success).toBe(false);
@@ -2814,9 +2851,9 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects unknown provider names with an actionable error", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:mystery-provider/some-model");
       expect(result.success).toBe(false);
@@ -2831,13 +2868,13 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects copilot-type provider instances as unsupported", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Copilot gateway routes need request-time tokens only an official
       // Copilot client can mint; Xum's Coder OAuth token is not enough.
       saveCoderConfig(config, {
         discoveredProviders: [{ name: "copilot", type: "copilot" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:copilot/gpt-5.2");
       expect(result.success).toBe(false);
@@ -2852,14 +2889,14 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("injects a fresh Bearer token per request and strips the placeholder x-api-key", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       const originalFetch = globalThis.fetch;
       let capturedFetch: typeof fetch | undefined;
       let forwardedHeaders: Headers | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService("at_fresh");
+      oauth.coderOauthService = stubCoderOauthService("at_fresh");
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -2913,14 +2950,14 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder" }],
       },
-      async (config, factory, policyService) => {
+      async (config, factory, policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         const originalFetch = globalThis.fetch;
         let capturedFetch: typeof fetch | undefined;
         let upstreamCalls = 0;
 
         saveCoderConfig(config);
-        factory.coderOauthService = stubCoderOauthService();
+        oauth.coderOauthService = stubCoderOauthService();
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3019,7 +3056,7 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder" }],
       },
-      async (config, factory, policyService) => {
+      async (config, factory, policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         const originalFetch = globalThis.fetch;
         let capturedFetch: typeof fetch | undefined;
@@ -3043,7 +3080,7 @@ describe("ProviderModelFactory Coder", () => {
           expect(refresh.success).toBe(true);
           return stubbedGetValidAuth();
         };
-        factory.coderOauthService = stub;
+        oauth.coderOauthService = stub;
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3096,13 +3133,13 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: LOCKED_URL }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         let capturedBaseURL: string | undefined;
 
         // Login performed against the policy-locked deployment (the
         // policy-aware CoderOauthService logs in to the forced URL).
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: LOCKED_URL,
             coderOauth: {
@@ -3116,8 +3153,8 @@ describe("ProviderModelFactory Coder", () => {
               clientSecret: "s",
             },
           },
-        } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
+        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3142,7 +3179,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("only routes models from the discovered bridge catalog through Coder", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Coder is logged in and preferred over direct, but its discovered
       // catalog only contains one anthropic model. The AI Bridge cannot serve
       // models outside its catalog, so any other model must fall back to the
@@ -3151,12 +3188,12 @@ describe("ProviderModelFactory Coder", () => {
         models: ["anthropic/claude-sonnet-4-5"],
         discoveredModels: ["anthropic/claude-sonnet-4-5"],
       });
-      const providersConfig = config.loadProvidersConfig() ?? {};
-      config.saveProvidersConfig({
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3176,18 +3213,18 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("keeps routing through Coder while the catalog is unknown", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // No models key: the catalog is unknown (discovery pending or failed
       // transiently after login). Routing stays permissive — blocking would
       // strand Coder routing until the next login even after the bridge
       // recovers.
       saveCoderConfig(config);
-      const providersConfig = config.loadProvidersConfig() ?? {};
-      config.saveProvidersConfig({
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3201,7 +3238,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not restore an explicit coder: prefix for models absent from the catalog", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The user explicitly selected coder:anthropic/claude-opus-4-1, but the
       // discovered catalog does not contain it. The explicit-gateway restore
       // must apply the same catalog gate as resolveRoute — otherwise the
@@ -3213,12 +3250,12 @@ describe("ProviderModelFactory Coder", () => {
         models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-3-7"],
         discoveredModels: ["anthropic/claude-sonnet-4-5"],
       });
-      const providersConfig = config.loadProvidersConfig() ?? {};
-      config.saveProvidersConfig({
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["direct"]);
 
@@ -3252,18 +3289,18 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("routes nothing through Coder when the discovered catalog is empty", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Discovery always overwrites the catalog — empty means the bridge
       // exposed no models (e.g. AI Bridge not entitled). Auto-routing must
       // skip Coder entirely rather than send every model to a bridge that
       // rejects them.
       saveCoderConfig(config, { models: [], discoveredModels: [] });
-      const providersConfig = config.loadProvidersConfig() ?? {};
-      config.saveProvidersConfig({
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3285,7 +3322,7 @@ describe("ProviderModelFactory Coder", () => {
           { id: "anthropic" },
         ],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         // The persisted catalog is deliberately policy-unfiltered (both
         // models present); the CURRENT policy must gate routing so the
         // disallowed model falls back to direct instead of being rewritten
@@ -3294,12 +3331,13 @@ describe("ProviderModelFactory Coder", () => {
           models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
           discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
         });
-        const providersConfig = config.loadProvidersConfig() ?? {};
-        config.saveProvidersConfig({
+        const providersConfig =
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           ...providersConfig,
           anthropic: { apiKey: "sk-ant-test" },
-        } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService();
+        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+        oauth.coderOauthService = stubCoderOauthService();
 
         await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3329,7 +3367,7 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: LOCKED_URL }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         let capturedBaseURL: string | undefined;
 
@@ -3337,7 +3375,7 @@ describe("ProviderModelFactory Coder", () => {
         // edited the (unlocked) deploymentUrl field to point elsewhere. The
         // forced URL must be resolved FIRST so the valid policy-bound
         // credentials are not rejected as issuer-mismatched.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://user-edited.example.com",
             coderOauth: {
@@ -3351,8 +3389,8 @@ describe("ProviderModelFactory Coder", () => {
               clientSecret: "s",
             },
           },
-        } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
+        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3382,14 +3420,14 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: "https://locked.coder.example.com" }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         // Logged in to a different (user-chosen) deployment: those tokens must
         // not be used for the policy-locked endpoint, nor may traffic flow to
         // the user-chosen deployment while policy is enforced. The coder route
         // is unavailable (issuer mismatch with the forced URL), so the model
         // falls back to the direct origin — which the policy also denies.
         saveCoderConfig(config);
-        factory.coderOauthService = stubCoderOauthService();
+        oauth.coderOauthService = stubCoderOauthService();
 
         const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
         expect(result.success).toBe(false);
@@ -3401,7 +3439,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("refuses to attach credentials minted by a different deployment than the model's", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       const originalFetch = globalThis.fetch;
       let capturedFetch: typeof fetch | undefined;
@@ -3412,7 +3450,7 @@ describe("ProviderModelFactory Coder", () => {
       // by request time the user has re-logged into a different deployment:
       // the wrapper must fail instead of sending that bearer token to the
       // model's (old) base URL.
-      factory.coderOauthService = stubCoderOauthService("at_other", "https://other.example.com");
+      oauth.coderOauthService = stubCoderOauthService("at_other", "https://other.example.com");
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -3459,9 +3497,9 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects model ids without a supported bridge origin", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       // Known direct origins (e.g. coder:google/...) canonicalize away from the
       // gateway before reaching the coder branch, so only coder-scoped ids
@@ -3477,12 +3515,12 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("fails with api_key_not_found when Coder OAuth is not connected", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Deployment URL alone is not enough - login is required. Use a
       // coder-scoped id so canonicalization cannot reroute to a direct
       // provider configured via workstation env keys.
       saveCoderConfig(config, { coderOauth: undefined });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:meta-llama/llama-3");
       expect(result.success).toBe(false);

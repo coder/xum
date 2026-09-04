@@ -46,6 +46,15 @@ describe("getModelCapabilities", () => {
     }
   });
 
+  it("reports image-only multimodal input for GLM 5.3 Flash", () => {
+    const caps = getModelCapabilities("zai:glm-5.3-flash");
+
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsVision).toBe(true);
+    expect(caps?.supportsPdfInput).toBe(false);
+    expect(caps?.supportsVideoInput).toBe(false);
+  });
+
   it("infers PDF support for OpenAI vision models when models-extra omits the flag", () => {
     const caps = getModelCapabilities("openai:gpt-5.5");
     expect(caps).not.toBeNull();

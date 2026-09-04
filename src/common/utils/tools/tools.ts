@@ -2,7 +2,7 @@ import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -80,6 +80,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
@@ -184,6 +185,10 @@ export interface ToolConfiguration {
   workspaceSessionDir?: string;
   /** Workspace ID for tracking background processes and plan storage */
   workspaceId?: string;
+  /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
+  agentId?: string;
+  /** The turn's strict-agent pin, persisted with workflow run provenance so wakes re-pin the launch agent. */
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
   xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
@@ -199,6 +204,7 @@ export interface ToolConfiguration {
   reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
+  workspaceTurnManager?: WorkspaceTurnManager;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
@@ -920,7 +926,7 @@ export async function getToolsForModel(
         //
         // Known limitations when the native override is active:
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
-        // - Not bridgeable in the PTC sandbox (no execute()); see BridgeableToolName comment.
+        // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
         // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
         if (supportsAnthropicNativeWebFetch(capabilityModelId)) {

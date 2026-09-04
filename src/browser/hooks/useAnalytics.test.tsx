@@ -168,7 +168,8 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper
@@ -245,8 +246,12 @@ function createAnalyticsServiceStub(summary: Summary): {
   return {
     calls,
     service: {
-      getSummary: (projectPath, from, to) => {
-        calls.summary.push({ projectPath, from, to });
+      getSummary: (input) => {
+        calls.summary.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve(summary);
       },
       getSpendOverTime: (input) => {
@@ -260,14 +265,22 @@ function createAnalyticsServiceStub(summary: Summary): {
         return Promise.resolve([]);
       },
       getSpendByProject: () => Promise.resolve([]),
-      getSpendByModel: (projectPath, from, to) => {
-        calls.spendByModel.push({ projectPath, from, to });
+      getSpendByModel: (input) => {
+        calls.spendByModel.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       getTimingDistribution: () => Promise.resolve({ p50: 0, p90: 0, p99: 0, histogram: [] }),
       getAgentCostBreakdown: () => Promise.resolve([]),
-      getCacheHitRatioByProvider: (projectPath, from, to) => {
-        calls.cacheHitRatioByProvider.push({ projectPath, from, to });
+      getCacheHitRatioByProvider: (input) => {
+        calls.cacheHitRatioByProvider.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       rebuildAll: () => Promise.resolve({ success: true, workspacesIngested: 0 }),
@@ -643,7 +656,11 @@ describe("useAnalytics hooks", () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.error).toBe("Internal server error");
+    // The behavioral contract is "generic error, no infrastructure detail leak".
+    // Match case-insensitively: oRPC changed its default INTERNAL_SERVER_ERROR
+    // message casing in 1.14 ("Internal server error" -> "Internal Server Error").
+    expect(result.current.error ?? "").toMatch(/^internal server error$/i);
+    expect(result.current.error).not.toContain("Analytics worker");
     expect(result.current.data).toBeNull();
   });
 });

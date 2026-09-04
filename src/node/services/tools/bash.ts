@@ -821,23 +821,18 @@ function formatResult(
 }
 
 /**
- * Shell-escape a string for safe use in bash commands (single-quote wrapping).
- */
-function shellEscape(str: string): string {
-  return `'${str.replace(/'/g, "'\\''")}'`;
-}
-
-/**
  * Build script prelude that sources .xum/tool_env if present.
  * Returns empty string if no tool_env path is provided.
  */
+const TOOL_ENV_PATH_ENV = "XUM_INTERNAL_TOOL_ENV_PATH";
+
 function buildToolEnvPrelude(toolEnvPath: string | null): string {
   if (!toolEnvPath) return "";
-  // Source the tool_env file; fail with clear error if sourcing fails
-  return `if ! source ${shellEscape(toolEnvPath)} 2>&1; then
-  echo "mux: failed to source ${toolEnvPath}" >&2
+  return `if ! source "$${TOOL_ENV_PATH_ENV}" 2>&1; then
+  echo "mux: failed to source $${TOOL_ENV_PATH_ENV}" >&2
   exit 1
 fi
+unset ${TOOL_ENV_PATH_ENV}
 `;
 }
 
@@ -1035,6 +1030,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           {
             cwd: config.cwd,
             env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
@@ -1114,6 +1110,7 @@ ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
         env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
       });

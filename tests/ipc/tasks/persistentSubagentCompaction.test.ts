@@ -151,12 +151,15 @@ describe("Persistent sub-agent compaction", () => {
     const executionTaskId = reactivated.data.executionTaskId;
     if (!executionTaskId) throw new Error("Expected a reactivated execution task ID");
 
-    const continuation = await env.services.taskService.waitForWorkspaceTurn(executionTaskId, {
-      requestingWorkspaceId: parentWorkspaceId,
-      ownerWorkspaceId: parentWorkspaceId,
-      backgroundOnMessageQueued: false,
-      timeoutMs: 10_000,
-    });
+    const continuation = await env.services.workspaceTurnManager.waitForWorkspaceTurn(
+      executionTaskId,
+      {
+        requestingWorkspaceId: parentWorkspaceId,
+        ownerWorkspaceId: parentWorkspaceId,
+        backgroundOnMessageQueued: false,
+        timeoutMs: 10_000,
+      }
+    );
     expect(continuation).toMatchObject({
       taskId: executionTaskId,
       workspaceId: childWorkspaceId,
@@ -198,14 +201,10 @@ describe("Persistent sub-agent compaction", () => {
     expect(fullHistoryResult.success).toBe(true);
     expect(fullHistory.some((message) => extractText(message).includes(seedText))).toBe(true);
 
-    const lastPromptResult = env.services.aiService.debugGetLastMockPrompt(childWorkspaceId);
-    expect(lastPromptResult.success).toBe(true);
-    if (!lastPromptResult.success || lastPromptResult.data == null) {
-      throw new Error("Expected a captured mock prompt");
-    }
-    expect(lastPromptResult.data[0]?.metadata?.compactionBoundary).toBe(true);
-    expect(lastPromptResult.data.some((message) => extractText(message).includes(seedText))).toBe(
-      false
-    );
+    const lastPrompt =
+      env.services.aiService.mockAiStreamPlayer?.debugGetLastPrompt(childWorkspaceId);
+    if (lastPrompt == null) throw new Error("Expected a captured mock prompt");
+    expect(lastPrompt[0]?.metadata?.compactionBoundary).toBe(true);
+    expect(lastPrompt.some((message) => extractText(message).includes(seedText))).toBe(false);
   }, 30_000);
 });

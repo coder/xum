@@ -13,6 +13,21 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
+import {
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
+
+function contextExceededResult(messageId: string) {
+  return {
+    success: true as const,
+    data: createFailedTurnHandle(messageId, {
+      error: "Context length exceeded",
+      errorType: "context_exceeded",
+    }),
+  };
+}
 
 function createPersistedPostCompactionState(options: {
   filePath: string;
@@ -35,7 +50,9 @@ describe("AgentSession post-compaction context retry", () => {
 
   test("retries once without post-compaction injection on context_exceeded", async () => {
     const workspaceId = "ws";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     const postCompactionPath = path.join(sessionDir, "post-compaction.json");
 
     await createPersistedPostCompactionState({
@@ -91,14 +108,18 @@ describe("AgentSession post-compaction context retry", () => {
           errorType: "context_exceeded",
         });
 
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
       }
 
       resolveSecondCall?.();
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle("assistant-retry"),
+      });
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -127,8 +148,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -202,7 +225,9 @@ describe("AgentSession post-compaction context retry", () => {
   // event) leave a child task running until the parent times out.
   test("recovery decision resolves only after the context retry startup outcome is known", async () => {
     const workspaceId = "ws-decision";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
@@ -237,7 +262,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return { success: true as const, data: undefined };
+        return contextExceededResult("assistant-ctx-exceeded");
       }
       // Retry startup in flight: hold it until the test releases, then fail
       // pre-stream (e.g. commitPartial / history read failure).
@@ -250,6 +275,7 @@ describe("AgentSession post-compaction context retry", () => {
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -279,8 +305,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -346,7 +374,9 @@ describe("AgentSession post-compaction context retry", () => {
   // settlement convinced the (dead) retry is still carrying the turn.
   test("a retry that starts and then fails terminally records separate per-attempt outcomes", async () => {
     const workspaceId = "ws-overlap";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
@@ -372,7 +402,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-attempt-1"));
       }
       // The retry's startup succeeds, but the stream dies immediately with a
       // terminal error — emitted before the original retry path resumes.
@@ -382,10 +412,17 @@ describe("AgentSession post-compaction context retry", () => {
         error: "The model refused to continue",
         errorType: "model_refusal",
       });
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createFailedTurnHandle("assistant-attempt-2", {
+          error: "The model refused to continue",
+          errorType: "model_refusal",
+        }),
+      });
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -415,8 +452,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({

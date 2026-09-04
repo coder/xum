@@ -24,6 +24,7 @@ Most providers only need an API key. The UI handles validation and shows which p
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
 | **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
+| **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
 | **OpenRouter**     | 300+ models                 | [openrouter.ai](https://openrouter.ai/)                 |
 | **Ollama**         | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |
 | **Bedrock**        | Claude via AWS              | AWS Console                                             |
@@ -45,6 +46,7 @@ Providers also read from environment variables as fallback:
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
+| Z.ai           | `ZAI_API_KEY`                                      |
 | github-copilot | `GITHUB_COPILOT_TOKEN`                             |
 | Bedrock        | `AWS_REGION` (credentials via AWS SDK chain)       |
 
@@ -108,6 +110,9 @@ The built-in `openai` provider supports two wire formats:
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `responses`       | Uses the OpenAI Responses API. This is the default and supports current OpenAI and Codex features.                                           |
 | `chatCompletions` | Uses `/v1/chat/completions`. Use this for OpenAI-API-shaped gateways that do not expose `/v1/responses`, such as Azure Government endpoints. |
+
+OpenAI documents that GPT-6 Astra only supports tool calling through the Responses API, so keep
+`responses` when using that model.
 
 Set the format in **Settings → Providers → OpenAI → Wire format**, or in
 `~/.xum/providers.jsonc`:
@@ -280,9 +285,11 @@ custom-named provider instances that Xum cannot discover, declare them by hand i
 }
 ```
 
-Login is available from the desktop app or a locally hosted Xum server. On a remote Xum
-server the OAuth callback cannot reach your browser's machine (Coder does not support the
-device-authorization grant), so login is disabled there.
+Login works from the desktop app and from a browser connected to a Xum server, including a
+remote one: in the desktop app the OAuth callback lands on a loopback listener on your
+machine, while in the browser Xum registers a callback URL on the server's own origin
+(`/auth/coder/callback`) so the redirect reaches the server directly. A remote server must
+be reachable over HTTPS for Coder to accept that callback URL.
 
 ### Bedrock Authentication
 

@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -12,22 +12,7 @@ import {
   runPostHook,
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-
-class ExecPathMappingRuntime extends LocalRuntime {
-  constructor(
-    projectPath: string,
-    private readonly hostPrefix: string,
-    private readonly execPrefix: string
-  ) {
-    super(projectPath);
-  }
-
-  mapPathForExec(filePath: string): string {
-    return filePath.startsWith(this.hostPrefix)
-      ? this.execPrefix + filePath.slice(this.hostPrefix.length)
-      : filePath;
-  }
-}
+import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 
 describe("hooks", () => {
   let tempDir: string;
@@ -43,38 +28,39 @@ describe("hooks", () => {
   });
 
   describe("exec path mapping", () => {
-    test("returns mapped project hook and tool_env paths after host discovery", async () => {
+    test("discovery returns host-namespace paths even on exec-mapping runtimes", async () => {
       const configDir = path.join(tempDir, ".xum");
       const hookPath = path.join(configDir, "tool_hook");
       const toolEnvPath = path.join(configDir, "tool_env");
-      const execPrefix = "/workspaces/project";
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(hookPath, "#!/bin/bash\necho test");
       await fs.writeFile(toolEnvPath, "export FOO=bar");
 
-      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
-      const statSpy = spyOn(mappingRuntime, "stat");
-
-      expect(await getHookPath(mappingRuntime, tempDir)).toBe(
-        path.posix.join(execPrefix, ".xum/tool_hook")
-      );
-      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(
-        path.posix.join(execPrefix, ".xum/tool_env")
-      );
-      const statPaths = statSpy.mock.calls.map(([filePath]) => filePath);
-      expect(statPaths).toContain(hookPath);
-      expect(statPaths).toContain(toolEnvPath);
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, "/workspaces/project");
+      expect(await getHookPath(mappingRuntime, tempDir)).toBe(hookPath);
+      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(toolEnvPath);
     });
 
     test("hook runners export the mapped project dir as XUM_PROJECT_DIR", async () => {
-      const execPrefix = "/workspaces/project";
+      const execPrefix = path.join(tempDir, "exec");
       const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
       const hookDir = path.join(tempDir, ".xum");
-      await fs.mkdir(hookDir, { recursive: true });
+      const execHookDir = path.join(execPrefix, ".xum");
+      await Promise.all([
+        fs.mkdir(hookDir, { recursive: true }),
+        fs.mkdir(execHookDir, { recursive: true }),
+      ]);
       const writeHook = async (name: string) => {
         const hookPath = path.join(hookDir, name);
-        await fs.writeFile(hookPath, '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"');
-        await fs.chmod(hookPath, 0o755);
+        const contents = '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"';
+        await Promise.all([
+          fs.writeFile(hookPath, contents),
+          fs.writeFile(path.join(execHookDir, name), contents),
+        ]);
+        await Promise.all([
+          fs.chmod(hookPath, 0o755),
+          fs.chmod(path.join(execHookDir, name), 0o755),
+        ]);
         return hookPath;
       };
       const context = {

@@ -1,5 +1,6 @@
 import * as crypto from "crypto";
 import * as http from "http";
+import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
@@ -12,6 +13,7 @@ import type { Config } from "@/node/config";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { WindowService } from "@/node/services/windowService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { log } from "@/node/services/log";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -27,7 +29,6 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -624,6 +625,77 @@ export class McpOauthService {
     this.serverFlows.clear();
   }
 
+  async startDesktopFlowForApi(input: {
+    projectPath?: string;
+    serverName: string;
+    pendingServer?: MCPOAuthPendingServerConfig;
+  }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    return this.startDesktopFlow({
+      ...input,
+      projectPath: input.projectPath ?? this.config.rootDir,
+    });
+  }
+
+  async startServerFlowForApi(
+    input: {
+      projectPath?: string;
+      serverName: string;
+      pendingServer?: MCPOAuthPendingServerConfig;
+    },
+    headers?: IncomingHttpHeaders
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const projectPath = input.projectPath ?? this.config.rootDir;
+    const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
+    if (origin) {
+      try {
+        const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
+        return this.startServerFlow({ ...input, projectPath, redirectUri });
+      } catch {
+        // Fall back to Host header.
+      }
+    }
+
+    const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
+    const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
+    if (!host) {
+      return Err("Missing Host header");
+    }
+    const protoHeader = headers?.["x-forwarded-proto"];
+    const forwardedProto = typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
+    const proto = forwardedProto.length ? forwardedProto : "http";
+    const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
+    return this.startServerFlow({ ...input, projectPath, redirectUri });
+  }
+
+  async getProjectAuthStatus(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return { isLoggedIn: false, hasRefreshToken: false };
+    }
+    return this.getAuthStatus({ serverUrl: server.url });
+  }
+
+  async logoutProjectServer(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<Result<void, string>> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return Ok(undefined);
+    }
+    return this.logout({ serverUrl: server.url });
+  }
   async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {

@@ -253,7 +253,7 @@ export class TaskHandleStore {
 
   private getOwnerHandleDir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "ownerWorkspaceId must be non-empty");
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), TASK_HANDLES_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, TASK_HANDLES_DIR);
   }
 
   private getHandlePath(ownerWorkspaceId: string, handleId: string): string {

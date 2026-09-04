@@ -369,7 +369,7 @@ describe("WorkflowRunner", () => {
       expect.objectContaining({
         id: "verify",
         agentId: "exec",
-        modelString: "anthropic:claude-fable-5",
+        modelString: "anthropic:claude-fable-5-1",
         thinkingLevel: "high",
       }),
     ]);
@@ -3235,6 +3235,9 @@ describe("WorkflowRunner", () => {
             onEvent: noop,
             abort: noop,
             getAbortSignal() {
+              return undefined;
+            },
+            takeActiveHostCallId() {
               return undefined;
             },
             async eval() {

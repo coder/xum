@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   supportsAnthropicCache,
   applyCacheControl,
+  getAnthropicCacheTtl,
   createCachedSystemMessage,
   createOpenAICachedSystemMessage,
   openaiExplicitPromptCachingAvailable,
@@ -683,5 +684,21 @@ describe("cacheStrategy", () => {
       // A recreated tool is a different object; sanity-check the marker rode along on the copy.
       expect(result.task).not.toBe(taskTool);
     });
+  });
+});
+
+describe("getAnthropicCacheTtl", () => {
+  it("recovers a valid ttl from merged provider options", () => {
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "1h" } } })).toBe("1h");
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "5m" } } })).toBe("5m");
+  });
+
+  it("returns undefined for missing or malformed shapes", () => {
+    expect(getAnthropicCacheTtl(undefined)).toBeUndefined();
+    expect(getAnthropicCacheTtl({})).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: "1h" })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: "1h" } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "2h" } } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: 300 } } })).toBeUndefined();
   });
 });

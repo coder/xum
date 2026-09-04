@@ -37,7 +37,7 @@ import {
   type VisualState,
 } from "./StatusDot";
 
-import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipIfPresent } from "../Tooltip/Tooltip";
 import { Popover, PopoverContent, PopoverTrigger, PopoverAnchor } from "../Popover/Popover";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
 import {
@@ -105,6 +105,9 @@ interface AgentListItemBaseProps {
   isSelected: boolean;
   depth?: number;
   sectionId?: string;
+  // Stable primitives (not an object) so React Compiler can skip unchanged rows.
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
 }
 
 /** Props for regular (persisted) workspace items */
@@ -471,7 +474,11 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
       role="button"
       tabIndex={0}
       aria-current={isSelected ? "true" : undefined}
-      aria-label={`Open workspace draft ${draft.draftNumber}`}
+      aria-label={
+        props.projectBadgeName != null
+          ? `Open workspace draft ${draft.draftNumber} (${props.projectBadgeName})`
+          : `Open workspace draft ${draft.draftNumber}`
+      }
       data-project-path={projectPath}
       data-draft-id={draft.draftId}
     >
@@ -490,6 +497,26 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           >
             {draft.title}
           </span>
+          {props.projectBadgeName != null && (
+            // The badge width cap can truncate hierarchical "Parent / Sub"
+            // names, so the shared tooltip keeps the full label reachable.
+            <TooltipIfPresent tooltip={props.projectBadgeName}>
+              <span
+                data-testid={`workspace-project-badge-draft-${draft.draftId}`}
+                className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                style={
+                  props.projectBadgeColor != null
+                    ? {
+                        backgroundColor: `${props.projectBadgeColor}20`,
+                        borderColor: `${props.projectBadgeColor}40`,
+                      }
+                    : undefined
+                }
+              >
+                {props.projectBadgeName}
+              </span>
+            </TooltipIfPresent>
+          )}
         </div>
         {hasPromptPreview && (
           <span
@@ -878,7 +905,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         type: WORKSPACE_DRAG_TYPE,
         workspaceId,
         projectPath,
-        currentSectionId: sectionId,
+        // Flat rows render without the sectionId prop (no section indent), so
+        // fall back to the row's own sub-project scope; drop zones use this to
+        // treat same-section drops as no-ops.
+        currentSectionId: sectionId ?? metadata.subProjectPath,
         pinned: isPinned,
         pinnedReorderGroup: props.pinnedReorderGroup,
         // Extra fields for custom drag layer preview
@@ -894,6 +924,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       workspaceId,
       projectPath,
       sectionId,
+      metadata.subProjectPath,
       isDisabled,
       isPinned,
       props.pinnedReorderGroup,
@@ -1041,15 +1072,21 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         aria-current={isSelected ? "true" : undefined}
         aria-expanded={canToggleCompletedChildren ? isCompletedChildrenExpanded : undefined}
         aria-keyshortcuts={canToggleCompletedChildren ? "ArrowRight ArrowLeft" : undefined}
-        aria-label={
-          isRemoving
-            ? `Deleting workspace ${displayTitle}`
+        aria-label={(() => {
+          // The explicit label overrides descendant badge text, so include the
+          // project identity whenever the badge is the only visible project cue.
+          const accessibleTitle =
+            props.projectBadgeName != null
+              ? `${displayTitle} (${props.projectBadgeName})`
+              : displayTitle;
+          return isRemoving
+            ? `Deleting workspace ${accessibleTitle}`
             : isInitializing
-              ? `Initializing workspace ${displayTitle}`
+              ? `Initializing workspace ${accessibleTitle}`
               : isArchiving
-                ? `Archiving workspace ${displayTitle}`
-                : `Select workspace ${displayTitle}`
-        }
+                ? `Archiving workspace ${accessibleTitle}`
+                : `Select workspace ${accessibleTitle}`;
+        })()}
         aria-describedby={secondaryStatusDescriptionId}
         aria-disabled={isDisabled}
         data-workspace-path={namedWorkspacePath}
@@ -1319,6 +1356,26 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
+                {props.projectBadgeName != null && (
+                  // The badge width cap can truncate hierarchical "Parent / Sub"
+                  // names, so the shared tooltip keeps the full label reachable.
+                  <TooltipIfPresent tooltip={props.projectBadgeName}>
+                    <span
+                      data-testid={`workspace-project-badge-${workspaceId}`}
+                      className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                      style={
+                        props.projectBadgeColor != null
+                          ? {
+                              backgroundColor: `${props.projectBadgeColor}20`,
+                              borderColor: `${props.projectBadgeColor}40`,
+                            }
+                          : undefined
+                      }
+                    >
+                      {props.projectBadgeName}
+                    </span>
+                  </TooltipIfPresent>
+                )}
                 {groupLabel && !suppressGroupMemberTitle && (
                   <span
                     data-testid={`workspace-scope-label-${workspaceId}`}

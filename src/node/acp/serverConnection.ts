@@ -5,7 +5,7 @@ import { RPCLink as WebSocketRPCLink } from "@orpc/client/websocket";
 import type { RouterClient } from "@orpc/server";
 import WebSocket from "ws";
 import { getXumHome } from "@/common/constants/paths";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import type { AppRouter } from "@/node/orpc/router";
 import { createOrpcServer } from "@/node/orpc/server";
 import { ServiceContainer } from "@/node/services/serviceContainer";
@@ -151,8 +151,8 @@ async function connectToExistingServer(options: {
 
 async function connectToInProcessServer(requestedAuthToken?: string): Promise<ServerConnection> {
   const authToken = requestedAuthToken ?? crypto.randomUUID();
-  const config = new Config();
-  const serviceContainer = new ServiceContainer(config);
+  const stores = createConfigStores();
+  const serviceContainer = new ServiceContainer(stores);
 
   let initialized = false;
   let inProcessServer: InProcessOrpcServer | undefined;
@@ -229,9 +229,10 @@ async function connectViaWebSocket(
   await waitForWebSocketOpen(websocket, wsUrl);
 
   // oRPC expects a browser-like WebSocket surface; ws is compatible at runtime.
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
   const link = new WebSocketRPCLink({
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    websocket: websocket as unknown as globalThis.WebSocket,
+    connect: () => websocket as unknown as globalThis.WebSocket,
   });
   const client = createTypedClient(link);
 

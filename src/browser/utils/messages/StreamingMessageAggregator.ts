@@ -1935,8 +1935,16 @@ export class StreamingMessageAggregator {
    * Get the active main-agent stream id (for interrupt, live usage, and token tracking).
    * Returns undefined when no interruptible stream is active.
    */
+  getMessagePartCount(messageId: string): number {
+    return this.messages.get(messageId)?.parts.length ?? 0;
+  }
+
   getActiveStreamMessageId(): string | undefined {
     return this.getActiveStreamEntry()?.[0];
+  }
+
+  isStreamActive(messageId: string): boolean {
+    return this.activeStreams.has(messageId);
   }
 
   /**
@@ -2500,19 +2508,30 @@ export class StreamingMessageAggregator {
         (part): part is DynamicToolPart =>
           part.type === "dynamic-tool" && part.toolCallId === data.parentToolCallId
       );
-      if (parentPart) {
-        // Initialize nestedCalls array if needed
-        parentPart.nestedCalls ??= [];
-        parentPart.nestedCalls.push({
-          toolCallId: data.toolCallId,
-          toolName: data.toolName,
-          state: "input-available",
-          input: data.args,
-          timestamp: data.timestamp,
-        });
-        this.markMessageDirty(data.messageId);
+      if (!parentPart) {
+        // execute() can emit nested events before the parent part streams in.
+        // Never fall through to creating a ghost top-level row: streamManager
+        // buffers the nested record and re-emits its events (start, workflow
+        // attachment, end) right after the parent part lands.
         return;
       }
+      // Initialize nestedCalls array if needed
+      parentPart.nestedCalls ??= [];
+      // Buffered-merge and reconnect replays re-deliver nested starts the
+      // renderer may already have; skip duplicates like the top-level path
+      // below does.
+      if (parentPart.nestedCalls.some((nc) => nc.toolCallId === data.toolCallId)) {
+        return;
+      }
+      parentPart.nestedCalls.push({
+        toolCallId: data.toolCallId,
+        toolName: data.toolName,
+        state: "input-available",
+        input: data.args,
+        timestamp: data.timestamp,
+      });
+      this.markMessageDirty(data.messageId);
+      return;
     }
 
     // Check if this tool call already exists to prevent duplicates

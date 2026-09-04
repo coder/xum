@@ -624,6 +624,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     localOnlyFiles: [],
     redactions: [],
     commandApprovals: [],
+    projectImports: [],
+    projectBundleSkipped: false,
+    pushError: null,
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -636,6 +639,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     snapshotPath: "/tmp/mux-backup-snapshot",
     changedFiles: [],
     localOnlyFiles: [],
+    projectImportResults: [],
+    projectBundleSkipped: false,
+    unapprovedProjectImports: [],
   };
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;

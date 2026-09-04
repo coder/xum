@@ -1182,7 +1182,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       const ws = "ws-cross-process-marker";
       const branchPoint = createMuxMessage("xp-1", "assistant", "branch point", { timestamp: 1 });
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
-      const sessionDir = config.getSessionDir(ws);
+      const sessionDir = path.join(config.sessionsDir, ws);
 
       // Gate the model so generation is provably in flight while the foreign
       // send checks the marker.

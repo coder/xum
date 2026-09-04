@@ -19,6 +19,14 @@ export const CODER_OAUTH_DISCOVERY_PATH = "/.well-known/oauth-authorization-serv
 /** Loopback callback path for the desktop authorization-code flow. */
 export const CODER_OAUTH_CALLBACK_PATH = "/callback";
 
+/**
+ * Xum server routes for the browser/server-mode flow: the browser cannot reach
+ * a loopback listener on a remote Xum server, so the authorization redirect
+ * lands on the server itself (shared between the HTTP layer and the UI).
+ */
+export const CODER_OAUTH_SERVER_START_PATH = "/auth/coder/start";
+export const CODER_OAUTH_SERVER_CALLBACK_PATH = "/auth/coder/callback";
+
 /** Client name registered via RFC 7591 dynamic client registration. */
 export const CODER_OAUTH_CLIENT_NAME = "Xum";
 

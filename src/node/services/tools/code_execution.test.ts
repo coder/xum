@@ -1633,6 +1633,104 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-event-bound");
     });
 
+    it("threads the nested record callId into bridged execute options", async () => {
+      // The UI keys nested cards and live events (workflow-run-attached,
+      // task-created, live bash output) by the PTC record callId; execute()
+      // must observe the SAME id or those events target an id no rendered
+      // card carries.
+      using tmp = new DisposableTempDir("code-exec-callid");
+      const host = new SandboxHostService();
+      const executed: Array<{ toolCallId: string; tag: string }> = [];
+      const probeTool: Tool = {
+        description: "Probe tool",
+        inputSchema: z.object({ tag: z.string() }),
+        execute: (args, options) => {
+          executed.push({ toolCallId: options.toolCallId, tag: (args as { tag: string }).tag });
+          return Promise.resolve({ success: true });
+        },
+      };
+      const emitted: Array<{
+        type?: string;
+        callId?: string;
+        toolName?: string;
+        args?: { tag?: string };
+      }> = [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ probe: probeTool }),
+        (event) => emitted.push(event as (typeof emitted)[number]),
+        persistentRunner(host, "ws-callid", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'mux.probe({tag: "a"}); mux.probe({tag: "b"}); return true;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const starts = emitted.filter((e) => e.type === "tool-call-start" && e.toolName === "probe");
+      expect(starts).toHaveLength(2);
+      expect(executed).toHaveLength(2);
+      for (const call of executed) {
+        const start = starts.find((e) => e.args?.tag === call.tag);
+        expect(start?.callId).toBe(call.toolCallId);
+      }
+      expect(executed[0].toolCallId).not.toBe(executed[1].toolCallId);
+      await host.disposeScope("ws-callid");
+    });
+
+    it("retains workflow identity on kernel-bounded workflow_run args and results", async () => {
+      // Oversized workflow launches and results collapse to markers, but the
+      // transcript card needs script_path (display) and runId/status (durable
+      // run refetch) to render the live workflow instead of raw JSON.
+      using tmp = new DisposableTempDir("code-exec-wf-bound");
+      const host = new SandboxHostService();
+      const workflowTools: Record<string, Tool> = {
+        workflow_run: createMockTool(
+          "workflow_run",
+          z.object({ script_path: z.string(), args: z.unknown() }),
+          () => ({
+            status: "completed",
+            runId: "wfr_bounded",
+            result: { reportMarkdown: "r".repeat(64 * 1024) },
+          })
+        ),
+      };
+      const emitted: Array<{ type?: string; toolName?: string; args?: unknown; result?: unknown }> =
+        [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(workflowTools),
+        (event) => emitted.push(event as (typeof emitted)[number]),
+        persistentRunner(host, "ws-wf-bound", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'const r = mux.workflow_run({script_path: "skill://demo/workflow.js", args: {problem: "p".repeat(4096)}}); return r.runId;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      // The guest still sees the full result.
+      expect(result.result).toBe("wfr_bounded");
+
+      const end = emitted.find((e) => e.type === "tool-call-end" && e.toolName === "workflow_run");
+      expect(end).toBeDefined();
+      const argsMarker = end!.args as { __kernelBounded?: boolean; script_path?: string };
+      expect(argsMarker.__kernelBounded).toBe(true);
+      expect(argsMarker.script_path).toBe("skill://demo/workflow.js");
+      const resultMarker = end!.result as {
+        __kernelBounded?: boolean;
+        runId?: string;
+        status?: string;
+      };
+      expect(resultMarker.__kernelBounded).toBe(true);
+      expect(resultMarker.runId).toBe("wfr_bounded");
+      expect(resultMarker.status).toBe("completed");
+      await host.disposeScope("ws-wf-bound");
+    });
+
     it("bounds oversized nested-call args in compact records (no echo of kernel data)", async () => {
       using tmp = new DisposableTempDir("code-exec-offload");
       const host = new SandboxHostService();

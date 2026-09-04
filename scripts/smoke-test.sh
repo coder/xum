@@ -240,15 +240,17 @@ const { RPCLink } = require('@orpc/client/fetch');
 const { createORPCClient } = require('@orpc/client');
 const WebSocket = require('ws');
 
-const ORPC_URL = 'http://${SERVER_HOST}:${SERVER_PORT}/orpc';
+const ORPC_ORIGIN = 'http://${SERVER_HOST}:${SERVER_PORT}';
 const WS_URL = 'ws://${SERVER_HOST}:${SERVER_PORT}/orpc/ws';
 const PROJECT_DIR = '$PROJECT_DIR';
 
 async function runTests() {
   // Test 1: HTTP oRPC client - create project
   console.log('Testing oRPC project creation via HTTP...');
+  // oRPC >=1.14 splits the request URL into origin + path-only url.
   const httpLink = new RPCLink({
-    url: ORPC_URL,
+    origin: ORPC_ORIGIN,
+    url: '/orpc',
     headers: { 'Authorization': 'Bearer ${AUTH_TOKEN}' }
   });
   const client = createORPCClient(httpLink);

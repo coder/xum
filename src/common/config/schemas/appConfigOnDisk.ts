@@ -117,6 +117,12 @@ export const AppConfigMigrationsSchema = z
     userPreferencesInitialized: z.boolean().optional(),
     /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
     defaultModelFallbacksSeeded: z.boolean().optional(),
+    /**
+     * One-time re-run of the fallback seed after the fable alias moved to
+     * Fable 5.1: configs seeded before the promotion lack a chain for the new
+     * source key.
+     */
+    defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
   })
@@ -203,6 +209,9 @@ export const AppConfigOnDiskSchema = z
     // Legacy: 1Password integration was removed. Old builds still read/write this
     // key, so it is round-tripped for downgrade compatibility but unused at runtime.
     onePasswordAccountName: z.string().optional(),
+    // A fresh random value per save (see Config.configFileWriteGeneration): lets a reader
+    // tell two writes of the same bytes apart, which no timestamp or inode reliably can.
+    writeId: z.string().optional(),
   })
   .passthrough();
 

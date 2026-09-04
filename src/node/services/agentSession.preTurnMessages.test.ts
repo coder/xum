@@ -8,11 +8,14 @@ import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {
+  rootDir: "/tmp",
+  sessionsDir: "/tmp",
   srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
+  loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 
 // r30: family-message payload rows ride sendMessage as pre-turn rows so they
@@ -26,8 +29,9 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
     const aiService = Object.assign(new EventEmitter(), {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],

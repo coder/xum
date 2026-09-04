@@ -692,14 +692,14 @@ export async function cleanupTempGitRepo(repoPath: string): Promise<void> {
  */
 export async function buildLargeHistory(
   workspaceId: string,
-  config: { getSessionDir: (id: string) => string; rootDir: string },
+  config: { sessionsDir: string; rootDir: string },
   options: {
     messageSize?: number;
     messageCount?: number;
     textPrefix?: string;
   } = {}
 ): Promise<void> {
-  // HistoryService needs getSessionDir plus rootDir (write locks/tombstones).
+  // HistoryService needs sessionsDir plus rootDir (write locks/tombstones).
   const historyService = new HistoryService(config);
 
   const messageSize = options.messageSize ?? 50_000;

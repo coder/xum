@@ -3,7 +3,7 @@ import { describe, expect, mock, spyOn, test } from "bun:test";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
@@ -99,7 +99,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
             turnId: "turn-different",
           }) === true,
       };
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-preparing-predecessor",
@@ -170,6 +170,117 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.sendQueuedMessages();
       expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(true);
       expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter reports an engaged no-metadata dispatch over a queued follow-up", async () => {
+    // Queue-cut attribution must never blame an entry queued BEHIND the input
+    // actually taking over the session: a manual message being dispatched wins
+    // over a workspace-turn follow-up waiting behind it, even though its
+    // metadata is undefined.
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-preparing",
+    });
+
+    try {
+      expect(session.getQueueCutCutter()).toBeUndefined();
+
+      session.queueMessage(
+        "manual message",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+
+      // Queued stage: the manual head entry is the candidate (no metadata).
+      const queued = session.getQueueCutCutter();
+      expect(queued?.stage).toBe("queued");
+      expect(queued?.muxMetadata).toBeUndefined();
+
+      // Dispatch the manual entry: it becomes the engaged PREPARING cutter and
+      // keeps winning over the follow-up still queued behind it.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect(engaged?.muxMetadata).toBeUndefined();
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter reports a no-metadata mid-dispatch entry over a queued follow-up", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-dispatching",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      // Force the dequeue-to-stream-start window with PREPARING already
+      // released (a background send can resolve before stream-start): the
+      // dispatched entry stays the engaged cutter.
+      const internal = session as unknown as {
+        dispatchingQueuedEntry: boolean;
+        dispatchingQueuedEntryMuxMetadata?: unknown;
+      };
+      internal.dispatchingQueuedEntry = true;
+      internal.dispatchingQueuedEntryMuxMetadata = undefined;
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("dispatching");
+      expect(cutter?.muxMetadata).toBeUndefined();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter exposes the queued head's dispatch mode and correlation", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-queued",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+          queueDispatchMode: "turn-end",
+        },
+        { synthetic: true }
+      );
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("queued");
+      expect(cutter?.stage === "queued" ? cutter.dispatchMode : undefined).toBe("turn-end");
+      expect((cutter?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
+
+      // Once dispatched, the follow-up's correlation rides through PREPARING.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect((engaged?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
       sendMessage.mockRestore();
     } finally {
       session.dispose();
@@ -260,6 +371,87 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await cleanup();
     }
   });
+
+  test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-head";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+      );
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+
+      controller.abort("monitor withdrawn");
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
+
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).not.toHaveBeenCalled();
+
+      session.queueMessage("follow up", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+      expect(queuedSignals).toEqual([true, false]);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each([
+    ["turn-end", "tool-end"],
+    ["tool-end", "turn-end"],
+  ] as const)(
+    "queueMessage reports the live entry's mode behind a withdrawn %s head",
+    async (withdrawnMode, liveMode) => {
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId: "queue-dispatch-withdrawn-" + withdrawnMode + "-head",
+      });
+      try {
+        const controller = new AbortController();
+        session.queueMessage(
+          "Background monitor wake",
+          { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
+          { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+        );
+        controller.abort("monitor withdrawn");
+
+        expect(
+          session.queueMessage("follow up", {
+            model: TEST_MODEL,
+            agentId: "exec",
+            queueDispatchMode: liveMode,
+          })
+        ).toBe(liveMode);
+      } finally {
+        session.dispose();
+        await cleanup();
+      }
+    }
+  );
 
   test("waits for every known sibling before stopping after a provider-executed result", async () => {
     const workspaceId = "queue-dispatch-provider-siblings";

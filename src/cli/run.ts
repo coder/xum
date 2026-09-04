@@ -14,7 +14,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { Config } from "../node/config";
+import { createConfigStores } from "../node/config";
 import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
@@ -23,7 +23,8 @@ import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
 import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
-import { createCoreServices } from "../node/services/coreServices";
+import { createCoreServices } from "../node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
   isCaughtUpMessage,
   isReasoningDelta,
@@ -501,7 +502,8 @@ async function main(): Promise<number> {
   using tempDir = new DisposableTempDir("mux-run");
 
   // Read credentials from the real config, then copy them into the private run config.
-  const realConfig = new Config();
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
 
   // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
   // to collect chat.jsonl and session-usage.json after the process exits.
@@ -513,10 +515,14 @@ async function main(): Promise<number> {
     return 1;
   }
   await using preparedSessionRoot = sessionRootOverride;
-  const config = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const preparedConfig = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const runStores = createConfigStores(preparedConfig.rootDir);
+  const config = runStores.config;
 
   // Copy providers and secrets from real config to ephemeral config
-  const existingProviders = realConfig.loadProvidersConfig();
+  const realProvidersStore = realStores.providersConfigStore;
+  const runProvidersStore = runStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
   const providersFile = path.join(config.rootDir, "providers.jsonc");
   await replacePrivateRunConfigFile(
     providersFile,
@@ -526,7 +532,7 @@ async function main(): Promise<number> {
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,
@@ -618,7 +624,7 @@ async function main(): Promise<number> {
   if (!hasAnyConfiguredProvider(existingProviders)) {
     const providersFromEnv = buildProvidersFromEnv();
     if (hasAnyConfiguredProvider(providersFromEnv)) {
-      config.saveProvidersConfig(providersFromEnv);
+      runProvidersStore.saveProvidersConfig(providersFromEnv);
     } else {
       throw new Error(
         "No provider credentials found. Configure providers.jsonc or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY / MOONSHOT_API_KEY."
@@ -651,8 +657,12 @@ async function main(): Promise<number> {
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
+    streamManager,
+    turnRequestBuilderBindings,
+    runtime: coreRuntime,
+    appFiberScope,
   } = createCoreServices({
-    config,
+    ...runStores,
     policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
@@ -674,23 +684,30 @@ async function main(): Promise<number> {
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
   // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
   // OAuth tokens from providers.jsonc.
-  const codexOauthService = new CodexOauthService(config, providerService);
-  aiService.setCodexOauthService(codexOauthService);
+  const codexOauthService = new CodexOauthService(runProvidersStore, providerService);
+  turnRequestBuilderBindings.codexOauthService = codexOauthService;
   // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
   // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
   // the refresh token on every use, so persisting rotations only to tempDir
   // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
   // once this CLI session exits.
-  const realProviderService = new ProviderService(realConfig, policyService);
-  const coderOauthService = new CoderOauthService(
+  const realFileLeaseManager = realStores.fileLeaseManager;
+  const realProviderService = new ProviderService(
     realConfig,
+    policyService,
+    realProvidersStore,
+    realFileLeaseManager
+  );
+  const coderOauthService = new CoderOauthService(
+    realProvidersStore,
+    realFileLeaseManager,
     realProviderService,
     undefined,
     // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
     // token refreshes/issuer checks, and denied providers fail closed.
     policyService
   );
-  aiService.setCoderOauthService(coderOauthService);
+  turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -715,13 +732,14 @@ async function main(): Promise<number> {
       return { success: true, exit_code };
     },
   });
-  aiService.setExtraTools({ set_exit_code: setExitCodeTool });
+  turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
     workspaceId,
     config,
     historyService,
     aiService,
+    streamManager,
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService,
@@ -1556,6 +1574,9 @@ async function main(): Promise<number> {
           name: "backgroundProcessManager.beginShutdown",
           run: () => backgroundProcessManager.beginShutdown(),
         },
+        // Interrupt + await the runtime's supervised fibers while their
+        // dependencies are still alive (same slot as ServiceContainer.dispose).
+        { name: "appFiberScope.close", run: () => closeScopeBounded(appFiberScope) },
         { name: "session.dispose", run: () => session.dispose() },
         { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
@@ -1570,6 +1591,8 @@ async function main(): Promise<number> {
                 run: () => backgroundProcessManager.terminateAll(),
               },
             ]),
+        // Last: release the Effect runtime that owns the core graph.
+        { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
       ],
       (stepName, error) => {
         const message = getErrorMessage(error);

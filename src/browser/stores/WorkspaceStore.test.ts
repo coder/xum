@@ -303,21 +303,6 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<bo
   return false;
 }
 
-/** Like {@link waitUntil} but with an attempt budget instead of a wall clock. */
-async function waitForCondition(
-  condition: () => boolean,
-  maxAttempts = 400,
-  intervalMs = 10
-): Promise<boolean> {
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (condition()) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return false;
-}
-
 /**
  * Sleep helper used to flush microtasks/timers between synchronous test steps.
  * Equivalent to `await new Promise(r => setTimeout(r, ms))` but easier to grep.
@@ -513,19 +498,6 @@ const streamEndEvent = (
   messageId,
   metadata: { model: TEST_MODEL, historySequence: 1, timestamp: 1_001 },
   parts: [],
-  ...overrides,
-});
-
-const streamAbortEvent = (
-  workspaceId: string,
-  messageId: string,
-  overrides: Partial<ChatEvent<"stream-abort">> = {}
-): WorkspaceChatMessage => ({
-  type: "stream-abort",
-  workspaceId,
-  messageId,
-  abortReason: "user",
-  metadata: {},
   ...overrides,
 });
 
@@ -1279,122 +1251,6 @@ describe("WorkspaceStore", () => {
         expect.anything()
       );
     });
-
-    it("does not pin hydration while waiting for the chat client", async () => {
-      const workspaceId = "workspace-awaiting-client";
-
-      store.setClient(null);
-      createAndAddWorkspace(store, workspaceId, {}, false);
-
-      store.setActiveWorkspaceId(workspaceId);
-      await tick(10);
-
-      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
-      expect(mockOnChat).not.toHaveBeenCalled();
-    });
-
-    it("clears hydration after first pre-caught-up failure when client disconnects", async () => {
-      const workspaceId = "workspace-hydration-first-failure-offline";
-      let attempts = 0;
-      let resolveFirstFailure!: () => void;
-      const firstFailure = new Promise<void>((resolve) => {
-        resolveFirstFailure = resolve;
-      });
-
-      // eslint-disable-next-line require-yield
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        attempts += 1;
-        if (attempts === 1) {
-          resolveFirstFailure();
-          throw new Error("first-retry-failure");
-        }
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.setActiveWorkspaceId(workspaceId);
-      await firstFailure;
-
-      // Simulate transport/client loss before a second retry can catch up.
-      store.setClient(null);
-      await tick(20);
-
-      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
-    });
-
-    it("switches onChat subscriptions when active workspace changes", async () => {
-      mockChatScript([], { keepOpen: true });
-
-      createAndAddWorkspace(store, "workspace-1", {}, false);
-      createAndAddWorkspace(store, "workspace-2", {}, false);
-
-      store.setActiveWorkspaceId("workspace-1");
-      await tick(0);
-
-      store.setActiveWorkspaceId("workspace-2");
-      await tick(0);
-
-      const subscribedWorkspaceIds = mockOnChat.mock.calls.map((call) => {
-        const input = call[0] as { workspaceId?: string };
-        return input.workspaceId;
-      });
-
-      expect(subscribedWorkspaceIds).toEqual(["workspace-1", "workspace-2"]);
-    });
-
-    it("clears replay buffers before aborting the previous active workspace subscription", async () => {
-      mockChatScript([], { keepOpen: true });
-
-      createAndAddWorkspace(store, "workspace-1", {}, false);
-      createAndAddWorkspace(store, "workspace-2", {}, false);
-
-      store.setActiveWorkspaceId("workspace-1");
-      await tick(0);
-
-      const transientState = getInternal<{
-        chatTransientState: Map<
-          string,
-          {
-            caughtUp: boolean;
-            isHydratingTranscript: boolean;
-            replayingHistory: boolean;
-            historicalMessages: WorkspaceChatMessage[];
-            pendingStreamEvents: WorkspaceChatMessage[];
-          }
-        >;
-      }>(store).chatTransientState.get("workspace-1");
-      expect(transientState).toBeDefined();
-
-      transientState!.caughtUp = false;
-      transientState!.isHydratingTranscript = true;
-      transientState!.replayingHistory = true;
-      transientState!.historicalMessages.push(
-        createHistoryMessageEvent("stale-buffered-message", 9)
-      );
-      transientState!.pendingStreamEvents.push({
-        type: "stream-start",
-        workspaceId: "workspace-1",
-        messageId: "stale-buffered-stream",
-        model: "claude-sonnet-4",
-        historySequence: 10,
-        startTime: Date.now(),
-      });
-
-      // Switching active workspaces should clear replay buffers synchronously
-      // before aborting the previous subscription.
-      store.setActiveWorkspaceId("workspace-2");
-
-      expect(transientState!.caughtUp).toBe(false);
-      expect(transientState!.isHydratingTranscript).toBe(false);
-      expect(transientState!.replayingHistory).toBe(false);
-      expect(transientState!.historicalMessages).toHaveLength(0);
-      expect(transientState!.pendingStreamEvents).toHaveLength(0);
-      expect(store.getWorkspaceState("workspace-2").isHydratingTranscript).toBe(true);
-    });
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
 
@@ -1431,122 +1287,6 @@ describe("WorkspaceStore", () => {
       const state = store.getWorkspaceState(workspaceId);
       expect(state.isStreamStarting).toBe(true);
       expect(state.pendingStreamModel).toBe(requestedModel);
-    });
-
-    it("clears transcript hydration after repeated catch-up retry failures", async () => {
-      const workspaceId = "workspace-hydration-retry-fallback";
-      let attempts = 0;
-
-      // eslint-disable-next-line require-yield
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        attempts += 1;
-        if (attempts <= 2) {
-          throw new Error(`retry-failure-${attempts}`);
-        }
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.setActiveWorkspaceId(workspaceId);
-
-      const startedAt = Date.now();
-      while (mockOnChat.mock.calls.length < 3 && Date.now() - startedAt < 3_000) {
-        await tick(20);
-      }
-
-      expect(mockOnChat.mock.calls.length).toBeGreaterThanOrEqual(3);
-      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
-    });
-
-    it("clears transcript hydration when retries keep replaying partial history without caught-up", async () => {
-      const workspaceId = "workspace-hydration-partial-replay-fallback";
-      let attempts = 0;
-
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        attempts += 1;
-
-        // Simulate flaky reconnects that emit some replay rows, then terminate
-        // before caught-up can arrive.
-        yield createHistoryMessageEvent(`partial-history-${attempts}`, attempts);
-        if (attempts <= 2) {
-          return;
-        }
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.setActiveWorkspaceId(workspaceId);
-
-      const startedAt = Date.now();
-      while (mockOnChat.mock.calls.length < 3 && Date.now() - startedAt < 3_000) {
-        await tick(20);
-      }
-
-      expect(mockOnChat.mock.calls.length).toBeGreaterThanOrEqual(3);
-      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
-    });
-
-    it("drops queued chat events from an aborted subscription attempt", async () => {
-      const queuedMicrotasks: Array<() => void> = [];
-      const originalQueueMicrotask = global.queueMicrotask;
-      let resolveQueuedEvent!: () => void;
-      const queuedEvent = new Promise<void>((resolve) => {
-        resolveQueuedEvent = resolve;
-      });
-
-      global.queueMicrotask = (callback) => {
-        queuedMicrotasks.push(callback);
-        resolveQueuedEvent();
-      };
-
-      try {
-        mockOnChat.mockImplementation(async function* (
-          input?: { workspaceId: string; mode?: unknown },
-          options?: { signal?: AbortSignal }
-        ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-          if (input?.workspaceId === "workspace-1") {
-            yield createHistoryMessageEvent("queued-after-switch", 11);
-          }
-          await waitForAbortSignal(options?.signal);
-        });
-
-        createAndAddWorkspace(store, "workspace-1", {}, false);
-        createAndAddWorkspace(store, "workspace-2", {}, false);
-
-        store.setActiveWorkspaceId("workspace-1");
-        await queuedEvent;
-
-        const transientState = getInternal<{
-          chatTransientState: Map<
-            string,
-            {
-              historicalMessages: WorkspaceChatMessage[];
-              pendingStreamEvents: WorkspaceChatMessage[];
-            }
-          >;
-        }>(store).chatTransientState.get("workspace-1");
-        expect(transientState).toBeDefined();
-
-        // Abort workspace-1 attempt by moving focus; the queued callback should now no-op.
-        store.setActiveWorkspaceId("workspace-2");
-
-        for (const callback of queuedMicrotasks) {
-          callback();
-        }
-
-        expect(transientState!.historicalMessages).toHaveLength(0);
-        expect(transientState!.pendingStreamEvents).toHaveLength(0);
-      } finally {
-        global.queueMicrotask = originalQueueMicrotask;
-      }
     });
   });
 
@@ -2262,6 +2002,395 @@ describe("WorkspaceStore", () => {
 
       const clearedState = store.getWorkspaceState(workspaceId);
       expect(clearedState.canInterrupt).toBe(false);
+    });
+
+    it("routes live deltas through the keyed channel without bumping workspace state", async () => {
+      const workspaceId = "fine-grained-deltas";
+      const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+      const messageId = "stream-message";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        states: { bump: (key: string) => void };
+        streamingStatsStore: { bump: (key: string) => void };
+        streamingMessageStore: { has: (key: string) => boolean };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        processStreamEvent: (
+          id: string,
+          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store);
+      // Dispatch below the caught-up buffering gate: the mock onChat retry loop
+      // resets transient.caughtUp whenever an await lets it advance, which would
+      // silently buffer later events. Hydration gating is covered elsewhere.
+      const dispatch = (event: WorkspaceChatMessage) =>
+        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
+
+      rawStore.handleChatMessage(workspaceId, {
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      rawStore.handleChatMessage(workspaceId, {
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: {},
+        tokens: 0,
+        timestamp: 1,
+      });
+
+      const bump = spyOn(rawStore.states, "bump");
+      const listener = mock(() => undefined);
+      // A delta that adds a part creates a new display row, which only a
+      // workspace bump can mount; within-part deltas stay row-local.
+      const deltas: Array<{ event: WorkspaceChatMessage; createsRow: boolean }> = [
+        {
+          event: {
+            type: "stream-delta",
+            workspaceId,
+            messageId,
+            delta: "hello",
+            tokens: 1,
+            timestamp: 2,
+          },
+          createsRow: true,
+        },
+        {
+          event: {
+            type: "stream-delta",
+            workspaceId,
+            messageId,
+            delta: " world",
+            tokens: 1,
+            timestamp: 3,
+          },
+          createsRow: false,
+        },
+        {
+          event: {
+            type: "reasoning-delta",
+            workspaceId,
+            messageId,
+            delta: "thinking",
+            tokens: 1,
+            timestamp: 4,
+          },
+          createsRow: true,
+        },
+        {
+          event: {
+            type: "reasoning-delta",
+            workspaceId,
+            messageId,
+            delta: " harder",
+            tokens: 1,
+            timestamp: 5,
+          },
+          createsRow: false,
+        },
+        {
+          event: {
+            type: "tool-call-delta",
+            workspaceId,
+            messageId,
+            toolCallId: "tool-1",
+            toolName: "bash",
+            delta: { command: "echo hi" },
+            tokens: 1,
+            timestamp: 6,
+          },
+          createsRow: false,
+        },
+      ];
+
+      const statsBump = spyOn(rawStore.streamingStatsStore, "bump");
+      const trailingRowId = () => {
+        const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const row = rows[i];
+          if ("historyId" in row && row.historyId === messageId) return row.id;
+        }
+        throw new Error("no displayed row for streaming message");
+      };
+      bump.mockClear();
+      for (const { event, createsRow } of deltas) {
+        listener.mockClear();
+        bump.mockClear();
+        statsBump.mockClear();
+        if (createsRow) {
+          dispatch(event);
+          expect(bump).toHaveBeenCalledWith(workspaceId);
+          expect(statsBump).toHaveBeenCalledWith(workspaceId);
+        } else {
+          const unsubscribeRow = store.subscribeStreamingMessage(
+            workspaceId,
+            trailingRowId(),
+            listener
+          );
+          dispatch(event);
+          await flushMicrotasks();
+          expect(bump).not.toHaveBeenCalled();
+          expect(listener).toHaveBeenCalledTimes(1);
+          unsubscribeRow();
+        }
+      }
+
+      dispatch({
+        type: "reasoning-end",
+        workspaceId,
+        messageId,
+      });
+      expect(bump).toHaveBeenCalledWith(workspaceId);
+
+      const streamingRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((message) => message.type === "assistant" && message.historyId === messageId)!;
+      expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).not.toBeNull();
+      const liveRowKey = `${workspaceId}\u0000${trailingRowId()}`;
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
+
+      dispatch(
+        streamEndEvent(workspaceId, messageId, {
+          parts: [{ type: "text", text: "hello world" }],
+        })
+      );
+      // Terminal events release the keyed channel and stop overriding prop rows,
+      // so transcript-level transforms (e.g. merged stream errors) survive.
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
+      expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
+    });
+
+    it("mounts rows created by a second concurrent stream's deltas", () => {
+      const workspaceId = "concurrent-stream-deltas";
+      const firstMessageId = "stream-message-1";
+      const secondMessageId = "stream-message-2";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        states: { bump: (key: string) => void };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        processStreamEvent: (
+          id: string,
+          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store);
+      const dispatch = (event: WorkspaceChatMessage) =>
+        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
+
+      rawStore.handleChatMessage(workspaceId, {
+        type: "stream-start",
+        workspaceId,
+        messageId: firstMessageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      // Second stream starts while the first stream's context is still active
+      // (its terminal event has not been processed yet).
+      dispatch({
+        type: "stream-start",
+        workspaceId,
+        messageId: secondMessageId,
+        historySequence: 2,
+        model: TEST_MODEL,
+        startTime: 2,
+      });
+
+      const bump = spyOn(rawStore.states, "bump");
+      bump.mockClear();
+      // The row-creating delta belongs to the newer stream; deriving the part
+      // count from the older active-stream entry would skip the mount bump and
+      // leave the new row hidden until the next structural event.
+      dispatch({
+        type: "stream-delta",
+        workspaceId,
+        messageId: secondMessageId,
+        delta: "hello",
+        tokens: 1,
+        timestamp: 3,
+      });
+      expect(bump).toHaveBeenCalledWith(workspaceId);
+
+      // The live row lookup must accept any active message: keying it to the
+      // first active-stream entry would return null for the newer stream's row
+      // and leave it rendering a stale prop row between workspace bumps.
+      const secondRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((message) => "historyId" in message && message.historyId === secondMessageId)!;
+      expect(store.getStreamingMessage(workspaceId, secondRow.id, secondMessageId)).not.toBeNull();
+    });
+
+    it("releases the keyed channel when a background activity stop clears the stream", async () => {
+      const workspaceId = "keyed-channel-background-stop";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        applyWorkspaceActivitySnapshot: (
+          id: string,
+          snapshot: WorkspaceActivitySnapshot | null
+        ) => void;
+      }>(store);
+      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
+      const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      send({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-a",
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      send(caughtUpEvent());
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId: "msg-a",
+        delta: "a",
+        tokens: 1,
+        timestamp: 2,
+      });
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId: "msg-a",
+        delta: "b",
+        tokens: 1,
+        timestamp: 3,
+      });
+      await flush();
+      const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
+      const liveRow = rows.find((row) => row.type === "assistant" && row.historyId === "msg-a")!;
+      const liveRowKey = `${workspaceId}\u0000${liveRow.id}`;
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
+
+      // Background the workspace, then let activity report the stream stopped:
+      // no terminal chat event ever arrives, so the activity path must release
+      // the keyed channel.
+      createAndAddWorkspace(store, "keyed-channel-foreground");
+      rawStore.applyWorkspaceActivitySnapshot(
+        workspaceId,
+        createActivitySnapshot(10, { streaming: true })
+      );
+      rawStore.applyWorkspaceActivitySnapshot(
+        workspaceId,
+        createActivitySnapshot(11, { streaming: false })
+      );
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
+    });
+
+    it("publishes the same accumulated text shown by the live channel", () => {
+      const workspaceId = "live-final-content";
+      const messageId = "stream-message";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+      }>(store);
+      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
+
+      send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      send(caughtUpEvent());
+      for (const [delta, timestamp] of [
+        ["hello", 2],
+        [" world", 3],
+      ] as const) {
+        send({ type: "stream-delta", workspaceId, messageId, delta, tokens: 1, timestamp });
+      }
+
+      const aggregator = store.getAggregator(workspaceId)!;
+      const displayed = aggregator
+        .getDisplayedMessages()
+        .find((message) => message.type === "assistant" && message.historyId === messageId)!;
+      const live = store.getStreamingMessage(workspaceId, displayed.id, messageId);
+      expect(live?.type === "assistant" ? live.content : null).toBe("hello world");
+
+      send(
+        streamEndEvent(workspaceId, messageId, {
+          parts: [{ type: "text", text: "hello world" }],
+        })
+      );
+      const published = aggregator
+        .getDisplayedMessages()
+        .find((message) => message.type === "assistant" && message.historyId === messageId);
+      expect(published?.type === "assistant" ? published.content : null).toBe(
+        live?.type === "assistant" ? live.content : null
+      );
+    });
+
+    it("keeps split tool and text rows distinct on fine-grained updates", () => {
+      const workspaceId = "split-streaming-rows";
+      const messageId = "stream-message";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+      }>(store);
+      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
+
+      send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      send(caughtUpEvent());
+      send({
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: { command: "ls" },
+        tokens: 1,
+        timestamp: 2,
+      });
+      send({
+        type: "tool-call-end",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        result: { output: "file.txt" },
+        timestamp: 3,
+      });
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId,
+        delta: "summary",
+        tokens: 1,
+        timestamp: 4,
+      });
+
+      const displayed = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .filter((message) => "historyId" in message && message.historyId === messageId);
+      const tool = displayed.find((message) => message.type === "tool")!;
+      const text = displayed.find((message) => message.type === "assistant")!;
+
+      expect(store.getStreamingMessage(workspaceId, tool.id, messageId)?.type).toBe("tool");
+      const liveText = store.getStreamingMessage(workspaceId, text.id, messageId);
+      expect(liveText?.type === "assistant" ? liveText.content : null).toBe("summary");
     });
 
     it("invalidates streaming-stats cache on stream-error so subscribers don't see stale TPS", async () => {
@@ -3753,354 +3882,6 @@ describe("WorkspaceStore", () => {
       expect(internalStore.activityStreamingStartRecency.size).toBe(0);
     });
 
-    it("opens activity subscription before listing snapshots", async () => {
-      resetStore();
-
-      const callOrder: string[] = [];
-
-      mockActivitySubscribe.mockImplementation(
-        (
-          _input?: void,
-          options?: { signal?: AbortSignal }
-        ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> => {
-          callOrder.push("subscribe");
-
-          // eslint-disable-next-line require-yield
-          return (async function* (): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-            await waitForAbortSignal(options?.signal);
-          })();
-        }
-      );
-
-      mockActivityList.mockImplementation(() => {
-        callOrder.push("list");
-        return Promise.resolve({});
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      const sawBothCalls = await waitUntil(() => callOrder.length >= 2);
-      expect(sawBothCalls).toBe(true);
-      expect(callOrder.slice(0, 2)).toEqual(["subscribe", "list"]);
-    });
-
-    it("ignores heartbeat events from workspace activity subscription", async () => {
-      const workspaceId = "activity-heartbeat-ignore";
-      const snapshotRecency = new Date("2024-01-09T00:00:00.000Z").getTime();
-      const snapshot: WorkspaceActivitySnapshot = {
-        recency: snapshotRecency,
-        streaming: false,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: "low",
-      };
-
-      let releaseHeartbeat!: () => void;
-      const heartbeatReady = new Promise<void>((resolve) => {
-        releaseHeartbeat = resolve;
-      });
-
-      resetStore();
-      mockActivityList.mockResolvedValue({ [workspaceId]: snapshot });
-
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await heartbeatReady;
-        if (options?.signal?.aborted) {
-          return;
-        }
-
-        yield { type: "heartbeat" as const };
-        await waitForAbortSignal(options?.signal);
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-      // Let the initial activity.list call seed the cache before the workspace is created.
-      await tick(0);
-      createAndAddWorkspace(
-        store,
-        workspaceId,
-        {
-          createdAt: "2020-01-01T00:00:00.000Z",
-        },
-        false
-      );
-
-      const seededSnapshot = await waitUntil(() => {
-        const state = store.getWorkspaceState(workspaceId);
-        return (
-          state.recencyTimestamp === snapshot.recency &&
-          state.canInterrupt === snapshot.streaming &&
-          state.currentModel === snapshot.lastModel
-        );
-      });
-      expect(seededSnapshot).toBe(true);
-
-      const stateBeforeHeartbeat = store.getWorkspaceState(workspaceId);
-      releaseHeartbeat();
-      await tick(20);
-
-      const stateAfterHeartbeat = store.getWorkspaceState(workspaceId);
-      expect(stateAfterHeartbeat).toBe(stateBeforeHeartbeat);
-      expect(stateAfterHeartbeat.recencyTimestamp).toBe(snapshot.recency);
-      expect(stateAfterHeartbeat.canInterrupt).toBe(snapshot.streaming);
-      expect(stateAfterHeartbeat.currentModel).toBe(snapshot.lastModel);
-      expect(stateAfterHeartbeat.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
-    });
-
-    it("retries workspace activity subscription after a stall", async () => {
-      const workspaceId = "activity-stall-retry";
-      const snapshot: WorkspaceActivitySnapshot = {
-        recency: new Date("2024-01-10T00:00:00.000Z").getTime(),
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: null,
-      };
-
-      resetStore();
-      mockActivityList.mockResolvedValue({ [workspaceId]: snapshot });
-      // Clear calls from the store created in beforeEach so this test only tracks its own retries.
-      mockActivitySubscribe.mockClear();
-
-      const subscriptionSignals: AbortSignal[] = [];
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        if (options?.signal) {
-          subscriptionSignals.push(options.signal);
-        }
-
-        if (subscriptionSignals.length === 1) {
-          yield {
-            type: "activity" as const,
-            workspaceId,
-            activity: snapshot,
-          };
-        }
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      const originalDateNow = Date.now;
-      let now = 0;
-      Date.now = () => now;
-
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-        store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-        createAndAddWorkspace(
-          store,
-          workspaceId,
-          {
-            createdAt: "2020-01-01T00:00:00.000Z",
-          },
-          false
-        );
-
-        const sawInitialSubscribe = await waitForCondition(
-          () => mockActivitySubscribe.mock.calls.length >= 1,
-          100,
-          10
-        );
-        expect(sawInitialSubscribe).toBe(true);
-
-        const sawSeededActivity = await waitForCondition(() => {
-          const state = store.getWorkspaceState(workspaceId);
-          return (
-            state.recencyTimestamp === snapshot.recency && state.canInterrupt === snapshot.streaming
-          );
-        });
-        expect(sawSeededActivity).toBe(true);
-
-        // Fast-forward perceived wall-clock so the first 2s watchdog tick treats the stream as stalled.
-        now = 11_000;
-
-        const sawRetry = await waitForCondition(
-          () => mockActivitySubscribe.mock.calls.length >= 2,
-          500,
-          10
-        );
-        expect(sawRetry).toBe(true);
-
-        await tick(20);
-        expect(subscriptionSignals[0]?.aborted).toBe(true);
-      } finally {
-        Date.now = originalDateNow;
-      }
-    });
-
-    it("preserves cached activity snapshots when list reports a read failure (null)", async () => {
-      const workspaceId = "activity-list-read-failure";
-      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
-      const snapshot: WorkspaceActivitySnapshot = {
-        recency: initialRecency,
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: "high",
-      };
-
-      resetStore();
-
-      let listCallCount = 0;
-      mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
-          listCallCount += 1;
-          if (listCallCount === 1) {
-            return Promise.resolve({ [workspaceId]: snapshot });
-          }
-          return Promise.resolve(null);
-        }
-      );
-
-      // eslint-disable-next-line require-yield
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await waitForAbortSignal(options?.signal);
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-      createAndAddWorkspace(
-        store,
-        workspaceId,
-        {
-          createdAt: "2020-01-01T00:00:00.000Z",
-        },
-        false
-      );
-
-      const seededSnapshot = await waitUntil(() => {
-        const state = store.getWorkspaceState(workspaceId);
-        return state.recencyTimestamp === initialRecency && state.canInterrupt === true;
-      });
-      expect(seededSnapshot).toBe(true);
-
-      // Swap to a new client object to force activity subscription restart and a fresh list() call.
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
-      expect(sawRetryListCall).toBe(true);
-
-      const stateAfterFailedList = store.getWorkspaceState(workspaceId);
-      expect(stateAfterFailedList.recencyTimestamp).toBe(initialRecency);
-      expect(stateAfterFailedList.canInterrupt).toBe(true);
-      expect(stateAfterFailedList.currentModel).toBe(snapshot.lastModel);
-      expect(stateAfterFailedList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
-    });
-
-    it("clears cached activity snapshots when a later list is legitimately empty", async () => {
-      const workspaceId = "activity-list-empty-clears";
-      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
-      const snapshot: WorkspaceActivitySnapshot = {
-        recency: initialRecency,
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: "high",
-      };
-
-      resetStore();
-
-      let listCallCount = 0;
-      mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
-          listCallCount += 1;
-          if (listCallCount === 1) {
-            return Promise.resolve({ [workspaceId]: snapshot });
-          }
-          return Promise.resolve({});
-        }
-      );
-
-      // eslint-disable-next-line require-yield
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await waitForAbortSignal(options?.signal);
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-      createAndAddWorkspace(
-        store,
-        workspaceId,
-        {
-          createdAt: "2020-01-01T00:00:00.000Z",
-        },
-        false
-      );
-
-      const seededSnapshot = await waitUntil(() => {
-        const state = store.getWorkspaceState(workspaceId);
-        return state.recencyTimestamp === initialRecency && state.canInterrupt === true;
-      });
-      expect(seededSnapshot).toBe(true);
-
-      // Swap to a new client object to force activity subscription restart and a fresh list() call.
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      // {} is a valid all-idle payload (failures arrive as null), so the stale
-      // streaming snapshot must clear instead of being preserved.
-      const clearedStreaming = await waitUntil(
-        () => store.getWorkspaceState(workspaceId).canInterrupt === false
-      );
-      expect(clearedStreaming).toBe(true);
-    });
-
-    it("marks activity authoritative when the initial list is legitimately empty", async () => {
-      resetStore();
-      mockActivityList.mockResolvedValue({});
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      // An all-idle cold start must become authoritative, otherwise baseline
-      // consumers (Workflows tab auto-activation) would stay disarmed forever.
-      const authoritative = await waitUntil(() => store.isActivityAuthoritative());
-      expect(authoritative).toBe(true);
-    });
-
-    it("hydrates without authority when the initial list reports a read failure", async () => {
-      resetStore();
-      mockActivityList.mockResolvedValue(null);
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      const hydrated = await waitUntil(() => store.isActivityHydrated());
-      expect(hydrated).toBe(true);
-      expect(store.isActivityAuthoritative()).toBe(false);
-    });
-
-    it("regains authority by retrying a transiently null bootstrap list", async () => {
-      resetStore();
-
-      let listCallCount = 0;
-      mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
-          listCallCount += 1;
-          // The subscription stays healthy the whole time, so only the
-          // background bootstrap retry can issue the second read.
-          return Promise.resolve(listCallCount === 1 ? null : {});
-        }
-      );
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      const authoritative = await waitUntil(() => store.isActivityAuthoritative(), 5000);
-      expect(authoritative).toBe(true);
-      expect(listCallCount).toBeGreaterThanOrEqual(2);
-    });
-
     it("keeps newer subscription deltas over a stale bootstrap-retry list", async () => {
       const workspaceId = "activity-retry-delta-race";
       resetStore();
@@ -4166,72 +3947,6 @@ describe("WorkspaceStore", () => {
       expect(authoritative).toBe(true);
       expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
     });
-
-    it("resyncs after a reconnect bootstrap failure even when authority is already latched", async () => {
-      const workspaceId = "activity-reconnect-null-bootstrap";
-      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
-      const snapshot: WorkspaceActivitySnapshot = {
-        recency: initialRecency,
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: "high",
-      };
-
-      resetStore();
-
-      let listCallCount = 0;
-      mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
-          listCallCount += 1;
-          if (listCallCount === 1) {
-            // First connection: authority latches.
-            return Promise.resolve({ [workspaceId]: snapshot });
-          }
-          if (listCallCount === 2) {
-            // Reconnect bootstrap: transient read failure.
-            return Promise.resolve(null);
-          }
-          // Reconnect retry: the workspace went idle while disconnected. The
-          // fresh subscription never replays this, so only the retry can resync.
-          return Promise.resolve({});
-        }
-      );
-
-      // eslint-disable-next-line require-yield
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await waitForAbortSignal(options?.signal);
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-      createAndAddWorkspace(
-        store,
-        workspaceId,
-        {
-          createdAt: "2020-01-01T00:00:00.000Z",
-        },
-        false
-      );
-
-      const seeded = await waitUntil(() => {
-        const state = store.getWorkspaceState(workspaceId);
-        return state.canInterrupt === true && store.isActivityAuthoritative();
-      });
-      expect(seeded).toBe(true);
-
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
-
-      const resynced = await waitUntil(
-        () => store.getWorkspaceState(workspaceId).canInterrupt === false,
-        5000
-      );
-      expect(resynced).toBe(true);
-      expect(listCallCount).toBeGreaterThanOrEqual(3);
-    });
   });
 
   describe("terminal activity", () => {
@@ -4288,80 +4003,6 @@ describe("WorkspaceStore", () => {
       const sidebarState = store.getWorkspaceSidebarState(workspaceId);
       expect(sidebarState.terminalActiveCount).toBe(2);
       expect(sidebarState.terminalSessionCount).toBe(3);
-    });
-
-    it("retries terminal activity subscription after a stall", async () => {
-      const workspaceId = "terminal-activity-stall-retry";
-      const subscriptionSignals: AbortSignal[] = [];
-
-      const terminalSubscribeMock = mock(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<TerminalActivityEvent, void, unknown> {
-        if (options?.signal) {
-          subscriptionSignals.push(options.signal);
-        }
-
-        if (subscriptionSignals.length === 1) {
-          yield {
-            type: "snapshot",
-            workspaces: {
-              [workspaceId]: { activeCount: 1, totalSessions: 1 },
-            },
-          };
-        }
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      const fullClient = {
-        ...mockClient,
-        terminal: {
-          activity: {
-            subscribe: terminalSubscribeMock,
-          },
-        },
-      };
-
-      resetStore();
-      createAndAddWorkspace(store, workspaceId);
-
-      const originalDateNow = Date.now;
-      let now = 0;
-      Date.now = () => now;
-
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-        store.setClient(fullClient as any);
-
-        const sawInitialSubscribe = await waitForCondition(
-          () => terminalSubscribeMock.mock.calls.length >= 1,
-          100,
-          10
-        );
-        expect(sawInitialSubscribe).toBe(true);
-
-        const sawSeededTerminalSnapshot = await waitForCondition(() => {
-          const state = store.getWorkspaceSidebarState(workspaceId);
-          return state.terminalActiveCount === 1 && state.terminalSessionCount === 1;
-        });
-        expect(sawSeededTerminalSnapshot).toBe(true);
-
-        // Fast-forward perceived wall-clock so the first 2s watchdog tick treats the stream as stalled.
-        now = 11_000;
-
-        const sawRetry = await waitForCondition(
-          () => terminalSubscribeMock.mock.calls.length >= 2,
-          500,
-          10
-        );
-        expect(sawRetry).toBe(true);
-
-        await tick(20);
-        expect(subscriptionSignals[0]?.aborted).toBe(true);
-      } finally {
-        Date.now = originalDateNow;
-      }
     });
 
     it("treats missing terminal.activity.subscribe as unsupported capability (no crash/retry)", async () => {
@@ -5109,6 +4750,10 @@ describe("WorkspaceStore", () => {
       ]);
 
       createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      const advisorKey = `${workspaceId}\u0000call-advisor-output-delete`;
 
       const hasLiveOutput = await waitUntil(
         () =>
@@ -5116,6 +4761,7 @@ describe("WorkspaceStore", () => {
           "stale partial advice"
       );
       expect(hasLiveOutput).toBe(true);
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
 
       releaseDelete?.();
 
@@ -5123,6 +4769,43 @@ describe("WorkspaceStore", () => {
         () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete") === null
       );
       expect(clearedLiveOutput).toBe(true);
+      // The delete-time sweep must release the keyed channel as well: with the
+      // transient entry gone, no later sweep can rediscover this key.
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
+    });
+
+    it("releases keyed advisor channels when a full replay resets transient state", async () => {
+      const workspaceId = "advisor-output-full-replay-reset";
+
+      mockChatScript(
+        [
+          caughtUpEvent(),
+          Promise.resolve(),
+          advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
+        ],
+        { keepOpen: true }
+      );
+
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+        resetChatStateForReplay: (workspaceId: string) => void;
+      }>(store);
+      const advisorKey = `${workspaceId}\u0000call-advisor-replay-reset`;
+
+      const hasLiveOutput = await waitUntil(
+        () =>
+          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")?.text ===
+          "partial advice"
+      );
+      expect(hasLiveOutput).toBe(true);
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
+
+      rawStore.resetChatStateForReplay(workspaceId);
+
+      // The replaced transient maps were the only record of this tool-call ID,
+      // so the reset itself must release the keyed channel.
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
     });
 
     it("replays pre-caught-up advisor output after full replay catches up", async () => {
@@ -5381,169 +5064,6 @@ describe("WorkspaceStore", () => {
       expect(store.getTaskToolLiveTaskIds(workspaceId, "call-task-2")).toBeNull();
     });
 
-    it("preserves pagination state across since reconnect retries", async () => {
-      const workspaceId = "pagination-since-retry";
-      let subscriptionCount = 0;
-      const firstSubscription = createReleaseGate();
-
-      mockOnChat.mockImplementation(async function* (): AsyncGenerator<
-        WorkspaceChatMessage,
-        void,
-        unknown
-      > {
-        subscriptionCount += 1;
-
-        if (subscriptionCount === 1) {
-          yield createHistoryMessageEvent("history-5", 5);
-          yield {
-            type: "caught-up",
-            replay: "full",
-            hasOlderHistory: true,
-            cursor: {
-              history: {
-                messageId: "history-5",
-                historySequence: 5,
-              },
-            },
-          };
-
-          await firstSubscription.wait;
-          return;
-        }
-
-        yield {
-          type: "caught-up",
-          replay: "since",
-          cursor: {
-            history: {
-              messageId: "history-5",
-              historySequence: 5,
-            },
-          },
-        };
-      });
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededPagination = await waitUntil(
-        () => store.getWorkspaceState(workspaceId).hasOlderHistory === true
-      );
-      expect(seededPagination).toBe(true);
-
-      firstSubscription.release();
-
-      const preservedPagination = await waitUntil(() => {
-        return (
-          subscriptionCount >= 2 && store.getWorkspaceState(workspaceId).hasOlderHistory === true
-        );
-      });
-      expect(preservedPagination).toBe(true);
-    });
-
-    it("clears stale live tool state when since replay reports no active stream", async () => {
-      const workspaceId = "task-created-workspace-4";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
-        subscriptionCount === 1
-          ? [
-              createHistoryMessageEvent("history-1", 1),
-              fullCaughtUpEvent(),
-              Promise.resolve(),
-              bashOutputEvent(workspaceId, "call-bash-4", "stale-output\n"),
-              taskCreatedEvent(workspaceId, "call-task-4", "child-workspace-4", 2),
-              firstSubscription.wait,
-            ]
-          : [createHistoryMessageEvent("history-1", 1), sinceCaughtUpEvent()]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededLiveState = await waitUntil(() => {
-        return (
-          store.getBashToolLiveOutput(workspaceId, "call-bash-4") !== null &&
-          JSON.stringify(store.getTaskToolLiveTaskIds(workspaceId, "call-task-4")) ===
-            JSON.stringify(["child-workspace-4"])
-        );
-      });
-      expect(seededLiveState).toBe(true);
-
-      firstSubscription.release();
-
-      const clearedLiveState = await waitUntil(() => {
-        return (
-          getSubscriptionCount() >= 2 &&
-          store.getBashToolLiveOutput(workspaceId, "call-bash-4") === null &&
-          store.getTaskToolLiveTaskIds(workspaceId, "call-task-4") === null
-        );
-      });
-      expect(clearedLiveState).toBe(true);
-    });
-
-    it("clears stale live tool state when server stream exists but local stream context is missing", async () => {
-      const workspaceId = "task-created-workspace-7";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
-        subscriptionCount === 1
-          ? [
-              // Cursor anchored at the row the in-flight stream below will finalize,
-              // so the second subscription legitimately requests since.
-              caughtUpEvent({
-                cursor: {
-                  history: { messageId: "msg-old-stream-missing-local", historySequence: 1 },
-                },
-              }),
-              Promise.resolve(),
-              streamStartEvent(workspaceId, "msg-old-stream-missing-local", {
-                startTime: 1_000,
-                model: "claude-3-5-sonnet-20241022",
-              }),
-              bashOutputEvent(workspaceId, "call-bash-7", "stale-after-end\n", {
-                timestamp: 1_001,
-              }),
-              taskCreatedEvent(workspaceId, "call-task-7", "child-workspace-7", 1_002),
-              streamEndEvent(workspaceId, "msg-old-stream-missing-local", {
-                metadata: {
-                  model: "claude-3-5-sonnet-20241022",
-                  historySequence: 1,
-                  timestamp: 1_003,
-                },
-              }),
-              firstSubscription.wait,
-            ]
-          : [
-              // Since replay re-sends the cursor-boundary row before caught-up.
-              createHistoryMessageEvent("msg-old-stream-missing-local", 1),
-              sinceCaughtUpEvent(1, "msg-old-stream-missing-local", {
-                messageId: "msg-new-stream-missing-local",
-                lastTimestamp: 2_000,
-              }),
-            ]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededStaleLiveState = await waitUntil(() => {
-        return (
-          store.getAggregator(workspaceId)?.getOnChatCursor()?.stream === undefined &&
-          store.getBashToolLiveOutput(workspaceId, "call-bash-7") !== null &&
-          JSON.stringify(store.getTaskToolLiveTaskIds(workspaceId, "call-task-7")) ===
-            JSON.stringify(["child-workspace-7"])
-        );
-      });
-      expect(seededStaleLiveState).toBe(true);
-
-      firstSubscription.release();
-
-      const clearedStaleLiveState = await waitUntil(() => {
-        return (
-          getSubscriptionCount() >= 2 &&
-          store.getBashToolLiveOutput(workspaceId, "call-bash-7") === null &&
-          store.getTaskToolLiveTaskIds(workspaceId, "call-task-7") === null
-        );
-      });
-      expect(clearedStaleLiveState).toBe(true);
-    });
-
     it("clears stale active stream context when since replay reports a different stream", async () => {
       const workspaceId = "task-created-workspace-5";
       const firstSubscription = createReleaseGate();
@@ -5608,42 +5128,6 @@ describe("WorkspaceStore", () => {
         );
       });
       expect(switchedToNewStream).toBe(true);
-    });
-
-    it("clears stale abort reason when since reconnect is downgraded to full replay", async () => {
-      const workspaceId = "task-created-workspace-6";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
-        subscriptionCount === 1
-          ? [
-              caughtUpEvent(),
-              Promise.resolve(),
-              streamStartEvent(workspaceId, "msg-abort-old-stream", {
-                startTime: 1_000,
-                model: "claude-3-5-sonnet-20241022",
-              }),
-              streamAbortEvent(workspaceId, "msg-abort-old-stream"),
-              firstSubscription.wait,
-            ]
-          : [caughtUpEvent({ replay: "full" })]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededAbortReason = await waitUntil(() => {
-        return store.getWorkspaceState(workspaceId).lastAbortReason?.reason === "user";
-      });
-      expect(seededAbortReason).toBe(true);
-
-      firstSubscription.release();
-
-      const clearedAbortReason = await waitUntil(() => {
-        return (
-          getSubscriptionCount() >= 2 &&
-          store.getWorkspaceState(workspaceId).lastAbortReason === null
-        );
-      });
-      expect(clearedAbortReason).toBe(true);
     });
 
     it("reuses the server-issued cursor verbatim on the next subscription", async () => {
@@ -5726,216 +5210,6 @@ describe("WorkspaceStore", () => {
       const resubscribed = await waitUntil(() => subscriptionCount >= 2);
       expect(resubscribed).toBe(true);
       expect(requestedModes[1]).toBeUndefined();
-    });
-
-    it("removes rows the server did not re-send from a since replay", async () => {
-      const workspaceId = "since-suffix-ghost-workspace";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
-        subscriptionCount === 1
-          ? [
-              createHistoryMessageEvent("history-1", 1),
-              createHistoryMessageEvent("history-2", 2),
-              fullCaughtUpEvent(2, "history-2"),
-              Promise.resolve(),
-              // Row streamed live after caught-up: it sits above the stored anchor.
-              createHistoryMessageEvent("history-3", 3),
-              firstSubscription.wait,
-            ]
-          : [
-              // Server deleted history-3 while the client was unsubscribed, so the
-              // since replay re-sends only the anchor row.
-              createHistoryMessageEvent("history-2", 2),
-              sinceCaughtUpEvent(2, "history-2"),
-            ]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seeded = await waitUntil(
-        () => store.getAggregator(workspaceId)?.getAllMessages().length === 3
-      );
-      expect(seeded).toBe(true);
-
-      firstSubscription.release();
-
-      const ghostRemoved = await waitUntil(() => {
-        const ids = store
-          .getAggregator(workspaceId)
-          ?.getAllMessages()
-          .map((message) => message.id);
-        return getSubscriptionCount() >= 2 && JSON.stringify(ids) === '["history-1","history-2"]';
-      });
-      expect(ghostRemoved).toBe(true);
-    });
-
-    it("clears stale auto-retry status when full replay reconnect replaces history", async () => {
-      const workspaceId = "task-created-workspace-auto-retry-reset";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
-        subscriptionCount === 1
-          ? [
-              caughtUpEvent(),
-              Promise.resolve(),
-              { type: "auto-retry-starting", attempt: 2 },
-              firstSubscription.wait,
-            ]
-          : [caughtUpEvent({ replay: "full" })]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededRetryStatus = await waitUntil(() => {
-        return store.getWorkspaceState(workspaceId).autoRetryStatus?.type === "auto-retry-starting";
-      });
-      expect(seededRetryStatus).toBe(true);
-
-      firstSubscription.release();
-
-      const clearedRetryStatus = await waitUntil(() => {
-        return (
-          getSubscriptionCount() >= 2 &&
-          store.getWorkspaceState(workspaceId).autoRetryStatus === null
-        );
-      });
-      expect(clearedRetryStatus).toBe(true);
-    });
-
-    it("replays pre-caught-up task-created after full replay catches up", async () => {
-      const workspaceId = "task-created-workspace-3";
-
-      mockChatScript([
-        {
-          type: "task-created",
-          workspaceId,
-          toolCallId: "call-task-3",
-          taskId: "child-workspace-3",
-          timestamp: 1,
-        },
-        Promise.resolve(),
-        { type: "caught-up", replay: "full" },
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-      await tick(10);
-
-      expect(store.getTaskToolLiveTaskIds(workspaceId, "call-task-3")).toEqual([
-        "child-workspace-3",
-      ]);
-    });
-
-    it("preserves usage state while full replay resets the aggregator", async () => {
-      const workspaceId = "usage-reset-replay-workspace";
-      const firstSubscription = createReleaseGate();
-      const secondCaughtUp = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount, signal) => {
-        if (subscriptionCount === 1) {
-          return [
-            caughtUpEvent(),
-            Promise.resolve(),
-            streamStartEvent(workspaceId, "msg-live-usage", {
-              startTime: 1,
-              model: "claude-3-5-sonnet-20241022",
-            }),
-            {
-              type: "usage-delta",
-              workspaceId,
-              messageId: "msg-live-usage",
-              usage: { inputTokens: 321, outputTokens: 9, totalTokens: 330 },
-              cumulativeUsage: { inputTokens: 500, outputTokens: 15, totalTokens: 515 },
-            },
-            firstSubscription.wait,
-          ];
-        }
-        if (subscriptionCount === 2) {
-          return [
-            // Hold caught-up so the test can inspect usage after resetChatStateForReplay()
-            // cleared the aggregator but before replay completion.
-            secondCaughtUp.wait,
-            caughtUpEvent({ replay: "full" }),
-          ];
-        }
-        return [() => waitForAbortSignal(signal)];
-      });
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededUsage = await waitUntil(() => {
-        const aggregator = store.getAggregator(workspaceId);
-        return aggregator?.getActiveStreamUsage("msg-live-usage")?.inputTokens === 321;
-      });
-      expect(seededUsage).toBe(true);
-
-      firstSubscription.release();
-
-      const startedSecondSubscription = await waitUntil(() => getSubscriptionCount() >= 2);
-      expect(startedSecondSubscription).toBe(true);
-
-      const usageDuringReplay = store.getWorkspaceUsage(workspaceId);
-      expect(usageDuringReplay.liveUsage?.input.tokens).toBe(321);
-      expect(usageDuringReplay.liveCostUsage?.input.tokens).toBe(500);
-
-      secondCaughtUp.release();
-      await tick(10);
-
-      const usageAfterCaughtUp = store.getWorkspaceUsage(workspaceId);
-      expect(usageAfterCaughtUp.liveUsage).toBeUndefined();
-    });
-
-    it("clears replay usage snapshot when reconnect fails before caught-up", async () => {
-      const workspaceId = "usage-reset-replay-failure-workspace";
-      const firstSubscription = createReleaseGate();
-      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount, signal) => {
-        if (subscriptionCount === 1) {
-          return [
-            caughtUpEvent(),
-            Promise.resolve(),
-            streamStartEvent(workspaceId, "msg-live-usage-failure", {
-              startTime: 1,
-              model: "claude-3-5-sonnet-20241022",
-            }),
-            {
-              type: "usage-delta",
-              workspaceId,
-              messageId: "msg-live-usage-failure",
-              usage: { inputTokens: 111, outputTokens: 9, totalTokens: 120 },
-              cumulativeUsage: { inputTokens: 300, outputTokens: 15, totalTokens: 315 },
-            },
-            // Keep two active streams so reconnect cannot build a safe incremental cursor.
-            // This forces a full replay attempt, which executes resetChatStateForReplay().
-            streamStartEvent(workspaceId, "msg-live-usage-failure-2", {
-              historySequence: 2,
-              startTime: 2,
-              model: "claude-3-5-sonnet-20241022",
-            }),
-            firstSubscription.wait,
-          ];
-        }
-        if (subscriptionCount === 2) {
-          // Simulate reconnect failure before authoritative caught-up.
-          return [Promise.resolve()];
-        }
-        return [() => waitForAbortSignal(signal)];
-      });
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const seededUsage = await waitUntil(() => {
-        const aggregator = store.getAggregator(workspaceId);
-        return aggregator?.getActiveStreamUsage("msg-live-usage-failure")?.inputTokens === 111;
-      });
-      expect(seededUsage).toBe(true);
-
-      firstSubscription.release();
-
-      const startedSecondSubscription = await waitUntil(() => getSubscriptionCount() >= 2);
-      expect(startedSecondSubscription).toBe(true);
-
-      const usageSnapshotCleared = await waitUntil(() => {
-        const usage = store.getWorkspaceUsage(workspaceId);
-        return usage.liveUsage === undefined && usage.liveCostUsage === undefined;
-      });
-      expect(usageSnapshotCleared).toBe(true);
     });
 
     it("uses compaction boundary context usage when it is the newest usage in the active epoch", async () => {

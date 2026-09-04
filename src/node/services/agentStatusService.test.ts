@@ -118,7 +118,7 @@ describe("AgentStatusService", () => {
 
     mockConfig = {
       loadConfigOrDefault: mock(() => projectsConfig),
-      getSessionDir: historyHandle.config.getSessionDir.bind(historyHandle.config),
+      sessionsDir: historyHandle.config.sessionsDir,
     } as unknown as Config;
 
     emitWorkspaceActivityMock = mock(() => undefined);

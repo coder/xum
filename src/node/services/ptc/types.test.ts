@@ -10,6 +10,7 @@ import {
   createCaptureSanitizerBudget,
   retainExemptKernelRecordResult,
   retainPersistenceCriticalArgsFields,
+  retainWorkflowResultIdentityFields,
   sanitizeCapturedMediaValue,
   sanitizeMediaRecordCapture,
   SANITIZER_BUDGET_EXHAUSTED_STUB,
@@ -557,6 +558,56 @@ describe("retainPersistenceCriticalArgsFields", () => {
     ).toBeUndefined();
     expect(
       retainPersistenceCriticalArgsFields("file_edit_insert", { path: "\uD800".repeat(1_000) })
+    ).toBeUndefined();
+  });
+
+  it("retains script_path for workflow_run launch args", () => {
+    expect(
+      retainPersistenceCriticalArgsFields("workflow_run", {
+        script_path: "skill://demo/workflow.js",
+        args: { problem: "x".repeat(5_000) },
+      })
+    ).toEqual({ script_path: "skill://demo/workflow.js" });
+    // Inline-source launches have no path to retain.
+    expect(
+      retainPersistenceCriticalArgsFields("workflow_run", {
+        script_source: "export default function workflow() {}",
+      })
+    ).toBeUndefined();
+    expect(
+      retainPersistenceCriticalArgsFields("workflow_run", { script_path: "p".repeat(5_000) })
+    ).toBeUndefined();
+  });
+});
+
+describe("retainWorkflowResultIdentityFields", () => {
+  it("retains runId and validated status for workflow tools", () => {
+    expect(
+      retainWorkflowResultIdentityFields("workflow_run", {
+        status: "completed",
+        runId: "wfr_1",
+        result: { reportMarkdown: "big" },
+      })
+    ).toEqual({ runId: "wfr_1", status: "completed" });
+    expect(
+      retainWorkflowResultIdentityFields("workflow_resume", { status: "running", runId: "wfr_2" })
+    ).toEqual({ runId: "wfr_2", status: "running" });
+  });
+
+  it("drops non-workflow tools, missing runIds, and invalid statuses", () => {
+    expect(
+      retainWorkflowResultIdentityFields("bash", { runId: "wfr_1", status: "completed" })
+    ).toBeUndefined();
+    expect(
+      retainWorkflowResultIdentityFields("workflow_run", { status: "completed" })
+    ).toBeUndefined();
+    expect(retainWorkflowResultIdentityFields("workflow_run", "not-an-object")).toBeUndefined();
+    // A guest-spoofable status is validated; the runId still survives alone.
+    expect(
+      retainWorkflowResultIdentityFields("workflow_run", { runId: "wfr_1", status: "exploded" })
+    ).toEqual({ runId: "wfr_1" });
+    expect(
+      retainWorkflowResultIdentityFields("workflow_run", { runId: "r".repeat(5_000) })
     ).toBeUndefined();
   });
 });

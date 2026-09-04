@@ -2,11 +2,10 @@ import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import type { AIService } from "@/node/services/aiService";
-import { AgentSession } from "@/node/services/agentSession";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
+import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -14,11 +13,30 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import type { StreamErrorType } from "@/common/types/errors";
+
+export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
+  return { messageId, completion: new Promise(() => undefined) };
+}
+
+export function createFailedTurnHandle(
+  messageId: string,
+  failure: { error: string; errorType: StreamErrorType }
+): TurnStreamHandle {
+  return {
+    messageId,
+    completion: Promise.resolve({
+      status: "failed" as const,
+      streamError: { messageId, ...failure },
+    }),
+  };
+}
 
 function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
   return {
+    rootDir: sessionDir,
+    sessionsDir: sessionDir,
     srcDir: sessionDir,
-    getSessionDir: mock((_workspaceId: string) => sessionDir),
     loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }
@@ -37,32 +55,54 @@ function createMockInitStateManager(overrides?: Partial<InitStateManager>): Init
   return Object.assign(new EventEmitter(), overrides) as unknown as InitStateManager;
 }
 
-function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partial<AIService> }): {
+/** Stream-lifecycle surface AgentSession's constructor requires from its engine seam. */
+export function createStreamLifecycleMocks() {
+  return {
+    isStreaming: mock((_workspaceId: string) => false),
+    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+    getStreamInfo: mock((_workspaceId: string) => undefined),
+    replayStream: mock((_workspaceId: string, _options?: { afterTimestamp?: number }) =>
+      Promise.resolve()
+    ),
+  };
+}
+
+function createMockAiService(args?: {
+  emitter?: EventEmitter;
+  overrides?: Partial<AgentSessionAIService>;
+}): {
   aiEmitter: EventEmitter;
-  aiService: AIService;
+  aiService: AgentSessionAIService;
 } {
   const aiEmitter = args?.emitter ?? new EventEmitter();
-  return {
-    aiEmitter,
-    aiService: Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      getStreamInfo: mock((_workspaceId: string) => null),
-      streamMessage: mock((_history: MuxMessage[]) =>
-        Promise.resolve(Ok(undefined))
-      ) as unknown as AIService["streamMessage"],
-      ...args?.overrides,
-    }) as unknown as AIService,
-  };
+  const aiService: AgentSessionAIService = Object.assign(aiEmitter, {
+    // Real implementations report failures as Err results, never rejections.
+    createModelWithPinnedMetadata: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
+    getWorkspaceMetadata: mock(() =>
+      Promise.resolve(Err("Test AI service has no workspace metadata"))
+    ),
+    getProvidersConfig: mock(() => null),
+    isExperimentEnabled: mock((_experimentId) => false),
+    ...createStreamLifecycleMocks(),
+    streamMessage: mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
+    ),
+    ...args?.overrides,
+  });
+  return { aiEmitter, aiService };
 }
 
 export interface AgentSessionHarnessOptions {
   workspaceId: string;
   config?: Config;
   historyService?: HistoryService;
-  aiService?: AIService;
+  aiService?: AgentSessionAIService;
   aiEmitter?: EventEmitter;
-  aiServiceOverrides?: Partial<AIService>;
+  aiServiceOverrides?: Partial<AgentSessionAIService>;
   initStateManager?: InitStateManager;
   initStateManagerOverrides?: Partial<InitStateManager>;
   backgroundProcessManager?: BackgroundProcessManager;
@@ -79,7 +119,7 @@ export interface AgentSessionHarness {
   historyService: HistoryService;
   cleanup: () => Promise<void>;
   aiEmitter: EventEmitter;
-  aiService: AIService;
+  aiService: AgentSessionAIService;
   initStateManager: InitStateManager;
   backgroundProcessManager: BackgroundProcessManager;
   events: WorkspaceChatMessage[];

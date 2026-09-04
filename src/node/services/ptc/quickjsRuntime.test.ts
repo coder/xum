@@ -1177,6 +1177,67 @@ describe("QuickJSRuntime", () => {
       expect(removed.result).toBe("mux.bash is no longer available in this sandbox");
     });
 
+    it("re-registering the same method reuses the guest function identity", async () => {
+      runtime.registerObject("mux", { bash: () => Promise.resolve("one") });
+      const before = await runtime.eval("globalThis.savedBash = mux.bash; return 0;");
+      expect(before.success).toBe(true);
+
+      runtime.registerObject("mux", { bash: () => Promise.resolve("two") });
+      const identity = await runtime.eval("return globalThis.savedBash === mux.bash;");
+      expect(identity.success).toBe(true);
+      expect(identity.result).toBe(true);
+      // Reuse must not pin the old implementation (late-bound dispatch).
+      const rewired = await runtime.eval("return mux.bash();");
+      expect(rewired.result).toBe("two");
+    });
+
+    it("a method removed and later re-added dispatches to the new implementation", async () => {
+      runtime.registerObject("mux", { bash: () => Promise.resolve("original") });
+      runtime.registerObject("mux", {});
+      runtime.registerObject("mux", { bash: () => Promise.resolve("back") });
+      const result = await runtime.eval("return mux.bash();");
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("back");
+    });
+
+    it("a method that flips between async and sync kinds is replaced, not reused", async () => {
+      runtime.registerObject("mux", { ping: () => Promise.resolve("was-async") });
+      const first = await runtime.eval("return mux.ping();");
+      expect(first.result).toBe("was-async");
+
+      runtime.registerObject("mux", {}, { ping: () => "now-sync" });
+      const second = await runtime.eval("return mux.ping();");
+      expect(second.success).toBe(true);
+      expect(second.result).toBe("now-sync");
+
+      runtime.registerObject("mux", { ping: () => Promise.resolve("async-again") });
+      const third = await runtime.eval("return mux.ping();");
+      expect(third.success).toBe(true);
+      expect(third.result).toBe("async-again");
+    });
+
+    it("heavy re-registration does not exhaust the 16-bit host-function id space", async () => {
+      // QuickJS stores host-function ids in a signed 16-bit slot, so one
+      // context can only ever mint 65,536 ids. Without handle reuse, the
+      // registrations below wrap the C-side id and victim.hello dispatches
+      // to an unrelated old closure (the observed kernel corruption where
+      // every xum.* call landed on the wrong tool).
+      const CHUNK = 256;
+      for (let c = 0; c < 260; c++) {
+        const obj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+        for (let i = 0; i < CHUNK; i++) {
+          const tag = `burn-${c}-${i}`;
+          obj[`m${i}`] = () => Promise.resolve(tag);
+        }
+        runtime.registerObject("burn", obj);
+      }
+
+      runtime.registerObject("victim", { hello: () => Promise.resolve("HELLO") });
+      const result = await runtime.eval("return victim.hello();");
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("HELLO");
+    });
+
     it("still reports a genuinely stuck pending Promise", async () => {
       const result = await runtime.eval("return new Promise(() => {});");
       expect(result.success).toBe(false);

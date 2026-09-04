@@ -335,7 +335,7 @@ describe("bash + task_* (background bash tasks)", () => {
     );
 
     expect(getProcess).toHaveBeenCalledWith("proc-1");
-    expect(terminate).toHaveBeenCalledWith("proc-1");
+    expect(terminate).toHaveBeenCalledWith("proc-1", { monitorDisposition: "discard" });
     expect(result).toEqual({
       results: [{ status: "stopped", taskId: "bash:proc-1", stoppedTaskIds: ["bash:proc-1"] }],
     });

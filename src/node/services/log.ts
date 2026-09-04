@@ -23,7 +23,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { parseBoolEnv } from "@/common/utils/env";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getXumHome, getXumLogsDir } from "@/common/constants/paths";
-import { hasDebugSubscriber, pushLogEntry } from "./logBuffer";
+import { clearLogEntries, hasDebugSubscriber, pushLogEntry } from "./logBuffer";
 
 process.once("exit", () => {
   closeLogFile();
@@ -317,6 +317,16 @@ function clearSink(): Promise<void> {
     const stream = createSafeStream(activeLogPath);
     fileSinkState = { status: "open", stream, path: activeLogPath, size: 0 };
   });
+}
+
+export async function clearLogsForApi() {
+  try {
+    await clearLogFiles();
+    clearLogEntries();
+    return { success: true as const };
+  } catch (error) {
+    return { success: false as const, error: getErrorMessage(error) };
+  }
 }
 
 export function clearLogFiles(): Promise<void> {

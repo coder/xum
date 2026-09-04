@@ -1,5 +1,29 @@
+/**
+ * Provider configuration service (providers.jsonc + provider-relevant main
+ * config state).
+ *
+ * Mutation internals are Effect-native: each fallible pipeline is an
+ * `Effect.gen` program and the public Promise methods are thin
+ * `Effect.runPromise` facades, so pre-Effect callers (OAuth services, tests)
+ * keep working unchanged while oRPC routes ride `handlerGen` directly. Every
+ * mutation pipeline is uninterruptible (see `asAtomicMutation`), so a client
+ * abort defers until the write and its post-write consistency steps finish —
+ * matching the pre-Effect Promise chains, which aborts never cancelled.
+ * The wire `Result` unions stay in the success
+ * channel — callers branch on `success`, not on thrown errors — and the only
+ * typed failure is `ProviderPersistenceError`, which carries the
+ * `getErrorMessage` string each facade folds into its own wire error shape
+ * (`persistence_failed` codes / `Failed to ...` strings), exactly like the
+ * old per-method try/catch blocks did.
+ *
+ * Synchronous read paths (`list`, `getConfig`, `validateRouteOverrides`) stay
+ * plain methods: they compose no async work, so an Effect conversion would
+ * add fiber overhead without composition benefit.
+ */
 import { EventEmitter } from "events";
+import { Effect, Schema } from "effect";
 import type { Config, ProjectsConfig } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import {
   PROVIDER_DEFINITIONS,
   SUPPORTED_PROVIDERS,
@@ -127,6 +151,34 @@ function getProviderConfigRecord(config: unknown): Record<string, BaseProviderCo
   return config as Record<string, BaseProviderConfig>;
 }
 
+/**
+ * Typed failure for providers.jsonc / main-config write pipelines. `message`
+ * carries `getErrorMessage(cause)` so each facade folds it into its wire
+ * error shape without reformatting. A single tag is deliberate: no caller
+ * branches on WHICH write failed, only on the folded wire `Result`.
+ */
+class ProviderPersistenceError extends Schema.TaggedError<ProviderPersistenceError>()(
+  "ProviderPersistenceError",
+  { message: Schema.String }
+) {}
+
+function toPersistenceError(error: unknown): ProviderPersistenceError {
+  return new ProviderPersistenceError({ message: getErrorMessage(error) });
+}
+
+/**
+ * Provider mutations must run their write + post-write consistency steps
+ * (change notification, gateway routePriority sync, durable-reference
+ * repair) to completion once started: a client abort interrupting the
+ * handler fiber mid-lock would otherwise persist the callback's write while
+ * skipping the follow-ups, leaving observers and routing state inconsistent.
+ * The pre-Effect implementation had exactly these semantics — an aborted
+ * oRPC request never cancelled the running Promise chain.
+ */
+function asAtomicMutation<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> {
+  return Effect.uninterruptible(effect);
+}
+
 export class ProviderService {
   private readonly policyService: PolicyService | null;
   private readonly emitter = new EventEmitter();
@@ -140,13 +192,19 @@ export class ProviderService {
   // granularity (FAT, some network mounts) can collide on mtimeMs across
   // distinct writes, and an external edit that produces byte-identical
   // contents is a no-op anyway.
+  public readonly providersConfigStore: ProvidersConfigStore;
+  public readonly fileLeaseManager: FileLeaseManager;
   private lastSelfWriteFingerprint: string | null = null;
 
   constructor(
     private readonly config: Config,
-    policyService?: PolicyService
+    policyService?: PolicyService,
+    providersConfigStore?: ProvidersConfigStore,
+    fileLeaseManager?: FileLeaseManager
   ) {
     this.policyService = policyService ?? null;
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+    this.fileLeaseManager = fileLeaseManager ?? new FileLeaseManager(config.rootDir);
     // The provider config subscription may have many concurrent listeners (e.g. multiple windows).
     // Avoid noisy MaxListenersExceededWarning for normal usage.
     this.emitter.setMaxListeners(50);
@@ -158,9 +216,9 @@ export class ProviderService {
     // the fingerprint captured by notifyFromMutation(); any external
     // edit that changes the bytes between the in-app save and the
     // watcher fire produces a different fingerprint and is forwarded.
-    this.stopWatchingProvidersFile = this.config.watchProvidersFile(() => {
+    this.stopWatchingProvidersFile = this.providersConfigStore.watchProvidersFile(() => {
       const expected = this.lastSelfWriteFingerprint;
-      const current = this.config.getProvidersFileFingerprint();
+      const current = this.providersConfigStore.getProvidersFileFingerprint();
       if (expected !== null && current !== null && current === expected) {
         // This watcher fire corresponds to our own write (or a benign
         // no-op external save with identical bytes). Clear the
@@ -209,8 +267,33 @@ export class ProviderService {
    * accidentally suppressed.
    */
   private notifyFromMutation(): void {
-    this.lastSelfWriteFingerprint = this.config.getProvidersFileFingerprint();
+    this.lastSelfWriteFingerprint = this.providersConfigStore.getProvidersFileFingerprint();
     this.notifyConfigChanged();
+  }
+
+  /**
+   * `notifyFromMutation` with a synchronously throwing subscriber routed into
+   * the error channel — the pre-Effect mutation methods invoked it inside
+   * their try/catch, so a subscriber throw folded into the wire error.
+   */
+  private notifyFromMutationEffect(): Effect.Effect<void, ProviderPersistenceError> {
+    return Effect.try({ try: () => this.notifyFromMutation(), catch: toPersistenceError });
+  }
+
+  /**
+   * Run a providers.jsonc read-modify-write callback under the cross-process
+   * lock (see FileLeaseManager.withProvidersFileLock). Lock acquisition
+   * failures and callback throws land in the error channel.
+   */
+  private providersFileLockEffect<T>(
+    callback: () => Promise<T> | T
+  ): Effect.Effect<T, ProviderPersistenceError> {
+    return Effect.tryPromise({
+      // async thunk: mirrors the old `await this.fileLeaseManager...`, which
+      // coerces non-Promise returns (e.g. a test double's synchronous lock).
+      try: async () => this.fileLeaseManager.withProvidersFileLock(callback),
+      catch: toPersistenceError,
+    });
   }
 
   private listBuiltInProviders(): ProviderName[] {
@@ -268,7 +351,7 @@ export class ProviderService {
   public list(): string[] {
     try {
       const providers = this.listBuiltInProviders();
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
+      const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
       const customProviderIds = getCustomProviderIds(providersConfig);
       this.detectAndLogShadowedProviders(providersConfig);
       const allowedCustomProviderIds = this.policyService?.isEnforced()
@@ -285,7 +368,7 @@ export class ProviderService {
    * Get the full providers config with safe info (no actual API keys)
    */
   public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
@@ -627,40 +710,50 @@ export class ProviderService {
       .filter((modelId) => !allowedModels.includes(modelId));
   }
 
-  public async addCustomProvider(
+  public addCustomProvider(
     input: AddCustomProviderInput
   ): Promise<CustomProviderMutationResult<ProviderConfigInfo>> {
+    return Effect.runPromise(this.addCustomProviderEffect(input));
+  }
+
+  public addCustomProviderEffect(
+    input: AddCustomProviderInput
+  ): Effect.Effect<CustomProviderMutationResult<ProviderConfigInfo>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
     const provider = input.provider.trim();
-    if (isBuiltInProvider(provider)) {
-      return {
-        success: false,
-        error: {
-          code: "built_in_provider",
-          message: `Provider ${provider} is built in and cannot be added as custom.`,
-        },
-      };
-    }
+    return Effect.gen(function* () {
+      if (isBuiltInProvider(provider)) {
+        return {
+          success: false as const,
+          error: {
+            code: "built_in_provider" as const,
+            message: `Provider ${provider} is built in and cannot be added as custom.`,
+          },
+        };
+      }
 
-    const validation = validateCustomProviderId(provider);
-    if (!validation.ok) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "invalid_provider_id", message: "Invalid custom provider id." },
-          validation.reason
-        ),
-      };
-    }
+      const validation = validateCustomProviderId(provider);
+      if (!validation.ok) {
+        return {
+          success: false as const,
+          error: addErrorReason(
+            { code: "invalid_provider_id" as const, message: "Invalid custom provider id." },
+            validation.reason
+          ),
+        };
+      }
 
-    const baseUrl = input.baseUrl.trim();
+      const baseUrl = input.baseUrl.trim();
 
-    try {
       // Read-modify-write under the cross-process lock so concurrent writers
       // (other windows, CLI processes) cannot clobber each other's saves.
       // The callback returns an error result to bail, or null once saved.
-      const lockError = await this.config.withProvidersFileLock(
+      const lockError = yield* self.providersFileLockEffect(
         (): CustomProviderMutationResult<ProviderConfigInfo> | null => {
-          const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
+          const providersConfig = getProviderConfigRecord(
+            self.providersConfigStore.loadProvidersConfig() ?? {}
+          );
           if (Object.hasOwn(providersConfig, provider)) {
             return {
               success: false,
@@ -682,19 +775,19 @@ export class ProviderService {
             };
           }
 
-          if (this.policyService?.isEnforced() && !this.policyService.isProviderAllowed(provider)) {
+          if (self.policyService?.isEnforced() && !self.policyService.isProviderAllowed(provider)) {
             return {
               success: false,
-              error: this.getPolicyDeniedError(`Provider ${provider} is not allowed by policy.`),
+              error: self.getPolicyDeniedError(`Provider ${provider} is not allowed by policy.`),
             };
           }
 
-          const providerPolicy = this.getProviderPolicy(provider);
+          const providerPolicy = self.getProviderPolicy(provider);
           const persistedBaseUrl = providerPolicy.forcedBaseUrl ?? baseUrl;
           if (providerPolicy.forcedBaseUrl && baseUrl !== providerPolicy.forcedBaseUrl) {
             return {
               success: false,
-              error: this.getPolicyDeniedError(
+              error: self.getPolicyDeniedError(
                 `Provider ${provider} base URL is locked by policy.`,
                 `Expected ${providerPolicy.forcedBaseUrl}.`
               ),
@@ -702,11 +795,11 @@ export class ProviderService {
           }
 
           const normalizedModels = normalizeProviderModelEntries(input.models);
-          const disallowedModels = this.getDisallowedModelsByPolicy(provider, normalizedModels);
+          const disallowedModels = self.getDisallowedModelsByPolicy(provider, normalizedModels);
           if (disallowedModels.length > 0) {
             return {
               success: false,
-              error: this.getPolicyDeniedError(
+              error: self.getPolicyDeniedError(
                 `One or more models are not allowed by policy: ${disallowedModels.join(", ")}`
               ),
             };
@@ -727,7 +820,7 @@ export class ProviderService {
           };
 
           providersConfig[provider] = providerConfig;
-          this.config.saveProvidersConfig(providersConfig);
+          self.providersConfigStore.saveProvidersConfig(providersConfig);
           return null;
         }
       );
@@ -735,87 +828,112 @@ export class ProviderService {
         return lockError;
       }
 
-      const providerInfo = this.getConfig()[provider];
-      if (!providerInfo) {
-        return {
+      // Reload + notify stay inside the guarded region: the pre-Effect
+      // try/catch covered them, so a throwing reload or subscriber folds
+      // into the persistence_failed wire error below.
+      return yield* Effect.try({
+        try: (): CustomProviderMutationResult<ProviderConfigInfo> => {
+          const providerInfo = self.getConfig()[provider];
+          if (!providerInfo) {
+            return {
+              success: false,
+              error: {
+                code: "persistence_failed",
+                message: `Provider ${provider} was saved but could not be reloaded.`,
+              },
+            };
+          }
+
+          self.notifyFromMutation();
+          return { success: true, data: providerInfo };
+        },
+        catch: toPersistenceError,
+      });
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<CustomProviderMutationResult<ProviderConfigInfo>>({
           success: false,
+          error: addErrorReason(
+            { code: "persistence_failed", message: `Failed to add provider ${provider}.` },
+            error.message
+          ),
+        })
+      ),
+      asAtomicMutation
+    );
+  }
+
+  public removeCustomProvider(providerInput: string): Promise<CustomProviderMutationResult<void>> {
+    return Effect.runPromise(this.removeCustomProviderEffect(providerInput));
+  }
+
+  public removeCustomProviderEffect(
+    providerInput: string
+  ): Effect.Effect<CustomProviderMutationResult<void>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const provider = providerInput.trim();
+      const providersConfig = getProviderConfigRecord(
+        self.providersConfigStore.loadProvidersConfig() ?? {}
+      );
+      const providerConfig = providersConfig[provider];
+      // Manual providers.jsonc edits can shadow a built-in id. Removing that entry
+      // restores the built-in default, so only reject bona fide built-in configs.
+      const isShadowedCustomProvider =
+        isBuiltInProvider(provider) && isCustomProviderConfig(providerConfig);
+
+      if (isBuiltInProvider(provider) && !isShadowedCustomProvider) {
+        return {
+          success: false as const,
           error: {
-            code: "persistence_failed",
-            message: `Provider ${provider} was saved but could not be reloaded.`,
+            code: "built_in_provider" as const,
+            message: `Provider ${provider} is built in and cannot be removed as custom.`,
           },
         };
       }
 
-      this.notifyFromMutation();
-      return { success: true, data: providerInfo };
-    } catch (error) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "persistence_failed", message: `Failed to add provider ${provider}.` },
-          getErrorMessage(error)
-        ),
-      };
-    }
-  }
+      if (!isShadowedCustomProvider) {
+        const validation = validateCustomProviderId(provider);
+        if (!validation.ok) {
+          return {
+            success: false as const,
+            error: addErrorReason(
+              { code: "invalid_provider_id" as const, message: "Invalid custom provider id." },
+              validation.reason
+            ),
+          };
+        }
+      }
 
-  public async removeCustomProvider(
-    providerInput: string
-  ): Promise<CustomProviderMutationResult<void>> {
-    const provider = providerInput.trim();
-    const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
-    const providerConfig = providersConfig[provider];
-    // Manual providers.jsonc edits can shadow a built-in id. Removing that entry
-    // restores the built-in default, so only reject bona fide built-in configs.
-    const isShadowedCustomProvider =
-      isBuiltInProvider(provider) && isCustomProviderConfig(providerConfig);
-
-    if (isBuiltInProvider(provider) && !isShadowedCustomProvider) {
-      return {
-        success: false,
-        error: {
-          code: "built_in_provider",
-          message: `Provider ${provider} is built in and cannot be removed as custom.`,
-        },
-      };
-    }
-
-    if (!isShadowedCustomProvider) {
-      const validation = validateCustomProviderId(provider);
-      if (!validation.ok) {
+      if (!Object.hasOwn(providersConfig, provider)) {
         return {
-          success: false,
-          error: addErrorReason(
-            { code: "invalid_provider_id", message: "Invalid custom provider id." },
-            validation.reason
-          ),
+          success: false as const,
+          error: {
+            code: "unknown_provider" as const,
+            message: `Provider ${provider} does not exist.`,
+          },
         };
       }
-    }
 
-    if (!Object.hasOwn(providersConfig, provider)) {
-      return {
-        success: false,
-        error: { code: "unknown_provider", message: `Provider ${provider} does not exist.` },
-      };
-    }
+      if (!isCustomProviderConfig(providersConfig[provider])) {
+        return {
+          success: false as const,
+          error: {
+            code: "not_custom_provider" as const,
+            message: `Provider ${provider} is not a custom provider.`,
+          },
+        };
+      }
 
-    if (!isCustomProviderConfig(providersConfig[provider])) {
-      return {
-        success: false,
-        error: {
-          code: "not_custom_provider",
-          message: `Provider ${provider} is not a custom provider.`,
-        },
-      };
-    }
-
-    try {
       // Re-validate and delete under the cross-process lock (see setConfigValue).
-      const lockError = await this.config.withProvidersFileLock(
-        (): CustomProviderMutationResult<void> | null => {
+      // A lock/save failure folds into persistence_failed here — narrower than
+      // the whole-pipeline fold because the repair step below owns a different
+      // wire error code.
+      const lockOutcome = yield* self
+        .providersFileLockEffect((): CustomProviderMutationResult<void> | null => {
           const latestProvidersConfig = getProviderConfigRecord(
-            this.config.loadProvidersConfig() ?? {}
+            self.providersConfigStore.loadProvidersConfig() ?? {}
           );
           if (!isCustomProviderConfig(latestProvidersConfig[provider])) {
             return {
@@ -828,45 +946,59 @@ export class ProviderService {
           }
 
           delete latestProvidersConfig[provider];
-          this.config.saveProvidersConfig(latestProvidersConfig);
+          self.providersConfigStore.saveProvidersConfig(latestProvidersConfig);
           return null;
-        }
-      );
-      if (lockError) {
-        return lockError;
+        })
+        .pipe(
+          Effect.catchTag("ProviderPersistenceError", (error) =>
+            Effect.succeed<CustomProviderMutationResult<void> | null>({
+              success: false,
+              error: addErrorReason(
+                { code: "persistence_failed", message: `Failed to remove provider ${provider}.` },
+                error.message
+              ),
+            })
+          )
+        );
+      if (lockOutcome) {
+        return lockOutcome;
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "persistence_failed", message: `Failed to remove provider ${provider}.` },
-          getErrorMessage(error)
-        ),
-      };
-    }
 
-    try {
-      await this.config.editConfig((config) =>
-        this.repairRemovedCustomProviderReferences(config, provider)
+      const repairOutcome = yield* Effect.tryPromise({
+        // async thunk: a synchronously throwing editConfig mock still lands in
+        // the error channel, mirroring the old `await` + try/catch.
+        try: async () =>
+          self.config.editConfig((config) =>
+            self.repairRemovedCustomProviderReferences(config, provider)
+          ),
+        catch: toPersistenceError,
+      }).pipe(
+        Effect.map((): CustomProviderMutationResult<void> | null => null),
+        Effect.catchTag("ProviderPersistenceError", (error) =>
+          Effect.sync((): CustomProviderMutationResult<void> | null => {
+            // The provider is already deleted from providers.jsonc. Notify subscribers so they
+            // re-sync even when durable model reference cleanup needs another attempt.
+            self.notifyFromMutation();
+            return {
+              success: false,
+              error: addErrorReason(
+                {
+                  code: "config_repair_failed",
+                  message: `Provider ${provider} was removed, but saved model references could not be repaired.`,
+                },
+                error.message
+              ),
+            };
+          })
+        )
       );
-    } catch (error) {
-      // The provider is already deleted from providers.jsonc. Notify subscribers so they
-      // re-sync even when durable model reference cleanup needs another attempt.
-      this.notifyFromMutation();
-      return {
-        success: false,
-        error: addErrorReason(
-          {
-            code: "config_repair_failed",
-            message: `Provider ${provider} was removed, but saved model references could not be repaired.`,
-          },
-          getErrorMessage(error)
-        ),
-      };
-    }
+      if (repairOutcome) {
+        return repairOutcome;
+      }
 
-    this.notifyFromMutation();
-    return { success: true, data: undefined };
+      self.notifyFromMutation();
+      return { success: true as const, data: undefined };
+    }).pipe(asAtomicMutation);
   }
 
   private repairRemovedCustomProviderReferences(
@@ -982,48 +1114,62 @@ export class ProviderService {
   /**
    * Set custom models for a provider
    */
-  public async setModels(
+  public setModels(provider: string, models: ProviderModelEntry[]): Promise<Result<void, string>> {
+    return Effect.runPromise(this.setModelsEffect(provider, models));
+  }
+
+  public setModelsEffect(
     provider: string,
     models: ProviderModelEntry[]
-  ): Promise<Result<void, string>> {
-    try {
-      const normalizedModels = normalizeProviderModelEntries(models);
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const normalizedModels = yield* Effect.try({
+        try: () => normalizeProviderModelEntries(models),
+        catch: toPersistenceError,
+      });
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateModelsEditPolicy(provider, normalizedModels);
+      const policyDenial = yield* self.providersFileLockEffect((): string | null => {
+        const denial = self.validateModelsEditPolicy(provider, normalizedModels);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
 
         if (!providersConfig[provider]) {
           providersConfig[provider] = {};
         }
 
         if (provider === "coder") {
-          this.applyCoderModelEdit(
+          self.applyCoderModelEdit(
             providersConfig.coder as Record<string, unknown>,
             normalizedModels
           );
         } else {
           providersConfig[provider].models = normalizedModels;
         }
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
-        return { success: false, error: policyDenial };
+        return { success: false as const, error: policyDenial };
       }
-      this.notifyFromMutation();
+      yield* self.notifyFromMutationEffect();
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set models: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set models: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1096,58 +1242,83 @@ export class ProviderService {
    * Gateways that are explicitly disabled or fully deconfigured are removed;
    * configured-but-not-auto-eligible gateways keep any manual route.
    */
-  private async syncGatewayLifecycle(provider: string): Promise<void> {
-    if (!(provider in PROVIDER_DEFINITIONS)) return;
-    const providerName = provider as ProviderName;
-    const def = PROVIDER_DEFINITIONS[providerName];
-    if (def.kind !== "gateway") return;
+  private syncGatewayLifecycleEffect(
+    provider: string
+  ): Effect.Effect<void, ProviderPersistenceError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (!(provider in PROVIDER_DEFINITIONS)) return;
+      const providerName = provider as ProviderName;
+      const def = PROVIDER_DEFINITIONS[providerName];
+      if (def.kind !== "gateway") return;
 
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
-    const rawProviderConfig = providersConfig[providerName] ?? {};
-    // Coder credentials are issuer-bound and its deploymentUrl field stays
-    // editable under an enforced forcedBaseUrl: lifecycle checks must resolve
-    // against the forced URL (mirroring getConfig and routing), or editing
-    // the unlocked field would evict coder from routePriority while Settings
-    // and runtime model creation stay connected to the forced deployment.
-    const forcedBaseUrl = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl(providerName)
-      : undefined;
-    const providerConfig =
-      providerName === "coder" && forcedBaseUrl !== undefined
-        ? { ...rawProviderConfig, deploymentUrl: forcedBaseUrl }
-        : rawProviderConfig;
-    const isAutoRouteEligible = isProviderAutoRouteEligible(providerName, providerConfig);
-    const config = this.config.loadConfigOrDefault();
-    const priority = config.routePriority ?? ["direct"];
+      // Everything up to the branch decision is synchronous config/policy
+      // reading; one Effect.try keeps a thrown read in the error channel
+      // exactly like the old `await this.syncGatewayLifecycle(...)` inside
+      // the callers' try/catch. It returns the main-config edit to apply,
+      // or null when routePriority already matches.
+      const edit = yield* Effect.try({
+        try: (): ((c: ProjectsConfig) => ProjectsConfig) | null => {
+          const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
+          const rawProviderConfig = providersConfig[providerName] ?? {};
+          // Coder credentials are issuer-bound and its deploymentUrl field stays
+          // editable under an enforced forcedBaseUrl: lifecycle checks must resolve
+          // against the forced URL (mirroring getConfig and routing), or editing
+          // the unlocked field would evict coder from routePriority while Settings
+          // and runtime model creation stay connected to the forced deployment.
+          const forcedBaseUrl = self.policyService?.isEnforced()
+            ? self.policyService.getForcedBaseUrl(providerName)
+            : undefined;
+          const providerConfig =
+            providerName === "coder" && forcedBaseUrl !== undefined
+              ? { ...rawProviderConfig, deploymentUrl: forcedBaseUrl }
+              : rawProviderConfig;
+          const isAutoRouteEligible = isProviderAutoRouteEligible(providerName, providerConfig);
+          const config = self.config.loadConfigOrDefault();
+          const priority = config.routePriority ?? ["direct"];
 
-    if (isAutoRouteEligible && !priority.includes(providerName)) {
-      // Insert before "direct" to stay reachable while preserving the
-      // relative order of any user-configured routes already present.
-      const directIndex = priority.indexOf("direct");
-      const insertIndex = directIndex === -1 ? priority.length : directIndex;
-      const nextPriority = [...priority];
-      nextPriority.splice(insertIndex, 0, providerName);
-      await this.config.editConfig((c) => ({
-        ...c,
-        routePriority: nextPriority,
-        // Clear legacy disable — routePriority presence is now the authoritative
-        // routing signal, so a stale muxGatewayEnabled: false must not veto it.
-        ...(providerName === "mux-gateway" ? { muxGatewayEnabled: undefined } : {}),
-      }));
-    } else if (!isAutoRouteEligible && priority.includes(providerName)) {
-      // Only remove a gateway from routePriority when it is truly deconfigured
-      // or explicitly disabled. Configured-but-not-auto-eligible providers
-      // (e.g., Bedrock with IAM role auth that has no observable credentials)
-      // should keep any manually added route.
-      const credentials = resolveProviderCredentials(providerName, providerConfig);
-      const shouldRemove = !credentials.isConfigured || isProviderDisabledInConfig(providerConfig);
-      if (shouldRemove) {
-        await this.config.editConfig((c) => ({
-          ...c,
-          routePriority: priority.filter((p) => p !== providerName),
-        }));
+          if (isAutoRouteEligible && !priority.includes(providerName)) {
+            // Insert before "direct" to stay reachable while preserving the
+            // relative order of any user-configured routes already present.
+            const directIndex = priority.indexOf("direct");
+            const insertIndex = directIndex === -1 ? priority.length : directIndex;
+            const nextPriority = [...priority];
+            nextPriority.splice(insertIndex, 0, providerName);
+            return (c) => ({
+              ...c,
+              routePriority: nextPriority,
+              // Clear legacy disable — routePriority presence is now the authoritative
+              // routing signal, so a stale muxGatewayEnabled: false must not veto it.
+              ...(providerName === "mux-gateway" ? { muxGatewayEnabled: undefined } : {}),
+            });
+          } else if (!isAutoRouteEligible && priority.includes(providerName)) {
+            // Only remove a gateway from routePriority when it is truly deconfigured
+            // or explicitly disabled. Configured-but-not-auto-eligible providers
+            // (e.g., Bedrock with IAM role auth that has no observable credentials)
+            // should keep any manually added route.
+            const credentials = resolveProviderCredentials(providerName, providerConfig);
+            const shouldRemove =
+              !credentials.isConfigured || isProviderDisabledInConfig(providerConfig);
+            if (shouldRemove) {
+              return (c) => ({
+                ...c,
+                routePriority: priority.filter((p) => p !== providerName),
+              });
+            }
+          }
+          return null;
+        },
+        catch: toPersistenceError,
+      });
+
+      if (edit !== null) {
+        yield* Effect.tryPromise({
+          try: async () => self.config.editConfig(edit),
+          catch: toPersistenceError,
+        });
       }
-    }
+    });
   }
 
   /**
@@ -1180,29 +1351,39 @@ export class ProviderService {
    * Intended for persisted auth blobs (e.g. Codex OAuth tokens) that should never
    * cross the frontend boundary.
    */
-  public async setConfigValue(
+  public setConfigValue(
     provider: string,
     keyPath: string[],
     value: unknown
   ): Promise<Result<void, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
+    return Effect.runPromise(this.setConfigValueEffect(provider, keyPath, value));
+  }
 
-    try {
+  private setConfigValueEffect(
+    provider: string,
+    keyPath: string[],
+    value: unknown
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+
       // Read-modify-write under the cross-process lock: every providers.jsonc
       // writer must cooperate or a whole-file save from one process could
       // resurrect credentials another process just rotated/cleared.
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateProviderEditPolicy(provider, keyPath);
+      const policyDenial = yield* self.providersFileLockEffect((): string | null => {
+        const denial = self.validateProviderEditPolicy(provider, keyPath);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
 
         // Ensure provider exists
         if (!providersConfig[provider]) {
@@ -1238,20 +1419,25 @@ export class ProviderService {
         }
 
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
-        return { success: false, error: policyDenial };
+        return { success: false as const, error: policyDenial };
       }
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set provider config: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1269,24 +1455,37 @@ export class ProviderService {
    * credential-management primitive (clearing dead tokens, persisting
    * rotations), not a user-driven config edit.
    */
-  public async updateConfigValue(
+  public updateConfigValue(
     provider: string,
     keyPath: string[],
     update: (current: unknown) => { value: unknown } | null
   ): Promise<Result<{ applied: boolean }, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
-    if (keyPath.length === 0) {
-      return { success: false, error: "updateConfigValue requires a non-empty key path" };
-    }
+    return Effect.runPromise(this.updateConfigValueEffect(provider, keyPath, update));
+  }
 
-    try {
-      const applied = await this.config.withProvidersFileLock(() => {
+  private updateConfigValueEffect(
+    provider: string,
+    keyPath: string[],
+    update: (current: unknown) => { value: unknown } | null
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+      if (keyPath.length === 0) {
+        return {
+          success: false as const,
+          error: "updateConfigValue requires a non-empty key path",
+        };
+      }
+
+      const applied = yield* self.providersFileLockEffect(() => {
         // Load, decide, and write under the lock — no awaits in between, so
         // the predicate result cannot be invalidated by any cooperating writer.
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         let current: unknown = providersConfig[provider];
         for (const key of keyPath) {
           current =
@@ -1318,16 +1517,21 @@ export class ProviderService {
           target[lastKey] = decision.value;
         }
 
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
-      await this.afterAppliedMutation(provider, applied);
-      return { success: true, data: { applied } };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to update provider config: ${message}` };
-    }
+      yield* self.afterAppliedMutationEffect(provider, applied);
+      return { success: true as const, data: { applied } };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<{ applied: boolean }, string>>({
+          success: false,
+          error: `Failed to update provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1339,16 +1543,22 @@ export class ProviderService {
    * any non-success result, which would strand a credential that IS stored
    * (and reported as connected) in a revoked state.
    */
-  private async afterAppliedMutation(provider: string, applied: boolean): Promise<void> {
-    if (!applied) {
-      return;
-    }
-    try {
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
-    } catch (error) {
-      log.error(`Post-write route sync failed for provider ${provider}:`, error);
-    }
+  private afterAppliedMutationEffect(provider: string, applied: boolean): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (!applied) {
+        return;
+      }
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          log.error(`Post-write route sync failed for provider ${provider}:`, error);
+        })
+      )
+    );
   }
 
   /**
@@ -1363,15 +1573,26 @@ export class ProviderService {
    * Internal credential-management primitive: skips policy gating like
    * updateConfigValue.
    */
-  public async updateProviderSection(
+  public updateProviderSection(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
     ) => { value: Record<string, unknown> } | null
   ): Promise<Result<{ applied: boolean }, string>> {
-    try {
-      const applied = await this.config.withProvidersFileLock(() => {
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+    return Effect.runPromise(this.updateProviderSectionEffect(provider, update));
+  }
+
+  private updateProviderSectionEffect(
+    provider: string,
+    update: (
+      section: Record<string, unknown> | undefined
+    ) => { value: Record<string, unknown> } | null
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const applied = yield* self.providersFileLockEffect(() => {
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         const section = providersConfig[provider] as Record<string, unknown> | undefined;
 
         const decision = update(section);
@@ -1387,35 +1608,50 @@ export class ProviderService {
         }
 
         providersConfig[provider] = decision.value as BaseProviderConfig;
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
       // Best-effort: a landed write must not be reported as failed (see
-      // afterAppliedMutation).
-      await this.afterAppliedMutation(provider, applied);
-      return { success: true, data: { applied } };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to update provider config: ${message}` };
-    }
+      // afterAppliedMutationEffect).
+      yield* self.afterAppliedMutationEffect(provider, applied);
+      return { success: true as const, data: { applied } };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<{ applied: boolean }, string>>({
+          success: false,
+          error: `Failed to update provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
-  public async setConfig(
+  public setConfig(
     provider: string,
     keyPath: string[],
     value: string | boolean
   ): Promise<Result<void, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
+    return Effect.runPromise(this.setConfigEffect(provider, keyPath, value));
+  }
 
-    try {
+  public setConfigEffect(
+    provider: string,
+    keyPath: string[],
+    value: string | boolean
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+
       const isProviderTypeEdit = keyPath.length === 1 && keyPath[0] === "providerType";
       if (isProviderTypeEdit && !isCustomProviderType(value)) {
-        return { success: false, error: `Invalid custom provider type: ${String(value)}` };
+        return { success: false as const, error: `Invalid custom provider type: ${String(value)}` };
       }
 
       // Value-only guard shared by every provider: no SDK adapter survives a
@@ -1426,19 +1662,19 @@ export class ProviderService {
       if (isBaseUrlEdit && typeof value === "string" && value !== "") {
         const queryFragmentError = baseUrlQueryFragmentError(value);
         if (queryFragmentError != null) {
-          return { success: false, error: queryFragmentError };
+          return { success: false as const, error: queryFragmentError };
         }
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateProviderEditPolicy(provider, keyPath);
+      const policyDenial = yield* self.providersFileLockEffect((): string | null => {
+        const denial = self.validateProviderEditPolicy(provider, keyPath);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
 
         // The add-time id collision rule applies only when this write would
         // CONVERT a non-custom entry into a custom provider. An entry that is
@@ -1522,24 +1758,38 @@ export class ProviderService {
         }
 
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
-        return { success: false, error: policyDenial };
+        return { success: false as const, error: policyDenial };
       }
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set provider config: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
+  }
+
+  updateRoutePreferences(
+    input: Omit<Parameters<Config["updateRoutePreferences"]>[0], "validateRouteOverrides">
+  ): Promise<void> {
+    return this.config.updateRoutePreferences({
+      ...input,
+      validateRouteOverrides: (overrides) => this.validateRouteOverrides(overrides),
+    });
   }
 
   public validateRouteOverrides(routeOverrides: Record<string, string>): Result<void, string> {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     for (const routeTarget of Object.values(routeOverrides)) {
       const targetConfig = providersConfig[routeTarget];
       if (isCustomProviderConfig(targetConfig)) {

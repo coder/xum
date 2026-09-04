@@ -22,14 +22,16 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
+import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "@/node/services/providerService";
-import { createCoreServices } from "@/node/services/coreServices";
+import { createCoreServices } from "@/node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -41,6 +43,7 @@ import {
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/providerRequirements";
+import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
 import { resolveProjectDir, resolveProjectTrusted } from "./trust";
@@ -207,14 +210,20 @@ function generateWorkspaceId(): string {
   return `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function copyPersistentConfig(realConfig: Config, config: Config): Promise<void> {
-  const existingProviders = realConfig.loadProvidersConfig();
+async function copyPersistentConfig(
+  realStores: ConfigStores,
+  runStores: ConfigStores
+): Promise<void> {
+  const realConfig = realStores.config;
+  const config = runStores.config;
+  const realProvidersStore = realStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
   if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
-    config.saveProvidersConfig(existingProviders);
+    runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await config.saveSecretsConfig(existingSecrets);
+    await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
   const existingConfig = realConfig.loadConfigOrDefault();
@@ -259,56 +268,45 @@ async function disposeWorkflowResources(input: {
   realProviderService?: ProviderService;
   policyService?: PolicyService;
 }): Promise<void> {
-  // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-  // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-  input.services?.backgroundProcessManager.beginShutdown();
-  try {
-    input.session?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose session", { error: getErrorMessage(error) });
-  }
-  try {
-    input.services?.mcpServerManager.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose MCP server manager", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.codexOauthService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose Codex OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.coderOauthService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose Coder OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.realProviderService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose real-config provider service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.policyService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose policy service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.services?.backgroundProcessManager.terminateAll();
-  } catch (error) {
-    log.warn("xum workflow: failed to terminate background processes", {
-      error: getErrorMessage(error),
-    });
-  }
+  const services = input.services;
+  // Same shape as `xum run`'s list: every step is contained, reported, and
+  // timed as a `[shutdown]` line; a failing step never skips the ones after it.
+  await runBestEffortCleanup(
+    [
+      ...(services
+        ? [
+            // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+            // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+            {
+              name: "backgroundProcessManager.beginShutdown",
+              run: () => services.backgroundProcessManager.beginShutdown(),
+            },
+            // Interrupt + await the runtime's supervised fibers while their dependencies
+            // are still alive (same slot as ServiceContainer.dispose); never rejects.
+            { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
+          ]
+        : []),
+      { name: "session.dispose", run: () => input.session?.dispose() },
+      { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
+      { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
+      { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
+      { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
+      { name: "policyService.dispose", run: () => input.policyService?.dispose() },
+      {
+        name: "backgroundProcessManager.terminateAll",
+        run: () => services?.backgroundProcessManager.terminateAll(),
+      },
+      // Last: release the Effect runtime that owns the core graph; never rejects.
+      ...(services
+        ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
+        : []),
+    ],
+    (stepName, error) => {
+      log.warn(`xum workflow: cleanup step failed: ${stepName}`, {
+        error: getErrorMessage(error),
+      });
+    }
+  );
   input.tempDir[Symbol.dispose]();
 }
 
@@ -336,15 +334,20 @@ async function createWorkflowContext(options: {
   let realProviderService: ProviderService | undefined;
   let policyService: PolicyService | undefined;
   try {
-    const realConfig = new Config();
-    const config = new Config(tempDir.path);
-    await copyPersistentConfig(realConfig, config);
+    const realStores = createConfigStores();
+    const realConfig = realStores.config;
+    const runStores = createConfigStores(tempDir.path);
+    const config = runStores.config;
+    await copyPersistentConfig(realStores, runStores);
 
-    const existingProviders = realConfig.loadProvidersConfig();
+    const realProvidersStore = realStores.providersConfigStore;
+    const realFileLeaseManager = realStores.fileLeaseManager;
+    const runProvidersStore = runStores.providersConfigStore;
+    const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        config.saveProvidersConfig(providersFromEnv);
+        runProvidersStore.saveProvidersConfig(providersFromEnv);
       }
     }
 
@@ -362,27 +365,33 @@ async function createWorkflowContext(options: {
     await policyService.initialize();
 
     services = createCoreServices({
-      config,
+      ...runStores,
       policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
-    codexOauthService = new CodexOauthService(config, services.providerService);
-    services.aiService.setCodexOauthService(codexOauthService);
+    codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
+    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
     // (dead) refresh token once this CLI session exits.
-    realProviderService = new ProviderService(realConfig, policyService);
-    coderOauthService = new CoderOauthService(
+    realProviderService = new ProviderService(
       realConfig,
+      policyService,
+      realProvidersStore,
+      realFileLeaseManager
+    );
+    coderOauthService = new CoderOauthService(
+      realProvidersStore,
+      realFileLeaseManager,
       realProviderService,
       undefined,
       // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
       // for token refreshes/issuer checks, and denied providers fail closed.
       policyService
     );
-    services.aiService.setCoderOauthService(coderOauthService);
+    services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -392,6 +401,7 @@ async function createWorkflowContext(options: {
       config,
       historyService: services.historyService,
       aiService: services.aiService,
+      streamManager: services.streamManager,
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,
@@ -461,7 +471,7 @@ function createWorkflowService(input: {
     workspaceName: input.ctx.workspaceId,
     workspacePath: input.ctx.workspacePath,
   });
-  const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
+  const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),

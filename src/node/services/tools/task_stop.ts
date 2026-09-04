@@ -14,6 +14,7 @@ import {
   dedupeStrings,
   parseToolResult,
   requireTaskService,
+  requireWorkspaceTurnManager,
   requireWorkspaceId,
 } from "./toolUtils";
 
@@ -83,6 +84,7 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args, { abortSignal }): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_stop");
       const taskService = requireTaskService(config, "task_stop");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_stop");
 
       const uniqueTaskIds = dedupeStrings(args.task_ids);
 
@@ -103,7 +105,7 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
               }
 
               if (isWorkspaceTurnTaskId(taskId)) {
-                const interruptResult = await taskService.interruptWorkspaceTurn(
+                const interruptResult = await workspaceTurnManager.interruptWorkspaceTurn(
                   workspaceId,
                   taskId
                 );
@@ -147,8 +149,12 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
                   return { status: "invalid_scope" as const, taskId };
                 }
 
-                const terminateResult =
-                  await config.backgroundProcessManager.terminate(maybeProcessId);
+                const terminateResult = await config.backgroundProcessManager.terminate(
+                  maybeProcessId,
+                  {
+                    monitorDisposition: "discard",
+                  }
+                );
                 if (!terminateResult.success) {
                   return { status: "error" as const, taskId, error: terminateResult.error };
                 }

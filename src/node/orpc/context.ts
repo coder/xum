@@ -1,7 +1,16 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { IncomingHttpHeaders } from "http";
-import type { Config } from "@/node/config";
+import type {
+  Config,
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { HistoryService } from "@/node/services/historyService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -50,10 +59,24 @@ import type { AnalyticsService } from "@/node/services/analytics/analyticsServic
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
+import type { WithEffectContext } from "@orpc/experimental-effect";
+import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
-export interface ORPCContext {
+/**
+ * `WithEffectContext` adds the `"effect/context"` key carrying the Effect
+ * services available to Effect-native handlers (the app runtime's built
+ * service context, `ServiceContainer.runtime.context`).
+ */
+export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   config: Config;
+  sessionLocator: WorkspaceSessionLocator;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: SecretsStore;
+  fileLeaseManager: FileLeaseManager;
   aiService: AIService;
+  historyService: HistoryService;
+  streamManager: StreamManager;
+  initStateManager: InitStateManager;
   projectService: ProjectService;
   workspaceService: WorkspaceService;
   taskService: TaskService;

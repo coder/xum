@@ -1,3 +1,5 @@
+import { ORPCError } from "@orpc/server";
+import { getErrorMessage } from "@/common/utils/errors";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -22,7 +24,6 @@ import type { SavedQuery } from "@/common/types/savedQueries";
 import { getModelProvider } from "@/common/utils/ai/models";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import type { Config } from "@/node/config";
-import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import type { RawQueryResult } from "./queries";
@@ -191,8 +192,15 @@ export function aggregateProviderCacheHitRows(
     });
 }
 
+interface AnalyticsFilterInput {
+  projectPath?: string | null;
+  from?: Date | null;
+  to?: Date | null;
+}
+
 export class AnalyticsService {
   private worker: Worker | null = null;
+  private workerExited = false;
   private messageIdCounter = 0;
   private readonly pendingPromises = new Map<
     number,
@@ -316,6 +324,7 @@ export class AnalyticsService {
   };
 
   private readonly onWorkerExit = (code: number): void => {
+    this.workerExited = true;
     if (code === 0) {
       return;
     }
@@ -602,11 +611,7 @@ export class AnalyticsService {
     });
   }
 
-  async getSummary(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<{
+  async getSummary(params: AnalyticsFilterInput): Promise<{
     totalSpendUsd: number;
     todaySpendUsd: number;
     avgDailySpendUsd: number;
@@ -615,9 +620,9 @@ export class AnalyticsService {
     totalResponses: number;
   }> {
     const row = await this.executeQuery<SummaryRow>("getSummary", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {
@@ -672,14 +677,12 @@ export class AnalyticsService {
   }
 
   async getSpendByModel(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<Array<{ model: string; costUsd: number; tokenCount: number; responseCount: number }>> {
     const rows = await this.executeQuery<SpendByModelRow[]>("getSpendByModel", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -690,11 +693,7 @@ export class AnalyticsService {
     }));
   }
 
-  async getTokensByModel(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<
+  async getTokensByModel(params: AnalyticsFilterInput): Promise<
     Array<{
       model: string;
       inputTokens: number;
@@ -707,9 +706,9 @@ export class AnalyticsService {
     }>
   > {
     const rows = await this.executeQuery<TokensByModelRow[]>("getTokensByModel", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -725,10 +724,7 @@ export class AnalyticsService {
   }
 
   async getTimingDistribution(
-    metric: "ttft" | "duration" | "tps",
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput & { metric: "ttft" | "duration" | "tps" }
   ): Promise<{
     p50: number;
     p90: number;
@@ -736,10 +732,10 @@ export class AnalyticsService {
     histogram: Array<{ bucket: number; count: number }>;
   }> {
     const row = await this.executeQuery<TimingDistributionRow>("getTimingDistribution", {
-      metric,
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      metric: params.metric,
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {
@@ -754,16 +750,14 @@ export class AnalyticsService {
   }
 
   async getAgentCostBreakdown(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<
     Array<{ agentId: string; costUsd: number; tokenCount: number; responseCount: number }>
   > {
     const rows = await this.executeQuery<AgentCostRow[]>("getAgentCostBreakdown", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -775,24 +769,18 @@ export class AnalyticsService {
   }
 
   async getCacheHitRatioByProvider(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<Array<{ provider: string; cacheHitRatio: number; responseCount: number }>> {
     const rows = await this.executeQuery<ProviderCacheHitModelRow[]>("getCacheHitRatioByProvider", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return aggregateProviderCacheHitRows(rows);
   }
 
-  async getDelegationSummary(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<{
+  async getDelegationSummary(params: AnalyticsFilterInput): Promise<{
     totalChildren: number;
     totalTokensConsumed: number;
     totalReportTokens: number;
@@ -810,9 +798,9 @@ export class AnalyticsService {
     }>;
   }> {
     const result = await this.executeQuery<DelegationSummaryQueryResult>("getDelegationSummary", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {
@@ -854,13 +842,11 @@ export class AnalyticsService {
   }
 
   dispose(): Promise<void> {
-    this.disposePromise ??= Promise.resolve().then(() => {
-      this.disposeInternal();
-    });
+    this.disposePromise ??= Promise.resolve().then(() => this.disposeInternal());
     return this.disposePromise;
   }
 
-  private disposeInternal(): void {
+  private async disposeInternal(): Promise<void> {
     this.isDisposed = true;
 
     const disposedError = new Error("Analytics service is shutting down");
@@ -879,15 +865,38 @@ export class AnalyticsService {
     worker.off("error", this.onWorkerError);
     worker.off("exit", this.onWorkerExit);
 
-    // Shut down DuckDB from inside the worker thread first. The worker is
-    // already unref'd, so process shutdown does not wait for this cleanup.
+    // A worker that already exited (crash or clean stop) has nothing left to close.
+    if (this.workerExited) {
+      return;
+    }
+
+    // Shut down DuckDB from inside the worker thread first. The worker is unref'd, so the
+    // process would not wait for it on its own; wait for its actual exit here because the
+    // worker closes DuckDB only after in-flight ETL finishes, and exiting the process mid-sync
+    // (e.g. Ctrl-C during the startup sync) tears the thread down inside native DuckDB code and
+    // aborts the whole process. Deliberately unbounded: an ETL that outlives a local timeout
+    // would still be mid-query when the caller exits, so the hard-exit decision belongs to the
+    // outer quit budgets in cli/server.ts and desktop/main.ts, which race the whole dispose.
+    // Keep an error listener until exit: onWorkerError was detached above, and a worker
+    // `error` with no listener is rethrown by the parent EventEmitter, which would turn a
+    // failing DuckDB close into a crash of the shutting-down process.
+    worker.on("error", (error: Error) => {
+      log.warn("[AnalyticsService] Analytics worker error during shutdown", {
+        error: getErrorMessage(error),
+      });
+    });
+    const exited = new Promise<void>((resolve) => {
+      worker.once("exit", () => resolve());
+    });
     try {
       worker.postMessage({ type: "shutdown" } satisfies WorkerShutdownMessage);
     } catch (error) {
       log.warn("[AnalyticsService] Failed to post graceful shutdown message to analytics worker", {
         error: getErrorMessage(error),
       });
+      return;
     }
+    await exited;
   }
 
   clearWorkspace(
@@ -982,5 +991,28 @@ export class AnalyticsService {
           error: getErrorMessage(error),
         });
       });
+  }
+}
+
+const RAW_QUERY_USER_ERROR_PATTERNS = [
+  /^parser error:/i,
+  /^binder error:/i,
+  /^catalog error:/i,
+  /^conversion error:/i,
+  /^invalid input error:/i,
+  /^out of range error:/i,
+  /^not implemented error:/i,
+  /query contains disallowed sql/i,
+  /string literals cannot be used as table sources/i,
+] as const;
+
+export async function executeRawQueryForApi(service: AnalyticsService, sql: string) {
+  try {
+    return await service.executeRawQuery(sql);
+  } catch (error) {
+    if (error instanceof ORPCError) throw error;
+    const message = getErrorMessage(error);
+    if (!RAW_QUERY_USER_ERROR_PATTERNS.some((pattern) => pattern.test(message))) throw error;
+    throw new ORPCError("BAD_REQUEST", { message, cause: error });
   }
 }

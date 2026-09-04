@@ -160,6 +160,7 @@ function createWorkspaceContextValue(): WorkspaceContextValue {
     loading: false,
     loaded: true,
     loadError: null,
+    archivingWorkspaceIds: new Set<string>(),
     workspaceDraftPromotionsByProject: {},
     promoteWorkspaceDraft: () => undefined,
     createWorkspace: () =>

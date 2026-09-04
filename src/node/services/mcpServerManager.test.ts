@@ -19,7 +19,9 @@ import {
   runMCPToolWithDeadline,
   wrapMCPTools,
 } from "./mcpServerManager";
-import type { MCPConfigService } from "./mcpConfigService";
+import { MCPConfigService } from "./mcpConfigService";
+import { Config } from "@/node/config";
+import type { TelemetryService } from "./telemetryService";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -151,6 +153,69 @@ describe("MCPServerManager", () => {
 
   afterEach(() => {
     manager.dispose();
+  });
+  test("testForApi resolves global defaults and emits categorized telemetry", async () => {
+    using tmp = new DisposableTempDir("mcp-api-test");
+    const config = new Config(tmp.path);
+    const captured: Array<Parameters<TelemetryService["capture"]>[0]> = [];
+    const capture = mock((payload: Parameters<TelemetryService["capture"]>[0]) => {
+      captured.push(payload);
+    });
+    const apiManager = new MCPServerManager(new MCPConfigService(config), {
+      config,
+      telemetryService: { capture },
+    });
+    const testServer = spyOn(apiManager, "test").mockResolvedValue({
+      success: false,
+      error: "ECONNREFUSED",
+    });
+    try {
+      await apiManager.testForApi({ command: "node server.js" });
+      expect(testServer).toHaveBeenCalledWith(
+        expect.objectContaining({ projectPath: tmp.path, trusted: false, projectSecrets: {} })
+      );
+      expect(captured[0]).toMatchObject({
+        event: "mcp_server_tested",
+        properties: { error_category: "connect", transport: "stdio" },
+      });
+    } finally {
+      apiManager.dispose();
+    }
+  });
+
+  test("testForApi resolves project trust from config before delegating", async () => {
+    for (const trusted of [true, false]) {
+      using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);
+      const config = new Config(tmp.path);
+      const projectPath = path.join(tmp.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted, workspaces: [] });
+        return cfg;
+      });
+      const apiConfigService = new MCPConfigService(config);
+      const listServers = spyOn(apiConfigService, "listServers").mockResolvedValue({
+        "repo-local": { transport: "stdio", command: "echo repo-local", disabled: false },
+      });
+      const apiManager = new MCPServerManager(apiConfigService, { config });
+      const testServer = spyOn(apiManager, "test").mockResolvedValue({
+        success: true,
+        tools: ["repo_tool"],
+      });
+      try {
+        const result = await apiManager.testForApi(
+          { projectPath, name: "repo-local" },
+          { includeAgentPlugins: false }
+        );
+        expect(result).toMatchObject({ success: true, tools: ["repo_tool"] });
+        expect(listServers).toHaveBeenCalledWith(projectPath, trusted, expect.anything());
+        expect(testServer).toHaveBeenCalledWith(
+          expect.objectContaining({ projectPath, trusted, name: "repo-local" })
+        );
+      } finally {
+        apiManager.dispose();
+      }
+    }
   });
 
   test("cross-process plugin mutation token retires cached plugin instances before serving", async () => {

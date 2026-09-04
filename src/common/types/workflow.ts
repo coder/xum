@@ -52,6 +52,16 @@ export function isTerminalWorkflowRunStatus(status: WorkflowRunStatus): boolean 
 }
 
 /**
+ * Terminal statuses that owe a proactive background continuation (terminal wake). An
+ * interrupted run was stopped deliberately, so neither the terminal callback (unless the
+ * service opts in) nor the level-triggered attention sweep may notify it.
+ */
+export const WORKFLOW_BACKGROUND_CONTINUATION_STATUSES: ReadonlySet<WorkflowRunStatus> = new Set([
+  "completed",
+  "failed",
+]);
+
+/**
  * Status of a nested-workflow ("child") run event embedded in a parent run's event stream.
  * Distinct from {@link WorkflowRunStatus}: an in-progress child event reports "started" rather
  * than the persisted run's "pending".

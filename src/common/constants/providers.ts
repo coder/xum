@@ -21,6 +21,7 @@ export type ProviderName =
   | "xai"
   | "deepseek"
   | "moonshotai"
+  | "zai"
   | "openrouter"
   | "github-copilot"
   | "coder"
@@ -57,7 +58,9 @@ const fromSlashSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex === -1) {
+  // Reject leading/trailing separators: an empty origin or model id would
+  // otherwise canonicalize to invalid ":model" / "origin:" identities.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -92,7 +95,9 @@ const fromDotSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf(".");
-  if (separatorIndex <= 0) {
+  // Reject leading/trailing separators (empty origin or model id) — see
+  // fromSlashSeparatedGatewayModelId.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -158,12 +163,20 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  zai: {
+    displayName: "Z.ai",
+    import: () => import("@ai-sdk/zai"),
+    factoryName: "createZai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
   openrouter: {
     displayName: "OpenRouter",
     import: () => import("@openrouter/ai-sdk-provider"),
     factoryName: "createOpenRouter",
     requiresApiKey: true,
     kind: "gateway",
+    // OpenRouter uses the hyphenated vendor slug "z-ai", so direct "zai" routing is not inferred.
     routes: ["anthropic", "openai", "google", "xai", "deepseek", "moonshotai"],
     passthrough: false,
     toGatewayModelId: toSlashSeparatedGatewayModelId,

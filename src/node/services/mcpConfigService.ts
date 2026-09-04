@@ -21,6 +21,14 @@ import { isCanonicalPluginServerKey } from "@/node/services/agentPlugins/mcpConf
 import { log } from "@/node/services/log";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { AIService } from "@/node/services/aiService";
+import type { PolicyService } from "@/node/services/policyService";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
+import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { roundToBase2 } from "@/common/telemetry/utils";
+import { isSecretReferenceValue } from "@/common/types/secrets";
 
 /**
  * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
@@ -57,8 +65,22 @@ export class MCPConfigService {
    * naturally fail with "not found".
    */
   private readonly agentPluginsMcpProvider: AgentPluginsMcpProvider | null;
+  private readonly policyService: Pick<
+    PolicyService,
+    "isEnforced" | "isMcpTransportAllowed"
+  > | null;
+  private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
+  private readonly workspaceMetadataProvider: Pick<AIService, "getWorkspaceMetadata"> | null;
 
-  constructor(config: Config, options?: { agentPluginsMcpProvider?: AgentPluginsMcpProvider }) {
+  constructor(
+    config: Config,
+    options?: {
+      agentPluginsMcpProvider?: AgentPluginsMcpProvider;
+      policyService?: Pick<PolicyService, "isEnforced" | "isMcpTransportAllowed">;
+      telemetryService?: Pick<TelemetryService, "capture">;
+      workspaceMetadataProvider?: Pick<AIService, "getWorkspaceMetadata">;
+    }
+  ) {
     assert(
       typeof config.rootDir === "string" && config.rootDir.trim().length > 0,
       "MCPConfigService: config.rootDir must be a non-empty string"
@@ -66,6 +88,180 @@ export class MCPConfigService {
 
     this.config = config;
     this.agentPluginsMcpProvider = options?.agentPluginsMcpProvider ?? null;
+    this.policyService = options?.policyService ?? null;
+    this.telemetryService = options?.telemetryService ?? null;
+    this.workspaceMetadataProvider = options?.workspaceMetadataProvider ?? null;
+  }
+
+  async listForApi(input: {
+    projectPath?: string | null;
+    workspaceId?: string | null;
+  }): Promise<Record<string, MCPServerInfo>> {
+    const projectPath = input.projectPath ?? undefined;
+    const servers = await this.listServers(
+      projectPath,
+      isProjectTrusted(this.config, projectPath),
+      {
+        agentPlugins: await this.resolveWorkspaceAgentPluginsContext(
+          input.workspaceId,
+          projectPath
+        ),
+      }
+    );
+    if (this.policyService?.isEnforced() !== true) {
+      return servers;
+    }
+    return Object.fromEntries(
+      Object.entries(servers).filter(([, info]) =>
+        this.policyService?.isMcpTransportAllowed(info.transport)
+      )
+    );
+  }
+
+  async addForApi(input: {
+    name: string;
+    transport?: MCPServerTransport;
+    command?: string;
+    url?: string;
+    headers?: Record<string, MCPHeaderValue>;
+  }): Promise<Result<void>> {
+    const existingServer = (await this.listServers())[input.name];
+    const transport = input.transport ?? "stdio";
+    if (this.transportDisabledByPolicy(transport)) {
+      return Err("MCP transport is disabled by policy");
+    }
+
+    const result = await this.addServer(input.name, {
+      transport,
+      command: input.command,
+      url: input.url,
+      headers: input.headers,
+    });
+    if (result.success) {
+      const action = !existingServer
+        ? "add"
+        : existingServer.transport !== "stdio" &&
+            transport !== "stdio" &&
+            existingServer.transport === transport &&
+            existingServer.url === input.url &&
+            JSON.stringify(existingServer.headers ?? {}) !== JSON.stringify(input.headers ?? {})
+          ? "set_headers"
+          : "edit";
+      this.captureConfigChange(action, transport, input.headers);
+    }
+    return result;
+  }
+
+  async removeForApi(name: string): Promise<Result<void>> {
+    const server = (await this.listServers())[name];
+    if (server && this.transportDisabledByPolicy(server.transport)) {
+      return Err("MCP transport is disabled by policy");
+    }
+    const result = await this.removeServer(name);
+    if (result.success && server) {
+      this.captureConfigChange(
+        "remove",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers
+      );
+    }
+    return result;
+  }
+
+  async setEnabledForApi(name: string, enabled: boolean): Promise<Result<void>> {
+    const server = (await this.listServers())[name];
+    if (server && this.transportDisabledByPolicy(server.transport)) {
+      return Err("MCP transport is disabled by policy");
+    }
+    const result = await this.setServerEnabled(name, enabled);
+    if (result.success && server) {
+      this.captureConfigChange(
+        enabled ? "enable" : "disable",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers
+      );
+    }
+    return result;
+  }
+
+  async setToolAllowlistForApi(name: string, toolAllowlist: string[]): Promise<Result<void>> {
+    const server = (await this.listServers())[name];
+    if (server && this.transportDisabledByPolicy(server.transport)) {
+      return Err("MCP transport is disabled by policy");
+    }
+    const result = await this.setToolAllowlist(name, toolAllowlist);
+    if (result.success && server) {
+      this.captureConfigChange(
+        "set_tool_allowlist",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers,
+        {
+          tool_allowlist_size_b2: roundToBase2(toolAllowlist.length),
+        }
+      );
+    }
+    return result;
+  }
+
+  /** Preserves the resolver's null sentinel: null suppresses plugin discovery for off-host workspaces. */
+  async resolveWorkspaceAgentPluginsContext(
+    workspaceId: string | null | undefined,
+    projectPath: string | null | undefined
+  ): Promise<AgentPluginsMcpContext | null | undefined> {
+    const trimmed = workspaceId?.trim();
+    if (!trimmed || !this.workspaceMetadataProvider) {
+      return undefined;
+    }
+    try {
+      const metadataResult = await this.workspaceMetadataProvider.getWorkspaceMetadata(trimmed);
+      if (!metadataResult.success) {
+        return undefined;
+      }
+      const metadata = metadataResult.data;
+      if (metadata.projectPath !== projectPath?.trim()) {
+        log.debug("Ignoring Agent Plugins workspace context for mismatched project", {
+          workspaceId: trimmed,
+          requestedProjectPath: projectPath,
+          workspaceProjectPath: metadata.projectPath,
+        });
+        return undefined;
+      }
+      const runtime = createRuntimeForWorkspace(metadata);
+      return resolveAgentPluginsMcpContext(metadata, resolveWorkspaceRootPath(metadata, runtime));
+    } catch (error) {
+      log.debug("Failed to resolve Agent Plugins MCP context for workspace", {
+        workspaceId: trimmed,
+        error,
+      });
+      return undefined;
+    }
+  }
+
+  private transportDisabledByPolicy(transport: MCPServerTransport | "auto"): boolean {
+    return (
+      this.policyService?.isEnforced() === true &&
+      !this.policyService.isMcpTransportAllowed(transport)
+    );
+  }
+
+  private captureConfigChange(
+    action: "add" | "edit" | "set_headers" | "remove" | "enable" | "disable" | "set_tool_allowlist",
+    transport: MCPServerTransport,
+    headers?: Record<string, MCPHeaderValue>,
+    extra: Record<string, number> = {}
+  ): void {
+    this.telemetryService?.capture({
+      event: "mcp_server_config_changed",
+      properties: {
+        action,
+        transport,
+        has_headers: Boolean(headers && Object.keys(headers).length > 0),
+        uses_secret_headers: Boolean(
+          headers && Object.values(headers).some((value) => isSecretReferenceValue(value))
+        ),
+        ...extra,
+      },
+    });
   }
 
   private getGlobalConfigPath(): string {

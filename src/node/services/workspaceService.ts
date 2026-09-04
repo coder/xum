@@ -1,25 +1,30 @@
+import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
-import * as path from "path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import {
+  clearAgentWorkflowRunReferences,
+  readAgentWorkflowRunReferences,
+  type AgentWorkflowRunReference,
+} from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   comparePinnedOrder,
   isWorkspacePinned,
+  appendPinnedTimestamp,
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -37,8 +42,11 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
+import type { QueueCutCutter } from "@/node/services/messageQueue";
+import { cancelReasonBeforeAcceptance } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type {
   ExtensionMetadataService,
@@ -199,6 +207,7 @@ import {
 } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
+  textContainsWorkflowResultPayload,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowRunCardMessage,
@@ -290,22 +299,32 @@ import type {
   MonitorStoppedPayload,
   OutputShownPayload,
 } from "@/node/services/backgroundProcessManager";
-import { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
+import {
+  BashMonitorRegistryStore,
+  type BashMonitorRegistryRecord,
+} from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
-  BashMonitorWakeStore,
-  buildBashMonitorWakeMetadata,
-  buildBashMonitorWakePrompt,
-  type BashMonitorClearToken,
-  type BashMonitorWakePromptContext,
-  type BashMonitorWakeRecord,
-} from "@/node/services/bashMonitorWakeStore";
+  BashMonitorWakeReconciler,
+  type BashMonitorWakeDispatch,
+  type BashMonitorWakeDispatchOutcome,
+  type BashMonitorWakeReconcilerSnapshot,
+} from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
-import type { TaskService } from "@/node/services/taskService";
+import {
+  areArchiveUntrackedPathListsEqual,
+  normalizeArchiveUntrackedPaths,
+  type AgentTaskIntegration,
+  type ArchiveWorkspaceOptions,
+  type SendMessageInternalOptions,
+  type WorkspaceHost,
+  type WorkspaceLiveActivity,
+} from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
+import type { DevToolsService } from "@/node/services/devToolsService";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createBashTool } from "@/node/services/tools/bash";
@@ -469,6 +488,23 @@ function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string)
   );
 }
 
+/**
+ * The terminal-attention drain delivers workflow results as one synthetic user prompt that may
+ * coalesce several runs, so it carries no per-run workflow-result metadata. If a crash lands
+ * between the send's durable acceptance and the settled-marker write, the next sweep re-queues
+ * the run; recognizing the accepted row as consumption is what settles it without a re-send.
+ * Only synthetic rows qualify: a manual user message is a supersession boundary and is
+ * classified before this check runs.
+ */
+function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): boolean {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) {
+    return false;
+  }
+  return message.parts.some(
+    (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
+  );
+}
+
 function isResetBoundaryMessage(message: MuxMessage): boolean {
   return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
 }
@@ -601,57 +637,13 @@ interface WorkspaceAgentStatus {
   url?: string;
 }
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+
+/** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
+type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
-export interface ArchiveWorkspaceOptions {
-  /**
-   * Refuse to archive when the effective worktree archive behavior would delete the checkout
-   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
-   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
-   * behavior read that drives the snapshot/deletion decisions.
-   */
-  forbidWorktreeCheckoutDeletion?: boolean;
-  /**
-   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
-   * session). Model-facing callers set this so an agent-driven archive fails closed instead
-   * of silently terminating user work that started after the caller's earlier activity check.
-   * Checked synchronously in the same block that marks the workspace as archiving, pairing
-   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
-   * other. Also holds the session's turn admission for the rest of the archive so a queued
-   * entry cannot dispatch through AgentSession's internal send path (which bypasses
-   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
-   * path intentionally omits this and keeps its stop-activity semantics.
-   */
-  refuseLiveUserActivity?: boolean;
-  /**
-   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
-   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
-   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
-   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
-   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
-   */
-  worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
-  /**
-   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
-   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
-   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
-   * fail closed instead; route that policy through user-mediated archive.
-   */
-  forbidCoderWorkspaceDeletion?: boolean;
-  /**
-   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
-   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
-   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
-   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
-   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
-   * otherwise strand already-interrupted turns behind a failed archive.
-   */
-  coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
-}
-
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -663,18 +655,6 @@ function normalizeRepoRootProjectPath(projectPath: string | null | undefined): s
   }
 
   return stripTrailingSlashes(path.posix.normalize(normalizedPath));
-}
-
-function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {
-  const normalizedPaths = paths.map((untrackedPath) => {
-    const trimmedPath = untrackedPath.trim();
-    assert(
-      trimmedPath.length > 0,
-      "normalizeArchiveUntrackedPaths: untracked paths must be non-empty"
-    );
-    return trimmedPath;
-  });
-  return [...new Set(normalizedPaths)].sort();
 }
 
 function buildArchiveLossyUntrackedFilesConfirmation(
@@ -689,23 +669,6 @@ function buildArchiveLossyUntrackedFilesConfirmation(
     kind: "confirm-lossy-untracked-files",
     paths: normalizedPaths,
   };
-}
-
-// Exported so TaskService's pre-interruption archive preflight applies the exact
-// acknowledgement semantics enforced at the archive sink (getArchiveUntrackedFilesConfirmation):
-// a drifted acknowledged set — extra OR missing paths — must re-confirm before any
-// destructive interruption, not after.
-export function areArchiveUntrackedPathListsEqual(
-  leftPaths: readonly string[],
-  rightPaths: readonly string[]
-): boolean {
-  const normalizedLeftPaths = normalizeArchiveUntrackedPaths(leftPaths);
-  const normalizedRightPaths = normalizeArchiveUntrackedPaths(rightPaths);
-  if (normalizedLeftPaths.length !== normalizedRightPaths.length) {
-    return false;
-  }
-
-  return normalizedLeftPaths.every((path, index) => path === normalizedRightPaths[index]);
 }
 
 function isArchiveLossyUntrackedFilesConfirmation(
@@ -730,56 +693,11 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // workspace became active. This is an expected race, not a compaction failure, so the
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
+const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 const SEND_ADMISSION_STALE_MESSAGE =
   "Send refused: the target was stopped or interrupted while the message was being admitted.";
-
-const BASH_MONITOR_WAKE_QUEUE_KEY_PREFIX = "bash-monitor-wake:";
-const BASH_MONITOR_CANCELED_QUEUE_REASON =
-  "Background bash monitor was explicitly canceled before its wake dispatched.";
-const BASH_MONITOR_SHOWN_QUEUE_REASON =
-  "Background bash monitor output was already shown before its wake dispatched.";
-// Re-arm retraction rebuilds rather than consumes: the store row was rewritten (stale terminal
-// cleared), so the queued prompt is stale but the wake itself must redeliver from the row.
-const BASH_MONITOR_REARMED_QUEUE_REASON =
-  "Background bash monitor was re-armed before its queued settlement wake dispatched.";
-
-/**
- * Parse a persisted generation marker (ISO timestamp) into an `originNotAfterMs` bound. A
- * malformed value degrades to NEGATIVE_INFINITY -- the fail-open bound under which every live
- * process counts as a newer generation, so its read state can neither supersede the durable wake
- * nor retract its queued turn. Raw Date.parse would instead yield NaN, which disables the
- * generation check (`startTime > NaN` and `startTime <= NaN` are both false) and poisons the
- * min/max bound accumulation across coalesced records.
- */
-function parseGenerationMarkerMs(value: string): number {
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
-}
-
-interface QueuedBashMonitorWakeCancellation {
-  abortController: AbortController;
-  dispatchState: { canceledBeforeAcceptance: boolean };
-  invalidatedProcessKeys: Set<string>;
-  /**
-   * Per-process signals a queued wake carries. A wake is retracted only when a shown event covers
-   * every present signal: matched output via the shown offset (absent on terminal-only wakes,
-   * vacuously covered), and settlement via the explicit terminal-shown flag (a filtered or
-   * zero-output post-exit read never advances the offset). Each signal carries its own
-   * generation bound: matched output binds to the record's originating createdAt while the
-   * terminal binds to the settling generation's terminalOriginAt, mirroring the drain gate.
-   */
-  matchedOutputByProcess: Map<
-    string,
-    {
-      matchedThroughOffset?: number;
-      matchedOriginNotAfterMs: number;
-      hasTerminal: boolean;
-      terminalOriginNotAfterMs: number;
-    }
-  >;
-}
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
   assert(session instanceof AgentSession, "waitForAgentSessionIdle requires an AgentSession");
@@ -1884,7 +1802,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-export class WorkspaceService extends EventEmitter {
+export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
@@ -1923,189 +1841,177 @@ export class WorkspaceService extends EventEmitter {
     { chat: () => void; metadata: () => void }
   >();
 
-  private readonly bashMonitorWakeStore: BashMonitorWakeStore;
   private readonly bashMonitorRegistryStore: BashMonitorRegistryStore;
-  // Construction timestamp; registry records armed at/after this instant belong to the
-  // live manager, so startup recovery must not convert them into "monitor lost" wakes.
+  private readonly bashMonitorWakeReconciler: BashMonitorWakeReconciler;
   private readonly constructedAtMs = Date.now();
-  private readonly pendingBashMonitorWakeDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
-  private readonly pendingBashMonitorWakeReadWaits = new Set<Promise<void>>();
-  private readonly cancelingBashMonitorWakeKeys = new Set<string>();
-  private readonly pendingBashMonitorWakeDrains = new Set<Promise<void>>();
-  // Explicit cancellation is a tombstone for late monitor-match handlers and queued wakes. It is
-  // cleared when the same process ID is re-armed, which can happen after workspace cleanup.
-  private readonly canceledBashMonitorKeys = new Set<string>();
-  // Settlement wakes whose wake-store write failed: the stopped listener consumes this to retain
-  // the armed-registry row as the restart-recovery breadcrumb (see handleBashMonitorMatch).
-  // Cleared on re-arm so a stale flag cannot retain a later generation's registry row.
-  private readonly failedBashSettlementPersistKeys = new Set<string>();
-  private readonly queuedBashMonitorWakeKeysByProcess = new Map<
-    string,
-    Map<string, QueuedBashMonitorWakeCancellation>
-  >();
-  private nextBashMonitorWakeQueueKey = 0;
-  private readonly bashOutputShownListener = (
-    workspaceId: string,
-    payload: OutputShownPayload
-  ): void => {
-    const processKey = this.bashMonitorProcessKey(workspaceId, payload.processId);
-    for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
-      processKey
-    ) ?? []) {
-      const matchedOutput = cancellation.matchedOutputByProcess.get(processKey);
-      if (matchedOutput == null) {
-        continue;
-      }
-      // Two-signal coverage with per-signal generation bounds (process IDs are reusable across
-      // restarts, mirroring the drain gate): a newer instance's shown frontier cannot cover an
-      // older instance's matched output, while the terminal is covered only by a read of the
-      // settling generation itself.
-      const matchedCovered =
-        matchedOutput.matchedThroughOffset == null ||
-        (payload.processStartTime <= matchedOutput.matchedOriginNotAfterMs &&
-          payload.shownThroughOffset >= matchedOutput.matchedThroughOffset);
-      const terminalCovered =
-        !matchedOutput.hasTerminal ||
-        (payload.processStartTime <= matchedOutput.terminalOriginNotAfterMs &&
-          payload.terminalStatusShown);
-      if (!matchedCovered || !terminalCovered) {
-        continue;
-      }
-      cancellation.invalidatedProcessKeys.add(processKey);
-      cancellation.abortController.abort(BASH_MONITOR_SHOWN_QUEUE_REASON);
-      this.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, queueKey, {
-        cancelReason: BASH_MONITOR_SHOWN_QUEUE_REASON,
-      });
-    }
-  };
-  private readonly bashMonitorMatchListener = (
-    _workspaceId: string,
-    payload: MonitorMatchPayload
-  ) => {
-    void this.handleBashMonitorMatch(payload);
-  };
-  // Serializes every registry/wake mutation for one (workspace, processId) across the
-  // armed/stopped listeners and startup recovery. The registry and wake stores each have
-  // their own internal locks, but cross-store sequences (upsert-then-supersede,
-  // consume-then-enqueue) must not interleave, or a monitor re-armed during recovery can
-  // race the stale-notice conversion (false "monitor lost" wakes, or stale notices left
-  // pending for a live process). NOTE: listeners must call withLock synchronously —
-  // MutexMap enqueues per-key work in call order, so back-to-back armed/stopped events
-  // for a fast-exiting process resolve FIFO and the registry ends deleted.
-  // Serializes monitor match/drain work with destructive history clears for one workspace.
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
-  private readonly bashMonitorRegistryLocks = new MutexMap<string>();
+  private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
+  // Failed-persistence chains active per process, so a later cancellation (task_stop after a
+  // runtime failure) can invalidate in-flight persists and scheduled retries by generation.
+  // "failed" can never follow "canceled" for one generation (stopMonitor guards on
+  // monitor.stopped), so tracking only live failed chains suffices; the owning chain removes
+  // its entry on termination, keeping the map bounded by in-flight failure persists.
+  private readonly activeBashMonitorFailurePersists = new Map<
+    string,
+    { createdAt: string; canceled: boolean }
+  >();
+
+  private trackBashMonitorPersistence(workspaceId: string, promise: Promise<void>): Promise<void> {
+    const pending =
+      this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId) ?? new Set<Promise<void>>();
+    this.pendingBashMonitorPersistenceByWorkspace.set(workspaceId, pending);
+    const tracked = promise.finally(() => {
+      pending.delete(tracked);
+      if (pending.size === 0) this.pendingBashMonitorPersistenceByWorkspace.delete(workspaceId);
+    });
+    pending.add(tracked);
+    return tracked;
+  }
+
+  private async drainBashMonitorPersistence(workspaceId: string): Promise<void> {
+    const pending = this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId);
+    if (pending != null) await Promise.allSettled([...pending]);
+  }
+  private readonly bashOutputShownListener = (
+    workspaceId: string,
+    _payload: OutputShownPayload
+  ): void => {
+    this.scheduleBashMonitorWakeReconcile(workspaceId);
+  };
+  private readonly bashMonitorMatchListener = (
+    workspaceId: string,
+    _payload: MonitorMatchPayload
+  ): void => {
+    this.scheduleBashMonitorWakeReconcile(workspaceId);
+  };
   private readonly bashMonitorArmedListener = (
     _workspaceId: string,
     payload: MonitorArmedPayload
-  ) => {
-    this.bashMonitorHistoryLocks
-      .withLock(payload.workspaceId, () =>
-        this.bashMonitorRegistryLocks.withLock(
-          `${payload.workspaceId}:${payload.processId}`,
-          async () => {
-            // Clear the old cancellation only after its locked wake cleanup finishes. New match
-            // handlers use the same locks, so a reused ID cannot inherit prior-generation cleanup.
-            this.canceledBashMonitorKeys.delete(
-              this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
-            );
-            this.failedBashSettlementPersistKeys.delete(
-              this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
-            );
-            await this.bashMonitorRegistryStore.upsert(payload);
-            await this.bashMonitorWakeStore.supersedePendingMonitorLost(
-              payload.workspaceId,
-              payload.processId
-            );
-            // A re-armed ID also invalidates an undelivered settlement wake's terminal metadata:
-            // the record must not render/gate the now-live task as already settled while the new
-            // generation has not matched yet (the match-merge path only covers the first match).
-            await this.bashMonitorWakeStore.clearStaleTerminalOnRearm(
-              payload.workspaceId,
-              payload.processId
-            );
-            // A wake already QUEUED behind an active owner stream embeds the pre-re-arm prompt
-            // (settled claim + terminal metadata). Retract it so the drain rebuilds from the
-            // rewritten row; only settled-claiming wakes are stale — a live process cannot have
-            // settled, so any queued terminal for this ID belongs to a dead prior generation.
-            const processKey = this.bashMonitorProcessKey(payload.workspaceId, payload.processId);
-            for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
-              processKey
-            ) ?? []) {
-              if (!cancellation.matchedOutputByProcess.get(processKey)?.hasTerminal) continue;
-              cancellation.abortController.abort(BASH_MONITOR_REARMED_QUEUE_REASON);
-              this.removeQueuedMessagesByDedupeKeyPrefix(payload.workspaceId, queueKey, {
-                cancelReason: BASH_MONITOR_REARMED_QUEUE_REASON,
-              });
-            }
-            // A re-armed process ID must not inherit its prior generation's pending
-            // monitor-lost wake in the background-bash listing. spawn() emits its change
-            // before this locked supersession runs, so subscribers need a fresh read now
-            // that the stale record is durably superseded.
-            this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
-          }
-        )
-      )
-      .catch((error: unknown) => {
+  ): void => {
+    if (this.removingWorkspaces.has(payload.workspaceId)) return;
+    const persistence = this.bashMonitorRegistryStore
+      .upsert(payload)
+      .then(() => this.scheduleBashMonitorWakeReconcile(payload.workspaceId));
+    void this.trackBashMonitorPersistence(payload.workspaceId, persistence).catch(
+      (error: unknown) => {
         log.error("Failed to persist armed bash monitor", {
           workspaceId: payload.workspaceId,
           error,
         });
-      });
+      }
+    );
   };
   private readonly bashMonitorStoppedListener = (
     workspaceId: string,
     payload: MonitorStoppedPayload
-  ) => {
-    const processKey = this.bashMonitorProcessKey(workspaceId, payload.processId);
-    const trackedWakeCancellations = this.queuedBashMonitorWakeKeysByProcess.get(processKey);
-    if (payload.reason === "canceled") {
-      // Tombstone synchronously so an already-scheduled match handler/drain cannot enqueue a wake
-      // between the monitor stopping and the persisted/queued cleanup below.
-      this.canceledBashMonitorKeys.add(processKey);
-      for (const [queueKey, cancellation] of trackedWakeCancellations ?? []) {
-        cancellation.invalidatedProcessKeys.add(processKey);
-        cancellation.abortController.abort(BASH_MONITOR_CANCELED_QUEUE_REASON);
-        this.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, queueKey, {
-          cancelReason: BASH_MONITOR_CANCELED_QUEUE_REASON,
-        });
-      }
+  ): void => {
+    const processKey = workspaceId + "\u0000" + payload.processId;
+    const createdAt = payload.armMetadata?.createdAt;
+    if (payload.reason === "canceled" && createdAt != null) {
+      const active = this.activeBashMonitorFailurePersists.get(processKey);
+      if (active?.createdAt === createdAt) active.canceled = true;
     }
-
-    this.bashMonitorHistoryLocks
-      .withLock(workspaceId, () =>
-        this.bashMonitorRegistryLocks.withLock(`${workspaceId}:${payload.processId}`, async () => {
-          // Consume the persist-failure flag under the lock (it is set inside the match
-          // handler's locked block, which this block queues behind). When the settlement wake
-          // failed to persist, the armed-registry row is the only remaining breadcrumb: retain
-          // it so restart recovery converts it into a monitor-lost wake instead of the
-          // settlement vanishing with neither a pending wake nor a registry record.
-          const settlementPersistFailed = this.failedBashSettlementPersistKeys.delete(
-            this.bashMonitorProcessKey(workspaceId, payload.processId)
+    const failurePersist =
+      payload.reason === "failed" && createdAt != null ? { createdAt, canceled: false } : undefined;
+    if (failurePersist != null) {
+      this.activeBashMonitorFailurePersists.set(processKey, failurePersist);
+    }
+    const wasCanceled = (): boolean => failurePersist?.canceled === true;
+    const settleFailurePersist = (): void => {
+      if (
+        failurePersist != null &&
+        this.activeBashMonitorFailurePersists.get(processKey) === failurePersist
+      ) {
+        this.activeBashMonitorFailurePersists.delete(processKey);
+      }
+    };
+    const persist = async (): Promise<boolean> => {
+      if (payload.reason === "canceled") {
+        if (createdAt == null) return false;
+        await this.bashMonitorWakeReconciler.discardProcess(
+          workspaceId,
+          payload.processId,
+          createdAt
+        );
+        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
+        return true;
+      }
+      if (payload.reason === "failed") {
+        if (wasCanceled()) return false;
+        if (payload.armMetadata != null) {
+          await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
+        }
+        if (wasCanceled()) return false;
+        if (payload.terminal != null) {
+          if (createdAt == null) return false;
+          await this.bashMonitorRegistryStore.recordTerminal(
+            workspaceId,
+            payload.processId,
+            createdAt,
+            payload.terminal
           );
-          if (settlementPersistFailed && payload.reason === "completed") {
-            return;
-          }
-          await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId);
-          if (payload.reason === "canceled" && (trackedWakeCancellations?.size ?? 0) === 0) {
-            // With no queued/preparing dispatch, cancellation can retire the wake directly.
-            // Otherwise onCanceled owns the transition after PREPARING rollback succeeds.
-            await this.bashMonitorWakeStore.markSuperseded(
-              workspaceId,
-              BashMonitorWakeStore.wakeId(payload.processId)
-            );
-            // The manager's process-change emit can precede this disk transition, and an
-            // already-exited process produces no later change event, so subscribers need a
-            // nudge after the supersession is durable or the pending-wake label lingers.
-            this.notifyBashMonitorWakeStateChanged(workspaceId);
-          }
-        })
-      )
-      .catch((error: unknown) => {
-        log.error("Failed to retire bash monitor state", { workspaceId, error });
-      });
+        }
+        if (wasCanceled()) return false;
+        if (createdAt == null) return false;
+        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, createdAt, {
+          reason: "runtime-failure",
+          ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
+          ...(payload.failedOperations != null
+            ? { failedOperations: payload.failedOperations }
+            : {}),
+          ...(payload.failedMatch != null ? { failedMatch: payload.failedMatch } : {}),
+          failedAt: new Date().toISOString(),
+        });
+        return !wasCanceled();
+      }
+      if (payload.terminal != null && createdAt != null) {
+        await this.bashMonitorRegistryStore.recordTerminal(
+          workspaceId,
+          payload.processId,
+          createdAt,
+          payload.terminal
+        );
+      }
+      return true;
+    };
+    const persistence = new Promise<void>((resolve) => {
+      let retryIndex = 0;
+      const finish = (): void => {
+        settleFailurePersist();
+        resolve();
+      };
+      const run = (): void => {
+        if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
+          finish();
+          return;
+        }
+        void persist()
+          .then((persisted) => {
+            if (persisted && !wasCanceled()) {
+              this.scheduleBashMonitorWakeReconcile(workspaceId);
+            }
+            finish();
+          })
+          .catch((error: unknown) => {
+            if (wasCanceled()) {
+              finish();
+              return;
+            }
+            const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
+            if (delay == null) {
+              log.error("Failed to retire bash monitor state", { workspaceId, error });
+              finish();
+              return;
+            }
+            const timer = setTimeout(run, delay);
+            timer.unref();
+          });
+      };
+      run();
+    });
+    void this.trackBashMonitorPersistence(workspaceId, persistence);
   };
   // Last armed-monitor count successfully broadcast per workspace, so background process
   // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
@@ -2135,7 +2041,10 @@ export class WorkspaceService extends EventEmitter {
     // the clear. Cost: an occasional duplicate emit, which renderers apply idempotently.
     this.lastEmittedBashMonitorCounts.delete(workspaceId);
     void this.extensionMetadata
-      .getSnapshot(workspaceId)
+      // Strict: emitting a suspect (partial-main) snapshot after a failed
+      // sidecar reconcile would clear goal/status in the renderer; the
+      // catch below already retains "unknown" and re-emits on next change.
+      .getSnapshot(workspaceId, { throwOnError: true })
       .then((snapshot) => {
         this.emitWorkspaceActivity(workspaceId, snapshot);
         // Record only after a successful emit. Re-read the count because the emit merges
@@ -2160,6 +2069,13 @@ export class WorkspaceService extends EventEmitter {
     Promise<Set<string>>
   >();
   private readonly activeWorkflowRunIdsByWorkspace = new Map<string, Set<string>>();
+  // Workspaces where NONZERO workflow-run activity was actually observed
+  // (bootstrap probe, run-status event, or list read). This — not cache
+  // presence — is the zero-count tombstone signal: the activity list's own
+  // probe installs an (empty) cache for every scoped id, so cache existence
+  // would fabricate recency:0 entries for every idle config-known workspace
+  // from the second list on, re-bloating the payload this scoping trims.
+  private readonly workflowRunSeenWorkspaces = new Set<string>();
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2220,29 +2136,105 @@ export class WorkspaceService extends EventEmitter {
    * a follow-up redispatched from within the originating send's own turn
    * (e.g. its on-send compaction completing) must not veto itself, and once
    * handed off the session's own queue/turn-phase state governs visibility.
+   * Tickets are kept in arrival order so a send can tell whether an EARLIER send is
+   * still in preflight (sendMessage queues behind it) without two simultaneous
+   * arrivals each deferring to the other, and so sends reach their queue-or-direct
+   * decision in arrival order (a later arrival must not enqueue first because its
+   * preflight awaits finished sooner). Supersedable tickets are maintenance sends that
+   * yield to user input (requireIdle skips and queue-mode heartbeats): they never count
+   * as "earlier" for anyone, nobody waits on them, and they yield to a manual send in
+   * preflight through preflightSendCounts.
    */
-  private readonly sessionInvisiblePreflightCounts = new Map<string, number>();
+  private readonly sessionInvisiblePreflights = new Map<
+    string,
+    Map<number, { supersedable: boolean; decided: Promise<void>; markDecided: () => void }>
+  >();
+  private nextSessionInvisiblePreflightTicket = 0;
 
-  /** See sessionInvisiblePreflightCounts. Release is idempotent. */
-  private armSessionInvisiblePreflight(workspaceId: string): { release: () => void } & Disposable {
-    this.sessionInvisiblePreflightCounts.set(
-      workspaceId,
-      (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) + 1
-    );
+  private hasSessionInvisiblePreflight(workspaceId: string): boolean {
+    return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
+  }
+
+  /**
+   * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
+   * service call) also drains messages queued behind this preflight when it is a
+   * blocking ticket with no blocking ticket before it (the head of the line that others
+   * queue behind): those entries have no stream end to drain them if this send settled
+   * without a turn (refused, rejected, startup failed). A younger send that settles
+   * first must not drain, or it would dispatch entries ahead of the older still-live
+   * preflight; the older send drains when it settles. Supersedable tickets never drain
+   * because nothing queues behind them, and the drain is a no-op when a turn was handed
+   * off (the session is busy).
+   */
+  private armSessionInvisiblePreflight(
+    workspaceId: string,
+    options?: { supersedable?: boolean }
+  ): {
+    release: () => void;
+    hasEarlierPreflight: () => boolean;
+    /** Resolve once every earlier blocking ticket has reached its queue-or-direct decision. */
+    awaitEarlierDecisions: () => Promise<void>;
+    markDecided: () => void;
+  } & Disposable {
+    const ticket = this.nextSessionInvisiblePreflightTicket++;
+    const supersedable = options?.supersedable === true;
+    let tickets = this.sessionInvisiblePreflights.get(workspaceId);
+    if (tickets == null) {
+      tickets = new Map();
+      this.sessionInvisiblePreflights.set(workspaceId, tickets);
+    }
+    let markDecided!: () => void;
+    const decided = new Promise<void>((resolve) => {
+      markDecided = resolve;
+    });
+    tickets.set(ticket, { supersedable, decided, markDecided });
     let released = false;
+    let releasedAsHead = false;
+    // Map iteration follows insertion order, so tickets before this one arrived earlier.
+    const earlierBlockingTickets = () => {
+      const earlier: Array<{ decided: Promise<void> }> = [];
+      if (released) {
+        return earlier;
+      }
+      for (const [liveTicket, entry] of this.sessionInvisiblePreflights.get(workspaceId) ?? []) {
+        if (liveTicket === ticket) {
+          break;
+        }
+        if (!entry.supersedable) {
+          earlier.push(entry);
+        }
+      }
+      return earlier;
+    };
+    const hasEarlierPreflight = () => earlierBlockingTickets().length > 0;
     const release = () => {
       if (released) {
         return;
       }
+      releasedAsHead = !supersedable && !hasEarlierPreflight();
       released = true;
-      const remaining = (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 1) - 1;
-      if (remaining <= 0) {
-        this.sessionInvisiblePreflightCounts.delete(workspaceId);
-      } else {
-        this.sessionInvisiblePreflightCounts.set(workspaceId, remaining);
+      // A send that leaves before deciding must not keep later arrivals waiting.
+      markDecided();
+      const live = this.sessionInvisiblePreflights.get(workspaceId);
+      live?.delete(ticket);
+      if (live?.size === 0) {
+        this.sessionInvisiblePreflights.delete(workspaceId);
       }
     };
-    return { release, [Symbol.dispose]: release };
+    return {
+      release,
+      hasEarlierPreflight,
+      awaitEarlierDecisions: async () => {
+        await Promise.all(earlierBlockingTickets().map((entry) => entry.decided));
+      },
+      markDecided,
+      [Symbol.dispose]: () => {
+        release();
+        if (releasedAsHead) {
+          this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
+        }
+      },
+    };
   }
   // In-flight renderer executeBash requests per workspace. Incremented in the same
   // synchronous block as executeBash's archivingWorkspaces check (mirroring
@@ -2294,7 +2286,7 @@ export class WorkspaceService extends EventEmitter {
   private readonly initSettlementPromises = new Map<string, Promise<void>>();
 
   /**
-   * Registers a fire-and-forget background init started outside this service (TaskService
+   * Registers a fire-and-forget background init started outside this service (task orchestration
    * starts inits for task workspaces after materializing their checkouts) with the same
    * abort-and-settlement mechanism archive uses: archiveUnlocked aborts the registered
    * controller when init state is still running, and always awaits the retained settlement
@@ -2353,19 +2345,47 @@ export class WorkspaceService extends EventEmitter {
     policyService?: PolicyService,
     telemetryService?: TelemetryService,
     experimentsService?: ExperimentsService,
-    sessionTimingService?: SessionTimingService
+    sessionTimingService?: SessionTimingService,
+    private readonly streamManager?: StreamManager,
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    ),
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
   ) {
     super();
-    this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
-    // A crash-orphaned temp write deferred by the store's live-writer freshness gate
-    // has no natural later trigger (startup discovery already ran and saw nothing
-    // pending). When the gate elapses, re-drive delivery: the drain's scan places the
-    // recovered wake and delivers it, and the notify refreshes the banner row.
-    this.bashMonitorWakeStore.onDeferredTempRecoveryDue = (ownerWorkspaceId) => {
-      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-    };
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
+    // Narrow WorkspaceService test doubles construct partial manager stubs (see the
+    // typeof guard on subscriptions below); a missing method reads as "no live monitor
+    // state" so shared paths like history clear still reconcile instead of crashing.
+    const monitorManager = this.backgroundProcessManager;
+    this.bashMonitorWakeReconciler = new BashMonitorWakeReconciler({
+      sessionsDir: config.sessionsDir,
+      processManager: {
+        pullMonitorWakeSignals: (ownerWorkspaceId) =>
+          typeof monitorManager.pullMonitorWakeSignals === "function"
+            ? monitorManager.pullMonitorWakeSignals(ownerWorkspaceId)
+            : Promise.resolve([]),
+        getMonitorWakeDeliveryState: (processId, originNotAfterMs) =>
+          typeof monitorManager.getMonitorWakeDeliveryState === "function"
+            ? monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs)
+            : Promise.resolve(undefined),
+        acknowledgeMonitorWake: (processId, originNotAfterMs, matchedThroughOffset, settledAt) =>
+          typeof monitorManager.acknowledgeMonitorWake === "function"
+            ? monitorManager.acknowledgeMonitorWake(
+                processId,
+                originNotAfterMs,
+                matchedThroughOffset,
+                settledAt
+              )
+            : undefined,
+        dropRetiredMonitor: (processId, createdAt) =>
+          typeof monitorManager.dropRetiredMonitor === "function"
+            ? monitorManager.dropRetiredMonitor(processId, createdAt)
+            : undefined,
+      },
+      registry: this.bashMonitorRegistryStore,
+      onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
+    });
     if (typeof this.backgroundProcessManager.on === "function") {
       this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
       this.backgroundProcessManager.on("monitor:match", this.bashMonitorMatchListener);
@@ -2401,6 +2421,19 @@ export class WorkspaceService extends EventEmitter {
     });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+    // A cleared tombstone means a removed id was re-registered (downgraded
+    // concurrent backend re-creating a deterministic legacy id): evict the
+    // process-local activity caches bootstrapped for the REMOVED incarnation
+    // so the revived workspace re-probes disk instead of showing ghost
+    // workflow-run counts from session state that removal deleted.
+    // Guarded like the backgroundProcessManager subscriptions above: tests
+    // may construct WorkspaceService with a partial ExtensionMetadataService
+    // stub.
+    if (typeof this.extensionMetadata.setTombstoneClearedListener === "function") {
+      this.extensionMetadata.setTombstoneClearedListener((workspaceId) => {
+        this.evictWorkspaceActivityCaches(workspaceId);
+      });
+    }
     // r63 startup self-heal: reclaim removal tombstones left behind by a
     // removal whose config deregistration AND tombstone rollback both failed
     // — otherwise that workspace stays registered but refused every mutation
@@ -2411,824 +2444,159 @@ export class WorkspaceService extends EventEmitter {
     });
   }
 
-  /**
-   * Startup recovery for bash monitors lost to a Xum restart (graceful or crash).
-   *
-   * The manager's process map is always empty at startup, so any persisted armed-monitor
-   * registry record found now describes a monitor that no longer exists: its process was
-   * terminated on shutdown (or orphaned by a crash). Convert those stale records into
-   * pending "monitor-lost" wakes *before* scheduling drains, so the existing drain
-   * machinery delivers the termination notice (merged with any undelivered match lines).
-   */
+  private async recoverBashMonitorRegistryPass(): Promise<boolean> {
+    let scan: { ownerWorkspaceIds: string[]; scanFailed: boolean };
+    try {
+      scan = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
+    } catch (error) {
+      log.debug("Failed to scan bash monitor registry", { error });
+      return true;
+    }
+    let retryNeeded = scan.scanFailed;
+    for (const ownerWorkspaceId of scan.ownerWorkspaceIds) {
+      try {
+        const records = await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId);
+        if (
+          records.some((record) => {
+            const createdAtMs = Date.parse(record.createdAt);
+            return !Number.isFinite(createdAtMs) || createdAtMs < this.constructedAtMs;
+          })
+        ) {
+          this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+        }
+      } catch (error) {
+        retryNeeded = true;
+        log.debug("Failed to scan bash monitor registry owner", { ownerWorkspaceId, error });
+      }
+    }
+    return retryNeeded;
+  }
+
   private async recoverBashMonitorStateAfterRestart(): Promise<void> {
-    try {
-      for (const ownerWorkspaceId of await this.bashMonitorRegistryStore.listOwnerWorkspaceIds()) {
-        await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
-          for (const record of await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId)) {
-            // Defensive: monitors armed after this service was constructed belong to the
-            // live manager; its own retirement events maintain their registry records.
-            if (Date.parse(record.createdAt) >= this.constructedAtMs) continue;
-            // Consume-then-enqueue runs under the same workspace + per-key locks as live lifecycle
-            // listeners, so destructive clears cannot lose or resurrect recovered monitor notices.
-            await this.bashMonitorRegistryLocks.withLock(
-              `${ownerWorkspaceId}:${record.processId}`,
-              async () => {
-                const consumed = await this.bashMonitorRegistryStore.consumeIfArmedBefore(
-                  ownerWorkspaceId,
-                  record.processId,
-                  this.constructedAtMs
-                );
-                if (consumed == null) return;
-                await this.bashMonitorWakeStore.enqueueMonitorLost(consumed, this.constructedAtMs);
-              }
-            );
-          }
-        });
-      }
-    } catch (error) {
-      log.debug("Failed to convert stale bash monitor registry records into wakes", { error });
-    }
-    await this.schedulePersistedBashMonitorWakeDrains();
-  }
-
-  private async schedulePersistedBashMonitorWakeDrains(): Promise<void> {
-    try {
-      const ownerWorkspaceIds = await this.bashMonitorWakeStore.listPendingOwnerWorkspaceIds();
-      for (const ownerWorkspaceId of ownerWorkspaceIds) {
-        this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-      }
-    } catch (error) {
-      log.debug("Failed to schedule persisted bash monitor wake drains", { error });
-    }
-  }
-
-  private bashMonitorWakeSnapshotKey(processId: string, updatedAt: string): string {
-    assert(processId.trim().length > 0, "bashMonitorWakeSnapshotKey requires processId");
-    assert(updatedAt.trim().length > 0, "bashMonitorWakeSnapshotKey requires updatedAt");
-    return `${processId}:${updatedAt}`;
-  }
-
-  private async findAcceptedBashMonitorWakeSnapshots(
-    ownerWorkspaceId: string,
-    pending: readonly BashMonitorWakeRecord[]
-  ): Promise<Set<string> | null> {
-    // Narrow WorkspaceService test doubles and older embedders may not expose full-history iteration.
-    // Fail open to the existing send path rather than treating an unverified wake as accepted.
-    if (typeof this.historyService.iterateFullHistory !== "function") {
-      return new Set<string>();
-    }
-    const pendingKeys = new Set(
-      pending.map((record) => this.bashMonitorWakeSnapshotKey(record.processId, record.updatedAt))
-    );
-    const acceptedKeys = new Set<string>();
-    const iteration = await this.historyService.iterateFullHistory(
-      ownerWorkspaceId,
-      "backward",
-      (messages) => {
-        for (const message of messages) {
-          const metadata: unknown = message.metadata?.muxMetadata;
-          if (typeof metadata !== "object" || metadata === null) continue;
-          const candidate = metadata as { type?: unknown; records?: unknown };
-          if (candidate.type !== "bash-monitor-wake" || !Array.isArray(candidate.records)) {
-            continue;
-          }
-          for (const rawRecord of candidate.records) {
-            if (typeof rawRecord !== "object" || rawRecord === null) continue;
-            const record = rawRecord as { processId?: unknown; wakeUpdatedAt?: unknown };
-            if (
-              typeof record.processId !== "string" ||
-              record.processId.trim().length === 0 ||
-              typeof record.wakeUpdatedAt !== "string" ||
-              record.wakeUpdatedAt.trim().length === 0
-            ) {
-              continue;
-            }
-            const key = this.bashMonitorWakeSnapshotKey(record.processId, record.wakeUpdatedAt);
-            if (pendingKeys.has(key)) {
-              acceptedKeys.add(key);
-            }
-          }
-        }
-        return acceptedKeys.size < pendingKeys.size;
-      }
-    );
-    if (!iteration.success) {
-      log.error("Failed to scan history for accepted bash monitor wakes", {
-        ownerWorkspaceId,
-        error: iteration.error,
-      });
-      return null;
-    }
-    return acceptedKeys;
-  }
-
-  private bashMonitorProcessKey(workspaceId: string, processId: string): string {
-    assert(workspaceId.trim().length > 0, "bashMonitorProcessKey requires workspaceId");
-    assert(processId.trim().length > 0, "bashMonitorProcessKey requires processId");
-    return `${workspaceId}:${processId}`;
-  }
-
-  private registerQueuedBashMonitorWake(
-    ownerWorkspaceId: string,
-    records: readonly BashMonitorWakeRecord[]
-  ): { queueKey: string; cancellation: QueuedBashMonitorWakeCancellation } {
-    const queueKey = `${BASH_MONITOR_WAKE_QUEUE_KEY_PREFIX}${this.nextBashMonitorWakeQueueKey++}:`;
-    const cancellation: QueuedBashMonitorWakeCancellation = {
-      abortController: new AbortController(),
-      dispatchState: { canceledBeforeAcceptance: false },
-      invalidatedProcessKeys: new Set<string>(),
-      matchedOutputByProcess: new Map(),
-    };
-    for (const record of records) {
-      const processKey = this.bashMonitorProcessKey(ownerWorkspaceId, record.processId);
-      if (
-        record.kind === "match" &&
-        (record.matchedThroughOffset != null || record.terminal != null)
-      ) {
-        const previous = cancellation.matchedOutputByProcess.get(processKey);
-        // matchedThroughOffset stays absent for terminal-only wakes so retraction never applies
-        // an offset condition the wake does not carry (see two-signal coverage in the listener).
-        const matchedThroughOffset =
-          record.matchedThroughOffset != null || previous?.matchedThroughOffset != null
-            ? Math.max(previous?.matchedThroughOffset ?? 0, record.matchedThroughOffset ?? 0)
-            : undefined;
-        cancellation.matchedOutputByProcess.set(processKey, {
-          ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
-          hasTerminal: (previous?.hasTerminal ?? false) || record.terminal != null,
-          // Matched output keeps the OLDEST originating marker (fail-open: an older bound only
-          // rejects newer generations' reads); the terminal takes the NEWEST settling-generation
-          // marker so the live settling process's own read can cover it.
-          matchedOriginNotAfterMs: Math.min(
-            previous?.matchedOriginNotAfterMs ?? Number.POSITIVE_INFINITY,
-            parseGenerationMarkerMs(record.createdAt)
-          ),
-          terminalOriginNotAfterMs: Math.max(
-            previous?.terminalOriginNotAfterMs ?? Number.NEGATIVE_INFINITY,
-            parseGenerationMarkerMs(record.terminalOriginAt ?? record.createdAt)
-          ),
-        });
-      }
-      const queueKeys =
-        this.queuedBashMonitorWakeKeysByProcess.get(processKey) ??
-        new Map<string, QueuedBashMonitorWakeCancellation>();
-      queueKeys.set(queueKey, cancellation);
-      this.queuedBashMonitorWakeKeysByProcess.set(processKey, queueKeys);
-    }
-    return { queueKey, cancellation };
-  }
-
-  private unregisterQueuedBashMonitorWake(
-    ownerWorkspaceId: string,
-    records: readonly BashMonitorWakeRecord[],
-    queueKey: string
-  ): void {
-    for (const record of records) {
-      const processKey = this.bashMonitorProcessKey(ownerWorkspaceId, record.processId);
-      const queueKeys = this.queuedBashMonitorWakeKeysByProcess.get(processKey);
-      queueKeys?.delete(queueKey);
-      if (queueKeys?.size === 0) {
-        this.queuedBashMonitorWakeKeysByProcess.delete(processKey);
-      }
-    }
-  }
-
-  private async handleBashMonitorMatch(payload: MonitorMatchPayload): Promise<void> {
-    try {
-      const processKey = this.bashMonitorProcessKey(payload.workspaceId, payload.processId);
-      await this.bashMonitorHistoryLocks.withLock(payload.workspaceId, () =>
-        this.bashMonitorRegistryLocks.withLock(processKey, async () => {
-          if (this.canceledBashMonitorKeys.has(processKey)) return;
-
-          try {
-            await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
-          } catch (error) {
-            if (payload.terminal != null) {
-              // The settlement wake was never persisted, and the monitor's retirement (queued
-              // behind this handler on the same locks) is about to delete the armed-registry
-              // row — losing BOTH the durable wake and the restart-recovery breadcrumb. Flag
-              // the failure INSIDE the locked block so the stopped listener reliably sees it
-              // and retains the registry row; startup recovery then converts that row into a
-              // monitor-lost wake instead of silence.
-              this.failedBashSettlementPersistKeys.add(processKey);
-            }
-            throw error;
-          }
-          // Surface "match found — waking agent" immediately: a one-shot watcher that
-          // matched and exited would otherwise look like a lost wake until delivery.
-          this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
-          this.scheduleBashMonitorWakeDrain(payload.workspaceId);
-        })
-      );
-    } catch (error) {
-      log.error("Failed to enqueue bash monitor wake", { workspaceId: payload.workspaceId, error });
-    }
-  }
-
-  private scheduleBashMonitorWakeDrain(ownerWorkspaceId: string): void {
-    assert(ownerWorkspaceId.trim().length > 0, "scheduleBashMonitorWakeDrain requires workspaceId");
-    const previous = this.pendingBashMonitorWakeDrainsByOwner.get(ownerWorkspaceId);
-    const promise = (previous ?? Promise.resolve())
-      .catch(() => undefined)
-      .then(() => this.drainBashMonitorWakes(ownerWorkspaceId))
-      .catch((error: unknown) => {
-        log.error("Bash monitor wake drain failed", { ownerWorkspaceId, error });
-        // A failed drain may be the LAST trigger a persisted wake ever gets: startup
-        // recovery runs once, and with no open UI and no later process event nothing
-        // else re-drives delivery. Retry on a delay until a drain pass succeeds; the
-        // timer dedupes per owner, so persistent failure retries at a bounded rate.
-        this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
-      })
-      .finally(() => {
-        this.pendingBashMonitorWakeDrains.delete(promise);
-        if (this.pendingBashMonitorWakeDrainsByOwner.get(ownerWorkspaceId) === promise) {
-          this.pendingBashMonitorWakeDrainsByOwner.delete(ownerWorkspaceId);
-        }
-      });
-    this.pendingBashMonitorWakeDrainsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingBashMonitorWakeDrains.add(promise);
-  }
-
-  // One retry timer per owner after a failed drain (see the catch above).
-  private readonly bashMonitorWakeDrainRetryTimers = new Map<string, NodeJS.Timeout>();
-
-  private scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId: string): void {
-    if (this.bashMonitorWakeDrainRetryTimers.has(ownerWorkspaceId)) return;
+    if (!(await this.recoverBashMonitorRegistryPass())) return;
+    if (!(await this.recoverBashMonitorRegistryPass())) return;
     const timer = setTimeout(() => {
-      this.bashMonitorWakeDrainRetryTimers.delete(ownerWorkspaceId);
-      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+      void this.recoverBashMonitorRegistryPass();
     }, 1_000);
-    // Never hold process shutdown open for a delivery retry.
     timer.unref();
-    this.bashMonitorWakeDrainRetryTimers.set(ownerWorkspaceId, timer);
   }
 
-  private scheduleBashMonitorWakeDrainAfterRead(
-    ownerWorkspaceId: string,
-    readSettled: Promise<void>
-  ): void {
-    if (this.pendingBashMonitorWakeReadWaits.has(readSettled)) {
-      return;
-    }
-    this.pendingBashMonitorWakeReadWaits.add(readSettled);
-
-    const promise = readSettled
-      .catch((error: unknown) => {
-        log.debug("Bash monitor blocking read failed; retrying drain anyway", {
-          ownerWorkspaceId,
-          error,
-        });
-      })
-      .then(() => {
-        this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-      })
-      .finally(() => {
-        this.pendingBashMonitorWakeDrains.delete(promise);
-        this.pendingBashMonitorWakeReadWaits.delete(readSettled);
-      });
-    this.pendingBashMonitorWakeDrains.add(promise);
+  private scheduleBashMonitorWakeReconcile(ownerWorkspaceId: string): void {
+    if (this.removingWorkspaces.has(ownerWorkspaceId)) return;
+    assert(
+      ownerWorkspaceId.trim().length > 0,
+      "scheduleBashMonitorWakeReconcile requires workspaceId"
+    );
+    this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+    this.bashMonitorWakeReconciler.scheduleReconcile(ownerWorkspaceId);
   }
 
-  private scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId: string): void {
-    if (this.pendingBashMonitorWakeIdleWaitsByOwner.has(ownerWorkspaceId)) {
-      return;
-    }
-
+  private scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId: string): void {
+    if (this.pendingBashMonitorWakeIdleWaitsByOwner.has(ownerWorkspaceId)) return;
     const promise = this.waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
       .catch((error: unknown) => {
-        log.debug("Bash monitor idle wait failed; retrying drain anyway", {
+        log.debug("Bash monitor idle wait failed; retrying reconciliation anyway", {
           ownerWorkspaceId,
           error,
         });
       })
-      .then(() => {
-        this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-      })
+      .then(() => this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId))
       .finally(() => {
-        this.pendingBashMonitorWakeDrains.delete(promise);
         if (this.pendingBashMonitorWakeIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
           this.pendingBashMonitorWakeIdleWaitsByOwner.delete(ownerWorkspaceId);
         }
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingBashMonitorWakeDrains.add(promise);
   }
 
-  private bashMonitorWakeKey(ownerWorkspaceId: string, wakeId: string): string {
-    assert(ownerWorkspaceId.trim().length > 0, "bashMonitorWakeKey requires ownerWorkspaceId");
-    assert(wakeId.trim().length > 0, "bashMonitorWakeKey requires wakeId");
-    return `${ownerWorkspaceId}:${wakeId}`;
-  }
-
-  /**
-   * A queued monitor wake has the same semantics as the user's "send after step":
-   * foreground bashes keep running, but detach into background tracking before the
-   * current stream is soft-stopped. Otherwise the stream abort can kill the process
-   * and discard work that the monitor wake was meant to observe.
-   */
-  private backgroundForegroundBashesForMonitorWake(ownerWorkspaceId: string): void {
-    for (const toolCallId of this.backgroundProcessManager.getForegroundToolCallIds(
-      ownerWorkspaceId
-    )) {
-      const result = this.backgroundProcessManager.sendToBackground(toolCallId);
-      if (!result.success) {
-        // The bash may have completed between the snapshot and the request.
-        log.debug("Failed to background foreground bash for monitor wake", {
-          ownerWorkspaceId,
-          toolCallId,
-          error: result.error,
-        });
-      }
-    }
-  }
-
-  private drainBashMonitorWakes(ownerWorkspaceId: string): Promise<void> {
-    // No wake may own the history mutex until startup recovery has finished discovering and
-    // converting stale registry records.
-    return this.bashMonitorRecoveryPromise.then(() =>
-      this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
-        this.drainBashMonitorWakesUnlocked(ownerWorkspaceId).finally(() => {
-          // Safety-net emit after every drain pass. Prompt transitions notify inline
-          // (reconcile loop, resolveWakeSnapshots), but the drain has many exit and
-          // error paths; a trailing no-op emit is cheaper than auditing each of them.
-          this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-        })
-      )
-    );
-  }
-
-  private async drainBashMonitorWakesUnlocked(ownerWorkspaceId: string): Promise<void> {
-    const pendingSnapshot = (await this.bashMonitorWakeStore.listPending(ownerWorkspaceId)).filter(
-      (record) =>
-        !this.cancelingBashMonitorWakeKeys.has(this.bashMonitorWakeKey(ownerWorkspaceId, record.id))
-    );
-    const acceptedSnapshots = await this.findAcceptedBashMonitorWakeSnapshots(
-      ownerWorkspaceId,
-      pendingSnapshot
-    );
-    if (acceptedSnapshots == null) {
-      // Verification FAILURE is not "not accepted": the synthetic turn may already
-      // sit in history with only its delivered transition missing (crash window, or
-      // a failed transition), and treating a transient history-read failure as an
-      // empty accepted set would append the same turn again — duplicating the agent
-      // turn and any actions it takes. Leave every record pending and retry the
-      // scan on the deduped drain retry timer.
-      if (pendingSnapshot.length === 0) return;
-      log.debug("Accepted-wake verification failed; deferring bash monitor wake drain", {
-        ownerWorkspaceId,
-      });
-      this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
-      return;
-    }
-    const pending: BashMonitorWakeRecord[] = [];
-    // The drain can block on a full sendMessage turn below, so transitions applied in
-    // this reconcile loop must notify before that await — not from the drain's finally.
-    let reconciledTransition = false;
-    for (const record of pendingSnapshot) {
-      const snapshotKey = this.bashMonitorWakeSnapshotKey(record.processId, record.updatedAt);
-      if (acceptedSnapshots.has(snapshotKey)) {
-        try {
-          const deliveredSnapshot = await this.bashMonitorWakeStore.markDeliveredSnapshot(
-            ownerWorkspaceId,
-            record
-          );
-          reconciledTransition = true;
-          if (!deliveredSnapshot) {
-            // New matches merged after the accepted snapshot. Keep the remainder pending for its own
-            // wake rather than marking those unseen lines delivered with the older accepted turn.
-            this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
-          }
-        } catch (error) {
-          // Accepted history is authoritative for redelivery suppression. Keep the pending store row
-          // retryable, but never append the same synthetic turn again.
-          log.error("Failed to reconcile accepted bash monitor wake", {
-            ownerWorkspaceId,
-            processId: record.processId,
-            error,
-          });
-        }
-        continue;
-      }
-      if (
-        this.canceledBashMonitorKeys.has(
-          this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-        )
-      ) {
-        await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
-        reconciledTransition = true;
-      } else {
-        pending.push(record);
-      }
-    }
-    if (reconciledTransition) {
-      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-    }
-    if (pending.length === 0) return;
-
-    const cfg = this.config.loadConfigOrDefault();
-    const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
-    if (entry == null) {
-      for (const record of pending) {
-        await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
-      }
-      return;
-    }
-
-    const ownerHasPendingQueuedPreparingOrRetry =
-      this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-    const ownerHasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
-    const ownerHasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-    if (
-      ownerHasPendingQueuedPreparingOrRetry ||
-      (ownerHasSessionBackedBusyState && !ownerHasAiServiceStream)
-    ) {
-      this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
-      return;
-    }
-
-    if (ownerHasAiServiceStream && !ownerHasSessionBackedBusyState) {
-      return;
-    }
-
-    // An in-flight delegated workspace turn continues under its own send options
-    // (per-turn agent/model overrides are not in the workspace's persisted defaults).
-    const sendOptions =
-      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
-      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
-    if (sendOptions == null) {
-      log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
-      return;
-    }
-
-    // Both terminal transitions return false when the persisted record picked up new merged
-    // matches after this drain snapshotted `pending`; in that case reschedule so the freshly
-    // merged lines get their own drain pass. The delivered/superseded callbacks differ only in
-    // which store transition they apply, so share the resolve-each-then-reschedule-on-any-miss
-    // loop rather than copy-pasting it. Defined ahead of the delivery gate below so the gate can
-    // reuse markSupersededSnapshots for matches it drops as already-shown.
-    const resolveWakeSnapshots = async (
-      records: readonly BashMonitorWakeRecord[],
-      resolve: (record: BashMonitorWakeRecord) => Promise<boolean>
-    ): Promise<void> => {
-      let hasUnresolvedMergedMatches = false;
-      try {
-        for (const record of records) {
-          if (!(await resolve(record))) {
-            hasUnresolvedMergedMatches = true;
-          }
-        }
-      } finally {
-        // Notify as soon as durable transitions land — even when a later record's
-        // transition throws after an earlier one already succeeded (observers must track
-        // partial durable updates). The accepted-send path runs this while the drain is
-        // still awaiting the full sendMessage turn, so deferring to the drain's finally
-        // would keep "waking agent…" on screen for the whole wake-triggered stream even
-        // though the wake was already delivered.
+  private async dispatchBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch
+  ): Promise<BashMonitorWakeDispatchOutcome> {
+    return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
+      const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
+      if (entry == null) {
+        await dispatch.onAccepted();
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+        return "in-flight";
       }
-      if (hasUnresolvedMergedMatches) {
-        this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
+      const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
+      const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
+      const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
+      if (hasPendingTurn || (hasSessionBackedBusyState && !hasAiServiceStream)) {
+        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+        return "deferred";
       }
-    };
-    const markDeliveredAfterAccepted = (records: readonly BashMonitorWakeRecord[]): Promise<void> =>
-      resolveWakeSnapshots(records, (record) =>
-        this.bashMonitorWakeStore.markDeliveredSnapshot(ownerWorkspaceId, record)
-      );
-    const markSupersededSnapshots = (records: readonly BashMonitorWakeRecord[]): Promise<void> =>
-      resolveWakeSnapshots(records, (record) =>
-        this.bashMonitorWakeStore.markSupersededSnapshot(ownerWorkspaceId, record)
-      );
-
-    // Register every pending match before the first frontier query. If an earlier process becomes
-    // shown while a later query awaits, the existing cancellation object retains that fact.
-    const { queueKey, cancellation } = this.registerQueuedBashMonitorWake(
-      ownerWorkspaceId,
-      pending
-    );
-    let queueKeyRegistered = true;
-    const unregisterQueueKey = (): void => {
-      if (!queueKeyRegistered) return;
-      queueKeyRegistered = false;
-      this.unregisterQueuedBashMonitorWake(ownerWorkspaceId, pending, queueKey);
-    };
-
-    const deliverable: BashMonitorWakeRecord[] = [];
-    let prompt: string;
-    try {
-      // Delivery gate: re-check each match against the shown frontier immediately before sending it.
-      // If task_await is already reading that same process, defer only that record until the read
-      // settles; unrelated process wakes in this owner batch remain deliverable. Partial manager stubs
-      // without the non-blocking query retain the previous settled-frontier behavior.
-      const canQueryDeliveryState =
-        typeof this.backgroundProcessManager.getMonitorWakeDeliveryState === "function";
-      const canQueryShownFrontier =
-        typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
-      const supersededByShown: BashMonitorWakeRecord[] = [];
-      const promptContext = new Map<string, BashMonitorWakePromptContext>();
-      for (const record of pending) {
-        // A match record carries up to two independent signals, each with its own shown-condition:
-        // matched output (matchedThroughOffset; shown when the offset frontier covers it) and
-        // settlement (terminal; shown only when the agent was returned the terminal status —
-        // NEVER via offsets alone, because a zero-output process has EOF = 0 = shown offset).
-        // Supersede only when every present signal is shown (vacuous for absent signals). Records
-        // with neither signal (legacy rows, or terminal stripped by a downgraded build's rewrite)
-        // fail open and deliver.
-        if (
-          record.kind === "match" &&
-          (record.matchedThroughOffset != null || record.terminal != null)
-        ) {
-          if (canQueryDeliveryState) {
-            const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
-              record.processId,
-              parseGenerationMarkerMs(record.createdAt)
-            );
-            // The terminal signal binds to its own generation marker (terminalOriginAt): a
-            // re-armed generation's settlement is gated against the live settling process, while
-            // the matched signal stays bound to the originating createdAt — offsets from
-            // different generations' output files are never comparable, so a dead generation's
-            // undelivered match must fail open and deliver rather than be superseded by a newer
-            // instance's shown frontier.
-            const terminalMarker = record.terminalOriginAt ?? record.createdAt;
-            const terminalState =
-              record.terminal == null
-                ? undefined
-                : terminalMarker === record.createdAt
-                  ? state
-                  : await this.backgroundProcessManager.getMonitorWakeDeliveryState(
-                      record.processId,
-                      parseGenerationMarkerMs(terminalMarker)
-                    );
-            if (state?.status === "blocked") {
-              this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
-              continue;
-            }
-            if (terminalState?.status === "blocked") {
-              this.scheduleBashMonitorWakeDrainAfterRead(
-                ownerWorkspaceId,
-                terminalState.readSettled
-              );
-              continue;
-            }
-            const matchedShown =
-              record.matchedThroughOffset == null ||
-              (state?.status === "settled" &&
-                state.shownThroughOffset >= record.matchedThroughOffset);
-            // Partial manager stubs may omit terminalStatusShown; undefined fails open.
-            const terminalShown =
-              record.terminal == null ||
-              (terminalState?.status === "settled" && terminalState.terminalStatusShown === true);
-            if (matchedShown && terminalShown) {
-              supersededByShown.push(record);
-              continue;
-            }
-            // Deliverable for its settlement signal only: the matched lines were already
-            // returned by an owner read, so the prompt flags them as consumed instead of
-            // presenting them as a fresh match condition.
-            if (record.terminal != null && record.matchedThroughOffset != null && matchedShown) {
-              promptContext.set(record.id, { matchedOutputAlreadyShown: true });
-            }
-            // A null terminal-marker state means the settling process instance is no longer
-            // registered (Xum restarted after the settlement persisted, or the ID was reclaimed
-            // by a newer generation): task_await on this record's task ID cannot return its
-            // report.
-            if (record.terminal != null && terminalState == null) {
-              promptContext.set(record.id, { taskAwaitable: false });
-            }
-          } else if (canQueryShownFrontier && record.matchedThroughOffset != null) {
-            // Legacy fallback without the non-blocking query: offset-only suppression, applied
-            // strictly to records that carry no terminal signal (a terminal wake must never be
-            // offset-suppressed).
-            const shownThroughOffset =
-              await this.backgroundProcessManager.getSettledShownThroughOffset(
-                record.processId,
-                parseGenerationMarkerMs(record.createdAt)
-              );
-            if (
-              record.terminal == null &&
-              shownThroughOffset != null &&
-              shownThroughOffset >= record.matchedThroughOffset
-            ) {
-              supersededByShown.push(record);
-              continue;
-            }
-          }
-        }
-        deliverable.push(record);
+      if (hasAiServiceStream && !hasSessionBackedBusyState) {
+        return "deferred";
       }
-      const supersededBeforeSend = new Map(
-        supersededByShown.map((record) => [record.id, record] as const)
-      );
-      if (supersededBeforeSend.size > 0) {
-        await markSupersededSnapshots([...supersededBeforeSend.values()]);
-      }
-      if (cancellation.abortController.signal.aborted) {
-        // Stop accepting new invalidations, then include every event retained while the gate awaited.
-        unregisterQueueKey();
-        const newlyInvalidated = pending.filter(
-          (record) =>
-            !supersededBeforeSend.has(record.id) &&
-            cancellation.invalidatedProcessKeys.has(
-              this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-            )
-        );
-        for (const record of newlyInvalidated) {
-          supersededBeforeSend.set(record.id, record);
-        }
-        if (newlyInvalidated.length > 0) {
-          await markSupersededSnapshots(newlyInvalidated);
-        }
-        if (supersededBeforeSend.size < pending.length) {
-          this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-        }
-        return;
-      }
-      // Cancellation can land while the shown-frontier checks above await I/O. Drop those records
-      // before constructing the prompt, while allowing unrelated process wakes in the batch through.
-      for (let index = deliverable.length - 1; index >= 0; index--) {
-        const record = deliverable[index];
-        if (
-          this.canceledBashMonitorKeys.has(
-            this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-          )
-        ) {
-          deliverable.splice(index, 1);
-          await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
-        }
-      }
-      if (deliverable.length === 0) {
-        unregisterQueueKey();
-        return;
+      const sendOptions =
+        (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+        (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
+      if (sendOptions == null) {
+        log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
+        return "deferred";
       }
 
-      prompt = buildBashMonitorWakePrompt(deliverable, promptContext);
-    } catch (error) {
-      unregisterQueueKey();
-      throw error;
-    }
-    const retryAfterIdleIfBusy = (reason: string): void => {
-      if (
-        this.isBusyForMessage(ownerWorkspaceId) ||
-        this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId)
-      ) {
-        this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
-        return;
-      }
-      log.debug("Bash monitor wake left pending without immediate retry", {
+      // Withdrawn while awaiting send options above: the abort listener below would never
+      // fire, and send preflight (which persists AI settings) has nothing left to admit.
+      if (dispatch.cancelSignal.aborted) return "deferred";
+
+      let accepted = false;
+      // A queued wake can be superseded after dequeue. Share cancellation state so
+      // AgentSession can release PREPARING when cancellation wins before acceptance.
+      const cancelState = { canceledBeforeAcceptance: false };
+      // Withdrawal (output already shown, process discarded, history cleared) must
+      // free the queue slot now, not at stream end: a lingering entry keeps the
+      // workspace reported busy and its dedupe key held. The key is unique per
+      // dispatch, so this cannot drop a newer wake's entry.
+      dispatch.cancelSignal.addEventListener(
+        "abort",
+        () => {
+          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
+            cancelReason: "Bash monitor wake withdrawn before dispatch.",
+          });
+        },
+        { once: true }
+      );
+      const sendResult = await this.sendMessage(
         ownerWorkspaceId,
-        reason,
-      });
-    };
-
-    // Once the synthetic wake turn is accepted into durable chat history, the wake has
-    // been delivered. If provider startup fails after acceptance, AgentSession's
-    // startup retry must resume that accepted turn instead of appending another copy
-    // of the same monitor wake.
-    let cancellationCallbackHandled = false;
-    let accepted = false;
-    let delivered = false;
-    let deliveryInFlight: Promise<void> | undefined;
-    const markDeliveredOnce = (): Promise<void> => {
-      if (delivered) return Promise.resolve();
-      if (deliveryInFlight) return deliveryInFlight;
-
-      const attempt = (async () => {
-        try {
-          await markDeliveredAfterAccepted(deliverable);
-          delivered = true;
-        } catch (error) {
-          // Keep delivered=false so the post-send/startup-failure path can retry the durable
-          // transition instead of silently stranding an accepted chat row with a pending wake.
-          log.error("Failed to mark bash monitor wake delivered after accepted send", {
-            ownerWorkspaceId,
-            error,
-          });
-        }
-      })().finally(() => {
-        if (deliveryInFlight === attempt) {
-          deliveryInFlight = undefined;
-        }
-      });
-      deliveryInFlight = attempt;
-      return attempt;
-    };
-
-    const sendResult = await this.sendMessage(
-      ownerWorkspaceId,
-      prompt,
-      {
-        ...sendOptions,
-        queueDispatchMode: "tool-end",
-        // Compact display summaries; the transcript collapses the raw prompt.
-        muxMetadata: buildBashMonitorWakeMetadata(deliverable),
-      },
-      {
-        skipAutoResumeReset: true,
-        synthetic: true,
-        agentInitiated: true,
-        cancelState: cancellation.dispatchState,
-        cancelSignal: cancellation.abortController.signal,
-        queueDedupeKey: queueKey,
-        removableQueueDedupeKey: true,
-        onAccepted: async () => {
-          accepted = true;
-          unregisterQueueKey();
-          await markDeliveredOnce();
+        dispatch.prompt,
+        {
+          ...sendOptions,
+          queueDispatchMode: "tool-end",
+          muxMetadata: dispatch.muxMetadata,
         },
-        onAcceptedPreStreamFailure: async (error) => {
-          unregisterQueueKey();
-          if (accepted) {
-            await markDeliveredOnce();
-            return;
-          }
-          if (delivered) return;
-          log.debug("Bash monitor wake send failed before acceptance; leaving pending", {
-            ownerWorkspaceId,
-            error,
-          });
-          retryAfterIdleIfBusy("pre-stream failure");
-        },
-        onCanceled: async (reason) => {
-          if (cancellationCallbackHandled) return;
-          cancellationCallbackHandled = true;
-          unregisterQueueKey();
-          if (delivered) return;
-          if (reason === BASH_MONITOR_REARMED_QUEUE_REASON) {
-            // Retraction-for-rebuild, not consumption: every record stays pending (the re-arm
-            // already rewrote the settled row) and the next drain re-delivers with fresh prompts.
-            this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
-            return;
-          }
-          const wakeInvalidated =
-            reason === BASH_MONITOR_CANCELED_QUEUE_REASON ||
-            reason === BASH_MONITOR_SHOWN_QUEUE_REASON;
-          const canceledRecords = wakeInvalidated
-            ? deliverable.filter((record) =>
-                cancellation.invalidatedProcessKeys.has(
-                  this.bashMonitorProcessKey(ownerWorkspaceId, record.processId)
-                )
-              )
-            : deliverable;
-          const cancelingKeys = canceledRecords.map((record) =>
-            this.bashMonitorWakeKey(ownerWorkspaceId, record.id)
-          );
-          for (const key of cancelingKeys) {
-            this.cancelingBashMonitorWakeKeys.add(key);
-          }
-          log.debug("Bash monitor wake queue was canceled; superseding canceled snapshot", {
-            ownerWorkspaceId,
-            reason,
-          });
-          try {
-            await markSupersededSnapshots(canceledRecords);
-            if (canceledRecords.length < deliverable.length) {
-              this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+        {
+          skipAutoResumeReset: true,
+          synthetic: true,
+          agentInitiated: true,
+          cancelState,
+          cancelSignal: dispatch.cancelSignal,
+          queueDedupeKey: dispatch.dedupeKey,
+          removableQueueDedupeKey: true,
+          onAccepted: async () => {
+            accepted = true;
+            await dispatch.onAccepted();
+            this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+          },
+          onAcceptedPreStreamFailure: async () => {
+            if (accepted) await dispatch.onAccepted();
+          },
+          onCanceled: async () => {
+            if (!accepted) {
+              await dispatch.onDeferred();
+              this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
             }
-          } catch (error) {
-            log.error("Failed to supersede canceled bash monitor wake snapshot", {
-              ownerWorkspaceId,
-              error,
-            });
-          } finally {
-            for (const key of cancelingKeys) {
-              this.cancelingBashMonitorWakeKeys.delete(key);
-            }
-          }
-        },
+          },
+        }
+      );
+      if (!sendResult.success && !accepted) {
+        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+        return "deferred";
       }
-    );
-
-    if (!accepted && cancellation.abortController.signal.aborted) {
-      // Cancellation may have raced the async preparation inside sendMessage and attempted queue
-      // removal before the entry existed. Retry after sendMessage returns from the enqueue path.
-      const cancelReason =
-        typeof cancellation.abortController.signal.reason === "string"
-          ? cancellation.abortController.signal.reason
-          : BASH_MONITOR_CANCELED_QUEUE_REASON;
-      this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, queueKey, { cancelReason });
-    }
-
-    if (!sendResult.success) {
-      unregisterQueueKey();
-      if (accepted) {
-        await markDeliveredOnce();
-        return;
-      }
-      if (!delivered) {
-        log.debug("Bash monitor wake-up not accepted; leaving pending", {
-          ownerWorkspaceId,
-          error: sendResult.error,
-        });
-        retryAfterIdleIfBusy("sendMessage rejected");
-      }
-      return;
-    }
-
-    if (ownerHasAiServiceStream) {
-      this.backgroundForegroundBashesForMonitorWake(ownerWorkspaceId);
-    }
-
-    if (accepted) {
-      await markDeliveredOnce();
-    }
+      return "in-flight";
+    });
   }
 
   private readonly policyService?: PolicyService;
@@ -3246,10 +2614,10 @@ export class WorkspaceService extends EventEmitter {
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
-  private taskService?: TaskService;
+  private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
-  private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  private devToolsService?: WorkspaceDevToolsCleanup;
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -3310,7 +2678,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * TaskService entry point: task worktrees are REGISTERED before their
+   * Task orchestration entry point: task worktrees are REGISTERED before their
    * checkout exists (queued/reserved launches persist the entry with a future
    * path), so creation-time sanitization cannot cover them and an uninstall's
    * override pruning enumerates a path with nothing to prune — the later
@@ -3592,16 +2960,12 @@ export class WorkspaceService extends EventEmitter {
     this.worktreeArchiveSnapshotService = service;
   }
 
-  /**
-   * Set the task service for auto-resume counter resets.
-   * Called after construction due to circular dependency.
-   */
-  setTaskService(taskService: TaskService): void {
-    this.taskService = taskService;
+  setAgentTaskIntegration(integration: AgentTaskIntegration): void {
+    this.agentTaskIntegration = integration;
   }
 
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
-  setDevToolsService(service: { removeWorkspaceData(workspaceId: string): Promise<void> }): void {
+  setDevToolsService(service: WorkspaceDevToolsCleanup): void {
     this.devToolsService = service;
   }
 
@@ -3819,7 +3183,7 @@ export class WorkspaceService extends EventEmitter {
    * Best-effort startup recovery for non-task chats so restart auto-retry can resume
    * interrupted turns before the user explicitly opens each workspace.
    */
-  async initialize(): Promise<void> {
+  async initialize(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
 
     try {
@@ -3837,13 +3201,24 @@ export class WorkspaceService extends EventEmitter {
       let skippedTaskCount = 0;
       let skippedArchivedCount = 0;
 
+      // Shutdown may have started during the cleanups above; the (synchronous) loop below must
+      // not spawn recovery sessions that beginShutdown() has already swept.
+      if (options?.signal?.aborted === true) {
+        log.info("[startup] WorkspaceService.initialize cancelled before scheduling recovery");
+        return;
+      }
+      // This can run while the server is already serving clients, and the cleanups above took
+      // time: re-read config right before the (synchronous) scheduling loop so a workspace archived
+      // or removed since `allMetadata` was read does not get a hidden recovery stream.
+      const liveConfig = this.config.loadConfigOrDefault();
       for (const metadata of allMetadata) {
         if (metadata.taskStatus) {
           skippedTaskCount += 1;
           continue;
         }
 
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+        const live = findWorkspaceEntry(liveConfig, metadata.id)?.workspace;
+        if (live == null || isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) {
           skippedArchivedCount += 1;
           continue;
         }
@@ -3910,8 +3285,14 @@ export class WorkspaceService extends EventEmitter {
    * This is used by integration tests to simulate network errors mid-stream.
    * @returns true if an active stream was found and error was triggered
    */
-  debugTriggerStreamError(workspaceId: string, errorMessage?: string): Promise<boolean> {
-    return this.aiService.debugTriggerStreamError(workspaceId, errorMessage);
+  debugTriggerStreamError(
+    workspaceId: string,
+    errorMessage = "Test-triggered stream error"
+  ): Promise<boolean> {
+    return (
+      this.streamManager?.debugTriggerStreamError(workspaceId, errorMessage) ??
+      Promise.resolve(false)
+    );
   }
 
   /**
@@ -3962,14 +3343,14 @@ export class WorkspaceService extends EventEmitter {
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
         void this.handleStreamCompletion(data.workspaceId);
-        this.scheduleBashMonitorWakeDrain(data.workspaceId);
+        this.scheduleBashMonitorWakeReconcile(data.workspaceId);
       }
     });
 
     this.aiService.on("stream-abort", (data: unknown) => {
       if (isStreamAbortEvent(data)) {
         void this.stopStreamingStatus(data.workspaceId);
-        this.scheduleBashMonitorWakeDrain(data.workspaceId);
+        this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         // Goal mutations are drained by AgentSession after any abort accounting
         // runs. Draining here would race ahead of AgentSession's stream-abort
         // listener and could charge the aborted in-flight stream to a goal that
@@ -3989,7 +3370,7 @@ export class WorkspaceService extends EventEmitter {
           });
         }
         void this.stopStreamingStatus(data.workspaceId);
-        this.scheduleBashMonitorWakeDrain(data.workspaceId);
+        this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         void this.workspaceGoalService?.applyPendingAfterStreamEnd(data.workspaceId);
       }
     });
@@ -4038,7 +3419,9 @@ export class WorkspaceService extends EventEmitter {
     activeRunIds: Set<string>
   ): Promise<Set<string>> {
     try {
-      const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      });
       const runs = await runStore.listRunStatusSnapshots();
       for (const run of runs) {
         if (
@@ -4059,29 +3442,66 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
-    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
-    const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-    if (cached != null) {
-      const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
-      if (bootstrap != null) {
-        await bootstrap;
-      }
-      return cached;
+    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
+    if (
+      activeRunIds.size > 0 &&
+      // Installation re-check in THIS continuation: an eviction (removal, or
+      // a tombstone lifted for revival) can land in the microtask gap after
+      // resolve's own final check. A detached set must not repopulate the
+      // seen marker — the evicted id's caches are empty, so a stale marker
+      // would fabricate zero-count entries for the idle revived workspace.
+      this.activeWorkflowRunIdsByWorkspace.get(workspaceId) === activeRunIds
+    ) {
+      // A list- or event-delivered nonzero count is what makes a later zero
+      // meaningful as a tombstone (see workflowRunSeenWorkspaces).
+      this.workflowRunSeenWorkspaces.add(workspaceId);
     }
+    return activeRunIds;
+  }
 
-    // Install the shared Set before awaiting disk so parallel workflow status events
-    // mutate the same cache instead of racing to replace each other after bootstrap.
-    const activeRunIds = new Set<string>();
-    this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-    const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
-    this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
-    try {
-      return await bootstrap;
-    } finally {
-      if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
-        this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+  private async resolveActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
+    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
+    // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
+    // lifted for re-registration) can race an in-flight bootstrap. A waiter
+    // that captured the pre-eviction Set would otherwise return the removed
+    // incarnation's runs — ghost counts with no future terminal event to
+    // clear them — so after every await the Set is re-verified as still the
+    // installed cache and the read restarts when it was evicted.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+      if (cached != null) {
+        const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
+        if (bootstrap != null) {
+          await bootstrap;
+        }
+        if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== cached) {
+          continue;
+        }
+        return cached;
       }
+
+      // Install the shared Set before awaiting disk so parallel workflow status events
+      // mutate the same cache instead of racing to replace each other after bootstrap.
+      const activeRunIds = new Set<string>();
+      this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+      const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
+      this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
+      try {
+        await bootstrap;
+      } finally {
+        if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
+          this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+        }
+      }
+      if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== activeRunIds) {
+        continue;
+      }
+      return activeRunIds;
     }
+    // Eviction churn exhausted the retries (pathological): probe disk once
+    // more DETACHED so the caller still gets current durable state without
+    // installing a cache that may itself be mid-eviction.
+    return this.populateActiveWorkflowRunIds(workspaceId, new Set<string>());
   }
 
   private async updateActiveWorkflowRunCount(event: {
@@ -4089,13 +3509,32 @@ export class WorkspaceService extends EventEmitter {
     runId: string;
     status: WorkflowRunStatus;
   }): Promise<number> {
-    const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
-    if (isActiveWorkflowRunStatus(event.status)) {
-      activeRunIds.add(event.runId);
-    } else {
-      activeRunIds.delete(event.runId);
+    // Bounded retry (same reason as resolveActiveWorkflowRunIds): an
+    // eviction can land in the microtask gap after the cache read resolves,
+    // so the mutation below would hit a detached incarnation — and must not
+    // mark the seen set for an id whose caches were just evicted, or the
+    // idle revived workspace emits fabricated zero-count entries forever.
+    let detachedSize = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
+      if (isActiveWorkflowRunStatus(event.status)) {
+        activeRunIds.add(event.runId);
+      } else {
+        activeRunIds.delete(event.runId);
+      }
+      detachedSize = activeRunIds.size;
+      if (this.activeWorkflowRunIdsByWorkspace.get(event.workspaceId) !== activeRunIds) {
+        continue;
+      }
+      if (isActiveWorkflowRunStatus(event.status)) {
+        this.workflowRunSeenWorkspaces.add(event.workspaceId);
+      }
+      return activeRunIds.size;
     }
-    return activeRunIds.size;
+    // Eviction churn exhausted the retries (pathological): report the last
+    // detached mutation's size without seen-marking, mirroring the detached
+    // disk-probe fallback in resolveActiveWorkflowRunIds.
+    return detachedSize;
   }
 
   private mergeCachedActiveWorkflowRuns(
@@ -4121,12 +3560,12 @@ export class WorkspaceService extends EventEmitter {
     return this.backgroundProcessManager.getActiveMonitorCount(workspaceId);
   }
 
-  // Last successfully read pending-wake set per workspace. On a transient wake-store read
-  // failure, listBackgroundProcesses republishes this instead of an (authoritative-looking)
-  // empty set that would clear pending-wake UI state with no later event to restore it.
   private readonly lastGoodPendingWakesByWorkspace = new Map<
     string,
-    readonly BashMonitorWakeRecord[]
+    {
+      snapshot: BashMonitorWakeReconcilerSnapshot;
+      registryRows: readonly BashMonitorRegistryRecord[];
+    }
   >();
 
   // One retry timer per workspace after a failed pending-wake read. The fallback above
@@ -4183,10 +3622,23 @@ export class WorkspaceService extends EventEmitter {
     assert(event.workspaceId.length > 0, "emitWorkflowRunActivity requires workspaceId");
     assert(event.runId.length > 0, "emitWorkflowRunActivity requires runId");
     await this.updateActiveWorkflowRunCount(event);
-    this.emitWorkspaceActivity(
-      event.workspaceId,
-      await this.extensionMetadata.getSnapshot(event.workspaceId)
-    );
+    let snapshot: WorkspaceActivitySnapshot | null;
+    try {
+      snapshot = await this.extensionMetadata.getSnapshot(event.workspaceId, {
+        throwOnError: true,
+      });
+    } catch (error) {
+      // Emitting a suspect (partial-main) snapshot after a failed sidecar
+      // reconcile would clear goal/status in the renderer with no repair
+      // event. Retention is recoverable: the run count is already cached,
+      // so the next emit or list read delivers it.
+      log.debug("Skipping workflow-run activity emit after failed snapshot read", {
+        workspaceId: event.workspaceId,
+        error,
+      });
+      return;
+    }
+    this.emitWorkspaceActivity(event.workspaceId, snapshot);
   }
 
   /**
@@ -4198,16 +3650,27 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
-    this.emit("activity", {
+    const activity = this.mergeCurrentActiveBashMonitorCount(
       workspaceId,
-      activity: this.mergeCurrentActiveBashMonitorCount(
+      this.mergeCachedActiveWorkflowRuns(
         workspaceId,
-        this.mergeCachedActiveWorkflowRuns(
-          workspaceId,
-          this.overlayPendingGoal(workspaceId, snapshot)
-        )
-      ),
-    });
+        this.overlayPendingGoal(workspaceId, snapshot)
+      )
+    );
+    // A late in-flight producer (e.g. a stream-abort stop-status handler mid
+    // todo read) can complete after removal deleted this workspace's
+    // metadata entry. Its disk write is already blocked by the write
+    // tombstone; suppress the broadcast too, or the renderer re-inserts the
+    // removed id into its activity map after having processed the
+    // metadata-removal event. Null (clearing) emissions stay allowed — the
+    // check runs on the MERGED payload (not the raw snapshot) because the
+    // workflow/bash-monitor cache overlays above can turn a null snapshot
+    // into a non-null activity from still-populated caches, which would
+    // re-insert the deleted id just the same.
+    if (activity !== null && this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+      return;
+    }
+    this.emit("activity", { workspaceId, activity });
   }
 
   /**
@@ -4274,7 +3737,7 @@ export class WorkspaceService extends EventEmitter {
     const nextUpdate = previousUpdate
       .catch(() => undefined)
       .then(async () => {
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         const todos = await readTodosForSessionDir(sessionDir);
         const todoStatus = deriveTodoStatus(todos) ?? null;
 
@@ -4304,7 +3767,7 @@ export class WorkspaceService extends EventEmitter {
       if (!streaming && (hasTodos === undefined || todoStatus === undefined)) {
         // Stop snapshots need an authoritative todo summary even for background workspaces,
         // and centralizing the read here preserves the fire-and-forget abort/error handlers.
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         const todos = await readTodosForSessionDir(sessionDir);
         hasTodos ??= todos.length > 0;
         // When there are no todos to derive from, leave `todoStatus` undefined
@@ -4489,6 +3952,22 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Shutdown: stop startup chat recovery before the services it dispatches through go away.
+   * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
+   * because recovery left a retry pending, or client-created ones housekeeping scheduled recovery
+   * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
+   */
+  beginShutdown(): void {
+    for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
+      this.transientStartupRecoverySessions.delete(workspaceId);
+      session.dispose();
+    }
+    for (const session of this.sessions.values()) {
+      session.beginShutdown();
+    }
+  }
+
+  /**
    * Run startup recovery without permanently caching a session for every workspace.
    * Only promote the temporary session if recovery leaves background activity alive.
    */
@@ -4542,6 +4021,7 @@ export class WorkspaceService extends EventEmitter {
       config: this.config,
       historyService: this.historyService,
       aiService: this.aiService,
+      streamManager: this.streamManager,
       mcpServerManager: this.mcpServerManager,
       telemetryService: this.telemetryService,
       initStateManager: this.initStateManager,
@@ -4581,8 +4061,7 @@ export class WorkspaceService extends EventEmitter {
       // counter, not preflightSendCounts — the originating send's reservation
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
-      hasExternalSendPreflight: () =>
-        (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) > 0,
+      hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
     });
   }
 
@@ -4726,7 +4205,8 @@ export class WorkspaceService extends EventEmitter {
 
   private async getPersistedPostCompactionDiffPaths(workspaceId: string): Promise<string[] | null> {
     const postCompactionPath = path.join(
-      this.config.getSessionDir(workspaceId),
+      this.config.sessionsDir,
+      workspaceId,
       "post-compaction.json"
     );
 
@@ -4850,7 +4330,7 @@ export class WorkspaceService extends EventEmitter {
    * Returns empty exclusions if file doesn't exist.
    */
   public async getPostCompactionExclusions(workspaceId: string): Promise<PostCompactionExclusions> {
-    const exclusionsPath = path.join(this.config.getSessionDir(workspaceId), "exclusions.json");
+    const exclusionsPath = path.join(this.config.sessionsDir, workspaceId, "exclusions.json");
     try {
       const data = await fsPromises.readFile(exclusionsPath, "utf-8");
       return JSON.parse(data) as PostCompactionExclusions;
@@ -4878,7 +4358,7 @@ export class WorkspaceService extends EventEmitter {
         set.delete(itemId);
       }
 
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       await ensurePrivateDir(sessionDir);
       const exclusionsPath = path.join(sessionDir, "exclusions.json");
       await fsPromises.writeFile(
@@ -4940,19 +4420,27 @@ export class WorkspaceService extends EventEmitter {
     return false;
   }
 
-  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
-    const scratchRoot = this.getScratchRoot();
-    await ensurePrivateDir(scratchRoot);
-
-    // Never interpret a config read failure as an empty reference set, because that would
-    // turn best-effort orphan cleanup into deletion of valid scratch chats.
+  /**
+   * Scratch workdirs referenced by config. Throws on unreadable config: never interpret a
+   * config read failure as an empty reference set, because that would turn best-effort
+   * orphan cleanup into deletion of valid scratch chats.
+   */
+  private listReferencedScratchPaths(): Set<string> {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
-    const referencedScratchPaths = new Set(
+    return new Set(
       (config.projects.get(SCRATCH_PROJECT_CONFIG_KEY)?.workspaces ?? [])
         .filter((workspace) => workspace.kind === "scratch")
         .map((workspace) => path.resolve(workspace.path))
     );
+  }
 
+  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
+    const scratchRoot = this.getScratchRoot();
+    await ensurePrivateDir(scratchRoot);
+
+    const referencedScratchPaths = this.listReferencedScratchPaths();
+
+    const nowMs = Date.now();
     for (const entry of await fsPromises.readdir(scratchRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
 
@@ -4960,6 +4448,14 @@ export class WorkspaceService extends EventEmitter {
       if (referencedScratchPaths.has(candidatePath)) continue;
 
       try {
+        // This sweep can run while the server is already accepting requests, and createScratch
+        // creates the workdir before persisting its config entry. Same guards as the session
+        // sweep: skip recently touched directories, then re-check fresh config right before
+        // deleting so a scratch chat created after the snapshot above is never reaped.
+        const stat = await fsPromises.stat(candidatePath);
+        if (nowMs - stat.mtimeMs < ORPHAN_SESSION_DIR_GRACE_MS) continue;
+        if (this.listReferencedScratchPaths().has(candidatePath)) continue;
+
         await fsPromises.rm(candidatePath, { recursive: true, force: true });
       } catch (error: unknown) {
         log.debug("Failed to clean orphaned scratch workdir", { candidatePath, error });
@@ -4978,6 +4474,13 @@ export class WorkspaceService extends EventEmitter {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
 
     const knownIds = new Set<string>(allMetadata.map((metadata) => metadata.id));
+    // Same rationale as the extension-metadata prune: normalization is lossy,
+    // and a live workspace whose config entry gets filtered (e.g. invalid
+    // project path) must not have its session data reaped as an orphan.
+    // Throws on unreadable/unparseable config, aborting this cleanup.
+    for (const persistedId of this.config.readPersistedWorkspaceIdSuperset()) {
+      knownIds.add(persistedId);
+    }
     // The config load-time migration (removeLegacyXumChatEntries) drops the
     // removed Chat with Xum workspace from config, which would make its
     // session dir look orphaned here. Preserve the transcript: a downgraded
@@ -5043,10 +4546,25 @@ export class WorkspaceService extends EventEmitter {
       return;
     }
 
+    const devToolsService = this.devToolsService;
     for (const metadata of allMetadata) {
       if (!isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
       try {
-        await this.devToolsService.removeWorkspaceData(metadata.id);
+        // archive() already removed the log for most archived workspaces, so gate the fresh config
+        // read below on there being something to delete: a per-workspace reload for every archived
+        // entry would scale this sweep with (archived workspaces x config size).
+        if (!(await devToolsService.hasWorkspaceData(metadata.id))) continue;
+        // This sweep can run while the server is serving clients. Unarchive runs under the same
+        // lock, so re-checking the live config inside it means a workspace unarchived since
+        // `allMetadata` was read keeps the logs it has produced since.
+        await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+          const live = findWorkspaceEntry(
+            this.config.loadConfigOrDefault(),
+            metadata.id
+          )?.workspace;
+          if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) return;
+          await devToolsService.removeWorkspaceData(metadata.id);
+        });
       } catch (error: unknown) {
         log.debug("Failed to remove DevTools log for archived workspace", {
           workspaceId: metadata.id,
@@ -5289,7 +4807,9 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
-      const createEnv = await secretsToRecord(this.config.getEffectiveSecrets(owningProjectPath));
+      const createEnv = await secretsToRecord(
+        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+      );
       const maxCollisionRetries = hasSanitizedWorkspaceName
         ? 0
         : MAX_WORKSPACE_NAME_COLLISION_RETRIES;
@@ -5493,7 +5013,9 @@ export class WorkspaceService extends EventEmitter {
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
       // Background init: run postCreateSetup (if present) then initWorkspace
-      const secrets = await secretsToRecord(this.config.getEffectiveSecrets(owningProjectPath));
+      const secrets = await secretsToRecord(
+        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+      );
       // Background init: postCreateSetup (provisioning) + initWorkspace (sync/checkout/hook)
       //
       // If the user cancelled creation while create() was still in flight, avoid spawning
@@ -5762,7 +5284,7 @@ export class WorkspaceService extends EventEmitter {
         );
 
         const createEnv = await secretsToRecord(
-          this.config.getEffectiveSecrets(projectRuntimeEntry.project.projectPath)
+          this.secretsStore.getEffectiveSecrets(projectRuntimeEntry.project.projectPath)
         );
 
         const createResult = await projectRuntimeEntry.runtime.createWorkspace({
@@ -5890,7 +5412,7 @@ export class WorkspaceService extends EventEmitter {
 
               try {
                 const secrets = await secretsToRecord(
-                  this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
+                  this.secretsStore.getEffectiveSecrets(createdWorkspace.project.projectPath)
                 );
 
                 const initResult = await runFullInit(createdWorkspace.runtime, {
@@ -5964,21 +5486,34 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
-    const taskService = this.taskService;
-    const withLock = taskService?.withTaskTreeLifecycleLock?.bind(taskService);
-    return withLock == null ? await operation() : await withLock(workspaceId, operation);
-  }
-
-  async remove(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.removeUnlocked(workspaceId, force)
-    );
+    const integration = this.agentTaskIntegration;
+    return integration == null
+      ? await operation()
+      : await integration.withTaskTreeLifecycleLock(workspaceId, operation);
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle lock,
+   * @param options.beforeRemove - evaluated inside the task-tree lifecycle lock; returning false
+   *   turns the call into a no-op. Lets callers that screened eligibility outside the lock confirm
+   *   it against live state within the same lock hold that performs the removal.
+   */
+  async remove(
+    workspaceId: string,
+    force = false,
+    options?: { beforeRemove?: () => Promise<boolean> }
+  ): Promise<Result<void>> {
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
+      if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+        return Ok(undefined);
+      }
+      return await this.removeUnlocked(workspaceId, force);
+    });
+  }
+
+  /**
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle lock,
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
-   * under TaskService's creation mutex, which the tree lock is ordered before).
+   * under the task creation mutex, which the tree lock is ordered before).
    */
   async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
     return await this.removeUnlocked(workspaceId, force);
@@ -5990,15 +5525,6 @@ export class WorkspaceService extends EventEmitter {
       return Ok(undefined);
     }
     this.removingWorkspaces.add(workspaceId);
-    // Cancel pending clear-promotion retries before any session data is deleted:
-    // their commitClear would otherwise recreate the session directory (mkdir in the
-    // tombstone mutation) after removal deletes it.
-    for (const [key, timer] of this.bashMonitorClearCommitRetryTimers) {
-      if (key.startsWith(`${workspaceId}:`)) {
-        clearTimeout(timer);
-        this.bashMonitorClearCommitRetryTimers.delete(key);
-      }
-    }
     let timelineClosed = false;
     let removedFromConfig = false;
 
@@ -6011,10 +5537,20 @@ export class WorkspaceService extends EventEmitter {
     }
 
     const persistedWorkspace = this.config.findWorkspace(workspaceId);
+    // Startup recovery or a queued dispatch can be one await from starting a stream that the single
+    // stopStream() below cannot see, and the entry stays present and unarchived until removal has
+    // finished with the runtime. Hold admission for the whole removal: success disposes the session,
+    // failure releases the hold so the workspace stays usable.
+    const admissionHolds = [
+      this.sessions.get(workspaceId),
+      this.transientStartupRecoverySessions.get(workspaceId),
+    ]
+      .filter((session): session is AgentSession => session != null)
+      .map((session) => session.holdTurnAdmission());
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.taskService?.hasDescendantAgentTasks?.(workspaceId) === true) {
+      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
@@ -6510,23 +6046,13 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
-      // Wait out any in-flight bash-monitor history clear, then disarm surviving
-      // clear writers BEFORE deleting the session directory. A commit-failed clear
-      // intentionally keeps its staged heartbeat armed for cross-instance liveness,
-      // and both that heartbeat and a late tombstone promotion drive
-      // mutateClearedAt, whose mkdir would recreate the directory after deletion.
-      // New clears are refused by the removingWorkspaces guard (set above), and
-      // promotion retries both re-check it and run their commitClear under this
-      // same lock — so the barrier waits out the in-flight clear transaction AND
-      // any already-fired retry.
-      await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
-      // Awaited: abandon also DRAINS heartbeat ticks that already fired, whose
-      // mutateClearedAt (queued outside the history lock) would otherwise mkdir the
-      // directory back after the deletion below.
-      await this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
+      await this.drainBashMonitorPersistence(workspaceId);
+      await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
+        this.bashMonitorWakeReconciler.dispose(workspaceId)
+      );
 
       // Remove session data
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       // r66: identifies THIS removal attempt in the durable tombstone so the
       // compensating rollback below cannot delete a concurrent backend
       // attempt's marker.
@@ -6534,7 +6060,7 @@ export class WorkspaceService extends EventEmitter {
       try {
         if (parentWorkspaceId) {
           try {
-            const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+            const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
             await archiveChildSessionArtifactsIntoParentSessionDir({
               parentWorkspaceId,
               parentSessionDir,
@@ -6661,10 +6187,16 @@ export class WorkspaceService extends EventEmitter {
             { workspaceId, rollbackError }
           );
         }
+        this.bashMonitorWakeReconciler.revive(workspaceId);
         throw error;
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+
+      // Deregistration succeeded: drop the workspace's activity/status entry
+      // so extensionMetadata.json stays bounded (stale entries were
+      // historically never pruned and grew monotonically, issue #3959).
+      await this.discardExtensionMetadataEntry(workspaceId);
 
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
@@ -6692,6 +6224,9 @@ export class WorkspaceService extends EventEmitter {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      for (const hold of admissionHolds) {
+        hold[Symbol.dispose]();
+      }
       this.removingWorkspaces.delete(workspaceId);
     }
   }
@@ -6779,6 +6314,13 @@ export class WorkspaceService extends EventEmitter {
       log.error("Failed to list workspaces:", error);
       return [];
     }
+  }
+
+  async listByArchivedStatus(archived: boolean): Promise<FrontendWorkspaceMetadata[]> {
+    const workspaces = await this.list();
+    return workspaces.filter(
+      (workspace) => isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) === archived
+    );
   }
 
   // Devcontainer Docker labels are keyed by the exact host worktree path from startup, so stop/status
@@ -7922,6 +7464,7 @@ export class WorkspaceService extends EventEmitter {
       const { projectPath, workspacePath } = workspace;
 
       let updated = false;
+      const healedIds: string[] = [];
       let validationError: string | undefined;
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
@@ -7953,18 +7496,28 @@ export class WorkspaceService extends EventEmitter {
           if (workspaceEntry.pinnedAt) {
             return config;
           }
-          // Server-generated monotonic timestamp: strictly greater than every existing
-          // pin in the project so rapid pins always append deterministically, even if
-          // the wall clock is skewed or several pins land within the same millisecond.
-          let pinnedAtMs = Date.now();
-          for (const entry of projectConfig.workspaces) {
-            if (!entry.pinnedAt) continue;
-            const existingMs = new Date(entry.pinnedAt).getTime();
-            if (Number.isFinite(existingMs) && existingMs >= pinnedAtMs) {
-              pinnedAtMs = existingMs + 1;
+          // Server-generated global monotonic timestamp, plus write-path
+          // healing when corrupted state saturates the sane key range; see
+          // appendPinnedTimestamp.
+          const pinnedEntries = Array.from(config.projects.values()).flatMap((project) =>
+            project.workspaces
+              .filter((entry) => entry.pinnedAt)
+              .map((entry) => ({ id: entry.id, pinnedAt: entry.pinnedAt }))
+          );
+          const { changed, pinnedAt } = appendPinnedTimestamp(pinnedEntries);
+          if (changed.size > 0) {
+            for (const project of config.projects.values()) {
+              for (const entry of project.workspaces) {
+                if (!entry.id) continue;
+                const healedPinnedAt = changed.get(entry.id);
+                if (healedPinnedAt !== undefined) {
+                  entry.pinnedAt = healedPinnedAt;
+                  healedIds.push(entry.id);
+                }
+              }
             }
           }
-          workspaceEntry.pinnedAt = new Date(pinnedAtMs).toISOString();
+          workspaceEntry.pinnedAt = pinnedAt;
           updated = true;
         } else if (workspaceEntry.pinnedAt) {
           delete workspaceEntry.pinnedAt;
@@ -7978,6 +7531,9 @@ export class WorkspaceService extends EventEmitter {
         return Err(validationError);
       }
 
+      if (healedIds.length > 0) {
+        await this.emitCurrentWorkspaceMetadataBatch(healedIds);
+      }
       if (updated) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
@@ -7989,11 +7545,18 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Reorder the pinned block of one project bucket. `workspaceIds` is the full
-   * desired pinned order for that bucket as the client sees it. Defensive
-   * contract: unknown/unpinned ids are dropped, currently-pinned ids omitted
-   * from the input keep their relative order and are appended, so concurrent
-   * pin/unpin from other clients is absorbed instead of erroring.
+   * Reorder a pinned block. `workspaceIds` is the full desired pinned order
+   * for that block as the client sees it: one project bucket in grouped mode,
+   * or the unified cross-project block in flat sidebar mode. The reorder
+   * scope is the union of config buckets referenced by the input ids, so a
+   * grouped drag never disturbs other buckets while a flat drag re-deals the
+   * whole unified block. Defensive contract: unknown/unpinned ids are
+   * dropped, and partial inputs (e.g. the grouped multi-project section sends
+   * only its own pins, which can span project buckets) permute the requested
+   * ids among the slots they already occupy while every omitted pin keeps its
+   * current position, so a section drag never shifts unrelated chats in the
+   * flat global order and concurrent pin/unpin from other clients is absorbed
+   * instead of erroring.
    *
    * Persistence model: pinnedAt is an ordering key, so reordering re-deals the
    * existing pool of pinnedAt timestamps onto the new order (see
@@ -8002,30 +7565,34 @@ export class WorkspaceService extends EventEmitter {
    */
   async reorderPinned(workspaceIds: string[]): Promise<Result<void>> {
     try {
-      // Derive the config bucket from the first resolvable id so clients never
-      // need internal bucket keys (e.g. the multi-project bucket). Nothing
-      // resolvable means the client acted on stale state: a benign no-op.
-      // Const (not narrowed let) so the editConfig closure sees type string.
-      const projectPath = workspaceIds
-        .map((id) => this.config.findWorkspace(id)?.projectPath)
-        .find((path) => path !== undefined);
-      if (projectPath === undefined) {
+      // Resolve buckets from the ids so clients never need internal bucket
+      // keys (e.g. the multi-project bucket). Nothing resolvable means the
+      // client acted on stale state: a benign no-op.
+      const projectPaths = new Set<string>();
+      for (const id of workspaceIds) {
+        const path = this.config.findWorkspace(id)?.projectPath;
+        if (path !== undefined) {
+          projectPaths.add(path);
+        }
+      }
+      if (projectPaths.size === 0) {
         return Ok(undefined);
       }
 
       const changedIds: string[] = [];
       await this.config.editConfig((config) => {
-        const projectConfig = config.projects.get(projectPath);
-        if (!projectConfig) {
-          return config;
-        }
+        const bucketConfigs = [...projectPaths]
+          .map((path) => config.projects.get(path))
+          .filter((bucket) => bucket !== undefined);
 
-        // Current pinned roots of the bucket, in effective pin order.
+        // Current pinned roots across the referenced buckets, in effective pin order.
         const pinnedEntries: Array<{ id: string; pinnedAt: string }> = [];
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id || !entry.pinnedAt) continue;
-          if (!isWorkspacePinned(entry)) continue;
-          pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id || !entry.pinnedAt) continue;
+            if (!isWorkspacePinned(entry)) continue;
+            pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+          }
         }
         if (pinnedEntries.length < 2) {
           return config;
@@ -8035,21 +7602,22 @@ export class WorkspaceService extends EventEmitter {
         const currentSet = new Set(currentOrder);
 
         // Desired order: dedupe the input, keep only currently-pinned ids,
-        // then append omitted pins in their current relative order.
+        // then substitute the requested ids into the slots they currently
+        // occupy so omitted pins never move.
         const seen = new Set<string>();
-        const desiredOrder: string[] = [];
+        const requestedIds: string[] = [];
         for (const id of workspaceIds) {
           if (seen.has(id)) continue;
           seen.add(id);
           if (currentSet.has(id)) {
-            desiredOrder.push(id);
+            requestedIds.push(id);
           }
         }
-        for (const id of currentOrder) {
-          if (!seen.has(id)) {
-            desiredOrder.push(id);
-          }
-        }
+        const requestedSet = new Set(requestedIds);
+        let nextRequestedIndex = 0;
+        const desiredOrder = currentOrder.map((id) =>
+          requestedSet.has(id) ? requestedIds[nextRequestedIndex++] : id
+        );
         if (desiredOrder.every((id, index) => id === currentOrder[index])) {
           return config;
         }
@@ -8058,12 +7626,14 @@ export class WorkspaceService extends EventEmitter {
           pinnedEntries.map((entry) => [entry.id, entry.pinnedAt])
         );
         const changes = reassignPinnedTimestamps(desiredOrder, currentPinnedAtById);
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id) continue;
-          const nextPinnedAt = changes.get(entry.id);
-          if (nextPinnedAt !== undefined) {
-            entry.pinnedAt = nextPinnedAt;
-            changedIds.push(entry.id);
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id) continue;
+            const nextPinnedAt = changes.get(entry.id);
+            if (nextPinnedAt !== undefined) {
+              entry.pinnedAt = nextPinnedAt;
+              changedIds.push(entry.id);
+            }
           }
         }
         return config;
@@ -8156,7 +7726,9 @@ export class WorkspaceService extends EventEmitter {
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>> {
     try {
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
 
@@ -8274,7 +7846,7 @@ export class WorkspaceService extends EventEmitter {
   private readonly pendingExternalEditorRecordings = new Map<string, number>();
 
   private externalEditorMarkerPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
+    return path.join(this.config.sessionsDir, workspaceId, "external-editor-opened");
   }
 
   /**
@@ -8632,19 +8204,7 @@ export class WorkspaceService extends EventEmitter {
    * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
    * archiving instead of killing activity that has no delegated workspace-turn handle.
    */
-  listLiveWorkspaceActivity(workspaceId: string): {
-    streaming: boolean;
-    /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
-    queuedMessages: boolean;
-    /**
-     * Detached background bash processes still running (sync snapshot; may briefly read
-     * stale-running until the next lazy refresh — callers wanting freshness should await
-     * hasRunningBackgroundBashProcesses first).
-     */
-    backgroundBashProcesses: boolean;
-    terminalSessions: boolean;
-    desktopSession: boolean;
-  } {
+  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity {
     return {
       streaming: this.aiService.isStreaming(workspaceId),
       queuedMessages:
@@ -8725,7 +8285,7 @@ export class WorkspaceService extends EventEmitter {
     // different turn) is treated as user work and refuses.
     if (this.aiService.isStreaming(workspaceId)) {
       const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
-        this.aiService.getStreamInfo(workspaceId)?.muxMetadata
+        this.streamManager?.getStreamInfo(workspaceId)?.muxMetadata
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&
@@ -8805,7 +8365,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
    * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
    * workspace lifecycle), so the sink must not re-acquire it.
@@ -8898,7 +8458,9 @@ export class WorkspaceService extends EventEmitter {
         // entering later observe the armed guard and refuse. This closes the window between
         // the caller's earlier active-run snapshot and this sink.
         if (
-          (await this.taskService?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) === true
+          (await this.agentTaskIntegration?.hasActiveTopLevelWorkflowRunsForWorkspace(
+            workspaceId
+          )) === true
         ) {
           return Err(
             "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
@@ -8923,7 +8485,9 @@ export class WorkspaceService extends EventEmitter {
       if (!workspace) {
         return Err("Workspace not found");
       }
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
       const initState = this.initStateManager.getInitState(workspaceId);
@@ -9161,6 +8725,16 @@ export class WorkspaceService extends EventEmitter {
         return config;
       });
 
+      // Startup housekeeping may still be recovering this chat in a transient session whose
+      // stream has not started yet, so the stream stop cannot see it. Disposing it once
+      // archivedAt is durable stops its pending auto-retry or follow-up dispatch; a session the
+      // scheduling loop creates later sees the archived entry and is never started.
+      const transientRecoverySession = this.transientStartupRecoverySessions.get(workspaceId);
+      if (transientRecoverySession) {
+        this.transientStartupRecoverySessions.delete(workspaceId);
+        transientRecoverySession.dispose();
+      }
+
       if (!needsSnapshotCapture) {
         try {
           await this.stopLiveWorkspaceActivityForArchive(workspaceId);
@@ -9271,7 +8845,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock (the model-facing unarchive path pre-acquires it for lock ordering; agent-task
    * ancestry unarchive runs under the send path's tree lock).
    */
@@ -9398,6 +8972,18 @@ export class WorkspaceService extends EventEmitter {
         projects: hookMetadata?.projects,
         subProjectPath: hookMetadata?.subProjectPath,
       });
+
+      // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
+      // workspace does not stay silent until the interval sweep. Only AFTER snapshot
+      // restoration and lifecycle startup above: the drain can admit a synthetic agent turn,
+      // which must not run against a half-restored checkout or precede a failed restoration's
+      // config rollback. Contained: reconciliation failure must not fail the unarchive (the
+      // sweep retries on its own cadence).
+      try {
+        await this.agentTaskIntegration?.noteWorkspaceUnarchived(workspaceId);
+      } catch (error: unknown) {
+        log.warn("Unarchive workflow attention reconciliation failed", { workspaceId, error });
+      }
 
       return Ok(undefined);
     } catch (error) {
@@ -10079,9 +9665,7 @@ export class WorkspaceService extends EventEmitter {
           hasBudgetedResumableGoal(goal) &&
           !modelHasPricingData(
             normalized.data.model,
-            typeof this.config.loadProvidersConfig === "function"
-              ? this.config.loadProvidersConfig()
-              : null
+            this.providersConfigStore.loadProvidersConfig()
           )
         ) {
           return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
@@ -10284,7 +9868,7 @@ export class WorkspaceService extends EventEmitter {
         }
 
         const projectEnv = await secretsToRecord(
-          this.config.getEffectiveSecrets(normalizedRuntimeProjectPath)
+          this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
         );
         projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
         return projectEnv;
@@ -10371,8 +9955,8 @@ export class WorkspaceService extends EventEmitter {
         workspacePath: sourceWorkspace?.workspacePath,
       });
 
-      const sourceSessionDir = this.config.getSessionDir(sourceWorkspaceId);
-      const newSessionDir = this.config.getSessionDir(newWorkspaceId);
+      const sourceSessionDir = path.join(this.config.sessionsDir, sourceWorkspaceId);
+      const newSessionDir = path.join(this.config.sessionsDir, newWorkspaceId);
 
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
@@ -10648,7 +10232,7 @@ export class WorkspaceService extends EventEmitter {
           workspaceId: newWorkspaceId,
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
-          sessionDir: this.config.getSessionDir(newWorkspaceId),
+          sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
@@ -10786,38 +10370,137 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
-    assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
+    return (await this.getWorkflowInvocationCurrentness(workspaceId, runId)) === "current";
+  }
 
-    let current = false;
-    let foundDecision = false;
+  /**
+   * Three-state currentness: "indeterminate" means history/provenance could not be read or
+   * ordered, so the answer is unknown rather than no. Callers that would permanently settle a
+   * terminal wake on a negative answer (the terminal-attention drain records a superseded
+   * settlement marker) must retain and retry on "indeterminate" instead; boolean callers treat
+   * it as not-current,
+   * the pre-existing fail-safe for non-destructive decisions.
+   */
+  async getWorkflowInvocationCurrentness(
+    workspaceId: string,
+    runId: string
+  ): Promise<"current" | "not_current" | "indeterminate"> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationCurrentness requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationCurrentness requires runId");
+
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    if (decision.status === "error") {
+      return "indeterminate";
+    }
+    if (decision.status === "found" && decision.outcome === "invocation") {
+      return "current";
+    }
+
+    // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
+    // no recognizable invocation part in history, so the backward walk above stops at the prior
+    // real user message (or, after a delivered result, at that consumed terminal message) and
+    // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
+    // agent-workflow-runs sidecar, which snapshots the ID of the decision row that was newest
+    // at record time: the run is current exactly when that row is still the newest decision row.
+    // Row identity, not wall-clock ordering, so a backward clock correction can neither strand
+    // a legitimate wake nor let a pre-supersession reference outrank a newer boundary. For a
+    // consumed boundary, equality means a background resume/retry was recorded after the prior
+    // result was delivered. References without a boundary snapshot (pre-upgrade entries,
+    // record-time read failures) cannot be ordered against the decision row at all and defer
+    // as indeterminate below.
+    let references: AgentWorkflowRunReference[];
+    try {
+      references = await readAgentWorkflowRunReferences(
+        path.join(this.config.sessionsDir, workspaceId)
+      );
+    } catch (error: unknown) {
+      // The sidecar is the only invocation evidence a kernel-launched run has, so an
+      // unreadable file is "cannot know right now", not "no reference": defer wake decisions
+      // exactly like an unreadable history.
+      log.warn("Could not read workflow run references for currentness", {
+        workspaceId,
+        runId,
+        error,
+      });
+      return "indeterminate";
+    }
+    const reference = references.find((candidate) => candidate.runId === runId);
+    if (decision.status === "none") {
+      // A decision-free history is current only for a reference whose snapshot verified an
+      // empty history at record time (null): kernel launches from a new or fully cleared
+      // workspace (e.g. a heartbeat turn) have no decision row before or after, and their wake
+      // must still deliver. Every other surviving reference fails safe, because a full clear
+      // (truncateHistory) removes every row WITHOUT appending a reset boundary while leaving
+      // the sidecar intact, and a reference pointing at a cleared row, or one without a
+      // verified snapshot, must not inject a workflow result into the freshly cleared
+      // conversation.
+      return reference?.afterBoundaryMessageId === null ? "current" : "not_current";
+    }
+    if (reference == null) {
+      return "not_current";
+    }
+    if (reference.afterBoundaryMessageId === undefined) {
+      // No boundary snapshot (pre-upgrade entry or record-time history read failure): row
+      // identity cannot be verified, and wall-clock ordering is the exact hole the identity
+      // path exists to close (a backward clock correction would let a pre-supersession
+      // reference outrank a newer manual turn and deliver its output under that turn's tool
+      // policy). Fail quiet rather than deliver or defer forever: this is a deliberately
+      // accepted narrow window (downgrade-stripped or snapshot-failed launches), and the
+      // run's result stays retrievable via an explicit workflow_resume, which re-records the
+      // reference with a fresh boundary.
+      return "not_current";
+    }
+    if (reference.afterBoundaryMessageId === null) {
+      // Verified-empty snapshot: a decision row now exists, so it appeared after the record.
+      return "not_current";
+    }
+    return reference.afterBoundaryMessageId === decision.messageId ? "current" : "not_current";
+  }
+
+  /**
+   * The newest invocation-decision row for this run: a manual user/reset supersession, a
+   * consumed terminal result for the run, or a direct invocation part. Shared by
+   * isWorkflowInvocationCurrent and the sidecar record path so both sides of the identity
+   * comparison classify rows identically.
+   */
+  private async findWorkflowInvocationDecisionRow(
+    workspaceId: string,
+    runId: string
+  ): Promise<
+    | {
+        status: "found";
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+      }
+    | { status: "none" }
+    | { status: "error" }
+  > {
+    const state: {
+      found: {
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+      } | null;
+    } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (messages) => {
         for (const message of messages) {
-          if (isManualUserSupersessionMessage(message)) {
-            current = false;
-            foundDecision = true;
-            return false;
-          }
-          if (isResetBoundaryMessage(message)) {
-            current = false;
-            foundDecision = true;
+          if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
+            state.found = { outcome: "superseded", messageId: message.id };
             return false;
           }
           if (
             isWorkflowResultContinuationMessage(message, runId) ||
+            isCoalescedWorkflowResultMessage(message, runId) ||
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            current = false;
-            foundDecision = true;
+            state.found = { outcome: "consumed", messageId: message.id };
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            current = true;
-            foundDecision = true;
+            state.found = { outcome: "invocation", messageId: message.id };
             return false;
           }
         }
@@ -10830,10 +10513,38 @@ export class WorkspaceService extends EventEmitter {
         runId,
         error: historyResult.error,
       });
-      return false;
+      return { status: "error" };
     }
+    return state.found != null
+      ? { status: "found", outcome: state.found.outcome, messageId: state.found.messageId }
+      : { status: "none" };
+  }
 
-    return foundDecision && current;
+  /** Testable seam for the pre-truncation retirement in truncateHistory. */
+  private async retireKernelWorkflowRunReferences(workspaceId: string): Promise<void> {
+    await clearAgentWorkflowRunReferences(path.join(this.config.sessionsDir, workspaceId));
+  }
+
+  /**
+   * Boundary snapshot for the agent-workflow-runs sidecar: the message ID of the newest
+   * invocation-decision row for this run, or null when history has none. Recorded at
+   * background launch/resume so isWorkflowInvocationCurrent can compare row identity instead
+   * of wall-clock timestamps, which clock corrections can reorder.
+   */
+  async getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationBoundaryMessageId requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationBoundaryMessageId requires runId");
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    // A read failure must not masquerade as a verified-empty history: persisting null would
+    // permanently fail the run's currentness check even after storage recovers. Throw so the
+    // record path can distinguish and record a rediscovery-only reference instead.
+    if (decision.status === "error") {
+      throw new Error("workflow invocation boundary unavailable: history read failed");
+    }
+    return decision.status === "found" ? decision.messageId : null;
   }
 
   /**
@@ -10938,60 +10649,7 @@ export class WorkspaceService extends EventEmitter {
     options: SendMessageOptions & {
       fileParts?: FilePart[];
     },
-    internal?: {
-      allowQueuedAgentTask?: boolean;
-      skipAutoResumeReset?: boolean;
-      synthetic?: boolean;
-      /** Marks a synthetic send as an active-goal continuation turn. */
-      goalContinuation?: boolean;
-      /** Specific active-goal synthetic turn kind to persist on the user message. */
-      goalKind?: GoalSyntheticMessageKind;
-      /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
-      goalId?: string;
-      /** Force Copilot billing classification to "agent" for internal sends. */
-      agentInitiated?: boolean;
-      onAccepted?: () => Promise<void> | void;
-      onCanceled?: (reason: string) => Promise<void> | void;
-      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
-      cancelSignal?: AbortSignal;
-      /**
-       * Synchronous staleness probe from the caller, re-evaluated at the real admission points
-       * (the enqueue block and the session's turn-admission gates) in addition to the
-       * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
-       * during this method's awaits refuses the send instead of queueing a wake or resurrecting
-       * the stopped task via markInterruptedTaskRunning.
-       */
-      admissionStale?: () => boolean;
-      /**
-       * Synthetic assistant rows persisted just before the turn's user row
-       * (family-message payloads). Delivered atomically with the message —
-       * queued alongside it when the workspace is busy — so they never land
-       * inside another turn's PREPARING window (see AgentSession.sendMessage).
-       */
-      preTurnMessages?: MuxMessage[];
-      /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
-      onPreTurnRowsPersisted?: () => void;
-      /** Return once the user message is accepted; stream startup continues asynchronously. */
-      startStreamInBackground?: boolean;
-      /** When true, reject instead of queueing if the workspace is busy. */
-      requireIdle?: boolean;
-      /** Preserve workspace-turn correlation only when this send is the next continuation. */
-      workspaceTurnContinuation?: boolean;
-      /** Coalescing for queued sends: drop the message when the same key is already queued. */
-      queueDedupeKey?: string;
-      /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
-      removableQueueDedupeKey?: boolean;
-      /**
-       * For queued sends: quietly drop the message (success) when other messages are already
-       * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
-       * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
-       * options, so merging a heartbeat in would run the user's queued turn with the
-       * heartbeat's model/agent.
-       */
-      yieldToQueuedMessages?: boolean;
-    }
+    internal?: SendMessageInternalOptions
   ): Promise<Result<void, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
       workspaceId,
@@ -11093,7 +10751,21 @@ export class WorkspaceService extends EventEmitter {
           }
         },
       };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      // Maintenance sends that yield to user input: requireIdle skips and queue-mode
+      // heartbeats. Both must yield to a manual send in preflight rather than race it.
+      const yieldsToPreflightSends =
+        internal?.requireIdle === true || internal?.yieldToQueuedMessages === true;
+      // A queue-mode heartbeat superseded by input that arrived during its preparation is a
+      // quiet success: its next slot fires anyway.
+      const yieldToPreflightSend = (): Result<void, SendMessageError> => {
+        log.info("sendMessage: yielded to a send in preflight during send preparation", {
+          workspaceId,
+        });
+        return Ok(undefined);
+      };
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
+        supersedable: yieldsToPreflightSends,
+      });
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -11105,7 +10777,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not start streaming via generic sendMessage calls.
-      // They should only be started by TaskService once a parallel slot is available.
+      // They should only be started by task orchestration once a parallel slot is available.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -11237,7 +10909,22 @@ export class WorkspaceService extends EventEmitter {
         await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
       }
 
-      const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
+      // Decide queue-or-direct in arrival order: a later send whose awaits above finished
+      // first would otherwise enqueue ahead of an earlier one. The decision below runs
+      // synchronously up to queueMessage / the session handoff.
+      await sessionInvisiblePreflight.awaitEarlierDecisions();
+      sessionInvisiblePreflight.markDecided();
+
+      // A send between service entry and the session's PREPARING claim is invisible to
+      // isBusy(). A later send admitted against that idle snapshot reaches StreamManager
+      // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
+      // to start the later one. Queue behind the earlier in-preflight send instead.
+      // requireIdle callers keep their skip semantics below (and are never waited on, see
+      // sessionInvisiblePreflights); edits bypass the queue by design.
+      const shouldQueue =
+        !normalizedOptions?.editMessageId &&
+        (session.isBusy() ||
+          (sessionInvisiblePreflight.hasEarlierPreflight() && !yieldsToPreflightSends));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -11247,15 +10934,16 @@ export class WorkspaceService extends EventEmitter {
       // synchronously at entry above), so any other in-preflight send makes
       // the count exceed 1; refusing is safe because idle-only callers
       // (continuations, heartbeats) treat this as a transient skip and retry.
-      if (
-        !shouldQueue &&
-        internal?.requireIdle &&
-        (this.preflightSendCounts.get(workspaceId) ?? 0) > 1
-      ) {
+      const hasOtherSendInPreflight = (this.preflightSendCounts.get(workspaceId) ?? 0) > 1;
+      if (!shouldQueue && internal?.requireIdle && hasOtherSendInPreflight) {
         return Err({
           type: "unknown",
           raw: IDLE_ONLY_BUSY_SKIP_MESSAGE,
         });
+      }
+      // Starting a queue-mode heartbeat here would race that input to PREPARING.
+      if (!shouldQueue && internal?.yieldToQueuedMessages === true && hasOtherSendInPreflight) {
+        return yieldToPreflightSend();
       }
 
       // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the count check above is a one-shot
@@ -11265,9 +10953,11 @@ export class WorkspaceService extends EventEmitter {
       // caller's staleness probe with a live preflight re-check so
       // AgentSession's admission gates (including the last gate before the
       // pre-turn batch becomes irrevocable) re-validate idleness; refusal
-      // rolls back the synthetic row and idle-only callers retry.
-      if (internal?.requireIdle) {
-        const callerAdmissionStale = internal.admissionStale;
+      // rolls back the synthetic row and idle-only callers retry. Queue-mode heartbeats
+      // carry the same probe so they cannot claim PREPARING against a manual send that
+      // entered preflight after their entry check (see the quiet yield below).
+      if (yieldsToPreflightSends) {
+        const callerAdmissionStale = internal?.admissionStale;
         internal = {
           ...internal,
           admissionStale: () =>
@@ -11277,12 +10967,27 @@ export class WorkspaceService extends EventEmitter {
       }
 
       if (shouldQueue) {
+        // Mirrors AgentSession's cancelBeforeAcceptance for the queue path: a send withdrawn
+        // during the preflight awaits above must not occupy a queue slot (and hold its dedupe
+        // key) until the stream drains it. Nothing is persisted yet, so only the handshake runs.
+        if (internal?.cancelSignal?.aborted === true) {
+          await getContinuationSendState().onCanceled?.(
+            cancelReasonBeforeAcceptance(internal.cancelSignal)
+          );
+          if (internal.cancelState != null) {
+            internal.cancelState.canceledBeforeAcceptance = true;
+          }
+          return Ok(undefined);
+        }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.
         if (internal?.admissionStale?.() === true) {
+          if (internal.yieldToQueuedMessages === true) {
+            return yieldToPreflightSend();
+          }
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
-        const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+        const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
             type: "unknown",
@@ -11386,18 +11091,18 @@ export class WorkspaceService extends EventEmitter {
         }
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
-          this.taskService?.resetAutoResumeCount?.(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.taskService?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
+          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
         return Ok(undefined);
       }
 
       if (!internal?.skipAutoResumeReset) {
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
 
       // A stale caller probe must refuse BEFORE the interrupted-task rescue below: a peer send
@@ -11408,7 +11113,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before starting a new stream so TaskService
+      // taskStatus=interrupted. Transition before starting a new stream so task orchestration
       // stream-end handling does not early-return on interrupted status.
       //
       // Guarded sends (peer messages) skip this rescue entirely: it exists for user-driven
@@ -11419,7 +11124,7 @@ export class WorkspaceService extends EventEmitter {
       if (internal?.admissionStale == null) {
         try {
           resumedInterruptedTask =
-            (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+            (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
         } catch (error: unknown) {
           log.error("Failed to restore interrupted task status before sendMessage", {
             workspaceId,
@@ -11432,7 +11137,7 @@ export class WorkspaceService extends EventEmitter {
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11488,6 +11193,14 @@ export class WorkspaceService extends EventEmitter {
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
       });
+      if (
+        !result.success &&
+        internal?.yieldToQueuedMessages === true &&
+        result.error.type === "unknown" &&
+        result.error.raw === SEND_ADMISSION_STALE_MESSAGE
+      ) {
+        return yieldToPreflightSend();
+      }
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {
           workspaceId,
@@ -11501,7 +11214,7 @@ export class WorkspaceService extends EventEmitter {
 
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11536,7 +11249,7 @@ export class WorkspaceService extends EventEmitter {
 
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11636,6 +11349,8 @@ export class WorkspaceService extends EventEmitter {
         },
       };
       using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      // A resume never queues, so later sends must not wait on its decision.
+      sessionInvisiblePreflight.markDecided();
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {
@@ -11646,7 +11361,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not be resumed by generic UI/API calls.
-      // TaskService is responsible for dequeuing and starting them.
+      // Task orchestration is responsible for dequeuing and starting them.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -11676,7 +11391,7 @@ export class WorkspaceService extends EventEmitter {
 
       const session = this.getOrCreateSession(workspaceId);
 
-      const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+      const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
       if (taskStatus === "interrupted" && session.isBusy()) {
         return Err({
           type: "unknown",
@@ -11697,11 +11412,11 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before stream start so TaskService stream-end
+      // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
       try {
         resumedInterruptedTask =
-          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       } catch (error: unknown) {
         log.error("Failed to restore interrupted task status before resumeStream", {
           workspaceId,
@@ -11728,7 +11443,7 @@ export class WorkspaceService extends EventEmitter {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -11744,7 +11459,7 @@ export class WorkspaceService extends EventEmitter {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -11759,7 +11474,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,
@@ -11834,11 +11549,11 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
     try {
-      this.taskService?.resetAutoResumeCount(workspaceId);
+      this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
         // Mark before attempting the session interrupt to close races where a child
         // could report between stop initiation and descendant cascade termination.
-        this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+        this.agentTaskIntegration?.markParentWorkspaceInterrupted(workspaceId);
         // Latch synchronously at the request boundary, BEFORE the session-interrupt await
         // below: the suppression mark above is level-triggered (a user resume clears it), so
         // a peer send from a still-running descendant entering during that await — or during
@@ -11846,8 +11561,7 @@ export class WorkspaceService extends EventEmitter {
         // ancestor epoch as its clean baseline and wake workspaces outside the stopped
         // subtree. Released in the finally, after the descendant cascade persisted terminal
         // statuses.
-        // Optional call: test harnesses mock TaskService with a narrow method surface.
-        releaseHardStopLatch = this.taskService?.latchHardInterruptCascade?.(workspaceId);
+        releaseHardStopLatch = this.agentTaskIntegration?.latchHardInterruptCascade(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -11855,7 +11569,7 @@ export class WorkspaceService extends EventEmitter {
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
-          this.taskService?.resetAutoResumeCount(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
@@ -11873,7 +11587,7 @@ export class WorkspaceService extends EventEmitter {
       if (!options?.soft) {
         try {
           const interruptedTaskIds =
-            await this.taskService?.terminateAllDescendantAgentTasks?.(workspaceId);
+            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
           if (interruptedTaskIds && interruptedTaskIds.length > 0) {
             log.debug("Cascade-interrupted descendant tasks on interrupt", {
               workspaceId,
@@ -11892,7 +11606,7 @@ export class WorkspaceService extends EventEmitter {
       if (options?.sendQueuedImmediately) {
         // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
         // clear hard-interrupt suppression first (it won't flow through sendMessage()).
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         // The card represents only user-authored queue content. Prioritize that
         // entry over hidden synthetic/background work before dispatching.
         session.sendNextUserQueuedMessage();
@@ -11905,7 +11619,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (!options?.soft) {
         // Keep suppression state consistent if interrupt setup/stop throws.
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);
@@ -12292,6 +12006,15 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Input poised to take over the session at a queue cut, for cut attribution.
+   * See AgentSession.getQueueCutCutter for stage semantics.
+   */
+  getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
+    const session = this.sessions.get(workspaceId.trim());
+    return session?.getQueueCutCutter();
+  }
+
+  /**
    * Narrow check for an actual scheduled/starting auto-retry, excluding queued
    * manual messages and preparing turns. Callers that must distinguish "the
    * same turn will resume on its own" from "some other queued work exists"
@@ -12371,180 +12094,41 @@ export class WorkspaceService extends EventEmitter {
     ]);
   }
 
-  private async retirePendingBashMonitorWakesBeforeHistoryClear(
-    workspaceId: string
-  ): Promise<Result<{ snapshots: BashMonitorWakeRecord[] } & BashMonitorClearToken>> {
-    try {
-      return Ok(await this.bashMonitorWakeStore.supersedeAllPending(workspaceId));
-    } catch (error) {
-      return Err(
-        `Cannot clear history until pending monitor wakes are retired: ${getErrorMessage(error)}`
-      );
-    }
-  }
-
   private clearHistoryWithRetiredBashMonitorWakes<T>(
     workspaceId: string,
     clear: () => Promise<Result<T>>,
     options?: { discardUnacceptedOnSuccess?: boolean }
   ): Promise<Result<T>> {
-    // Constructor recovery begins before any user clear can be requested, but owner discovery is
-    // asynchronous. Gate destructive clears on that whole operation, not just its eventual lock.
+    if (options?.discardUnacceptedOnSuccess !== true) return clear();
     return this.bashMonitorRecoveryPromise.then(() =>
-      this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
-        this.clearHistoryWithRetiredBashMonitorWakesUnlocked(workspaceId, clear, options)
-      )
-    );
-  }
-
-  private async clearHistoryWithRetiredBashMonitorWakesUnlocked<T>(
-    workspaceId: string,
-    clear: () => Promise<Result<T>>,
-    options?: { discardUnacceptedOnSuccess?: boolean }
-  ): Promise<Result<T>> {
-    // Removal deletes the session directory: a clear admitted after removal begins
-    // would stage a tombstone and stamp records — writes whose mkdir can recreate
-    // the deleted directory and leak a cleared-at file into a future workspace
-    // reusing the ID. removeUnlocked sets the flag before its history-lock barrier,
-    // so checking under this lock is race-free.
-    if (this.removingWorkspaces.has(workspaceId)) {
-      return Err("Cannot clear history while the workspace is being removed.");
-    }
-    const pending = await this.bashMonitorWakeStore.listPending(workspaceId);
-    const acceptedBefore = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, pending);
-    if (acceptedBefore == null) {
-      return Err("Cannot clear history while monitor wake acceptance cannot be verified.");
-    }
-    const retireResult = await this.retirePendingBashMonitorWakesBeforeHistoryClear(workspaceId);
-    if (!retireResult.success) return retireResult;
-    // History clears retire pending wakes without any process-state change, so
-    // background-bash subscribers need explicit nudges to drop (and, after a restore,
-    // re-show) pending-wake rows; nothing else re-emits for already-exited processes.
-    this.notifyBashMonitorWakeStateChanged(workspaceId);
-    const staged = retireResult.data.snapshots;
-    const clearToken = {
-      clearId: retireResult.data.clearId,
-      clearedAt: retireResult.data.clearedAt,
-    };
-    const restoreSnapshots = async (includeUnaccepted: boolean): Promise<void> => {
-      const acceptedAfter = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, staged);
-      const restorable = staged.filter((record) => {
-        const key = this.bashMonitorWakeSnapshotKey(record.processId, record.updatedAt);
-        return (
-          (includeUnaccepted && !acceptedBefore.has(key)) ||
-          (acceptedBefore.has(key) && acceptedAfter?.has(key) === true)
-        );
-      });
-      try {
-        await this.bashMonitorWakeStore.restorePendingSnapshots(
-          workspaceId,
-          restorable,
-          clearToken
-        );
-      } finally {
-        // Notify even when restoration throws partway: earlier records in the pass are
-        // already durably pending again, and without a nudge subscribers would keep the
-        // post-retirement snapshot (hiding those wakes) until unrelated activity.
+      this.bashMonitorHistoryLocks.withLock(workspaceId, async () => {
+        if (this.removingWorkspaces.has(workspaceId)) {
+          return Err("Cannot clear history while the workspace is being removed.");
+        }
+        const clearToken = await this.bashMonitorWakeReconciler.beginFullHistoryClear(workspaceId);
         this.notifyBashMonitorWakeStateChanged(workspaceId);
-      }
-    };
-    let clearResult: Result<T>;
-    try {
-      clearResult = await clear();
-    } catch (error) {
-      try {
-        await restoreSnapshots(true);
-      } catch (restoreError) {
-        log.error("Failed to restore monitor wakes after history clear threw", {
-          workspaceId,
-          error: restoreError,
-        });
-      }
-      throw error;
-    }
-    if (!clearResult.success) {
-      await restoreSnapshots(true);
-      return clearResult;
-    }
-    if (options?.discardUnacceptedOnSuccess !== true) {
-      await restoreSnapshots(true);
-      return clearResult;
-    }
-    // Full clear committed: promote the staged tombstone so pre-clear deferred
-    // temps stop being held and become condemned. Without this, a crash-scan
-    // would eventually treat the staging as failed and resurrect them. The
-    // transcript is durably cleared at this point, so a failed promotion must
-    // NOT reach any restore path (that would resurrect retired wakes straight
-    // into the cleared transcript) nor fail the caller's successful clear —
-    // leave the staging standing (it keeps holding pre-clear temps) and retry
-    // the promotion in the background until it lands.
-    try {
-      await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
-    } catch (commitError) {
-      log.error("Failed to promote bash monitor clear tombstone; will retry", {
-        workspaceId,
-        error: commitError,
-      });
-      this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
-    }
-    return clearResult;
-  }
-
-  // One retry timer per clear transaction for a tombstone promotion that failed AFTER
-  // the history clear durably succeeded (see above): nothing else re-drives the
-  // promotion, and an unpromoted staging would eventually be rolled back as crashed —
-  // resurrecting retired wakes into the cleared transcript.
-  private readonly bashMonitorClearCommitRetryTimers = new Map<string, NodeJS.Timeout>();
-
-  private scheduleBashMonitorClearCommitRetry(
-    workspaceId: string,
-    clearToken: BashMonitorClearToken
-  ): void {
-    const key = `${workspaceId}:${clearToken.clearId}`;
-    if (this.bashMonitorClearCommitRetryTimers.has(key)) return;
-    const timer = setTimeout(() => {
-      this.bashMonitorClearCommitRetryTimers.delete(key);
-      // Serialized through the history lock so removal's pre-deletion barrier also
-      // waits out an ALREADY-FIRED retry: a retry that passed the guard below just
-      // before removal began would otherwise run commitClear (whose tombstone
-      // mutation mkdirs the wake directory) concurrently with — or after — session
-      // deletion. Holding the lock also makes the removingWorkspaces re-check
-      // race-free: removal sets the flag before its barrier acquires this lock.
-      void this.bashMonitorHistoryLocks
-        .withLock(workspaceId, async () => {
-          // A removed (or mid-removal) workspace must never have its session
-          // directory recreated by a late promotion: the tombstone mutation's mkdir
-          // would resurrect deleted session data and could leak a cleared-at file
-          // into a future workspace reusing the ID.
-          if (
-            this.removingWorkspaces.has(workspaceId) ||
-            this.config.findWorkspace(workspaceId) == null
-          ) {
-            return;
-          }
-          await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
-        })
-        .catch((error: unknown) => {
-          log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
-          this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
-        });
-    }, 1_000);
-    // Never hold process shutdown open for a promotion retry: a staging orphaned by
-    // shutdown is reconciled by the staged-clear grace scan on the next start.
-    timer.unref();
-    this.bashMonitorClearCommitRetryTimers.set(key, timer);
+        const result = await clear();
+        if (result.success) {
+          await this.bashMonitorWakeReconciler.finishFullHistoryClear(clearToken);
+          this.notifyBashMonitorWakeStateChanged(workspaceId);
+        }
+        return result;
+      })
+    );
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     const effectivePercentage = percentage ?? 1.0;
-    const isFullClear = effectivePercentage >= 1.0;
-    // A full clear holds the admission guard across the refine drain/lock
-    // awaits below: without it, a send admitted during those awaits could
-    // snapshot the pre-clear transcript and stream across the truncation,
-    // repopulating the cleared context. Partial truncation keeps the plain
-    // pre-check — no awaits sit between it and the truncation.
+    // The admission guard is acquired BEFORE the scope preflight and held across every await
+    // below: a turn admitted during any of them could snapshot the pre-truncation transcript
+    // and stream across the mutation, and one admitted during the preflight itself could
+    // launch a kernel workflow whose sidecar reference the wholesale retirement below would
+    // delete while its launch turn's rows survive the prefix cut, permanently suppressing
+    // that run's wake. The preflight cannot yet prove scope "none", so every request that
+    // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
+    // no-op that retires nothing and keeps the plain busy pre-check.
     let admissionGuard: Disposable | null = null;
-    if (isFullClear) {
+    if (effectivePercentage > 0) {
       const guardResult = this.acquireContextMutationAdmissionGuard(
         workspaceId,
         "truncate history"
@@ -12562,6 +12146,36 @@ export class WorkspaceService extends EventEmitter {
       );
     }
     using _admissionGuard = admissionGuard;
+    // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
+    // a proper prefix, or everything (historyService's full-delete fast path), and each scope
+    // carries different obligations: an emptied transcript needs every full-clear guard, a
+    // prefix cut still needs kernel workflow reference retirement (it can delete the launch
+    // turn's restriction rows without a supersession decision), and a no-op must retire
+    // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
+    // Decide up front; historyService revalidates the dangerous drift directions under the
+    // history write lock (refuseFullDelete / refuseRowRemoval / requireFullDelete below).
+    const truncationScope =
+      effectivePercentage >= 1.0
+        ? ("all" as const)
+        : effectivePercentage <= 0
+          ? ("none" as const)
+          : await this.historyService
+              .classifyTruncationRemoval(workspaceId, effectivePercentage)
+              .catch((error: unknown) => {
+                log.warn("History truncation scope preflight failed; refusing truncation", {
+                  workspaceId,
+                  error,
+                });
+                return null;
+              });
+    if (truncationScope == null) {
+      // An unknown scope must not choose a side-effect set: labeling it a full clear would
+      // discard goal/plan/retry state and advance the context epoch while rows may remain,
+      // and labeling it smaller would skip full-clear guards. Nothing is mutated or retired
+      // yet, so refusing is lossless and the user can simply retry.
+      return Err("Failed to read history to classify the truncation scope. Try again.");
+    }
+    const isFullClear = truncationScope === "all";
     const session = this.sessions.get(workspaceId);
 
     // A full clear discards the transcript a streaming refine pass may be
@@ -12605,10 +12219,49 @@ export class WorkspaceService extends EventEmitter {
         );
       }
     }
+    // Kernel workflow run references belong to the conversation this truncation mutates: a
+    // full clear leaves a verified-empty (null) boundary snapshot reading the fresh
+    // conversation as current, and even a prefix truncation can delete the launch turn's
+    // restriction-bearing rows without appending any supersession decision, letting the wake
+    // recompose from unrestricted defaults. Retire the references on every row-removing
+    // truncation, BEFORE it commits, so both fault directions fail safe: a failed retirement
+    // aborts with the conversation intact, and a failed or refused truncation leaves
+    // reference-less runs settling superseded (dropped wake, still retrievable via resume,
+    // which re-records provenance under the surviving context).
+    if (truncationScope !== "none") {
+      try {
+        await this.retireKernelWorkflowRunReferences(workspaceId);
+      } catch (error) {
+        return Err(
+          `Cannot clear history: stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}). Retry once the session storage is writable.`
+        );
+      }
+      // In-turn compaction retries bypass admission gating across a transient idle gap (see
+      // the full-clear recheck above), and this retirement is the last await before the
+      // rewrite for BOTH row-removing scopes: revalidate here or a retry admitted during it
+      // would have its history truncated underneath the stream. Refusing after retirement is
+      // the documented fail-safe direction (dropped wake, retrievable via resume).
+      if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
-    const truncate = () => this.historyService.truncateHistory(workspaceId, effectivePercentage);
+    // historyService revalidates the scope preflight under the history write lock: an
+    // overlapping mutation can shift this one across a scope boundary in any dangerous
+    // direction (a partial cut becoming a full delete skips the full-clear guards; a no-op
+    // becoming a real cut skips reference retirement; a full clear leaving survivors would
+    // apply full-clear-only discards while rows remain).
+    const truncate = () =>
+      this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+        refuseFullDelete: truncationScope === "partial",
+        refuseRowRemoval: truncationScope === "none",
+        requireFullDelete: truncationScope === "all",
+      });
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -12687,7 +12340,10 @@ export class WorkspaceService extends EventEmitter {
       // data from the supposedly cleared context through the kernel. Same
       // durable invalidation + partial-failure posture as resetContext.
       try {
-        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+        await sandboxHostService.discardScope(
+          workspaceId,
+          path.join(this.config.sessionsDir, workspaceId)
+        );
       } catch (error) {
         log.error(
           `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
@@ -12798,7 +12454,7 @@ export class WorkspaceService extends EventEmitter {
         try {
           await sandboxHostService.discardScope(
             workspaceId,
-            this.config.getSessionDir(workspaceId)
+            path.join(this.config.sessionsDir, workspaceId)
           );
         } catch (error) {
           return Err(
@@ -12883,7 +12539,10 @@ export class WorkspaceService extends EventEmitter {
       // snapshotted) — vars must not survive a reset the way they survive
       // archive/un-archive.
       try {
-        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+        await sandboxHostService.discardScope(
+          workspaceId,
+          path.join(this.config.sessionsDir, workspaceId)
+        );
       } catch (error) {
         // The chat-side reset already applied, but the sandbox invalidation
         // is NOT durable: the empty-snapshot tombstone failed to publish, and
@@ -13040,6 +12699,22 @@ export class WorkspaceService extends EventEmitter {
             );
           }
         }
+        // A destructive non-compaction replacement discards the conversation the kernel
+        // workflow references belong to, exactly like a full clear: a verified-empty (null)
+        // boundary snapshot reads the decision-free replacement history as current and would
+        // inject a pre-replacement workflow result into it. Same ordering and failure posture
+        // as truncateHistory: retire before the clear commits, abort when retirement fails.
+        // Compaction replaces preserve conversation identity, so their references stay live.
+        if (!isCompaction) {
+          try {
+            await this.retireKernelWorkflowRunReferences(workspaceId);
+          } catch (error) {
+            return Err(
+              `Cannot replace history: stale workflow run references could not be retired ` +
+                `(${getErrorMessage(error)}). Retry once the session storage is writable.`
+            );
+          }
+        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
@@ -13080,7 +12755,7 @@ export class WorkspaceService extends EventEmitter {
           try {
             await sandboxHostService.discardScope(
               workspaceId,
-              this.config.getSessionDir(workspaceId)
+              path.join(this.config.sessionsDir, workspaceId)
             );
           } catch (error) {
             log.error(
@@ -13151,30 +12826,322 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * Best-effort removal of a deregistered workspace's activity/status entry
+   * from extensionMetadata.json. Used by remove() and by rollback paths that
+   * deregister via config.removeWorkspace directly (e.g. TaskService's failed
+   * task-create rollback, where a send that failed mid-create may already
+   * have scheduled metadata writes that would recreate the entry after
+   * deregistration). A missed delete is reclaimed by the one-time
+   * pruneStaleExtensionMetadataOnce pass on a later process start.
+   */
+  async discardExtensionMetadataEntry(workspaceId: string): Promise<void> {
+    try {
+      // Deleting also write-tombstones the id for the rest of this process,
+      // so verify deregistration actually landed before publishing it:
+      // saveConfig swallows write failures, meaning config.removeWorkspace
+      // can resolve while the workspace is still persisted in config.json —
+      // tombstoning a still-live id would suppress all of its future
+      // activity writes. A failed verification (unreadable config) skips the
+      // delete too; like a missed delete, the entry is reclaimed by a later
+      // process start's prune, which re-checks against config.
+      //
+      // Deliberately NOT getAllWorkspaceMetadata here: that walks every
+      // configured workspace with per-workspace fs probes — an O(n)
+      // traversal just to check one id. The raw persisted superset (which
+      // throws on an unreadable config, also making findWorkspace's lenient
+      // internal load safe below) covers entries normalization would drop,
+      // and the targeted findWorkspace lookup covers normalized/legacy ids
+      // (metadata.json / generated legacy ids) the raw scan cannot see.
+      const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+      // throwOnError: a lenient findWorkspace swallows unreadable legacy
+      // metadata.json files, and "identity unknowable" must fail closed here
+      // (skip the delete) rather than read as "not registered".
+      if (
+        knownIds.has(workspaceId) ||
+        this.config.findWorkspace(workspaceId, { throwOnError: true }) != null
+      ) {
+        log.debug("Skipping extension metadata discard: workspace still persisted in config", {
+          workspaceId,
+        });
+        return;
+      }
+      await this.extensionMetadata.deleteWorkspace(workspaceId);
+      // Removal-side counterpart of the tombstone-cleared eviction: drop the
+      // process-local workflow/bash-monitor caches for the removed id so a
+      // later re-registration never inherits activity bootstrapped from
+      // session state that removal deleted.
+      this.evictWorkspaceActivityCaches(workspaceId);
+    } catch (error) {
+      log.debug("Failed to prune extension metadata after workspace deregistration", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Strict authoritative enumeration for destructive/identity decisions:
+   * every primary workspace id PLUS legacy alias identities (a second
+   * resolvable compatibility file findWorkspace still vouches for — see
+   * Config.getAllWorkspaceMetadata's legacyAliasIds). Known-id sets built
+   * without the aliases would prune or drop live alias-keyed activity.
+   */
+  private async enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>> {
+    const legacyAliasIds = new Set<string>();
+    const ids = new Set(
+      (await this.config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })).map(
+        (metadata) => metadata.id
+      )
+    );
+    for (const aliasId of legacyAliasIds) {
+      ids.add(aliasId);
+    }
+    return ids;
+  }
+
+  /**
+   * Evict process-local activity caches for a removed (or removed-then-
+   * revived) workspace id. The caches re-bootstrap from disk on next access;
+   * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
+   */
+  private evictWorkspaceActivityCaches(workspaceId: string): void {
+    this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
+    this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+    this.bashMonitorSeenWorkspaces.delete(workspaceId);
+    this.workflowRunSeenWorkspaces.delete(workspaceId);
+  }
+
+  /**
+   * One-time lazy cleanup for pre-existing deployments: drop
+   * extensionMetadata.json entries whose workspace no longer exists in
+   * config. remove() prunes going forward, but entries that leaked before
+   * that hook existed (issue #3959) would otherwise bloat the file — and
+   * every serialized rewrite of it — forever. Runs at most once per process
+   * from the activity bootstrap path; never a per-read scan.
+   */
+  private prunedStaleExtensionMetadata = false;
+  /**
+   * Returns the config-known workspace ids captured during the prune so the
+   * first activity bootstrap can reuse them for scoping —
+   * getAllWorkspaceMetadata walks every workspace with per-workspace disk
+   * probes, which large deployments should not pay twice in the
+   * latency-sensitive bootstrap. `knownIds` is the FULL raw-plus-normalized
+   * union the prune spared from deletion: scoping to anything narrower (the
+   * normalized view alone) would drop raw-registered ids the normalized
+   * view cannot see (e.g. a project pair shadowed by a duplicate path key),
+   * and if the bootstrap's later raw refreshes then failed transiently, the
+   * authoritative response would omit a live workspace whose id this READ
+   * already loaded successfully — clearing its renderer state with no event
+   * to correct it. `enumeratedIds` is what the strict enumeration itself
+   * vouched for (see scopeEnumerationIds: only those ids may treat
+   * enumeration absence as removal evidence). Null when the prune was
+   * skipped or failed.
+   */
+  private async pruneStaleExtensionMetadataOnce(): Promise<{
+    knownIds: Set<string>;
+    enumeratedIds: ReadonlySet<string>;
+  } | null> {
+    if (this.prunedStaleExtensionMetadata) {
+      return null;
+    }
+    // Latch before awaiting so concurrent bootstraps don't queue redundant
+    // prunes; a failed attempt is retried on the next process start rather
+    // than on every read.
+    this.prunedStaleExtensionMetadata = true;
+    try {
+      let prunedScope: { knownIds: Set<string>; enumeratedIds: ReadonlySet<string> } | null = null;
+      const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(
+        async () => {
+          // Invoked inside the file's serialized mutation AFTER the file load,
+          // reading config fresh from disk (see pruneMissingWorkspaces), so a
+          // concurrently created workspace — even in another backend process —
+          // cannot lose its just-written entry.
+          //
+          // Union of two views, both of which throw (aborting the prune, caught
+          // below) rather than resolving with a silently lossy id set:
+          // - the raw persisted superset covers entries loadConfigOrDefault's
+          //   validation/normalization would filter or discard (see
+          //   readPersistedWorkspaceIdSuperset), so a live workspace with a
+          //   malformed config entry is never treated as removed;
+          // - the strict normalized view covers ids produced by in-memory
+          //   config migrations that are not yet persisted verbatim.
+          // A missing config file resolves as a healthy empty set in both.
+          const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+          const enumeratedIds = await this.enumerateAuthoritativeWorkspaceIds();
+          for (const workspaceId of enumeratedIds) {
+            knownIds.add(workspaceId);
+          }
+          prunedScope = { knownIds, enumeratedIds };
+          return knownIds;
+        },
+        async () => {
+          // Mid-prune re-registration recheck. The first callback's strict
+          // enumeration walks a session lookup per configured workspace;
+          // rerunning it doubles that cost on exactly the stale-heavy
+          // deployments this prune exists to fix, while the serialized
+          // metadata queue blocks live recency/status writes. The raw id view
+          // is complete registration evidence whenever every persisted
+          // workspace entry carries its id inline — only id-less legacy
+          // entries (whose stable id lives in session metadata.json) can be
+          // registered raw-invisibly, so the enumeration is repeated only
+          // when such entries exist. Both reads throw on failure, aborting
+          // the prune rather than deleting on lossy evidence.
+          const evidence = this.config.readPersistedWorkspaceIdEvidence();
+          if (!evidence.hasWorkspaceEntriesWithoutIds) {
+            return evidence.ids;
+          }
+          for (const workspaceId of await this.enumerateAuthoritativeWorkspaceIds()) {
+            evidence.ids.add(workspaceId);
+          }
+          return evidence.ids;
+        }
+      );
+      if (prunedCount > 0) {
+        log.info(`Pruned ${prunedCount} stale extension metadata entries`);
+      }
+      return prunedScope;
+    } catch (error) {
+      log.debug("Failed to prune stale extension metadata entries", { error });
+      return null;
+    }
+  }
+
   async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot> | null> {
     try {
-      const snapshots = await this.extensionMetadata.getAllSnapshots();
-      const workspaceIds = new Set(snapshots.keys());
-      for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
-        workspaceIds.add(workspaceId);
-      }
-      for (const workspaceId of this.bashMonitorSeenWorkspaces) {
-        workspaceIds.add(workspaceId);
-      }
+      // On the first bootstrap the prune already enumerated the config; reuse
+      // that id set instead of paying the per-workspace disk walk twice.
+      // Baseline for the post-await cross-process removal revalidation at
+      // the end of this method: captured before ANY await (including the
+      // first-bootstrap prune, whose enumeration another backend's removal
+      // could otherwise outdate before this baseline is read) so ids
+      // deregistered from the shared config while this list computes can be
+      // told apart from ids the raw scan can never see.
+      let initialConfigIds: ReadonlySet<string> | null = null;
       try {
-        for (const metadata of await this.config.getAllWorkspaceMetadata()) {
-          workspaceIds.add(metadata.id);
+        initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+      } catch {
+        initialConfigIds = null;
+      }
+      const prefetchedScope = await this.pruneStaleExtensionMetadataOnce();
+      // throwOnError: the default load self-heals an unreadable/malformed
+      // metadata file into an empty one, which this list would then present
+      // as an authoritative "no activity anywhere" answer — the renderer
+      // applies that by wiping every cached streaming/status/goal snapshot
+      // with no retry (the subscription stays connected). Throwing to the
+      // null-returning catch below instead keeps last-known renderer state
+      // and lets the bootstrap retry read the real list later.
+      const snapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+      // Scope the list to config-known workspaces. extensionMetadata.json was
+      // historically never pruned, so long-lived deployments accumulate stale
+      // entries for removed workspaces/sub-agents by the thousands (issue
+      // #3959: 13,901 entries / 2.89 MB / ~59 s per bootstrap while the
+      // sidebar needed ~246). Stale ids must neither inflate the payload nor
+      // trigger the per-id workflow-run bootstrap disk probe below. Known ids
+      // WITHOUT a snapshot still flow through the tombstone logic below —
+      // scoping only drops ids that are not in config at all.
+      let workspaceIds: Set<string>;
+      // Whether scoping ended up on the fail-open legacy union (config
+      // unreadable): only that availability path may serve a response with
+      // the cross-process removal guards disabled.
+      let scopedFailOpen = false;
+      // Ids the SCOPE's strict enumeration itself vouched for, captured
+      // before raw-view additions: the authoritative-removal fallback below
+      // may treat mid-list enumeration absence as removal evidence only for
+      // these ids — raw-registered ids the normalized view cannot see
+      // (invalid project path) are legitimately absent from every
+      // enumeration and must not read that absence as removal.
+      let scopeEnumerationIds: ReadonlySet<string> | null = null;
+      if (prefetchedScope != null) {
+        scopeEnumerationIds = prefetchedScope.enumeratedIds;
+        // Scope to the FULL known-id union the prune spared (raw +
+        // normalized), not the enumeration alone: a raw-registered id the
+        // normalized view cannot see was already loaded successfully by the
+        // prune's raw read, and relying solely on the refresh below to
+        // re-admit it would let a transient refresh failure turn into an
+        // authoritative response that omits the live workspace.
+        workspaceIds = prefetchedScope.knownIds;
+        // The prune enumerated config BEFORE the snapshot read above, so a
+        // workspace registered in between would be missing here — and an
+        // authoritative list omitting it would clear its live-arrived
+        // renderer state with no retry. Admit every id a fresh raw config
+        // view now knows, NOT just ids with a persisted snapshot: a
+        // concurrently registered workspace with workflow- or bash-monitor-
+        // only activity has no extensionMetadata entry, and its on-disk
+        // workflow runs are only discovered by the per-id probe below.
+        // (Cheap sync read; on failure the prefetched view stands and the
+        // miss is a transient one.)
+        try {
+          const refreshedConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+          for (const workspaceId of refreshedConfigIds) {
+            workspaceIds.add(workspaceId);
+          }
+        } catch (error) {
+          log.debug("Failed to refresh config ids for first-bootstrap scoping", { error });
         }
-      } catch (error) {
-        log.debug("Failed to include all workspaces while listing activity", { error });
+      } else {
+        try {
+          // throwOnError so a corrupted config.json actually reaches the
+          // fail-open fallback below instead of silently resolving as the
+          // empty default and dropping every live entry from the list.
+          workspaceIds = await this.enumerateAuthoritativeWorkspaceIds();
+          scopeEnumerationIds = workspaceIds;
+        } catch (error) {
+          // Fail open: without the config view, stale ids cannot be told apart
+          // from live ones, and dropping live entries would strand renderer
+          // activity state. Fall back to the legacy unscoped union.
+          log.debug("Failed to scope activity list to known workspaces", { error });
+          scopedFailOpen = true;
+          workspaceIds = new Set(snapshots.keys());
+          for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+            workspaceIds.add(workspaceId);
+          }
+          for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
+          for (const workspaceId of this.workflowRunSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
+        }
       }
 
+      // Re-establish the raw baseline when the pre-await read failed: with a
+      // null baseline BOTH cross-process removal guards stay disabled while
+      // the response is still authoritative — a workspace another backend
+      // removes during the probes below would ride back into the renderer
+      // with no event to correct it. This retry still precedes every per-id
+      // probe await, so it remains a valid "registered at list start"
+      // baseline; ids it cannot see flow through the authoritative-identity
+      // path instead. If it fails again the config is genuinely unreadable
+      // and the fail-open scoping above already chose availability.
+      if (initialConfigIds == null) {
+        try {
+          initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+        } catch (error) {
+          // Authoritative scope but NO raw baseline even on retry: both
+          // cross-process removal guards would silently stay disabled on a
+          // response the renderer applies as authoritative — a workspace
+          // another backend deregisters during the probes below would ride
+          // back with no event to correct it. Fail the list instead (null →
+          // renderer keeps last-known state and retries). The fail-open
+          // scope keeps its availability contract: config is unreadable
+          // there by definition, and no baseline exists by design.
+          if (!scopedFailOpen) {
+            throw error;
+          }
+          initialConfigIds = null;
+        }
+      }
       const entries = await Promise.all(
         Array.from(
           workspaceIds,
           async (workspaceId): Promise<readonly [string, WorkspaceActivitySnapshot] | null> => {
             const snapshot = snapshots.get(workspaceId) ?? null;
-            const hadWorkflowActivityCache = this.activeWorkflowRunIdsByWorkspace.has(workspaceId);
+            // Nonzero-observation signal, NOT cache presence: the probe below
+            // installs an empty cache for every scoped id, which would turn
+            // every idle config-known workspace into a fabricated recency:0
+            // entry on the next list.
+            const hadWorkflowActivity = this.workflowRunSeenWorkspaces.has(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
             // while the renderer was disconnected (or whose stop emit failed) must still
             // surface a zero-count entry here, otherwise the renderer's last-known
@@ -13194,7 +13161,7 @@ export class WorkspaceService extends EventEmitter {
             if (
               snapshot == null &&
               activeWorkflowRunCount === 0 &&
-              !hadWorkflowActivityCache &&
+              !hadWorkflowActivity &&
               activeBashMonitorCount === 0 &&
               !hadBashMonitorActivityCache
             ) {
@@ -13220,15 +13187,651 @@ export class WorkspaceService extends EventEmitter {
           }
         )
       );
-      return Object.fromEntries(
-        entries.filter(
-          (entry): entry is readonly [string, WorkspaceActivitySnapshot] => entry != null
-        )
+      // Cross-process counterparts of the in-process tombstone check below:
+      // with XUM_ALLOW_MULTIPLE_INSTANCES another backend can remove a
+      // workspace while this list computes, invisible to this process's
+      // deletedWorkspaceIds. Re-read the (post-prune bounded) metadata file
+      // and the raw persisted config id superset once. Best-effort: an
+      // unreadable re-read skips its revalidation instead of failing an
+      // otherwise complete response.
+      let freshSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
+      try {
+        freshSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+      } catch {
+        freshSnapshots = null;
+      }
+      const freshPersistedIds: ReadonlySet<string> | null =
+        freshSnapshots != null ? new Set(freshSnapshots.keys()) : null;
+      // Tombstones the registration evidence below may legitimately clear:
+      // only ones that already exist HERE, before the evidence is captured
+      // (the raw superset read is synchronous with this snapshot, and the
+      // authoritative enumeration runs later still). A same-process removal
+      // landing during the enumeration await publishes its tombstone after
+      // the evidence reads began — stale evidence still showing the id
+      // registered must not clear that fresh tombstone, or the pre-removal
+      // snapshot rides back into the renderer and late producers persist the
+      // entry again. Such a tombstone stays clearable by the NEXT list's
+      // fresh evidence if the id really is re-registered.
+      const clearableTombstoneIds = this.extensionMetadata.getTombstonedIds();
+      let freshConfigIds: ReadonlySet<string> | null = null;
+      // Whether the fresh raw view is COMPLETE registration evidence: id-less
+      // legacy entries register raw-invisibly (their stable id lives in
+      // session metadata.json), so their presence — or an unreadable raw
+      // view — forces the authoritative enumeration below for admission and
+      // removal decisions the raw comparison cannot make.
+      let freshConfigHasRawInvisibleEntries = false;
+      try {
+        const evidence = this.config.readPersistedWorkspaceIdEvidence();
+        freshConfigIds = evidence.ids;
+        freshConfigHasRawInvisibleEntries = evidence.hasWorkspaceEntriesWithoutIds;
+      } catch {
+        freshConfigIds = null;
+        freshConfigHasRawInvisibleEntries = true;
+      }
+      // Like-for-like raw-superset comparison only: an id that WAS persisted
+      // in config before the awaits and is gone from the fresh raw view was
+      // verifiably deregistered. Ids the raw scan cannot see (legacy entries
+      // whose stable id lives in a session metadata.json, in-memory migration
+      // ids) never appear in either view — dropping them on a cheap fresh
+      // view would misclassify identity-lookup gaps as removals, so they are
+      // revalidated through the authoritative identity path below instead.
+      // Skipped when either superset read fails.
+      const isRemovedFromConfig = (workspaceId: string): boolean =>
+        initialConfigIds != null &&
+        freshConfigIds != null &&
+        initialConfigIds.has(workspaceId) &&
+        !freshConfigIds.has(workspaceId);
+      // Raw-invisible ids (legacy stable ids resolved from session
+      // metadata.json during enumeration) need their own removal
+      // revalidation: the raw baseline can never contain them, so the
+      // comparison above is blind to their cross-process removal — a
+      // snapshotless (workflow/bash-monitor-only) legacy entry removed
+      // mid-list would otherwise ride the delayed authoritative response
+      // back into the renderer. Revalidate against ONE fresh authoritative
+      // enumeration (per-id findWorkspace lookups would re-read and scan the
+      // whole config per entry — O(n²) on legacy-heavy first bootstraps,
+      // recreating the very stall this scoping removes): a verified "not
+      // registered" drops the entry, while an unknowable identity anywhere
+      // (unreadable/id-less metadata.json throws in strict mode) skips the
+      // recheck and conservatively retains every raw-invisible id. Computed
+      // only when a retained entry is actually missing from the raw
+      // baseline (or a raw-invisible late snapshot needs admission below),
+      // so modern deployments (every workspace id persisted in config)
+      // never pay the extra walk.
+      // Second trigger: a fresh-snapshot id outside the per-id scope that
+      // the raw view cannot vouch for. It is either a raw-invisible legacy
+      // id a downgraded backend registered mid-list — which the merge below
+      // must ADMIT, and only the authoritative enumeration can prove
+      // registered — or noise the merge must keep excluding; either way the
+      // enumeration is the only view that can tell.
+      const hasRawInvisibleLateSnapshotId =
+        freshSnapshots != null &&
+        Array.from(freshSnapshots.keys()).some(
+          (workspaceId) =>
+            !workspaceIds.has(workspaceId) && !(freshConfigIds?.has(workspaceId) ?? false)
+        );
+      let authoritativeIds: ReadonlySet<string> | null = null;
+      if (
+        initialConfigIds != null &&
+        (entries.some((entry) => entry != null && !initialConfigIds.has(entry[0])) ||
+          hasRawInvisibleLateSnapshotId ||
+          // Third trigger: id-less legacy entries exist, so a downgraded
+          // backend may have registered a raw-invisible workspace with
+          // workflow-only activity (no snapshot) mid-list — only the
+          // enumeration can discover it for the merge admission below.
+          // Modern deployments (every id inline) never pay this walk.
+          freshConfigHasRawInvisibleEntries)
+      ) {
+        try {
+          authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+        } catch (error) {
+          log.debug("Failed to enumerate authoritative ids for removal revalidation", { error });
+          authoritativeIds = null;
+        }
+        // The enumeration awaited disk: refresh the raw view so the
+        // like-for-like removal comparison below never compares two
+        // pre-removal reads. An inline-id workspace removed by another
+        // backend DURING the enumeration is invisible to the pre-await
+        // freshConfigIds (and deliberately exempt from the authoritative
+        // check, which skips ids present in the initial baseline), so its
+        // stale entry would otherwise pass the retained-entry filter with no
+        // cross-process event to correct it. Fresher raw evidence is
+        // strictly better for every downstream consumer; the tombstone-clear
+        // eligibility snapshot was captured before ALL evidence reads, so
+        // ordering stays sound.
+        try {
+          const refreshedEvidence = this.config.readPersistedWorkspaceIdEvidence();
+          freshConfigIds = refreshedEvidence.ids;
+          freshConfigHasRawInvisibleEntries = refreshedEvidence.hasWorkspaceEntriesWithoutIds;
+        } catch {
+          freshConfigIds = null;
+          freshConfigHasRawInvisibleEntries = true;
+        }
+        if (freshConfigHasRawInvisibleEntries) {
+          // The refresh postdates the enumeration and reveals id-less
+          // entries, so the enumeration's DENIALS may already be stale: an
+          // id removed before the enumeration can have been re-registered
+          // id-less (with fresh cross-process activity) in the gap, and
+          // trusting the stale denial would drop the revived workspace and
+          // tombstone it. Re-enumerate ONCE so the enumeration-backed
+          // removal arms use the freshest capable view; a revival landing
+          // after this last read is the contract's out-of-scope window
+          // (the next list's evidence clears any republished tombstone).
+          // The raw view deliberately stays at its pre-re-enumeration
+          // read: staleness there errs toward retention (an id present in
+          // the older view is kept), never toward a wrong drop. On failure
+          // fall back to retention, not the stale denial set.
+          try {
+            authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+          } catch (error) {
+            log.debug("Failed to re-enumerate authoritative ids after raw refresh", { error });
+            authoritativeIds = null;
+          }
+        }
+      }
+      const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
+        (initialConfigIds != null &&
+          !initialConfigIds.has(workspaceId) &&
+          // An id visible in the FRESH raw view is verifiably registered
+          // regardless of what the (possibly earlier) authoritative
+          // enumeration saw — e.g. a workspace registered after that
+          // enumeration ran must not read as removed.
+          !(freshConfigIds?.has(workspaceId) ?? false) &&
+          authoritativeIds != null &&
+          !authoritativeIds.has(workspaceId)) ||
+        // Raw view unavailable (initial evidence read or post-enumeration
+        // refresh failed): the mid-list authoritative enumeration is the
+        // only usable post-removal view — without this arm an inline-id
+        // workspace removed during that enumeration would ride the
+        // authoritative response with every raw guard disabled and no
+        // cross-process event to repair the renderer. Confined to ids the
+        // scope enumeration itself vouched for (see scopeEnumerationIds).
+        (freshConfigIds == null &&
+          authoritativeIds != null &&
+          (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+          !authoritativeIds.has(workspaceId));
+      // Raw-visible→raw-invisible is verifiable removal only while the
+      // fresh raw view is COMPLETE registration evidence. With id-less
+      // legacy entries present, the id may have been removed and
+      // RE-REGISTERED by a downgraded backend as an id-less entry during
+      // the awaits (raw-invisible from then on) — the raw comparison alone
+      // would drop the revived workspace and republish the very tombstone
+      // the authoritative evidence just cleared, suppressing its activity
+      // again. In that case the authoritative enumeration (which resolves
+      // id-less identities, and is attempted whenever id-less entries
+      // exist — see the third trigger above) must DENY the id before the
+      // transition counts as removal; an affirmation or a failed
+      // enumeration retains the entry (keeping a stale entry briefly is
+      // recoverable, wrongly suppressing a live workspace is not). The
+      // enumeration consulted here postdates the raw refresh whenever that
+      // refresh reports id-less entries (see the re-enumeration above), so
+      // a stale pre-refresh denial can never veto a revived id; a revival
+      // landing after that last enumeration is the contract's out-of-scope
+      // window — the next list's initial baseline no longer contains the
+      // id, so the raw arm cannot re-fire and its fresh evidence clears
+      // the republished tombstone.
+      const isVerifiablyRemovedFromRawConfig = (workspaceId: string): boolean =>
+        isRemovedFromConfig(workspaceId) &&
+        (!freshConfigHasRawInvisibleEntries ||
+          (authoritativeIds != null && !authoritativeIds.has(workspaceId)));
+      // Tombstones are process-local removal knowledge; the shared config is
+      // the authority. A downgraded concurrent backend can legitimately
+      // re-register a deterministic legacy id this process pruned earlier —
+      // observing the id in a FRESH config-derived view (raw superset or the
+      // strict authoritative enumeration above; never snapshot/cache keys,
+      // which do not prove registration) makes the tombstone stale, so its
+      // write suppression and list filtering must end. Cleared before the
+      // revalidation filter below so a re-registered id's entry survives.
+      if (freshConfigIds != null || authoritativeIds != null) {
+        const registeredIds = new Set<string>();
+        for (const workspaceId of freshConfigIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        for (const workspaceId of authoritativeIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        this.extensionMetadata.clearTombstonesForRegisteredIds(
+          registeredIds,
+          clearableTombstoneIds
+        );
+      }
+      const activityById = Object.fromEntries(
+        entries.filter((entry): entry is readonly [string, WorkspaceActivitySnapshot] => {
+          if (entry == null) {
+            return false;
+          }
+          const workspaceId = entry[0];
+          // Revalidate after the per-workspace awaits above: a workspace
+          // removed while this list was computing would otherwise ride the
+          // delayed response past emitWorkspaceActivity's tombstone
+          // suppression — a renderer that already processed the removal
+          // event would re-insert the deleted id until the next reconnect.
+          if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+            return false;
+          }
+          const foreignRemoved =
+            // Persisted snapshot vanished from the shared file mid-list.
+            // Metadata keys normally only disappear through removal, but
+            // NOT always: a deterministically corrupt file self-heals into
+            // a valid (possibly EMPTY) one on the strict re-read, so a
+            // mid-list quarantine makes every earlier key vanish while the
+            // workspaces stay registered. Disappearance therefore counts as
+            // removal evidence only when a fresh config-derived view
+            // CAPABLE of seeing the id corroborates the deregistration:
+            // raw-visible ids need the fresh raw view to deny them,
+            // raw-invisible (legacy) ids the authoritative enumeration.
+            // With neither view available the entry is retained — keeping a
+            // stale entry briefly is recoverable, wiping live renderer
+            // state on a corruption reset is not. Entries that never had a
+            // persisted snapshot are covered by the config check.
+            (freshPersistedIds != null &&
+              snapshots.has(workspaceId) &&
+              !freshPersistedIds.has(workspaceId) &&
+              !(authoritativeIds?.has(workspaceId) ?? false) &&
+              ((initialConfigIds?.has(workspaceId) ?? false) ||
+              (freshConfigIds?.has(workspaceId) ?? false)
+                ? freshConfigIds != null && !freshConfigIds.has(workspaceId)
+                : authoritativeIds != null)) ||
+            // Deregistered from the shared config mid-list — also covers
+            // workflow/bash-monitor-only entries with no persisted snapshot.
+            isVerifiablyRemovedFromRawConfig(workspaceId) ||
+            // Raw-invisible (legacy stable) ids: authoritative-lookup
+            // counterpart of the raw-superset comparison above.
+            isRemovedPerAuthoritativeIdentity(workspaceId);
+          if (foreignRemoved) {
+            // A cross-process removal publishes no local tombstone, so the
+            // tombstone-cleared eviction listener never fires for it. Stale
+            // workflow-run/monitor caches would then survive the removal —
+            // and if a downgraded backend re-registers the same
+            // deterministic legacy id later, getActiveWorkflowRunIds would
+            // serve the REMOVED incarnation's cached runs as ghost activity
+            // instead of probing the recreated session.
+            this.evictWorkspaceActivityCaches(workspaceId);
+            // Eviction alone cannot stop a LATE local producer (workflow-run
+            // or bash-monitor completion) from repopulating the caches and
+            // re-emitting the removed incarnation's activity right after
+            // this authoritative response dropped it — publish a local
+            // tombstone so emits and writes stay suppressed until fresh
+            // config evidence proves a revival.
+            this.extensionMetadata.suppressForeignRemoval(workspaceId);
+            return false;
+          }
+          return true;
+        })
       );
+      // Addition-side counterpart of the fresh re-read: another backend can
+      // register a workspace AND persist its first activity after this
+      // process's initial snapshot read. The refreshed config admits the id
+      // into scope, but its per-id computation saw a null snapshot (and no
+      // local workflow/monitor caches, which are process-local), so the
+      // entry was omitted — and the activity subscription cannot heal that
+      // (it is backed by this process's EventEmitter, so cross-process
+      // writes produce no delta). Merge in-scope additions from the fresh
+      // re-read, subject to the same removal guards as retained entries.
+      // NOT gated on the snapshot re-read succeeding: config-proven late ids
+      // (workflow-only registrations) must be probed even when the metadata
+      // re-read transiently failed — the method still returns an
+      // authoritative (non-null) response in that case, and the
+      // process-local subscription can never supply the foreign workflow
+      // event, so skipping the probe would hide that activity until
+      // reconnect. Snapshot-derived candidates and snapshot guards simply
+      // degrade to the views that ARE available.
+      {
+        // Merge scope: the (possibly stale) per-id scope PLUS fresh-snapshot
+        // ids a fresh config-derived view proves registered — a workspace
+        // registered and written between the scope reads and the fresh
+        // re-read is in both fresh views but in neither stale one. Raw-
+        // invisible ids (legacy stable ids resolved from session
+        // metadata.json) can never appear in the raw view, so they are
+        // admitted through the authoritative enumeration instead — without
+        // that, a legacy workspace registered by a downgraded backend
+        // mid-list would stay absent until reconnect (the process-local
+        // subscription cannot deliver the cross-process snapshot).
+        const mergeCandidateIds = new Set(workspaceIds);
+        for (const workspaceId of freshSnapshots?.keys() ?? []) {
+          if (
+            (freshConfigIds?.has(workspaceId) ?? false) ||
+            (authoritativeIds?.has(workspaceId) ?? false)
+          ) {
+            mergeCandidateIds.add(workspaceId);
+          }
+        }
+        // Workflow-only late registrations: a workspace registered after the
+        // scope reads can have active workflow runs but no metadata snapshot
+        // at all, so admission cannot come from fresh-snapshot keys alone —
+        // every fresh config-derived id outside the stale per-id scope is a
+        // candidate. The authoritative enumeration contributes the ids the
+        // raw view can never carry (id-less legacy registrations by a
+        // downgraded backend). Ids with neither a snapshot nor live activity
+        // cost one workflow probe and are dropped by the emptiness check
+        // below.
+        for (const lateIdSource of [freshConfigIds, authoritativeIds]) {
+          for (const workspaceId of lateIdSource ?? []) {
+            if (!workspaceIds.has(workspaceId)) {
+              mergeCandidateIds.add(workspaceId);
+            }
+          }
+        }
+        // Workflow-run bootstrap for candidates the per-id loop never saw:
+        // their on-disk active runs are not in the process-local cache, and
+        // a cached-only merge would omit activeWorkflowRunCount for exactly
+        // the cross-process registrations this merge exists to bootstrap.
+        // Probed BEFORE the final guard views below so no await separates
+        // guard evaluation from insertion (ids the per-id loop already
+        // probed resolve synchronously from the shared cached Set).
+        const probedWorkflowRunIds = new Map<string, ReadonlySet<string>>();
+        for (const workspaceId of mergeCandidateIds) {
+          if (
+            workspaceId in activityById ||
+            // In-scope ids without a late snapshot were fully decided by the
+            // per-id loop (probe + zero-tombstone logic); re-probing them
+            // would only trigger the final re-reads below on every list.
+            (workspaceIds.has(workspaceId) && !(freshSnapshots?.has(workspaceId) ?? false))
+          ) {
+            continue;
+          }
+          probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
+        }
+        const isRawInvisible = (workspaceId: string): boolean =>
+          !(initialConfigIds?.has(workspaceId) ?? false) &&
+          !(freshConfigIds?.has(workspaceId) ?? false);
+        // The final revalidation must ALSO run when a retained entry is
+        // raw-invisible even with zero late candidates: the mid-list
+        // authoritative enumeration can observe a legacy stable id right
+        // before another backend deregisters it and deletes its metadata
+        // later in the same await. Every view the retained filter used
+        // (pre-enumeration freshSnapshots, raw scans blind to stable ids,
+        // the stale enumeration itself) then still shows the workspace, and
+        // with no candidates to probe nothing else would re-read — the
+        // deleted workspace would ride every authoritative response
+        // indefinitely because cross-process removals emit no local event.
+        // Modern deployments (all ids raw-visible) never pay this path.
+        if (probedWorkflowRunIds.size > 0 || Object.keys(activityById).some(isRawInvisible)) {
+          // Final post-probe views: the probes awaited disk, so a removal
+          // landing during them is invisible to every view captured above —
+          // inserting on those alone would ride the deleted id back into the
+          // renderer. Re-read the (post-prune bounded) metadata file and the
+          // raw config superset once more, then evaluate every guard with no
+          // awaits before insertion. A removed workspace's metadata key is
+          // deleted on removal, so the snapshot re-read also covers legacy
+          // ids the raw view cannot see; same-process removals are covered
+          // by the tombstone check. Best-effort like the other fresh
+          // re-reads: an unreadable view falls back to the pre-probe one.
+          let finalSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
+          try {
+            finalSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+          } catch {
+            finalSnapshots = null;
+          }
+          // Post-probe authoritative recheck, only when a probed candidate is
+          // raw-invisible (in no raw view): the raw deregistration guard
+          // below is blind to a legacy workspace removed during the probes,
+          // and in the normal gap between config deregistration and metadata
+          // cleanup its snapshot still exists — the pre-probe authoritative
+          // set is the view that ADMITTED it, so only a fresh enumeration
+          // can prove the removal. Modern deployments never pay this walk.
+          let finalAuthoritativeIds: ReadonlySet<string> | null = null;
+          let finalConfigIds: ReadonlySet<string> | null = null;
+          // Completeness of the final raw view, mirroring the mid-list
+          // fresh read: id-less legacy entries make raw denial insufficient
+          // removal evidence (see isVerifiablyRemovedFromRawConfig).
+          let finalConfigHasRawInvisibleEntries = false;
+          try {
+            const finalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+            finalConfigIds = finalEvidence.ids;
+            finalConfigHasRawInvisibleEntries = finalEvidence.hasWorkspaceEntriesWithoutIds;
+          } catch {
+            finalConfigIds = null;
+            finalConfigHasRawInvisibleEntries = true;
+          }
+          if (
+            Array.from(probedWorkflowRunIds.keys()).some(isRawInvisible) ||
+            // Retained entries are re-filtered with the final views below
+            // (they were admitted before the probes awaited), and a
+            // raw-invisible retained id's removal is provable only through
+            // the same fresh enumeration.
+            Object.keys(activityById).some(isRawInvisible) ||
+            // A transiently unreadable post-probe raw view would otherwise
+            // disable the raw deregistration guards below entirely: an
+            // inline-id workspace deregistered during the probes (its
+            // metadata key not yet cleaned up) would ride the response with
+            // no cross-process event to repair it. The enumeration
+            // substitutes as removal evidence for ids the scope enumeration
+            // vouched for.
+            finalConfigIds == null ||
+            // Id-less legacy entries in the final raw view: a raw-visible
+            // id deregistered during the probes is indistinguishable from
+            // one removed-and-revived as an id-less entry by a downgraded
+            // backend, so the raw deregistration guards below need the
+            // enumeration to tell them apart (same rule as the mid-list
+            // isVerifiablyRemovedFromRawConfig). Modern deployments (every
+            // id inline) never pay this walk.
+            finalConfigHasRawInvisibleEntries
+          ) {
+            try {
+              finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+            } catch (error) {
+              log.debug("Failed to re-enumerate authoritative ids after workflow probes", {
+                error,
+              });
+              finalAuthoritativeIds = null;
+            }
+            // The enumeration is itself an await: a raw-invisible legacy
+            // workspace can be admitted by it and then removed (metadata
+            // key deleted) before it finishes — invisible to the snapshot
+            // view captured before it and to every raw view. Re-read the
+            // snapshot evidence after the enumeration so the vanish guard
+            // sees the removal; on failure keep the pre-enumeration view
+            // (still a post-probe view).
+            try {
+              finalSnapshots = await this.extensionMetadata.getAllSnapshots({
+                throwOnError: true,
+              });
+            } catch {
+              // Keep the pre-enumeration re-read (possibly null).
+            }
+            // Re-read the raw view after the awaits above so the raw
+            // deregistration guards see the freshest possible view; on a
+            // repeat failure keep the earlier successful read (still a
+            // valid post-probe view) rather than degrading to null.
+            try {
+              const refreshedFinalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+              finalConfigIds = refreshedFinalEvidence.ids;
+              finalConfigHasRawInvisibleEntries =
+                refreshedFinalEvidence.hasWorkspaceEntriesWithoutIds;
+            } catch {
+              // Keep the pre-enumeration read (possibly null).
+            }
+            if (finalConfigHasRawInvisibleEntries) {
+              // Same staleness rule as the mid-list re-enumeration: the
+              // refresh revealed id-less entries, so the enumeration's
+              // denials may predate an id-less re-registration — the
+              // enumeration-backed drops below must use the freshest
+              // capable view (a revival after this last read is the
+              // contract's out-of-scope window). The raw and snapshot
+              // views deliberately stay at their earlier reads: their
+              // staleness errs toward retention, never a wrong drop. On
+              // failure retain rather than trust the stale denial set.
+              try {
+                finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+              } catch (error) {
+                log.debug("Failed to re-enumerate authoritative ids after final raw refresh", {
+                  error,
+                });
+                finalAuthoritativeIds = null;
+              }
+            }
+          }
+          // The retained-entry filter above ran BEFORE the workflow probes,
+          // so a removal landing during those awaits is invisible to every
+          // view it used — the removed workspace would ride the response
+          // back into the renderer with no cross-process event to correct
+          // it. Re-apply the removal guards to retained entries with the
+          // post-probe views (final filtering must follow the last await).
+          // Removal guards only: zero-count tombstone entries legitimately
+          // have no snapshot and no live counts, so the probed candidates'
+          // emptiness check must not run here.
+          for (const workspaceId of Object.keys(activityById)) {
+            const foreignRemoved =
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Corroborated like the
+              // mid-list filter's vanish arm: a strict re-read self-heals
+              // deterministic corruption into a valid (possibly EMPTY)
+              // file, so disappearance alone is not removal evidence — a
+              // post-probe config-derived view capable of seeing the id
+              // must also deny it.
+              (finalSnapshots != null &&
+                (snapshots.has(workspaceId) || (freshSnapshots?.has(workspaceId) ?? false)) &&
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
+              // Verifiably deregistered from the raw config during the
+              // probes: visible in an earlier raw view, gone from the
+              // post-probe one. With id-less entries in the final raw view
+              // the id may instead have been removed-and-revived id-less,
+              // so the final enumeration must deny it (same completeness
+              // rule as isVerifiablyRemovedFromRawConfig).
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
+              // Raw-invisible retained ids: post-probe authoritative
+              // counterpart of the raw guard above.
+              (isRawInvisible(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: the fallback enumeration
+              // substitutes as removal evidence, but only for ids the scope
+              // enumeration itself vouched for — raw-only ids are
+              // enumeration-invisible by design and stay retained on
+              // transient read failures.
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+                !finalAuthoritativeIds.has(workspaceId));
+            if (foreignRemoved) {
+              // Cross-process removals publish no local tombstone, so the
+              // tombstone-cleared eviction listener never fires — see the
+              // mid-list filter above (including the late-producer
+              // suppression rationale).
+              this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
+              delete activityById[workspaceId];
+            } else if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+              delete activityById[workspaceId];
+            }
+          }
+          for (const [workspaceId, activeWorkflowRunIds] of probedWorkflowRunIds) {
+            // Freshest available view, degrading to the INITIAL read: a raw-
+            // registered id outside the normalized scope (e.g. invalid
+            // project path) is admitted here, and when both re-reads failed
+            // transiently its already-loaded initial snapshot must still
+            // supply goal/status/recency — omitting it from an authoritative
+            // response would clear that renderer state with no repair event.
+            const lateSnapshot =
+              finalSnapshots != null
+                ? (finalSnapshots.get(workspaceId) ?? null)
+                : freshSnapshots != null
+                  ? (freshSnapshots.get(workspaceId) ?? null)
+                  : (snapshots.get(workspaceId) ?? null);
+            const lateForeignRemoved =
+              isVerifiablyRemovedFromRawConfig(workspaceId) ||
+              isRemovedPerAuthoritativeIdentity(workspaceId) ||
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Same corruption-reset
+              // corroboration as the retained-entry vanish arms: a
+              // self-healed (possibly empty) re-read is not removal
+              // evidence on its own.
+              (finalSnapshots != null &&
+                (freshSnapshots?.has(workspaceId) ?? false) &&
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
+              // Verifiably deregistered from the raw config during the
+              // probes: the id was visible in an EARLIER raw view — the
+              // initial baseline or the fresh re-read that admitted it (a
+              // late registration is absent from the initial baseline by
+              // definition) — and is gone from the post-probe view. During
+              // the normal gap between config deregistration and metadata
+              // cleanup the snapshot still exists, so the vanish check
+              // above cannot catch this. Same raw-view completeness rule as
+              // the retained-entry arm: with id-less entries present the
+              // final enumeration must deny a possibly-revived id.
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
+              // Raw-invisible candidates: post-probe authoritative
+              // counterpart of the raw guard above — a legacy workspace
+              // deregistered during the probes is invisible to every raw
+              // view, and its snapshot may outlive the deregistration.
+              (!(initialConfigIds?.has(workspaceId) ?? false) &&
+                !(freshConfigIds?.has(workspaceId) ?? false) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: same enumeration fallback
+              // as the retained-entry filter, scoped to ids the scope
+              // enumeration vouched for (raw-only ids stay admitted on
+              // transient read failures — see lateSnapshot above).
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+                !finalAuthoritativeIds.has(workspaceId));
+            if (lateForeignRemoved) {
+              // Same cross-process eviction + late-producer suppression
+              // rationale as the mid-list filter: no local tombstone means
+              // no listener-driven eviction, and the probes above may have
+              // installed caches for the removed incarnation.
+              this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
+              continue;
+            }
+            if (
+              // Nothing to contribute: no persisted snapshot and no live
+              // counts (a workflow-only candidate legitimately has no
+              // snapshot, so its absence alone is not removal evidence) —
+              // never removal proof, so no cache eviction.
+              (lateSnapshot == null &&
+                activeWorkflowRunIds.size === 0 &&
+                this.getActiveBashMonitorCount(workspaceId) === 0) ||
+              this.extensionMetadata.isWorkspaceDeleted(workspaceId)
+            ) {
+              continue;
+            }
+            // Same overlay path emitWorkspaceActivity uses.
+            const merged = this.mergeCurrentActiveBashMonitorCount(
+              workspaceId,
+              mergeActiveWorkflowRuns(
+                this.overlayPendingGoal(workspaceId, lateSnapshot),
+                activeWorkflowRunIds
+              )
+            );
+            if (merged != null) {
+              activityById[workspaceId] = merged;
+            }
+          }
+        }
+      }
+      return activityById;
     } catch (error) {
       log.error("Failed to list activity:", error);
       // null (not {}) so the renderer can tell a read failure from a legitimately
-      // idle deployment — {} is a valid successful result when nothing is active.
+      // idle deployment — with scoping, {} is a valid authoritative answer (no
+      // known workspace has activity) that the renderer must apply to clear
+      // stale entries after a disconnected removal. On null the renderer keeps
+      // last-known state and retries in the background.
       return null;
     }
   }
@@ -13774,8 +14377,8 @@ export class WorkspaceService extends EventEmitter {
 
       // Multi-project bash shares one execution environment, so inject the union of repo secrets.
       const projectSecrets = isMultiProject(metadata)
-        ? mergeMultiProjectSecrets(metadata, this.config)
-        : this.config.getEffectiveSecrets(metadata.projectPath);
+        ? mergeMultiProjectSecrets(metadata, this.secretsStore)
+        : this.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");
@@ -13819,122 +14422,80 @@ export class WorkspaceService extends EventEmitter {
    */
   async listBackgroundProcesses(workspaceId: string): Promise<BackgroundProcessInfo[]> {
     const processes = await this.backgroundProcessManager.list(workspaceId);
-    // Surface durably-pending monitor wakes (matched but not yet delivered as a synthetic
-    // turn), so a one-shot watcher that matched and exited does not look like a lost wake.
-    // Wake ids equal process ids (BashMonitorWakeStore.wakeId). The indicator must never
-    // break process listing, so a wake-store read failure degrades to "no pending wakes".
-    let pendingWakes: readonly BashMonitorWakeRecord[];
+    let wakeState: {
+      snapshot: BashMonitorWakeReconcilerSnapshot;
+      registryRows: readonly BashMonitorRegistryRecord[];
+    };
     try {
-      pendingWakes = await this.bashMonitorWakeStore.listPending(workspaceId);
-      this.lastGoodPendingWakesByWorkspace.set(workspaceId, pendingWakes);
+      const [snapshot, registryRows] = await Promise.all([
+        this.bashMonitorWakeReconciler.snapshot(workspaceId),
+        this.bashMonitorRegistryStore.listAll(workspaceId),
+      ]);
+      wakeState = { snapshot, registryRows };
+      this.lastGoodPendingWakesByWorkspace.set(workspaceId, wakeState);
     } catch (error) {
-      // Publishing an empty set here would authoritatively clear durable pending-wake
-      // state on a transient I/O failure — and an already-exited process may never emit
-      // another change event to restore it. Fail to the last good snapshot instead, and
-      // schedule a retry: serving the fallback makes this call resolve, so the
-      // subscription's own failure retry never engages, and the fallback may be empty
-      // (no seed yet) or stale (wakes retired since) with no later event to correct it.
       log.debug("Failed to read pending bash monitor wakes for process listing", {
         workspaceId,
         error,
       });
-      pendingWakes = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? [];
+      wakeState = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? {
+        snapshot: { ownerWorkspaceId: workspaceId, pendingWakeKinds: new Map() },
+        registryRows: [],
+      };
       this.schedulePendingWakeReadRetry(workspaceId);
     }
-    // A wake whose only event is process settlement (terminal-only wakeOnExit, or an
-    // earlier run's preserved settlement) still has kind "match" in the durable
-    // record; labeling it "match" in the UI would report a match the filter never
-    // produced. Coalesced records with real UNDELIVERED matches keep the match label
-    // — judged by the matched frontier (matchedThroughOffset), mirroring the prompt
-    // builder's terminal-only test: totalMatches is the monitor's CUMULATIVE counter,
-    // so a settlement enqueued after an earlier match wake was already delivered
-    // carries a nonzero count while only settlement is actually pending.
-    const pendingWakeKindOf = (
-      record: BashMonitorWakeRecord
-    ): "match" | "monitor-lost" | "settled" =>
-      record.kind === "monitor-lost"
-        ? "monitor-lost"
-        : (record.terminal != null || record.staleTerminal != null) &&
-            record.matchedThroughOffset == null
-          ? "settled"
-          : "match";
-    // Present monitor state derived purely from a durable wake record, for rows (or reused
-    // process IDs) that have no live monitor snapshot to decorate.
-    const monitorFromWakeRecord = (record: BashMonitorWakeRecord) => ({
-      filter: record.filter,
-      filter_exclude: record.filterExclude,
-      cooldown_ms: 0,
-      totalMatches: record.totalMatches,
-      droppedLines: record.droppedLines,
-      lastLines: record.lines,
-      stopped: true,
-      pendingWakeKind: pendingWakeKindOf(record),
-    });
-    const liveProcessById = new Map(processes.map((p) => [p.id, p] as const));
-    // A pending wake decorates the live row only when it belongs to that process
-    // generation (created at/after spawn). An older wake merely shares a reused
-    // display-name-derived ID; overlaying it onto the new process's monitor would mix
-    // another generation's wake with the live filter/match counts and point its output
-    // action at the wrong process, so such wakes get their own synthesized row below.
-    const wakeOnLiveRow = new Map<string, BashMonitorWakeRecord>();
-    for (const record of pendingWakes) {
-      const live = liveProcessById.get(record.processId);
-      if (live != null && Date.parse(record.createdAt) >= live.startTime) {
-        wakeOnLiveRow.set(record.processId, record);
-      }
-    }
-    const rows: BackgroundProcessInfo[] = processes.map((p) => {
-      const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
-      const pendingWake = wakeOnLiveRow.get(p.id);
-      // Same-generation wake on a monitorless row (e.g. the monitor was stopped after the
-      // match): fall back to a record-derived snapshot so the wake stays visible.
-      const monitorPayload =
-        pendingWake != null
-          ? {
-              ...(monitor ?? monitorFromWakeRecord(pendingWake)),
-              pendingWakeKind: pendingWakeKindOf(pendingWake),
-            }
-          : monitor;
+
+    const rows: BackgroundProcessInfo[] = processes.map((process) => {
+      const monitor = this.backgroundProcessManager.getMonitorSnapshot(process);
+      const pendingWakeKind = this.bashMonitorWakeReconciler.pendingWakeKind(
+        wakeState.snapshot,
+        process.id
+      );
       return {
-        id: p.id,
-        pid: p.pid,
-        script: p.script,
-        displayName: p.displayName,
-        startTime: p.startTime,
-        status: p.status,
-        ...(monitorPayload != null ? { monitor: monitorPayload } : {}),
-        exitCode: p.exitCode,
+        id: process.id,
+        pid: process.pid,
+        script: process.script,
+        displayName: process.displayName,
+        startTime: process.startTime,
+        status: process.status,
+        ...(monitor != null
+          ? { monitor: pendingWakeKind != null ? { ...monitor, pendingWakeKind } : monitor }
+          : {}),
+        exitCode: process.exitCode,
       };
     });
-    // Durable pending wakes can outlive the in-memory process table (app restart wipes the
-    // manager while the wake store persists, and startup delivery can lag). Synthesize a row
-    // from the wake record so the pending-delivery state stays visible — that restart window
-    // is exactly the state this listing is meant to expose.
-    // Row ids double as React keys. Process ids derive from arbitrary display names, so
-    // any fixed suffix for prior-generation wake rows can collide with a real live id
-    // (a process may literally be named "foo#pending-wake"); extend until unique instead.
-    // Nothing dereferences synthesized ids (no output/terminate actions).
+
+    const liveProcessIds = new Set(processes.map((process) => process.id));
     const usedRowIds = new Set(rows.map((row) => row.id));
-    for (const record of pendingWakes) {
-      if (wakeOnLiveRow.has(record.processId)) continue;
-      const startTime = Date.parse(record.createdAt);
+    for (const record of wakeState.registryRows) {
+      const pendingWakeKind = this.bashMonitorWakeReconciler.pendingWakeKind(
+        wakeState.snapshot,
+        record.processId
+      );
+      if (pendingWakeKind == null || liveProcessIds.has(record.processId)) continue;
       let rowId = record.processId;
-      while (usedRowIds.has(rowId)) rowId = `${rowId}#pending-wake`;
+      while (usedRowIds.has(rowId)) rowId = rowId + "#pending-wake";
       usedRowIds.add(rowId);
+      const startTime = Date.parse(record.createdAt);
       rows.push({
         id: rowId,
-        // No live process behind this row; `synthesized` (not the pid) tells the renderer
-        // that output/terminate actions cannot work.
         pid: 0,
-        script: record.script ?? "",
-        // Match records may carry neither displayName nor script; fall back to the
-        // processId (itself display-name derived) so the banner row is never blank.
+        script: record.script,
         displayName: record.displayName ?? record.processId,
         synthesized: true,
         startTime: Number.isNaN(startTime) ? Date.now() : startTime,
         status: "exited",
-        monitor: monitorFromWakeRecord(record),
-        exitCode: undefined,
+        monitor: {
+          filter: record.filter,
+          filter_exclude: record.filterExclude,
+          cooldown_ms: 0,
+          totalMatches: 0,
+          droppedLines: 0,
+          lastLines: [],
+          stopped: true,
+          pendingWakeKind,
+        },
+        exitCode: record.terminal?.exitCode,
       });
     }
     return rows;
@@ -13954,7 +14515,9 @@ export class WorkspaceService extends EventEmitter {
       return Err(`Process ${processId} does not belong to workspace ${workspaceId}`);
     }
 
-    const result = await this.backgroundProcessManager.terminate(processId);
+    const result = await this.backgroundProcessManager.terminate(processId, {
+      monitorDisposition: "discard",
+    });
     if (!result.success) {
       return Err(result.error);
     }

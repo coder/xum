@@ -7,6 +7,7 @@ import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -48,7 +49,7 @@ function createAiService(workspaceId: string): AIService {
   return Object.assign(aiEmitter, {
     isStreaming: mock((_workspaceId: string) => false),
     stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(undefined))),
+    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(createStartedTurnHandle()))),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
     getWorkspaceMetadata: mock((_workspaceId: string) =>

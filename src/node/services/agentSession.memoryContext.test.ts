@@ -8,6 +8,7 @@ import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
@@ -21,6 +22,8 @@ import { createTestHistoryService } from "./testHistoryService";
  * injected bytes stay prompt-cache-stable.
  */
 
+const WORKSPACE_ID = "workspace-hot-memories-test";
+
 function createSession(args: {
   historyService: HistoryService;
   sessionDir: string;
@@ -28,6 +31,7 @@ function createSession(args: {
 }): AgentSession {
   const aiEmitter = new EventEmitter();
   const aiService: AIService = {
+    ...createStreamLifecycleMocks(),
     on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
       aiEmitter.on(String(eventName), listener);
       return this;
@@ -58,12 +62,14 @@ function createSession(args: {
   } as unknown as BackgroundProcessManager;
 
   const config: Config = {
+    rootDir: path.dirname(args.sessionDir),
+    sessionsDir: path.dirname(args.sessionDir),
     srcDir: "/tmp",
-    getSessionDir: mock(() => args.sessionDir),
+    loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 
   return new AgentSession({
-    workspaceId: "workspace-hot-memories-test",
+    workspaceId: WORKSPACE_ID,
     config,
     historyService: args.historyService,
     aiService,
@@ -81,6 +87,7 @@ interface PrivateSessionAccess {
 }
 
 async function writePendingPostCompactionState(sessionDir: string): Promise<void> {
+  await fs.mkdir(sessionDir, { recursive: true });
   await fs.writeFile(
     path.join(sessionDir, "post-compaction.json"),
     JSON.stringify({ version: 1, createdAt: Date.now(), diffs: [], loadedSkills: [] })
@@ -105,7 +112,7 @@ describe("AgentSession memory context", () => {
     const buildMemorySessionContext = mock(() => Promise.resolve(context));
     const session = createSession({
       historyService,
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -136,7 +143,7 @@ describe("AgentSession memory context", () => {
     );
     const session = createSession({
       historyService,
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -171,7 +178,7 @@ describe("AgentSession memory context", () => {
     );
     const session = createSession({
       historyService,
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -200,7 +207,7 @@ describe("AgentSession memory context", () => {
     const buildMemorySessionContext = mock(() => Promise.resolve(null));
     const session = createSession({
       historyService,
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -228,7 +235,7 @@ describe("AgentSession memory context", () => {
     );
     const session = createSession({
       historyService,
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -240,7 +247,7 @@ describe("AgentSession memory context", () => {
 
       // Consume a pending compaction boundary (first stream after compaction).
       version = 2;
-      await writePendingPostCompactionState(sessionDir.path);
+      await writePendingPostCompactionState(path.join(sessionDir.path, WORKSPACE_ID));
       await priv.getPostCompactionAttachmentsIfNeeded();
 
       expect((await priv.resolveMemoryContext("test-model"))?.hotMemoriesBlock).toBe(

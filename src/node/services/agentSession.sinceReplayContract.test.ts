@@ -13,7 +13,6 @@
  * recomputation (silent since→full downgrade after ≥2 live-streamed turns).
  */
 import { describe, expect, it, mock, afterEach } from "bun:test";
-import type { AIService } from "@/node/services/aiService";
 import type { MuxMessage } from "@/common/types/message";
 import {
   isMuxMessage,
@@ -36,7 +35,7 @@ async function createContractHarness(workspaceId: string) {
   return await createAgentSessionHarness({
     workspaceId,
     aiServiceOverrides: {
-      getStreamInfo: mock((_workspaceId: string) => undefined) as AIService["getStreamInfo"],
+      getStreamInfo: mock((_workspaceId: string) => undefined),
       replayStream,
     },
     initStateManagerOverrides: { replayInit },

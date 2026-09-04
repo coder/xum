@@ -135,6 +135,26 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_pdf_input: true,
   },
 
+  // Claude Fable 5.1 - successor to Fable 5 in the Mythos-class tier at the same
+  // input/output pricing: $10/M input, $50/M output, cache write 1.25x input. Cache
+  // reads are cheaper than Fable 5 at $0.25/M (0.025x input, a quarter of the old
+  // 0.1x ratio). Native 1M context, 128K max output, native xhigh effort level.
+  "claude-fable-5-1": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001, // $10 per million input tokens
+    output_cost_per_token: 0.00005, // $50 per million output tokens
+    cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.00000025, // $0.25 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Claude Fable 5 / Mythos 5 - Released June 9, 2026
   // Mythos-class model (a tier above Opus). Fable 5 (`claude-fable-5`) is the
   // generally-available variant with safeguards; Mythos 5 (`claude-mythos-5`) is the same
@@ -149,6 +169,27 @@ export const modelsExtra: Record<string, ModelData> = {
     output_cost_per_token: 0.00005, // $50 per million output tokens
     cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25× input)
     cache_read_input_token_cost: 0.000001, // $1.00 per million tokens (0.1× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Claude Mythos 5.1 - successor to Mythos 5, the restricted-access (Project
+  // Glasswing) twin of Fable 5.1 with identical announced specs and pricing:
+  // $10/M input, $50/M output, cache write 1.25x input, cache read 0.025x input
+  // ($0.25/M, down from Mythos 5's 0.1x), native 1M context, 128K max output,
+  // native xhigh effort level.
+  "claude-mythos-5-1": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001, // $10 per million input tokens
+    output_cost_per_token: 0.00005, // $50 per million output tokens
+    cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.00000025, // $0.25 per million tokens (0.025× input)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,
@@ -401,6 +442,40 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-02-16",
   },
 
+  // GPT-6 Astra - Released September 3, 2026 (OpenAI's frontier tier above the
+  // GPT-5.6 family). Model page: 1.05M context window, 128K max output, Apr 30
+  // 2026 cutoff. Base pricing: $10/M input, $50/M output, $1/M cached input;
+  // cache writes billed at 1.25x the active input rate ($12.50/M base). Prompts
+  // above 272K input tokens bill the full request at 2x input / 1.5x output:
+  // $20/M input, $75/M output, $2/M cached input, $25/M cache writes.
+  // supports_function_calling holds for the default Responses wire format only:
+  // Astra is served on Chat Completions too, but OpenAI's reasoning guide states
+  // tool calling requires the Responses API there, so the `chatCompletions`
+  // wireFormat opt-in loses tools for this model.
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6-astra
+  // Ref: https://developers.openai.com/api/docs/pricing
+  // Ref: https://developers.openai.com/api/docs/guides/reasoning#reasoning-effort
+  "gpt-6-astra": {
+    max_input_tokens: 1050000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001, // $10 per million input tokens (<272K prompt tokens)
+    input_cost_per_token_above_200k_tokens: 0.00002, // $20 per million input tokens (>272K)
+    output_cost_per_token: 0.00005, // $50 per million output tokens (<272K prompt tokens)
+    output_cost_per_token_above_200k_tokens: 0.000075, // $75 per million output tokens (>272K)
+    cache_read_input_token_cost: 0.000001, // $1 per million cached input tokens (<272K)
+    cache_read_input_token_cost_above_200k_tokens: 0.000002, // $2 per million cached input tokens (>272K)
+    cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_200k_tokens: 0.000025, // $25 per million tokens (1.25x long-context input)
+    tiered_pricing_threshold_tokens: 272000, // OpenAI's published boundary is 272K (field names say 200K)
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-30",
+  },
+
   // GPT-5.5 Pro - Released April 23, 2026
   // Native 1.05M context, 128K max output; Responses API only.
   // Base pricing: $30/M input, $180/M output; OpenAI has not published cached-input pricing.
@@ -561,6 +636,30 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
+  // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
+  // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,
+  // $3.75/M output, $0.075/M cached input) so displayed costs and goal budgets match
+  // real charges. TODO(2027-01-01): raise to the standard list rates ($1.50/$7.50/$0.15)
+  // when the intro pricing expires. Source: Gemini API pricing docs as of 2026-09-02.
+  // Note: 3.8 Flash rejects thinkingLevel "minimal" (see isGeminiFlashMinimalRejectingModelName).
+  "gemini-3.8-flash": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.00000075, // $0.75 per million input tokens (intro rate)
+    output_cost_per_token: 0.00000375, // $3.75 per million output tokens, including thinking tokens (intro rate)
+    cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.1 Pro Preview - Released February 19, 2026
   // Tiered pricing: ≤200K tokens $2/M input, $12/M output; >200K tokens $4/M input, $18/M output
   // 1M input context, ~64K max output tokens
@@ -658,6 +757,20 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_function_calling: true,
     supports_reasoning: true,
     supports_response_schema: true,
+  },
+
+  // GLM 5.3 Flash list pricing and limits for the direct Z.ai provider.
+  "zai/glm-5.3-flash": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 131072,
+    input_cost_per_token: 0.00000015, // $0.15 per million input tokens
+    output_cost_per_token: 0.0000005, // $0.50 per million output tokens
+    cache_read_input_token_cost: 0.00000003, // $0.03 per million cached input tokens
+    litellm_provider: "zai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
   },
 
   // Kimi K3 - released July 16, 2026. 1M context, 128K max output, text+image input.

@@ -180,6 +180,18 @@ describe("buildProviderOptions - Anthropic", () => {
       // the summarized display flag.
       expect(anthropic.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic.effort).toBe("medium");
+      // Fable 5.1 rides the same Mythos-class wildcard matcher.
+      const anthropic51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-fable-5-1", "medium")
+      );
+      expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(anthropic51.effort).toBe("medium");
+      // Mythos 5.1 does too.
+      const mythos51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-mythos-5-1", "medium")
+      );
+      expect(mythos51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(mythos51.effort).toBe("medium");
     });
 
     test("omits thinking instead of sending disabled when off", () => {
@@ -187,6 +199,12 @@ describe("buildProviderOptions - Anthropic", () => {
       // omitting the field lets it default to adaptive. "off" can still reach here
       // when no thinking level was provided upstream (defaults to off).
       expect(buildProviderOptions("anthropic:claude-fable-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
     });
@@ -1376,6 +1394,97 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
+  // Astra keeps the GPT-5.6 native max effort but rejects "none" (HTTP 400) and has
+  // no documented pro mode; these tests pin exactly that split.
+  describe("GPT-6 Astra reasoning options", () => {
+    test("maps max to the native max effort and clamps off to low instead of none", () => {
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "max"))).toMatchObject({
+        reasoningEffort: "max",
+        reasoningSummary: "detailed",
+        include: ["reasoning.encrypted_content"],
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "xhigh"))).toMatchObject({
+        reasoningEffort: "xhigh",
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "off"))).toMatchObject({
+        reasoningEffort: "low",
+      });
+    });
+
+    test("preserves native max on the chatCompletions wire format", () => {
+      const result = buildProviderOptions("openai:gpt-6-astra", "max", undefined, undefined, {
+        openai: { wireFormat: "chatCompletions" },
+      });
+      expect(getOpenAIOptions(result)?.reasoningEffort).toBe("max");
+    });
+
+    test("degrades max to xhigh and keeps the low clamp through the Copilot-routed gateway", () => {
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        buildProviderOptions(
+          "openai:gpt-6-astra",
+          level,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          "github-copilot"
+        );
+      expect(build("max")).toEqual({ "github-copilot": { reasoningEffort: "xhigh" } });
+      expect(build("off")).toEqual({ "github-copilot": { reasoningEffort: "low" } });
+    });
+
+    test("withholds pro mode even when requested on the direct Responses route", () => {
+      const result = buildProviderOptions(
+        "openai:gpt-6-astra",
+        "max",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "pro"
+      );
+      const openai = getOpenAIOptions(result);
+      expect(openai?.reasoningEffort).toBe("max");
+      expect(openai?.reasoningMode).toBeUndefined();
+    });
+
+    test("resolves mapped aliases to Astra for the native effort mapping", () => {
+      const providersConfig = createMockProvidersConfig({
+        "openai:team-astra": "openai:gpt-6-astra",
+      });
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        getOpenAIOptions(
+          buildProviderOptions(
+            "openai:team-astra",
+            level,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            providersConfig
+          )
+        );
+      expect(build("max")?.reasoningEffort).toBe("max");
+      expect(build("off")?.reasoningEffort).toBe("low");
+    });
+
+    test("keeps named Astra variants on the legacy OpenAI mapping", () => {
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "max"))
+      ).toMatchObject({ reasoningEffort: "xhigh" });
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "off"))?.reasoningEffort
+      ).toBeUndefined();
+    });
+  });
+
   describe("GPT-5.6 explicit prompt caching serialization", () => {
     // Production-path wire test: createOpenAI + capture fetch + streamText
     // (the same streaming parser Xum uses), not intermediate TS objects.
@@ -1742,6 +1851,46 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
+  test("clamps Gemini 3.8 Flash off to low thinking because the API rejects minimal", () => {
+    // Policy already excludes "off" for 3.8 Flash; this guards callers that bypass it.
+    expect(buildProviderOptions("google:gemini-3.8-flash", "off")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "low",
+        },
+      },
+    });
+    // Older Flash tiers keep the minimal mapping.
+    expect(buildProviderOptions("google:gemini-3.7-flash", "off")).toEqual({
+      google: { thinkingConfig: { thinkingLevel: "minimal" } },
+    });
+  });
+
+  test("maps Gemini 3.8 Flash low/medium/high to the matching thinkingLevel with thoughts", () => {
+    for (const level of ["low", "medium", "high"] as const) {
+      expect(buildProviderOptions("google:gemini-3.8-flash", level)).toEqual({
+        google: {
+          thinkingConfig: {
+            includeThoughts: true,
+            thinkingLevel: level,
+          },
+        },
+      });
+    }
+  });
+
+  test("maps gateway-routed Gemini 3.8 Flash to thinkingLevel config", () => {
+    expect(buildProviderOptions("mux-gateway:google/gemini-3.8-flash", "high")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "high",
+        },
+      },
+    });
+  });
+
   test("maps Gemini 3.5 Flash medium to thinkingLevel medium with thoughts", () => {
     expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "medium")).toEqual({
       google: {
@@ -1859,6 +2008,28 @@ describe("buildProviderOptions - Moonshot", () => {
 
   test("emits no provider options for other Moonshot models", () => {
     expect(buildProviderOptions("moonshotai:kimi-k2.5", "medium")).toEqual({});
+  });
+});
+
+describe("buildProviderOptions - Z.ai", () => {
+  test("enables thinking and maps every GLM 5.3 policy level", () => {
+    for (const [level, reasoningEffort] of [
+      ["low", "low"],
+      ["high", "high"],
+      ["max", "max"],
+    ] as const) {
+      expect(buildProviderOptions("zai:glm-5.3-flash", level)).toEqual({
+        zai: {
+          thinking: { type: "enabled" },
+          reasoningEffort,
+          toolStream: true,
+        },
+      });
+    }
+  });
+
+  test("does not apply forced GLM 5.3 options to other Z.ai models", () => {
+    expect(buildProviderOptions("zai:glm-4.7-flash", "high")).toEqual({});
   });
 });
 

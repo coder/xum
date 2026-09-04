@@ -73,6 +73,77 @@ export function createAsyncEventQueue<T>(): {
   return { push, iterate, end };
 }
 
+export interface AsyncEventQueue<T> {
+  push: (value: T) => void;
+  iterate: () => AsyncGenerator<T>;
+  end: () => void;
+}
+
+interface SubscriptionOptions<T> {
+  signal?: AbortSignal;
+  validate?: () => void;
+  subscribe: (push: (value: T) => void) => () => void;
+  initialize?: (push: (value: T) => void) => void | Promise<void>;
+  initial?: () => T | Promise<T>;
+  queue?: AsyncEventQueue<T>;
+  take?: number;
+  onEnd?: () => void | Promise<void>;
+}
+
+/** Convert a callback subscription into an abortable AsyncIterable. */
+export function asyncIterableFromSubscription<T>(
+  options: SubscriptionOptions<T>
+): AsyncGenerator<T> {
+  return (async function* () {
+    options.validate?.();
+    if (options.signal?.aborted) return;
+
+    const queue = options.queue ?? createAsyncEventQueue<T>();
+    const unsubscribe = options.subscribe(queue.push);
+    const aborted = Symbol("aborted");
+    let resolveAbort: (() => void) | undefined;
+    const abortPromise = new Promise<typeof aborted>((resolve) => {
+      resolveAbort = () => resolve(aborted);
+    });
+    const onAbort = () => {
+      queue.end();
+      resolveAbort?.();
+    };
+
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+
+    try {
+      let yielded = 0;
+      if (options.initialize) {
+        const initialized = await Promise.race([
+          Promise.resolve().then(() => options.initialize?.(queue.push)),
+          abortPromise,
+        ]);
+        if (initialized === aborted) return;
+      }
+      if (options.initial) {
+        const initial = await Promise.race([Promise.resolve().then(options.initial), abortPromise]);
+        if (initial === aborted) return;
+        yield initial;
+        yielded++;
+      }
+
+      if (options.take != null && yielded >= options.take) return;
+      for await (const value of queue.iterate()) {
+        yield value;
+        yielded++;
+        if (options.take != null && yielded >= options.take) return;
+      }
+      await options.onEnd?.();
+    } finally {
+      options.signal?.removeEventListener("abort", onAbort);
+      queue.end();
+      unsubscribe();
+    }
+  })();
+}
+
 /**
  * Latest-value variant of createAsyncEventQueue: pushing replaces any unconsumed value
  * instead of appending. Use it for full-state snapshots where only the newest state

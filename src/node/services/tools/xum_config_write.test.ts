@@ -8,6 +8,9 @@ import * as jsonc from "jsonc-parser";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 import type { XumToolScope } from "@/common/types/toolScope";
 
+import { projectRegistrationLockFilePath } from "@/node/config/projectRegistrationLock";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+
 import { createXumConfigWriteTool } from "./xum_config_write";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
@@ -417,8 +420,13 @@ describe("mux_config_write", () => {
 
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
+      writeId?: string;
     };
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o" });
+    // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
+    expect(configDocument).toEqual({
+      defaultModel: "openai:gpt-4o",
+      writeId: expect.any(String) as string,
+    });
   });
 
   it("repairs primitive providers.jsonc root during write", async () => {
@@ -471,8 +479,13 @@ describe("mux_config_write", () => {
 
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
+      writeId?: string;
     };
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o" });
+    // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
+    expect(configDocument).toEqual({
+      defaultModel: "openai:gpt-4o",
+      writeId: expect.any(String) as string,
+    });
   });
 
   it("repairs array providers.jsonc root during write", async () => {
@@ -530,6 +543,70 @@ describe("mux_config_write", () => {
 
     // External target must remain unchanged
     expect(await fs.readFile(externalTarget, "utf-8")).toBe(originalContent);
+  });
+
+  it("rewrites config.json only under the project registration lock, from the bytes under it", async () => {
+    using xumHome = new TestTempDir("mux-config-write");
+    const configPath = path.join(xumHome.path, "config.json");
+    await fs.writeFile(configPath, JSON.stringify({ projects: [] }), "utf-8");
+    // A settings-backup import in another process holds the lock while it registers a
+    // project; a value-only rewrite from bytes read before that would drop the project.
+    const otherProcess = await acquireProcessFileLock({
+      lockPath: projectRegistrationLockFilePath(xumHome.path),
+      timeoutMs: 5_000,
+      label: "test holder",
+    });
+    const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+    const writing = tool.execute!(
+      {
+        file: "config",
+        operations: [{ op: "set", path: ["defaultModel"], value: "openai:gpt-4o" }],
+        confirm: true,
+      },
+      mockToolCallOptions
+    ) as Promise<XumConfigWriteResult>;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(JSON.parse(await fs.readFile(configPath, "utf-8"))).toEqual({ projects: [] });
+
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ projects: [["/imported", { workspaces: [] }]] }),
+      "utf-8"
+    );
+    await otherProcess[Symbol.asyncDispose]();
+    expect((await writing).success).toBe(true);
+    const written = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
+      projects: Array<[string, unknown]>;
+      defaultModel: string;
+    };
+    expect(written.defaultModel).toBe("openai:gpt-4o");
+    expect(written.projects.map(([projectPath]) => projectPath)).toEqual(["/imported"]);
+  });
+
+  it("refreshes the write stamp on every config.json rewrite", async () => {
+    using xumHome = new TestTempDir("mux-config-write");
+    const configPath = path.join(xumHome.path, "config.json");
+    const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+    const stampAfter = async (): Promise<unknown> => {
+      const result = (await tool.execute!(
+        {
+          file: "config",
+          operations: [{ op: "set", path: ["defaultModel"], value: "openai:gpt-4o" }],
+          confirm: true,
+        },
+        mockToolCallOptions
+      )) as XumConfigWriteResult;
+      expect(result.success).toBe(true);
+      return (JSON.parse(await fs.readFile(configPath, "utf-8")) as { writeId?: unknown }).writeId;
+    };
+    // The same operation twice writes the same content; a reader comparing the file's write
+    // generation around the second write (a settings-backup export deciding whether remote
+    // hints still apply) must still see a write.
+    const first = await stampAfter();
+    const second = await stampAfter();
+    expect(typeof first).toBe("string");
+    expect(typeof second).toBe("string");
+    expect(second).not.toBe(first);
   });
 
   it("rejects writes to symlinked providers.jsonc target", async () => {

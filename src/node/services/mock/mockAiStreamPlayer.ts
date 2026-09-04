@@ -7,6 +7,11 @@ import { Ok, Err } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
 import type { AIService } from "@/node/services/aiService";
 import { createErrorEvent } from "@/node/services/utils/sendMessageError";
+import {
+  createTurnCompletionController,
+  type TurnCompletion,
+  type TurnStreamHandle,
+} from "@/node/services/streamManager";
 import { log } from "@/node/services/log";
 import type {
   MockAssistantEvent,
@@ -135,6 +140,7 @@ interface ActiveStream {
   eventQueue: Array<() => Promise<void>>;
   isProcessing: boolean;
   cancelled: boolean;
+  settleCompletion: (completion: TurnCompletion) => void;
 }
 
 export class MockAiStreamPlayer {
@@ -281,7 +287,7 @@ export class MockAiStreamPlayer {
       muxMetadata?: MuxMessageMetadata;
       abortSignal?: AbortSignal;
     }
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<TurnStreamHandle | undefined, SendMessageError>> {
     const abortSignal = options?.abortSignal;
     if (abortSignal?.aborted) {
       return Ok(undefined);
@@ -402,14 +408,16 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    this.scheduleEvents(workspaceId, events, messageId, historySequence, options?.muxMetadata);
+    const handle = this.scheduleEvents(
+      workspaceId,
+      events,
+      messageId,
+      historySequence,
+      options?.muxMetadata
+    );
 
     await streamStartPromise;
-    if (abortSignal?.aborted) {
-      return Ok(undefined);
-    }
-
-    return Ok(undefined);
+    return Ok(handle);
   }
 
   async replayStream(_workspaceId: string): Promise<void> {
@@ -422,11 +430,12 @@ export class MockAiStreamPlayer {
     messageId: string,
     historySequence: number,
     muxMetadata?: MuxMessageMetadata
-  ): void {
+  ): TurnStreamHandle {
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     const streamStart = events.find(
       (event): event is MockStreamStartEvent => event.kind === "stream-start"
     );
+    const completionController = createTurnCompletionController();
     this.activeStreams.set(workspaceId, {
       timers,
       messageId,
@@ -442,6 +451,7 @@ export class MockAiStreamPlayer {
       eventQueue: [],
       isProcessing: false,
       cancelled: false,
+      settleCompletion: completionController.settle,
     });
 
     for (const event of events) {
@@ -452,6 +462,7 @@ export class MockAiStreamPlayer {
       }, event.delay);
       timers.push(timer);
     }
+    return { messageId, completion: completionController.promise };
   }
 
   private enqueueEvent(workspaceId: string, messageId: string, handler: () => Promise<void>): void {
@@ -804,6 +815,10 @@ export class MockAiStreamPlayer {
             errorType: payload.errorType,
           })
         );
+        active.settleCompletion({
+          status: "failed",
+          streamError: { messageId, error: payload.error, errorType: payload.errorType },
+        });
         this.cleanup(workspaceId);
         break;
       }
@@ -868,6 +883,7 @@ export class MockAiStreamPlayer {
         if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
         this.deps.aiService.emit("stream-end", payload);
+        active.settleCompletion({ status: "completed" });
         this.cleanup(workspaceId);
         break;
       }
@@ -879,6 +895,8 @@ export class MockAiStreamPlayer {
     if (!active) return;
 
     active.cancelled = true;
+    // Settle-once backstop: terminal events settled above; cancels settle here.
+    active.settleCompletion({ status: "aborted", abortReason: "user" });
 
     if (active.partialWriteTimer) {
       clearTimeout(active.partialWriteTimer);

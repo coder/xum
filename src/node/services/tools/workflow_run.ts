@@ -262,6 +262,7 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         }
       }
       const createdRun: { id: string | null } = { id: null };
+      const invocationStartedAtMs = Date.now();
       const startInput = {
         script,
         workspaceId,
@@ -271,6 +272,14 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
           createdRun.id = event.runId;
           // The run record is durable now, so a concurrent duplicate launch will see it.
           releaseAdmission?.();
+          // Provenance must be durable BEFORE the runner starts: a fast background run (or a
+          // process exit mid-dispatch) can reach terminal state before any post-dispatch
+          // write, and a terminal wake with no sidecar reference is permanently superseded.
+          if (args.run_in_background === true) {
+            await recordBackgroundWorkflowRunReference(config, event.runId, invocationStartedAtMs, {
+              propagateWriteFailure: true,
+            });
+          }
           await emitWorkflowRunAttachedEvent({
             config,
             workspaceId,
@@ -280,7 +289,6 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
           });
         },
       };
-      const invocationStartedAtMs = Date.now();
       let result: { runId: string; status: string; result: unknown };
       try {
         result =
@@ -335,7 +343,10 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         releaseAdmission?.();
       }
 
-      if (isBackgroundWorkflowResult(args, result.status)) {
+      // Explicit background launches already recorded provenance in onRunCreated; this covers
+      // a foreground dispatch that backgrounded itself, where the run ID outcome is only
+      // knowable post-dispatch.
+      if (args.run_in_background !== true && isBackgroundWorkflowResult(args, result.status)) {
         await recordBackgroundWorkflowRunReference(config, result.runId, invocationStartedAtMs);
       }
 

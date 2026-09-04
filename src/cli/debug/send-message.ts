@@ -1,5 +1,5 @@
-import * as fs from "fs";
 import * as path from "path";
+import * as fs from "fs";
 import { defaultConfig } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -23,7 +23,7 @@ export function sendMessageCommand(
   console.log();
 
   // Load chat history to verify message exists if editing
-  const sessionDir = defaultConfig.getSessionDir(workspaceId);
+  const sessionDir = path.join(defaultConfig.sessionsDir, workspaceId);
   const chatHistoryPath = path.join(sessionDir, "chat.jsonl");
 
   if (!fs.existsSync(chatHistoryPath)) {

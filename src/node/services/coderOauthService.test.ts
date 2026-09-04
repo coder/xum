@@ -3,7 +3,7 @@ import * as crypto from "crypto";
 
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
-import type { Config, ProvidersConfig } from "@/node/config";
+import type { FileLeaseManager, ProvidersConfig, ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import type { ProviderModelEntry } from "@/common/config/schemas/providerModelEntry";
@@ -126,24 +126,23 @@ function createMockDeps(): MockDeps {
   };
 }
 
-function createMockConfig(
+function createMockProvidersConfigStore(
   deps: MockDeps
-): Pick<
-  Config,
-  | "loadProvidersConfig"
-  | "getProvidersFileFingerprint"
-  | "tryAcquireCoderOauthClientLease"
-  | "withCoderOauthRefreshLock"
-  | "withCoderOauthLoginCommitLock"
-> {
+): Pick<ProvidersConfigStore, "loadProvidersConfig" | "getProvidersFileFingerprint"> {
   return {
     loadProvidersConfig: () => deps.providersConfig,
-    // Mirrors Config.getProvidersFileFingerprint (content hash): changes
-    // whenever the in-memory providers config changes, exactly like the real
-    // file fingerprint changes on every persisted write.
     getProvidersFileFingerprint: () => JSON.stringify(deps.providersConfig),
-    // Mirrors Config.tryAcquireCoderOauthClientLease: non-blocking, exclusive,
-    // released via the returned function.
+  };
+}
+
+function createMockFileLeaseManager(
+  deps: MockDeps,
+  overrides?: Partial<FileLeaseManager>
+): Pick<
+  FileLeaseManager,
+  "tryAcquireCoderOauthClientLease" | "withCoderOauthRefreshLock" | "withCoderOauthLoginCommitLock"
+> {
+  return {
     tryAcquireCoderOauthClientLease: () => {
       if (deps.coderClientLeaseHeld) {
         return null;
@@ -153,10 +152,9 @@ function createMockConfig(
         deps.coderClientLeaseHeld = false;
       };
     },
-    // Single-process tests do not contend on the cross-process locks; the
-    // two-process race tests wire shared serializing locks instead.
     withCoderOauthRefreshLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
     withCoderOauthLoginCommitLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
+    ...overrides,
   };
 }
 
@@ -286,7 +284,8 @@ function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMain
 
 function createService(deps: MockDeps): CoderOauthService {
   return new CoderOauthService(
-    createMockConfig(deps) as Config,
+    createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+    createMockFileLeaseManager(deps) as FileLeaseManager,
     createMockProviderService(deps) as ProviderService,
     createMockWindowService(deps) as WindowService
   );
@@ -599,10 +598,10 @@ describe("CoderOauthService", () => {
       const sharedLock = createSharedCrossProcessLock();
       const makeProcess = (): CoderOauthService =>
         new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthRefreshLock: sharedLock,
-          } as Config,
+          }) as FileLeaseManager,
           createMockProviderService(deps) as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -703,10 +702,10 @@ describe("CoderOauthService", () => {
         return await fn();
       };
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthRefreshLock: lockSimulatingEdit,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -789,7 +788,8 @@ describe("CoderOauthService", () => {
           Promise.resolve(Err("Failed to update provider config: disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1112,7 +1112,8 @@ describe("CoderOauthService", () => {
       // backend RPCs from registering OAuth clients or minting credentials —
       // not merely hide the login UI.
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1142,7 +1143,8 @@ describe("CoderOauthService", () => {
       // after coder was denied, and the exchanged tokens must be revoked.
       let coderAllowed = true;
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1241,7 +1243,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1354,18 +1357,18 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1455,7 +1458,8 @@ describe("CoderOauthService", () => {
       // must be revoked against their own issuer instead.
       let forcedUrl: string | undefined = undefined;
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1560,12 +1564,14 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1642,7 +1648,8 @@ describe("CoderOauthService", () => {
     it("logs in to the policy-forced deployment instead of the requested URL", async () => {
       const FORCED_URL = "http://locked.coder.test";
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1883,7 +1890,8 @@ describe("CoderOauthService", () => {
           Promise.resolve({ success: false as const, error: "providers.jsonc is unwritable" }),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1947,11 +1955,11 @@ describe("CoderOauthService", () => {
       // task: the flow must finish with the error immediately (not hang until
       // the five-minute timeout) and the exchanged tokens must be revoked.
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: <T>(_fn: () => Promise<T> | T): Promise<T> =>
             Promise.reject(new Error("EACCES: permission denied, mkdir lock")),
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2105,7 +2113,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2200,7 +2209,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2300,7 +2310,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2405,7 +2416,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2593,7 +2605,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2740,10 +2753,10 @@ describe("CoderOauthService", () => {
           },
         };
         const service = new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthLoginCommitLock: sharedCommitLock,
-          } as Config,
+          }) as FileLeaseManager,
           gatedProviderService as unknown as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -3278,7 +3291,8 @@ describe("CoderOauthService", () => {
         updateProviderSection: () => Promise.resolve(Err("disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -3319,7 +3333,8 @@ describe("CoderOauthService", () => {
       // Policy is applied at exposure time instead (getConfig filtering,
       // routing checks, per-model factory enforcement).
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -3883,6 +3898,14 @@ describe("CoderOauthService", () => {
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
           return Promise.resolve(aiProvidersResponse());
         }
+        // Earlier tests can finish their OAuth flow before post-login catalog discovery settles.
+        // Keep those stale requests from participating in this flow's concurrency gate.
+        if (
+          url.includes("/api/v2/aibridge/") &&
+          new Headers(init?.headers).get("Authorization") !== "Bearer at_concurrent"
+        ) {
+          return new Response("stale test flow", { status: 404 });
+        }
         if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
           catalogSignals.push(init?.signal);
           await anthropicGate; // Stalled until openai is queried.
@@ -4141,6 +4164,211 @@ describe("CoderOauthService", () => {
         (c.models as unknown as string[]).some((m) => String(m).includes("stale-model"))
       );
       expect(staleWrite).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // startServerFlow / handleServerCallback (browser + remote Xum server)
+  // -------------------------------------------------------------------------
+
+  describe("startServerFlow", () => {
+    const SERVER_REDIRECT_URI = "https://xum.example.com/auth/coder/callback";
+
+    /** Deployment mocks for the server flow; `onTokens` customizes the exchange. */
+    function mockServerFlowDeployment(opts: {
+      registerCalls?: unknown[];
+      onTokens?: (init?: RequestInit) => Promise<Response>;
+      onRevoke?: (init?: RequestInit) => void;
+    }): void {
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          opts.registerCalls?.push(JSON.parse(fetchBodyText(init)));
+          return jsonResponse({ client_id: "client_srv", client_secret: "secret_srv" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          if (opts.onTokens) return opts.onTokens(init);
+          return jsonResponse({
+            access_token: "at_srv",
+            refresh_token: "rt_srv",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
+          opts.onRevoke?.(init);
+          return new Response(null, { status: 200 });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return aiProvidersResponse();
+        }
+        if (url.startsWith(`${DEPLOYMENT_URL}/api/v2/aibridge/`)) {
+          return jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] });
+        }
+        // No loopback listener may be involved: any 127.0.0.1 request is a bug.
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
+    }
+
+    it("registers the server callback URL instead of a loopback listener and commits via handleServerCallback", async () => {
+      const registerCalls: unknown[] = [];
+      let exchangeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        registerCalls,
+        onTokens: (init) => {
+          exchangeBody = new URLSearchParams(fetchBodyText(init));
+          return Promise.resolve(
+            jsonResponse({
+              access_token: "at_srv",
+              refresh_token: "rt_srv",
+              expires_in: 86400,
+              token_type: "Bearer",
+            })
+          );
+        },
+      });
+
+      const flowId = "server-flow-0123456789abcdef";
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        flowId,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+
+      const authorize = new URL(startResult.data.authorizeUrl);
+      expect(startResult.data.flowId).toBe(flowId);
+      expect(authorize.searchParams.get("state")).toBe(flowId);
+      // Exact redirect URI matching: the server route URL is what gets
+      // registered and what the authorize request names.
+      expect(authorize.searchParams.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect((registerCalls[0] as { redirect_uris: string[] }).redirect_uris).toEqual([
+        SERVER_REDIRECT_URI,
+      ]);
+
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      // Unknown state is refused before any exchange.
+      const unknown = await service.handleServerCallback({
+        state: "not-a-registered-flow",
+        code: "code",
+        error: null,
+      });
+      expect(unknown.success).toBe(false);
+
+      // The callback route's outcome is the committed login.
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(callbackResult).toEqual(Ok(undefined));
+      expect(await waitPromise).toEqual(Ok(undefined));
+
+      expect(exchangeBody!.get("code")).toBe("auth_code_srv");
+      expect(exchangeBody!.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect(sha256Base64Url(exchangeBody!.get("code_verifier")!)).toBe(
+        authorize.searchParams.get("code_challenge")!
+      );
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_srv");
+      expect(coderSection.deploymentUrl).toBe(DEPLOYMENT_URL);
+
+      // An authorization code is single-use; so is its delivery. The finished
+      // flow is gone from the manager, so a replayed redirect is refused.
+      const replay = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(replay.success).toBe(false);
+    });
+
+    it("fails the flow when the redirect carries an OAuth error", async () => {
+      mockServerFlowDeployment({});
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: null,
+        error: "access_denied",
+        errorDescription: "User declined",
+      });
+      expect(callbackResult).toEqual(Err("access_denied: User declined"));
+      expect(await waitPromise).toEqual(Err("access_denied: User declined"));
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("settles the pending callback request when the flow is cancelled mid-exchange", async () => {
+      let releaseExchange!: () => void;
+      const exchangeGate = new Promise<void>((resolve) => (releaseExchange = resolve));
+      let exchangeStarted!: () => void;
+      const exchangeStartedPromise = new Promise<void>((resolve) => (exchangeStarted = resolve));
+      let revokeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        onTokens: async () => {
+          exchangeStarted();
+          await exchangeGate;
+          return jsonResponse({
+            access_token: "at_raced",
+            refresh_token: "rt_raced",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        },
+        onRevoke: (init) => {
+          revokeBody = new URLSearchParams(fetchBodyText(init));
+        },
+      });
+
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+
+      // The Express route awaits this; Cancel must resolve it rather than
+      // leave the browser tab hanging until the flow timeout.
+      const callbackPromise = service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_raced",
+        error: null,
+      });
+      await exchangeStartedPromise;
+      await service.cancelDesktopFlow(flowId);
+      const callbackResult = await callbackPromise;
+      expect(callbackResult.success).toBe(false);
+      releaseExchange();
+
+      await waitUntil(() => revokeBody !== null);
+      expect(revokeBody!.get("token")).toBe("rt_raced");
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("rejects a non-http(s) redirect URI without network calls", async () => {
+      mockFetch(() => Promise.reject(new Error("network must not be reached")));
+      const result = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: "javascript:alert(1)",
+      });
+      expect(result).toEqual(Err("Invalid OAuth redirect URI"));
     });
   });
 
@@ -5045,7 +5273,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -5096,7 +5325,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );

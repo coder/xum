@@ -31,8 +31,8 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
  * Map an agent class onto the per-scope memory write matrix
  * (see MemoryScopeAccess in src/common/constants/memory.ts):
  * - Plan-like and editing-capable (exec-like) agents get read-write everywhere;
- *   project memory is host-local and never mutates the repo checkout, so even
- *   plan agents may write it.
+ *   project memory is host-local (opt-in settings backup aside) and never
+ *   mutates the repo checkout, so even plan agents may write it.
  * - Everything else (explore/read-only agents) is view-only.
  */
 export function resolveMemoryAccessPolicy(options: {

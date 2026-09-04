@@ -3,7 +3,10 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { AIService } from "@/node/services/aiService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+} from "@/node/services/agentSession.testHarness";
 
 function promptMetadata() {
   return {
@@ -229,7 +232,7 @@ describe("AgentSession MCP prompt snapshots", () => {
 
   test("excludes crash-orphaned snapshots from provider requests", async () => {
     const streamMessage = mock((_args: { messages: MuxMessage[] }) =>
-      Promise.resolve(Ok(undefined))
+      Promise.resolve(Ok(createStartedTurnHandle()))
     );
     const harness = await createAgentSessionHarness({
       workspaceId: "workspace",

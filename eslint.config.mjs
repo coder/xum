@@ -1488,7 +1488,8 @@ export default defineConfig([
     // Temporarily allow sync fs methods in files with existing usage
     // TODO: Gradually migrate these to async operations
     files: [
-      "src/node/config.ts",
+      "src/node/config/index.ts",
+      "src/node/config/**/*.ts",
       "src/cli/debug/**/*.ts",
       "src/node/git.ts",
       "src/desktop/main.ts",

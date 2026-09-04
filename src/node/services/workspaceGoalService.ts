@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import {
@@ -32,13 +32,12 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   hasBudgetedResumableGoal,
-  hasGoalBudgetLimit,
   modelHasPricingData,
   normalizeGoalBudgetCents,
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import type { SendMessageError } from "@/common/types/errors";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -54,6 +53,20 @@ import { buildGoalBudgetLimitMessage, buildGoalContinuationMessage } from "@/con
 import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
+import {
+  applyBudgetDrivenStatus,
+  evaluateGoalContinuationBeforeGoal,
+  evaluateGoalContinuationGoal,
+  getGoalCostMicroCents,
+  hasReachedGoalBudgetLimit,
+  hasReachedGoalTurnLimit,
+  isBudgetWrapupEligibleOrigin,
+  MICRO_CENTS_PER_CENT,
+  type GoalContinuationDecision,
+  type GoalContinuationPolicyProbe,
+  type GoalContinuationSkipReason,
+  type GoalStreamOriginKind,
+} from "./goalContinuationPolicy";
 
 const GOAL_FILE = "goal.json";
 const GOAL_BOARD_FILE = "goal-board.json";
@@ -73,19 +86,9 @@ const GOAL_HISTORY_FILE = "goal-history.jsonl";
 // generous cap still keeps the response payload bounded; older entries remain
 // on disk in the JSONL but are simply not surfaced to the UI.
 const GOAL_HISTORY_RENDER_CAP = 200;
-const MICRO_CENTS_PER_CENT = 1_000_000;
 
 function costUsdToMicroCents(costUsd: number | null | undefined): number {
   return Math.max(0, Math.round((costUsd ?? 0) * 100 * MICRO_CENTS_PER_CENT));
-}
-
-/**
- * Returns the goal's accumulated cost in micro-cents, falling back to the
- * coarser `costCents` field for goals persisted before micro-cent tracking
- * was added.
- */
-function getGoalCostMicroCents(goal: GoalRecordV1): number {
-  return goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
 }
 
 type GoalLifecycleEvent =
@@ -142,29 +145,7 @@ export interface SetGoalInput {
   editInPlace?: boolean | null;
 }
 
-export type GoalContinuationSkipReason =
-  | "not_registered"
-  | "no_pending_candidate"
-  | "workspace_not_found"
-  | "archived"
-  | "transcript_only"
-  | "initializing"
-  | "incompatible_runtime"
-  | "child_workspace"
-  | "active_descendant_tasks"
-  | "currently_streaming"
-  | "queued_user_input"
-  | "pending_follow_up"
-  | "plan_mode"
-  | "compact_mode"
-  | "user_stop"
-  | "goal_missing"
-  | "goal_mismatch"
-  | "goal_not_active"
-  | "requires_ack"
-  | "budget_wrapup_already_fired"
-  | "budget_wrapup_suppressed"
-  | "cooldown";
+export type { GoalContinuationSkipReason, GoalStreamOriginKind } from "./goalContinuationPolicy";
 
 export interface GoalContinuationRuntimeState {
   isInitializing?: boolean;
@@ -329,8 +310,6 @@ interface PendingGoalMutation {
    */
   editInPlace?: boolean | null;
 }
-
-export type GoalStreamOriginKind = "goal_continuation" | "goal_budget_limit" | "user" | "other";
 
 interface GoalStreamStamp {
   originKind: GoalStreamOriginKind;
@@ -674,7 +653,8 @@ export class WorkspaceGoalService {
     private readonly historyService: HistoryService,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly analytics?: GoalLifecycleAnalyticsSink,
-    options: WorkspaceGoalServiceOptions = {}
+    options: WorkspaceGoalServiceOptions = {},
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
   ) {
     this.continuationCooldownMs =
       options.continuationCooldownMs ?? DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS;
@@ -1008,7 +988,7 @@ export class WorkspaceGoalService {
       status: desiredStatus,
       updatedAtMs: Date.now(),
     });
-    return this.applyBudgetDrivenStatus(next);
+    return applyBudgetDrivenStatus(next, { nowMs: Date.now() });
   }
 
   private async syncGoalStatusToChatTail(workspaceId: string): Promise<GoalRecordV1 | null> {
@@ -1087,7 +1067,7 @@ export class WorkspaceGoalService {
   // doesn't re-assert and re-join the same way.
   private resolveSessionFilePath(workspaceId: string, fileName: string): string {
     assert(workspaceId.trim().length > 0, "WorkspaceGoalService requires non-empty workspaceId");
-    return path.join(this.config.getSessionDir(workspaceId), fileName);
+    return path.join(this.config.sessionsDir, workspaceId, fileName);
   }
 
   private getFilePath(workspaceId: string): string {
@@ -1166,7 +1146,7 @@ export class WorkspaceGoalService {
       createdAtMs: now,
       updatedAtMs: now,
     });
-    return status === "active" ? this.applyBudgetDrivenStatus(goal) : goal;
+    return status === "active" ? applyBudgetDrivenStatus(goal, { nowMs: Date.now() }) : goal;
   }
 
   private async writeGoal(workspaceId: string, goal: GoalRecordV1): Promise<void> {
@@ -1280,24 +1260,41 @@ export class WorkspaceGoalService {
   private async pushTransientGoalSnapshot(
     workspaceId: string,
     snapshot: GoalSnapshot
-  ): Promise<boolean> {
-    const activity = await this.extensionMetadata.getSnapshot(workspaceId);
+  ): Promise<"delivered" | "no_baseline" | "unavailable"> {
+    let activity: WorkspaceActivitySnapshot | null;
+    try {
+      activity = await this.extensionMetadata.getSnapshot(workspaceId, { throwOnError: true });
+    } catch (error) {
+      // A suspect baseline (failed sidecar reconcile / unreadable main)
+      // must not feed an emitted overlay: partial-main fields would clear
+      // status in the renderer. "unavailable" is deliberately DISTINCT from
+      // the authoritative "no_baseline": the durable pushSnapshot fallback
+      // writes through the lenient load (accepting the same suspect partial
+      // main this strict read refused) and emits the result — converting
+      // this failure into that fallback would clear exactly the renderer
+      // state the strict read preserves.
+      log.debug("Skipping transient goal emit after failed snapshot read", {
+        workspaceId,
+        error,
+      });
+      return "unavailable";
+    }
     if (!activity) {
       // No baseline activity snapshot to overlay the transient goal on
       // (extensionMetadata has no entry for this workspace yet). Callers
       // that must guarantee delivery — e.g. live cost previews — should
-      // observe this `false` return and fall back to `pushSnapshot`, which
+      // observe "no_baseline" and fall back to `pushSnapshot`, which
       // creates the entry and emits via the durable path. Pending-goal
       // publication does not retry here because it only fires after a
       // `setGoal` that already created the entry.
-      return false;
+      return "no_baseline";
     }
     this.onActivityChange?.(workspaceId, {
       ...activity,
       goal: snapshot,
       transientGoalOnly: true,
     });
-    return true;
+    return "delivered";
   }
 
   private async pushLiveGoalPreviewOverlay(
@@ -1972,7 +1969,7 @@ export class WorkspaceGoalService {
               const stamp = this.lastGoalStreamStamps.get(workspaceId);
               if (
                 stamp?.goalId !== goal.goalId ||
-                !this.isBudgetWrapupEligibleOrigin(stamp.originKind)
+                !isBudgetWrapupEligibleOrigin(stamp.originKind, this.allowUserOriginBudgetWrapup)
               ) {
                 return true;
               }
@@ -2109,125 +2106,91 @@ export class WorkspaceGoalService {
     assert(workspaceId.trim().length > 0, "checkGoalContinuationEligibility requires workspaceId");
     assert(Number.isFinite(nowMs) && nowMs >= 0, "checkGoalContinuationEligibility requires nowMs");
 
-    const candidate = this.pendingContinuationCandidates.get(workspaceId);
-    if (!candidate) {
-      return { eligible: false, reason: "no_pending_candidate" };
-    }
+    const candidate = this.pendingContinuationCandidates.get(workspaceId) ?? null;
+    const finish = (
+      decision: GoalContinuationDecision,
+      goal?: GoalRecordV1,
+      lastStreamStamp?: GoalStreamStamp
+    ): GoalContinuationEligibilityResult => {
+      if (decision.kind === "continue") {
+        return { eligible: true, goal, candidate: candidate ?? undefined, lastStreamStamp };
+      }
+      if (decision.kind === "stop" && decision.dropCandidate) {
+        this.pendingContinuationCandidates.delete(workspaceId);
+      }
+      return {
+        eligible: false,
+        reason: decision.reason,
+        ...(decision.kind === "defer" ? { deferUntilMs: decision.untilMs } : {}),
+      };
+    };
     const bridge = this.goalContinuationBridge;
-    if (!bridge) {
-      return { eligible: false, reason: "not_registered" };
-    }
+    const probe: GoalContinuationPolicyProbe = {
+      nowMs,
+      candidate,
+      bridgeRegistered: bridge != null,
+    };
+    const evaluateProbe = () => evaluateGoalContinuationBeforeGoal(probe);
+    let decision = evaluateProbe();
+    if (decision) return finish(decision);
+    assert(
+      candidate != null && bridge != null,
+      "registered continuation requires candidate and bridge"
+    );
 
     const workspace = this.findWorkspaceConfigEntry(workspaceId);
-    if (!workspace) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "workspace_not_found" };
-    }
-    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "archived" };
-    }
-    if (!workspace.path) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "transcript_only" };
-    }
-    if (workspace.parentWorkspaceId != null) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "child_workspace" };
-    }
-    if (bridge.hasActiveDescendantTasks(workspaceId)) {
-      return { eligible: false, reason: "active_descendant_tasks" };
-    }
+    probe.workspace = {
+      found: workspace != null,
+      archived:
+        workspace != null && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
+      hasPath: Boolean(workspace?.path),
+      isChild: workspace?.parentWorkspaceId != null,
+    };
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
+
+    probe.hasActiveDescendantTasks = bridge.hasActiveDescendantTasks(workspaceId);
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
     const runtimeState = bridge.getRuntimeState(workspaceId);
-    if (runtimeState.isInitializing === true) {
-      return { eligible: false, reason: "initializing", deferUntilMs: nowMs + 1_000 };
-    }
-    if (runtimeState.isRuntimeCompatible === false) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "incompatible_runtime" };
-    }
-    if (runtimeState.isBusy === true || (await this.isWorkspaceStreaming(workspaceId))) {
-      return { eligible: false, reason: "currently_streaming", deferUntilMs: nowMs + 1_000 };
-    }
-    if (runtimeState.hasQueuedMessages === true) {
-      return { eligible: false, reason: "queued_user_input" };
-    }
-    if (runtimeState.hasPendingFollowUp === true) {
-      return { eligible: false, reason: "pending_follow_up" };
-    }
-    if (candidate.sendOptions.agentId === "plan" || candidate.sendOptions.mode === "plan") {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "plan_mode" };
-    }
-    if (candidate.sendOptions.agentId === "compact" || candidate.sendOptions.mode === "compact") {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "compact_mode" };
-    }
+    probe.runtime = {
+      isInitializing: runtimeState.isInitializing === true,
+      isRuntimeCompatible: runtimeState.isRuntimeCompatible !== false,
+      isBusy: runtimeState.isBusy === true,
+      hasQueuedMessages: runtimeState.hasQueuedMessages === true,
+      hasPendingFollowUp: runtimeState.hasPendingFollowUp === true,
+    };
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
-    const userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId);
-    if (userStopAtMs != null) {
-      const goalForStopCheck = await this.readGoalFile(workspaceId);
-      if (!goalForStopCheck) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "goal_missing" };
-      }
-      if (userStopAtMs >= goalForStopCheck.createdAtMs) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "user_stop" };
-      }
+    probe.isStreaming = await this.isWorkspaceStreaming(workspaceId);
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
+
+    probe.userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null;
+    if (probe.userStopAtMs != null) {
+      probe.stopCheckGoal = await this.readGoalFile(workspaceId);
     }
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
     const goal = await this.normalizeGoalLimits(workspaceId, {
       syncChatTail: candidate.source !== "kickoff",
     });
-    if (!goal) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "goal_missing" };
-    }
-    if (goal.goalId !== candidate.goalId) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "goal_mismatch" };
-    }
-    if (goal.status !== "active" && goal.status !== "budget_limited") {
-      if (goal.status !== "paused" || candidate.source !== "kickoff") {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "goal_not_active" };
-      }
-    }
-    if (goal.requireUserAcknowledgmentSinceMs != null) {
-      return { eligible: false, reason: "requires_ack" };
-    }
-
-    if (goal.status === "budget_limited") {
-      const lastStreamStamp = this.lastGoalStreamStamps.get(workspaceId);
-      if (goal.budgetLimitInjectedForGoalId === goal.goalId) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "budget_wrapup_already_fired" };
-      }
-      if (
-        lastStreamStamp?.goalId !== goal.goalId ||
-        !this.isBudgetWrapupEligibleOrigin(lastStreamStamp.originKind)
-      ) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "budget_wrapup_suppressed" };
-      }
-      return { eligible: true, goal, candidate, lastStreamStamp };
-    }
-
-    const lastContinuationFiredAtMs = goal.lastContinuationFiredAtMs ?? null;
-    if (
-      lastContinuationFiredAtMs != null &&
-      nowMs - lastContinuationFiredAtMs < this.continuationCooldownMs
-    ) {
-      return {
-        eligible: false,
-        reason: "cooldown",
-        deferUntilMs: lastContinuationFiredAtMs + this.continuationCooldownMs,
-      };
-    }
-
-    return { eligible: true, goal, candidate };
+    const lastStreamStamp =
+      goal?.status === "budget_limited"
+        ? (this.lastGoalStreamStamps.get(workspaceId) ?? null)
+        : null;
+    decision = evaluateGoalContinuationGoal({
+      nowMs,
+      candidate,
+      goal,
+      lastStreamStamp,
+      continuationCooldownMs: this.continuationCooldownMs,
+      allowUserOriginBudgetWrapup: this.allowUserOriginBudgetWrapup,
+    });
+    return finish(decision, goal ?? undefined, lastStreamStamp ?? undefined);
   }
 
   private scheduleContinuationReRequest(workspaceId: string, dueAtMs: number): void {
@@ -2285,7 +2248,7 @@ export class WorkspaceGoalService {
         preReadChatTailMode != null && current.goalId === preRead?.goalId
           ? preReadChatTailMode
           : null;
-      const budgetNormalized = this.applyBudgetDrivenStatus(current);
+      const budgetNormalized = applyBudgetDrivenStatus(current, { nowMs: Date.now() });
       const next = chatTailMode
         ? this.applyChatTailGoalMode(workspaceId, budgetNormalized, chatTailMode)
         : budgetNormalized;
@@ -2363,10 +2326,6 @@ export class WorkspaceGoalService {
     });
   }
 
-  private isBudgetWrapupEligibleOrigin(originKind: GoalStreamOriginKind): boolean {
-    return this.allowUserOriginBudgetWrapup || originKind !== "user";
-  }
-
   private async tryMarkBudgetLimitInjected(
     workspaceId: string,
     expectedGoalId: string,
@@ -2374,7 +2333,10 @@ export class WorkspaceGoalService {
   ): Promise<GoalRecordV1 | null> {
     assert(expectedGoalId.trim().length > 0, "budget wrap-up reservation requires a goal id");
     assert(
-      this.isBudgetWrapupEligibleOrigin(expectedLastStreamStamp.originKind),
+      isBudgetWrapupEligibleOrigin(
+        expectedLastStreamStamp.originKind,
+        this.allowUserOriginBudgetWrapup
+      ),
       "budget wrap-up reservation requires a goal-attributable stream"
     );
 
@@ -2382,7 +2344,7 @@ export class WorkspaceGoalService {
       const currentStamp = this.lastGoalStreamStamps.get(workspaceId);
       if (
         currentStamp?.goalId !== expectedGoalId ||
-        !this.isBudgetWrapupEligibleOrigin(currentStamp.originKind)
+        !isBudgetWrapupEligibleOrigin(currentStamp.originKind, this.allowUserOriginBudgetWrapup)
       ) {
         return null;
       }
@@ -2559,23 +2521,7 @@ export class WorkspaceGoalService {
       ...completionSummaryPatch(input.status, completionSummary),
       updatedAtMs: Date.now(),
     });
-    return this.applyBudgetDrivenStatus(next);
-  }
-
-  private hasReachedBudgetLimit(goal: GoalRecordV1): boolean {
-    const { budgetCents } = goal;
-    if (budgetCents == null || !hasGoalBudgetLimit(budgetCents)) {
-      return false;
-    }
-    return getGoalCostMicroCents(goal) >= budgetCents * MICRO_CENTS_PER_CENT;
-  }
-
-  private hasReachedTurnLimit(goal: GoalRecordV1): boolean {
-    return goal.turnCap != null && goal.turnsUsed >= goal.turnCap;
-  }
-
-  private hasReachedAnyLimit(goal: GoalRecordV1): boolean {
-    return this.hasReachedBudgetLimit(goal) || this.hasReachedTurnLimit(goal);
+    return applyBudgetDrivenStatus(next, { nowMs: Date.now() });
   }
 
   private applyCostAccounting(
@@ -2587,45 +2533,6 @@ export class WorkspaceGoalService {
       costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT),
       costMicroCents,
     };
-  }
-
-  private applyBudgetDrivenStatus(
-    next: GoalRecordV1,
-    options?: { originKind?: GoalStreamOriginKind }
-  ): GoalRecordV1 {
-    const normalizedBudgetCents = normalizeGoalBudgetCents(next.budgetCents);
-    const normalized =
-      normalizedBudgetCents === next.budgetCents
-        ? next
-        : GoalRecordV1Schema.parse({
-            ...next,
-            budgetCents: normalizedBudgetCents,
-            updatedAtMs: Date.now(),
-          });
-    const reachedLimit = this.hasReachedAnyLimit(normalized);
-    const shouldLimitActiveGoal = normalized.status === "active" && reachedLimit;
-    const shouldRearmBudgetLimitedGoal = normalized.status === "budget_limited" && !reachedLimit;
-    if (!shouldLimitActiveGoal && !shouldRearmBudgetLimitedGoal) {
-      return normalized;
-    }
-
-    return GoalRecordV1Schema.parse({
-      ...normalized,
-      status: shouldLimitActiveGoal ? "budget_limited" : "active",
-      // Raising/removing limits re-arms the one-shot budget wrap-up.
-      budgetLimitInjectedForGoalId: shouldRearmBudgetLimitedGoal
-        ? null
-        : normalized.budgetLimitInjectedForGoalId,
-      // Persist the origin kind on active→budget_limited so restart recovery
-      // can decide whether to arm a wrap-up. Clear it when re-arming back to
-      // `active` after the budget is raised or removed.
-      budgetLimitOriginKind: shouldLimitActiveGoal
-        ? (options?.originKind ?? null)
-        : shouldRearmBudgetLimitedGoal
-          ? null
-          : normalized.budgetLimitOriginKind,
-      updatedAtMs: Date.now(),
-    });
   }
 
   private emitBudgetLimited(
@@ -2647,10 +2554,10 @@ export class WorkspaceGoalService {
     this.emitLifecycle("goal_budget_limited", {
       hasBudget: goal.budgetCents != null,
       hasTurnCap: goal.turnCap != null,
-      "cost-overshoot": this.hasReachedBudgetLimit(goal)
+      "cost-overshoot": hasReachedGoalBudgetLimit(goal)
         ? centsBucket(Math.max(0, goal.costCents - (goal.budgetCents ?? 0)))
         : null,
-      "turn-overshoot": this.hasReachedTurnLimit(goal)
+      "turn-overshoot": hasReachedGoalTurnLimit(goal)
         ? countBucket(Math.max(0, goal.turnsUsed - (goal.turnCap ?? 0)))
         : null,
       ...(properties ?? {}),
@@ -2736,14 +2643,8 @@ export class WorkspaceGoalService {
   }
 
   private getProvidersConfigForPricing(): ProvidersConfigMap | null {
-    const maybeConfig = this.config as Config & {
-      loadProvidersConfig?: () => ProvidersConfigMap | null;
-    };
-    if (typeof maybeConfig.loadProvidersConfig !== "function") {
-      return null;
-    }
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    return maybeConfig.loadProvidersConfig() as unknown as ProvidersConfigMap | null;
+    const providersConfig = this.providersConfigStore.loadProvidersConfig();
+    return providersConfig as ProvidersConfigMap | null;
   }
 
   async requestPendingGoalContinuationDispatch(workspaceId: string): Promise<void> {
@@ -4114,13 +4015,17 @@ export class WorkspaceGoalService {
       });
       const snapshot = toGoalSnapshot(preview);
       this.liveGoalPreviewSnapshots.set(input.workspaceId, snapshot);
-      const didEmitTransient = await this.pushTransientGoalSnapshot(input.workspaceId, snapshot);
-      if (!didEmitTransient) {
+      const transientResult = await this.pushTransientGoalSnapshot(input.workspaceId, snapshot);
+      if (transientResult === "no_baseline") {
         // If the baseline activity snapshot does not exist yet (for
         // example, extensionMetadata was reset or stream-start's
         // fire-and-forget metadata write has not finished), fall back to
         // the durable path so this preview is still delivered to Goals UI
-        // subscribers instead of being dropped.
+        // subscribers instead of being dropped. "unavailable" must NOT take
+        // this path: the durable write's lenient load would accept the
+        // suspect partial main the strict read refused and emit it,
+        // clearing renderer goal/status state — return the computed preview
+        // without delivery instead (renderer keeps last-known state).
         return this.pushSnapshot(input.workspaceId, preview);
       }
       return snapshot;
@@ -4204,7 +4109,7 @@ export class WorkspaceGoalService {
         turnsUsed: current.turnsUsed + turnsDelta,
         updatedAtMs: Date.now(),
       });
-      const next = this.applyBudgetDrivenStatus(accounted, { originKind });
+      const next = applyBudgetDrivenStatus(accounted, { originKind, nowMs: Date.now() });
       if (input.streamStartedAtMs != null) {
         this.recordedStreamStartedAtMsByWorkspace.set(input.workspaceId, input.streamStartedAtMs);
       }
@@ -4263,7 +4168,10 @@ export class WorkspaceGoalService {
       // wrap-up is owed . `goal_continuation` is the right tag here
       // because the wrap-up MUST fire — child attribution is goal-attributable
       // work. The recovery path checks for `!= "user"`.
-      const next = this.applyBudgetDrivenStatus(accounted, { originKind: "goal_continuation" });
+      const next = applyBudgetDrivenStatus(accounted, {
+        originKind: "goal_continuation",
+        nowMs: Date.now(),
+      });
       const causedLimit = current.status === "active" && next.status === "budget_limited";
 
       await this.writeGoal(input.parentWorkspaceId, next);
@@ -5142,7 +5050,7 @@ export class WorkspaceGoalService {
         // activation consent (see stampUserActivation).
         lastUserActivationAtMs: now,
       });
-      const activated = this.applyBudgetDrivenStatus(baseActivated);
+      const activated = applyBudgetDrivenStatus(baseActivated, { nowMs: Date.now() });
 
       // gate budgeted goal promotion on pricing data. A user
       // who queued a goal under a priced model and then switched to an
@@ -5318,7 +5226,7 @@ export class WorkspaceGoalService {
       // queue-race pause bypasses fail closed for this activation.
       lastUserActivationAtMs: null,
     });
-    const activated = this.applyBudgetDrivenStatus(baseActivated);
+    const activated = applyBudgetDrivenStatus(baseActivated, { nowMs: Date.now() });
     // same pricing gate as `promoteUpcomingGoal`. If the next
     // queued goal is budgeted and the workspace is currently on an
     // unpriced model, refuse the auto-promotion — otherwise we'd leave

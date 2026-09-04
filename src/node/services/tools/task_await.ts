@@ -22,6 +22,7 @@ import {
   dedupeStrings,
   parseToolResult,
   requireTaskService,
+  requireWorkspaceTurnManager,
   requireWorkspaceId,
 } from "./toolUtils";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -32,9 +33,9 @@ import {
   type WorkspaceTurnTaskStatus,
 } from "@/node/services/taskHandleStore";
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import {
   ForegroundWaitBackgroundedError,
-  type AgentTaskStatus,
   type AgentTaskStatusLookup,
   type AgentTaskTimestamps,
 } from "@/node/services/taskService";
@@ -245,6 +246,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args, { abortSignal }): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_await");
       const taskService = requireTaskService(config, "task_await");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_await");
 
       const timeoutMs = coerceTimeoutMs(args.timeout_secs);
       // Preserve the documented 600s default when the model sends null
@@ -307,10 +309,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         return dedupeStrings(workflowRunIds);
       };
       const listInScopeWorkspaceTurnTaskIds = async (): Promise<string[]> => {
-        if (taskService.listWorkspaceTurnTasks == null) {
+        if (workspaceTurnManager.listWorkspaceTurnTasks == null) {
           return [];
         }
-        const turns = await taskService.listWorkspaceTurnTasks(workspaceId, {
+        const turns = await workspaceTurnManager.listWorkspaceTurnTasks(workspaceId, {
           statuses: ["queued", "starting", "running"],
         });
         const publicTurnIds: string[] = [];
@@ -411,10 +413,12 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         if (!isTerminalWorkflowRunStatus(run.status)) {
           return;
         }
-        await taskService.markWorkflowRunTerminalAttentionConsumed?.({
+        await taskService.markWorkflowRunTerminalAttentionSettled?.({
           ownerWorkspaceId: workspaceId,
           status: run.status,
           runId: run.id,
+          runUpdatedAt: run.updatedAt,
+          settledAs: "delivered",
         });
       };
 
@@ -552,9 +556,13 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               : null;
           const workspaceTurnOwnerId = resolvedExecution?.ownerWorkspaceId ?? workspaceId;
           const getWorkspaceTurnSnapshotForAwait = () =>
-            taskService.getWorkspaceTurnSnapshot(workspaceTurnOwnerId, workspaceTurnTaskId, {
-              consumingWorkspaceId: workspaceId,
-            });
+            workspaceTurnManager.getWorkspaceTurnSnapshot(
+              workspaceTurnOwnerId,
+              workspaceTurnTaskId,
+              {
+                consumingWorkspaceId: workspaceId,
+              }
+            );
           const snapshot =
             resolvedExecution?.record ??
             (resolveAgentExecution == null || !isAgentContinuation
@@ -578,7 +586,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             status: WorkspaceTurnTaskStatus;
             updatedAt: string;
           }): Promise<void> => {
-            await taskService.markWorkspaceTurnTerminalAttentionConsumed?.({
+            await workspaceTurnManager.markWorkspaceTurnTerminalAttentionConsumed?.({
               ownerWorkspaceId: workspaceTurnOwnerId,
               consumingWorkspaceId: workspaceId,
               handleId: workspaceTurnTaskId,
@@ -640,7 +648,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           try {
-            const report = await taskService.waitForWorkspaceTurn(workspaceTurnTaskId, {
+            const report = await workspaceTurnManager.waitForWorkspaceTurn(workspaceTurnTaskId, {
               timeoutMs: timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS,
               abortSignal: taskSignal,
               requestingWorkspaceId: workspaceId,

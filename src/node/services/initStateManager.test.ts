@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import * as os from "os";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Config } from "@/node/config";
@@ -254,7 +254,7 @@ describe("InitStateManager", () => {
       const workspaceId = "test-workspace";
       manager.startInit(workspaceId, "/path/to/hook");
 
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
 
       let releaseLock: (() => void) | undefined;

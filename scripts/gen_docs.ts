@@ -370,6 +370,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   xai: "xAI",
   deepseek: "DeepSeek",
   moonshotai: "Moonshot AI",
+  zai: "Z.ai",
   openrouter: "OpenRouter",
   bedrock: "Bedrock",
 };

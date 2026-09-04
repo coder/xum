@@ -1,6 +1,6 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import * as path from "path";
 import assert from "@/common/utils/assert";
 import type {
   DevToolsEvent,
@@ -410,8 +410,25 @@ export class DevToolsService extends EventEmitter {
     this.emit(`update:${workspaceId}`, event);
   }
 
+  /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
+  async hasWorkspaceData(workspaceId: string): Promise<boolean> {
+    assert(
+      workspaceId.trim().length > 0,
+      "DevToolsService.hasWorkspaceData requires a workspaceId"
+    );
+    if (this.workspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fs.access(this.getSessionFilePath(workspaceId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private getSessionFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "devtools.jsonl");
+    return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
 
   private getOrCreateWorkspaceData(workspaceId: string): WorkspaceData {
@@ -651,7 +668,7 @@ export class DevToolsService extends EventEmitter {
   ): Promise<void> {
     await withTargetMutationLock(
       this.config.rootDir,
-      this.config.getSessionDir(workspaceId),
+      path.join(this.config.sessionsDir, workspaceId),
       async () => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
           log.debug("Skipping DevTools write for removed workspace", { workspaceId });

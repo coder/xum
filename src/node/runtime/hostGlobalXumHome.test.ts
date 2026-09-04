@@ -1,66 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
 import { LocalRuntime } from "./LocalRuntime";
-import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
+import { TestRemoteRuntime } from "./testRemoteRuntime";
 import { resolveGlobalRuntime, shouldUseHostGlobalXumFallback } from "./hostGlobalXumHome";
 
-class StubRemoteRuntime extends RemoteRuntime {
+class StubRemoteRuntime extends TestRemoteRuntime {
   constructor(private readonly xumHome: string) {
     super();
   }
 
-  protected readonly commandPrefix = "StubRemote";
-
-  protected getBasePath(): string {
-    return "/workspace";
-  }
-
-  protected quoteForRemote(filePath: string): string {
-    return `'${filePath}'`;
-  }
-
-  protected cdCommand(cwd: string): string {
-    return `cd '${cwd}'`;
-  }
-
-  protected spawnRemoteProcess(): Promise<SpawnResult> {
-    throw new Error("spawn should not be called");
-  }
-
   override getXumHome(): string {
     return this.xumHome;
-  }
-
-  resolvePath(filePath: string): Promise<string> {
-    return Promise.resolve(filePath);
-  }
-
-  getWorkspacePath(): string {
-    return "/workspace";
-  }
-
-  createWorkspace() {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  initWorkspace() {
-    return Promise.resolve({ success: true });
-  }
-
-  deleteWorkspace() {
-    return Promise.resolve({ success: true as const, deletedPath: "/workspace" });
-  }
-
-  renameWorkspace() {
-    return Promise.resolve({
-      success: true as const,
-      oldPath: "/workspace",
-      newPath: "/workspace",
-    });
-  }
-
-  forkWorkspace() {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
   }
 }
 
