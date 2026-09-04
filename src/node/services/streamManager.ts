@@ -2362,15 +2362,6 @@ export class StreamManager {
   }
 
   private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
-    if (
-      swap.journal.headPartIndex != null &&
-      swap.journal.headEnd.id !== swap.journal.streamMessageId
-    ) {
-      log.warn(
-        "[continuous-compaction] committed step has no exact wire boundary; retaining full context"
-      );
-      return null;
-    }
     const index = messages.findIndex(
       (message) =>
         Array.isArray(message.content) &&

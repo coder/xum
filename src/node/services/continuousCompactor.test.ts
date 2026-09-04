@@ -611,8 +611,12 @@ describe("ContinuousCompactor", () => {
     return answer;
   }
 
-  async function activateJournaledSwap(committedTail = false, consumed = true) {
-    const answer = await seedLiveTurn(committedTail);
+  async function activateJournaledSwap(
+    committedTail = false,
+    consumed = true,
+    splitCommitted = false
+  ) {
+    const answer = await seedLiveTurn(committedTail, splitCommitted);
     assert(live, "Live fixture missing");
     const toolPart: MuxMessage["parts"][number] = {
       type: "dynamic-tool",
@@ -622,8 +626,9 @@ describe("ContinuousCompactor", () => {
       input: { script: "pwd" },
       output: { success: true },
     };
-    live.parts[1] = toolPart;
-    answer.parts[1] = toolPart;
+    const liveToolIndex = committedTail ? 0 : 1;
+    live.parts[liveToolIndex] = toolPart;
+    answer.parts[liveToolIndex] = toolPart;
     let swap: ContinuousPrefixSwap | undefined;
     let state: "none" | "pending" | "consumed" = "none";
     const dependencies: Dependencies = {
@@ -675,7 +680,7 @@ describe("ContinuousCompactor", () => {
     assert(journal, "Expected reproducible journal");
     state = consumed ? "consumed" : "pending";
     swap.consumed = consumed;
-    return { answer, journal, journalStore, dependencies };
+    return { answer, journal, journalStore, dependencies, swap };
   }
 
   for (const reason of ["disabled", "threshold-changed", "context-changed"]) {
@@ -711,7 +716,7 @@ describe("ContinuousCompactor", () => {
     });
   }
 
-  it("uses P1 durable fallback for an internal cut in a committed tool-only row", async () => {
+  it("uses P1 durable fallback when the first retained live step has no tool anchor", async () => {
     await seedLiveTurn(true, true);
     const deps = Reflect.get(compactor, "deps") as Dependencies;
     const setSwap = mock(() => true);
@@ -741,6 +746,31 @@ describe("ContinuousCompactor", () => {
     expect(JSON.stringify(current.slice(1))).not.toContain("committed investigation");
     expect(JSON.stringify(current.slice(1))).toContain("committed-tool");
     expect(current[0].metadata?.compactionBoundary).toBe(true);
+  });
+
+  it("seamlessly rebuilds an internal committed cut as static prefix context and anchors the live step", async () => {
+    const { answer, journal, journalStore } = await activateJournaledSwap(true, true, true);
+    expect(journal.headEnd.id).toBe("committed-tail");
+    expect(journal.headPartIndex).toBe(2);
+    expect(journal.liveTailCopySpec.partIndex).toBe(0);
+    expect(journal.firstTailToolCallId).toBe("tail-tool");
+    expect(journal.prefixSourceRows).toEqual([journal.boundary, ...journal.staticCopies]);
+    expect(JSON.stringify(journal.prefix)).not.toContain("old-committed-tool");
+    expect(JSON.stringify(journal.prefix)).toContain("committed-tool");
+    expect(fastApply).not.toHaveBeenCalled();
+    assert(live, "Live fixture missing");
+    answer.parts = [...live.parts, { type: "text", text: "work after static prefix swap" }];
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    expect(await compactor.observe(0, context)).toBe("applied");
+    const current = await rows();
+    expect(current[0].id).toBe(journal.boundary.id);
+    expect(current.slice(1, -1).map((row) => row.parts)).toEqual(
+      journal.staticCopies.map((row) => row.parts)
+    );
+    expect(current.at(-1)?.parts).toEqual(answer.parts);
+    expect(await journalStore.read()).toBeNull();
   });
 
   it("retains a consumed journal after failed disabled finalization so the next attempt can fold it", async () => {
@@ -875,7 +905,7 @@ describe("ContinuousCompactor", () => {
   it("a cut before a committed row preserves every later static row and the entire growing live answer", async () => {
     const { answer, journal, dependencies } = await activateJournaledSwap(true);
     expect(journal.liveTailCopySpec.partIndex).toBe(0);
-    expect(journal.firstTailToolCallId).toBe("committed-tool");
+    expect(journal.firstTailToolCallId).toBe("tail-tool");
     expect(
       journal.staticCopies.some((row) =>
         row.parts.some(

@@ -213,7 +213,7 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
   });
 
-  it("declines a committed step cut that the real provider pipeline flattens into one assistant", async () => {
+  it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
     const { run, tracker, store, swap } = await setup();
     const committed = createMuxMessage("committed", "assistant", "", {
       stepStartPartIndices: [0, 2],
@@ -230,7 +230,7 @@ describe("continuous prefix prepareStep and journal", () => {
       },
       {
         type: "dynamic-tool",
-        toolCallId: "keep",
+        toolCallId: "static-keep",
         toolName: "bash",
         state: "output-available",
         input: {},
@@ -239,21 +239,57 @@ describe("continuous prefix prepareStep and journal", () => {
     ];
     swap.journal.headEnd = { id: committed.id, sequence: 0 };
     swap.journal.headPartIndex = 2;
+    swap.journal.liveTailCopySpec.partIndex = 0;
+    const liveUser = createMuxMessage("live-user", "user", "continue");
+    const live = createMuxMessage("live", "assistant", "", { stepStartPartIndices: [0] });
+    live.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "keep",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+    ];
+    swap.journal.staticCopies = [
+      {
+        ...committed,
+        id: "static-copy",
+        parts: committed.parts.slice(2),
+        metadata: { synthetic: true, rlmPreservedTailCopy: true, stepStartPartIndices: [0] },
+      },
+      { ...liveUser, id: "live-user-copy" },
+    ];
+    swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
+    swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
     const messages = await prepareMessagesForProvider({
       ...swap.journal.preparation,
       workspaceId,
-      messagesWithSentinel: [createMuxMessage("user", "user", "request"), committed],
+      messagesWithSentinel: [
+        createMuxMessage("user", "user", "request"),
+        committed,
+        liveUser,
+        live,
+      ],
     });
     const assistant = messages.find(
       (message) =>
         message.role === "assistant" &&
-        JSON.stringify(message.content).includes('"toolCallId":"keep"')
+        JSON.stringify(message.content).includes('"toolCallId":"static-keep"')
     );
     expect(JSON.stringify(assistant)).toContain("summarized head must not return");
-    // No provable wire step boundary means P1 fallback, never a partly swapped request.
-    expect(await run(messages)).toBeUndefined();
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
-    expect(await store.read()).toBeNull();
+    const result = await run(messages);
+    assert(result?.messages, "Expected a seamless swap at the live anchor");
+    expect(JSON.stringify(result.messages)).not.toContain("summarized head must not return");
+    const calls = result.messages.flatMap((message) =>
+      message.role === "assistant" && Array.isArray(message.content)
+        ? message.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []))
+        : []
+    );
+    expect(calls).toEqual(["static-keep", "keep"]);
+    expect(tracker.consumedPrefixSwap).toBe(swap);
+    expect((await store.read())?.prefixSourceRows).toEqual(swap.journal.prefixSourceRows);
   });
 
   it("does not return a swap when atomic journal persistence fails", async () => {
@@ -361,7 +397,7 @@ describe("continuous prefix prepareStep and journal", () => {
   }
 
   for (const family of ["anthropic", "openai"]) {
-    for (const mode of ["pending", "whole-row", "sliced-row"] as const) {
+    for (const mode of ["pending", "whole-row", "static-cut", "sliced-row"] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
       it(`${family} fallback ${mode} preserves the correct view and emits only after reset`, async () => {
@@ -372,6 +408,44 @@ describe("continuous prefix prepareStep and journal", () => {
           swap.journal.liveTailCopySpec.partIndex = 2;
         } else {
           swap.journal.liveTailCopySpec.partIndex = 0;
+        }
+        const committed =
+          mode === "static-cut"
+            ? createMuxMessage("committed", "assistant", "", { stepStartPartIndices: [0, 1] })
+            : undefined;
+        if (committed) {
+          committed.parts = [
+            {
+              type: "dynamic-tool",
+              toolCallId: "discard-static",
+              toolName: "bash",
+              state: "output-available",
+              input: {},
+              output: { success: true },
+            },
+            {
+              type: "dynamic-tool",
+              toolCallId: "keep-static",
+              toolName: "bash",
+              state: "output-available",
+              input: {},
+              output: { success: true },
+            },
+          ];
+          swap.journal.headEnd = { id: committed.id, sequence: 0 };
+          swap.journal.headPartIndex = 1;
+          const userCopy = swap.journal.prefixSourceRows[1];
+          swap.journal.staticCopies = [
+            {
+              ...committed,
+              id: "static-copy",
+              parts: committed.parts.slice(1),
+              metadata: { synthetic: true, rlmPreservedTailCopy: true, stepStartPartIndices: [0] },
+            },
+            userCopy,
+          ];
+          swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
+          swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
         }
         if (consumed) await run();
         const controller = new AbortController();
@@ -415,7 +489,13 @@ describe("continuous prefix prepareStep and journal", () => {
           ...swap.journal.preparation,
           providerForMessages: family,
           workspaceId,
-          messagesWithSentinel: [createMuxMessage("prompt", "user", "original request"), rebuilt],
+          messagesWithSentinel: [
+            ...(committed
+              ? [createMuxMessage("earlier-prompt", "user", "earlier request"), committed]
+              : []),
+            createMuxMessage("prompt", "user", "original request"),
+            rebuilt,
+          ],
         });
         if (sliced) {
           const containing = preparedMessages.find(
@@ -492,6 +572,16 @@ describe("continuous prefix prepareStep and journal", () => {
         if (consumed && family === "anthropic" && !sliced) {
           expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
           expect(stream.request.messages.slice(0, swap.prefix.length)).toEqual(swap.prefix);
+          if (committed) {
+            const calls = stream.request.messages.flatMap((message) =>
+              message.role === "assistant" && Array.isArray(message.content)
+                ? message.content.flatMap((part) =>
+                    part.type === "tool-call" ? [part.toolCallId] : []
+                  )
+                : []
+            );
+            expect(calls).toEqual(["keep-static", "keep"]);
+          }
         } else {
           expect(stream.request.messages).toEqual(preparedMessages);
         }

@@ -456,21 +456,21 @@ export class ContinuousCompactor {
     const source = rows.at(-1);
     if (!live || source?.id !== live.messageId || source.metadata?.historySequence == null)
       return false;
-    // Persisted row metadata is not a wire step delimiter in the SDK converter.
-    // Keep Phase 1's stop/apply fallback for cuts inside a committed assistant.
-    if (
-      staged.cut.stepCut &&
-      staged.cut.stepCut.partIndex > 0 &&
-      staged.cut.stepCut.messageId !== live.messageId
-    )
-      return false;
     const tail = this.materializeTail(staged, rows);
-    const firstAssistant = tail.findIndex((row) => row.role === "assistant");
-    const first = tail[firstAssistant];
-    // A later tool in another step is not a locator for the beginning of the tail.
-    const firstStepEnd = first?.metadata?.stepStartPartIndices?.[1] ?? first?.parts.length;
-    const tool = first?.parts.slice(0, firstStepEnd).find((part) => part.type === "dynamic-tool");
-    if (!first || first.metadata?.stepStartPartIndices?.[0] !== 0 || tool?.type !== "dynamic-tool")
+    const retainedLive = tail.at(-1);
+    // Rebuild all committed context in the prefix: persisted rows can combine
+    // consecutive tool-only steps. Only the current live step supplies a wire anchor.
+    const firstStepEnd =
+      retainedLive?.metadata?.stepStartPartIndices?.[1] ?? retainedLive?.parts.length;
+    const tool = retainedLive?.parts
+      .slice(0, firstStepEnd)
+      .find((part) => part.type === "dynamic-tool");
+    if (
+      retainedLive?.id !== live.messageId ||
+      retainedLive.role !== "assistant" ||
+      retainedLive.metadata?.stepStartPartIndices?.[0] !== 0 ||
+      tool?.type !== "dynamic-tool"
+    )
       return false;
     const prepared = await this.deps.prepareSwap(staged.cut.head);
     if (!prepared || !this.isValid(staged, rows)) return false;
@@ -482,6 +482,7 @@ export class ContinuousCompactor {
       systemMessageTokens: context.systemMessageTokens ?? 0,
       attachmentTokens: staged.attachmentTokens,
     });
+    const staticCopies = copies.slice(0, -1);
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
     // A live template must never replay costs, boundary/error flags, or stale partial state.
@@ -494,7 +495,7 @@ export class ContinuousCompactor {
       const journal: ContinuousCompactionJournal = {
         version: 1,
         boundary,
-        staticCopies: copies.slice(0, -1),
+        staticCopies,
         liveTailCopySpec: {
           sourceMessageId: live.messageId,
           sourceHistorySequence: source.metadata.historySequence,
@@ -502,7 +503,7 @@ export class ContinuousCompactor {
           partIndex,
           metadataTemplate: liveCopy.metadata,
         },
-        prefixSourceRows: [boundary, ...copies.slice(0, firstAssistant)],
+        prefixSourceRows: [boundary, ...staticCopies],
         systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
         cacheEnabled: prepared.cacheEnabled,
         sourceFingerprint: fingerprint([
