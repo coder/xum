@@ -112,7 +112,16 @@ async function waitForDesktopScreen(canvasElement: HTMLElement) {
 export const ViewOnly: AppStory = {
   render: () => <AppWithMocks setup={() => setupDesktopStory("connected")} />,
   play: async ({ canvasElement }) => {
-    const { canvas, control } = await waitForDesktopScreen(canvasElement);
+    const { canvas, control, screen } = await waitForDesktopScreen(canvasElement);
+    // The sidebar's capture-phase close-tab shortcut must leave guest Ctrl+W untouched.
+    const closeTab = new KeyboardEvent("keydown", {
+      key: "w",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    screen.dispatchEvent(closeTab);
+    await expect(closeTab.defaultPrevented).toBe(false);
     await expect(control).toHaveAttribute("aria-pressed", "false");
     await expect(canvas.getByRole("button", { name: "Zoom to 100%" })).toHaveAttribute(
       "aria-pressed",

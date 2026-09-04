@@ -214,6 +214,18 @@ describe("useDesktopConnection control ownership", () => {
     expect(getBootstrap).toHaveBeenCalledTimes(2);
   });
 
+  test("connects after another suite replaces queueMicrotask with synchronous scheduling", async () => {
+    const queueMicrotask = globalThis.queueMicrotask;
+    globalThis.queueMicrotask = (callback) => callback();
+    try {
+      const view = mountConnection();
+      const rfb = await connect(view);
+      expect(rfb.viewOnly).toBe(true);
+    } finally {
+      globalThis.queueMicrotask = queueMicrotask;
+    }
+  });
+
   test("unmount prevents a pending bootstrap from creating a connection", async () => {
     let resolve!: (value: typeof bootstrap) => void;
     getBootstrap = mock(

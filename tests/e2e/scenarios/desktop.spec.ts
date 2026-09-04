@@ -5,6 +5,16 @@ import { electronTest as test, electronExpect as expect } from "../electronTest"
 
 type HandoffEvent = { type: "send"; bytes: number[] } | { type: "disconnect" | "connect" };
 
+interface DesktopRecoveryProbe {
+  events: HandoffEvent[];
+  releaseBringBack?: () => void;
+}
+
+type RecoveryProbeWindow = Window & {
+  __desktopReadyDropped?: boolean;
+  __desktopRecoveryProbe?: DesktopRecoveryProbe;
+};
+
 interface KeyEvent {
   keysym: number;
   down: boolean;
@@ -282,6 +292,160 @@ test.describe("Electron desktop", () => {
     expect(inlineConnections.filter((connection) => !connection.closed)).toHaveLength(1);
     expect(app.windows()).toHaveLength(existingWindows);
     await screenshot(page, testInfo, "inline-after-native-close");
+  });
+
+  test("Electron reload recovers a lost ready and Reconnect here waits for responsive input release", async ({
+    app,
+    page,
+    ui,
+    workspace,
+  }, testInfo) => {
+    await enableRealDesktop(page, workspace.demoProject.workspaceId);
+    await ui.projects.openFirstWorkspace();
+    const inlineConnections = observeDesktopConnections(page);
+    await ui.metaSidebar.selectTab("Desktop");
+    await expectConnectedViewOnly(page);
+
+    // Lose only the readiness packet; the real child, manager, and VNC transport remain intact.
+    await app.context().addInitScript(() => {
+      if (!window.location.pathname.endsWith("/desktop.html")) return;
+      const send = BroadcastChannel.prototype.postMessage;
+      BroadcastChannel.prototype.postMessage = function (message: unknown) {
+        const target = window as RecoveryProbeWindow;
+        if (
+          !target.__desktopReadyDropped &&
+          typeof message === "object" &&
+          message !== null &&
+          "type" in message &&
+          message.type === "ready"
+        ) {
+          target.__desktopReadyDropped = true;
+          return;
+        }
+        send.call(this, message);
+      };
+    });
+    const opening = app.waitForEvent("window");
+    await page.getByRole("button", { name: "Detach", exact: true }).click();
+    const child = await opening;
+    const childConnections = observeDesktopConnections(child);
+    await child.waitForFunction(() => (window as RecoveryProbeWindow).__desktopReadyDropped);
+    await expect(viewport(child)).toHaveCount(0);
+    expect(childConnections).toHaveLength(0);
+
+    await page.reload();
+    await ui.projects.openFirstWorkspace();
+    await ui.metaSidebar.selectTab("Desktop");
+    await expectConnectedViewOnly(child);
+    await expect(viewport(page)).toHaveCount(0);
+    expect(childConnections).toHaveLength(1);
+    expect(inlineConnections).toHaveLength(1);
+    await screenshot(child, testInfo, "electron-lost-ready-recovered-after-parent-reload");
+
+    const nativeChild = await app.browserWindow(child);
+    const forceDestroy = await nativeChild.evaluateHandle((window) => {
+      const observation = { calls: 0 };
+      const destroy = window.destroy.bind(window);
+      window.destroy = () => {
+        observation.calls += 1;
+        destroy();
+      };
+      return observation;
+    });
+    const probeChannel = `desktop-e2e-release:${crypto.randomUUID()}`;
+    await page.evaluate((name) => {
+      const probe: DesktopRecoveryProbe = { events: [] };
+      (window as RecoveryProbeWindow).__desktopRecoveryProbe = probe;
+      const observer = new BroadcastChannel(name);
+      observer.onmessage = (event: MessageEvent<HandoffEvent>) => probe.events.push(event.data);
+      const send = BroadcastChannel.prototype.postMessage;
+      BroadcastChannel.prototype.postMessage = function (message: unknown) {
+        if (
+          !probe.releaseBringBack &&
+          typeof message === "object" &&
+          message !== null &&
+          "type" in message &&
+          message.type === "bring-back"
+        ) {
+          // Hold delivery, not cleanup: a responsive child must stay alive until it
+          // can consume the request, rather than being force-destroyed by the manager.
+          probe.releaseBringBack = () => send.call(this, message);
+          return;
+        }
+        send.call(this, message);
+      };
+    }, probeChannel);
+    await child.evaluate((name) => {
+      const observer = new BroadcastChannel(name);
+      const send = WebSocket.prototype.send;
+      const close = WebSocket.prototype.close;
+      WebSocket.prototype.send = function (data) {
+        send.call(this, data);
+        if (!new URL(this.url).pathname.endsWith("/desktop/ws")) return;
+        if (typeof data === "string" || data instanceof Blob) return;
+        const bytes = ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+          : new Uint8Array(data);
+        observer.postMessage({ type: "send", bytes: Array.from(bytes) });
+      };
+      WebSocket.prototype.close = function (...args) {
+        close.apply(this, args);
+        if (new URL(this.url).pathname.endsWith("/desktop/ws"))
+          observer.postMessage({ type: "disconnect" });
+      };
+    }, probeChannel);
+    await child.getByRole("button", { name: "Take control", exact: true }).click();
+    await viewport(child).click();
+    await child.keyboard.down("Shift");
+    const connection = childConnections[0];
+    assert(connection);
+    await expect
+      .poll(() => connection.keys.some((key) => key.keysym === 0xffe1 && key.down))
+      .toBe(true);
+
+    const closed = child.waitForEvent("close");
+    await page.getByRole("button", { name: "Reconnect here", exact: true }).click();
+    await page.waitForFunction(() =>
+      Boolean((window as RecoveryProbeWindow).__desktopRecoveryProbe?.releaseBringBack)
+    );
+    // The read-only manager query is an IPC barrier after the recovery request.
+    const managed = await page.evaluate(async (workspaceId) => {
+      const api = window.__ORPC_CLIENT__;
+      if (!api) throw new Error("E2E API client not initialized");
+      return api.desktop.getWindow({ workspaceId });
+    }, workspace.demoProject.workspaceId);
+    expect(managed).not.toBeNull();
+    expect(child.isClosed()).toBe(false);
+    expect(await forceDestroy.evaluate((observation) => observation.calls)).toBe(0);
+    await page.evaluate(() =>
+      (window as RecoveryProbeWindow).__desktopRecoveryProbe?.releaseBringBack?.()
+    );
+    await closed;
+    await expectConnectedViewOnly(page);
+    const probe = await page.evaluate(() => {
+      const value = (window as RecoveryProbeWindow).__desktopRecoveryProbe;
+      if (!value) throw new Error("Missing recovery probe");
+      return { events: value.events };
+    });
+    const up = probe.events.findIndex((event) => {
+      if (event.type !== "send") return false;
+      const key = readKeyEvent(new Uint8Array(event.bytes));
+      return key?.keysym === 0xffe1 && !key.down;
+    });
+    expect(up).toBeGreaterThanOrEqual(0);
+    expect(probe.events.findIndex((event) => event.type === "disconnect")).toBeGreaterThan(up);
+    const forceDestroyCalls = await forceDestroy.evaluate((observation) => observation.calls);
+    expect(forceDestroyCalls).toBe(0);
+    expect(inlineConnections).toHaveLength(2);
+    const wirePath = testInfo.outputPath("electron-responsive-recovery-wire.json");
+    await writeFile(wirePath, JSON.stringify({ ...probe, forceDestroyCalls }, null, 2));
+    await testInfo.attach("electron-responsive-recovery-wire", {
+      path: wirePath,
+      contentType: "application/json",
+    });
+    await screenshot(page, testInfo, "electron-inline-after-responsive-reconnect");
+    await forceDestroy.dispose();
+    await nativeChild.dispose();
   });
 });
 

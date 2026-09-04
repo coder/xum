@@ -423,19 +423,54 @@ describe("DesktopPopout handoff", () => {
     expect(clear).toHaveBeenCalledWith(deadline.handle);
   });
 
-  test("Electron manager truth suppresses inline until the matching window closes", async () => {
+  test("manager-confirmed reconciliation re-grants a waiting child before or after its ready message", async () => {
     const popout = new DesktopPopout(workspaceId, true);
-    expect(popout.getSnapshot().state).toBe("checking");
+    const disconnect = mock(() => undefined);
+    popout.attach(disconnect);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
     await popout.reconcile(api);
+    expect(disconnect).toHaveBeenCalledTimes(1);
     expect(popout.getSnapshot().state).toBe("detached");
+    expect(channel().sent).toEqual([{ type: "grant", instanceId: "existing" }]);
+    // If the first grant preceded the child's subscription, its late ready completes handoff.
     message("ready", "existing");
-    expect(channel().sent).toEqual([]);
-    await popout.open(api);
-    expect(api.openWindow).toHaveBeenCalledWith({ workspaceId, instanceId: "existing" });
+    expect(channel().sent.at(-1)).toEqual({ type: "grant", instanceId: "existing" });
+    expect(channel().sent).toHaveLength(2);
+    message("opened", "existing");
+    message("ready", "existing");
+    expect(channel().sent).toHaveLength(2);
+  });
+
+  test("Electron recovery waits for responsive child cleanup without force destruction", async () => {
+    const popout = new DesktopPopout(workspaceId, true);
+    api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
+    await popout.reconcile(api);
+    const recovering = popout.recover(api);
+    await Promise.resolve();
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "existing" });
+    expect(api.closeWindow).not.toHaveBeenCalled();
+    expect(popout.getSnapshot().state).toBe("detached");
+    await popout.reconcile(api);
+    message("ready", "existing");
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "existing" });
+    message("closed", "existing");
+    await recovering;
+    expect(api.closeWindow).not.toHaveBeenCalled();
+    expect(popout.getSnapshot().state).toBe("inline");
+  });
+
+  test("Electron recovery force-closes only after an unresponsive child misses its cleanup deadline", async () => {
+    const popout = new DesktopPopout(workspaceId, true);
+    api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
+    await popout.reconcile(api);
     const closed = deferred<void>();
     api.closeWindow = mock(() => closed.promise);
     const recovering = popout.recover(api);
+    await Promise.resolve();
+    expect(api.closeWindow).not.toHaveBeenCalled();
+    const deadline = deadlines.at(-1);
+    assert(deadline);
+    deadline.run();
     await Promise.resolve();
     expect(api.closeWindow).toHaveBeenCalledWith({ workspaceId, instanceId: "existing" });
     expect(popout.getSnapshot().state).toBe("detached");

@@ -262,6 +262,24 @@ describe("ImmersiveReviewView", () => {
     expect(badge.textContent ?? "").toContain("2/3");
   });
 
+  test("guest Escape and Tab cannot exit or change host immersive review", () => {
+    const onExit = mock(() => undefined);
+    const view = renderImmersiveReview({ isTouchImmersive: false, onExit });
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    for (const key of ["Escape", "Tab"]) {
+      const event = new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      fireEvent(canvas, event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(onExit).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExit).toHaveBeenCalledTimes(1);
+  });
+
   test("reserves the assisted banner slot while iterating through hunks in one file", () => {
     const assistedHunk = createHunk({
       id: "hunk-assisted",

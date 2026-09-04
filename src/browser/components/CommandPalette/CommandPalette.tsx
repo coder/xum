@@ -10,6 +10,7 @@ import {
   formatKeybind,
   KEYBINDS,
   isEditableElement,
+  isDesktopViewportFocused,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -113,6 +114,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   // Close palette with Escape
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (matchesKeybind(e, KEYBINDS.CANCEL) && isOpen) {
         // Intercept Escape in capture phase so it doesn't reach global bubble handlers
         // (e.g., stream interrupt).

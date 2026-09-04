@@ -50,6 +50,8 @@ export class DesktopPopout {
   private readonly storageKey: string;
   private instanceId: string | null;
   private popup: Window | null = null;
+  private grantPending = false;
+  private returning = false;
   private channel: BroadcastChannel | null = null;
   private deadline: ReturnType<typeof setTimeout> | undefined;
   private closeTimer: number | undefined;
@@ -86,11 +88,14 @@ export class DesktopPopout {
       if (!isDesktopPopoutMessage(event.data) || event.data.instanceId !== this.instanceId) return;
       switch (event.data.type) {
         case "ready":
-          if (this.snapshot.state !== "opening") return;
-          // Flush human input and close the inline socket before the child can start VNC.
-          this.suspendInline?.();
-          updatePersistedState(this.storageKey, this.instanceId);
-          this.update("detached");
+          if (!this.grantPending) return;
+          this.grantPending = false;
+          if (this.snapshot.state === "opening") {
+            // Flush human input and close the inline socket before the child can start VNC.
+            this.suspendInline?.();
+            updatePersistedState(this.storageKey, this.instanceId);
+            this.update("detached");
+          }
           this.send("grant");
           break;
         case "grant":
@@ -98,6 +103,7 @@ export class DesktopPopout {
           break;
         case "opened":
           if (this.snapshot.state !== "detached") return;
+          this.grantPending = false;
           clearTimeout(this.deadline);
           break;
         case "closed":
@@ -117,6 +123,8 @@ export class DesktopPopout {
     clearTimeout(this.deadline);
     window.clearTimeout(this.closeTimer);
     this.instanceId = null;
+    this.grantPending = false;
+    this.returning = false;
     this.popup = null;
     this.channel?.close();
     this.channel = null;
@@ -139,10 +147,15 @@ export class DesktopPopout {
         const current = await api.getWindow({ workspaceId: this.workspaceId });
         if (snapshot !== this.snapshot || snapshot.state === "opening") return;
         if (current) {
+          if (this.returning) return;
           this.suspendInline?.();
           this.instanceId = current.instanceId;
           this.listen();
+          // A reloaded parent may have missed ready. Manager truth, unlike a browser
+          // hint, permits completing the handoff now or when a late ready arrives.
+          this.grantPending = true;
           this.update("detached");
+          this.send("grant");
         } else this.restore();
       } else if (this.popup?.closed) this.restore();
     } catch (error) {
@@ -162,6 +175,7 @@ export class DesktopPopout {
     const instanceId = crypto.randomUUID();
     try {
       this.instanceId = instanceId;
+      this.grantPending = true;
       this.listen();
       this.update("opening");
       // A failure deadline, not handoff coordination: only a ready message grants VNC.
@@ -180,6 +194,7 @@ export class DesktopPopout {
           clearTimeout(this.deadline);
           this.instanceId = opened.instanceId;
           this.update("detached");
+          this.send("grant");
           return;
         }
       } else {
@@ -198,7 +213,25 @@ export class DesktopPopout {
   }
 
   bringBack() {
+    if (!this.instanceId) return;
+    this.returning = true;
+    this.grantPending = false;
     this.send("bring-back");
+  }
+
+  private waitForRelease(instanceId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const finish = (released: boolean) => {
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(released);
+      };
+      const unsubscribe = this.subscribe(() => {
+        if (this.instanceId !== instanceId) finish(true);
+      });
+      const timer = setTimeout(() => finish(false), DESKTOP_POPOUT_READY_TIMEOUT_MS);
+      this.bringBack();
+    });
   }
 
   private watchClosed(popup: Window, instanceId: string | null, deadline: number) {
@@ -220,14 +253,25 @@ export class DesktopPopout {
   async recover(api: DesktopWindowAPI) {
     clearTimeout(this.deadline);
     const instanceId = this.instanceId;
-    this.send("bring-back");
+    this.returning = true;
+    this.grantPending = false;
     if (this.electron) {
       // Manager truth also recovers a missed ready/closed message or renderer crash.
       const current = await api.getWindow({ workspaceId: this.workspaceId });
       if (this.instanceId !== instanceId) return;
-      if (current)
+      if (current) {
+        this.instanceId = current.instanceId;
+        this.listen();
+        // A responsive renderer must release held inputs before native destruction.
+        // Force-close only when its cleanup acknowledgment misses the bounded wait.
+        if (await this.waitForRelease(current.instanceId)) return;
+        if (this.instanceId !== current.instanceId) return;
         await api.closeWindow({ workspaceId: this.workspaceId, instanceId: current.instanceId });
+        if (this.instanceId === current.instanceId) this.restore();
+        return;
+      }
     } else {
+      this.bringBack();
       // A browser reload loses the Window handle, not the named popup. Reacquire it
       // in this user gesture so a stale hint can be recovered without granting a
       // second viewer while a live child is still releasing its inputs.

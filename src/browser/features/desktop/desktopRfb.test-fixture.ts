@@ -36,7 +36,9 @@ export default class DesktopRfbFixture {
           this.input.push({ type, button: event.button, viewOnly: this.viewOnly });
       });
     }
-    queueMicrotask(() => {
+    // Some unit suites replace global queueMicrotask with a synchronous mock. Promise jobs
+    // still let the hook install its listeners before this simulated network event fires.
+    void Promise.resolve().then(() => {
       if (!this.disconnectCount) this.events.dispatchEvent(new Event("connect"));
     });
   }
