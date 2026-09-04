@@ -34,7 +34,9 @@ import type {
 } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
-  accumulateStepsProviderMetadata,
+  accumulateProviderMetadata,
+  addUsage,
+  withCacheWriteMetadata,
   normalizeUsage,
 } from "@/common/utils/tokens/usageHelpers";
 import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -250,6 +252,9 @@ export async function runMemoryIntuition(args: {
   }, MEMORY_INTUITION_TIMEOUT_MS);
   const signal = controller.signal;
   let ownedModel: LanguageModel | undefined;
+  let completedUsage: LanguageModelV2Usage | undefined;
+  let completedMetadata: Record<string, unknown> | undefined;
+  let usageClosed = false;
   try {
     validateBudgets();
     assert(args.cue.trim().length > 0, "intuition requires a non-empty cue");
@@ -431,8 +436,17 @@ export async function runMemoryIntuition(args: {
       maxOutputTokens: MEMORY_INTUITION_MAX_OUTPUT_TOKENS,
       maxRetries: 0,
       abortSignal: signal,
-      onStepFinish: () => {
-        if (!signal.aborted) stats.steps++;
+      onStepFinish: (step) => {
+        if (usageClosed) return;
+        stats.steps++;
+        // The SDK also finishes failed steps with unknown usage; do not invent zero spend.
+        if (step.usage.inputTokens == null && step.usage.outputTokens == null) return;
+        // Finished provider steps are billed even if a later step fails or aborts.
+        completedUsage = addUsage(completedUsage, normalizeUsage(step.usage));
+        completedMetadata = accumulateProviderMetadata(
+          completedMetadata,
+          withCacheWriteMetadata(step.providerMetadata, step.usage)
+        );
       },
       onError: ({ error }) => {
         errors.push(getErrorMessage(error));
@@ -457,18 +471,6 @@ export async function runMemoryIntuition(args: {
             entries: selection.entries,
             readFile,
           });
-    // Preserve a valid report even when provider usage or the accounting callback fails/hangs.
-    if (!signal.aborted && errors.length === 0 && args.recordUsage) {
-      try {
-        const usage = await untilAborted(signal, () => stream.usage);
-        const steps = await untilAborted(signal, () => stream.steps);
-        await untilAborted(signal, () =>
-          args.recordUsage!(normalizeUsage(usage), accumulateStepsProviderMetadata(steps))
-        );
-      } catch {
-        /* Accounting is best-effort, not evidence. */
-      }
-    }
     if (classified) return { kind: "report", ...classified, stats };
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
     return { kind: "no_report", stats };
@@ -477,6 +479,19 @@ export async function runMemoryIntuition(args: {
       ? { kind: "no_report", stats }
       : { kind: "error", message: getErrorMessage(error), stats };
   } finally {
+    usageClosed = true;
+    if (completedUsage && args.recordUsage) {
+      try {
+        // Invoke before the abort-aware wait: the host captures usage synchronously
+        // even on cancellation. Handle late rejection without waiting past the deadline.
+        const write = Promise.resolve(args.recordUsage(completedUsage, completedMetadata)).catch(
+          () => undefined
+        );
+        await untilAborted(signal, () => write);
+      } catch {
+        /* Accounting is best-effort and must not discard a verified report. */
+      }
+    }
     clearTimeout(timer);
     args.abortSignal?.removeEventListener("abort", abort);
     abort();

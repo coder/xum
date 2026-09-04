@@ -11,6 +11,10 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
+import { createMockORPCClient } from "./mocks/orpc";
+import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSection.agents";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 
 export default {
   ...appMeta,
@@ -152,5 +156,56 @@ export const Phone: AppStory = {
     const card = header.parentElement!;
     await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth + 1);
     await expect(canvas.getByText(RECOGNIZED_INTUITION.memories[0].path)).toBeVisible();
+  },
+};
+
+export const ModelOnlySettings: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), true);
+        return createMockORPCClient({
+          agentDefinitions: FALLBACK_AGENTS,
+          agentAiDefaults: {
+            intuition: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+          },
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await waitFor(() =>
+      expect(
+        canvas.queryByTestId("settings-button") ??
+          canvas.queryByRole("button", { name: "Open sidebar menu" })
+      ).not.toBeNull()
+    );
+    if (!canvas.queryByTestId("settings-button")) {
+      await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
+    }
+    await userEvent.click(await canvas.findByTestId("settings-button"));
+    await userEvent.click((await canvas.findAllByRole("button", { name: "Agents" }))[0]);
+    const name = await canvas.findByText("Intuition", { exact: true });
+    const card = name.closest<HTMLElement>(".rounded-md");
+    if (!card) throw new globalThis.Error("Expected Intuition settings card");
+    card.scrollIntoView({ block: "center" });
+    await expect(within(card).getByRole("combobox")).toBeVisible();
+    await expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
+    await expect(within(card).queryByText("Reasoning")).toBeNull();
+  },
+};
+
+export const ModelOnlySettingsPhone: AppStory = {
+  ...ModelOnlySettings,
+  play: async (context) => {
+    await ModelOnlySettings.play!(context);
+  },
+  decorators: [PhoneDecorator],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
   },
 };

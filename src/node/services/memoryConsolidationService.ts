@@ -165,7 +165,7 @@ export function resolveHeadlessAgentModelString(
 }
 
 /**
- * Resolve a headless agent body: a user override at <muxRoot>/agents/<agentId>.md
+ * Resolve a headless agent definition: a user override at <muxRoot>/agents/<agentId>.md
  * (global agent scope) shadows the built-in definition, like any other agent.
  * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
  * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
@@ -173,12 +173,13 @@ export function resolveHeadlessAgentModelString(
  * agent overrides (which need a live checkout) are intentionally not resolved.
  * Shared with the debug CLI.
  */
-export async function resolveHeadlessAgentBody(
+export async function resolveHeadlessAgentDefinition(
   muxRoot: string,
   agentId: string
-): Promise<string | null> {
+): Promise<ReturnType<typeof parseAgentDefinitionMarkdown> | null> {
   assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
   const overridePath = path.join(muxRoot, "agents", `${agentId}.md`);
+  const builtIn = getBuiltInAgentDefinitions().find((definition) => definition.id === agentId);
   try {
     const content = await fsPromises.readFile(overridePath, "utf-8");
     const parsed = parseAgentDefinitionMarkdown({
@@ -186,10 +187,12 @@ export async function resolveHeadlessAgentBody(
       byteSize: Buffer.byteLength(content, "utf8"),
     });
     const body = parsed.body.trim();
-    if (body.length > 0) return body;
+    if (body.length > 0) return { frontmatter: parsed.frontmatter, body };
     log.warn("[HeadlessAgent] override has an empty body; using built-in", {
       overridePath,
     });
+    // A frontmatter-only override can disable an agent while retaining its built-in body.
+    return builtIn ? { frontmatter: parsed.frontmatter, body: builtIn.body } : null;
   } catch (error) {
     // Missing override is the normal case; anything else (malformed
     // frontmatter, permissions) deserves a warning instead of a silent
@@ -201,8 +204,14 @@ export async function resolveHeadlessAgentBody(
       });
     }
   }
-  const agent = getBuiltInAgentDefinitions().find((definition) => definition.id === agentId);
-  return agent?.body ?? null;
+  return builtIn ?? null;
+}
+
+export async function resolveHeadlessAgentBody(
+  muxRoot: string,
+  agentId: string
+): Promise<string | null> {
+  return (await resolveHeadlessAgentDefinition(muxRoot, agentId))?.body ?? null;
 }
 
 export function resolveDreamModelString(config: Config, workspaceId: string): string {

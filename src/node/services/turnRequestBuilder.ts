@@ -2,7 +2,7 @@ import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
 import {
-  resolveHeadlessAgentBody,
+  resolveHeadlessAgentDefinition,
   resolveHeadlessAgentModelString,
 } from "@/node/services/memoryConsolidationService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -40,7 +40,7 @@ import {
 import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
-import { resolveAgentEnabledOverride } from "@/node/services/agentDefinitions/agentEnablement";
+import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -1456,12 +1456,19 @@ export class TurnRequestBuilder {
     // below so the prompt never advertises an absent tool.
     const memoryToolEligible =
       memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
-    // Agent settings can disable paid headless calls independently of the experiment.
+    // Gate and execute the same global-only definition snapshot: edits during
+    // turn assembly must not swap the body after its enablement was checked.
+    const intuitionDefinition =
+      memoryToolEligible && memoryIntuitionExperimentEnabled && !isSubagentWorkspace
+        ? await resolveHeadlessAgentDefinition(this.dependencies.config.rootDir, "intuition")
+        : null;
     const intuitionToolEligible =
-      memoryToolEligible &&
-      memoryIntuitionExperimentEnabled &&
-      !isSubagentWorkspace &&
-      resolveAgentEnabledOverride(cfg, "intuition") !== false;
+      intuitionDefinition !== null &&
+      !isAgentEffectivelyDisabled({
+        cfg,
+        agentId: "intuition",
+        resolvedFrontmatter: intuitionDefinition.frontmatter,
+      });
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -2013,8 +2020,7 @@ export class TurnRequestBuilder {
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
               usesThisTurn: 0,
               createModel: createToolModel,
-              resolveAgentBody: () =>
-                resolveHeadlessAgentBody(this.dependencies.config.rootDir, "intuition"),
+              resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
               abortSignal: combinedAbortSignal,
             },
           }

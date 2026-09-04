@@ -1626,6 +1626,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       agentEnabled: true,
       eligible: true,
     },
+    ...[
+      { frontmatterDisabled: true, agentEnabled: undefined, eligible: false },
+      { frontmatterDisabled: true, agentEnabled: undefined, emptyBody: true, eligible: false },
+      { frontmatterDisabled: true, agentEnabled: true, eligible: true },
+      { frontmatterDisabled: false, agentEnabled: false, eligible: false },
+    ].map((definition) => ({
+      name: `frontmatter disabled=${definition.frontmatterDisabled}, enabled override=${String(definition.agentEnabled)}, empty body=${"emptyBody" in definition}`,
+      memory: true,
+      intuition: true,
+      child: false,
+      service: true,
+      ...definition,
+    })),
     {
       name: "disabled memory",
       memory: false,
@@ -1685,6 +1698,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         };
         return cfg;
       });
+      const frontmatterDisabled =
+        "frontmatterDisabled" in scenario ? scenario.frontmatterDisabled : undefined;
+      const definitionPath = path.join(xumHome.path, "agents", "intuition.md");
+      if (frontmatterDisabled !== undefined) {
+        await fs.mkdir(path.dirname(definitionPath), { recursive: true });
+        await fs.writeFile(
+          definitionPath,
+          `---\nname: Intuition\ndisabled: ${frontmatterDisabled}\n---\n${"emptyBody" in scenario ? "" : "Pinned global intuition body."}`
+        );
+      }
       const createModel = spyOn(harness.service, "createModel");
       const result = await harness.service.streamMessage({
         messages: [createMuxMessage("user", "user", "hello")],
@@ -1696,7 +1719,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(result.success).toBe(true);
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
       expect(runtime !== undefined).toBe(scenario.eligible);
-      if (runtime) expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
+      if (runtime) {
+        expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
+        if (frontmatterDisabled !== undefined) {
+          await fs.writeFile(
+            definitionPath,
+            "---\nname: Intuition\ndisabled: true\n---\nChanged after gate."
+          );
+          expect(await runtime.resolveAgentBody()).toBe("Pinned global intuition body.");
+        }
+      }
       expect(harness.streamSystemContextIntuitionFlags).toEqual([scenario.eligible]);
       expect(harness.startStreamCalls[0]?.tools?.intuition !== undefined).toBe(scenario.eligible);
       expect(createModel).not.toHaveBeenCalled();

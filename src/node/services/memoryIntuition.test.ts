@@ -538,6 +538,86 @@ describe("runMemoryIntuition", () => {
     });
     expect(result).toMatchObject({ kind: "report", memories: [item("a.md", 0.8, "alpha")] });
   });
+  it.each(["error", "abort", "timeout"])(
+    "accounts completed steps once after a later %s, including cache usage",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha" });
+      const completedSteps = scriptedModel([[read("a.md")], [read("a.md")]]);
+      const controller = new AbortController();
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let canceled!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        canceled = resolve;
+      });
+      let step = 0;
+      const model = new MockLanguageModelV3({
+        doStream: (options) => {
+          if (step++ < 2) return completedSteps.doStream(options);
+          started();
+          if (mode === "error") return Promise.reject(new Error("later step failed"));
+          return Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({ cancel: canceled }),
+          });
+        },
+      });
+      const cleanup = mock(() => undefined);
+      attachLanguageModelCleanup(model, cleanup);
+      // A canceled host may capture usage synchronously but never finish persistence.
+      const recordUsage = mock(
+        (_usage: unknown, _metadata?: Record<string, unknown>): Promise<void> =>
+          mode === "error"
+            ? Promise.resolve()
+            : new Promise(() => {
+                /* stalled telemetry */
+              })
+      );
+      const timer = spyOn(globalThis, "setTimeout");
+      const pending = runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "mock:test",
+        createModel: () => Promise.resolve(pinned(model)),
+        resolveAgentBody: body,
+        abortSignal: controller.signal,
+        recordUsage,
+      });
+      try {
+        await ready;
+        if (mode === "abort") controller.abort();
+        if (mode === "timeout") {
+          const expire = timer.mock.calls.find(
+            ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+          )?.[0];
+          if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+          expire();
+        }
+        expect(await pending).toMatchObject({
+          kind: mode === "error" ? "error" : "no_report",
+          stats: { steps: 2, timedOut: mode === "timeout" },
+        });
+        expect(recordUsage).toHaveBeenCalledTimes(1);
+        expect(recordUsage.mock.calls[0][0]).toMatchObject({
+          inputTokens: 20,
+          outputTokens: 8,
+          totalTokens: 28,
+          cachedInputTokens: 6,
+          reasoningTokens: 2,
+        });
+        expect(recordUsage.mock.calls[0][1]).toMatchObject({
+          anthropic: { cacheCreationInputTokens: 4 },
+        });
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        if (mode !== "error") await closed;
+      } finally {
+        timer.mockRestore();
+        controller.abort();
+      }
+    }
+  );
+
   it("returns an error when a provider disconnects before its report tool executes", async () => {
     using f = await fixture({ "a.md": "alpha" });
     const chunks: LanguageModelV3StreamPart[] = [
@@ -554,13 +634,16 @@ describe("runMemoryIntuition", () => {
     });
     const cleanup = mock(() => undefined);
     attachLanguageModelCleanup(model, cleanup);
+    const recordUsage = mock(() => Promise.resolve());
     const result = await runMemoryIntuition({
       ...f,
       cue: "alpha",
       modelString: "mock:test",
       createModel: () => Promise.resolve(pinned(model)),
       resolveAgentBody: body,
+      recordUsage,
     });
+    expect(recordUsage).not.toHaveBeenCalled();
     expect(result).toMatchObject({ kind: "error", message: "stream disconnected" });
     expect(cleanup).toHaveBeenCalledTimes(1);
   });

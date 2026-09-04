@@ -205,8 +205,11 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
       "openai:gpt-5.6-sol"
     );
-    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-    expect(card.querySelector('[data-component="ProModeToggle"]')).toBeNull();
+    expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
+    expect(within(card).queryByText("Reasoning")).toBeNull();
+    expect(
+      within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
+    ).toBeTruthy();
   });
 
   test("renders a distinct Exec subagent row", async () => {

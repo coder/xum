@@ -308,6 +308,7 @@ interface AiDefaultsControlsProps {
   reasoningModeValue: OpenAIReasoningMode;
   /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
   allowProMode?: boolean;
+  modelOnly?: boolean;
   effectiveModel: string;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -359,41 +360,43 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         ) : null}
       </div>
 
-      <div className="space-y-1">
-        <div className="text-muted text-xs">Reasoning</div>
-        <div className="flex items-center gap-2">
-          {/* Shared composer picker so settings inherit the same features
+      {!props.modelOnly && (
+        <div className="space-y-1">
+          <div className="text-muted text-xs">Reasoning</div>
+          <div className="flex items-center gap-2">
+            {/* Shared composer picker so settings inherit the same features
               (route-aware Pro mode, provider Fast mode) as the chat input. */}
-          <ThinkingSelectorControl
-            modelString={props.effectiveModel}
-            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-            reasoningMode={props.reasoningModeValue}
-            onReasoningModeChange={props.onReasoningModeChange}
-            allowProMode={props.allowProMode}
-            variant="box"
-            inheritOption={{
-              label: inheritLabel,
-              selected: props.thinkingValue === INHERIT,
-              onSelect: () => props.onThinkingChange(INHERIT),
-            }}
-          />
-          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-9 px-2"
-              onClick={() => props.onThinkingChange(INHERIT)}
-            >
-              {resetThinkingLabel}
-            </Button>
+            <ThinkingSelectorControl
+              modelString={props.effectiveModel}
+              thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+              onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+              reasoningMode={props.reasoningModeValue}
+              onReasoningModeChange={props.onReasoningModeChange}
+              allowProMode={props.allowProMode}
+              variant="box"
+              inheritOption={{
+                label: inheritLabel,
+                selected: props.thinkingValue === INHERIT,
+                onSelect: () => props.onThinkingChange(INHERIT),
+              }}
+            />
+            {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-9 px-2"
+                onClick={() => props.onThinkingChange(INHERIT)}
+              >
+                {resetThinkingLabel}
+              </Button>
+            ) : null}
+          </div>
+          {props.thinkingValue === INHERIT && props.inheritedThinkingDescription ? (
+            <div className="text-muted text-xs">{props.inheritedThinkingDescription}</div>
           ) : null}
         </div>
-        {props.thinkingValue === INHERIT && props.inheritedThinkingDescription ? (
-          <div className="text-muted text-xs">{props.inheritedThinkingDescription}</div>
-        ) : null}
-      </div>
+      )}
     </div>
   );
 }
@@ -1054,6 +1057,8 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          // Intuition is model-only; persisted thinking values never affect its requests.
+          modelOnly={agent.id === "intuition"}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
