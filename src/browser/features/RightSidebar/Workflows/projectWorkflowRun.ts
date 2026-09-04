@@ -96,6 +96,7 @@ export interface WorkflowArgEntry {
   /** null for a single positional/primitive arg with no name. */
   key: string | null;
   value: string;
+  stages?: Array<{ name: string; role?: string; brief?: string }>;
 }
 
 export interface WorkflowRunView {
@@ -149,12 +150,42 @@ export function stringifyWorkflowArgValue(value: unknown): string {
   }
 }
 
+function derivePlannedStages(value: unknown): WorkflowArgEntry["stages"] {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const items: unknown[] = value;
+  const stages: NonNullable<WorkflowArgEntry["stages"]> = [];
+  for (const item of items) {
+    if (
+      item == null ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      !("name" in item) ||
+      typeof item.name !== "string" ||
+      item.name.trim().length === 0
+    ) {
+      return undefined;
+    }
+    const role = "role" in item ? item.role : undefined;
+    const brief = "brief" in item ? item.brief : undefined;
+    if (
+      (role !== undefined && typeof role !== "string") ||
+      (brief !== undefined && typeof brief !== "string")
+    ) {
+      return undefined;
+    }
+    stages.push({ name: item.name, role, brief });
+  }
+  return stages;
+}
+
 function deriveArgEntries(args: unknown): WorkflowArgEntry[] {
   if (args != null && typeof args === "object" && !Array.isArray(args)) {
-    return Object.entries(args as Record<string, unknown>).map(([key, value]) => ({
-      key,
-      value: stringifyWorkflowArgValue(value),
-    }));
+    return Object.entries(args as Record<string, unknown>).map(([key, value]) => {
+      const entry: WorkflowArgEntry = { key, value: stringifyWorkflowArgValue(value) };
+      const stages = key === "stages" ? derivePlannedStages(value) : undefined;
+      if (stages != null) entry.stages = stages;
+      return entry;
+    });
   }
   const value = stringifyWorkflowArgValue(args);
   return value.length > 0 ? [{ key: null, value }] : [];
