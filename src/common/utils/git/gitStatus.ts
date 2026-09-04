@@ -123,12 +123,7 @@ echo "$OUTGOING_STATS $INCOMING_STATS"
 }
 
 /**
- * Bash script to get git status for a workspace (auto-detects primary branch).
- */
-export const GIT_STATUS_SCRIPT = generateGitStatusScript();
-
-/**
- * Parse the output from GIT_STATUS_SCRIPT.
+ * Parse the output of the script produced by generateGitStatusScript.
  * Frontend-safe parsing function.
  */
 export interface ParsedGitStatusOutput {

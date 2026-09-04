@@ -3528,10 +3528,6 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
 
 export type ToolName = keyof typeof TOOL_DEFINITIONS;
 
-export type BridgeableToolName = {
-  [K in ToolName]: (typeof TOOL_DEFINITIONS)[K] extends { resultSchema: z.ZodType } ? K : never;
-}[ToolName];
-
 export function getToolResultSchema(toolName: string): z.ZodType | undefined {
   if (!Object.hasOwn(TOOL_DEFINITIONS, toolName)) return undefined;
   const definition = TOOL_DEFINITIONS[toolName as ToolName];

@@ -367,12 +367,6 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   }),
 });
 
-export const PostCompactionStateSchema = z.object({
-  planPath: z.string().nullable(),
-  trackedFilePaths: z.array(z.string()),
-  excludedItems: z.array(z.string()),
-});
-
 export const GitStatusSchema = z.object({
   /** Current HEAD branch name (empty string if detached HEAD or not a git repo) */
   branch: z.string(),

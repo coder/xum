@@ -1,25 +1,7 @@
 import type { WorkflowArgSummary, WorkflowMetadata } from "@/common/types/workflow";
 import { WorkflowArgSummarySchema } from "@/common/orpc/schemas";
-import assert from "@/common/utils/assert";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { parseWorkflowMetadataDescription } from "./workflowDescription";
 import { parseStaticWorkflowMetadataLiteral } from "./staticWorkflowMetadata";
-
-export interface WorkflowSourceStats {
-  chars: number;
-  lines: number;
-}
-
-export interface WorkflowMetadataSummary {
-  metadata: WorkflowMetadata;
-  args?: WorkflowArgSummary[];
-  sourceStats: WorkflowSourceStats;
-}
-
-export interface WorkflowSourceSummary {
-  description: string | null;
-  metadataSummary: WorkflowMetadataSummary | null;
-}
 
 export function parseWorkflowMetadata(source: string): WorkflowMetadata | null {
   let rawMetadata: unknown;
@@ -32,29 +14,6 @@ export function parseWorkflowMetadata(source: string): WorkflowMetadata | null {
     return null;
   }
   return rawMetadata;
-}
-
-export function summarizeWorkflowSource(
-  source: string,
-  fallbackDescription?: string
-): WorkflowSourceSummary {
-  assert(
-    fallbackDescription == null || fallbackDescription.trim().length > 0,
-    "Workflow metadata fallback description must be non-empty when provided"
-  );
-  const parsedMetadata = parseWorkflowMetadata(source);
-  const metadataDescription =
-    parsedMetadata == null ? null : parseWorkflowMetadataDescription(parsedMetadata);
-  const description = metadataDescription ?? fallbackDescription ?? null;
-  const metadata =
-    description == null
-      ? null
-      : metadataForDescription(parsedMetadata, description, metadataDescription != null);
-
-  return {
-    description,
-    metadataSummary: metadata == null ? null : metadataSummaryForSource(source, metadata),
-  };
 }
 
 export function summarizeWorkflowArgs(
@@ -74,36 +33,6 @@ export function summarizeWorkflowArgs(
     .map(([name, rawProperty]) => summarizeWorkflowArg(name, rawProperty, required))
     .filter((summary): summary is WorkflowArgSummary => summary != null);
   return summaries.length > 0 ? summaries : undefined;
-}
-
-function metadataForDescription(
-  parsedMetadata: WorkflowMetadata | null,
-  description: string,
-  metadataHasDescription: boolean
-): WorkflowMetadata {
-  if (parsedMetadata != null) {
-    return !metadataHasDescription ? { ...parsedMetadata, description } : parsedMetadata;
-  }
-  return { description };
-}
-
-function metadataSummaryForSource(
-  source: string,
-  metadata: WorkflowMetadata
-): WorkflowMetadataSummary {
-  const args = summarizeWorkflowArgs(metadata);
-  return {
-    metadata,
-    ...(args != null ? { args } : {}),
-    sourceStats: workflowSourceStats(source),
-  };
-}
-
-function workflowSourceStats(source: string): WorkflowSourceStats {
-  return {
-    chars: source.length,
-    lines: source.length === 0 ? 0 : source.split(/\r\n|\r|\n/u).length,
-  };
 }
 
 function summarizeWorkflowArg(

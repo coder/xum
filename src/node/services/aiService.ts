@@ -18,7 +18,7 @@ import {
   resolveXumToolScope,
   type StreamMessageOptions,
 } from "./turnRequestBuilder";
-export { prepareProviderRequestMessages, replaceOrAppendMessageById } from "./turnRequestBuilder";
+export { replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";

@@ -211,29 +211,6 @@ export function createSubagentReportMessage(
   );
 }
 
-/** Create a compaction request user message (triggers shimmer effect on streaming response) */
-export function createCompactionRequestMessage(
-  id: string,
-  opts: { historySequence: number; timestamp?: number; rawCommand?: string }
-): ChatMuxMessage {
-  const rawCommand = opts.rawCommand ?? "/compact";
-  return {
-    type: "message",
-    id,
-    role: "user",
-    parts: [{ type: "text", text: rawCommand }],
-    metadata: {
-      historySequence: opts.historySequence,
-      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
-      muxMetadata: {
-        type: "compaction-request",
-        rawCommand,
-        parsed: {},
-      },
-    },
-  };
-}
-
 export function createAssistantMessage(
   id: string,
   text: string,

@@ -127,14 +127,12 @@ export {
   WorkflowMetadataSchema,
   WorkflowScriptScopeSchema,
   WorkflowEventSequenceSchema,
-  WorkflowNameSchema,
   WorkflowResultSchema,
   WorkflowRunEventSchema,
   WorkflowRunIdSchema,
   WorkflowRunParentSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
-  WorkflowRunStatusTransitionSchema,
   WorkflowRunStreamEventSchema,
   WorkflowStepRecordSchema,
   WorkflowStepStatusSchema,
@@ -226,9 +224,7 @@ export {
 // Message schemas
 export {
   BranchListResultSchema,
-  DynamicToolPartAvailableSchema,
   DynamicToolPartPendingSchema,
-  DynamicToolPartRedactedSchema,
   DynamicToolPartSchema,
   FilePartSchema,
   MuxFilePartSchema,
@@ -241,8 +237,6 @@ export type { FilePart, MuxFilePart } from "./schemas/message";
 
 // Stream event schemas
 export {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
@@ -263,7 +257,6 @@ export {
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,

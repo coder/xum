@@ -64,7 +64,6 @@ export const CODER_GATEWAY_PROVIDER_TYPES = [
   "bedrock",
   "copilot",
 ] as const;
-export type CoderGatewayProviderType = (typeof CODER_GATEWAY_PROVIDER_TYPES)[number];
 
 /** A configured AI Gateway provider instance discovered from the deployment. */
 export interface CoderGatewayProvider {

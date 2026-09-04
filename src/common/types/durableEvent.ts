@@ -167,7 +167,6 @@ export const DurableEventSchema = z.discriminatedUnion("kind", [
 ]);
 
 export type DurableEvent = z.infer<typeof DurableEventSchema>;
-export type DurableEventKind = DurableEvent["kind"];
 
 /** Omit that distributes over union members, preserving the discriminant pairing. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
