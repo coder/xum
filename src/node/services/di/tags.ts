@@ -35,6 +35,7 @@ import type { CoderService } from "@/node/services/coderService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
+import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -152,6 +153,11 @@ export class MemoryConsolidation extends Context.Service<
   MemoryConsolidation,
   MemoryConsolidationService
 >()("xum/MemoryConsolidation") {}
+/** Shared input gates are available before task/workspace construction (no desktop-session dependency). */
+export class DesktopInputCoordinatorTag extends Context.Service<
+  DesktopInputCoordinatorTag,
+  DesktopInputCoordinator
+>()("xum/DesktopInputCoordinator") {}
 /** Terminal attention records; built by the core graph for Task/TurnManager (not a `CoreServices` field). */
 export class TerminalAttentionStoreTag extends Context.Service<
   TerminalAttentionStoreTag,
@@ -318,6 +324,7 @@ export type CoreTags =
   | Memory
   | MemoryMeta
   | MemoryConsolidation
+  | DesktopInputCoordinatorTag
   | TerminalAttentionStoreTag
   | TurnRequestBuilderBindingsTag;
 

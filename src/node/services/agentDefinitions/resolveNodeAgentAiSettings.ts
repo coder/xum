@@ -50,6 +50,7 @@ export interface ResolveNodeAgentAiSettingsParams {
     reasoningMode?: OpenAIReasoningMode;
   };
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
+  parentWorkspaceExecSettings?: AgentAiSettingsLayerValues;
   parentRuntime?: AgentAiSettingsLayerValues;
   fallbacks?: readonly AgentAiSettingsLayerValues[];
   defaultModel?: string;
@@ -177,6 +178,7 @@ export async function resolveNodeAgentAiSettings(
     agentAiDefaults: params.cfg.agentAiDefaults,
     targetDefinitionAiDefaults,
     ancestors,
+    parentWorkspaceExecSettings: params.parentWorkspaceExecSettings,
     parentRuntime: params.parentRuntime,
     fallbacks: params.fallbacks,
     defaultModel: params.defaultModel,

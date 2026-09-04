@@ -67,6 +67,7 @@ import {
   CopilotOauth,
   DesktopBridgeServerTag,
   DesktopSessionManagerTag,
+  DesktopInputCoordinatorTag,
   DesktopTokenManagerTag,
   DevTools,
   Editor,
@@ -286,10 +287,11 @@ export const BrowserLive: Layer.Layer<BrowserTags, never, ConfigTag> = Layer.eff
 export const DesktopBridgeLive: Layer.Layer<
   DesktopBridgeTags,
   never,
-  ConfigTag | Experiments | Workspace
+  ConfigTag | Experiments | Workspace | DesktopInputCoordinatorTag
 > = Layer.effectContext(
   Effect.gen(function* () {
     const desktopSessionManager = new DesktopSessionManager({
+      inputCoordinator: yield* DesktopInputCoordinatorTag,
       config: yield* ConfigTag,
       experimentsService: yield* Experiments,
       workspaceService: yield* Workspace,

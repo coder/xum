@@ -30,3 +30,25 @@ export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;
  * inside the same 5 s quit budgets.
  */
 export const STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS = 500;
+
+/**
+ * Outer budget the `xum server` and ACP roots give the whole
+ * `ServiceContainer.dispose()` — the SIGTERM cleanup and the dispose after a
+ * failed startup; `desktop/main.ts` races its before-quit dispose against the
+ * same 5 s. The bounded steps above are sized to fit inside it.
+ */
+export const SERVICE_TEARDOWN_BUDGET_MS = 5 * 1000;
+
+/**
+ * Bounds each hard startup step of `ServiceContainer.initializeCore()` on the app
+ * runtime's clock. A step that has not settled by then fails startup with a
+ * `StartupStepTimeoutError` through the same exit path as a throwing step
+ * (desktop "Startup Failed" dialog, `xum server`/ACP log-and-exit after the
+ * bounded `dispose()`), instead of pinning the splash screen or the listener
+ * bind forever. Deliberately generous — a false timeout turns a slow-but-fine
+ * start into a crash: sandbox cold starts measured ≤ 60 ms for the slowest core
+ * step (`taskService.recoverInterruptedTasks`, which scales with the number of
+ * active agent tasks, not with deployment size), so this is ≥ 1000× the observed
+ * maximum and still above the policy service's own 10 s fetch timeout.
+ */
+export const STARTUP_STEP_TIMEOUT_MS = 60 * 1000;

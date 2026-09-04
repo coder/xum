@@ -8,7 +8,9 @@
  * `xum workflow`, via `coreServicesRoot.ts`). It owns the app-lifetime
  * `Scope`, its built `Context<AppTags>` is what oRPC Effect-native handlers
  * receive as `"effect/context"`, and it is the source of the two runtime seams
- * described below. Service classes were not rewritten for this: Layers are
+ * described below. Subscription streams run on this context, so heartbeat
+ * sleeps use the runtime's Clock without inheriting build-fiber artifacts.
+ * Service classes were not rewritten for this: Layers are
  * thin adapters around the existing constructors, and the former composition
  * roots' setter/listener wiring lives in `CoreWiringLive`/`DesktopWiringLive`
  * in the original statement order.
@@ -96,6 +98,32 @@
  *   torn down before step 2 below, and never fork long-lived I/O work through
  *   `EffectRunner` expecting shutdown to await it.
  *
+ * ## Startup (`ServiceContainer.initializeCore()`, Wave 4 PR 3)
+ *
+ * The hard startup steps (`startupCoreSteps`: the initializations request
+ * handling depends on, then agent-task recovery) run as one startup effect on
+ * the runtime — `runtime.managed.runPromise(startupCoreEffect())`, a
+ * root fiber on the built context, not a layer (I1 keeps layer bodies
+ * synchronous, so asynchronous acquisition lives here). Each step is a Promise
+ * thunk in `Effect.tryPromise` with an identity catch, bounded by
+ * `Effect.timeoutOrElse(STARTUP_STEP_TIMEOUT_MS)` on the runtime's `Clock`
+ * (tests inject a `TestClock` beneath the graph and drive the bound
+ * deterministically). Contract: step names/order are the `stepDurationsMs`
+ * keys of the completion log; the first failure or timeout rejects the facade
+ * with the step's own error (identity — v4 `runPromise` rejects with the raw
+ * failure) or a `StartupStepTimeoutError`, later steps do not run, and a
+ * timed-out step keeps running as a plain promise (the timeout interrupts only
+ * the wait; nothing observes the step's result afterwards). Every root
+ * therefore runs the bounded `dispose()` before exiting on a rejected startup
+ * (desktop before-quit race, `cli/server.ts` `main().catch`, ACP
+ * `connectToInProcessServer` catch) so an abandoned step's work is cut off by
+ * the same latches as a quit. Disposing the runtime does not interrupt an
+ * in-flight startup fiber (root fibers are not scope children), matching the
+ * promise chain it replaced. `runStartupHousekeeping()` stays a Promise
+ * pipeline on purpose: its steps are already cancellable through the dispose
+ * abort signal and non-fatal by policy, so a per-step timeout there would be a
+ * policy change, not a lifecycle fix.
+ *
  * ## Shutdown order (`ServiceContainer.dispose()`, one shared teardown behind
  * a latch so concurrent/repeated calls — the desktop's two `before-quit`
  * listeners, tests' dispose-then-shutdown — await the same sequence)
@@ -142,17 +170,27 @@
  *
  * ## Deliberately not done in Phase 11
  *
- * `initialize()` as a Layer/startup effect (would break I1's failure
- * semantics), layer finalizers for the existing `dispose()` steps (I5),
- * `streamBridge` on the runtime, per-service optional tags (optional
- * cross-cutting services stay optional via `CoreOptionsTag`). The streamManager
- * engine core became the `AppFiberScope` occupant in Wave 4 PR 1; the
- * pre-registration stream-start window (`pendingStreamStarts`) stays
+ * Startup as a Layer (would break I1's failure semantics; it became a
+ * runtime-run effect instead, see "Startup"), layer finalizers for the existing
+ * `dispose()` steps (I5), per-service optional
+ * tags (optional cross-cutting services stay optional via `CoreOptionsTag`),
+ * per-step timeouts for `runStartupHousekeeping()` (policy, see "Startup"). The
+ * streamManager engine core became the `AppFiberScope` occupant in Wave 4 PR 1;
+ * the pre-registration stream-start window (`pendingStreamStarts`) stays
  * unsupervised (nothing durable exists for it yet).
  */
 import assert from "@/common/utils/assert";
-import { Context, Duration, Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";
-import type { Layer } from "effect";
+import {
+  Context,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  ManagedRuntime,
+  Scheduler,
+  Scope,
+} from "effect";
 import {
   APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS,
   APP_RUNTIME_DISPOSE_TIMEOUT_MS,
@@ -176,7 +214,13 @@ export interface AppRuntime<R> {
 export function makeAppRuntime<R>(layer: Layer.Layer<R, never, never>): AppRuntime<R> {
   const startedAt = performance.now();
   const managed = ManagedRuntime.make(layer);
-  const context = managed.runSync(Effect.context<R>());
+  // Subscription pulls must not inherit the eager build's scope, memo map or sync scheduler.
+  // These artifacts are not declared app services in R (see the DI contract).
+  const context = Context.omit(
+    Scope.Scope,
+    Layer.CurrentMemoMap,
+    Scheduler.Scheduler
+  )(managed.runSync(Effect.context<R>())) as Context.Context<R>;
   assert(
     managed.cachedContext !== undefined,
     "AppRuntime layer graph must build synchronously (see DI contract in di/appRuntime.ts)"

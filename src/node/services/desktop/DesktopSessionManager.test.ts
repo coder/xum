@@ -1,7 +1,13 @@
 import * as fs from "fs/promises";
+import * as nodeFs from "node:fs";
 import * as os from "os";
 import * as path from "path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import type { Workspace } from "@/common/types/project";
+import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import { PortableDesktopSession } from "./PortableDesktopSession";
+import { DesktopTokenManager } from "./DesktopTokenManager";
+import { getDesktopBootstrap } from "./desktopOperations";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
 import { ExperimentsService } from "@/node/services/experimentsService";
@@ -85,6 +91,44 @@ async function withDesktopManagerHarness(
   const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
   try {
+    await config.editConfig((current) => {
+      current.projects.set("/tmp/project-1", {
+        workspaces: [
+          "platform",
+          "missing-binary",
+          "local",
+          "reuse",
+          "archiving",
+          "dead",
+          "close-one",
+          "close-two",
+          "action",
+        ]
+          .map(
+            (suffix): Workspace => ({
+              id: `workspace-${suffix}`,
+              name: `workspace-${suffix}`,
+              path: `/tmp/project-1/workspace-${suffix}`,
+              runtimeConfig: { type: "local" },
+            })
+          )
+          .concat([
+            {
+              id: "workspace-ssh",
+              name: "workspace-ssh",
+              path: "/tmp/project-1/ssh",
+              runtimeConfig: { type: "ssh", host: "example.com", srcBaseDir: "~/mux" },
+            },
+            {
+              id: "workspace-worktree",
+              name: "workspace-worktree",
+              path: "/tmp/project-1/worktree",
+              runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/worktrees" },
+            },
+          ] as Workspace[]),
+      });
+      return current;
+    });
     await run({ tempDir, config, originalPath });
   } finally {
     process.env.PATH = originalPath;
@@ -293,7 +337,261 @@ function assertPortableDesktopRecordedCommands(
   }
 }
 
+async function registerSharedWorkspaces(config: Config): Promise<void> {
+  await config.editConfig((current) => {
+    const project = current.projects.get("/tmp/project-1");
+    if (!project) throw new Error("Missing test project");
+    project.workspaces.push(
+      { id: "owner", name: "owner-name", path: "/tmp/project-1/owner" },
+      {
+        id: "child",
+        name: "child",
+        path: "/tmp/project-1/child",
+        parentWorkspaceId: "owner",
+        taskDesktopOwnerWorkspaceId: "owner",
+        taskStatus: "running",
+      },
+      {
+        id: "isolated",
+        name: "isolated",
+        path: "/tmp/project-1/isolated",
+        parentWorkspaceId: "owner",
+      }
+    );
+    return current;
+  });
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("DesktopSessionManager", () => {
+  test("shares startup, screenshots, actions and bootstrap while legacy children stay isolated", async () => {
+    await withDesktopManagerHarness(async ({ tempDir, config }) => {
+      if (process.platform === "win32") return;
+      await registerSharedWorkspaces(config);
+      const actionRecordPath = path.join(tempDir, "shared-actions.json");
+      await installPortableDesktopShim({
+        rootDir: tempDir,
+        config: {
+          startupInfo: createStartupInfo({ display: 20, vncPort: 5910, geometry: "1024x768" }),
+          actionRecordPath,
+        },
+      });
+      process.env.PATH = "";
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+      });
+      const tokens = new DesktopTokenManager();
+      const start = spyOn(PortableDesktopSession.prototype, "start");
+      const serverService = {
+        getServerInfo: () => ({
+          baseUrl: "http://127.0.0.1:1234",
+          token: "test",
+          bindHost: "127.0.0.1",
+          port: 1234,
+          networkBaseUrls: [],
+        }),
+      };
+      try {
+        const [parentSession, childSession] = await Promise.all([
+          manager.ensureStarted("owner"),
+          manager.ensureStarted("child"),
+        ]);
+        expect(childSession).toBe(parentSession);
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(manager.has("child")).toBe(false);
+        expect(await manager.screenshot("child")).toEqual(await manager.screenshot("owner"));
+        expect(await manager.action("child", "key_press", { key: "Return" })).toEqual({
+          success: true,
+        });
+        expect(manager.action("owner", "key_press", { key: "Return" })).rejects.toThrow(
+          "controlled by"
+        );
+        const recorded: unknown = JSON.parse(await fs.readFile(actionRecordPath, "utf8"));
+        assertPortableDesktopRecordedCommands(recorded);
+        expect(recorded.length).toBe(1);
+        expect(recorded[0]?.stateFile).toContain("owner");
+        await manager.close("child");
+        expect(parentSession.isAlive()).toBe(true);
+
+        const isolated = await manager.ensureStarted("isolated");
+        expect(isolated).not.toBe(parentSession);
+        expect(start).toHaveBeenCalledTimes(2);
+        const bootstrap = await getDesktopBootstrap(
+          { desktopSessionManager: manager, desktopTokenManager: tokens, serverService },
+          "child"
+        );
+        expect(bootstrap.capability.available).toBe(true);
+        if (!bootstrap.capability.available || !bootstrap.token)
+          throw new Error("Expected bootstrap");
+        expect(bootstrap.capability.sharedDesktop).toEqual({
+          ownerWorkspaceId: "owner",
+          ownerName: "owner-name",
+        });
+        const ownerSessionId = parentSession.getSessionInfo().sessionId;
+        if (!ownerSessionId) throw new Error("Expected owner session ID");
+        expect(tokens.validate(bootstrap.token)).toEqual({
+          workspaceId: "child",
+          sessionId: ownerSessionId,
+        });
+        expect(tokens.validate(bootstrap.token)).toBeNull();
+        expect(manager.getLiveSessionConnection("child")).toEqual(
+          manager.getLiveSessionConnection("owner")
+        );
+        expect(manager.getLiveSessionConnection("child")?.ownerWorkspaceId).toBe("owner");
+
+        await config.editConfig((current) => {
+          const child = current.projects
+            .get("/tmp/project-1")
+            ?.workspaces.find((entry) => entry.id === "child");
+          if (!child) throw new Error("Missing child");
+          child.archivedAt = "2026-09-01T00:00:00Z";
+          return current;
+        });
+        expect(manager.getLiveSessionConnection("child")).toBeNull();
+        expect(manager.getLiveSessionConnection("owner")).not.toBeNull();
+        expect(await manager.getCapability("child")).toEqual({
+          available: false,
+          reason: "startup_failed",
+        });
+      } finally {
+        start.mockRestore();
+        tokens.dispose();
+        await manager.closeAll();
+      }
+    });
+  });
+
+  for (const archivedId of ["owner", "child"]) {
+    test(`rechecks ${archivedId} after a shared startup without leaking or closing another owner's session`, async () => {
+      await withDesktopManagerHarness(async ({ tempDir, config }) => {
+        if (process.platform === "win32") return;
+        await registerSharedWorkspaces(config);
+        await installPortableDesktopShim({
+          rootDir: tempDir,
+          config: {
+            startupInfo: createStartupInfo({ display: 21, vncPort: 5911, geometry: "1024x768" }),
+          },
+        });
+        process.env.PATH = "";
+        const manager = new DesktopSessionManager({
+          config,
+          experimentsService: createExperimentsService(true),
+          workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+        });
+        const started = deferred();
+        const release = deferred();
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- call below supplies the session under test.
+        const originalStart = PortableDesktopSession.prototype.start;
+        const start = spyOn(PortableDesktopSession.prototype, "start").mockImplementation(
+          async function (this: PortableDesktopSession) {
+            await originalStart.call(this);
+            started.resolve();
+            await release.promise;
+          }
+        );
+        const startup = manager.ensureStarted("child").catch((error: unknown) => error);
+        try {
+          await started.promise;
+          expect(manager.has("owner")).toBe(true);
+          expect(manager.has("child")).toBe(false);
+          await config.editConfig((current) => {
+            const entry = current.projects
+              .get("/tmp/project-1")
+              ?.workspaces.find((entry) => entry.id === archivedId);
+            if (!entry) throw new Error("Missing workspace");
+            entry.archivedAt = "2026-09-01T00:00:00Z";
+            return current;
+          });
+          release.resolve();
+          expect(String(await startup)).toContain("archived");
+          expect(manager.has("owner")).toBe(archivedId !== "owner");
+          expect(manager.getLiveSessionConnection("child")).toBeNull();
+          if (archivedId === "owner") {
+            expect(
+              await fs.readdir(
+                path.join(tempDir, "cache", DESKTOP_DEFAULTS.CACHE_DIR_NAME, "sessions")
+              )
+            ).toEqual([]);
+          }
+        } finally {
+          release.resolve();
+          await startup;
+          start.mockRestore();
+          await manager.closeAll();
+        }
+      });
+    });
+  }
+
+  test("rejects requester and owner archive guards before shared startup", async () => {
+    await withDesktopManagerHarness(async ({ config }) => {
+      await registerSharedWorkspaces(config);
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+      });
+      for (const id of ["owner", "child"]) {
+        manager.setWorkspaceArchiveGuard((candidate) => candidate === id);
+        expect(manager.ensureStarted("child")).rejects.toThrow("being archived");
+        expect(manager.has("owner")).toBe(false);
+      }
+    });
+  });
+
+  for (const event of ["error", "close"] as const) {
+    test(`config watcher ${event} fails closed once and explicit disposal does not`, async () => {
+      await withDesktopManagerHarness(({ config, tempDir }) => {
+        const manager = new DesktopSessionManager({
+          config,
+          experimentsService: createExperimentsService(true),
+          workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+        });
+        const watcher = nodeFs.watch(tempDir, { persistent: false });
+        const watch = spyOn(nodeFs, "watch").mockReturnValue(watcher);
+        const failures: unknown[] = [];
+        const stop = manager.watchWorkspaceConfig(
+          () => undefined,
+          (error) => failures.push(error)
+        );
+        try {
+          watcher.emit(event, new Error("watch lost"));
+          expect(failures).toHaveLength(1);
+          stop();
+          expect(failures).toHaveLength(1);
+        } finally {
+          stop();
+          watch.mockRestore();
+        }
+
+        const cleanWatch = nodeFs.watch(tempDir, { persistent: false });
+        const cleanSpy = spyOn(nodeFs, "watch").mockReturnValue(cleanWatch);
+        try {
+          const dispose = manager.watchWorkspaceConfig(
+            () => undefined,
+            (error) => failures.push(error)
+          );
+          dispose();
+          cleanWatch.emit("close");
+          expect(failures).toHaveLength(1);
+        } finally {
+          cleanWatch.close();
+          cleanSpy.mockRestore();
+        }
+        return Promise.resolve();
+      });
+    });
+  }
+
   test("reports machine-level prereqs without consulting workspace metadata when the binary is missing", async () => {
     await withDesktopManagerHarness(async ({ config }) => {
       process.env.PATH = "";

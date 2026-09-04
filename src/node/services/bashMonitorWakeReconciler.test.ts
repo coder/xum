@@ -115,6 +115,8 @@ describe("BashMonitorWakeReconciler", () => {
   });
 
   afterEach(async () => {
+    // Accepted wakes schedule another pass; stop it before the next test reuses the fixtures.
+    await reconciler.dispose(OWNER);
     await fsPromises.rm(root, { recursive: true, force: true });
   });
 

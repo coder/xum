@@ -32,14 +32,17 @@ function isEmptyProfile(profile: AgentAiSubagentProfile): boolean {
  * Drops delegated fields equal to the base profile: the delegated profile is a
  * sparse diff, so equal values must fall through to the base at read time
  * instead of freezing a copy that a later base edit would silently miss.
+ * Explicit canonical Exec fields are exempt: absence inherits from the calling
+ * chat before the global profile. Legacy-only mirrors retain their old cleanup.
  */
 function pruneSubagentProfile(
   profile: AgentAiSubagentProfile,
-  base: AgentAiDefaultsEntry
+  base: AgentAiDefaultsEntry,
+  explicitFields?: AgentAiSubagentProfile
 ): AgentAiSubagentProfile | undefined {
   const pruned: AgentAiSubagentProfile = { ...profile };
   for (const field of SUBAGENT_PROFILE_FIELDS) {
-    if (pruned[field] !== undefined && pruned[field] === base[field]) {
+    if (explicitFields?.[field] === undefined && pruned[field] === base[field]) {
       delete pruned[field];
     }
   }
@@ -67,9 +70,11 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
     const normalized: AgentAiDefaultsEntry = { ...base, enabled, advisorEnabled };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
+      const profile = normalizeProfileFields(entry.subagent as Record<string, unknown>);
       const subagent = pruneSubagentProfile(
-        normalizeProfileFields(entry.subagent as Record<string, unknown>),
-        normalized
+        profile,
+        normalized,
+        agentId === "exec" ? profile : undefined
       );
       if (subagent) {
         normalized.subagent = subagent;
@@ -132,7 +137,11 @@ export function mergeLegacySubagentAiDefaults(
     merged.modelString ??= legacyEntry.modelString;
     merged.thinkingLevel ??= legacyEntry.thinkingLevel;
     merged.reasoningMode ??= legacyEntry.reasoningMode;
-    const pruned = pruneSubagentProfile(merged, base);
+    const pruned = pruneSubagentProfile(
+      merged,
+      base,
+      agentId === "exec" ? base.subagent : undefined
+    );
     if (pruned) {
       base.subagent = pruned;
     } else {
