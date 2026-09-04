@@ -21,7 +21,7 @@ export function installCommand(
   const spec = `@coder/xum@${version}`;
   const flags = {
     bun: ["add", "--ignore-scripts", "--exact"],
-    npm: ["install", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts"],
+    npm: ["install", "--no-global", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts"],
     pnpm: ["add", "--ignore-scripts"],
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
@@ -40,7 +40,8 @@ export async function verifyStagedPackage(
     throw new Error("Staged package version does not match the requested update");
   const entry = path.join(packageDir, "dist/cli/index.js");
   if (!(await fs.stat(entry)).isFile()) throw new Error("Staged CLI entry is not a file");
-  using smoke = execFileAsync(process.execPath, [entry, "--version"], {
+  // Parse-only: nothing from the registry runs until the operator activates it.
+  using smoke = execFileAsync(process.execPath, ["--check", entry], {
     timeoutMs: SERVER_UPDATE_SMOKE_TIMEOUT_MS,
     signal,
   });

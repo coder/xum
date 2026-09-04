@@ -109,11 +109,15 @@ describe("server install layout", () => {
     expect(
       resolveInstallLayout({ XUM_SERVER_SUPERVISED: "1" }, ["node", layout.launcher]).supported
     ).toBe(true);
-    const other = await writePackage(path.join(root, "other"), "2.0.0");
-    await fs.writeFile(path.join(root, "other/bun.lock"), "");
-    expect(resolveInstallLayout(env, ["node", other.bin]).supported).toBe(false);
-    // A declared launcher does not excuse starting the entry file directly.
+    // A declared launcher does not excuse starting the entry file directly, and it must be the
+    // symlink the process was started through (the one the supervisor relaunches).
     expect(resolveInstallLayout(env, ["node", layout.entry]).supported).toBe(false);
+    const twin = path.join(root, "twin-mux");
+    await fs.symlink(await fs.readlink(layout.launcher), twin);
+    expect(resolveInstallLayout(env, ["node", twin]).supported).toBe(false);
+    expect(resolveInstallLayout({ RESTART_ON_KILL_VALUE: "true" }, ["node", twin]).supported).toBe(
+      true
+    );
   });
   test("honors canonical environment values and registry precedence", async () => {
     const { env, argv, layout } = await fixture();
@@ -196,7 +200,7 @@ describe("staging and activation", () => {
   test("verification rejects mismatched versions, missing entrypoints, and failing smoke runs", async () => {
     const { layout } = await fixture();
     await expectFailure(() => verifyStagedPackage(layout.workdir, "9.0.0"));
-    await fs.writeFile(layout.entry, "process.exit(1)");
+    await fs.writeFile(layout.entry, "this is not javascript (");
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
     await fs.unlink(layout.entry);
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));

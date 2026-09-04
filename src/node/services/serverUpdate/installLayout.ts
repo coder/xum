@@ -81,15 +81,15 @@ export function resolveInstallLayout(
     }
     const running = argv[1];
     if (!running) throw new Error("Cannot identify the server launcher");
-    // The supervisor relaunches whatever path it started; a direct entry path would keep running
-    // the old version after the launcher symlink is re-pointed.
-    if (!lstatSync(path.resolve(running)).isSymbolicLink())
+    // The supervisor relaunches argv[1], so that symlink is the one to re-point: a direct entry
+    // path would keep running the old version, and a declared binary may only confirm the path.
+    const launcher = path.resolve(running);
+    if (!lstatSync(launcher).isSymbolicLink())
       throw new Error("Server must be started through its launcher symlink");
-    const launcher = path.resolve(resolveXumEnvironmentValue("BINARY", env) ?? running);
-    if (!lstatSync(launcher).isSymbolicLink()) throw new Error("Server launcher must be a symlink");
-    const entry = resolveCliEntry(running);
-    if (resolveCliEntry(launcher) !== entry)
-      throw new Error("Server launcher does not point to the running entry");
+    const declared = resolveXumEnvironmentValue("BINARY", env);
+    if (declared !== undefined && path.resolve(declared) !== launcher)
+      throw new Error("Server launcher does not match the declared binary");
+    const entry = resolveCliEntry(launcher);
     const packageDir = path.dirname(path.dirname(path.dirname(entry)));
     if (entry !== path.join(packageDir, "dist", "cli", "index.js"))
       throw new Error("Unsupported server entry layout");

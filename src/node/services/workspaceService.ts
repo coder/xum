@@ -3973,8 +3973,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       {
         kind: "workspace-lifecycle",
         count: new Set([
+          ...this.renamingWorkspaces,
           ...this.removingWorkspaces,
           ...this.archivingWorkspaces,
+          ...this.contextMutationWorkspaces,
           ...this.preflightForkCounts.keys(),
           ...this.preflightStagingCounts.keys(),
         ]).size,
@@ -6936,6 +6938,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     try {
+      if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot rename workspace while AI stream is active. Please wait for the stream to complete."

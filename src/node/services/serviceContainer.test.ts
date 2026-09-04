@@ -207,6 +207,7 @@ describe("ServiceContainer", () => {
       initAbortControllers: Map<string, AbortController>;
       removingWorkspaces: Set<string>;
       archivingWorkspaces: Set<string>;
+      renamingWorkspaces: Set<string>;
     };
     try {
       streams.workspaceStreams.set("streaming", {});
@@ -216,6 +217,7 @@ describe("ServiceContainer", () => {
       workspace.removingWorkspaces.add("removing");
       workspace.archivingWorkspaces.add("archiving");
       workspace.archivingWorkspaces.add("removing");
+      workspace.renamingWorkspaces.add("renaming");
       terminals.pendingSessionCreations.set("terminal-starting", 2);
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
@@ -225,7 +227,7 @@ describe("ServiceContainer", () => {
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
         { kind: "workspace-inits", count: 2 },
-        { kind: "workspace-lifecycle", count: 2 },
+        { kind: "workspace-lifecycle", count: 3 },
         { kind: "background-processes", count: 3 },
         { kind: "active-streams", count: 1 },
         { kind: "terminals", count: 2 },
@@ -240,6 +242,7 @@ describe("ServiceContainer", () => {
       workspace.initAbortControllers.clear();
       workspace.removingWorkspaces.clear();
       workspace.archivingWorkspaces.clear();
+      workspace.renamingWorkspaces.clear();
     }
     expect(services.collectRestartBlockers()).toEqual([]);
   });

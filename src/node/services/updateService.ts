@@ -131,11 +131,18 @@ export class UpdateService {
   async setChannel(channel: UpdateChannel): Promise<void> {
     await this.ready;
     if (this.impl && this.currentStatus.type === "unsupported") return;
-    // Let the implementation reject busy-state changes before persisting the preference.
+    // Let the implementation reject busy-state changes before persisting the preference, and
+    // roll the runtime back if persistence fails so the two never disagree.
+    const previous = this.currentChannel;
     if (this.impl) {
       this.impl.setChannel(channel);
     }
-    await this.config.setUpdateChannel(channel);
+    try {
+      await this.config.setUpdateChannel(channel);
+    } catch (error) {
+      this.impl?.setChannel(previous);
+      throw error;
+    }
     this.currentChannel = channel;
   }
 
