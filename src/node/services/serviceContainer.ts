@@ -425,6 +425,13 @@ export class ServiceContainer {
       }).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
+          // Fatal on purpose — the same exit path a throwing step already takes on every root
+          // (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are the hard steps
+          // request handling depends on (#4058): continuing past a timed-out step would, e.g., let
+          // the server accept task operations while task recovery is still running. The
+          // "startup must never crash the app" rule governs the best-effort work in
+          // runStartupHousekeeping(), which stays non-fatal; this bound only turns an indefinite
+          // hang (splash pinned, listener never bound, no dispose) into the existing failure path.
           orElse: () =>
             Effect.fail(new StartupStepTimeoutError(step.name, STARTUP_STEP_TIMEOUT_MS)),
         }),
