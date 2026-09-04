@@ -4080,6 +4080,9 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
 
+    // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
+    // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
+    let materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
     const materialize = async () => {
       const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
 
@@ -4164,6 +4167,8 @@ export class TaskService implements AgentTaskIntegration {
         inheritedProjects = forkResult.data.projects;
       }
 
+      materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
+
       // Multi-project forks need per-project secrets for each runtime's init hook.
       this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
 
@@ -4240,7 +4245,21 @@ export class TaskService implements AgentTaskIntegration {
     const materialized = await reserveDesktop(materialize).catch((error: unknown) =>
       Err(getErrorMessage(error))
     );
-    if (!materialized.success) return materialized;
+    if (!materialized.success) {
+      if (materializedCheckout != null) {
+        // Runs after the desktop gate released: only the checkout and any persisted entry (which
+        // would otherwise hold the desktop reservation as a running child) need to go.
+        await this.rollbackFailedTaskCreate(
+          materializedCheckout.runtime,
+          parentMeta.projectPath,
+          workspaceName,
+          taskId,
+          { preservePhysicalWorkspace: useSharedWorkspace }
+        );
+        materializedCheckout.initLogger.logComplete(-1);
+      }
+      return materialized;
+    }
     const { initLogger, workspacePath, trunkBranch, forkedRuntimeConfig, runtimeForTaskWorkspace } =
       materialized.data;
 

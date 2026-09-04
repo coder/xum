@@ -15682,6 +15682,78 @@ describe("TaskService", () => {
     expect(workspacePathExists).toBe(false);
   }, 20_000);
 
+  test("rolls back a forked checkout when persistence throws after the fork", async () => {
+    const config = await createTestConfig(rootDir);
+    const childTaskId = "cccccccccc";
+    stubStableIds(config, [childTaskId, "dddddddddd"], childTaskId);
+
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    const parentCreate = await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    expect(parentCreate.success).toBe(true);
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage, discardExtensionMetadataEntry } =
+      createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Deterministic post-fork failure: the transform that registers the child entry throws, so
+    // the checkout already exists on disk while nothing was persisted.
+    const editConfig = config.editConfig.bind(config);
+    const persistSpy = spyOn(config, "editConfig").mockImplementation((transform) =>
+      editConfig((cfg) => {
+        const next = transform(cfg);
+        const registersChild = Array.from(next.projects.values()).some((project) =>
+          project.workspaces.some((workspace) => workspace.id === childTaskId)
+        );
+        if (registersChild) throw new Error("config persistence failed after fork");
+        return next;
+      })
+    );
+    try {
+      const failed = await createAgentTask(taskService, parentId, "Inspect", { desktop: "shared" });
+      expect(failed).toEqual(Err("config persistence failed after fork"));
+    } finally {
+      persistSpy.mockRestore();
+    }
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith(childTaskId);
+    const forkedPath = runtime.getWorkspacePath(projectPath, `agent_explore_${childTaskId}`);
+    expect(existsSync(forkedPath)).toBe(false);
+
+    // The owner's desktop is free again: the reservation never outlived the failed callback.
+    const next = await createAgentTask(taskService, parentId, "Inspect again", {
+      desktop: "shared",
+    });
+    assert(next.success, "Expected the next shared desktop task to be admitted");
+    expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
+      parentId
+    );
+  }, 20_000);
+
   test("failed config deregistration during rollback does not tombstone the task's metadata", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["bbbbbbbbbb"], "bbbbbbbbbb");
