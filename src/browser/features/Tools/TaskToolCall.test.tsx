@@ -825,6 +825,45 @@ describe("TaskSendMessageToolCall", () => {
       workspaceContextMock = null;
     }
   });
+
+  test.each(
+    [
+      "legacy output",
+      42,
+      true,
+      [],
+      { status: "refused", reason: {} },
+      { status: "constructor" },
+    ].map((result) => ({ result }))
+  )("keeps malformed persisted message results renderable: %j", ({ result }) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").className).not.toContain("text-success");
+    fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
+    expect(view.getByText(taskSendMessageArgs.message)).toBeTruthy();
+  });
+
+  test("does not render unvalidated fields carried beside a transport error", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="failed"
+          result={{
+            success: false,
+            error: "Connection lost",
+            status: "refused",
+            reason: {},
+            targetRelation: {},
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Connection lost");
+  });
 });
 
 const taskTerminateArgs = { task_ids: ["wfr_x"] };

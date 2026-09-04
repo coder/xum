@@ -129,4 +129,31 @@ describe("AgentReportToolCall", () => {
     expect(view.queryByText("Draft report")).toBeNull();
     expect(view.getByText("Accepted report")).toBeTruthy();
   });
+
+  test.each(["", "   "])("keeps the report toggle named for a blank title: %j", (title) => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall args={{ title, reportMarkdown: "Findings" }} status="completed" />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("button", { name: /\S/ })).toBeTruthy();
+  });
+
+  test.each(
+    ["legacy output", 42, true, [], { success: false, message: "Missing errors" }].map(
+      (result) => ({ result })
+    )
+  )("keeps malformed persisted report results renderable: %j", ({ result }) => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdown: "Preserved findings" }}
+          result={result}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByText("Preserved findings")).toBeTruthy();
+    expect(view.getByRole("status").className).not.toContain("text-success");
+  });
 });

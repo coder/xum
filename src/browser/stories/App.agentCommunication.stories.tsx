@@ -1,4 +1,4 @@
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
@@ -15,9 +15,9 @@ const REPORT =
 const MESSAGE =
   "Focused follow-up before finalizing: verify the native canvas clipping behavior and the parent popup-blocked failure path.\n\nCheck handshake ordering in src/browser/features/Tools/SubagentTranscriptDialog.tsx and keep the change scoped to the existing behavior.";
 
-function setupCommunicationStory(failed = false) {
+function setupCommunicationStory(failed = false, longMessage = false) {
   // Separate transcript stores so switching stories cannot retain a successful delivery.
-  const workspaceId = failed ? `${WORKSPACE_ID}-failed` : WORKSPACE_ID;
+  const workspaceId = `${WORKSPACE_ID}-${failed ? "failed" : longMessage ? "long" : "sent"}`;
   collapseLeftSidebar();
   collapseRightSidebar();
   updatePersistedState(getAutoExpandPrefsKey(workspaceId), {});
@@ -45,7 +45,14 @@ function setupCommunicationStory(failed = false) {
             toolCallId: "outgoing-message",
             toolName: "task_send_message",
             state: "output-available",
-            input: { task_id: "b3947e259a", message: MESSAGE },
+            input: {
+              task_id: "b3947e259a",
+              message: longMessage
+                ? Array.from({ length: 200 }, (_, index) => `Check ${index + 1}: ${MESSAGE}`).join(
+                    "\n\n"
+                  )
+                : MESSAGE,
+            },
             output: failed
               ? {
                   status: "refused",
@@ -135,4 +142,27 @@ export const DeliveryFailures: AppStory = {
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     await expect(canvas.getAllByRole("alert")).toHaveLength(2);
   },
+};
+
+export const LongMessage: AppStory = {
+  ...Outgoing,
+  render: () => <AppWithMocks setup={() => setupCommunicationStory(false, true)} />,
+  play: async (context) => {
+    await Outgoing.play?.(context);
+    const content = within(context.canvasElement).getByRole("region", { name: "Message content" });
+    await expect(content.scrollHeight).toBeGreaterThan(content.clientHeight);
+    await expect(content.clientHeight).toBeLessThanOrEqual(window.innerHeight * 0.4 + 1);
+    content.focus();
+    await expect(content).toHaveFocus();
+    content.scrollTo({ top: content.scrollHeight });
+    await waitFor(() => expect(content.scrollTop).toBeGreaterThan(0));
+    await expect(content.scrollWidth).toBeLessThanOrEqual(content.clientWidth);
+  },
+};
+
+export const LongMessagePhone: AppStory = {
+  ...LongMessage,
+  globals: Phone.globals,
+  decorators: Phone.decorators,
+  parameters: Phone.parameters,
 };

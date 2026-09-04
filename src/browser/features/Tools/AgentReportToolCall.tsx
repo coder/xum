@@ -1,6 +1,7 @@
 import React from "react";
 
 import type { AgentReportToolArgs, AgentReportToolResult } from "@/common/types/tools";
+import { AgentReportToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 
 import { ErrorBox } from "./Shared/ToolPrimitives";
 import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
@@ -17,7 +18,7 @@ type AgentReportRenderableArgs = AgentReportToolArgs | LegacyAgentReportFileArgs
 
 interface AgentReportToolCallProps {
   args: AgentReportRenderableArgs;
-  result?: AgentReportToolResult;
+  result?: unknown;
   status?: ToolStatus;
 }
 
@@ -35,15 +36,25 @@ function getSubmittedReportMarkdown(
 }
 
 export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = (props) => {
-  const reportMarkdown = getSubmittedReportMarkdown(props.args, props.result);
-  const failedResult = props.result?.success === false ? props.result : null;
+  // Persisted results bypass input-schema validation and may be malformed.
+  const parsed = AgentReportToolResultSchema.safeParse(props.result);
+  const result = isToolErrorResult(props.result)
+    ? props.result
+    : parsed.success
+      ? parsed.data
+      : undefined;
+  const invalidResult = props.result != null && result == null;
+  const reportMarkdown = getSubmittedReportMarkdown(props.args, result);
+  const failedResult = result?.success === false ? result : null;
+  const title = props.args.title?.trim() ?? "";
 
   return (
     <AgentCommunicationCard
       toolName="agent_report"
-      title={props.args.title ?? "Agent update"}
+      title={title.length > 0 ? title : "Agent update"}
       destination="To parent"
-      status={failedResult ? "failed" : (props.status ?? "pending")}
+      status={failedResult || invalidResult ? "failed" : (props.status ?? "pending")}
+      statusLabel={invalidResult ? "Result unavailable" : undefined}
       preview={reportMarkdown}
       initiallyExpanded
       error={

@@ -18,6 +18,7 @@ import {
   type ToolStatus,
 } from "./Shared/toolUtils";
 import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
+import { TaskSendMessageToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 import { useOptionalMessageListContext } from "../Messages/MessageListContext";
 import { useStickyExpand } from "../Messages/useStickyExpand";
@@ -1707,7 +1708,7 @@ const TaskListItem: React.FC<{
 
 interface TaskSendMessageToolCallProps {
   args: TaskSendMessageToolArgs;
-  result?: TaskSendMessageToolSuccessResult | ToolErrorResult;
+  result?: unknown;
   status?: ToolStatus;
 }
 
@@ -1732,12 +1733,15 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
     workspaceContext?.workspaceMetadata,
     props.args.task_id
   );
-  const result = props.result;
-  const toolError = isToolErrorResult(result);
+  // Persisted output is unknown even when the tool arguments have passed validation.
+  const parsed = TaskSendMessageToolResultSchema.safeParse(props.result);
+  const result = parsed.success ? parsed.data : undefined;
+  const toolError = isToolErrorResult(props.result) ? props.result : undefined;
+  const invalidResult = props.result != null && result == null && toolError == null;
   // A finished tool call can still mean delivery was refused or queued, not sent.
-  const delivery = result && !toolError ? MESSAGE_DELIVERY[result.status] : undefined;
+  const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
   const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
-  const error = result && "error" in result ? result.error : undefined;
+  const error = toolError?.error ?? (result && "error" in result ? result.error : undefined);
 
   return (
     <AgentCommunicationCard
@@ -1749,8 +1753,10 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
           <TaskId id={props.args.task_id} className="text-xs opacity-100" />
         </>
       }
-      status={toolError ? "failed" : (delivery?.status ?? props.status ?? "pending")}
-      statusLabel={delivery?.label}
+      status={
+        toolError || invalidResult ? "failed" : (delivery?.status ?? props.status ?? "pending")
+      }
+      statusLabel={invalidResult ? "Result unavailable" : delivery?.label}
       preview={props.args.message}
       initiallyExpanded={false}
       error={
@@ -1760,23 +1766,27 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
               {error}
             </ErrorBox>
           )}
-          {result && "status" in result && result.status === "refused" && (
+          {result?.status === "refused" && (
             <ErrorBox className="mt-2" role="alert">
               {result.reason}
             </ErrorBox>
           )}
-          {result &&
-            "status" in result &&
-            result.status === "rate_limited" &&
-            result.retryAfterMs != null && (
-              <div className="text-warning mt-2 text-xs">
-                Retry in {Math.ceil(result.retryAfterMs / 1000)}s
-              </div>
-            )}
+          {result?.status === "rate_limited" && result.retryAfterMs != null && (
+            <div className="text-warning mt-2 text-xs">
+              Retry in {Math.ceil(result.retryAfterMs / 1000)}s
+            </div>
+          )}
         </>
       }
     >
-      <div className="whitespace-pre-wrap">{props.args.message}</div>
+      <div
+        role="region"
+        aria-label="Message content"
+        tabIndex={0}
+        className="focus-visible:ring-ring max-h-[40vh] overflow-y-auto rounded-sm whitespace-pre-wrap focus-visible:ring-2 focus-visible:outline-none"
+      >
+        {props.args.message}
+      </div>
     </AgentCommunicationCard>
   );
 };
