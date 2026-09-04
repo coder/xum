@@ -2399,25 +2399,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
       readDeliveredWakeRecords: (ownerWorkspaceId) =>
         this.readLastBashMonitorWakeRecords(ownerWorkspaceId),
-      onOutstandingChanged: (ownerWorkspaceId, outstanding) => {
-        // The level drives the same tool-boundary side effects a queued tool-end message
-        // does: long-polling bash reads return early and foreground agent-task waits are
-        // backgrounded so the stream can reach the boundary where it yields to the wake.
-        // The session arbitrates the level against its queue head and fires the yield
-        // edge (onToolEndYieldRequested) when the lever actually becomes effective.
-        const session = this.sessions.get(ownerWorkspaceId);
-        if (session != null) {
-          session.setBashMonitorWakeOutstanding(outstanding);
-        } else if (
-          !outstanding &&
-          // Partial BackgroundProcessManager stubs in tests (see the constructor guards).
-          typeof this.backgroundProcessManager.setMessageQueued === "function"
-        ) {
-          // No session, no queue: the flag can only be a stale mirror (e.g. reconciler
-          // disposal after the session went away), so drop it directly.
-          this.backgroundProcessManager.setMessageQueued(ownerWorkspaceId, false);
-        }
-      },
+      onOutstandingChanged: (ownerWorkspaceId, outstanding) =>
+        this.publishBashMonitorWakeLevel(ownerWorkspaceId, outstanding),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
       this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
@@ -4136,6 +4119,43 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       chat: chatUnsubscribe,
       metadata: metadataUnsubscribe,
     });
+  }
+
+  /**
+   * Reconciler level → session mirror. The level drives the same tool-boundary side effects a
+   * queued tool-end message does: long-polling bash reads return early and foreground
+   * agent-task waits are backgrounded so the stream can reach the boundary where it yields to
+   * the wake. The session arbitrates the level against its queue head and fires the yield edge
+   * (onToolEndYieldRequested) when the lever actually becomes effective.
+   *
+   * Published to the live session, including one still running startup recovery: a recovered
+   * stream must see the level too, or a long-running foreground wait inside it is never
+   * backgrounded and the deferred wake waits for that stream to end on its own.
+   */
+  private publishBashMonitorWakeLevel(ownerWorkspaceId: string, outstanding: boolean): void {
+    const session = this.getLiveSession(ownerWorkspaceId);
+    if (session != null) {
+      session.setBashMonitorWakeOutstanding(outstanding);
+    } else if (
+      !outstanding &&
+      // Partial BackgroundProcessManager stubs in tests (see the constructor guards).
+      typeof this.backgroundProcessManager.setMessageQueued === "function"
+    ) {
+      // No session, no queue: the flag can only be a stale mirror (e.g. reconciler disposal
+      // after the session went away), so drop it directly.
+      this.backgroundProcessManager.setMessageQueued(ownerWorkspaceId, false);
+    }
+  }
+
+  /**
+   * The session currently owning a workspace's runtime state, whether cached or still
+   * transient for startup recovery. Read-only lookups of per-session state (wake level, debt,
+   * stream ledger) must use this rather than `sessions` alone: a recovered turn runs inside the
+   * transient session before it is promoted.
+   */
+  private getLiveSession(workspaceId: string): AgentSession | undefined {
+    const trimmed = workspaceId.trim();
+    return this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
   }
 
   public getOrCreateSession(workspaceId: string): AgentSession {
@@ -12029,15 +12049,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     messageIds: readonly string[]
   ): boolean {
     return (
-      this.sessions
-        .get(workspaceId.trim())
-        ?.hasCorrelatedStreamStartedAfter(correlation, messageIds) === true
+      this.getLiveSession(workspaceId)?.hasCorrelatedStreamStartedAfter(correlation, messageIds) ===
+      true
     );
   }
 
   /** See AgentSession.hasBashMonitorWakeContinuation. */
   hasBashMonitorWakeContinuation(workspaceId: string): boolean {
-    return this.sessions.get(workspaceId.trim())?.hasBashMonitorWakeContinuation() === true;
+    return this.getLiveSession(workspaceId)?.hasBashMonitorWakeContinuation() === true;
   }
 
   /**

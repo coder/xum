@@ -2203,6 +2203,17 @@ export class WorkspaceTurnManager {
             current.status
           );
           this.taskHost.markTaskForegroundRelevant(current.handleId);
+          // The terminal row is the first durable write of a settlement; the phases after it
+          // (mirror, waiters, disposable cleanup) can be skipped by a throw, and this branch is
+          // where the retry lands. Resume the cleanup phase here too — a still-registered
+          // disposable workspace on a terminal record means no settlement reached it (cleanup
+          // either removes the workspace or, when forwarding it, clears the flag).
+          if (
+            current.disposableWorkspace &&
+            (await this.workspaceService.getInfo(current.workspaceId)) != null
+          ) {
+            await this.cleanupDisposableWorkspaceTurn(current);
+          }
           return { pendingNotify: null, winningStatus: current.status };
         }
 

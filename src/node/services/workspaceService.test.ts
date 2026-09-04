@@ -1227,6 +1227,37 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("the wake level reaches a session still running startup recovery", async () => {
+    // Startup recovery runs the recovered turn inside a transient session before promoting
+    // it. A wake published while that turn streams must reach it, or the stream's foreground
+    // waits are never backgrounded and the deferred wake waits for the stream to end.
+    const { service, cleanup } = await createWakeWiringService();
+    const workspaceId = "transient-recovery-wake-owner";
+    const internal = service as unknown as {
+      backgroundProcessManager: { setMessageQueued: ReturnType<typeof mock> };
+      createSession(workspaceId: string): AgentSession;
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+      publishBashMonitorWakeLevel(ownerWorkspaceId: string, outstanding: boolean): void;
+    };
+    const setMessageQueued = internal.backgroundProcessManager.setMessageQueued;
+    const session = internal.createSession(workspaceId);
+    internal.transientStartupRecoverySessions.set(workspaceId, session);
+    try {
+      // The session's lever is the observable: with no queue head the level is effective at
+      // once, so long-polling bash reads return early and foreground waits background.
+      internal.publishBashMonitorWakeLevel(workspaceId, true);
+      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+
+      // Promotion keeps the mirror: it lives on the session, not on the map it sits in.
+      expect(service.getOrCreateSession(workspaceId)).toBe(session);
+      internal.publishBashMonitorWakeLevel(workspaceId, false);
+      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("routes the session's tool-end yield edge to backgroundForegroundWaitsForWorkspace", async () => {
     // Which transitions raise the edge is the session's business
     // (agentSession.queueDispatch.test.ts); the service only routes it.

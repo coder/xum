@@ -422,6 +422,53 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
+  test("a send refused after its on-send compaction row landed rolls that row back", async () => {
+    // The compaction row is the one durable write that precedes the admission gates. A send
+    // whose admission went stale in between (a bash-monitor wake whose monitor was cancelled,
+    // a peer send racing a Stop) is refused without a stream — leaving the row would let
+    // startup recovery resume a compaction whose follow-up nobody accepted.
+    const workspaceId = "ws-auto-compaction-stale-admission-rollback";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, historyService } = await createSessionHarness({
+      workspaceId,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    });
+
+    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: false,
+        usagePercentage: 72,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+
+    const result = await session.sendMessage(
+      "hello",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { admissionStale: () => true }
+    );
+    expect(result.success).toBe(false);
+    expect(streamMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`failed to load history: ${String(historyResult.error)}`);
+    }
+    expect(
+      historyResult.data.some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      )
+    ).toBe(false);
+
+    session.dispose();
+  });
+
   test("uses preferred compaction model for on-send auto-compaction requests", async () => {
     const workspaceId = "ws-auto-compaction-preferred-model";
 

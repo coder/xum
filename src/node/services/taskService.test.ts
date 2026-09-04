@@ -344,6 +344,7 @@ describe("TaskService", () => {
       disposable?: boolean;
       sendMessage?: ReturnType<typeof mock>;
       remove?: ReturnType<typeof mock>;
+      getInfo?: ReturnType<typeof mock>;
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
@@ -24842,6 +24843,67 @@ describe("TaskService", () => {
       const error = await waited;
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toContain("superseded by new input");
+    } finally {
+      mirrorSpy.mockRestore();
+    }
+  });
+
+  test("a void retried after a partially persisted settlement still removes the disposable workspace", async () => {
+    // Same partial settlement as above, for a disposable workspace: the first attempt persists
+    // the terminal handle and throws before cleanup. The retry re-enters the terminal branch,
+    // which must resume the skipped cleanup instead of only repairing waiter/mirror state —
+    // otherwise the checkout leaks with nothing left to own it.
+    const remove = mock(
+      (_workspaceId: string): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const getInfo = mock(
+      (): Promise<{ id: string } | null> => Promise.resolve({ id: "childworkspace" })
+    );
+    const { parentId, taskService } = await startWorkspaceTurnForTest({
+      disposable: true,
+      remove,
+      getInfo,
+    });
+    const manager = workspaceTurnManagerFor(taskService) as unknown as {
+      updateAgentTaskExecutionState: (...args: unknown[]) => Promise<void>;
+    };
+    const mirrorSpy = spyOn(manager, "updateAgentTaskExecutionState").mockImplementationOnce(() =>
+      Promise.reject(new Error("execution state mirror unavailable"))
+    );
+    try {
+      const firstAttempt = await taskService
+        .settleVoidedWorkspaceTurnContinuation(
+          "childworkspace",
+          workspaceTurnMuxMetadata(parentId),
+          "abandoned"
+        )
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(firstAttempt).toBeInstanceOf(Error);
+      expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+        status: "interrupted",
+        disposableWorkspace: true,
+      });
+      expect(remove).not.toHaveBeenCalled();
+
+      await taskService.settleVoidedWorkspaceTurnContinuation(
+        "childworkspace",
+        workspaceTurnMuxMetadata(parentId),
+        "abandoned"
+      );
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove.mock.calls[0]?.[0]).toBe("childworkspace");
+
+      // Once the workspace is gone, later replays into the terminal branch do not retry it.
+      getInfo.mockImplementation(() => Promise.resolve(null));
+      await taskService.settleVoidedWorkspaceTurnContinuation(
+        "childworkspace",
+        workspaceTurnMuxMetadata(parentId),
+        "abandoned"
+      );
+      expect(remove).toHaveBeenCalledTimes(1);
     } finally {
       mirrorSpy.mockRestore();
     }

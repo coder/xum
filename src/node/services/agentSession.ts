@@ -3938,12 +3938,19 @@ export class AgentSession {
     // refuse while sends are in preflight (r42), so rows can no longer land
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
+    //
+    // "Pre-persist" has one exception: the on-send compaction row above is already durable and
+    // carries this send as its follow-up. Refusing without removing it would leave a compaction
+    // request that startup recovery later resumes — for a bash-monitor wake whose lease is
+    // released by this refusal, that resubmits output the reconciler has already re-derived.
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
+      await rollbackPersistedTurnRows();
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     }
-    // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
-    // while streamWithHistory's own latch check keeps its stream from ever running.
+    // A row appended now would read as a dispatched turn on the next startup while
+    // streamWithHistory's own latch check keeps its stream from ever running.
     if (this.shuttingDown) {
+      await rollbackPersistedTurnRows();
       return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
     }
 
