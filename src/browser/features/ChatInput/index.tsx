@@ -2716,9 +2716,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     />
                   </div>
 
+                  {/* Paint the border inside the shared height, including when nested touch targets grow. */}
                   <div
                     className={cn(
-                      "border-border-light flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-0.5",
+                      "ring-border-light flex min-w-0 items-center gap-1.5 rounded-md px-1.5 ring-1 ring-inset",
                       COMPOSER_CONTROL_HEIGHT_CLASS
                     )}
                     data-component="ModelSelectorGroup"
