@@ -444,6 +444,21 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
   return true;
 }
 
+/**
+ * Whether admitted send metadata carries a bash-monitor wake: the wake itself, or an on-send
+ * compaction request whose follow-up is the wake. The compaction row is what the turn shows
+ * (optionsForStream.muxMetadata, the stream's metadata), so the wake identity has to be read
+ * through it (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
+ */
+function carriesBashMonitorWake(muxMetadata: unknown): boolean {
+  const meta = muxMetadata as MuxMessageMetadata | undefined;
+  if (meta?.type === "bash-monitor-wake") return true;
+  if (!isCompactionRequestMetadata(meta)) return false;
+  const followUpMetadata =
+    meta.parsed.followUpContent?.muxMetadata ?? meta.parsed.continueMessage?.muxMetadata;
+  return followUpMetadata?.type === "bash-monitor-wake";
+}
+
 const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
 
 /**
@@ -890,11 +905,16 @@ export class AgentSession {
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
   /**
-   * The send in the PREPARING phase is a bash-monitor wake. Its `onAccepted` lowers the
-   * reconciler level once the user row is durable, before the stream is observable, so
-   * this marker is what keeps the wake continuation visible across that window.
+   * The turn in flight carries a bash-monitor wake: the admitted send is the wake itself, or
+   * an on-send compaction whose follow-up is (carriesBashMonitorWake). The wake's `onAccepted`
+   * lowers the reconciler level once its row is durable, so from admission on this marker is
+   * the only thing that keeps the continuation visible to delegated-turn settlement until a
+   * stream that shows it exists. A direct wake stream shows it through its inherited
+   * correlation, so the marker drops at that stream's start; a compaction stream does not
+   * (its metadata is the compaction request), so the marker outlives it until the follow-up
+   * dispatches in COMPLETING or the turn ends (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
    */
-  private preparingBashMonitorWake = false;
+  private turnCarriesBashMonitorWake = false;
   /**
    * The last stream cut itself for the wake level (hasPendingToolEndInput returned true
    * from the level) and no turn has been admitted since. This is cut *attribution*
@@ -5836,7 +5856,9 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
-        this.preparingBashMonitorWake = false;
+        // A compaction stream's metadata does not show the wake its follow-up carries; keep
+        // the marker until the follow-up dispatches (see turnCarriesBashMonitorWake).
+        if (this.activeCompactionRequest == null) this.turnCarriesBashMonitorWake = false;
         // A live stream is the continuation (or a superseding turn) the cut waited for.
         this.streamYieldedToBashMonitorWake = false;
         this.activeStreamStartedAtMs = payload.startTime;
@@ -6337,7 +6359,7 @@ export class AgentSession {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
-      this.preparingBashMonitorWake = false;
+      this.turnCarriesBashMonitorWake = false;
       // Turn ended: expire any mid-turn thinking override. Safe unconditionally
       // because a replacement turn (e.g. an edit) only creates its holder after
       // the preempted turn has already been transitioned to IDLE.
@@ -6781,21 +6803,21 @@ export class AgentSession {
   /** Claim PREPARING for a send and record what kind of input it carries. */
   private enterPreparing(muxMetadata: unknown): void {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
-    this.preparingBashMonitorWake =
-      (muxMetadata as MuxMessageMetadata | undefined)?.type === "bash-monitor-wake";
+    this.turnCarriesBashMonitorWake = carriesBashMonitorWake(muxMetadata);
     // Whatever is admitted now (the wake turn, or input superseding it) settles the cut.
     this.streamYieldedToBashMonitorWake = false;
     this.setTurnPhase(TurnPhase.PREPARING);
   }
 
   /**
-   * A bash-monitor wake turn between admission and stream start (direct send in PREPARING,
-   * or a dequeued wake entry). The reconciler level is already low here — `onAccepted`
-   * ran when the user row became durable — but no replacement stream is observable yet,
-   * so delegated-turn settlement must still see the continuation.
+   * A bash-monitor wake turn admitted but not yet shown by a correlated stream: a direct wake
+   * send in PREPARING, a dequeued wake entry, or an on-send compaction turn (preparing,
+   * streaming, or dispatching its follow-up) that consumed the wake. The reconciler level is
+   * already low here — `onAccepted` ran when the durable row landed — so delegated-turn
+   * settlement must read the continuation from this marker.
    */
   hasPendingBashMonitorWakeTurn(): boolean {
-    if (this.preparingBashMonitorWake) return true;
+    if (this.turnCarriesBashMonitorWake) return true;
     const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
     return dispatching?.type === "bash-monitor-wake";
   }

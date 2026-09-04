@@ -11969,8 +11969,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * The bash-monitor wake level: a wake the workspace has not seen yet, or a wake turn
-   * admitted but not yet streaming (AgentSession.hasPendingBashMonitorWakeTurn — the
-   * reconciler level is already consumed there). A stream that ended with "tool-calls"
+   * admitted but not yet shown by a correlated stream — including an on-send compaction
+   * that consumed it (AgentSession.hasPendingBashMonitorWakeTurn — the reconciler level is
+   * already consumed there). A stream that ended with "tool-calls"
    * while this is high yielded to the wake and will be continued by it. Deliberately not
    * the session's cut latch: a wake retracted after the cut (monitor canceled) has no
    * continuation, and settlement must not defer on it (AgentSession.getQueueCutCutter

@@ -1378,6 +1378,8 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
   async function createGuidanceHarness(args: {
     workspaceId: string;
     summaryText?: string;
+    /** Observes each stream request (1-based) just before and just after its stream-start. */
+    onStreamRequest?: (index: number, phase: "preparing" | "streaming") => void;
   }): Promise<GuidanceStreamFixture> {
     const workspaceId = args.workspaceId;
     const streamHistories: MuxMessage[][] = [];
@@ -1390,6 +1392,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
           : undefined;
       streamHistories.push(Array.isArray(requestMessages) ? (requestMessages as MuxMessage[]) : []);
 
+      args.onStreamRequest?.(streamHistories.length, "preparing");
       aiEmitter.emit("stream-start", {
         type: "stream-start",
         workspaceId,
@@ -1398,6 +1401,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         historySequence: streamHistories.length,
         startTime: Date.now(),
       });
+      args.onStreamRequest?.(streamHistories.length, "streaming");
 
       const usage = {
         inputTokens: 42,
@@ -1525,6 +1529,66 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         (event) => (event as { type?: string }).type === "auto-compaction-completed"
       )
     ).toBe(true);
+
+    fixture.session.dispose();
+  });
+
+  test("a wake consumed by on-send compaction stays a pending wake turn until its follow-up streams", async () => {
+    // The wake's onAccepted lowers the reconciler level, and the compaction turn's metadata is
+    // the compaction request — so while the compaction prepares/streams and until the follow-up
+    // dispatches, this marker is the only thing that tells delegated-turn settlement the wake
+    // continuation is still coming (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
+    const observed: Array<[number, "preparing" | "streaming", boolean]> = [];
+    const fixtureRef: { session?: AgentSession } = {};
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-wake-identity",
+      onStreamRequest: (index, phase) => {
+        observed.push([index, phase, fixtureRef.session?.hasPendingBashMonitorWakeTurn() ?? false]);
+      },
+    });
+    fixtureRef.session = fixture.session;
+    // Compact the wake once; its follow-up must then stream as the wake itself.
+    let compactionChecks = 0;
+    (
+      fixture.session as unknown as { compactionMonitor: CompactionMonitor }
+    ).compactionMonitor.checkBeforeSend = () => {
+      compactionChecks += 1;
+      return {
+        shouldShowWarning: compactionChecks === 1,
+        shouldForceCompact: compactionChecks === 1,
+        usagePercentage: compactionChecks === 1 ? 95 : 10,
+        thresholdPercentage: 70,
+      };
+    };
+
+    const result = await fixture.session.sendMessage(
+      "READY",
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      },
+      { synthetic: true, agentInitiated: true, startStreamInBackground: true }
+    );
+    expect(result.success).toBe(true);
+    expect(await waitFor(() => fixture.streamHistories.length >= 2)).toBe(true);
+
+    expect(fixture.streamHistories[0].at(-1)?.metadata?.muxMetadata?.type).toBe(
+      "compaction-request"
+    );
+    expect(fixture.streamHistories[1].at(-1)?.metadata?.muxMetadata?.type).toBe(
+      "bash-monitor-wake"
+    );
+    expect(observed).toEqual([
+      // Compaction turn: preparing and streaming both still carry the wake.
+      [1, "preparing", true],
+      [1, "streaming", true],
+      // Follow-up wake turn: preparing carries it; its own stream shows it instead.
+      [2, "preparing", true],
+      [2, "streaming", false],
+    ]);
+    expect(await waitFor(() => !fixture.session.isBusy())).toBe(true);
+    expect(fixture.session.hasPendingBashMonitorWakeTurn()).toBe(false);
 
     fixture.session.dispose();
   });
