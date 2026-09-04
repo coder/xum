@@ -959,6 +959,7 @@ describe("ProjectSidebar flat chat list", () => {
         ({
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1010,6 +1011,7 @@ describe("ProjectSidebar flat chat list", () => {
         ({
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1100,6 +1102,7 @@ describe("ProjectSidebar flat chat list", () => {
         ({
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1280,6 +1283,7 @@ describe("ProjectSidebar flat chat list", () => {
         ({
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1335,6 +1339,7 @@ describe("ProjectSidebar flat chat list", () => {
         ({
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
