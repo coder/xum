@@ -5050,7 +5050,8 @@ export class StreamManager {
         Effect.sync(() => {
           log.warn("[stream] engine supervisor defect", { workspaceId, error: defect });
         })
-      )
+      ),
+      Effect.asVoid
     );
     // startImmediately: the fiber reaches its (only) suspension point — the
     // promise wait — before forkIn registers it with the scope, so a scope that
