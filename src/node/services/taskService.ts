@@ -11185,7 +11185,56 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async handleStreamAbort(event: StreamAbortEvent): Promise<void> {
-    await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamAbort(event);
+    if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamAbort(event)) {
+      return;
+    }
+    if (event.abortReason === "user") {
+      await this.releaseSharedDesktopTaskOnUserStop(event.workspaceId);
+    }
+  }
+
+  /**
+   * A user Stop on an ordinary child is a steerable pause: the task stays `running` so the
+   * user can resume it. A shared-desktop child, however, holds the owner's desktop through that
+   * `running` status (the config ledger is the only ownership source), so a paused child would
+   * block the owner until the parent's foreground wait timed out. Mirror task_stop instead: the
+   * durable `interrupted` status releases the desktop and fails the parent's wait fast, while a
+   * user resume re-admits the child onto the same desktop via markInterruptedTaskRunning.
+   */
+  private async releaseSharedDesktopTaskOnUserStop(workspaceId: string): Promise<void> {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace?.parentWorkspaceId == null || workspace.taskDesktopOwnerWorkspaceId == null) {
+      return;
+    }
+    if (workspace.taskStatus !== "running" && workspace.taskStatus !== "awaiting_report") {
+      return;
+    }
+    // Stop-and-send-queued dispatches a new turn right after the abort; that turn keeps the
+    // desktop, so only a genuinely idle child releases it.
+    if (
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+    ) {
+      return;
+    }
+    let transitionedToInterrupted = false;
+    let parentWorkspaceId: string | undefined;
+    await this.editWorkspaceEntry(
+      workspaceId,
+      (ws) => {
+        if (ws.taskStatus !== "running" && ws.taskStatus !== "awaiting_report") return;
+        parentWorkspaceId = ws.parentWorkspaceId;
+        transitionedToInterrupted = this.applyInterruptedTaskStatus(ws) === "interrupted";
+      },
+      { allowMissing: true }
+    );
+    if (!transitionedToInterrupted) {
+      return;
+    }
+    this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
+    this.rejectWaiters(workspaceId, new Error("Task interrupted"));
+    await this.emitWorkspaceMetadata(workspaceId);
+    this.scheduleMaybeStartQueuedTasks();
   }
 
   private async handleTaskStreamError(event: ErrorEvent): Promise<void> {

@@ -4250,6 +4250,76 @@ describe("TaskService", () => {
     }
   });
 
+  test.each([
+    ["shared", "user", "interrupted"],
+    ["shared", "system", "running"],
+    ["isolated", "user", "running"],
+  ] as const)(
+    "%s desktop child %s stream abort leaves the task %s",
+    async (desktop, abortReason, expectedStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const desktopCoordinator = new DesktopInputCoordinator(config);
+      // Drive the real aiService subscription so the abort flows through the event lock.
+      const listeners = new Map<string, (payload: unknown) => void>();
+      const on = mock((event: string, handler: (payload: unknown) => void) => {
+        listeners.set(event, handler);
+      });
+      const { aiService } = createAIServiceMocks(config, { on });
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, {
+        aiService,
+        workspaceService,
+        desktopInputCoordinator: desktopCoordinator,
+      });
+      const created = await createAgentTask(taskService, parentId, "Inspect", { desktop });
+      assert(created.success, "Expected the child task to start");
+      const childId = created.data.taskId;
+      const ownerInput = () =>
+        desktopCoordinator
+          .withInput(parentId, () => Promise.resolve("clicked"))
+          .then(
+            (value) => value,
+            (error: unknown) => (error instanceof Error ? error.message : String(error))
+          );
+      if (desktop === "shared") {
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+      }
+      const waiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 }).then(
+        () => "settled",
+        (error: unknown) => (error instanceof Error ? error.message : "?")
+      );
+
+      const onStreamAbort = listeners.get("stream-abort");
+      assert(onStreamAbort, "TaskService must subscribe to stream-abort");
+      onStreamAbort({
+        type: "stream-abort",
+        workspaceId: childId,
+        messageId: "msg_1",
+        abortReason,
+      });
+
+      if (expectedStatus === "interrupted") {
+        await waitForWorkspaceTaskStatus(config, childId, "interrupted");
+        // Clicking Stop in the child UI hands the desktop back to the owner immediately...
+        expect(await ownerInput()).toBe("clicked");
+        expect(await waiter).toBe("Task interrupted");
+        // ...and the paused child still reawakens onto the same desktop when the user resumes it.
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        expect(findWorkspaceInConfig(config, childId)?.taskDesktopOwnerWorkspaceId).toBe(parentId);
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+      if (desktop === "shared") {
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+      } else {
+        expect(await ownerInput()).toBe("clicked");
+      }
+    }
+  );
+
   test.each(["reported", "interrupted"] as const)(
     "shared desktop %s resume preserves binding and refuses a competing controller",
     async (taskStatus) => {
