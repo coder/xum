@@ -215,11 +215,12 @@ export function makeAppRuntime<R>(layer: Layer.Layer<R, never, never>): AppRunti
   const startedAt = performance.now();
   const managed = ManagedRuntime.make(layer);
   // Subscription pulls must not inherit the eager build's scope, memo map or sync scheduler.
+  // These artifacts are not declared app services in R (see the DI contract).
   const context = Context.omit(
     Scope.Scope,
     Layer.CurrentMemoMap,
     Scheduler.Scheduler
-  )(managed.runSync(Effect.context<R>()));
+  )(managed.runSync(Effect.context<R>())) as Context.Context<R>;
   assert(
     managed.cachedContext !== undefined,
     "AppRuntime layer graph must build synchronously (see DI contract in di/appRuntime.ts)"
