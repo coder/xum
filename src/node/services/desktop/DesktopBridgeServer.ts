@@ -2,6 +2,7 @@ import * as net from "node:net";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS } from "@/common/constants/desktop";
 import { assert } from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 import type { DesktopSessionManager } from "./DesktopSessionManager";
@@ -108,6 +109,7 @@ export class DesktopBridgeServer {
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
+  private readonly drainingSockets = new Map<net.Socket, Promise<void>>();
   private stopConfigWatch: (() => void) | undefined;
   // Keep upgrade rejection aligned with stop() so httpServer.close() cannot hang on sockets
   // that reconnect after shutdown snapshots the current bridge clients.
@@ -176,6 +178,8 @@ export class DesktopBridgeServer {
           ws.terminate();
         }
       }
+
+      await Promise.allSettled(this.drainingSockets.values());
 
       this.activePairs.clear();
 
@@ -246,11 +250,17 @@ export class DesktopBridgeServer {
         this.cleanupPair(pair, {
           closeCode: MISSING_SESSION_CLOSE_CODE,
           closeReason: "session unavailable",
+          // Renderer acknowledgment can beat the server's final WS close callback. If its
+          // handshake already started, preserve accepted release frames on this path too.
+          flushTcp:
+            pair.ws.readyState === WebSocket.CLOSING || pair.ws.readyState === WebSocket.CLOSED,
         });
       }
     });
     this.activePairs.add(pair);
-    ws.once("close", () => this.cleanupPair(pair, { closeReason: "websocket closed" }));
+    ws.once("close", () =>
+      this.cleanupPair(pair, { closeReason: "websocket closed", flushTcp: true })
+    );
     ws.on("error", (error) => {
       log.error("DesktopBridgeServer: WebSocket bridge failed", {
         workspaceId: payload.workspaceId,
@@ -329,13 +339,15 @@ export class DesktopBridgeServer {
         ReturnType<DesktopSessionManager["getLiveSessionConnection"]>
       >();
       for (const pair of this.activePairs) {
-        if (!connections.has(pair.requesterWorkspaceId)) {
+        const mode = pair.tcp ? "established" : "admission";
+        const key = `${mode}:${pair.requesterWorkspaceId}`;
+        if (!connections.has(key)) {
           connections.set(
-            pair.requesterWorkspaceId,
-            this.desktopSessionManager.getLiveSessionConnection(pair.requesterWorkspaceId)
+            key,
+            this.desktopSessionManager.getLiveSessionConnection(pair.requesterWorkspaceId, mode)
           );
         }
-        const current = connections.get(pair.requesterWorkspaceId);
+        const current = connections.get(key);
         if (
           current?.ownerWorkspaceId !== pair.ownerWorkspaceId ||
           current.sessionId !== pair.sessionId ||
@@ -453,10 +465,9 @@ export class DesktopBridgeServer {
         return;
       }
 
-      if (pair.ws.readyState !== WebSocket.OPEN) {
-        this.cleanupPair(pair, { closeReason: "websocket unavailable for tcp data" });
-        return;
-      }
+      // A client close may race the last screen update. Let its close event drain pending
+      // client→VNC key/button releases instead of destroying the socket from this read path.
+      if (pair.ws.readyState !== WebSocket.OPEN) return;
 
       try {
         pair.ws.send(chunk, { binary: true });
@@ -484,9 +495,24 @@ export class DesktopBridgeServer {
     });
   }
 
+  private drainTcp(tcp: net.Socket): void {
+    const drained = new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => tcp.destroy(), DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS);
+      timeout.unref?.();
+      tcp.once("close", () => {
+        clearTimeout(timeout);
+        this.drainingSockets.delete(tcp);
+        resolve();
+      });
+    });
+    this.drainingSockets.set(tcp, drained);
+    // end() preserves buffered release frames; destroy() would discard unwritten bytes.
+    tcp.end();
+  }
+
   private cleanupPair(
     pair: BridgePair,
-    options: { closeCode?: number; closeReason?: string } = {}
+    options: { closeCode?: number; closeReason?: string; flushTcp?: boolean } = {}
   ): void {
     if (pair.closed) {
       return;
@@ -504,8 +530,10 @@ export class DesktopBridgeServer {
 
     if (pair.tcp && !pair.tcp.destroyed) {
       try {
-        pair.tcp.destroy();
+        if (options.flushTcp) this.drainTcp(pair.tcp);
+        else pair.tcp.destroy();
       } catch (error) {
+        pair.tcp.destroy();
         log.debug("DesktopBridgeServer: TCP cleanup failed", {
           error,
           reason: options.closeReason,

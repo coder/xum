@@ -3285,9 +3285,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
 
-    // Archiving hides workspace UI; do not leave terminal PTYs or desktop sessions running headless.
+    // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
-    await this.closeDesktopSessionBestEffort(workspaceId, "archive");
   }
 
   /**
@@ -8695,6 +8694,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           });
         }
 
+        await this.closeDesktopSessionBestEffort(workspaceId, "archive");
         await this.stopLiveWorkspaceActivityForArchive(workspaceId);
 
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
@@ -8713,6 +8713,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         capturedWorktreeSnapshot = captureResult.data;
       }
+
+      // Let borrowed viewers release input before archivedAt revokes their bridge identity.
+      if (!needsSnapshotCapture) await this.closeDesktopSessionBestEffort(workspaceId, "archive");
 
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);

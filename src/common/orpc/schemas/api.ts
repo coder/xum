@@ -3183,7 +3183,38 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
   }),
 ]);
 
+const DesktopWindowInputSchema = z.object({
+  workspaceId: z.string().min(1),
+  instanceId: z.string().min(1),
+});
+const DesktopWindowStateSchema = z.object({ instanceId: z.string().min(1) });
+
+export const DesktopViewerEventSchema = z.object({
+  type: z.enum(["ready", "release"]),
+  viewerId: z.string().min(1),
+});
+
 export const desktop = {
+  watchViewer: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(DesktopViewerEventSchema),
+  },
+  acknowledgeViewerRelease: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
+  openWindow: {
+    input: DesktopWindowInputSchema,
+    output: DesktopWindowStateSchema,
+  },
+  closeWindow: {
+    input: DesktopWindowInputSchema,
+    output: z.void(),
+  },
+  getWindow: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: DesktopWindowStateSchema.nullable(),
+  },
   getPrereqStatus: {
     input: z.void(),
     output: DesktopPrereqStatusSchema,

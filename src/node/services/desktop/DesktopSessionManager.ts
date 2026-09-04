@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
+import { DESKTOP_DEFAULTS, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS } from "@/common/constants/desktop";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -8,6 +11,7 @@ import type {
   DesktopCapability,
   DesktopPrereqStatus,
   DesktopScreenshotResult,
+  DesktopViewerEvent,
 } from "@/common/types/desktop";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -20,11 +24,135 @@ import {
   PortableDesktopSession,
 } from "./PortableDesktopSession";
 
+interface DesktopViewerRegistration {
+  viewerId: string;
+  workspaceId: string;
+  ownerWorkspaceId: string;
+  push: (event: DesktopViewerEvent) => void;
+  release?: Promise<void>;
+  acknowledge?: () => void;
+}
+
 export class DesktopSessionManager {
+  private readonly viewers = new Map<string, DesktopViewerRegistration>();
   private readonly sessions = new Map<string, PortableDesktopSession>();
   private readonly startupPromises = new Map<string, Promise<PortableDesktopSession>>();
   private readonly inputCoordinator: DesktopInputCoordinator;
   private readonly closeListeners = new Set<(workspaceId: string | null) => void>();
+  private windowManager:
+    | Pick<
+        DesktopWindowManager,
+        "openWindow" | "closeWindow" | "getWindow" | "closeWorkspace" | "closeAll"
+      >
+    | undefined;
+  private readonly pendingWindowOpens = new Set<{
+    workspaceId: string;
+    instanceId: string;
+    ownerWorkspaceId: string;
+  }>();
+  private readonly windowOwners = new Map<string, string>();
+  private readonly closingWorkspaces = new Map<string, Promise<void>>();
+  private disposed = false;
+  private closeAllPromise: Promise<void> | undefined;
+
+  watchViewer(workspaceId: string, signal?: AbortSignal): AsyncGenerator<DesktopViewerEvent> {
+    return asyncIterableFromSubscription<DesktopViewerEvent>({
+      signal,
+      subscribe: (push) => {
+        // Admission and registration share one synchronous block: cleanup either sees this
+        // viewer in its snapshot or rejects its registration before sending ready.
+        const target = this.resolveActiveTarget(workspaceId);
+        const viewer: DesktopViewerRegistration = {
+          viewerId: randomUUID(),
+          workspaceId,
+          ownerWorkspaceId: target.ownerWorkspaceId,
+          push,
+        };
+        this.viewers.set(viewer.viewerId, viewer);
+        push({ type: "ready", viewerId: viewer.viewerId });
+        // Deregister even if the generator is paused at a yield when the transport aborts.
+        // Losing the subscription is not proof that held remote input was released:
+        // a pending teardown still waits for its deadline rather than resolving here.
+        const unsubscribe = () => {
+          this.viewers.delete(viewer.viewerId);
+        };
+        signal?.addEventListener("abort", unsubscribe, { once: true });
+        return () => {
+          signal?.removeEventListener("abort", unsubscribe);
+          unsubscribe();
+        };
+      },
+    });
+  }
+
+  acknowledgeViewerRelease(viewerId: string): void {
+    this.viewers.get(viewerId)?.acknowledge?.();
+  }
+
+  private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
+    viewer.release ??= new Promise<void>((resolve) => {
+      const complete = () => {
+        clearTimeout(timeout);
+        this.viewers.delete(viewer.viewerId);
+        viewer.acknowledge = undefined;
+        resolve();
+      };
+      const timeout = setTimeout(complete, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS);
+      timeout.unref?.();
+      viewer.acknowledge = complete;
+      viewer.push({ type: "release", viewerId: viewer.viewerId });
+    });
+    return viewer.release;
+  }
+
+  setDesktopWindowManager(manager: NonNullable<DesktopSessionManager["windowManager"]>): void {
+    this.windowManager = manager;
+  }
+
+  async openWindow(workspaceId: string, instanceId: string): Promise<{ instanceId: string }> {
+    assert(workspaceId.length > 0 && instanceId.length > 0, "Desktop window IDs must be non-empty");
+    const manager = this.windowManager;
+    if (!manager) throw new Error("Desktop windows are only available in Electron");
+    const target = this.resolveActiveTarget(workspaceId);
+
+    // Reserve before capability lookup yields. Teardown cancels these reservations, and archive
+    // admission must see them as activity even before an Electron window exists.
+    const request = { workspaceId, instanceId, ownerWorkspaceId: target.ownerWorkspaceId };
+    this.pendingWindowOpens.add(request);
+    try {
+      const capability = await this.getCapability(workspaceId);
+      if (!capability.available) {
+        throw new Error(`Desktop is unavailable: ${capability.reason}`);
+      }
+      if (!this.pendingWindowOpens.has(request))
+        throw new Error("Desktop window opening was canceled");
+      if (this.resolveActiveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
+        throw new Error(`Desktop target changed while opening a window for ${workspaceId}`);
+      }
+      // The viewer belongs to the requester, but closing its shared owner revokes it too.
+      this.windowOwners.set(workspaceId, target.ownerWorkspaceId);
+      return await manager.openWindow(workspaceId, instanceId);
+    } finally {
+      this.pendingWindowOpens.delete(request);
+      if (manager.getWindow(workspaceId) === null) this.windowOwners.delete(workspaceId);
+    }
+  }
+
+  getWindow(workspaceId: string): { instanceId: string } | null {
+    const window = this.windowManager?.getWindow(workspaceId) ?? null;
+    if (window === null) this.windowOwners.delete(workspaceId);
+    return window;
+  }
+
+  closeWindow(workspaceId: string, instanceId: string): Promise<void> {
+    for (const request of this.pendingWindowOpens) {
+      if (request.workspaceId === workspaceId && request.instanceId === instanceId) {
+        this.pendingWindowOpens.delete(request);
+      }
+    }
+    return this.windowManager?.closeWindow(workspaceId, instanceId) ?? Promise.resolve();
+  }
+
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
   /**
@@ -57,6 +185,19 @@ export class DesktopSessionManager {
           `Workspace is being archived or removed: ${id}. Wait for cleanup to finish.`
         );
       }
+    }
+    return target;
+  }
+
+  // Keep config-based target discovery separate from admission to new sessions/viewers.
+  private resolveActiveTarget(workspaceId: string) {
+    const target = this.resolveTarget(workspaceId);
+    if (
+      this.disposed ||
+      this.closingWorkspaces.has(workspaceId) ||
+      this.closingWorkspaces.has(target.ownerWorkspaceId)
+    ) {
+      throw new Error("Desktop sessions are shutting down");
     }
     return target;
   }
@@ -126,19 +267,19 @@ export class DesktopSessionManager {
   }
 
   async ensureStarted(workspaceId: string): Promise<PortableDesktopSession> {
-    const target = this.resolveTarget(workspaceId);
+    const target = this.resolveActiveTarget(workspaceId);
     // Reserve the owner startup synchronously with both archive guards; has() stays owner-keyed.
     const session = await this.ensureOwnerStarted(target.ownerWorkspaceId);
     // A requester may disappear/archive while joining somebody else's startup. Reject that
     // request without closing the owner's desktop, which other requesters can still use.
-    if (this.resolveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
+    if (this.resolveActiveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
       throw new Error(`Desktop target changed while starting for workspace ${workspaceId}`);
     }
     return session;
   }
 
   private async ensureOwnerStarted(workspaceId: string): Promise<PortableDesktopSession> {
-    this.resolveTarget(workspaceId);
+    this.resolveActiveTarget(workspaceId);
     const existingSession = this.sessions.get(workspaceId);
     if (existingSession?.isAlive()) {
       return existingSession;
@@ -232,7 +373,18 @@ export class DesktopSessionManager {
     // live activity, though — stale map entries linger until the next ensureStarted()/close()
     // touches them and must not hold the archive refusal gate open indefinitely.
     return (
-      (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.startupPromises.has(workspaceId)
+      (this.sessions.get(workspaceId)?.isAlive() ?? false) ||
+      this.startupPromises.has(workspaceId) ||
+      Array.from(this.viewers.values()).some(
+        (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+      ) ||
+      this.getWindow(workspaceId) !== null ||
+      Array.from(this.pendingWindowOpens).some(
+        (request) => request.workspaceId === workspaceId || request.ownerWorkspaceId === workspaceId
+      ) ||
+      Array.from(this.windowOwners).some(
+        ([requesterId, ownerId]) => ownerId === workspaceId && this.getWindow(requesterId) !== null
+      )
     );
   }
 
@@ -282,9 +434,45 @@ export class DesktopSessionManager {
     return () => this.closeListeners.delete(listener);
   }
 
-  async close(workspaceId: string): Promise<void> {
-    // A shared borrower has no owned session, but cleanup must still revoke its viewers.
-    for (const listener of this.closeListeners) listener(workspaceId);
+  close(workspaceId: string): Promise<void> {
+    const existingClose = this.closingWorkspaces.get(workspaceId);
+    if (existingClose) return existingClose;
+    for (const request of this.pendingWindowOpens) {
+      if (request.workspaceId === workspaceId || request.ownerWorkspaceId === workspaceId) {
+        this.pendingWindowOpens.delete(request);
+      }
+    }
+    const browserViewers = Array.from(this.viewers.values()).filter(
+      (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+    );
+    const viewers = new Set([workspaceId]);
+    for (const [requesterId, ownerId] of this.windowOwners) {
+      if (requesterId === workspaceId || ownerId === workspaceId) {
+        viewers.add(requesterId);
+        this.windowOwners.delete(requesterId);
+      }
+    }
+    // Latch before entering the async teardown, but leave established bridges alive long enough
+    // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
+    const closing = Promise.resolve().then(async () => {
+      try {
+        await Promise.allSettled([
+          ...Array.from(
+            viewers,
+            (requesterId) => this.windowManager?.closeWorkspace(requesterId) ?? Promise.resolve()
+          ),
+          ...browserViewers.map((viewer) => this.releaseViewer(viewer)),
+        ]);
+        for (const listener of this.closeListeners) listener(workspaceId);
+      } finally {
+        await this.closeSession(workspaceId);
+      }
+    });
+    this.closingWorkspaces.set(workspaceId, closing);
+    return closing;
+  }
+
+  private async closeSession(workspaceId: string): Promise<void> {
     const session = this.sessions.get(workspaceId);
     const startupPromise = this.startupPromises.get(workspaceId);
 
@@ -305,23 +493,37 @@ export class DesktopSessionManager {
     } finally {
       this.sessions.delete(workspaceId);
       this.startupPromises.delete(workspaceId);
+      this.closingWorkspaces.delete(workspaceId);
     }
   }
 
-  async closeAll(): Promise<void> {
-    for (const listener of this.closeListeners) listener(null);
-    const sessions = Array.from(this.sessions.values());
-    const startupPromises = Array.from(this.startupPromises.values());
+  closeAll(): Promise<void> {
+    this.disposed = true;
+    this.pendingWindowOpens.clear();
+    this.windowOwners.clear();
+    const browserViewers = Array.from(this.viewers.values());
+    this.closeAllPromise ??= Promise.resolve().then(async () => {
+      await Promise.allSettled([
+        this.windowManager?.closeAll() ?? Promise.resolve(),
+        ...browserViewers.map((viewer) => this.releaseViewer(viewer)),
+        // A disconnected subscription may have left a release waiting on its deadline.
+        ...this.closingWorkspaces.values(),
+      ]);
+      for (const listener of this.closeListeners) listener(null);
+      const sessions = Array.from(this.sessions.values());
+      const startupPromises = Array.from(this.startupPromises.values());
 
-    this.sessions.clear();
-    this.startupPromises.clear();
+      this.sessions.clear();
+      this.startupPromises.clear();
 
-    await Promise.allSettled([
-      ...sessions.map(async (session) => session.close()),
-      ...startupPromises.map(async (startupPromise) => {
-        await startupPromise.then((session) => session.close()).catch(() => undefined);
-      }),
-    ]);
+      await Promise.allSettled([
+        ...sessions.map(async (session) => session.close()),
+        ...startupPromises.map(async (startupPromise) => {
+          await startupPromise.then((session) => session.close()).catch(() => undefined);
+        }),
+      ]);
+    });
+    return this.closeAllPromise;
   }
 
   /**
@@ -329,14 +531,22 @@ export class DesktopSessionManager {
    * Returns null if no live session exists for the workspace.
    * Used by DesktopBridgeServer to resolve token→VNC-port mappings.
    */
-  getLiveSessionConnection(workspaceId: string): {
+  getLiveSessionConnection(
+    workspaceId: string,
+    mode: "admission" | "established" = "admission"
+  ): {
     ownerWorkspaceId: string;
     sessionId: string;
     vncPort: number;
   } | null {
     let ownerWorkspaceId: string;
     try {
-      ownerWorkspaceId = this.resolveTarget(workspaceId).ownerWorkspaceId;
+      // An established viewer needs its release channel during local lifecycle admission.
+      // Durable archive/removal/owner changes still revoke it through config-based resolution.
+      ownerWorkspaceId =
+        mode === "established"
+          ? this.inputCoordinator.resolveTarget(workspaceId).ownerWorkspaceId
+          : this.resolveActiveTarget(workspaceId).ownerWorkspaceId;
     } catch (error) {
       log.debug("Desktop bridge target unavailable", { workspaceId, error });
       return null;

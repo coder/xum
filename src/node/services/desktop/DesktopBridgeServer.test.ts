@@ -50,6 +50,7 @@ function createDeferred<T>(): Deferred<T> {
 }
 
 function createBridgeServer(options: {
+  onWorkspaceClose?: (listener: (workspaceId: string | null) => void) => () => void;
   validate?: (token: string) => { workspaceId: string; sessionId: string } | null;
   getLiveSessionConnection?:
     | ((workspaceId: string) => { sessionId: string; vncPort: number } | null)
@@ -74,7 +75,7 @@ function createBridgeServer(options: {
             : null;
         return live ? { ...live, ownerWorkspaceId: workspaceId } : null;
       },
-      onWorkspaceClose: () => () => undefined,
+      onWorkspaceClose: options.onWorkspaceClose ?? (() => () => undefined),
       watchWorkspaceConfig: () => () => undefined,
     },
   });
@@ -622,6 +623,36 @@ describe("DesktopBridgeServer", () => {
     });
   });
 
+  test("config notifications preserve an established release channel after admission closes", async () => {
+    await withSharedBridge(async ({ manager, connect }) => {
+      let changed!: () => void;
+      const watch = spyOn(manager, "watchWorkspaceConfig").mockImplementation((onChange) => {
+        changed = onChange;
+        return () => undefined;
+      });
+      try {
+        const child = await connect("child");
+        const live = manager.getLiveSessionConnection("child");
+        const lookup = spyOn(manager, "getLiveSessionConnection").mockImplementation(
+          (_workspaceId, mode) => (mode === "established" ? live : null)
+        );
+        try {
+          changed();
+          await expectEcho(child);
+          // Durable invalidation still wins, even for an established release channel.
+          lookup.mockReturnValue(null);
+          const closed = waitForWebSocketClose(child);
+          changed();
+          expect((await closed).code).toBe(4002);
+        } finally {
+          lookup.mockRestore();
+        }
+      } finally {
+        watch.mockRestore();
+      }
+    });
+  });
+
   test("config revalidation deduplicates requesters and checks owner, session and port bindings", async () => {
     await withSharedBridge(async ({ manager, bridge, connect }) => {
       let changed!: () => void;
@@ -838,6 +869,61 @@ describe("DesktopBridgeServer", () => {
       await tcpHarness.close();
     }
   });
+
+  test.each([false, true])(
+    "client close flushes buffered input even when workspace revocation wins the close callback (%s)",
+    async (revokeFirst) => {
+      const tcpHarness = await listenTcpServer();
+      let revoke!: (workspaceId: string | null) => void;
+      const bridge = createBridgeServer({
+        getLiveSessionConnection: () => ({ sessionId: VALID_SESSION_ID, vncPort: tcpHarness.port }),
+        onWorkspaceClose: (listener) => {
+          revoke = listener;
+          return () => undefined;
+        },
+      });
+      const internal = bridge as unknown as {
+        connectToVnc: (port: number, signal: AbortSignal) => Promise<net.Socket>;
+        activePairs: Set<{ ws: WebSocket }>;
+      };
+      const connectToVnc = internal.connectToVnc.bind(bridge);
+      const connected = createDeferred<net.Socket>();
+      const connect = spyOn(internal, "connectToVnc").mockImplementation(async (port, signal) => {
+        const tcp = await connectToVnc(port, signal);
+        // Keep the release frame in Node's write buffer until cleanup chooses end or destroy.
+        tcp.cork();
+        connected.resolve(tcp);
+        return tcp;
+      });
+      const upgrade = await listenUpgradeServer(bridge);
+      const ws = new WebSocket(`ws://127.0.0.1:${upgrade.port}/?token=${VALID_TOKEN}`);
+      try {
+        await waitForWebSocketOpen(ws);
+        await connected.promise;
+        if (revokeFirst) {
+          for (const pair of internal.activePairs) {
+            pair.ws.prependOnceListener("close", () => revoke(VALID_WORKSPACE_ID));
+          }
+        }
+        const peer = await tcpHarness.connectionPromise;
+        const received: Buffer[] = [];
+        peer.on("data", (data: Buffer) => received.push(data));
+        const ended = once(peer, "end");
+        const release = Buffer.from([4, 0, 0, 0, 0, 0, 0xff, 0xe1]);
+        ws.send(release);
+        await closeWebSocket(ws);
+        await ended;
+        expect(Buffer.concat(received)).toEqual(release);
+        await bridge.stop();
+      } finally {
+        connect.mockRestore();
+        await closeWebSocket(ws);
+        await upgrade.close();
+        await bridge.stop();
+        await tcpHarness.close();
+      }
+    }
+  );
 
   test("bridges binary traffic in both directions for a valid token", async () => {
     const tcpHarness = await listenTcpServer();

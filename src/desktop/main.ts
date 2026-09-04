@@ -41,6 +41,7 @@ if (process.platform === "darwin") {
   }
 }
 
+import { DesktopWindowManager } from "./desktopWindowManager";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
@@ -852,6 +853,9 @@ async function loadServices(): Promise<void> {
     return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0];
   });
 
+  services.setDesktopWindowManager(
+    new DesktopWindowManager((options) => new BrowserWindow(options), app.isPackaged)
+  );
   services.setTerminalWindowManager(terminalWindowManager);
 
   loadTokenizerModules().catch((error) => {

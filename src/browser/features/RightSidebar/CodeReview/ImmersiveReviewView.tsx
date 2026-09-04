@@ -53,6 +53,7 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
@@ -1630,6 +1631,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       // Tab: toggle between diff and notes panels.
       if (matchesKeybind(e, KEYBINDS.REVIEW_FOCUS_NOTES)) {
         // Keep normal tab behavior when typing in inline note editors.

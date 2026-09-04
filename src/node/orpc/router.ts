@@ -2062,6 +2062,36 @@ export const router = (authToken?: string) => {
       },
     },
     desktop: {
+      watchViewer: t
+        .input(schemas.desktop.watchViewer.input)
+        .output(schemas.desktop.watchViewer.output)
+        .handler(({ context, input, signal }) =>
+          context.desktopSessionManager.watchViewer(input.workspaceId, signal)
+        ),
+      acknowledgeViewerRelease: t
+        .input(schemas.desktop.acknowledgeViewerRelease.input)
+        .output(schemas.desktop.acknowledgeViewerRelease.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.acknowledgeViewerRelease(input.viewerId)
+        ),
+      openWindow: t
+        .input(schemas.desktop.openWindow.input)
+        .output(schemas.desktop.openWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.openWindow(input.workspaceId, input.instanceId)
+        ),
+      closeWindow: t
+        .input(schemas.desktop.closeWindow.input)
+        .output(schemas.desktop.closeWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.closeWindow(input.workspaceId, input.instanceId)
+        ),
+      getWindow: t
+        .input(schemas.desktop.getWindow.input)
+        .output(schemas.desktop.getWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.getWindow(input.workspaceId)
+        ),
       getPrereqStatus: t
         .input(schemas.desktop.getPrereqStatus.input)
         .output(schemas.desktop.getPrereqStatus.output)

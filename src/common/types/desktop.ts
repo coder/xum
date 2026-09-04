@@ -1,3 +1,8 @@
+import type { z } from "zod";
+import type { DesktopViewerEventSchema } from "@/common/orpc/schemas/api";
+
+export type DesktopViewerEvent = z.infer<typeof DesktopViewerEventSchema>;
+
 /**
  * Shared types for PortableDesktop integration.
  * Used by backend services and (future) oRPC routes.

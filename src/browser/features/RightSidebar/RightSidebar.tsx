@@ -46,6 +46,7 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -1399,6 +1400,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();

@@ -14101,17 +14101,31 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
   });
 
-  test("archive() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+  test("archive() releases desktop viewers before persisting the archived identity", async () => {
+    const started = createDeferred<void>();
+    const released = createDeferred<void>();
+    const close = mock(() => {
+      started.resolve();
+      return released.promise;
+    });
     const desktopSessionManager = {
       close,
       setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
-    const result = await workspaceService.archive(workspaceId);
+    const archiving = workspaceService.archive(workspaceId);
+    await started.promise;
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    try {
+      expect(entry?.archivedAt).toBeUndefined();
+    } finally {
+      released.resolve();
+    }
+    const result = await archiving;
 
     expect(result.success).toBe(true);
+    expect(entry?.archivedAt).toBeTruthy();
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });

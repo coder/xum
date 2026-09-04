@@ -31,16 +31,19 @@ describe("Mermaid layout stability", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
   let originalDOMParser: typeof globalThis.DOMParser;
+  let originalHTMLElement: typeof globalThis.HTMLElement;
 
   beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalDOMParser = globalThis.DOMParser;
+    originalHTMLElement = globalThis.HTMLElement;
 
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.DOMParser = domWindow.DOMParser;
+    globalThis.HTMLElement = domWindow.HTMLElement;
 
     mermaidParse.mockImplementation(() => Promise.resolve());
     mermaidRender.mockImplementation(() => Promise.resolve({ svg: DEFAULT_SVG }));
@@ -51,8 +54,31 @@ describe("Mermaid layout stability", () => {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.DOMParser = originalDOMParser;
+    globalThis.HTMLElement = originalHTMLElement;
     mermaidParse.mockClear();
     mermaidRender.mockClear();
+  });
+
+  test("guest Escape cannot close an expanded host diagram", async () => {
+    const view = renderMermaid();
+    fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+    const close = await view.findByRole("button", { name: "Close" });
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByRole("button", { name: "Close" })).toBe(close);
+
+    fireEvent.keyDown(close, { key: "Escape" });
+    expect(view.queryByRole("button", { name: "Close" })).toBeNull();
   });
 
   test("reserves diagram height while a streaming diagram is still rendering", () => {

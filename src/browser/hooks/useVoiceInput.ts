@@ -7,7 +7,7 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { matchesKeybind, KEYBINDS, isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   shouldTranscribeRecording,
@@ -104,6 +104,7 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   window.addEventListener(
     "keydown",
     (e) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") isSpaceCurrentlyHeld = true;
     },
     true
@@ -111,6 +112,7 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   window.addEventListener(
     "keyup",
     (e) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") isSpaceCurrentlyHeld = false;
     },
     true
@@ -418,10 +420,13 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     spaceHeldAtStartRef.current = isSpaceCurrentlyHeld;
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") spaceHeldAtStartRef.current = false;
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Global capture runs before noVNC can contain the guest's keyboard input.
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " " && !spaceHeldAtStartRef.current) {
         e.preventDefault();
         stop({ send: true });
