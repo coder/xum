@@ -6229,6 +6229,11 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
+  withWorkspaceEventLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(workspaceId.length > 0, "withWorkspaceEventLock requires workspaceId");
+    return this.workspaceEventLocks.withLock(workspaceId, operation);
+  }
+
   /**
    * Reject all foreground task waiters for a workspace that opted into backgrounding
    * when a new message is queued. Returns the number of waiters signaled.

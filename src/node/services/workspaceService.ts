@@ -2538,8 +2538,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * message: while the owner streams, the stream itself reads the level at each tool
    * boundary (AgentSession.hasPendingToolEndInput) and yields with finishReason
    * "tool-calls"; the after-idle reconcile then lands here again and sends directly.
+   *
+   * The send runs under the owner's workspace event lock (outermost — workspace removal
+   * takes the history lock while holding it, so this order is the only deadlock-free one).
+   * The lock is FIFO, so the wake cannot start — and redeem the continuation debt the cut
+   * stream took — before the stream-end handler of the stream that yielded to it has run:
+   * that handler is what reads the debt to defer, rather than settle, a delegated turn.
    */
   private async dispatchBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch
+  ): Promise<BashMonitorWakeDispatchOutcome> {
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    const underEventLock = <T>(operation: () => Promise<T>): Promise<T> =>
+      this.agentTaskIntegration != null
+        ? this.agentTaskIntegration.withWorkspaceEventLock(ownerWorkspaceId, operation)
+        : operation();
+    return underEventLock(() => this.dispatchBashMonitorWakeUnderEventLock(dispatch));
+  }
+
+  private async dispatchBashMonitorWakeUnderEventLock(
     dispatch: BashMonitorWakeDispatch
   ): Promise<BashMonitorWakeDispatchOutcome> {
     return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {

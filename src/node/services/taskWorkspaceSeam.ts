@@ -534,6 +534,12 @@ export interface AgentTaskIntegration {
     muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
     reason: WorkspaceTurnContinuationVoidReason
   ): Promise<void>;
+  /**
+   * Run `operation` under the per-workspace event lock that serializes stream-end/abort/error
+   * handling for `workspaceId` (FIFO). A send made inside it is ordered after every handler
+   * already queued for that workspace's earlier events.
+   */
+  withWorkspaceEventLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
   restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;

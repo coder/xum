@@ -71,6 +71,8 @@ export function makeAgentTaskIntegrationFake(
     resetAutoResumeCount: () => undefined,
     backgroundForegroundWaitsForWorkspace: () => 0,
     settleVoidedWorkspaceTurnContinuation: () => Promise.resolve(),
+    withWorkspaceEventLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
+      operation(),
     markInterruptedTaskRunning: () => Promise.resolve(false),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,

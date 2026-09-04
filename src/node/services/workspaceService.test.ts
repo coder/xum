@@ -967,6 +967,85 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("the wake send waits behind the owner's queued stream-end handling", async () => {
+    // The stream that yielded to the wake emits stream-end, and TaskService handles it under
+    // the workspace event lock. That handler reads the continuation debt to defer a delegated
+    // turn; a wake that streamed first would have redeemed the debt and the handler would
+    // read the cut as retracted. Dispatch therefore enters the same (FIFO) lock.
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "event-locked-wake-owner";
+    await config.addWorkspace("/tmp/event-locked-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "event-locked-wake-project",
+      projectPath: "/tmp/event-locked-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    let releaseHandler: () => void = () => undefined;
+    const handlerDone = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const lockedWorkspaceIds: string[] = [];
+    service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        withWorkspaceEventLock: async (lockedWorkspaceId, operation) => {
+          lockedWorkspaceIds.push(lockedWorkspaceId);
+          await handlerDone;
+          return operation();
+        },
+      })
+    );
+    const sendMessage = mock(
+      (
+        _workspaceId: string,
+        _prompt: string,
+        _options: unknown,
+        internal?: { onAccepted?: () => Promise<void> }
+      ) => internal?.onAccepted?.().then(() => Ok(undefined)) ?? Promise.resolve(Ok(undefined))
+    );
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      internal.aiService = { isStreaming: () => false };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => false;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.sendMessage = sendMessage;
+
+      const outcome = internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(lockedWorkspaceIds).toEqual([workspaceId]);
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      releaseHandler();
+      expect(await outcome).toBe("in-flight");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a monitor canceled while send options resolve retires the wake before it is sent", async () => {
     const { config, service, cleanup } = await createWakeWiringService();
     const workspaceId = "canceled-mid-dispatch-wake-owner";
