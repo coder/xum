@@ -13,6 +13,7 @@ import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
+import { STARTUP_STEP_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -78,7 +79,7 @@ import {
   WorktreeArchiveSnapshot,
   type AppTags,
 } from "@/node/services/di/tags";
-import { ServiceContainer } from "./serviceContainer";
+import { ServiceContainer, StartupStepTimeoutError } from "./serviceContainer";
 
 /**
  * Independent field → tag listing for every ORPC context field (the production
@@ -343,6 +344,150 @@ describe("ServiceContainer", () => {
     expect(idleCompactionStart).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).toHaveBeenCalledTimes(1);
     expect(agentStatusStart).toHaveBeenCalledTimes(1);
+  });
+
+  const CORE_STEP_NAMES = [
+    "extensionMetadata.initialize",
+    "telemetryService.initialize",
+    "policyService.initialize",
+    "experimentsService.initialize",
+    "taskService.recoverInterruptedTasks",
+  ];
+
+  /** The container's private startup bookkeeping, read for assertions only. */
+  function startupInternals(container: ServiceContainer) {
+    return container as unknown as {
+      extensionMetadata: { initialize: () => Promise<void> };
+      startupStepDurationsMs: Record<string, number>;
+    };
+  }
+
+  it("initializeCore times out a hung step on the runtime clock and skips the later steps", async () => {
+    // TestClock beneath the real graph: the per-step bound must sleep on the runtime's clock
+    // (the effect runs through the ManagedRuntime, not a global Effect.runPromise).
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    spyOn(startupInternals(services).extensionMetadata, "initialize").mockResolvedValue(undefined);
+    spyOn(services.telemetryService, "initialize").mockResolvedValue(undefined);
+    let policyCalled: (() => void) | undefined;
+    const policyCalledPromise = new Promise<void>((resolve) => {
+      policyCalled = resolve;
+    });
+    let rejectAbandonedStep: ((error: unknown) => void) | undefined;
+    spyOn(services.policyService, "initialize").mockImplementation(() => {
+      policyCalled?.();
+      return new Promise<void>((_resolve, reject) => {
+        rejectAbandonedStep = reject;
+      });
+    });
+    const experimentsInitialize = spyOn(services.experimentsService, "initialize");
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
+
+    let outcome: { settled: boolean; error?: unknown } = { settled: false };
+    const core = services.initializeCore().then(
+      () => {
+        outcome = { settled: true };
+      },
+      (error: unknown) => {
+        outcome = { settled: true, error };
+      }
+    );
+    await policyCalledPromise;
+
+    // One millisecond short of the budget the wait is still pending...
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(outcome.settled).toBe(false);
+    // ...and exactly at the budget the step is abandoned.
+    await runtime.runPromise(TestClock.adjust(Duration.millis(1)));
+    await core;
+    expect(outcome.error).toBeInstanceOf(StartupStepTimeoutError);
+    const timeoutError = outcome.error as StartupStepTimeoutError;
+    expect(timeoutError.step).toBe("policyService.initialize");
+    expect(timeoutError.timeoutMs).toBe(STARTUP_STEP_TIMEOUT_MS);
+    // The roots' default Error formatting (dialog / log line) names the class and the step.
+    expect(String(timeoutError)).toMatch(/^StartupStepTimeoutError: policyService\.initialize /);
+    expect(experimentsInitialize).not.toHaveBeenCalled();
+    expect(recoverTasks).not.toHaveBeenCalled();
+    const durations = startupInternals(services).startupStepDurationsMs;
+    expect(Object.keys(durations)).toEqual(CORE_STEP_NAMES.slice(0, 3));
+    const durationsAtTimeout = { ...durations };
+
+    // The abandoned step keeps running as a plain promise: its late rejection is neither
+    // unhandled nor a late side effect on the container.
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      rejectAbandonedStep?.(new Error("late policy failure"));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+    expect(unhandled).toEqual([]);
+    expect(durations).toEqual(durationsAtTimeout);
+    expect(experimentsInitialize).not.toHaveBeenCalled();
+    expect(recoverTasks).not.toHaveBeenCalled();
+  });
+
+  it("initializeCore rejects with the failing step's own error and skips the later steps", async () => {
+    services = new ServiceContainer(stores);
+    const boom = new Error("policy endpoint unreachable");
+    spyOn(services.policyService, "initialize").mockImplementation(() => Promise.reject(boom));
+    const experimentsInitialize = spyOn(services.experimentsService, "initialize");
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
+
+    // Identity, not a wrapped copy: roots log/print the object they receive.
+    await expect(services.initializeCore()).rejects.toBe(boom);
+    expect(experimentsInitialize).not.toHaveBeenCalled();
+    expect(recoverTasks).not.toHaveBeenCalled();
+  });
+
+  it("initializeCore rejects with a synchronously thrown step error", async () => {
+    services = new ServiceContainer(stores);
+    const boom = new Error("policy store corrupt");
+    spyOn(services.policyService, "initialize").mockImplementation(() => {
+      throw boom;
+    });
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
+
+    await expect(services.initializeCore()).rejects.toBe(boom);
+    expect(recoverTasks).not.toHaveBeenCalled();
+  });
+
+  it("initializeCore records the five core steps and re-runs them when called again", async () => {
+    services = new ServiceContainer(stores);
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
+      undefined
+    );
+
+    await services.initializeCore();
+    expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
+    // Not re-entrancy guarded (parity with the plain promise chain it replaced).
+    await services.initializeCore();
+    expect(recoverTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it("initializeCore after dispose() fails fast without running a step", async () => {
+    services = new ServiceContainer(stores);
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
+    await services.dispose();
+
+    // A disposed ManagedRuntime would otherwise reject with a bare "ManagedRuntime disposed"
+    // defect string from inside the first step.
+    await expect(services.initializeCore()).rejects.toThrow("after dispose()");
+    expect(recoverTasks).not.toHaveBeenCalled();
   });
 
   it("exposes desktopSessionManager in the ORPC context", () => {
