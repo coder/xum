@@ -380,6 +380,7 @@ function isAgentRunnableAsChild(
 }
 
 export interface TaskCreateResult {
+  desktopOwnerWorkspaceId?: string;
   taskId: string;
   kind: TaskKind;
   status: "queued" | "starting" | "running";
@@ -3106,6 +3107,7 @@ export class TaskService implements AgentTaskIntegration {
         status,
         modelString: taskModelString,
         thinkingLevel: effectiveThinkingLevel,
+        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
       });
     }
 
@@ -4074,6 +4076,7 @@ export class TaskService implements AgentTaskIntegration {
         status: "queued",
         modelString: taskModelString,
         thinkingLevel: effectiveThinkingLevel,
+        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
       });
     }
 
@@ -4340,6 +4343,7 @@ export class TaskService implements AgentTaskIntegration {
       status: "running",
       modelString: taskModelString,
       thinkingLevel: effectiveThinkingLevel,
+      desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
     });
   }
 

@@ -4090,6 +4090,7 @@ describe("TaskService", () => {
     );
     assert(result.success);
     expect(result.data.map((task) => task.status)).toEqual(["queued", "queued"]);
+    expect(result.data.map((task) => task.desktopOwnerWorkspaceId)).toEqual(owners);
     expect(
       result.data.map(
         (task) => findWorkspaceInConfig(config, task.taskId)?.taskDesktopOwnerWorkspaceId
@@ -4123,6 +4124,9 @@ describe("TaskService", () => {
       expect(result.data.status).toBe("queued");
       expect(findWorkspaceInConfig(config, result.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
         desktop === "isolated" ? undefined : parentId
+      );
+      expect(result.data.desktopOwnerWorkspaceId).toBe(
+        desktop === "isolated" ? result.data.taskId : parentId
       );
     }
   );

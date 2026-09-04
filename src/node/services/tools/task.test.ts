@@ -390,9 +390,11 @@ describe("task tool", () => {
         createWorkspaceTurn,
       } as unknown as NonNullable<typeof baseConfig.workspaceTurnManager>,
     });
-    await expect(
-      tool.execute!({ ...args, prompt: "test", title: "Operator" }, mockToolCallOptions)
-    ).rejects.toThrow("task tool input validation failed");
+    await Promise.resolve(
+      expect(
+        tool.execute!({ ...args, prompt: "test", title: "Operator" }, mockToolCallOptions)
+      ).rejects.toThrow("task tool input validation failed")
+    );
     expect(create).not.toHaveBeenCalled();
     expect(createWorkspaceTurn).not.toHaveBeenCalled();
   });
@@ -414,7 +416,7 @@ describe("task tool", () => {
         waitForAgentReport: () => Promise.resolve({ reportMarkdown: "done" }),
       } as unknown as TaskService;
       const tool = createTaskTool({ ...createTestToolConfig(tempDir.path), taskService });
-      const result = await tool.execute!(
+      const result: unknown = await tool.execute!(
         {
           agentId: "custom",
           desktop: "shared",
