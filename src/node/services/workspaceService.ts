@@ -3964,7 +3964,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
     const blockers: RestartBlocker[] = [
       { kind: "pending-turns", count: pendingTurns.size },
-      { kind: "workspace-inits", count: this.initSettlementPromises.size },
+      {
+        kind: "workspace-inits",
+        // Controllers exist from the start of provisioning; settlements from init start onward.
+        count: new Set([...this.initAbortControllers.keys(), ...this.initSettlementPromises.keys()])
+          .size,
+      },
       { kind: "queued-messages", count: queuedMessages },
       { kind: "auto-retries", count: autoRetries },
       {

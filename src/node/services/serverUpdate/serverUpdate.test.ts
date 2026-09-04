@@ -106,7 +106,8 @@ describe("server install layout", () => {
     expect(result.supported && result.layout.registry).toBe("https://registry.example.com");
     for (const [registry, supported] of [
       ["http://registry.example.com", false],
-      ["http://127.0.0.1:4873", true],
+      ["http://127.0.0.1:4873", false],
+      ["https://registry.example.com:8443/npm", true],
       ["https://user:secret@registry.example.com", false],
     ] as const) {
       expect(
@@ -297,6 +298,27 @@ describe("server updater", () => {
     events.length = 0;
     await Promise.all([updater.installUpdate(), updater.installUpdate()]);
     expect(events).toEqual(["refresh", "snapshot", "activate", "restart"]);
+  });
+  test("shutdown aborts a pending stage and waits for it to settle", async () => {
+    const { layout } = await fixture();
+    let observed: AbortSignal | undefined;
+    const updater = new ServerUpdater({ supported: true, layout }, undefined, {
+      collectBlockers: () => [],
+      restart: () => Promise.resolve(),
+      fetchDistTags: () => Promise.resolve({ next: "2.0.0" }),
+      runInstall: (_layout, _version, _install, signal) =>
+        new Promise((_resolve, reject) => {
+          observed = signal;
+          signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    });
+    await updater.checkForUpdates();
+    const download = updater.downloadUpdate();
+    expect(updater.getStatus()).toMatchObject({ type: "downloading" });
+    await updater.beginShutdown();
+    await download;
+    expect(observed?.aborted).toBe(true);
+    expect(updater.getStatus()).toMatchObject({ type: "error", phase: "download" });
   });
   test("serializes checks and downloads and refuses channel changes while busy", async () => {
     const { layout } = await fixture();

@@ -2,12 +2,14 @@ import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import { SERVER_UPDATE_CHECK_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { isExactVersion } from "./installLayout";
 
-const dispatcher = new EnvHttpProxyAgent();
+// Built on first use: a malformed proxy variable must surface as a check error, not crash startup.
+let dispatcher: Dispatcher | undefined;
 
 export async function fetchDistTags(
   registry: string,
   request: (url: string, options: RequestInit) => Promise<Response> = fetch
 ): Promise<{ latest?: string; next?: string }> {
+  dispatcher ??= new EnvHttpProxyAgent();
   const options: RequestInit & { dispatcher: Dispatcher } = {
     dispatcher,
     signal: AbortSignal.timeout(SERVER_UPDATE_CHECK_TIMEOUT_MS),

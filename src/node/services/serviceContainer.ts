@@ -600,6 +600,7 @@ export class ServiceContainer {
     // it, and nothing may dispatch through the provider/runtime services torn down below.
     shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
+    await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
     const housekeepingSettled = this.startupHousekeepingSettled;
     if (housekeepingSettled != null) {
       await shutdownStep("startupHousekeeping.join", async () => {

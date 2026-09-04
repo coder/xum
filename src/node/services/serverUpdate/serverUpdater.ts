@@ -30,6 +30,7 @@ export class ServerUpdater {
   private availableVersion: string | null = null;
   private stagedEntry: string | null = null;
   private installing = false;
+  private download: { abort: AbortController; settled: Promise<void> } | null = null;
 
   constructor(
     result: LayoutResult,
@@ -117,15 +118,34 @@ export class ServerUpdater {
     )
       return;
     this.setStatus({ type: "downloading", percent: null });
+    const abort = new AbortController();
+    const download = {
+      abort,
+      settled: this.stage(this.layout, this.availableVersion, abort.signal),
+    };
+    this.download = download;
+    await download.settled;
+    if (this.download === download) this.download = null;
+  }
+
+  private async stage(layout: InstallLayout, version: string, signal: AbortSignal): Promise<void> {
     try {
       this.stagedEntry = await (this.deps.runInstall ?? stageUpdate)(
-        this.layout,
-        this.availableVersion
+        layout,
+        version,
+        undefined,
+        signal
       );
-      this.setStatus({ type: "downloaded", info: { version: this.availableVersion } });
+      this.setStatus({ type: "downloaded", info: { version } });
     } catch (error) {
       this.setStatus({ type: "error", phase: "download", message: getErrorMessage(error) });
     }
+  }
+
+  /** A detached package manager must not outlive the server and keep writing into the stage. */
+  async beginShutdown(): Promise<void> {
+    this.download?.abort.abort();
+    await this.download?.settled;
   }
 
   async installUpdate(): Promise<void> {

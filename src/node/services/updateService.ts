@@ -11,6 +11,7 @@ interface UpdaterImpl {
   checkForUpdates(options?: { source?: "auto" | "manual" }): void | Promise<void>;
   downloadUpdate(): Promise<void>;
   installUpdate(): void | Promise<void>;
+  beginShutdown?(): Promise<void>;
   subscribe(callback: (status: UpdateStatus) => void): () => void;
   getStatus(): UpdateStatus;
   getChannel(): UpdateChannel;
@@ -113,6 +114,10 @@ export class UpdateService {
     if (this.impl) {
       await this.impl.installUpdate();
     }
+  }
+
+  async beginShutdown(): Promise<void> {
+    await this.impl?.beginShutdown?.();
   }
 
   getChannel(): UpdateChannel {
