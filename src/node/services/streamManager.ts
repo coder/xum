@@ -2367,16 +2367,20 @@ export class StreamManager {
   }
 
   private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
-    // Providers can reuse IDs across turns. Only the newest assistant call is
-    // the live anchor; its following tool-result must never win this lookup.
-    const index = messages.findLastIndex(
-      (message) =>
-        message.role === "assistant" &&
-        Array.isArray(message.content) &&
-        message.content.some(
-          (part) => part.type === "tool-call" && part.toolCallId === swap.firstTailToolCallId
-        )
-    );
+    // Reused IDs can name different turns or steps. Neither oldest nor newest
+    // proves the cut: ambiguity must use P1 instead of dropping or restoring context.
+    let index = -1;
+    for (const [messageIndex, message] of messages.entries()) {
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-call" || part.toolCallId !== swap.firstTailToolCallId) continue;
+        if (index !== -1) {
+          log.warn("[continuous-compaction] ambiguous prefix locator; retaining full context");
+          return null;
+        }
+        index = messageIndex;
+      }
+    }
     if (index < 0) {
       log.warn("[continuous-compaction] prefix locator missing; retaining full context");
       return null;

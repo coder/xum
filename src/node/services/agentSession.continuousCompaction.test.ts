@@ -130,6 +130,8 @@ describe("AgentSession continuous compaction wiring", () => {
     "disabled-terminal",
     "threshold-terminal",
     "disabled-usage-terminal",
+    "terminal-error",
+    "failed-consumed-apply",
   ] as const)("%s commits a consumed journal before retry or new work", async (mode) => {
     const h = await setup();
     const source = createMuxMessage("live-answer", "assistant", "", {
@@ -239,12 +241,32 @@ describe("AgentSession continuous compaction wiring", () => {
     source.parts.push({ type: "text", text: "post-swap crash growth" });
     await h.historyService.writePartial(workspaceId, source);
     streaming = false;
+    if (mode === "failed-consumed-apply") {
+      Reflect.set(h.session, "continuousCompactionStopped", true);
+      const reset = spyOn(compactor, "reset");
+      await internals(h.session).finishContinuousCompaction(false, {
+        modelString: model,
+        options: sendOptions,
+        providersConfig: null,
+      });
+      expect(reset).not.toHaveBeenCalled();
+      expect(await store.read()).not.toBeNull();
+      Reflect.set(h.session, "continuousCompactionStopped", false);
+    }
     if (mode !== "startup") {
       const terminal = Reflect.get(h.session, "observeContinuousCompactionAtStreamEnd") as (
         model: string,
         options: SendMessageOptions
       ) => Promise<void>;
       const options = { ...sendOptions, experiments: { continuousCompaction: false } };
+      if (mode === "terminal-error") {
+        spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(() =>
+          Promise.reject(new Error("temporary terminal history failure"))
+        );
+        await terminal.call(h.session, model, options);
+        expect(await store.read()).not.toBeNull();
+        expect(compactor.hasConsumedSwap()).toBe(true);
+      }
       await terminal.call(h.session, model, options);
       await terminal.call(h.session, model, options);
       const history = await rows(h);
@@ -475,6 +497,220 @@ describe("AgentSession continuous compaction wiring", () => {
     });
   });
 
+  test("invalidation contains an initial wait rejection and safely stops the blocked stream", async () => {
+    const h = await setup();
+    const compactor = internals(h.session).continuousCompactor;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    let streaming = true;
+    internals(h.session).activeStreamContext = {
+      modelString: model,
+      options: sendOptions,
+      providersConfig: null,
+    };
+    spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
+    spyOn(h.aiService, "getStreamInfo").mockReturnValue({
+      messageId: "live-assistant",
+      parts: [],
+      toolCompletionTimestamps: new Map(),
+    });
+    Reflect.set(Reflect.get(h.session, "streamManager"), "getPrefixSwapState", () => "invalidated");
+    spyOn(compactor, "waitForIdle").mockImplementationOnce(() =>
+      Promise.reject(new Error("apply wait failed"))
+    );
+    const reset = spyOn(compactor, "reset");
+    const drain = spyOn(h.session, "drainQueuedMessagesIfIdle");
+    const stop = spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
+      expect(options?.abortReason).toBe("system");
+      streaming = false;
+      h.aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: "live-assistant",
+        abortReason: "system",
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+    try {
+      startStream(h);
+      h.aiEmitter.emit("prefix-swap-invalidated", {
+        type: "prefix-swap-invalidated",
+        workspaceId,
+        messageId: "live-assistant",
+      });
+      await h.session.waitForIdle();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(reset).not.toHaveBeenCalled();
+      expect(drain).not.toHaveBeenCalled();
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
+      stop.mockRestore();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("duplicate invalidations wait for the owner and never clear another observation's flags", async () => {
+    const h = await setup();
+    let streaming = true;
+    internals(h.session).activeStreamContext = {
+      modelString: model,
+      options: sendOptions,
+      providersConfig: null,
+    };
+    spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
+    spyOn(h.aiService, "getStreamInfo").mockReturnValue({
+      messageId: "live-assistant",
+      parts: [],
+      toolCompletionTimestamps: new Map(),
+    });
+    const release = deferred<void>();
+    const invoked = deferred<void>();
+    const drain = spyOn(h.session, "drainQueuedMessagesIfIdle").mockImplementation(() => undefined);
+    const run = Reflect.get(h.session, "runContinuousCompactionObservation") as (
+      observe: () => Promise<void>
+    ) => Promise<void>;
+    const first = run.call(h.session, async () => {
+      Reflect.set(h.session, "midStreamCompactionPending", true);
+      await release.promise;
+    });
+    const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      () => {
+        streaming = false;
+        internals(h.session).activeStreamContext = undefined;
+        invoked.resolve();
+        return Promise.resolve("none");
+      }
+    );
+    const event = { type: "prefix-swap-invalidated", workspaceId, messageId: "live-assistant" };
+    h.aiEmitter.emit("prefix-swap-invalidated", event);
+    h.aiEmitter.emit("prefix-swap-invalidated", event);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(true);
+    expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(true);
+    expect(drain).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    release.resolve();
+    await first;
+    await invoked.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(drain).toHaveBeenCalledTimes(2);
+    expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(false);
+    expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(false);
+  });
+
+  test.each(["usage-delta", "prefix-swap-invalidated"] as const)(
+    "%s contains a follow-up history read rejection and preserves durable retry",
+    async (eventType) => {
+      const h = await setup();
+      const unhandled: unknown[] = [];
+      const onUnhandled = (error: unknown) => {
+        unhandled.push(error);
+      };
+      process.on("unhandledRejection", onUnhandled);
+      const drained = deferred<void>();
+      const failedRead = deferred<void>();
+      let watching = false;
+      spyOn(h.session, "drainQueuedMessagesIfIdle").mockImplementation(() => {
+        if (watching) drained.resolve();
+      });
+      let streaming = false;
+      spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+        streaming = true;
+        startStream(h);
+        return Promise.resolve(Ok(createStartedTurnHandle()));
+      });
+      const stop = spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        streaming = false;
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("live-assistant", "assistant", "Committed partial")
+        );
+        h.aiEmitter.emit("stream-abort", {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "live-assistant",
+          abortReason: "system",
+        });
+        return Ok(undefined);
+      });
+      let failRead = false;
+      const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+      spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementation((id) => {
+        if (failRead) {
+          failRead = false;
+          failedRead.resolve();
+          return Promise.reject(new Error("transient follow-up history read"));
+        }
+        return read(id);
+      });
+      const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+        async (_usage, context) => {
+          if (context.phase !== "mid-stream") return "none";
+          const applied = await internals(h.session).interruptForContinuousCompaction(
+            async (followUp) => {
+              const history = await rows(h);
+              const applied = await handler.persistContinuousCompaction({
+                messages: history,
+                text: "Recovered summary",
+                model,
+                tail: history.slice(-1),
+                pendingFollowUp: followUp,
+                systemMessageTokens: 0,
+                attachmentTokens: 0,
+                shouldPersist: () => true,
+              });
+              failRead = true;
+              return applied;
+            }
+          );
+          return applied ? "applied" : "none";
+        }
+      );
+      try {
+        expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+        spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
+        spyOn(h.aiService, "getStreamInfo").mockReturnValue({
+          messageId: "live-assistant",
+          parts: [],
+          toolCompletionTimestamps: new Map(),
+        });
+        watching = true;
+        h.aiEmitter.emit(eventType, {
+          type: eventType,
+          workspaceId,
+          messageId: "live-assistant",
+          usage: { inputTokens: 92_160, outputTokens: 1, totalTokens: 92_161 },
+        });
+        await failedRead.promise;
+        await drained.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(unhandled).toEqual([]);
+        expect(h.session.isBusy()).toBe(false);
+        expect(Reflect.get(h.session, "continuousCompactionObserving")).toBe(false);
+        expect(Reflect.get(h.session, "midStreamCompactionPending")).toBe(false);
+        const boundary = (await rows(h))[0];
+        expect(Reflect.get(h.session, "pendingCompactionFollowUpSummaryId")).toBe(boundary.id);
+        expect(boundary.metadata?.muxMetadata?.type).toBe("compaction-summary");
+        expect(
+          boundary.metadata?.muxMetadata?.type === "compaction-summary" &&
+            boundary.metadata.muxMetadata.pendingFollowUp?.text
+        ).toBe("Continue");
+        expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded(boundary.id)).toBe(true);
+        expect((await rows(h)).at(-1)?.parts).toMatchObject([{ type: "text", text: "Continue" }]);
+      } finally {
+        stop.mockRestore();
+        process.off("unhandledRejection", onUnhandled);
+      }
+    }
+  );
+
   test.each(["usage-delta", "prefix-swap-invalidated"] as const)(
     "%s fast apply commits after system stop then resumes without a compact turn or latch recursion",
     async (eventType) => {
@@ -577,6 +813,7 @@ describe("AgentSession continuous compaction wiring", () => {
       });
       if (eventType === "prefix-swap-invalidated") {
         expect(order).toEqual([]);
+        Reflect.set(h.session, "continuousCompactionObserving", false);
         observationFinished.resolve();
       }
       await resumed.promise;

@@ -749,6 +749,7 @@ export class AgentSession {
   private continuousCompactionAbandoned = false;
   private continuousCompactionStopped = false;
   private continuousCompactionObserving = false;
+  private continuousCompactionObservation: Promise<void> | null = null;
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
@@ -4981,22 +4982,96 @@ export class AgentSession {
       this.deferQueuedFlushUntilAfterEdit
     )
       return;
-    const context = this.getContinuousCompactionContext(model, options);
-    if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
-      this.continuousCompactor.reset("disabled");
-      return;
+    try {
+      const context = this.getContinuousCompactionContext(model, options);
+      if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
+        this.continuousCompactor.reset("disabled");
+        return;
+      }
+      const usage = this.compactionMonitor.checkBeforeSend({
+        model,
+        usage: this.getUsageState(),
+        use1MContext: this.is1MContextEnabledForModel(
+          model,
+          options,
+          this.getProvidersConfigSafe()
+        ),
+        providersConfig: this.getProvidersConfigSafe(),
+      });
+      const result = await this.continuousCompactor.observe(usage.usagePercentage, {
+        ...context,
+        phase: "stream-end",
+      });
+      if (result === "applied") this.clearUsageState();
+    } catch (error) {
+      await this.recoverContinuousCompactionFailure(error);
     }
-    const usage = this.compactionMonitor.checkBeforeSend({
-      model,
-      usage: this.getUsageState(),
-      use1MContext: this.is1MContextEnabledForModel(model, options, this.getProvidersConfigSafe()),
-      providersConfig: this.getProvidersConfigSafe(),
+  }
+
+  private async recoverContinuousCompactionFailure(
+    error: unknown,
+    ownsObservation = false
+  ): Promise<void> {
+    log.warn(
+      "[continuous-compaction] observation failed; preserving durable recovery state",
+      error
+    );
+    try {
+      // An invalidated prepareStep waits for abort. If failure preceded the stop,
+      // release that wait without resetting the consumed journal or saved follow-up.
+      if (
+        (!ownsObservation && this.midStreamCompactionPending) ||
+        !this.streamManager.isStreaming(this.workspaceId) ||
+        this.streamManager.getPrefixSwapState?.(this.workspaceId) !== "invalidated"
+      )
+        return;
+      const result = await this.streamManager.stopStream(this.workspaceId, {
+        abortReason: "system",
+      });
+      if (!result.success) log.warn("[continuous-compaction] recovery stop failed", result.error);
+    } catch (stopError) {
+      log.warn("[continuous-compaction] recovery stop failed", stopError);
+    }
+  }
+
+  private async waitForContinuousCompactionObservation(): Promise<void> {
+    while (this.continuousCompactionObservation) await this.continuousCompactionObservation;
+  }
+
+  private async runContinuousCompactionObservation<T>(
+    observe: () => Promise<T>
+  ): Promise<T | undefined> {
+    if (this.continuousCompactionObservation) {
+      await this.continuousCompactionObservation;
+      return undefined;
+    }
+    let finish!: () => void;
+    const observation = new Promise<void>((resolve) => {
+      finish = resolve;
     });
-    const result = await this.continuousCompactor.observe(usage.usagePercentage, {
-      ...context,
-      phase: "stream-end",
-    });
-    if (result === "applied") this.clearUsageState();
+    this.continuousCompactionObservation = observation;
+    this.continuousCompactionObserving = true;
+    try {
+      return await observe();
+    } catch (error) {
+      await this.recoverContinuousCompactionFailure(error, true);
+      return undefined;
+    } finally {
+      // Reserve through dispatch and cleanup, not just the compactor's apply latch.
+      // Waiters/duplicate invalidations never own or clear these flags.
+      if (this.continuousCompactionObservation === observation) {
+        this.midStreamCompactionPending = false;
+        this.continuousCompactionStopped = false;
+        this.continuousCompactionObserving = false;
+        this.continuousCompactionObservation = null;
+        try {
+          this.drainQueuedMessagesIfIdle();
+        } catch (error) {
+          log.warn("[continuous-compaction] queued drain failed", error);
+        }
+      }
+      finish();
+    }
   }
 
   private async interruptForContinuousCompaction(
@@ -5057,6 +5132,9 @@ export class AgentSession {
       "Continue must dispatch after the apply latch clears"
     );
     if (!this.continuousCompactionStopped || !context.options) return;
+    // A consumed journal is an outstanding durable obligation, not a failed
+    // speculative summary. Leave it retryable instead of resetting into legacy compaction.
+    if (!applied && this.continuousCompactor.hasConsumedSwap()) return;
     if (!applied) {
       const followUp = this.buildContinuousCompactionFollowUp(context);
       // The completed step can outgrow the staged tail budget during stop.
@@ -5112,11 +5190,12 @@ export class AgentSession {
     }
     this.lastUsageState = undefined;
     const summaryId = this.pendingCompactionFollowUpSummaryId;
-    this.pendingCompactionFollowUpSummaryId = null;
     await this.dispatchPendingFollowUp(
       summaryId ?? undefined,
       () => this.continuousCompactionAbandoned
     );
+    if (this.pendingCompactionFollowUpSummaryId === summaryId)
+      this.pendingCompactionFollowUpSummaryId = null;
   }
 
   private async interruptForCompaction(): Promise<void> {
@@ -6255,34 +6334,35 @@ export class AgentSession {
     });
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
     forward("prefix-swap-invalidated", async (payload) => {
-      if (
-        payload.type !== "prefix-swap-invalidated" ||
-        payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId
-      )
-        return;
-      // A usage observation can overlap the fallback. Join it rather than dropping
-      // the only invalidation event while the fallback's prepareStep is blocked.
-      await this.continuousCompactor.waitForIdle();
-      const context = this.activeStreamContext;
-      if (
-        !context ||
-        this.midStreamCompactionPending ||
-        !this.streamManager.isStreaming(this.workspaceId)
-      )
-        return;
-      this.continuousCompactionObserving = true;
       try {
-        const result = await this.continuousCompactor.observe(0, {
-          ...this.getContinuousCompactionContext(context.modelString, context.options),
-          phase: "mid-stream",
+        if (
+          payload.type !== "prefix-swap-invalidated" ||
+          payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId
+        )
+          return;
+        // Wait for the entire owning observer, including its follow-up dispatch.
+        await this.waitForContinuousCompactionObservation();
+        await this.continuousCompactor.waitForIdle();
+        await this.waitForContinuousCompactionObservation();
+        const context = this.activeStreamContext;
+        if (
+          !context ||
+          this.continuousCompactionObserving ||
+          this.midStreamCompactionPending ||
+          payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId ||
+          !this.streamManager.isStreaming(this.workspaceId)
+        )
+          return;
+        await this.runContinuousCompactionObservation(async () => {
+          const result = await this.continuousCompactor.observe(0, {
+            ...this.getContinuousCompactionContext(context.modelString, context.options),
+            phase: "mid-stream",
+          });
+          this.midStreamCompactionPending = false;
+          await this.finishContinuousCompaction(result === "applied", context);
         });
-        this.midStreamCompactionPending = false;
-        await this.finishContinuousCompaction(result === "applied", context);
-      } finally {
-        this.midStreamCompactionPending = false;
-        this.continuousCompactionStopped = false;
-        this.continuousCompactionObserving = false;
-        this.drainQueuedMessagesIfIdle();
+      } catch (error) {
+        await this.recoverContinuousCompactionFailure(error);
       }
     });
 
@@ -6343,23 +6423,20 @@ export class AgentSession {
       if (continuousContext.enabled || consumedSwapPending) {
         // One usage handler owns the eventual resume; observe itself shares its
         // latch result, which must not dispatch the continuation twice.
-        this.continuousCompactionObserving = true;
-        try {
-          continuousResult = await this.continuousCompactor.observe(usagePercent, {
+        const observed = await this.runContinuousCompactionObservation(async () => {
+          const result = await this.continuousCompactor.observe(usagePercent, {
             ...continuousContext,
             phase: "mid-stream",
           });
           if (this.midStreamCompactionPending) {
-            await this.finishContinuousCompaction(continuousResult === "applied", streamContext);
-            return;
+            await this.finishContinuousCompaction(result === "applied", streamContext);
+            return undefined;
           }
-          if (continuousResult === "applied") this.clearUsageState();
-        } finally {
-          this.midStreamCompactionPending = false;
-          this.continuousCompactionStopped = false;
-          this.continuousCompactionObserving = false;
-          this.drainQueuedMessagesIfIdle();
-        }
+          if (result === "applied") this.clearUsageState();
+          return result;
+        });
+        if (observed === undefined) return;
+        continuousResult = observed;
       }
       if (
         continuousResult === "applied" ||

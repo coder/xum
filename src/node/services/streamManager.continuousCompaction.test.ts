@@ -217,39 +217,35 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
   });
 
-  it("anchors the newest assistant tool call when IDs repeat across turns, not its tool result", async () => {
-    const { run, swap } = await setup();
-    const currentTail: ai.ModelMessage[] = [
-      {
+  it.each(["historical", "live-steps", "same-message"] as const)(
+    "declines ambiguous %s anchors before journaling",
+    async (mode) => {
+      const { run, store, tracker } = await setup();
+      const duplicate: ai.AssistantModelMessage = {
         role: "assistant",
         content: [
-          { type: "text", text: "Current live step" },
-          { type: "tool-call", toolCallId: "keep", toolName: "bash", input: { step: "current" } },
+          { type: "tool-call", toolCallId: "keep", toolName: "bash", input: { step: "duplicate" } },
         ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "keep",
-            toolName: "bash",
-            output: { type: "text", value: "Current result" },
-          },
-        ],
-      },
-    ];
-    const messages = [
-      ...originalMessages,
-      { role: "user" as const, content: "New turn after obsolete head" },
-      ...currentTail,
-    ];
-    const result = await run(messages);
-    assert(result?.messages, "Expected a prefix swap at the live step");
-    expect(result.messages.slice(swap.prefix.length)).toEqual(currentTail);
-    expect(JSON.stringify(result.messages)).not.toContain("kept output");
-    expect(JSON.stringify(result.messages)).not.toContain("New turn after obsolete head");
-  });
+      };
+      assert(Array.isArray(duplicate.content), "Duplicate fixture requires content parts");
+      const messages: ai.ModelMessage[] =
+        mode === "same-message"
+          ? [{ role: "assistant", content: [...duplicate.content, ...duplicate.content] }]
+          : [
+              ...originalMessages,
+              ...(mode === "historical" ? [{ role: "user" as const, content: "Next turn" }] : []),
+              duplicate,
+              originalMessages[4],
+            ];
+      const write = spyOn(store, "write");
+      expect(await run(messages)).toBeUndefined();
+      expect(tracker.latestMessages).toEqual(messages);
+      expect(tracker.pendingPrefixSwap).toBeUndefined();
+      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(write).not.toHaveBeenCalled();
+      expect(await store.read()).toBeNull();
+    }
+  );
 
   it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
     const { run, tracker, store, swap } = await setup();
@@ -560,6 +556,7 @@ describe("continuous prefix prepareStep and journal", () => {
       "static-cut",
       "sliced-row",
       "journal-failure",
+      "ambiguous-anchor",
     ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
@@ -670,8 +667,9 @@ describe("continuous prefix prepareStep and journal", () => {
           anthropicCacheTtl: "1h",
           workspaceId,
           history: [
-            createMuxMessage("obsolete-user", "user", "Obsolete turn"),
-            obsolete,
+            ...(mode === "ambiguous-anchor"
+              ? [createMuxMessage("obsolete-user", "user", "Obsolete turn"), obsolete]
+              : []),
             ...(committed
               ? [createMuxMessage("earlier-prompt", "user", "earlier request"), committed]
               : []),
@@ -769,11 +767,21 @@ describe("continuous prefix prepareStep and journal", () => {
           })
         ).toEqual({ kind: "swapped" });
         expect(events).toEqual(
-          consumed && (family === "openai" || sliced || mode === "journal-failure")
+          consumed &&
+            (family === "openai" ||
+              sliced ||
+              mode === "journal-failure" ||
+              mode === "ambiguous-anchor")
             ? ["prefix-swap-invalidated"]
             : []
         );
-        if (consumed && family === "anthropic" && !sliced && mode !== "journal-failure") {
+        if (
+          consumed &&
+          family === "anthropic" &&
+          !sliced &&
+          mode !== "journal-failure" &&
+          mode !== "ambiguous-anchor"
+        ) {
           expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
           expect(JSON.stringify(stream.request.messages)).not.toContain("obsolete result");
           const systems = preparedMessages.filter((message) => message.role === "system");
@@ -813,7 +821,13 @@ describe("continuous prefix prepareStep and journal", () => {
         }
         expect(Reflect.get(stream.request, "system")).toEqual(payload.system);
         expect(Reflect.get(stream.request, "tools")).toHaveProperty("nextTool");
-        if (consumed && (family === "openai" || sliced || mode === "journal-failure")) {
+        if (
+          consumed &&
+          (family === "openai" ||
+            sliced ||
+            mode === "journal-failure" ||
+            mode === "ambiguous-anchor")
+        ) {
           const blocked = prepareHarness(manager, tracker);
           const result = blocked.run().catch((error: unknown) => error);
           blocked.controller.abort(new Error("stop for durable fold"));
