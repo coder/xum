@@ -142,6 +142,25 @@ describe("inferPhaseManifest", () => {
           `run = ({ phase }) => { phase("b"); return {}; };\n`
       )
     ).toBeUndefined();
+    // Non-binary rebinding forms: destructuring assignment and for-of targets.
+    expect(
+      phaseNames(
+        `export default function run({ phase }) { phase("a"); return {}; }\n` +
+          `({ run } = replacements);\n`
+      )
+    ).toBeUndefined();
+    expect(
+      phaseNames(
+        `const run = ({ phase }) => { phase("a"); return {}; };\n` +
+          `for (run of replacements) {}\nexport default run;\n`
+      )
+    ).toBeUndefined();
+    // Any other mention (passing the binding around) is enough to bail.
+    expect(
+      phaseNames(
+        `function run({ phase }) { phase("a"); return {}; }\nregister(run);\nexport default run;\n`
+      )
+    ).toBeUndefined();
   });
 
   test("bails when direct eval could touch the phase binding", () => {
@@ -150,6 +169,8 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(legacyWorkflow(`phase("a"); const n = eval("1 + 1"); log(n);`))
     ).toBeUndefined();
+    // Parenthesized callee is still a direct eval (the Reference survives).
+    expect(phaseNames(legacyWorkflow(`((eval))("phase = () => {}"); phase("b");`))).toBeUndefined();
     // Indirect eval / member calls named eval do not share the lexical scope.
     expect(
       phaseNames(legacyWorkflow(`phase("a"); const g = globalThis; log(g.eval("1"));`))

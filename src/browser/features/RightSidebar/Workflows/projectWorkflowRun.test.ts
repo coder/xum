@@ -844,6 +844,37 @@ describe("projectWorkflowRun — declared phase manifest", () => {
     expect(getActiveWorkflowPhase(view.phases)?.name).toBe("scope");
   });
 
+  test("active phase is the entered phase even while an earlier phase's step still runs", () => {
+    // phase(scope); agent(...) still in flight; phase(verify) — rail order must not
+    // regress the header to "phase 1/N" just because scope still has live work.
+    const view = projectWorkflowRun(
+      manifestRun({
+        events: [
+          phaseEvent(1, "scope"),
+          {
+            sequence: 2,
+            type: "task",
+            at: at(2),
+            stepId: "s1",
+            taskId: "t1",
+            status: "started",
+            title: "Background scope task",
+          },
+          phaseEvent(3, "verify"),
+        ],
+        steps: [
+          { stepId: "s1", inputHash: "h", status: "started", taskId: "t1", startedAt: at(2) },
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.running, phase.lifecycle])).toEqual([
+      ["scope", true, "completed"],
+      ["verify", false, "running"],
+      ["synthesize", false, "pending"],
+    ]);
+    expect(getActiveWorkflowPhase(view.phases)?.name).toBe("verify");
+  });
+
   test("no active phase before the first phase event on a declared run", () => {
     // Pending / setup-failed declared runs seed an all-unvisited rail; a summary
     // must not claim the last manifest phase ("phase 3/3") for them.

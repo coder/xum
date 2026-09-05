@@ -196,16 +196,16 @@ export const WorkflowPhaseFlow: React.FC<WorkflowPhaseFlowProps> = (props) => {
       {/* Wraps at narrow widths (~375px) instead of overflowing the card. */}
       <div className="flex min-w-0 flex-wrap items-center gap-y-1" role="list">
         {props.nodes.map((node, index) => (
-          <React.Fragment key={node.name}>
+          // The connector lives INSIDE the node's flex item so a wrap can never
+          // strand a dangling line at the end of a row.
+          <span key={node.name} role="listitem" className="flex min-w-0 items-center">
             {index > 0 && <span aria-hidden="true" className="bg-border h-px w-2.5 shrink-0" />}
-            <span role="listitem" className="flex min-w-0 items-center">
-              <PhaseFlowNode
-                node={node}
-                activeLayoutId={activeLayoutId}
-                onSelect={props.onPhaseSelect}
-              />
-            </span>
-          </React.Fragment>
+            <PhaseFlowNode
+              node={node}
+              activeLayoutId={activeLayoutId}
+              onSelect={props.onPhaseSelect}
+            />
+          </span>
         ))}
         {props.provenance === "inferred" && (
           <TooltipIfPresent tooltip="Phases inferred from the script's phase() calls; order and coverage are best-effort. Declare meta.phases for an exact rail.">

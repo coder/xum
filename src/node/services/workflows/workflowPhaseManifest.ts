@@ -218,9 +218,12 @@ function findDefaultExportedFunction(
       hasModifier(statement, ts.SyntaxKind.ExportKeyword) &&
       hasModifier(statement, ts.SyntaxKind.DefaultKeyword)
     ) {
-      // `export default function run` is a live binding: a later `run = ...`
-      // changes what the default export executes, so treat it like `export default run`.
-      if (statement.name != null && isReassigned(ts, sourceFile, statement.name.text)) {
+      // `export default function run` is a live binding: any later mention of
+      // `run` could rebind what the default export executes.
+      if (
+        statement.name != null &&
+        hasOtherReferences(ts, sourceFile, statement.name.text, new Set([statement.name]))
+      ) {
         return undefined;
       }
       return statement;
@@ -244,14 +247,26 @@ function resolveFunctionExpression(
     return undefined;
   }
   // `export default run;` referencing a top-level function or const initializer.
-  // The binding must be immutable AND never reassigned: `let run = a; run = b;`
+  // The binding must be immutable AND mentioned nowhere else: `let run = a; run = b;`
   // would make the initializer describe a function the runtime never executes.
-  if (isReassigned(ts, sourceFile, expression.text)) {
+  const resolved = findImmutableFunctionBinding(ts, sourceFile, expression.text);
+  if (resolved == null) {
     return undefined;
   }
+  if (hasOtherReferences(ts, sourceFile, expression.text, new Set([resolved.name, expression]))) {
+    return undefined;
+  }
+  return resolved.fn;
+}
+
+function findImmutableFunctionBinding(
+  ts: TypeScriptModule,
+  sourceFile: ts.SourceFile,
+  name: string
+): { name: ts.Identifier; fn: WorkflowFunctionNode } | undefined {
   for (const statement of sourceFile.statements) {
-    if (ts.isFunctionDeclaration(statement) && statement.name?.text === expression.text) {
-      return statement;
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text === name) {
+      return { name: statement.name, fn: statement };
     }
     if (
       ts.isVariableStatement(statement) &&
@@ -260,12 +275,12 @@ function resolveFunctionExpression(
       for (const declaration of statement.declarationList.declarations) {
         if (
           ts.isIdentifier(declaration.name) &&
-          declaration.name.text === expression.text &&
+          declaration.name.text === name &&
           declaration.initializer != null &&
           (ts.isFunctionExpression(declaration.initializer) ||
             ts.isArrowFunction(declaration.initializer))
         ) {
-          return declaration.initializer;
+          return { name: declaration.name, fn: declaration.initializer };
         }
       }
     }
@@ -274,37 +289,40 @@ function resolveFunctionExpression(
 }
 
 function containsDirectEval(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
-  const check = (node: ts.Node): boolean =>
-    (ts.isCallExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === "eval") ||
-    ts.forEachChild(node, check) === true;
+  // `(eval)(x)` is still a direct eval — parentheses preserve the Reference —
+  // whereas `(0, eval)(x)` and `obj.eval(x)` are indirect and out of scope.
+  const unwrap = (node: ts.Expression): ts.Expression =>
+    ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node;
+  const check = (node: ts.Node): boolean => {
+    if (ts.isCallExpression(node)) {
+      const callee = unwrap(node.expression);
+      if (ts.isIdentifier(callee) && callee.text === "eval") {
+        return true;
+      }
+    }
+    return ts.forEachChild(node, check) === true;
+  };
   return check(sourceFile);
 }
 
-/** Any assignment or ++/-- targeting the top-level identifier `name` anywhere in the file. */
-function isReassigned(ts: TypeScriptModule, sourceFile: ts.SourceFile, name: string): boolean {
-  const targets = (node: ts.Node): boolean => {
-    if (ts.isBinaryExpression(node)) {
-      const kind = node.operatorToken.kind;
-      if (
-        kind >= ts.SyntaxKind.FirstAssignment &&
-        kind <= ts.SyntaxKind.LastAssignment &&
-        ts.isIdentifier(node.left) &&
-        node.left.text === name
-      ) {
-        return true;
-      }
-    } else if (
-      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
-      ts.isIdentifier(node.operand) &&
-      node.operand.text === name
-    ) {
-      return true;
-    }
-    return ts.forEachChild(node, targets) === true;
-  };
-  return targets(sourceFile);
+/**
+ * True when the identifier `name` is referenced anywhere other than the nodes in
+ * `allowed` (its declaration and the `export default name` expression). Any other
+ * mention — `name = f`, `({ name } = o)`, `for (name of xs)`, `helper(name)` — could
+ * rebind or observe the live export, so inference gives up rather than enumerate
+ * assignment forms. Property names (`obj.name`, `{ name: 1 }`) also bail: harmless
+ * over-caution for the all-or-nothing gate.
+ */
+function hasOtherReferences(
+  ts: TypeScriptModule,
+  sourceFile: ts.SourceFile,
+  name: string,
+  allowed: ReadonlySet<ts.Node>
+): boolean {
+  const check = (node: ts.Node): boolean =>
+    (ts.isIdentifier(node) && node.text === name && !allowed.has(node)) ||
+    ts.forEachChild(node, check) === true;
+  return check(sourceFile);
 }
 
 function hasModifier(node: ts.FunctionDeclaration, kind: ts.SyntaxKind): boolean {

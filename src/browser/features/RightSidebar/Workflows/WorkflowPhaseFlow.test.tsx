@@ -105,6 +105,31 @@ describe("WorkflowPhaseFlow", () => {
     expect(rendered.getByText("Skipped")).toBeTruthy();
   });
 
+  test("each connector is grouped inside its following node's list item", () => {
+    // flex-wrap can only break BETWEEN list items, so a connector that lives inside
+    // the item it leads into can never be stranded at the end of a row.
+    const rendered = render(
+      <WorkflowPhaseFlow
+        nodes={[
+          { name: "a", label: "A", lifecycle: "completed" },
+          { name: "b", label: "B", lifecycle: "running" },
+          { name: "c", label: "C", lifecycle: "pending" },
+        ]}
+        provenance="declared"
+      />
+    );
+    const items = rendered.getAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    const connectorCounts = items.map(
+      (item) => item.querySelectorAll(':scope > [aria-hidden="true"]').length
+    );
+    expect(connectorCounts).toEqual([0, 1, 1]);
+    // No connector may sit directly in the list between items.
+    expect(
+      rendered.getByRole("list").querySelectorAll(':scope > [aria-hidden="true"]')
+    ).toHaveLength(0);
+  });
+
   test("renders nothing for an empty node list", () => {
     const rendered = render(<WorkflowPhaseFlow nodes={[]} provenance="declared" />);
     expect(rendered.container.textContent).toBe("");
