@@ -150,7 +150,7 @@ describe("session_history real disk recovery", () => {
       windowId: "w:m:legacy-reset",
     });
     expect(result.malformedLines).toBeGreaterThan(0);
-    expect((await call({ action: "read_item", itemId: "0" })).error).toBe("item_not_found");
+    expect((await call({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   test("lists root, sequenced compactions, heartbeat/rollover windows and legacy IDs", async () => {
@@ -190,7 +190,7 @@ describe("session_history real disk recovery", () => {
       `w:${String(roll.metadata!.historySequence)}`,
       "w:m:legacy-boundary",
     ]);
-    expect((await call({ action: "read_item", itemId: "m:legacy-item" })).items?.[0]?.text).toBe(
+    expect((await call({ action: "read_item", item_id: "m:legacy-item" })).items?.[0]?.text).toBe(
       "legacy facts"
     );
     expect(
@@ -198,7 +198,7 @@ describe("session_history real disk recovery", () => {
         await call({
           action: "search",
           query: "facts",
-          windowId: `w:${String(roll.metadata!.historySequence)}`,
+          window_id: `w:${String(roll.metadata!.historySequence)}`,
         })
       ).items?.map((item) => item.text)
     ).toEqual(["recent facts"]);
@@ -213,14 +213,16 @@ describe("session_history real disk recovery", () => {
     await fs.appendFile(chatPath, tail.map((message) => JSON.stringify(message)).join("\n") + "\n");
     const first = await call({
       action: "read_item",
-      itemId: String(hidden.metadata!.historySequence),
+      item_id: String(hidden.metadata!.historySequence),
     });
     expect(first.items).toEqual([]);
     expect(first.nextCursor).toBeString();
-    const all = await pages({ action: "search", query: "private-before-reset", windowId: "w:0" });
+    expect(first.exhausted).toBe(false);
+    const all = await pages({ action: "search", query: "private-before-reset", window_id: "w:0" });
     expect(all.flatMap((page) => page.items ?? [])).toEqual([]);
+    expect(all.at(-1)?.exhausted).toBe(true);
     expect(
-      (await pages({ action: "read_item", itemId: String(hidden.metadata!.historySequence) })).at(
+      (await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })).at(
         -1
       )?.error
     ).toBe("item_not_found");
@@ -239,7 +241,7 @@ describe("session_history real disk recovery", () => {
       (
         await call({
           action: "read_item",
-          itemId: String(hidden.metadata!.historySequence),
+          item_id: String(hidden.metadata!.historySequence),
           cursor: Buffer.from(JSON.stringify(envelope)).toString("base64url"),
         })
       ).error
@@ -275,7 +277,7 @@ describe("session_history real disk recovery", () => {
     expect((await call({ action: "search", query: "NEEDLE" })).items?.length).toBe(2);
     const read = await call({
       action: "read_item",
-      itemId: String(mixed.metadata!.historySequence),
+      item_id: String(mixed.metadata!.historySequence),
     });
     expect(read.items?.[0]?.text).toContain("safe");
     expect(read.items?.[0]?.text).not.toContain("private needle");
@@ -291,12 +293,51 @@ describe("session_history real disk recovery", () => {
     expect(all.map((item) => item.text)).toEqual(["A [x].* literal", "another [X].* value"]);
     const read = await call({
       action: "read_item",
-      itemId: String(first.metadata!.historySequence),
-      charOffset: 2,
-      charLimit: 5,
+      item_id: String(first.metadata!.historySequence),
+      offset_chars: 2,
+      limit_chars: 5,
     });
     expect(read.items?.[0]?.text).toBe("[x].*");
     expect(read.items?.[0]?.nextCharOffset).toBe(7);
+  });
+
+  test("default read returns 8000 fitting ASCII characters and snake-case inputs resume the remainder", async () => {
+    const text = "a".repeat(8000) + "remaining".repeat(250);
+    const message = await append("paged-item", text);
+    const first = await call({
+      action: "read_item",
+      item_id: String(message.metadata!.historySequence),
+      window_id: null,
+      offset_chars: null,
+      limit_chars: null,
+      cursor: null,
+      limit: null,
+    });
+    expect(first.items?.[0]?.text).toBe(text.slice(0, 8000));
+    expect(first.items?.[0]?.nextCharOffset).toBe(8000);
+    expect(first.exhausted).toBe(true);
+    expect(first.skipped_oversized_rows).toBe(0);
+    const second = await call({
+      action: "read_item",
+      item_id: first.items![0].itemId,
+      window_id: first.items![0].windowId,
+      offset_chars: first.items![0].nextCharOffset,
+    });
+    expect(second.items?.[0]?.text).toBe(text.slice(8000));
+    expect(second.items?.[0]?.nextCharOffset).toBeUndefined();
+    expect(second.exhausted).toBe(true);
+    expect(
+      (
+        await call({
+          action: "read_item",
+          item_id: first.items![0].itemId,
+          window_id: "w:missing",
+        })
+      ).error
+    ).toBe("item_not_found");
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(
+      SESSION_HISTORY_MAX_RESULT_BYTES
+    );
   });
 
   test("oversized rows consume bounded bytes and resume mid-line, then recover newer data", async () => {
@@ -321,7 +362,7 @@ describe("session_history real disk recovery", () => {
     );
     const all = await pages({ action: "search", query: "recover me" });
     expect(all.length).toBeGreaterThanOrEqual(3);
-    expect(all.reduce((sum, page) => sum + (page.oversizedLines ?? 0), 0)).toBe(2);
+    expect(all.reduce((sum, page) => sum + page.skipped_oversized_rows, 0)).toBe(2);
     expect(all.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
       "recover me",
     ]);
@@ -352,7 +393,7 @@ describe("session_history real disk recovery", () => {
         JSON.stringify(createMuxMessage("new", "assistant", "public after oversized reset")) +
         "\n"
     );
-    const hidden = await pages({ action: "read_item", itemId: "0" });
+    const hidden = await pages({ action: "read_item", item_id: "0" });
     expect(hidden.flatMap((page) => page.items ?? [])).toEqual([]);
     expect(hidden.at(-1)?.error).toBe("item_not_found");
     expect(
@@ -386,6 +427,7 @@ describe("session_history real disk recovery", () => {
     expect(second.success).toBe(true);
     expect(second.items?.[0]?.text).toBe("match two");
     expect(second.nextCursor).toBeUndefined();
+    expect(second.exhausted).toBe(true);
     await append("roll", "", rollover);
     expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
       "stale_cursor"
@@ -452,8 +494,8 @@ describe("session_history real disk recovery", () => {
     const message = await append("big", text);
     const read = await call({
       action: "read_item",
-      itemId: String(message.metadata!.historySequence),
-      charLimit: 16000,
+      item_id: String(message.metadata!.historySequence),
+      limit_chars: 16000,
     });
     expect(read.success).toBe(true);
     expect(read.items?.[0]?.nextCharOffset).toBeGreaterThan(0);

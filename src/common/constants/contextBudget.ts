@@ -23,6 +23,7 @@ export const SESSION_HISTORY_MAX_CURSOR_CHARS = 12 * 1024;
 export const SESSION_HISTORY_MAX_QUERY_CHARS = 1024;
 export const SESSION_HISTORY_MAX_ID_CHARS = 1024;
 export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 10 * 1024;
+export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
