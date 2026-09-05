@@ -17,6 +17,16 @@
  *     rendering, exactly as before this feature. A wrong or incomplete inferred
  *     rail is worse than none.
  *
+ *     Boundary: the scanner recognizes routes to the global object by NAME
+ *     (identifier or string literal). It does not evaluate expressions, so a
+ *     route name assembled at runtime (`obj["con" + "structor"]`) is outside the
+ *     subset by design — closing that class statically would mean forbidding
+ *     computed member access altogether, which real conductors use pervasively
+ *     (`results[i]`, `seen[key]`). This is acceptable because the manifest is a
+ *     pre-run PREVIEW, not the rail's source of truth: the projection merges
+ *     observed phase events, so a phase emitted through any route still renders
+ *     in its actual position once the run executes.
+ *
  * The manifest is derived data: it is NEVER persisted (see
  * WorkflowRunStore.writeRunFile) and read-path failures never throw — they
  * memoize a negative result so old/hand-edited runs keep loading.

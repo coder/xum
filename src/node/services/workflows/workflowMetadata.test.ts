@@ -169,6 +169,10 @@ describe("parseDeclaredPhasesFromSource", () => {
 
   test("keeps ignoring unreadable meta that does not declare phases (legacy workflows stay startable)", () => {
     for (const declaration of [
+      // Method/accessor syntax with an unrelated key is not a phases declaration.
+      'export const meta = { description: "x", helper() {} };\n',
+      'export const meta = { get description() { return "x"; }, async run() {} };\n',
+      "export const meta = { *items() {}, get: 1, async: 2 };\n",
       'const description = "x";\nexport const meta = { description };\n',
       "export const meta = { argsSchema: buildSchema(), nested: { phases: 1 } };\n",
       // Not even an object literal: nothing to declare phases in.

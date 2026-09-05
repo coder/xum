@@ -143,17 +143,27 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
     if (!expectKey || /\s/u.test(char ?? "")) continue;
     expectKey = false;
     try {
-      const token = readStaticObjectKey(source, index);
-      if (token.value === key) return true;
-      // A bare identifier followed by another key token or `(` is property
-      // syntax the strict parser never accepts (`get phases() {}`, `async
-      // phases() {}`, `phases() {}`, `*phases() {}`): the real key comes next,
-      // so conservatively count it as "may declare".
+      // Method/accessor syntax the strict parser never accepts still has a
+      // definite key: `helper() {}` → helper, `get phases() {}` → phases,
+      // `*phases() {}` → phases. Read past a generator star and past a
+      // get/set/async modifier that is followed by another key token.
+      let keyStart = index;
+      if (masked[keyStart] === "*") keyStart = skipStaticWhitespace(masked, keyStart + 1);
+      let token = readStaticObjectKey(source, keyStart);
       const next = skipStaticWhitespace(masked, token.end);
-      if (masked[next] !== ":" && masked[next] !== "," && masked[next] !== "}") return true;
+      const isModifier =
+        (token.value === "get" || token.value === "set" || token.value === "async") &&
+        next < end &&
+        ![":", ",", "}", "("].includes(masked[next] ?? "");
+      if (isModifier) {
+        const realKeyStart = masked[next] === "*" ? skipStaticWhitespace(masked, next + 1) : next;
+        token = readStaticObjectKey(source, realKeyStart);
+      }
+      if (token.value === key) return true;
+      // Parameters and bodies that follow are skipped by the depth tracking.
       index = token.end - 1;
     } catch {
-      // Dynamic or otherwise unreadable key (`*gen() {}` etc.): may declare anything.
+      // Unreadable key syntax: may declare anything.
       return true;
     }
   }
