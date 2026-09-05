@@ -14,16 +14,6 @@ import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchem
 
 export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
 
-/** Carries a typed preflight refusal across thinking-rebuild callbacks that cannot return Result. */
-export class ContextBudgetExceededError extends Error {
-  constructor(readonly budgetError: ContextBudgetExceeded) {
-    super(
-      `Assembled request for ${budgetError.model} exceeds its context budget (${budgetError.estimate} > ${budgetError.hardCeiling})`
-    );
-    this.name = "ContextBudgetExceededError";
-  }
-}
-
 /** Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
 export function checkAssembledRequestBudget(
   payload: Parameters<typeof estimateAssembledRequestTokens>[0],

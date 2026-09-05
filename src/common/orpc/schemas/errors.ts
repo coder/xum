@@ -25,6 +25,7 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
     estimate: z.number().finite().nonnegative(),
     hardCeiling: z.number().finite(),
   }),
+  z.object({ type: z.literal("context_budget_blocked"), message: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 

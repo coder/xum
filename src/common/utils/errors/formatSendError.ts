@@ -84,6 +84,9 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
         message: error.message,
       };
 
+    case "context_budget_blocked":
+      return { message: error.message };
+
     case "context_budget_exceeded":
       return {
         message: `Request for ${error.model} exceeds its usable context budget (${error.estimate} estimated tokens; ${error.hardCeiling} available).`,

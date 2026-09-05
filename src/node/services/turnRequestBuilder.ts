@@ -1,8 +1,6 @@
 import type { OnStepSettled } from "./streamManager";
-import {
-  checkAssembledRequestBudget,
-  ContextBudgetExceededError,
-} from "@/common/utils/compaction/contextBudget";
+import { checkAssembledRequestBudget } from "@/common/utils/compaction/contextBudget";
+import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
@@ -2604,7 +2602,7 @@ export class TurnRequestBuilder {
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) {
         runLanguageModelCleanup(modelResult.data.model);
-        return { type: "finished", result: Err(error.budgetError) };
+        return { type: "finished", result: Err(error.details) };
       }
       throw error;
     }
@@ -2872,7 +2870,7 @@ export class TurnRequestBuilder {
                   cleanupModelOnError: true,
                 });
               } catch (error) {
-                if (error instanceof ContextBudgetExceededError) return Err(error.budgetError);
+                if (error instanceof ContextBudgetExceededError) return Err(error.details);
                 throw error;
               }
               let nextHeaders = nextRequest.headers;
@@ -2946,7 +2944,7 @@ export class TurnRequestBuilder {
         if (error instanceof ContextBudgetExceededError) {
           runLanguageModelCleanup(modelResult.data.model);
           await deleteAbortedPlaceholder(assistantMessageId);
-          return { type: "finished", result: Err(error.budgetError) };
+          return { type: "finished", result: Err(error.details) };
         }
         throw error;
       }
