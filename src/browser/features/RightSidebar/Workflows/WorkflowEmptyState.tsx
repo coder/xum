@@ -217,7 +217,7 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
                         />
                       )}
                       {script.phaseManifestWarning != null && (
-                        <div className="text-warning mt-0.5 text-[11px]">
+                        <div className="text-warning mt-0.5 min-w-0 text-[11px] break-words">
                           Invalid meta.phases declaration — runs will be rejected:{" "}
                           {script.phaseManifestWarning}
                         </div>

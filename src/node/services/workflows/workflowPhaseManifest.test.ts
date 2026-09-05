@@ -180,12 +180,21 @@ describe("inferPhaseManifest", () => {
     ).toBeUndefined();
     // Parenthesized callee is still a direct eval (the Reference survives).
     expect(phaseNames(legacyWorkflow(`((eval))("phase = () => {}"); phase("b");`))).toBeUndefined();
-    // A member call named eval on an ordinary object is not a direct eval.
+    // Indirect eval is a route to the global object (and thus to the runtime's
+    // primitives), so ANY `eval` identifier voids inference — including a member
+    // merely named eval, which the scanner does not try to disambiguate.
+    expect(
+      phaseNames(
+        legacyWorkflow(
+          `const g = (0, eval)("this"); g["__work" + "flowPhase"]("hidden"); phase("visible");`
+        )
+      )
+    ).toBeUndefined();
     expect(
       phaseNames(
         legacyWorkflow(`phase("a"); const util = { eval: (x) => x }; log(util.eval("1"));`)
       )
-    ).toEqual(["a"]);
+    ).toBeUndefined();
   });
 
   test("bails when a parameter initializer already uses phase", () => {

@@ -63,9 +63,14 @@ export type WorkflowPhaseManifestOutcome =
   // No declaration and inference bailed: today's observed-only behavior.
   | { kind: "none" };
 
-// The subscribe stream re-hydrates on every run-changed event, so parses are
-// memoized per distinct source. Keyed by sourceHash (content-addressed).
-const outcomeBySourceHash = new LRUCache<string, WorkflowPhaseManifestOutcome>({ max: 128 });
+// The subscribe stream re-hydrates on every run-changed event and listRuns
+// hydrates a workspace's whole history in one pass, so parses are memoized per
+// distinct source (keyed by content hash). The bound must comfortably exceed the
+// number of distinct workflow sources one workspace accumulates: a history just
+// over the limit would otherwise cycle-evict on every bulk read and reparse
+// every script with the TypeScript compiler. Entries are tiny (a manifest or a
+// warning string), so a generous bound costs little.
+const outcomeBySourceHash = new LRUCache<string, WorkflowPhaseManifestOutcome>({ max: 4096 });
 
 /**
  * Resolve the phase manifest for a workflow source. Never throws: invalid
@@ -157,9 +162,8 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     /* setParentNodes */ true,
     ts.ScriptKind.JS
   );
-  // Direct `eval` can read or reassign the lexical `phase` binding from a string
-  // the scanner cannot see, and a sloppy-mode `with` block resolves `phase`
-  // dynamically through its object; either anywhere in the file voids inference.
+  // A sloppy-mode `with` block resolves `phase` dynamically through its object;
+  // anywhere in the file, that voids inference.
   if (containsDynamicScope(ts, sourceFile)) {
     return undefined;
   }
@@ -167,7 +171,8 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   // globals; `__workflowPhase("hidden")` emits a phase the `phase` identifier
   // walk never sees. Any reference into that namespace — by identifier, by a
   // string naming it (`globalThis["__workflowPhase"]`), or via a route to the
-  // global object (`globalThis`, `this`, `Function`) — voids inference.
+  // global object (`globalThis`, `this`, `Function`, direct or indirect `eval`,
+  // which can also read or rebind the lexical `phase`) — voids inference.
   if (referencesRuntimeInternals(ts, sourceFile)) {
     return undefined;
   }
@@ -373,7 +378,9 @@ function mentionsIdentifier(ts: TypeScriptModule, root: ts.Node, name: string): 
 }
 
 const RUNTIME_INTERNAL_PREFIXES = ["__workflow", "__mux"];
-const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function"]);
+// `eval` in ANY position: direct eval sees the lexical `phase` binding, and
+// indirect eval (`(0, eval)("this")`) returns the global object.
+const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function", "eval"]);
 
 function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
   const namesInternal = (text: string): boolean =>
@@ -400,22 +407,10 @@ function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceF
 }
 
 function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
-  // `(eval)(x)` is still a direct eval — parentheses preserve the Reference —
-  // whereas `(0, eval)(x)` and `obj.eval(x)` are indirect and out of scope.
-  const unwrap = (node: ts.Expression): ts.Expression =>
-    ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node;
-  const check = (node: ts.Node): boolean => {
-    if (ts.isWithStatement(node)) {
-      return true;
-    }
-    if (ts.isCallExpression(node)) {
-      const callee = unwrap(node.expression);
-      if (ts.isIdentifier(callee) && callee.text === "eval") {
-        return true;
-      }
-    }
-    return ts.forEachChild(node, check) === true;
-  };
+  // `with` resolves identifiers through an object at runtime. (`eval` — direct or
+  // indirect — is covered by referencesRuntimeInternals as a global-object route.)
+  const check = (node: ts.Node): boolean =>
+    ts.isWithStatement(node) || ts.forEachChild(node, check) === true;
   return check(sourceFile);
 }
 
