@@ -895,6 +895,13 @@ export class AIService extends EventEmitter {
         recordStartupPhaseTiming,
       });
       if (buildOutcome.type === "finished") {
+        if (startupState.pendingRunMetadataId != null) {
+          this.clearTrackedPendingDevToolsRunMetadataById(
+            workspaceId,
+            startupState.pendingRunMetadataId
+          );
+          startupState.pendingRunMetadataId = null;
+        }
         return buildOutcome.result;
       }
 

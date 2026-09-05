@@ -540,6 +540,8 @@ export interface TranscriptAnchor {
 
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
+  /** Correlates a rollover continuation without replacing its original attribution. */
+  rolloverId?: string;
   /** Structured review data for rich UI display (orthogonal to message type) */
   reviews?: ReviewNoteDataForDisplay[];
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
@@ -561,6 +563,8 @@ interface MuxMessageMetadataBase {
    */
   agentSkillRefs?: AgentSkillReference[];
   mcpPromptRefs?: MCPPromptReference[];
+  /** Internal budget control turn; retains delegation metadata without a human prompt bubble. */
+  contextBudgetContinuation?: true;
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }
@@ -604,6 +608,28 @@ export interface BashMonitorWakeDisplayRecord {
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &
   (
+    | {
+        type: "context-window-rollover";
+        rolloverId: string;
+        reason: "on-send" | "mid-stream" | "context-exceeded";
+        previousWindowId: string;
+        flushOpportunity: boolean;
+        contextTokens: number;
+        maxTokens: number;
+      }
+    | {
+        type: "context-window-continuation";
+        rolloverId: string;
+      }
+    | {
+        type: "context-window-lead-in";
+        rolloverId: string;
+      }
+    | {
+        type: "context-budget-warning";
+        contextTokens: number;
+        maxTokens: number;
+      }
     | {
         type: "compaction-request";
         rawCommand: string; // The original /compact command as typed by user (for display)
@@ -777,6 +803,24 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
   );
 
+/** Rollover internals do not make an otherwise empty window eligible for another reset. */
+export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
+  const type = message.metadata?.muxMetadata?.type;
+  return (
+    type === "context-window-lead-in" ||
+    type === "context-budget-warning" ||
+    (message.metadata?.synthetic === true &&
+      message.metadata.muxMetadata?.contextBudgetContinuation === true)
+  );
+}
+
+export function isRolloverBoundary(message: MuxMessage): boolean {
+  return (
+    message.metadata?.contextBoundaryKind === "reset" &&
+    message.metadata.muxMetadata?.type === "context-window-rollover"
+  );
+}
+
 /** Correlation identifying which delegated workspace turn a stream belongs to. */
 export interface WorkspaceTurnTaskCorrelation {
   taskHandleId: string;
@@ -947,6 +991,10 @@ export interface MuxMetadata {
    * Set this flag for synthetic notices that should be visible to users.
    */
   uiVisible?: boolean;
+  /** Display-only input rejected by the token-budget gate before provider submission. */
+  contextBudgetRejected?: true;
+  /** Accepted snapshots and assistant payloads that must travel with this turn on retry. */
+  requestPreludeMessageIds?: string[];
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
   error?: string; // Error message if stream failed
@@ -1170,6 +1218,11 @@ export type DisplayedMessage =
        * payload itself is a separate assistant row). Excluded from human-prompt navigation.
        */
       agentPeerMessageTrigger?: true;
+      /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
+      contextBudgetWarning?: {
+        contextTokens: number;
+        maxTokens: number;
+      };
     }
   | {
       type: "assistant";
@@ -1282,6 +1335,8 @@ export type DisplayedMessage =
       id: string; // Display ID for UI/React keys
       historySequence: number; // Sequence of the compaction summary this boundary belongs to
       boundaryKind?: ContextBoundaryKind;
+      /** Distinguishes automatic rollover from a manual reset without changing boundary semantics. */
+      contextWindowRollover?: true;
       position: "start" | "end";
       compactionEpoch?: number;
       strategy?: CompactionSummaryMetadata["strategy"];

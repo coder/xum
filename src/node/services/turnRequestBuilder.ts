@@ -1,3 +1,8 @@
+import type { OnStepSettled } from "./streamManager";
+import { checkAssembledRequestBudget } from "@/common/utils/compaction/contextBudget";
+import { ContextBudgetExceededError } from "./contextBudgetError";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
@@ -280,6 +285,7 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  onStepSettled?: OnStepSettled;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -410,6 +416,40 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/** Shared assembly path for primary, fallback, and thinking-rebuild provider attempts. */
+export async function assembleBudgetCheckedPromptPayload(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  budget: { enabled: boolean; providerOptions?: MuxProviderOptions }
+): ReturnType<typeof assemblePromptPayload> {
+  const payload = await assemblePromptPayload(options);
+  // Check after provider transforms and system/schema assembly: history-only
+  // estimates cannot prevent oversized requests from reaching the provider.
+  if (budget.enabled) {
+    const modelContextLimit = getEffectiveContextLimit(
+      options.modelString,
+      isAnthropic1MEffectivelyEnabled(
+        options.modelString,
+        budget.providerOptions,
+        options.providersConfig
+      ),
+      options.providersConfig,
+      { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
+    );
+    if (modelContextLimit == null) {
+      log.warn("Context budget preflight unavailable: model context limit is unknown", {
+        workspaceId: options.workspaceId,
+        model: options.modelString,
+      });
+    }
+    const exceeded = checkAssembledRequestBudget(payload, {
+      model: options.modelString,
+      modelContextLimit,
+    });
+    if (exceeded) throw new ContextBudgetExceededError(exceeded);
+  }
+  return payload;
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -744,6 +784,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      onStepSettled,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -1217,6 +1258,10 @@ export class TurnRequestBuilder {
     const memoryExperimentEnabled =
       experiments?.memory ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
+    const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
+      this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
+    const sessionHistoryEnabled =
+      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1271,6 +1316,7 @@ export class TurnRequestBuilder {
         onPreStartError?.(event);
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
+      sessionHistoryEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
@@ -1291,7 +1337,28 @@ export class TurnRequestBuilder {
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
     } = agentResult.data;
+    // Explicit summaries remain recovery operations, not token-budget turns.
+    // Inspect this request's last effective user row, never an older compact command.
+    const latestUserMessage = providerRequestMessages.findLast(
+      (message) => message.role === "user"
+    );
+    const isCompactionRequest =
+      effectiveAgentId === "compact" ||
+      muxMetadata?.type === "compaction-request" ||
+      latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    const tokenBudgetEnabled =
+      !isCompactionRequest &&
+      sessionHistoryEnabled &&
+      !(
+        experiments?.continuousCompaction ??
+        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
+      ) &&
+      !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
+    const memoryAccess = resolveMemoryAccessPolicy({
+      planLike: agentIsPlanLike,
+      editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
+    });
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
@@ -1495,6 +1562,8 @@ export class TurnRequestBuilder {
         loadDesktopCapability,
         advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
+        tokenBudgetEnabled,
+        workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
         intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
@@ -2172,11 +2241,9 @@ export class TurnRequestBuilder {
       // Agent memory (memory experiment): per-scope write policy derived from
       // the agent class (exec-like / plan-like / read-only). Project memory is
       // host-local under xumHome, keyed by the stable project identity.
+      historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
-      memoryAccess: resolveMemoryAccessPolicy({
-        planLike: agentIsPlanLike,
-        editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
-      }),
+      memoryAccess,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,
@@ -2370,7 +2437,8 @@ export class TurnRequestBuilder {
           if (attemptTools.intuition === undefined) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
               assembleCtx.systemMessage,
-              attemptTools.memory !== undefined
+              attemptTools.memory !== undefined,
+              memoryContextForModel?.hotMemoriesBlock
             );
           }
           if (assembleCtx.systemMessage !== attemptSystem) {
@@ -2421,24 +2489,27 @@ export class TurnRequestBuilder {
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
         const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
-          assemblePromptPayload({
-            history: options.sourceMessages,
-            systemMessage: attemptSystem,
-            tools: attemptTools,
-            modelString: seed.rawModelString,
-            routeProvider: seed.routeProvider,
-            openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
-            providerForMessages: seed.wireProviderName,
-            effectiveThinkingLevel: level,
-            effectiveAgentId,
-            toolNamesForSentinel,
-            planContentForTransition,
-            planFilePath,
-            postCompactionAttachments,
-            providersConfig: seed.providersConfig,
-            anthropicCacheTtl: effectiveAnthropicCacheTtl,
-            workspaceId,
-          });
+          assembleBudgetCheckedPromptPayload(
+            {
+              history: options.sourceMessages,
+              systemMessage: attemptSystem,
+              tools: attemptTools,
+              modelString: seed.rawModelString,
+              routeProvider: seed.routeProvider,
+              openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
+              providerForMessages: seed.wireProviderName,
+              effectiveThinkingLevel: level,
+              effectiveAgentId,
+              toolNamesForSentinel,
+              planContentForTransition,
+              planFilePath,
+              postCompactionAttachments,
+              providersConfig: seed.providersConfig,
+              anthropicCacheTtl: effectiveAnthropicCacheTtl,
+              workspaceId,
+            },
+            { enabled: tokenBudgetEnabled, providerOptions: effectiveMuxProviderOptions }
+          );
         const prepareMessagesForProviderStartedAt = Date.now();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
@@ -2503,6 +2574,8 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
+          contextBudgetMemoryWritable:
+            memoryAccess.workspace === "readwrite" && attemptTools.memory !== undefined,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
@@ -2532,15 +2605,24 @@ export class TurnRequestBuilder {
       -1
     );
     emitStartupBreadcrumb("preparing_request");
-    const primaryRequest = await prepareModelRequest({
-      seed: modelResult.data,
-      sourceMessages: messages,
-      providerRequestMessages,
-      initializeToolSearch: true,
-      reusePrePolicySystemContext: true,
-      requestHistorySequence,
-      recordTimings: true,
-    });
+    let primaryRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
+    try {
+      primaryRequest = await prepareModelRequest({
+        seed: modelResult.data,
+        sourceMessages: messages,
+        providerRequestMessages,
+        initializeToolSearch: true,
+        reusePrePolicySystemContext: true,
+        requestHistorySequence,
+        recordTimings: true,
+      });
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) {
+        runLanguageModelCleanup(modelResult.data.model);
+        return { type: "finished", result: Err(error.details) };
+      }
+      throw error;
+    }
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
@@ -2793,15 +2875,21 @@ export class TurnRequestBuilder {
                 return Err(formatSendMessageError(nextSeedResult.error).message);
               }
 
-              const nextRequest = await prepareModelRequest({
-                seed: nextSeedResult.data,
-                sourceMessages,
-                initializeToolSearch: false,
-                reusePrePolicySystemContext: false,
-                requestHistorySequence,
-                partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
-                cleanupModelOnError: true,
-              });
+              let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
+              try {
+                nextRequest = await prepareModelRequest({
+                  seed: nextSeedResult.data,
+                  sourceMessages,
+                  initializeToolSearch: false,
+                  reusePrePolicySystemContext: false,
+                  requestHistorySequence,
+                  partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                  cleanupModelOnError: true,
+                });
+              } catch (error) {
+                if (error instanceof ContextBudgetExceededError) return Err(error.details);
+                throw error;
+              }
               let nextHeaders = nextRequest.headers;
               if (pendingRunMetadataId != null) {
                 nextHeaders = {
@@ -2818,6 +2906,7 @@ export class TurnRequestBuilder {
                 messages: nextRequest.messages,
                 system: nextRequest.engineSystem,
                 tools: nextRequest.engineTools,
+                contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
                 providerOptions: nextRequest.providerOptions,
                 headers: nextHeaders,
                 callSettingsOverrides: nextRequest.resolvedOverrides.standard,
@@ -2865,9 +2954,18 @@ export class TurnRequestBuilder {
         // re-check pending — a change may have raced the previous rebuild.
         continue;
       }
-      streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
-        folded.effectiveLevel
-      );
+      try {
+        streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
+          folded.effectiveLevel
+        );
+      } catch (error) {
+        if (error instanceof ContextBudgetExceededError) {
+          runLanguageModelCleanup(modelResult.data.model);
+          await deleteAbortedPlaceholder(assistantMessageId);
+          return { type: "finished", result: Err(error.details) };
+        }
+        throw error;
+      }
       streamProviderOptions = folded.providerOptions;
       streamThinkingLevel = folded.effectiveLevel;
       activeTurnThinkingOverride.applied = folded.effectiveLevel;
@@ -2892,6 +2990,7 @@ export class TurnRequestBuilder {
       messageId: assistantMessageId,
       abortSignal: combinedAbortSignal,
       tools: toolsForStream,
+      contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
       initialMetadata: {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         systemMessageTokens,
@@ -2909,6 +3008,7 @@ export class TurnRequestBuilder {
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
       hasQueuedMessages,
+      onStepSettled,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

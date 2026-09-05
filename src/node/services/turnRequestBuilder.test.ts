@@ -1,3 +1,7 @@
+import { tool } from "ai";
+import { z } from "zod";
+import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
+import { ContextBudgetExceededError } from "./contextBudgetError";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -15,6 +19,7 @@ import { StreamManager } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   TurnRequestBuilder,
+  assembleBudgetCheckedPromptPayload,
   prepareProviderRequestMessages,
   resolveXumToolScope,
   type PrepareModelAttemptOptions,
@@ -222,6 +227,93 @@ describe("TurnRequestBuilder message preparation", () => {
     expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
       ...testCase.expected,
     ]);
+  });
+});
+
+describe("TurnRequestBuilder assembled preflight", () => {
+  function options(modelString = "openai:custom-context-model") {
+    return {
+      history: [createMuxMessage("user", "user", "small user request")],
+      systemMessage: "system instructions ".repeat(500),
+      tools: {
+        big_schema: tool({
+          description: "schema ".repeat(1000),
+          inputSchema: z.object({ value: z.string().describe("parameter ".repeat(1000)) }),
+        }),
+      },
+      modelString,
+      providerForMessages: "openai",
+      effectiveThinkingLevel: "off" as const,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: ["big_schema"],
+      workspaceId: "workspace",
+      providersConfig: {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [
+            { id: "custom-context-model", contextWindowTokens: 10000 },
+            { id: "large-context-model", contextWindowTokens: 100000 },
+          ],
+        },
+      },
+    };
+  }
+
+  it("refuses a known over-ceiling assembled request with a typed error before dispatch", async () => {
+    try {
+      await assembleBudgetCheckedPromptPayload(options(), { enabled: true });
+      throw new Error("Expected preflight refusal");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ContextBudgetExceededError);
+      if (!(error instanceof ContextBudgetExceededError)) throw error;
+      expect(error.details.type).toBe("context_budget_exceeded");
+      expect(error.details.model).toBe("openai:custom-context-model");
+      expect(error.details.hardCeiling).toBe(getContextBudgetHardCeiling(10000));
+      expect(error.details.estimate).toBeGreaterThan(error.details.hardCeiling);
+    }
+  });
+
+  it("rechecks the target limit when a large-window primary falls back to a smaller model", async () => {
+    const primary = await assembleBudgetCheckedPromptPayload(
+      options("openai:large-context-model"),
+      { enabled: true }
+    );
+    expect(primary.messages.length).toBeGreaterThan(0);
+    const error = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    expect(error).toBeInstanceOf(ContextBudgetExceededError);
+  });
+
+  it("uses the request-level auth route when checking the assembled context ceiling", async () => {
+    const base = options("openai:gpt-6-astra");
+    const request = {
+      ...base,
+      systemMessage: "x".repeat(1_500_000),
+      providersConfig: {
+        openai: {
+          ...base.providersConfig.openai,
+          codexOauthSet: true,
+          codexOauthDefaultAuth: "oauth" as const,
+        },
+      },
+    };
+    const error = await assembleBudgetCheckedPromptPayload(request, { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    expect(error).toBeInstanceOf(ContextBudgetExceededError);
+    const payload = await assembleBudgetCheckedPromptPayload(
+      { ...request, openaiWireFormat: "chatCompletions" },
+      { enabled: true, providerOptions: { openai: { wireFormat: "chatCompletions" } } }
+    );
+    expect(payload.messages.length).toBeGreaterThan(0);
+  });
+
+  it("leaves legacy behavior unchanged when the effective budget flag is disabled", async () => {
+    const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
+    expect(payload.messages.length).toBeGreaterThan(0);
   });
 });
 

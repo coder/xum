@@ -193,6 +193,8 @@ export const MuxMessageSchema = z.object({
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
+      contextBudgetRejected: z.literal(true).optional(),
+      requestPreludeMessageIds: z.array(z.string()).optional(),
       // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.
       rlmPreservedTailCopy: z.boolean().optional(),
       transcriptAnchor: TranscriptAnchorSchema.optional().catch(undefined),

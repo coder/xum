@@ -98,6 +98,23 @@ describe("getLastNonDecorativeMessage", () => {
   });
 });
 
+describe("context budget retry suppression", () => {
+  it("does not automatically retry either a preflight refusal or a terminal budget block", () => {
+    expect(isNonRetryableSendError({ type: "context_budget_exceeded" })).toBe(true);
+    expect(isNonRetryableSendError({ type: "context_budget_blocked" })).toBe(true);
+    expect(isNonRetryableStreamError({ type: "context_budget_blocked" })).toBe(true);
+    expect(
+      isEligibleForAutoRetry([
+        userMessage(),
+        streamErrorMessage({ errorType: "context_budget_blocked" }),
+      ])
+    ).toBe(false);
+    expect(
+      isEligibleForAutoRetry([userMessage(), streamErrorMessage({ errorType: "network" })])
+    ).toBe(true);
+  });
+});
+
 describe("hasInterruptedStream", () => {
   it("returns false for empty messages", () => {
     expect(hasInterruptedStream([])).toBe(false);

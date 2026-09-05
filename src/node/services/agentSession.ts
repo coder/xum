@@ -1,3 +1,27 @@
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { randomUUID } from "crypto";
+import { sandboxHostService } from "./sandbox/sandboxHostService";
+import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPolicy";
+import {
+  CONTEXT_CONTINUE_DEDUPE_KEY,
+  CONTEXT_WARNING_DEDUPE_KEY,
+} from "@/common/constants/contextBudget";
+import {
+  evaluateStepBudget,
+  estimateFreshRequestTokens,
+  getContextBudgetHardCeiling,
+} from "@/common/utils/compaction/contextBudget";
+import {
+  buildLeadInText,
+  createRolloverPrefix,
+  createContextBudgetWarning,
+  currentContextWindowId,
+  hasRolloverEligibleMessages,
+  estimateLastStepToolResults,
+  type ContextWindowRollover,
+} from "./contextWindowRollover";
+import { resolveAgentForStream } from "./agentResolution";
+import type { SettledStepBudget } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
 import assert from "@/common/utils/assert";
@@ -186,6 +210,7 @@ import {
 } from "@/common/constants/experiments";
 import {
   awaitPendingBranchSummary,
+  clearPendingBranchSummary,
   isRlmModeEnabled,
   runInlineAbandonedBranchSummary,
   type BranchSummaryAiService,
@@ -645,6 +670,7 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  onContextWindowRollover?: () => void;
 }
 
 enum TurnPhase {
@@ -742,6 +768,14 @@ export class AgentSession {
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
+  private pendingRollover?: ContextWindowRollover;
+  private contextBudgetWarningClaimed = false;
+  private pendingBudgetWarning?: true;
+  private contextBudgetGeneration = 0;
+  // Unknown after restart: do not spend the window's warning on guessed permissions.
+  private contextBudgetMemoryWritable: boolean | undefined;
+  private contextBudgetHistoryAvailable = false;
+  private readonly onContextWindowRollover?: () => void;
   private lastSystemMessageTokens?: number;
 
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
@@ -886,6 +920,7 @@ export class AgentSession {
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
     modelString: string;
+    contextBudgetRetried?: boolean;
     options?: SendMessageOptions;
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
@@ -914,6 +949,7 @@ export class AgentSession {
 
   constructor(options: AgentSessionOptions) {
     assert(options, "AgentSession requires options");
+    this.onContextWindowRollover = options.onContextWindowRollover;
     const {
       workspaceId,
       config,
@@ -2005,7 +2041,7 @@ export class AgentSession {
   }
 
   private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
-    if (message.role !== "user") {
+    if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
       return false;
     }
 
@@ -2024,6 +2060,7 @@ export class AgentSession {
     if (message.metadata?.synthetic === true) {
       return (
         message.metadata?.uiVisible === true ||
+        message.metadata.muxMetadata?.contextBudgetContinuation === true ||
         isCompactionRequestMetadata(message.metadata?.muxMetadata)
       );
     }
@@ -3197,6 +3234,8 @@ export class AgentSession {
        * post-mutation context by design.
        */
       admissionEpochStale?: () => boolean;
+      /** Advance other sends' epochs while keeping this rollover send admitted. */
+      onContextWindowRollover?: () => void;
       /**
        * Caller-supplied staleness probe that, unlike the epoch probe above, IS threaded
        * through queued entries (MessageQueue stores it per entry and re-emits it at
@@ -3696,6 +3735,7 @@ export class AgentSession {
       extractAcpDelegatedTools(typedMuxMetadata);
     const isCompactionRequest = isCompactionRequestMetadata(typedMuxMetadata);
     if (isCompactionRequest) {
+      this.clearContextBudgetState();
       this.continuousCompactor.reset("compaction-request");
     }
 
@@ -3737,7 +3777,10 @@ export class AgentSession {
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
-        ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
+        ...(internal?.synthetic && {
+          synthetic: true,
+          uiVisible: !typedMuxMetadata?.contextBudgetContinuation,
+        }),
       },
       additionalParts
     );
@@ -3765,13 +3808,37 @@ export class AgentSession {
     // turn in model context (the compaction would otherwise summarize a transcript that already
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
+    const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
+    let contextBudgetPrefix: MuxMessage[] = [];
+    if (tokenBudgetActive && !editMessageId) {
+      // A stopped turn's partial belongs to the old window, never after its reset.
+      const committed = await this.historyService.commitPartial(this.workspaceId);
+      if (!committed.success) return Err(createUnknownSendMessageError(committed.error));
+      await this.seedUsageStateFromHistory();
+      const prepared = await this.prepareContextBudgetSend(userMessage, optionsForStream);
+      if (!prepared.success) {
+        if (isManualUserMessage)
+          await this.preserveRejectedManualSend(
+            message,
+            options,
+            prepared.error,
+            internal?.enqueuedAtMs
+          );
+        else
+          this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(prepared.error)));
+        return prepared;
+      }
+      contextBudgetPrefix = prepared.data;
+    }
+    const contextRollover =
+      contextBudgetPrefix[0]?.metadata?.muxMetadata?.type === "context-window-rollover";
     // Pre-turn rows cannot ride the on-send compaction follow-up (its durable
     // metadata carries only text + send options), and compacting a payload row
     // away would dangle the trigger's message-ID reference. Family sends are
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
-    if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
+    if (!tokenBudgetActive && !isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -3950,7 +4017,8 @@ export class AgentSession {
       try {
         skillSnapshotMessages = await this.materializeAgentSkillSnapshots(
           typedMuxMetadata,
-          options?.disableWorkspaceAgents
+          options?.disableWorkspaceAgents,
+          contextRollover
         );
         mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
           typedMuxMetadata,
@@ -3965,7 +4033,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && snapshotResult?.snapshotMessage) {
+    if (shouldPersistTurnSnapshots && !tokenBudgetActive && snapshotResult?.snapshotMessage) {
       const snapshotAppendResult = await this.historyService.appendToHistory(
         this.workspaceId,
         snapshotResult.snapshotMessage
@@ -3979,7 +4047,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && skillSnapshotMessages.length > 0) {
+    if (shouldPersistTurnSnapshots && !tokenBudgetActive && skillSnapshotMessages.length > 0) {
       for (const snapshotMessage of skillSnapshotMessages) {
         const skillSnapshotAppendResult = await this.historyService.appendToHistory(
           this.workspaceId,
@@ -3996,7 +4064,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && mcpPromptSnapshotMessages.length > 0) {
+    if (shouldPersistTurnSnapshots && !tokenBudgetActive && mcpPromptSnapshotMessages.length > 0) {
       for (const snapshotMessage of mcpPromptSnapshotMessages) {
         const appendResult = await this.historyService.appendToHistory(
           this.workspaceId,
@@ -4020,16 +4088,65 @@ export class AgentSession {
     // the turn that delivers it — in-process rollback cannot repair a process
     // exit. They still join the rollback set for in-process failures.
     // hasPreTurnMessages implies autoCompactionMessage === null (exempted above).
-    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      for (const preTurnMessage of internal.preTurnMessages) {
-        // Family payloads are the only producer today: synthetic assistant rows
-        // only, so a future caller cannot smuggle user-role content past the
-        // provenance rules or non-synthetic rows past queue/restore projections.
+    for (const preTurnMessage of internal?.preTurnMessages ?? []) {
+      // Family payloads are the only producer today: synthetic assistant rows
+      // only, so a future caller cannot smuggle user-role content past the
+      // provenance rules or non-synthetic rows past queue/restore projections.
+      assert(
+        preTurnMessage.role === "assistant" && preTurnMessage.metadata?.synthetic === true,
+        "sendMessage: preTurnMessages must be synthetic assistant rows"
+      );
+    }
+    if (tokenBudgetActive) {
+      const requestPrelude = [
+        ...(snapshotResult?.snapshotMessage ? [snapshotResult.snapshotMessage] : []),
+        ...skillSnapshotMessages,
+        ...mcpPromptSnapshotMessages,
+        ...(internal?.preTurnMessages ?? []),
+      ];
+      if (requestPrelude.length > 0) {
+        userMessage.metadata = {
+          ...userMessage.metadata,
+          requestPreludeMessageIds: requestPrelude.map((row) => row.id),
+        };
+      }
+      const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
+      try {
+        if (contextRollover) {
+          if (await cancelBeforeAcceptance()) return Ok(undefined);
+          if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
+            return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+          }
+          // Fail closed before publication: a crash must not reopen a fresh window
+          // with stale carryover/kernel state. An append failure may leave the old
+          // transcript with disposable context state cleared (ADR-0005).
+          await this.applyContextResetSideEffects();
+        }
+        if (await cancelBeforeAcceptance()) return Ok(undefined);
+        if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
+          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        }
+        const appended = await this.historyService.appendManyToHistory(this.workspaceId, batch);
+        if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+      } catch (error) {
+        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+      }
+      persistedCancelableMessageIds.push(...batch.map((row) => row.id));
+      if (contextRollover) {
+        const sequences = [batch[0], batch[1], userMessage].map(
+          (row) => row.metadata?.historySequence
+        );
         assert(
-          preTurnMessage.role === "assistant" && preTurnMessage.metadata?.synthetic === true,
-          "sendMessage: preTurnMessages must be synthetic assistant rows"
+          sequences.every((seq) => seq != null),
+          "rollover rows must be sequenced"
+        );
+        assert(
+          sequences[0] < sequences[1] && sequences[1] < sequences[2],
+          "rollover rows must be ordered"
         );
       }
+      if (await cancelBeforeAcceptance()) return Ok(undefined);
+    } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
       const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
         ...internal.preTurnMessages,
         userMessage,
@@ -4091,6 +4208,25 @@ export class AgentSession {
       );
     }
 
+    if (contextRollover) {
+      // Branch summaries must remain discoverable if the append/rollback failed. Only
+      // discard their registration once the new window has crossed the rollback horizon.
+      this.clearContextBudgetState();
+      (internal?.onContextWindowRollover ?? this.onContextWindowRollover)?.();
+      await clearPendingBranchSummary(this.workspaceId);
+    } else if (tokenBudgetActive) {
+      this.contextBudgetWarningClaimed ||=
+        contextBudgetPrefix.length > 0 ||
+        userMessage.metadata?.muxMetadata?.type === "context-budget-warning";
+      this.pendingBudgetWarning = undefined;
+    }
+
+    // Rollover clears old tracking before append; register only the snapshot that
+    // actually survived into the accepted window, using the bytes already read.
+    for (const file of snapshotResult?.fileStates ?? []) {
+      await this.recordFileState(file.path, file.state);
+    }
+
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
     // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
     // wake finish acceptance rather than delete the row after goal state has already observed it.
@@ -4137,6 +4273,8 @@ export class AgentSession {
     // creation) lands in the holder the stream's prepareStep will read.
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
     this.activeTurnThinkingOverride = turnThinkingOverride;
+
+    for (const row of contextBudgetPrefix) this.emitChatEvent({ ...row, type: "message" });
 
     // Emit snapshots only for immediately-sent turns. On on-send compaction paths,
     // snapshots are deferred with the follow-up message to avoid duplicate ephemeral
@@ -4273,7 +4411,8 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          contextRollover
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4528,8 +4667,499 @@ export class AgentSession {
 
   /** Prevent cached usage from auto-compacting a rewritten context. */
   clearUsageState(): void {
+    this.clearContextBudgetState();
     this.continuousCompactor.reset("context-changed");
     this.lastUsageState = undefined;
+  }
+
+  private isTokenBudgetActive(options?: SendMessageOptions): boolean {
+    const enabled = (id: ExperimentId) =>
+      typeof this.aiService.isExperimentEnabled === "function" &&
+      this.aiService.isExperimentEnabled(id);
+    if (!(options?.experiments?.tokenBudget ?? enabled(EXPERIMENT_IDS.TOKEN_BUDGET))) return false;
+    if (
+      (options?.experiments?.continuousCompaction ??
+        enabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)) ||
+      this.isRlmCompactionEnabled(options)
+    ) {
+      log.debug("Token-budget rollover yields to continuous/RLM compaction", {
+        workspaceId: this.workspaceId,
+      });
+      return false;
+    }
+    return !isCompactionRequestMetadata(options?.muxMetadata);
+  }
+
+  private clearContextBudgetState(): void {
+    this.contextBudgetGeneration += 1;
+    this.pendingRollover = undefined;
+    this.pendingBudgetWarning = undefined;
+    this.contextBudgetWarningClaimed = false;
+    this.contextBudgetMemoryWritable = undefined;
+    this.contextBudgetHistoryAvailable = false;
+    this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
+    this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY);
+  }
+
+  /** Shared with manual reset, but only context-scoped state: tasks, costs and goal consent survive. */
+  async applyContextResetSideEffects(): Promise<void> {
+    assert(
+      !this.streamManager.isStreaming(this.workspaceId),
+      "context reset requires a settled stream"
+    );
+    this.retryManager.cancel();
+    this.setAutoRetryResumeState(undefined);
+    this.lastUsageState = undefined;
+    this.continuousCompactor.reset("context-changed");
+    this.clearFileState();
+    this.memoryContextByModelString.clear();
+    try {
+      await this.clearPostCompactionState();
+    } catch (error) {
+      throw new Error(
+        `The persisted post-compaction carryover could not be durably discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be re-injected after a restart.`,
+        { cause: error }
+      );
+    }
+    try {
+      await sandboxHostService.discardScope(
+        this.workspaceId,
+        path.join(this.config.sessionsDir, this.workspaceId)
+      );
+    } catch (error) {
+      throw new Error(
+        `The sandbox kernel state could not be durably invalidated (${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables may reappear after a restart.`,
+        { cause: error }
+      );
+    }
+  }
+
+  private async checkContextBudgetHistoryAccess(
+    options: SendMessageOptions | undefined
+  ): Promise<Result<void, SendMessageError>> {
+    const blocked: Result<void, SendMessageError> = Err({
+      type: "context_budget_blocked",
+      message:
+        "Context budget reached, but session_history is disabled. Enable it, use /compact, or /clear --soft.",
+    });
+    if (isSessionHistoryExplicitlyDisabled(options?.toolPolicy)) {
+      return blocked;
+    }
+    // Agent removals are absent from caller options. Resolve them before sealing
+    // history, including after restart or switching agents between turns.
+    try {
+      const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (!metadata.success) return Err(createUnknownSendMessageError(metadata.error));
+      const resolved = await resolveAgentForStream({
+        workspaceId: this.workspaceId,
+        metadata: metadata.data,
+        ...createRuntimeContextForWorkspace(metadata.data),
+        requestedAgentId: options?.agentId,
+        strictAgentResolution: options?.strictAgentResolution,
+        disableWorkspaceAgents: options?.disableWorkspaceAgents ?? false,
+        callerToolPolicy: options?.toolPolicy,
+        cfg: this.config.loadConfigOrDefault(),
+        emitError: () => undefined,
+        isAdvisorExperimentEnabled:
+          options?.experiments?.advisorTool ??
+          this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
+        includeAgentPlugins: this.aiService.isAgentPluginsEnabled?.() ?? false,
+        sessionHistoryEnabled: true,
+      });
+      if (!resolved.success) return Err(resolved.error);
+      return isSessionHistoryExplicitlyDisabled(resolved.data.effectiveToolPolicy)
+        ? blocked
+        : Ok(undefined);
+    } catch (error) {
+      return Err(createUnknownSendMessageError(getErrorMessage(error)));
+    }
+  }
+
+  private async rejectActiveContextBudgetRequest(): Promise<Result<void, SendMessageError>> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return Err(createUnknownSendMessageError(history.error));
+    const trigger = history.data.findLast((row) => row.id === this.activeStreamUserMessageId);
+    if (!trigger) return Ok(undefined);
+    const updated = await this.historyService.rejectContextBudgetRequest(this.workspaceId, trigger);
+    if (!updated.success) return Err(createUnknownSendMessageError(updated.error));
+    for (const row of updated.data) this.emitChatEvent({ ...row, type: "message" });
+    return Ok(undefined);
+  }
+
+  /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
+  private async rolloverAfterBudgetFailure(
+    model: string,
+    estimate?: number
+  ): Promise<Result<boolean, SendMessageError>> {
+    const context = this.activeStreamContext;
+    const generation = this.contextBudgetGeneration;
+    if (
+      !context ||
+      context.contextBudgetRetried ||
+      this.compactionMonitor.getThreshold() >= 1 ||
+      this.turnAdmissionBlocks > 0 ||
+      this.deferQueuedFlushUntilAfterEdit ||
+      this.disposed ||
+      this.shuttingDown
+    )
+      return Ok(false);
+    try {
+      // StreamManager's completion settles after teardown. Commit its error partial,
+      // including any settled fallback tool outputs, before sealing the old window.
+      const committed = await this.historyService.commitPartial(this.workspaceId);
+      if (!committed.success) return Err(createUnknownSendMessageError(committed.error));
+      const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+      if (!history.success) return Err(createUnknownSendMessageError(history.error));
+      const user = history.data.findLast((row) => row.id === this.activeStreamUserMessageId);
+      if (!user) return Ok(false);
+      const priorRows = history.data.filter(
+        (row) => row !== user && !isSyntheticSnapshotUserMessage(row)
+      );
+      if (!hasRolloverEligibleMessages(priorRows)) return Ok(false);
+      const maxTokens = getEffectiveContextLimit(
+        model,
+        this.is1MContextEnabledForModel(model, context.options, context.providersConfig),
+        context.providersConfig,
+        { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
+      );
+      if (maxTokens == null || maxTokens <= 0) return Ok(false);
+      const access = await this.checkContextBudgetHistoryAccess(context.options);
+      if (!access.success) return access;
+      const rollover: ContextWindowRollover = {
+        type: "context-window-rollover",
+        rolloverId: randomUUID(),
+        reason: "context-exceeded",
+        previousWindowId: currentContextWindowId(history.data),
+        flushOpportunity: false,
+        contextTokens: estimate ?? maxTokens,
+        maxTokens,
+      };
+      const { historySequence: _sequence, ...metadata } = user.metadata ?? {};
+      const continuation: MuxMessage = {
+        ...user,
+        id: createUserMessageId(),
+        metadata: {
+          ...metadata,
+          timestamp: Date.now(),
+          muxMetadata: {
+            ...(metadata.muxMetadata ?? { type: "context-window-continuation" }),
+            rolloverId: rollover.rolloverId,
+          },
+        },
+      };
+      // Snapshot/payload rows are part of the accepted request, not just its
+      // fixed trigger. Preserve their roles and rebind server-owned ID references.
+      const preludeIds = new Set(user.metadata?.requestPreludeMessageIds ?? []);
+      const requestPrelude = [...preludeIds].flatMap((id) => {
+        const row = history.data.findLast((message) => message.id === id);
+        // Tolerant history parsing can drop a damaged snapshot or payload while
+        // retaining its trigger. Don't let stale references prevent recovery.
+        if (
+          !id ||
+          !row ||
+          !(
+            isSyntheticSnapshotUserMessage(row) ||
+            (row.role === "assistant" && row.metadata?.synthetic === true)
+          )
+        ) {
+          log.warn("Skipping damaged context-budget request prelude", {
+            workspaceId: this.workspaceId,
+          });
+          return [];
+        }
+        const newId = randomUUID();
+        continuation.parts = continuation.parts.map((part) =>
+          part.type === "text" ? { ...part, text: part.text.replaceAll(id, newId) } : part
+        );
+        const { historySequence: _preludeSequence, ...rowMetadata } = row.metadata!;
+        return {
+          ...row,
+          id: newId,
+          metadata: {
+            ...rowMetadata,
+            uiVisible: false,
+            ...(rowMetadata.mcpPromptSnapshot
+              ? {
+                  mcpPromptSnapshot: {
+                    ...rowMetadata.mcpPromptSnapshot,
+                    invokingMessageId: continuation.id,
+                  },
+                }
+              : {}),
+          },
+        };
+      });
+      continuation.metadata!.requestPreludeMessageIds = requestPrelude.map((row) => row.id);
+      await this.applyContextResetSideEffects();
+      if (
+        this.activeStreamContext !== context ||
+        this.contextBudgetGeneration !== generation ||
+        this.turnAdmissionBlocks > 0 ||
+        this.disposed ||
+        this.shuttingDown
+      )
+        return Ok(false);
+      // Retry the accepted skill instructions, not their dynamic commands. They
+      // may have been deduped against a snapshot elsewhere in the sealed window.
+      const skillSnapshots = extractAgentSkillRefs(user.metadata?.muxMetadata).flatMap((ref) => {
+        const snapshot = history.data.findLast(
+          (row) =>
+            !row.metadata?.contextBudgetRejected &&
+            row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
+        );
+        if (!snapshot || preludeIds.has(snapshot.id)) return [];
+        const { historySequence: _snapshotSequence, ...snapshotMetadata } = snapshot.metadata!;
+        return [
+          { ...snapshot, id: createAgentSkillSnapshotMessageId(), metadata: snapshotMetadata },
+        ];
+      });
+      const rows = [
+        ...createRolloverPrefix(rollover),
+        ...skillSnapshots,
+        ...requestPrelude,
+        continuation,
+      ];
+      const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
+      if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+      this.clearContextBudgetState();
+      this.onContextWindowRollover?.();
+      await clearPendingBranchSummary(this.workspaceId);
+      for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
+      return Ok(true);
+    } catch (error) {
+      return Err(createUnknownSendMessageError(getErrorMessage(error)));
+    }
+  }
+
+  private async prepareContextBudgetSend(
+    userMessage: MuxMessage,
+    options: SendMessageOptions
+  ): Promise<Result<MuxMessage[], SendMessageError>> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return Err(createUnknownSendMessageError(history.error));
+    // A filesystem error can be reported after an atomic replacement became visible.
+    // Disk wins over an unconsumed in-memory claim: never append the same rollover twice.
+    if (
+      this.pendingRollover &&
+      history.data.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-window-rollover" &&
+          row.metadata.muxMetadata.rolloverId === this.pendingRollover?.rolloverId
+      )
+    ) {
+      this.clearContextBudgetState();
+    }
+    this.contextBudgetWarningClaimed = history.data.some(
+      (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+    );
+    const providersConfig = this.getProvidersConfigSafe();
+    const maxTokens = getEffectiveContextLimit(
+      options.model,
+      this.is1MContextEnabledForModel(options.model, options, providersConfig),
+      providersConfig,
+      { openaiWireFormat: options.providerOptions?.openai?.wireFormat }
+    );
+    if (maxTokens == null || maxTokens <= 0) {
+      log.warn("Token budget has no known model context limit", { model: options.model });
+      return Ok([]);
+    }
+    const lastAssistant = history.data.findLast(
+      (row) => row.role === "assistant" && row.metadata?.contextUsage
+    );
+    // History parsing is tolerant: discard corrupt counters at this boundary,
+    // while the final assembled-request preflight still enforces the hard limit.
+    const tokenCount = (value: unknown): number | undefined =>
+      isNonNegativeInteger(value) && Number.isSafeInteger(value) ? value : undefined;
+    const usage = this.lastUsageState?.lastContextUsage;
+    const contextTokens =
+      (tokenCount(usage?.input.tokens) ?? 0) +
+      (tokenCount(usage?.cached.tokens) ?? 0) +
+      (tokenCount(usage?.cacheCreate.tokens) ?? 0);
+    const userText = userMessage.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    const attachments = userMessage.parts.filter((part) => part.type === "file");
+    const decision = evaluateStepBudget({
+      contextTokens:
+        contextTokens + estimateFreshRequestTokens({ userText, attachments, systemFloorTokens: 0 }),
+      outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
+      ...estimateLastStepToolResults(lastAssistant),
+      modelContextLimit: maxTokens,
+      threshold: this.compactionMonitor.getThreshold(),
+      warningEmitted: this.contextBudgetWarningClaimed,
+    });
+    const shouldRollover =
+      this.compactionMonitor.getThreshold() < 1 &&
+      (this.pendingRollover != null || decision.decision === "rollover");
+    const rollover: ContextWindowRollover | undefined =
+      shouldRollover && hasRolloverEligibleMessages(history.data)
+        ? (this.pendingRollover ?? {
+            type: "context-window-rollover",
+            rolloverId: randomUUID(),
+            reason: "on-send",
+            previousWindowId: currentContextWindowId(history.data),
+            flushOpportunity: decision.flushOpportunity,
+            contextTokens: decision.projected,
+            maxTokens,
+          })
+        : undefined;
+    // Recovery access is required only when sealing old context, not for a
+    // first request that crosses the proactive threshold but still fits below.
+    if (rollover) {
+      const access = await this.checkContextBudgetHistoryAccess(options);
+      if (!access.success) return access;
+    }
+    const firstAssistant = history.data.find(
+      (row) => row.role === "assistant" && row.metadata?.contextUsage
+    );
+    // Only a single-step first response gives a known first-request input floor.
+    const systemFloorTokens =
+      firstAssistant && (firstAssistant.metadata?.stepStartPartIndices?.length ?? 1) <= 1
+        ? tokenCount(firstAssistant.metadata?.contextUsage?.inputTokens)
+        : undefined;
+    const freshEstimate = estimateFreshRequestTokens({
+      userText,
+      attachments,
+      leadIn: rollover ? buildLeadInText(rollover) : undefined,
+      systemFloorTokens,
+      modelContextLimit: maxTokens,
+    });
+    if (freshEstimate >= getContextBudgetHardCeiling(maxTokens)) {
+      return Err({
+        type: "context_budget_blocked",
+        message: `This message plus the system context does not fit in a fresh context window for ${options.model}; shorten it, remove attachments, or use a larger model.`,
+      });
+    }
+    if (rollover) {
+      this.pendingRollover = rollover;
+      userMessage.metadata = {
+        ...userMessage.metadata,
+        muxMetadata: {
+          ...(userMessage.metadata?.muxMetadata ?? { type: "context-window-continuation" }),
+          rolloverId: rollover.rolloverId,
+        },
+      };
+      // An enqueued warning superseded by rollover must not warn in the fresh window.
+      if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
+        userMessage.parts = [{ type: "text", text: "Continue" }];
+        userMessage.metadata.muxMetadata = undefined;
+      }
+      return Ok(createRolloverPrefix(rollover));
+    }
+    if (shouldRollover) {
+      log.warn("Context-budget window is already fresh; skipping duplicate reset", {
+        workspaceId: this.workspaceId,
+      });
+      this.pendingRollover = undefined;
+    }
+    if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
+      this.pendingBudgetWarning = undefined;
+      return Ok([]);
+    }
+    if (
+      !this.contextBudgetWarningClaimed &&
+      this.contextBudgetMemoryWritable !== undefined &&
+      this.compactionMonitor.getThreshold() < 1 &&
+      (this.pendingBudgetWarning != null || decision.decision === "warn")
+    ) {
+      return Ok([
+        createContextBudgetWarning(
+          decision.projected,
+          maxTokens,
+          this.contextBudgetMemoryWritable,
+          this.contextBudgetHistoryAvailable &&
+            !isSessionHistoryExplicitlyDisabled(options.toolPolicy)
+        ),
+      ]);
+    }
+    return Ok([]);
+  }
+
+  private async onContextBudgetStepSettled(
+    step: SettledStepBudget
+  ): Promise<"continue" | "warn" | "rollover"> {
+    const context = this.activeStreamContext;
+    const generation = this.contextBudgetGeneration;
+    if (
+      !context?.options ||
+      !this.isTokenBudgetActive(context.options) ||
+      this.compactionMonitor.getThreshold() >= 1
+    )
+      return "continue";
+    // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
+    context.modelString = step.model;
+    this.contextBudgetMemoryWritable = step.memoryWritable;
+    this.contextBudgetHistoryAvailable = step.sessionHistoryAvailable;
+    const usage = createDisplayUsage(step.usage, step.model, step.providerMetadata);
+    const maxTokens = getEffectiveContextLimit(
+      step.model,
+      this.is1MContextEnabledForModel(step.model, context.options, context.providersConfig ?? null),
+      context.providersConfig ?? null,
+      { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
+    );
+    if (maxTokens == null || maxTokens <= 0) {
+      log.warn("Token budget has no known model context limit", { model: step.model });
+      return "continue";
+    }
+    const decision = evaluateStepBudget({
+      contextTokens: usage
+        ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
+        : 0,
+      outputTokens: step.usage?.outputTokens ?? 0,
+      toolResultChars: step.toolResultChars,
+      imageParts: step.imageParts,
+      modelContextLimit: maxTokens,
+      threshold: this.compactionMonitor.getThreshold(),
+      warningEmitted: this.contextBudgetWarningClaimed,
+    });
+    if (decision.decision === "continue") return "continue";
+    if (decision.decision === "rollover") {
+      const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+      if (!history.success) throw new Error(history.error);
+      if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
+        return "continue";
+      this.pendingRollover ??= {
+        type: "context-window-rollover",
+        rolloverId: randomUUID(),
+        reason: "mid-stream",
+        previousWindowId: currentContextWindowId(history.data),
+        flushOpportunity: decision.flushOpportunity,
+        contextTokens: decision.projected,
+        maxTokens,
+      };
+    } else {
+      this.contextBudgetWarningClaimed = true;
+      this.pendingBudgetWarning = true;
+    }
+    if (this.messageQueue.isEmpty()) {
+      const warning = decision.decision === "warn";
+      this.messageQueue.addOnce(
+        // Keep the continuation's delegated-turn/goal attribution; the warning
+        // itself is a separate durable prefix row when this entry dispatches.
+        "Continue",
+        {
+          ...context.options,
+          model: step.model,
+          queueDispatchMode: "tool-end",
+          muxMetadata: {
+            ...(context.workspaceTurnMetadata ?? { type: "normal" }),
+            contextBudgetContinuation: true,
+          },
+        },
+        warning ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
+        {
+          synthetic: true,
+          agentInitiated: true,
+          sealed: true,
+          removableDedupeKey: true,
+          goalKind: context.goalKind,
+          goalId: context.goalId,
+        }
+      );
+      this.emitQueuedMessageChanged();
+    }
+    return decision.decision;
   }
 
   /**
@@ -4589,6 +5219,7 @@ export class AgentSession {
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
           timestamp: Date.now(),
+          ...(rejection.type === "context_budget_blocked" ? { contextBudgetRejected: true } : {}),
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
@@ -5320,6 +5951,7 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+    this.clearContextBudgetState();
     if (options?.abandonPartial || this.midStreamCompactionPending) {
       this.continuousCompactionAbandoned = true;
       this.continuousCompactor.reset("user-interrupt");
@@ -5436,7 +6068,8 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    contextBudgetRetried = false
   ): Promise<AgentSessionResult<void>> {
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
@@ -5457,6 +6090,7 @@ export class AgentSession {
     const providersConfig = this.getProvidersConfigSafe();
     this.activeStreamContext = {
       modelString,
+      contextBudgetRetried,
       options,
       agentInitiated,
       openaiTruncationModeOverride,
@@ -5510,6 +6144,12 @@ export class AgentSession {
     if (!historyResult.success) {
       return await this.handleStreamWithHistoryFailure(
         createUnknownSendMessageError(historyResult.error)
+      );
+    }
+
+    if (this.isTokenBudgetActive(options)) {
+      this.contextBudgetWarningClaimed ||= historyResult.data.some(
+        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
       );
     }
 
@@ -5674,6 +6314,9 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      onStepSettled: this.isTokenBudgetActive(options)
+        ? (step) => this.onContextBudgetStepSettled(step)
+        : undefined,
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5683,6 +6326,43 @@ export class AgentSession {
     });
 
     if (!streamResult.success) {
+      if (
+        streamResult.error.type === "context_budget_exceeded" &&
+        this.isTokenBudgetActive(options)
+      ) {
+        const rolled = await this.rolloverAfterBudgetFailure(
+          streamResult.error.model,
+          streamResult.error.estimate
+        );
+        if (rolled.success && rolled.data) {
+          return this.streamWithHistory(
+            streamResult.error.model,
+            options,
+            openaiTruncationModeOverride,
+            true,
+            agentInitiated,
+            abortSignal,
+            goalKind,
+            goalId,
+            activeTurnThinkingOverride,
+            true
+          );
+        }
+        // This row passed send-time admission but never fit the final request.
+        // Keep it visible without poisoning subsequent sends (including after restart).
+        const rejected = await this.rejectActiveContextBudgetRequest();
+        if (!rejected.success)
+          return await this.handleStreamWithHistoryFailure(rejected.error, acpPromptId);
+        if (!rolled.success)
+          return await this.handleStreamWithHistoryFailure(rolled.error, acpPromptId);
+        return await this.handleStreamWithHistoryFailure(
+          {
+            type: "context_budget_blocked",
+            message: `The assembled request exceeds the safe context budget for ${streamResult.error.model}. Shorten the message, remove attachments, use /compact, or choose a larger model.`,
+          },
+          acpPromptId
+        );
+      }
       return await this.handleStreamWithHistoryFailure(
         streamResult.error,
         acpPromptId,
@@ -6185,6 +6865,43 @@ export class AgentSession {
     this.queuedProviderToolEndAbortInFlight = false;
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
+    const context = this.activeStreamContext;
+    const budgetFailure =
+      context &&
+      !hadCompactionRequest &&
+      this.isTokenBudgetActive(context.options) &&
+      ((data.errorType === "context_exceeded" && !this.activeStreamHadAnyDelta) ||
+        data.contextBudgetExceeded != null);
+    const rejectBudgetRequest = budgetFailure && !this.activeStreamHadAnyDelta;
+    if (budgetFailure) {
+      const model = data.contextBudgetExceeded?.model ?? context.modelString;
+      const rolled = await this.rolloverAfterBudgetFailure(
+        model,
+        data.contextBudgetExceeded?.estimate
+      );
+      if (rolled.success && rolled.data) {
+        this.setTurnPhase(TurnPhase.PREPARING);
+        const retry = await this.streamWithHistory(
+          model,
+          context.options,
+          context.openaiTruncationModeOverride,
+          true,
+          context.agentInitiated,
+          undefined,
+          context.goalKind,
+          context.goalId,
+          undefined,
+          true
+        );
+        this.resolveStreamErrorRecoveryDecision(
+          data.messageId,
+          retry.success ? "retry-started" : "terminal"
+        );
+        return;
+      }
+      if (!rolled.success)
+        data = { ...data, ...buildStreamErrorEventData(rolled.error), messageId: data.messageId };
+    }
     if (
       await this.maybeRetryCompactionOnContextExceeded({
         messageId: data.messageId,
@@ -6201,6 +6918,14 @@ export class AgentSession {
       })
     ) {
       return; // retry set PREPARING
+    }
+
+    // Provider overflow arrives asynchronously, but must exclude the same
+    // undelivered request payloads as preflight rejection. Preserve started turns.
+    if (rejectBudgetRequest) {
+      const rejected = await this.rejectActiveContextBudgetRequest();
+      if (!rejected.success)
+        data = { ...data, ...buildStreamErrorEventData(rejected.error), messageId: data.messageId };
     }
 
     // Terminal error — no retry succeeded
@@ -6323,6 +7048,17 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
+        // Includes nested PTC calls and directory/rename mutations that affect notes.
+        // Reads can also change hot-set ranking; rebuild at the next request, not mid-step.
+        if (
+          payload.toolName === "memory" &&
+          typeof payload.result === "object" &&
+          payload.result != null &&
+          "success" in payload.result &&
+          payload.result.success === true
+        ) {
+          this.memoryContextByModelString.clear();
+        }
         this.activeToolCallIds.delete(payload.toolCallId);
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
@@ -6403,7 +7139,8 @@ export class AgentSession {
       if (
         this.activeCompactionRequest ||
         this.midStreamCompactionPending ||
-        this.continuousCompactionObserving
+        this.continuousCompactionObserving ||
+        this.isTokenBudgetActive(this.activeStreamContext?.options)
       ) {
         return;
       }
@@ -6525,6 +7262,7 @@ export class AgentSession {
       const isQueuedProviderToolEndAbort =
         this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
       if (abortReason === "user") {
+        this.clearContextBudgetState();
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
       if (activeModelForAbort) {
@@ -6907,6 +7645,7 @@ export class AgentSession {
    * deleting the partial removes the discarded transcript's tail durably.
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
+    this.clearContextBudgetState();
     this.continuousCompactor.reset("context-mutation");
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
@@ -8146,6 +8885,7 @@ export class AgentSession {
    * (compactionOccurred + the in-session mirrors).
    */
   async clearPostCompactionState(): Promise<void> {
+    this.memoryContextByModelString.clear();
     // In-memory clears stay unconditional: they stop THIS session from
     // injecting carryover even when the durable discard below fails.
     this.compactionOccurred = false;
@@ -8387,13 +9127,16 @@ export class AgentSession {
    * their content. The snapshot is persisted to history so subsequent sends don't
    * re-read the files (which would bust prompt cache if files changed).
    *
-   * Also registers file state for change detection via <system-file-update> diffs.
+   * Captures file state for registration after acceptance, so rollover cleanup
+   * cannot erase the new snapshot's <system-file-update> tracking.
    *
    * @returns The snapshot message and list of materialized mentions, or null if no mentions found
    */
-  private async materializeFileAtMentionsSnapshot(
-    messageText: string
-  ): Promise<{ snapshotMessage: MuxMessage; materializedTokens: string[] } | null> {
+  private async materializeFileAtMentionsSnapshot(messageText: string): Promise<{
+    snapshotMessage: MuxMessage;
+    materializedTokens: string[];
+    fileStates: Array<{ path: string; state: FileState }>;
+  } | null> {
     // Guard for test mocks that may not implement getWorkspaceMetadata
     if (typeof this.aiService.getWorkspaceMetadata !== "function") {
       return null;
@@ -8419,16 +9162,16 @@ export class AgentSession {
       return null;
     }
 
-    // Register file state for each successfully read file (for change detection)
+    const fileStates: Array<{ path: string; state: FileState }> = [];
     for (const mention of materialized) {
       if (
         mention.content !== undefined &&
         mention.modifiedTimeMs !== undefined &&
         mention.resolvedPath
       ) {
-        await this.recordFileState(mention.resolvedPath, {
-          content: mention.content,
-          timestamp: mention.modifiedTimeMs,
+        fileStates.push({
+          path: mention.resolvedPath,
+          state: { content: mention.content, timestamp: mention.modifiedTimeMs },
         });
       }
     }
@@ -8444,7 +9187,7 @@ export class AgentSession {
       fileAtMentionSnapshot: tokens,
     });
 
-    return { snapshotMessage, materializedTokens: tokens };
+    return { snapshotMessage, materializedTokens: tokens, fileStates };
   }
 
   private async materializeMcpPromptSnapshots(
@@ -8503,7 +9246,8 @@ export class AgentSession {
 
   private async materializeAgentSkillSnapshots(
     muxMetadata: MuxMessageMetadata | undefined,
-    disableWorkspaceAgents: boolean | undefined
+    disableWorkspaceAgents: boolean | undefined,
+    freshContext = false
   ): Promise<MuxMessage[]> {
     const refs = extractAgentSkillRefs(muxMetadata);
     if (refs.length === 0) {
@@ -8534,11 +9278,14 @@ export class AgentSession {
     // Dedupe per skill against recent persisted snapshots. A wider window keeps multi-skill
     // turns from reloading snapshots that were persisted together on the previous turn.
     const recentSnapshots: Array<{ skillName: string; sha256: string }> = [];
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 10);
+    // Sealed-window snapshots cannot satisfy a skill invocation in the fresh request.
+    const historyResult = freshContext
+      ? Ok<MuxMessage[]>([])
+      : await this.historyService.getLastMessages(this.workspaceId, 10);
     if (historyResult.success) {
-      for (const msg of historyResult.data) {
+      for (const msg of sliceMessagesForProviderFromLatestContextBoundary(historyResult.data)) {
         const metadata = msg.metadata;
-        if (metadata?.synthetic && metadata.agentSkillSnapshot) {
+        if (metadata?.synthetic && metadata.agentSkillSnapshot && !metadata.contextBudgetRejected) {
           recentSnapshots.push({
             skillName: metadata.agentSkillSnapshot.skillName,
             sha256: metadata.agentSkillSnapshot.sha256,
