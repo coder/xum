@@ -4516,7 +4516,7 @@ export class StreamManager {
         messageId: streamInfo.messageId,
         error: actualError.message,
         errorType: "context_budget_blocked",
-        contextBudgetExceeded: actualError.budgetError,
+        contextBudgetExceeded: actualError.details,
         acpPromptId: streamInfo.initialMetadata?.acpPromptId,
       };
     }

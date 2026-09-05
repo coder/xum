@@ -770,6 +770,7 @@ export class AgentSession {
   private contextBudgetWarningClaimed = false;
   private pendingBudgetWarning?: true;
   private pendingRolloverMissingHistory = false;
+  private contextBudgetGeneration = 0;
   private contextBudgetMemoryWritable = false;
   private readonly onContextWindowRollover?: () => void;
   private lastSystemMessageTokens?: number;
@@ -4661,6 +4662,7 @@ export class AgentSession {
   }
 
   private clearContextBudgetState(): void {
+    this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
     this.pendingBudgetWarning = undefined;
     this.contextBudgetWarningClaimed = false;
@@ -4684,7 +4686,7 @@ export class AgentSession {
     await this.clearPostCompactionState();
     await sandboxHostService.discardScope(
       this.workspaceId,
-      this.config.getSessionDir(this.workspaceId)
+      path.join(this.config.sessionsDir, this.workspaceId)
     );
   }
 
@@ -4694,6 +4696,7 @@ export class AgentSession {
     estimate?: number
   ): Promise<Result<boolean, SendMessageError>> {
     const context = this.activeStreamContext;
+    const generation = this.contextBudgetGeneration;
     if (
       !context ||
       context.contextBudgetRetried ||
@@ -4755,6 +4758,7 @@ export class AgentSession {
       await this.applyContextResetSideEffects();
       if (
         this.activeStreamContext !== context ||
+        this.contextBudgetGeneration !== generation ||
         this.turnAdmissionBlocks > 0 ||
         this.disposed ||
         this.shuttingDown
@@ -4900,8 +4904,10 @@ export class AgentSession {
     step: SettledStepBudget
   ): Promise<"continue" | "warn" | "rollover"> {
     const context = this.activeStreamContext;
+    const generation = this.contextBudgetGeneration;
     if (
       !context ||
+      !context.options ||
       !this.isTokenBudgetActive(context.options) ||
       this.compactionMonitor.getThreshold() >= 1
     )
@@ -4935,6 +4941,8 @@ export class AgentSession {
       this.pendingRolloverMissingHistory = !step.sessionHistoryAvailable;
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
+      if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
+        return "continue";
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -5763,6 +5771,7 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+    this.clearContextBudgetState();
     if (options?.abandonPartial || this.midStreamCompactionPending) {
       this.continuousCompactionAbandoned = true;
       this.continuousCompactor.reset("user-interrupt");
