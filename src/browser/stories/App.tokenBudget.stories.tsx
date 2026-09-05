@@ -187,11 +187,16 @@ export const ExperimentSettings: AppStory = {
     await waitFor(() =>
       expect(
         canvas.queryByTestId("settings-button") ??
-          canvas.queryByRole("button", { name: "Open sidebar menu" })
+          canvas.queryByRole("button", { name: "Open sidebar menu" }) ??
+          canvas.queryByRole("button", { name: "Expand sidebar" })
       ).not.toBeNull()
     );
-    if (!canvas.queryByTestId("settings-button"))
-      await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
+    if (!canvas.queryByTestId("settings-button")) {
+      await userEvent.click(
+        canvas.queryByRole("button", { name: "Open sidebar menu" }) ??
+          canvas.getByRole("button", { name: "Expand sidebar" })
+      );
+    }
     await userEvent.click(await canvas.findByTestId("settings-button"));
     await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
     const toggle = await canvas.findByRole("switch", {
