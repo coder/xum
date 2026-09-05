@@ -1,0 +1,19 @@
+/** Shared limits for opt-in, lossless context-window rollover and history retrieval. */
+export const CONTEXT_NOTES_MEMORY_PATH = "/memories/workspace/context-notes.md";
+export const CONTEXT_NOTES_RESERVED_BYTES = 8 * 1024;
+export const CONTEXT_NOTES_RESERVED_TOKENS = 2_000;
+export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
+export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
+export const OUTPUT_RESERVE_TOKENS = 8_192;
+export const WARNING_RESERVE_TOKENS = 2_048;
+export const IMAGE_TOKEN_ESTIMATE = 1_024;
+export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
+export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;
+export const SESSION_HISTORY_MAX_SCAN_BYTES = 2 * 1024 * 1024;
+export const SESSION_HISTORY_MAX_SCAN_ROWS = 500;
+export const SESSION_HISTORY_MAX_LINE_BYTES = 1024 * 1024;
+export const SESSION_HISTORY_DEFAULT_LIMIT = 10;
+export const SESSION_HISTORY_MAX_SEARCH_LIMIT = 25;
+export const SESSION_HISTORY_MAX_WINDOW_LIMIT = 50;
+export const SESSION_HISTORY_DEFAULT_READ_CHARS = 8_000;
+export const SESSION_HISTORY_MAX_READ_CHARS = 16_000;

@@ -605,6 +605,24 @@ export interface BashMonitorWakeDisplayRecord {
 export type MuxMessageMetadata = MuxMessageMetadataBase &
   (
     | {
+        type: "context-window-rollover";
+        rolloverId: string;
+        reason: "on-send" | "mid-stream" | "context-exceeded";
+        previousWindowId: string;
+        flushOpportunity: boolean;
+        contextTokens: number;
+        maxTokens: number;
+      }
+    | {
+        type: "context-window-lead-in";
+        rolloverId: string;
+      }
+    | {
+        type: "context-budget-warning";
+        contextTokens: number;
+        maxTokens: number;
+      }
+    | {
         type: "compaction-request";
         rawCommand: string; // The original /compact command as typed by user (for display)
         parsed: CompactionRequestData;
@@ -776,6 +794,19 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         relationship: AgentMessageRelationship;
       }
   );
+
+/** Rollover internals do not make an otherwise empty window eligible for another reset. */
+export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
+  const type = message.metadata?.muxMetadata?.type;
+  return type === "context-window-lead-in" || type === "context-budget-warning";
+}
+
+export function isRolloverBoundary(message: MuxMessage): boolean {
+  return (
+    message.metadata?.contextBoundaryKind === "reset" &&
+    message.metadata.muxMetadata?.type === "context-window-rollover"
+  );
+}
 
 /** Correlation identifying which delegated workspace turn a stream belongs to. */
 export interface WorkspaceTurnTaskCorrelation {
