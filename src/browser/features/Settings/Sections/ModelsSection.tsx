@@ -102,16 +102,22 @@ function buildProviderModelEntry(
   return entry;
 }
 
-export function shouldShowModelInSettings(modelId: string, codexOauthConfigured: boolean): boolean {
+export function shouldShowModelInSettings(
+  modelId: string,
+  codexOauthConfigured: boolean,
+  // A configured gateway (mux-gateway, openrouter, ...) supplies its own
+  // credentials, so the row must stay visible for users to pick that route.
+  hasConfiguredGatewayRoute = false
+): boolean {
   // OpenAI OAuth gating only applies to OpenAI-routed models; other providers can
   // reuse the same providerModelId string without requiring OpenAI OAuth.
   if (getModelProvider(modelId) !== "openai") {
     return true;
   }
 
-  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected,
-  // so users don't pick defaults that fail at send time.
-  return codexOauthConfigured || !isCodexOauthRequiredModelId(modelId);
+  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected
+  // or a gateway can serve them, so users don't pick defaults that fail at send time.
+  return codexOauthConfigured || hasConfiguredGatewayRoute || !isCodexOauthRequiredModelId(modelId);
 }
 
 export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
@@ -384,7 +390,15 @@ export function ModelsSection() {
       fullId: model.id,
       aliases: model.aliases,
     }))
-    .filter((model) => shouldShowModelInSettings(model.fullId, codexOauthConfigured))
+    .filter((model) =>
+      shouldShowModelInSettings(
+        model.fullId,
+        codexOauthConfigured,
+        routing
+          .availableRoutes(model.fullId)
+          .some((route) => route.route !== "direct" && route.isConfigured)
+      )
+    )
     .filter((model) => isModelAllowedByPolicy(effectivePolicy, model.fullId));
 
   const customModels = getCustomModels();

@@ -217,7 +217,20 @@ export function useModelsFromSettings() {
   const openaiApiKeySet = config === null ? null : config.openai?.apiKeySet === true;
   const codexOauthSet = config === null ? null : config.openai?.codexOauthSet === true;
 
-  const requiresCodexOauth = (modelId: string) => isCodexOauthRequiredModel(modelId, config);
+  // The OpenAI auth gates below apply to the direct route only. A gateway
+  // route (mux-gateway, openrouter, ...) supplies its own credentials, so the
+  // user's OpenAI auth state must not hide, or warn about, models the gateway
+  // serves. For a model with no active route, resolveRoute falls back to
+  // direct, which keeps the gate in place.
+  const resolvesToDirectOpenAI = useCallback(
+    (modelId: string) =>
+      resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
+        .routeProvider === "openai",
+    [routePriority, routeOverrides, isConfigured, isGatewayModelAccessible]
+  );
+
+  const requiresCodexOauth = (modelId: string) =>
+    isCodexOauthRequiredModel(modelId, config) && resolvesToDirectOpenAI(modelId);
 
   const providerHiddenModels = useMemo(() => {
     if (config == null) {
@@ -314,28 +327,19 @@ export function useModelsFromSettings() {
     const hasOpenaiApiKey = openaiApiKeySet === true;
     const hasCodexOauth = codexOauthSet === true;
 
-    // OpenAI model gating (direct route only):
+    // OpenAI model gating (direct route only; see resolvesToDirectOpenAI):
     // - API key + OAuth: allow everything.
     // - API key only: hide models that require OAuth.
     // - OAuth only: show only models routable via OAuth.
     // - Neither: hide models that require OAuth (status quo).
-    // A gateway route (mux-gateway, openrouter, ...) supplies its own
-    // credentials, so the user's OpenAI auth state must not hide models the
-    // gateway serves. providerFiltered already guarantees an active route, so
-    // resolveRoute returns that route rather than its direct fallback.
+    // providerFiltered already guarantees an active route, so the resolved
+    // route is the real one rather than the direct fallback.
     const next = providerFiltered.filter((modelId) => {
       if (!modelId.startsWith("openai:")) {
         return true;
       }
 
-      const route = resolveRoute(
-        modelId,
-        routePriority,
-        routeOverrides,
-        isConfigured,
-        isGatewayModelAccessible
-      );
-      if (route.routeProvider !== "openai") {
+      if (!resolvesToDirectOpenAI(modelId)) {
         return true;
       }
 
@@ -358,6 +362,7 @@ export function useModelsFromSettings() {
     isConfigured,
     isGatewayModelAccessible,
     isAuthoritativeProviderModelAccessible,
+    resolvesToDirectOpenAI,
     routePriority,
     routeOverrides,
     openaiApiKeySet,

@@ -496,6 +496,35 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
   });
 
+  test("oauth disconnected: requiresCodexOauth follows the active route", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: false,
+        codexOauthSet: false,
+      },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    routePriority = ["mux-gateway", "direct"];
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    // The gateway serves the OAuth-required model, so it is selectable and the
+    // ChatInput warning must not ask the user to connect OpenAI.
+    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
+    expect(result.current.requiresCodexOauth("openai:gpt-5.3-codex-spark")).toBe(false);
+    // A gateway-less model still resolves to direct, so the warning stays.
+    routePriority = ["direct"];
+    const { result: directOnly } = renderHook(() => useModelsFromSettings());
+    expect(directOnly.current.requiresCodexOauth("openai:gpt-5.3-codex-spark")).toBe(true);
+  });
+
   test("exposes OpenAI auth state flags", () => {
     providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true },
