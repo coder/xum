@@ -12573,18 +12573,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       try {
         await this.getOrCreateSession(workspaceId).applyContextResetSideEffects();
       } catch (error) {
-        // Same partial-failure posture as the sandbox invalidation below:
-        // the chat-side reset applied, but the stale persisted carryover
-        // would re-inject pre-reset context after a restart, so success must
-        // not be reported while the discard is not durable.
-        log.error(
-          `Failed to durably discard post-compaction carryover for ${workspaceId} after context reset`,
-          error
-        );
+        // The boundary is durable, but success must wait for both persisted
+        // carryover and sandbox invalidation. Preserve the failing stage's diagnosis.
+        log.error(`Failed to durably discard context state for ${workspaceId}`, error);
         return Err(
-          `Context was reset, but the persisted post-compaction carryover could not be durably ` +
-            `discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be ` +
-            `re-injected after a restart; retry once the session storage is writable.`
+          `Context was reset, but ${getErrorMessage(error)} Retry once the session storage is writable.`
         );
       }
 

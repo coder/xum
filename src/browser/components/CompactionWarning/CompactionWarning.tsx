@@ -17,6 +17,7 @@ export const CompactionWarning: React.FC<{
   usagePercentage: number;
   thresholdPercentage: number;
   isStreaming: boolean;
+  rolloverEnabled: boolean;
 }> = (props) => {
   // At threshold or above, next message will trigger compaction
   const willCompactNext = props.usagePercentage >= props.thresholdPercentage;
@@ -31,7 +32,14 @@ export const CompactionWarning: React.FC<{
   let text: string;
   let isUrgent: boolean;
 
-  if (showForceCompactCountdown) {
+  if (props.rolloverEnabled) {
+    // Rollover uses the same force threshold on-send and at settled tool steps.
+    text =
+      forceCompactRemaining > 0
+        ? `Context rollover in ${Math.round(forceCompactRemaining)}% usage`
+        : "Next message starts a fresh context window";
+    isUrgent = forceCompactRemaining <= 0;
+  } else if (showForceCompactCountdown) {
     text = `Force-compacting in ${Math.round(forceCompactRemaining)}%`;
     isUrgent = false;
   } else if (willCompactNext) {

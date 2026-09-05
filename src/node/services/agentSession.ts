@@ -4079,6 +4079,15 @@ export class AgentSession {
     // the turn that delivers it — in-process rollback cannot repair a process
     // exit. They still join the rollback set for in-process failures.
     // hasPreTurnMessages implies autoCompactionMessage === null (exempted above).
+    for (const preTurnMessage of internal?.preTurnMessages ?? []) {
+      // Family payloads are the only producer today: synthetic assistant rows
+      // only, so a future caller cannot smuggle user-role content past the
+      // provenance rules or non-synthetic rows past queue/restore projections.
+      assert(
+        preTurnMessage.role === "assistant" && preTurnMessage.metadata?.synthetic === true,
+        "sendMessage: preTurnMessages must be synthetic assistant rows"
+      );
+    }
     if (tokenBudgetActive) {
       const batch = [
         ...contextBudgetPrefix,
@@ -4115,15 +4124,6 @@ export class AgentSession {
       }
       if (await cancelBeforeAcceptance()) return Ok(undefined);
     } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      for (const preTurnMessage of internal.preTurnMessages) {
-        // Family payloads are the only producer today: synthetic assistant rows
-        // only, so a future caller cannot smuggle user-role content past the
-        // provenance rules or non-synthetic rows past queue/restore projections.
-        assert(
-          preTurnMessage.role === "assistant" && preTurnMessage.metadata?.synthetic === true,
-          "sendMessage: preTurnMessages must be synthetic assistant rows"
-        );
-      }
       const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
         ...internal.preTurnMessages,
         userMessage,
@@ -4188,9 +4188,9 @@ export class AgentSession {
     if (contextRollover) {
       // Branch summaries must remain discoverable if the append/rollback failed. Only
       // discard their registration once the new window has crossed the rollback horizon.
+      this.clearContextBudgetState();
       (internal?.onContextWindowRollover ?? this.onContextWindowRollover)?.();
       await clearPendingBranchSummary(this.workspaceId);
-      this.clearContextBudgetState();
     } else if (tokenBudgetActive) {
       this.contextBudgetWarningClaimed ||=
         contextBudgetPrefix.length > 0 ||
@@ -4683,11 +4683,25 @@ export class AgentSession {
     this.continuousCompactor.reset("context-changed");
     this.clearFileState();
     this.memoryContextByModelString.clear();
-    await this.clearPostCompactionState();
-    await sandboxHostService.discardScope(
-      this.workspaceId,
-      path.join(this.config.sessionsDir, this.workspaceId)
-    );
+    try {
+      await this.clearPostCompactionState();
+    } catch (error) {
+      throw new Error(
+        `The persisted post-compaction carryover could not be durably discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be re-injected after a restart.`,
+        { cause: error }
+      );
+    }
+    try {
+      await sandboxHostService.discardScope(
+        this.workspaceId,
+        path.join(this.config.sessionsDir, this.workspaceId)
+      );
+    } catch (error) {
+      throw new Error(
+        `The sandbox kernel state could not be durably invalidated (${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables may reappear after a restart.`,
+        { cause: error }
+      );
+    }
   }
 
   /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
@@ -4767,9 +4781,9 @@ export class AgentSession {
       const rows = [...createRolloverPrefix(rollover), continuation];
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
       if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+      this.clearContextBudgetState();
       this.onContextWindowRollover?.();
       await clearPendingBranchSummary(this.workspaceId);
-      this.clearContextBudgetState();
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
       return Ok(true);
     } catch (error) {
@@ -4783,6 +4797,18 @@ export class AgentSession {
   ): Promise<Result<MuxMessage[], SendMessageError>> {
     const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (!history.success) return Err(createUnknownSendMessageError(history.error));
+    // A filesystem error can be reported after an atomic replacement became visible.
+    // Disk wins over an unconsumed in-memory claim: never append the same rollover twice.
+    if (
+      this.pendingRollover &&
+      history.data.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-window-rollover" &&
+          row.metadata.muxMetadata.rolloverId === this.pendingRollover?.rolloverId
+      )
+    ) {
+      this.clearContextBudgetState();
+    }
     this.contextBudgetWarningClaimed = history.data.some(
       (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
     );

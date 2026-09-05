@@ -6,7 +6,7 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
-import { collapseLeftSidebar } from "./helpers/uiState";
+import { collapseLeftSidebar, expandLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { waitForScrollStabilization } from "./storyPlayHelpers.js";
@@ -19,7 +19,7 @@ const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
-function setupTokenBudgetStory() {
+function setupTokenBudgetStory(inputTokens = 2400) {
   collapseLeftSidebar();
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), true);
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), false);
@@ -46,7 +46,7 @@ function setupTokenBudgetStory() {
         type: "context-window-rollover",
         rolloverId: "rollover",
         reason: "on-send",
-        previousWindowId: "initial",
+        previousWindowId: "w:0",
         flushOpportunity: true,
         contextTokens: 700_000,
         maxTokens: 1_000_000,
@@ -72,15 +72,20 @@ function setupTokenBudgetStory() {
         historySequence: 6,
         timestamp: STABLE_TIMESTAMP,
         model: MODEL,
-        contextUsage: { inputTokens: 2400, outputTokens: 100 },
+        contextUsage: { inputTokens, outputTokens: 100 },
         toolCalls: [
           {
             type: "dynamic-tool",
             toolName: "session_history",
             toolCallId: "history-read",
-            input: { action: "list" },
+            input: { action: "list_windows" },
             state: "output-available",
-            output: { windows: [{ id: "initial", messageCount: 2 }] },
+            output: {
+              success: true,
+              windows: [{ windowId: "w:0", boundaryKind: "root" }],
+              exhausted: true,
+              skipped_oversized_rows: 0,
+            },
           },
         ],
       }),
@@ -182,20 +187,25 @@ export const ContextSettingsPhone375: AppStory = {
 
 export const ExperimentSettings: AppStory = {
   ...Rollover,
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupTokenBudgetStory();
+        expandLeftSidebar();
+        return client;
+      }}
+    />
+  ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await waitFor(() =>
       expect(
         canvas.queryByTestId("settings-button") ??
-          canvas.queryByRole("button", { name: "Open sidebar menu" }) ??
-          canvas.queryByRole("button", { name: "Expand sidebar" })
+          canvas.queryByRole("button", { name: "Open sidebar menu" })
       ).not.toBeNull()
     );
     if (!canvas.queryByTestId("settings-button")) {
-      await userEvent.click(
-        canvas.queryByRole("button", { name: "Open sidebar menu" }) ??
-          canvas.getByRole("button", { name: "Expand sidebar" })
-      );
+      await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
     }
     await userEvent.click(await canvas.findByTestId("settings-button"));
     await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
@@ -213,5 +223,16 @@ export const ExperimentSettings: AppStory = {
 
 export const ExperimentSettingsPhone375: AppStory = {
   ...Phone375,
+  render: ExperimentSettings.render,
   play: ExperimentSettings.play,
+};
+
+export const HighUsage: AppStory = {
+  ...Rollover,
+  render: () => <AppWithMocks setup={() => setupTokenBudgetStory(650_000)} />,
+};
+
+export const HighUsagePhone375: AppStory = {
+  ...Phone375,
+  render: HighUsage.render,
 };

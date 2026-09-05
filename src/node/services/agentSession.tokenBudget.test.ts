@@ -331,6 +331,27 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rows.filter((row) => text(row) === "Retry me")).toHaveLength(1);
   });
 
+  test("a published rollover is not repeated when its append acknowledgment fails", async () => {
+    const h = await setup();
+    await seedHistory(h, 110_000);
+    const append = h.historyService.appendManyToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
+      async (workspace, rows) => {
+        const result = await append(workspace, rows);
+        if (!result.success) throw new Error(result.error);
+        throw new Error("directory sync failed after publication");
+      }
+    );
+    expect((await h.session.sendMessage("Published input", options)).success).toBe(false);
+    expect(h.requests).toHaveLength(0);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    expect((await h.session.sendMessage("Resume safely", options)).success).toBe(true);
+    const rows = await allRows(h);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    expect(rows.filter((row) => text(row) === "Published input")).toHaveLength(1);
+    expect(h.requests).toHaveLength(1);
+  });
+
   test.each(["tool-end", "turn-end"] as const)(
     "%s queued real input receives the settled rollover without a duplicate Continue",
     async (queueDispatchMode) => {
