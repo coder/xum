@@ -161,7 +161,7 @@ export const experiments = {
   },
 };
 // Re-export telemetry schemas
-export { telemetry, TelemetryEventSchema } from "./telemetry";
+export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
@@ -1111,15 +1111,7 @@ export const secrets = {
 };
 
 // Re-export Coder schemas from dedicated file
-export {
-  coder,
-  CoderInfoSchema,
-  CoderPresetSchema,
-  CoderTemplateSchema,
-  CoderWorkspaceConfigSchema,
-  CoderWorkspaceSchema,
-  CoderWorkspaceStatusSchema,
-} from "./coder";
+export { coder } from "./coder";
 
 // Workspace
 const DebugLlmRequestSnapshotSchema = z

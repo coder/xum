@@ -26,11 +26,6 @@ import {
   workspaceTurnTerminalAttentionSuppressed,
   type WorkspaceTurnManager,
 } from "@/node/services/workspaceTurnManager";
-export type {
-  WorkspaceTurnCreateArgs,
-  WorkspaceTurnCreateResult,
-  WorkspaceTurnWaitResult,
-} from "@/node/services/workspaceTurnManager";
 import {
   TASK_RECOVERY_FALLBACK_AGENT_ID,
   formatSubagentFailureUserMessage,
@@ -48,7 +43,7 @@ import {
   type WorkspaceHost,
   type WorkspaceLifecycleResult,
 } from "@/node/services/taskWorkspaceSeam";
-export type { TaskCreateArgs, TaskKind } from "@/node/services/taskWorkspaceSeam";
+export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";

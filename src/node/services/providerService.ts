@@ -33,7 +33,6 @@ import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig
 import type { Result } from "@/common/types/result";
 import type {
   AddCustomProviderInput,
-  AWSCredentialStatus,
   CustomProviderMutationError,
   ProviderConfigInfo,
   ProviderModelEntry,
@@ -73,9 +72,6 @@ import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import type { PolicyService } from "@/node/services/policyService";
 import { getErrorMessage } from "@/common/utils/errors";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-
-// Re-export types for backward compatibility
-export type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap };
 
 function filterProviderModelsByPolicy(
   models: ProviderModelEntry[] | undefined,

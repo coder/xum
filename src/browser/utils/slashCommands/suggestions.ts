@@ -14,8 +14,6 @@ import type {
   SuggestionDefinition,
 } from "./types";
 
-export type { SlashSuggestion } from "./types";
-
 const COMMAND_DEFINITIONS = getSlashCommandDefinitions();
 
 function filterAndMapSuggestions<T extends SuggestionDefinition>(

@@ -213,7 +213,7 @@ type AgentSessionResult<T> =
  * Uses timestamp-based polling with diff injection.
  */
 // Re-export types from FileChangeTracker for backward compatibility
-export type { FileState, EditedFileAttachment } from "@/node/services/utils/fileChangeTracker";
+export type { FileState } from "@/node/services/utils/fileChangeTracker";
 
 // Type guard for compaction request metadata
 // Supports both new `followUpContent` and legacy `continueMessage` for backwards compatibility

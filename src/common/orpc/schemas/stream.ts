@@ -888,6 +888,3 @@ export const SendMessageOptionsSchema = z.object({
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
 });
-
-// Re-export ChatUsageDisplaySchema for convenience
-export { ChatUsageDisplaySchema };

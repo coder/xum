@@ -56,9 +56,6 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
-// Shared with workspace metadata IPC; see src/common/orpc/schemas/workspace.ts.
-export { WorkflowTaskMetadataSchema };
-
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",

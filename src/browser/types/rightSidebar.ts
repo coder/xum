@@ -8,14 +8,7 @@
  * to pattern-match on tab ids.
  */
 
-import {
-  BASE_TAB_IDS,
-  isBaseTabId,
-  type BaseTabType,
-} from "@/browser/features/RightSidebar/Tabs/tabConfig";
-
-/** Runtime list of static (non-terminal) tab ids — useful for iteration. */
-export const RIGHT_SIDEBAR_TABS = BASE_TAB_IDS;
+import { isBaseTabId, type BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 export type { BaseTabType };
 
 /**
