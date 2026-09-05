@@ -15,7 +15,7 @@ import {
   normalizeSelectedModel,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
-import { isModelAvailable } from "@/common/routing";
+import { isModelAvailable, resolveRoute } from "@/common/routing";
 import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
@@ -314,13 +314,28 @@ export function useModelsFromSettings() {
     const hasOpenaiApiKey = openaiApiKeySet === true;
     const hasCodexOauth = codexOauthSet === true;
 
-    // OpenAI model gating:
+    // OpenAI model gating (direct route only):
     // - API key + OAuth: allow everything.
     // - API key only: hide models that require OAuth.
     // - OAuth only: show only models routable via OAuth.
     // - Neither: hide models that require OAuth (status quo).
+    // A gateway route (mux-gateway, openrouter, ...) supplies its own
+    // credentials, so the user's OpenAI auth state must not hide models the
+    // gateway serves. providerFiltered already guarantees an active route, so
+    // resolveRoute returns that route rather than its direct fallback.
     const next = providerFiltered.filter((modelId) => {
       if (!modelId.startsWith("openai:")) {
+        return true;
+      }
+
+      const route = resolveRoute(
+        modelId,
+        routePriority,
+        routeOverrides,
+        isConfigured,
+        isGatewayModelAccessible
+      );
+      if (route.routeProvider !== "openai") {
         return true;
       }
 

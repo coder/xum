@@ -443,6 +443,59 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
   });
 
+  test("codex oauth only: a gateway route bypasses the OpenAI auth gate", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        models: SEEDED_OPENAI_CUSTOM_MODELS,
+      },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    routePriority = ["mux-gateway", "direct"];
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    // The gateway supplies its own credentials, so API-key-only models stay visible.
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).toContain("openai:gpt-5.2-pro");
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
+    expect(result.current.hiddenModelsForSelector).not.toContain(KNOWN_MODELS.GPT_PRO.id);
+  });
+
+  test("codex oauth only: a per-model gateway override bypasses the gate for that model only", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        models: SEEDED_OPENAI_CUSTOM_MODELS,
+      },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    routePriority = ["direct", "mux-gateway"];
+    routeOverrides = { [KNOWN_MODELS.GPT_PRO.id]: "mux-gateway" };
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    // Direct-routed models keep the OAuth-only gate.
+    expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
+  });
+
   test("exposes OpenAI auth state flags", () => {
     providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true },
