@@ -158,6 +158,29 @@ describe("getEffectiveContextLimit", () => {
     expect(limit).toBe(1_050_000);
   });
 
+  test("keeps the API window for Chat Completions when an API key exists, even if OAuth is preferred", () => {
+    // Mirrors providerModelFactory: Codex OAuth serves only the Responses API.
+    const limit = getEffectiveContextLimit(
+      "openai:gpt-5.5",
+      false,
+      providersWithOpenAI({
+        apiKeySet: true,
+        codexOauthSet: true,
+        codexOauthDefaultAuth: "oauth",
+        wireFormat: "chatCompletions",
+      })
+    );
+    expect(limit).toBe(1_050_000);
+
+    // Without an API key there is nothing to fall back to; the OAuth cap stays.
+    const oauthOnlyLimit = getEffectiveContextLimit(
+      "openai:gpt-5.5",
+      false,
+      providersWithOpenAI({ codexOauthSet: true, wireFormat: "chatCompletions" })
+    );
+    expect(oauthOnlyLimit).toBe(272_000);
+  });
+
   test("does not treat unresolved API-key files as active API-key auth", () => {
     const limit = getEffectiveContextLimit(
       "openai:gpt-5.5",

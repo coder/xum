@@ -105,6 +105,26 @@ export function getSuggestedModels(config: ProvidersConfigMap | null): string[] 
   return dedupeKeepFirst([...customModels, ...BUILT_IN_MODELS]);
 }
 
+/**
+ * The OpenAI auth gates in this hook apply to the direct route only. A gateway
+ * route (mux-gateway, openrouter, ...) supplies its own credentials, so the
+ * user's OpenAI auth state must not hide, or warn about, models the gateway
+ * serves. For a model with no active route, resolveRoute falls back to direct,
+ * which keeps the gate in place.
+ */
+function resolvesToDirectOpenAI(
+  modelId: string,
+  routePriority: string[],
+  routeOverrides: Record<string, string>,
+  isConfigured: (provider: string) => boolean,
+  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+): boolean {
+  return (
+    resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
+      .routeProvider === "openai"
+  );
+}
+
 export function getDefaultModel(): string {
   const fallback = WORKSPACE_DEFAULTS.model;
   const persisted = readPersistedString(DEFAULT_MODEL_KEY);
@@ -177,6 +197,10 @@ export function useModelsFromSettings() {
 
   const isGatewayModelAccessible = useCallback(
     (gateway: string, modelId: string) =>
+      // Mirror the backend's routing-time policy gate
+      // (createGatewayModelAccessibilityChecker): a gateway model the policy
+      // disallows falls back to other routes, so it must not count as a route here.
+      isModelAllowedByPolicy(effectivePolicy, `${gateway}:${modelId}`) &&
       isGatewayModelAccessibleFromAuthoritativeCatalog(
         gateway,
         modelId,
@@ -184,7 +208,7 @@ export function useModelsFromSettings() {
         config?.[gateway]?.discoveredModels,
         config?.[gateway]?.removedModels
       ),
-    [config]
+    [config, effectivePolicy]
   );
 
   const isAuthoritativeProviderModelAccessible = useCallback(
@@ -217,20 +241,15 @@ export function useModelsFromSettings() {
   const openaiApiKeySet = config === null ? null : config.openai?.apiKeySet === true;
   const codexOauthSet = config === null ? null : config.openai?.codexOauthSet === true;
 
-  // The OpenAI auth gates below apply to the direct route only. A gateway
-  // route (mux-gateway, openrouter, ...) supplies its own credentials, so the
-  // user's OpenAI auth state must not hide, or warn about, models the gateway
-  // serves. For a model with no active route, resolveRoute falls back to
-  // direct, which keeps the gate in place.
-  const resolvesToDirectOpenAI = useCallback(
-    (modelId: string) =>
-      resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
-        .routeProvider === "openai",
-    [routePriority, routeOverrides, isConfigured, isGatewayModelAccessible]
-  );
-
   const requiresCodexOauth = (modelId: string) =>
-    isCodexOauthRequiredModel(modelId, config) && resolvesToDirectOpenAI(modelId);
+    isCodexOauthRequiredModel(modelId, config) &&
+    resolvesToDirectOpenAI(
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      isGatewayModelAccessible
+    );
 
   const providerHiddenModels = useMemo(() => {
     if (config == null) {
@@ -339,7 +358,15 @@ export function useModelsFromSettings() {
         return true;
       }
 
-      if (!resolvesToDirectOpenAI(modelId)) {
+      if (
+        !resolvesToDirectOpenAI(
+          modelId,
+          routePriority,
+          routeOverrides,
+          isConfigured,
+          isGatewayModelAccessible
+        )
+      ) {
         return true;
       }
 
@@ -362,7 +389,6 @@ export function useModelsFromSettings() {
     isConfigured,
     isGatewayModelAccessible,
     isAuthoritativeProviderModelAccessible,
-    resolvesToDirectOpenAI,
     routePriority,
     routeOverrides,
     openaiApiKeySet,

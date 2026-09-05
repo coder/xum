@@ -63,8 +63,9 @@ export function hasOpenAIApiKey(config: unknown): boolean {
  * Would a direct-OpenAI request for this model route through Codex OAuth?
  *
  * Mirrors providerModelFactory: allowed model + stored OAuth tokens, then
- * required models always route OAuth; otherwise OAuth wins when no API key is
- * configured or when `codexOauthDefaultAuth` prefers OAuth over a present key.
+ * Chat Completions with an API key never routes OAuth, required models always
+ * route OAuth; otherwise OAuth wins when no API key is configured or when
+ * `codexOauthDefaultAuth` prefers OAuth over a present key.
  */
 export function wouldRouteOpenAIThroughCodexOauth(
   model: string,
@@ -75,6 +76,11 @@ export function wouldRouteOpenAIThroughCodexOauth(
     return false;
   }
   if (!hasCodexOauthTokens(openAIConfig)) {
+    return false;
+  }
+  // Codex OAuth serves only the Responses API. With Chat Completions selected,
+  // the factory falls back to the API key whenever one exists.
+  if (asRecord(openAIConfig)?.wireFormat === "chatCompletions" && hasOpenAIApiKey(openAIConfig)) {
     return false;
   }
   if (isCodexOauthRequiredModel(model, providersConfig ?? null)) {

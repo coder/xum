@@ -13,6 +13,7 @@ import {
 } from "./useModelsFromSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type {
+  EffectivePolicy,
   ProviderConfigInfo,
   ProviderModelEntry,
   ProvidersConfigMap,
@@ -60,6 +61,19 @@ interface TestApi {
 }
 
 let apiMock: TestApi | null = null;
+// null = policy disabled (the default); a value = enforced policy.
+let enforcedPolicy: EffectivePolicy | null = null;
+
+function buildEnforcedPolicy(
+  providerAccess: NonNullable<EffectivePolicy["providerAccess"]>
+): EffectivePolicy {
+  return {
+    policyFormatVersion: "0.1",
+    providerAccess,
+    mcp: { allowUserDefined: { stdio: true, remote: true } },
+    runtimes: null,
+  };
+}
 
 const useProvidersConfigMock = mock(() => ({
   config: providersConfig,
@@ -110,10 +124,10 @@ async function installUseModelsModuleMocks() {
   }));
   await mock.module(POLICY_CONTEXT_MODULE, () => ({
     ...actualPolicyContextModule,
-    usePolicy: () => ({
-      status: { state: "disabled" as const },
-      policy: null,
-    }),
+    usePolicy: () =>
+      enforcedPolicy
+        ? { status: { state: "enforced" as const }, policy: enforcedPolicy }
+        : { status: { state: "disabled" as const }, policy: null },
   }));
 }
 
@@ -135,6 +149,7 @@ async function setupUseModelsHookTest() {
   routePriority = ["direct"];
   routeOverrides = {};
   apiMock = null;
+  enforcedPolicy = null;
   await installUseModelsModuleMocks();
 }
 
@@ -523,6 +538,38 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     routePriority = ["direct"];
     const { result: directOnly } = renderHook(() => useModelsFromSettings());
     expect(directOnly.current.requiresCodexOauth("openai:gpt-5.3-codex-spark")).toBe(true);
+  });
+
+  test("codex oauth only: a policy-blocked gateway model does not bypass the gate", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        models: SEEDED_OPENAI_CUSTOM_MODELS,
+      },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    routePriority = ["mux-gateway", "direct"];
+    // The policy allows the canonical OpenAI models but lets the gateway serve
+    // only Sol. The backend then routes GPT Pro direct, where OAuth-only auth
+    // fails, so the picker must keep the gate for it.
+    enforcedPolicy = buildEnforcedPolicy([
+      { id: "openai", allowedModels: null },
+      { id: "mux-gateway", allowedModels: [`openai/${KNOWN_MODELS.GPT.providerModelId}`] },
+    ]);
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
+    expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
   });
 
   test("exposes OpenAI auth state flags", () => {
