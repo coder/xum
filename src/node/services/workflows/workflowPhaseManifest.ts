@@ -172,6 +172,12 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     /* setParentNodes */ true,
     ts.ScriptKind.JS
   );
+  // TypeScript recovers from syntax errors and still yields an AST; the runner
+  // will refuse to compile such a script, so a rail inferred from it would
+  // describe code that never executed.
+  if (sourceFileHasParseDiagnostics(ts, sourceFile)) {
+    return undefined;
+  }
   // A sloppy-mode `with` block resolves `phase` dynamically through its object;
   // anywhere in the file, that voids inference.
   if (containsDynamicScope(ts, sourceFile)) {
@@ -417,6 +423,14 @@ function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceF
     return ts.forEachChild(node, check) === true;
   };
   return check(sourceFile);
+}
+
+function sourceFileHasParseDiagnostics(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
+  // `parseDiagnostics` is populated by createSourceFile but is not on the public
+  // SourceFile type; the program-level alternative would require a full Program.
+  const diagnostics = (sourceFile as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] })
+    .parseDiagnostics;
+  return Array.isArray(diagnostics) && diagnostics.length > 0;
 }
 
 function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {

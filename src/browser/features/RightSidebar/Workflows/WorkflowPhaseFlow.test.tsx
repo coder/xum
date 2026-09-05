@@ -106,6 +106,22 @@ describe("WorkflowPhaseFlow", () => {
     expect(rendered.getByText("Skipped")).toBeTruthy();
   });
 
+  test("non-interactive nodes expose their lifecycle as the accessible name", () => {
+    // Unvisited nodes are not focusable, so the hover tooltip is unreachable for
+    // keyboard/screen-reader users; the status must live in the accessible name.
+    const rendered = render(
+      <WorkflowPhaseFlow
+        nodes={[
+          { name: "a", label: "Scope", lifecycle: "completed" },
+          { name: "b", label: "Verify", lifecycle: "skipped", description: "Adversarial pass" },
+        ]}
+        provenance="declared"
+      />
+    );
+    expect(rendered.getByRole("img", { name: "Scope — Completed" })).toBeTruthy();
+    expect(rendered.getByRole("img", { name: "Verify — Skipped — Adversarial pass" })).toBeTruthy();
+  });
+
   test("each connector is grouped inside its following node's list item", () => {
     // flex-wrap can only break BETWEEN list items, so a connector that lives inside
     // the item it leads into can never be stranded at the end of a row.

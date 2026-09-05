@@ -267,6 +267,14 @@ describe("inferPhaseManifest", () => {
     ).toBeUndefined();
   });
 
+  test("bails when the source has parse diagnostics even though an AST was recovered", () => {
+    // The runner will refuse to compile this; a rail inferred from it would
+    // describe code that never ran.
+    expect(
+      phaseNames(`export default function workflow({ phase }) { phase("a"); return {}; }\n@\n`)
+    ).toBeUndefined();
+  });
+
   test("bails on with statements, which resolve identifiers dynamically", () => {
     expect(
       phaseNames(legacyWorkflow(`with ({ phase: () => {} }) { phase("shadowed"); } phase("b");`))

@@ -492,6 +492,9 @@ class StaticMetadataLiteralParser {
       case "'":
       case "\\":
       case "`":
+      // JSON permits an escaped solidus (`"https:\\/\\/…"`); JSON.stringify output
+      // and hand-written URLs both use it, so the metadata contract must too.
+      case "/":
         return char;
       case "b":
         return "\b";

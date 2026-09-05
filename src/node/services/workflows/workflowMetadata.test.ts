@@ -119,6 +119,17 @@ describe("parseDeclaredPhasesFromSource", () => {
     ).toBeUndefined();
   });
 
+  test("accepts JSON escaped solidus in neighboring metadata strings", () => {
+    // `\/` is valid JSON (JSON.stringify output, hand-written URLs); it must not
+    // route an otherwise valid declaration into the unreadable-phases rejection.
+    expect(
+      parseDeclaredPhasesFromSource(
+        'export const meta = { description: "https:\\/\\/example.com", phases: [{ name: "a" }] };\n' +
+          body
+      )
+    ).toEqual([{ name: "a" }]);
+  });
+
   test("reads phases from a static meta", () => {
     expect(
       parseDeclaredPhasesFromSource('export const meta = { phases: [{ name: "a" }] };\n' + body)

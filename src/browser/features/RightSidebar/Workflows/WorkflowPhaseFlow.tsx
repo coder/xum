@@ -190,7 +190,12 @@ const PhaseFlowNode: React.FC<{
           {content}
         </button>
       ) : (
-        <span className={sharedClassName}>{content}</span>
+        // Not focusable, so the hover tooltip is unreachable for keyboard and
+        // screen-reader users: expose the lifecycle (and description) as the
+        // accessible name instead of the bare label.
+        <span className={sharedClassName} role="img" aria-label={tooltip}>
+          {content}
+        </span>
       )}
     </TooltipIfPresent>
   );
