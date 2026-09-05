@@ -135,6 +135,25 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(`function run({ phase }) { phase("fn"); return {}; }\nexport default run;\n`)
     ).toEqual(["fn"]);
+    // `export default function run` is itself a live binding.
+    expect(
+      phaseNames(
+        `export default function run({ phase }) { phase("a"); return {}; }\n` +
+          `run = ({ phase }) => { phase("b"); return {}; };\n`
+      )
+    ).toBeUndefined();
+  });
+
+  test("bails when direct eval could touch the phase binding", () => {
+    expect(phaseNames(legacyWorkflow(`eval("phase = () => {}"); phase("b");`))).toBeUndefined();
+    // Even an eval that never mentions phase voids inference: its string is opaque.
+    expect(
+      phaseNames(legacyWorkflow(`phase("a"); const n = eval("1 + 1"); log(n);`))
+    ).toBeUndefined();
+    // Indirect eval / member calls named eval do not share the lexical scope.
+    expect(
+      phaseNames(legacyWorkflow(`phase("a"); const g = globalThis; log(g.eval("1"));`))
+    ).toEqual(["a"]);
   });
 
   test("bails on shadowing declarations", () => {

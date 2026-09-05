@@ -165,3 +165,26 @@ describe("meta declaration detection after a block statement", () => {
     expect(parseDeclaredPhasesFromSource(source)).toBeUndefined();
   });
 });
+
+describe("meta declaration detection with comments between tokens", () => {
+  const body = 'export default function workflow({ phase }) { phase("a"); return {}; }\n';
+
+  test("comments between declaration tokens are treated as whitespace", () => {
+    for (const declaration of [
+      'export const meta /* phase metadata */ = { phases: [{ name: "a" }] };\n',
+      'export /* x */ const meta = { phases: [{ name: "a" }] };\n',
+      'export const meta // note\n  = { phases: [{ name: "a" }] };\n',
+      'export const meta = /* v */ { phases: [{ name: "a" }] };\n',
+    ]) {
+      expect(parseDeclaredPhasesFromSource(declaration + body)).toEqual([{ name: "a" }]);
+    }
+  });
+
+  test("a non-static meta with a comment before the initializer is still rejected", () => {
+    const source =
+      'const phases = [{ name: "a" }];\nexport const meta /* dynamic */ = { phases };\n' + body;
+    expect(() => parseDeclaredPhasesFromSource(source)).toThrow(
+      WorkflowDeclaredPhasesValidationError
+    );
+  });
+});

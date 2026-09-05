@@ -141,6 +141,11 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     /* setParentNodes */ true,
     ts.ScriptKind.JS
   );
+  // Direct `eval` can read or reassign the lexical `phase` binding from a string
+  // the scanner cannot see, so any direct eval call in the file voids inference.
+  if (containsDirectEval(ts, sourceFile)) {
+    return undefined;
+  }
   const workflowFn = findDefaultExportedFunction(ts, sourceFile);
   if (workflowFn?.body == null) {
     return undefined;
@@ -213,6 +218,11 @@ function findDefaultExportedFunction(
       hasModifier(statement, ts.SyntaxKind.ExportKeyword) &&
       hasModifier(statement, ts.SyntaxKind.DefaultKeyword)
     ) {
+      // `export default function run` is a live binding: a later `run = ...`
+      // changes what the default export executes, so treat it like `export default run`.
+      if (statement.name != null && isReassigned(ts, sourceFile, statement.name.text)) {
+        return undefined;
+      }
       return statement;
     }
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
@@ -261,6 +271,15 @@ function resolveFunctionExpression(
     }
   }
   return undefined;
+}
+
+function containsDirectEval(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
+  const check = (node: ts.Node): boolean =>
+    (ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "eval") ||
+    ts.forEachChild(node, check) === true;
+  return check(sourceFile);
 }
 
 /** Any assignment or ++/-- targeting the top-level identifier `name` anywhere in the file. */
