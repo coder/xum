@@ -36,40 +36,12 @@ interface MetadataLiteralRange {
   literal: string;
 }
 
-interface StringLiteralRange {
-  start: number;
-  end: number;
-}
-
 export function parseStaticWorkflowMetadataLiteral(source: string): unknown {
   const metadata = findRequiredStaticMetadataLiteral(source);
   return new StaticMetadataLiteralParser(
     metadata.literal,
     findStaticMuxSchemaAliases(source, metadata.declarationStart)
   ).parseValue();
-}
-
-export function removeStaticWorkflowMetadataDeclaration(source: string): string {
-  const metadata = findStaticMetadataLiteral(source);
-  if (metadata == null) return source;
-  return source.slice(0, metadata.declarationStart) + source.slice(metadata.declarationEnd);
-}
-
-export function replaceStaticMetadataStringProperty(
-  source: string,
-  propertyName: string,
-  value: string
-): string | null {
-  const metadata = findStaticMetadataLiteral(source);
-  if (metadata == null) return null;
-  const range = findTopLevelStringPropertyRange(source, metadata.start, metadata.end, propertyName);
-  if (range != null) {
-    return source.slice(0, range.start) + JSON.stringify(value) + source.slice(range.end);
-  }
-  if (findTopLevelPropertyValueRange(source, metadata.start, metadata.end, propertyName) != null) {
-    return null;
-  }
-  return insertTopLevelStringProperty(source, metadata.start, propertyName, value);
 }
 
 function findRequiredStaticMetadataLiteral(source: string): MetadataLiteralRange {
@@ -115,60 +87,6 @@ function findStaticMuxSchemaAliases(source: string, beforeIndex: number): Set<st
   return aliases;
 }
 
-function findTopLevelStringPropertyRange(
-  source: string,
-  objectStart: number,
-  objectEnd: number,
-  propertyName: string
-): StringLiteralRange | null {
-  const range = findTopLevelPropertyValueRange(source, objectStart, objectEnd, propertyName);
-  if (range == null) return null;
-  const quote = source[range.start];
-  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
-  return { start: range.start, end: skipQuotedString(source, range.start, quote) };
-}
-
-function findTopLevelPropertyValueRange(
-  source: string,
-  objectStart: number,
-  objectEnd: number,
-  propertyName: string
-): StringLiteralRange | null {
-  if (source[objectStart] !== "{") throw new Error(STATIC_METADATA_ERROR);
-  let index = objectStart + 1;
-  while (index < objectEnd) {
-    index = skipStaticWhitespace(source, index);
-    if (source[index] === "}") return null;
-    const key = readStaticObjectKey(source, index);
-    index = skipStaticWhitespace(source, key.end);
-    if (source[index] !== ":") throw new Error(STATIC_METADATA_ERROR);
-    index = skipStaticWhitespace(source, index + 1);
-    const valueStart = index;
-    const valueEnd = skipStaticValue(source, index, objectEnd);
-    if (key.value === propertyName) return { start: valueStart, end: valueEnd };
-    index = skipStaticWhitespace(source, valueEnd);
-    if (source[index] === ",") {
-      index += 1;
-      continue;
-    }
-    if (source[index] === "}") return null;
-    throw new Error(STATIC_METADATA_ERROR);
-  }
-  return null;
-}
-
-function insertTopLevelStringProperty(
-  source: string,
-  objectStart: number,
-  propertyName: string,
-  value: string
-): string {
-  const insertionIndex = skipStaticWhitespace(source, objectStart + 1);
-  const separator = source[insertionIndex] === "}" ? "" : ", ";
-  const propertySource = `${propertyName}: ${JSON.stringify(value)}${separator}`;
-  return source.slice(0, insertionIndex) + propertySource + source.slice(insertionIndex);
-}
-
 function skipStaticHorizontalWhitespace(source: string, start: number): number {
   let index = start;
   while (source[index] === " " || source[index] === "\t") {
@@ -182,43 +100,6 @@ function skipStaticTrailingNewline(source: string, start: number): number {
   if (source[index] === "\r" && source[index + 1] === "\n") return index + 2;
   if (source[index] === "\n") return index + 1;
   return index;
-}
-
-function readStaticObjectKey(source: string, start: number): { value: string; end: number } {
-  const index = skipStaticWhitespace(source, start);
-  const char = source[index];
-  if (char === '"' || char === "'") {
-    return readStaticStringLiteral(source, index, char);
-  }
-  const match = /^[A-Za-z_$][A-Za-z0-9_$-]*/u.exec(source.slice(index));
-  if (match == null) throw new Error(STATIC_METADATA_ERROR);
-  return { value: match[0], end: index + match[0].length };
-}
-
-function readStaticStringLiteral(
-  source: string,
-  start: number,
-  quote: string
-): { value: string; end: number } {
-  let index = start + 1;
-  let value = "";
-  while (index < source.length) {
-    const char = source[index];
-    if (char === quote) return { value, end: index + 1 };
-    if (isStaticTemplateInterpolationStart(source, index, quote)) {
-      throw new Error(STATIC_METADATA_ERROR);
-    }
-    if (char === "\\") {
-      const escape = source[index + 1];
-      if (escape == null) throw new Error(STATIC_METADATA_ERROR);
-      value += "\\" + escape;
-      index += 2;
-      continue;
-    }
-    value += char;
-    index += 1;
-  }
-  throw new Error(STATIC_METADATA_ERROR);
 }
 
 function readObjectLiteralEnd(source: string, start: number): number {
@@ -245,44 +126,6 @@ function readObjectLiteralEnd(source: string, start: number): number {
       depth -= 1;
       if (depth === 0) return index + 1;
     }
-    index += 1;
-  }
-  throw new Error(STATIC_METADATA_ERROR);
-}
-
-function skipStaticValue(source: string, start: number, objectEnd: number): number {
-  let index = start;
-  let braceDepth = 0;
-  let bracketDepth = 0;
-  let parenDepth = 0;
-  while (index < objectEnd) {
-    const char = source[index];
-    if (char === '"' || char === "'" || char === "`") {
-      index = skipQuotedString(source, index, char);
-      continue;
-    }
-    if (char === "/" && source[index + 1] === "/") {
-      index = skipLineComment(source, index + 2);
-      continue;
-    }
-    if (char === "/" && source[index + 1] === "*") {
-      index = skipBlockComment(source, index + 2);
-      continue;
-    }
-    if (
-      braceDepth === 0 &&
-      bracketDepth === 0 &&
-      parenDepth === 0 &&
-      (char === "," || char === "}")
-    ) {
-      return index;
-    }
-    if (char === "{") braceDepth += 1;
-    else if (char === "}") braceDepth = Math.max(0, braceDepth - 1);
-    else if (char === "[") bracketDepth += 1;
-    else if (char === "]") bracketDepth = Math.max(0, bracketDepth - 1);
-    else if (char === "(") parenDepth += 1;
-    else if (char === ")") parenDepth = Math.max(0, parenDepth - 1);
     index += 1;
   }
   throw new Error(STATIC_METADATA_ERROR);

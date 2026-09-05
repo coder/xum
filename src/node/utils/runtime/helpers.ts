@@ -177,39 +177,6 @@ export async function readPlanFile(
 }
 
 /**
- * Check if a non-empty plan file exists for this workspace.
- * Checks both the canonical (per-project) path and the legacy (by workspaceId) path.
- */
-export async function hasNonEmptyPlanFile(
-  runtime: Runtime,
-  workspaceName: string,
-  projectName: string,
-  workspaceId: string
-): Promise<boolean> {
-  // Defensive: missing identifiers means we cannot safely resolve plan paths.
-  if (!workspaceName || !projectName || !workspaceId) {
-    return false;
-  }
-
-  const xumHome = runtime.getXumHome();
-  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
-  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
-
-  for (const candidatePath of [planPath, legacyPath]) {
-    try {
-      const stat = await runtime.stat(candidatePath);
-      if (!stat.isDirectory && stat.size > 0) {
-        return true;
-      }
-    } catch {
-      // Try next candidate.
-    }
-  }
-
-  return false;
-}
-
-/**
  * Move a plan file from one workspace name to another (e.g., during rename).
  * Silently succeeds if source file doesn't exist.
  */

@@ -666,14 +666,6 @@ export async function probeDevcontainerStatuses(
     });
   });
 }
-
-export async function probeDevcontainerStatus(
-  workspacePath: string,
-  timeoutMs = 10_000
-): Promise<DevcontainerProbeResult> {
-  const results = await probeDevcontainerStatuses([workspacePath], timeoutMs);
-  return results[workspacePath] ?? { kind: "absent" };
-}
 /**
  * Get the container name for a devcontainer workspace.
  * Returns null if no container exists.

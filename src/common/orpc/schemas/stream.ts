@@ -110,13 +110,13 @@ export const RuntimeStatusEventSchema = z.object({
   detail: z.string().optional(), // Human-readable status like "Starting Coder workspace..."
 });
 
-export const AutoCompactionTriggeredEventSchema = z.object({
+const AutoCompactionTriggeredEventSchema = z.object({
   type: z.literal("auto-compaction-triggered"),
   reason: z.enum(["on-send", "mid-stream", "idle"]),
   usagePercent: z.number(),
 });
 
-export const AutoCompactionCompletedEventSchema = z.object({
+const AutoCompactionCompletedEventSchema = z.object({
   type: z.literal("auto-compaction-completed"),
   newUsagePercent: z.number(),
 });
@@ -294,7 +294,7 @@ export const StreamEndEventSchema = z.object({
 
 export const StreamAbortReasonSchema = z.enum(["user", "startup", "system"]);
 
-export const StreamLifecyclePhaseSchema = z.enum([
+const StreamLifecyclePhaseSchema = z.enum([
   "idle",
   "preparing",
   "streaming",

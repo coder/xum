@@ -108,7 +108,6 @@ export const AgentPluginUpdateCheckSchema = z.object({
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
 export type AgentPluginPreviewMcpServer = z.infer<typeof AgentPluginPreviewMcpServerSchema>;
 export type AgentPluginPreviewHook = z.infer<typeof AgentPluginPreviewHookSchema>;
-export type AgentPluginPreviewSlashCommand = z.infer<typeof AgentPluginPreviewSlashCommandSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;

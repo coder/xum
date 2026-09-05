@@ -227,17 +227,6 @@ export function getXumHome(): string {
 }
 
 /**
- * Get the directory where workspace git worktrees are stored.
- * Example: ~/.xum/src/my-project/feature-branch
- *
- * @param rootDir - Optional root directory (defaults to getXumHome())
- */
-export function getXumSrcDir(rootDir?: string): string {
-  const root = rootDir ?? getXumHome();
-  return join(root, "src");
-}
-
-/**
  * Get the directory where session chat histories are stored.
  * Example: ~/.xum/sessions/workspace-id/chat.jsonl
  *

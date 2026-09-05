@@ -162,17 +162,9 @@ export const ProvidersConfigSchema = z
   .catchall(BaseProviderConfigSchema);
 
 export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
-export type AnthropicProviderConfig = z.infer<typeof AnthropicProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
-export type OpenRouterProviderConfig = z.infer<typeof OpenRouterProviderConfigSchema>;
-export type XAIProviderConfig = z.infer<typeof XAIProviderConfigSchema>;
 export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
-export type GoogleProviderConfig = z.infer<typeof GoogleProviderConfigSchema>;
-export type DeepSeekProviderConfig = z.infer<typeof DeepSeekProviderConfigSchema>;
-export type MoonshotAIProviderConfig = z.infer<typeof MoonshotAIProviderConfigSchema>;
-export type OllamaProviderConfig = z.infer<typeof OllamaProviderConfigSchema>;
-export type GitHubCopilotProviderConfig = z.infer<typeof GitHubCopilotProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

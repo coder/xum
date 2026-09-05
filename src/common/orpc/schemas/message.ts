@@ -85,12 +85,12 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
-export const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
+const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
-export const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
+const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
   state: z.literal("output-redacted"),
   failed: z.boolean().optional(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),

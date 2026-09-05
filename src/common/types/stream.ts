@@ -5,8 +5,6 @@
 import type { z } from "zod";
 import type { MuxReasoningPart, MuxTextPart, MuxToolPart } from "./message";
 import type {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
@@ -16,7 +14,6 @@ import type {
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
@@ -45,7 +42,6 @@ export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
-export type StreamLifecyclePhase = z.infer<typeof StreamLifecyclePhaseSchema>;
 export type StreamLifecycleSnapshot = z.infer<typeof StreamLifecycleSnapshotSchema>;
 export type StreamLifecycleEvent = z.infer<typeof StreamLifecycleEventSchema>;
 
@@ -86,9 +82,6 @@ export type ReasoningEndEvent = z.infer<typeof ReasoningEndEventSchema>;
  * Allows UI to update token display as steps complete (after each tool call or at stream end).
  */
 export type UsageDeltaEvent = z.infer<typeof UsageDeltaEventSchema>;
-
-export type AutoCompactionTriggeredEvent = z.infer<typeof AutoCompactionTriggeredEventSchema>;
-export type AutoCompactionCompletedEvent = z.infer<typeof AutoCompactionCompletedEventSchema>;
 
 export type AutoRetryScheduledEvent = z.infer<typeof AutoRetryScheduledEventSchema>;
 export type AutoRetryStartingEvent = z.infer<typeof AutoRetryStartingEventSchema>;

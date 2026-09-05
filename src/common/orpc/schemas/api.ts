@@ -2187,7 +2187,6 @@ export const WorkflowActiveRunSummarySchema = z.object({
   /** Nested (workflow-in-workflow) runs are absent from workspace activity. */
   nested: z.boolean(),
 });
-export type WorkflowActiveRunSummary = z.infer<typeof WorkflowActiveRunSummarySchema>;
 
 export const workflows = {
   listRuns: {

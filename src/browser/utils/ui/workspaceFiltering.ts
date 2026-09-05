@@ -149,16 +149,6 @@ function hasDelegatedActivity(activity: WorkspaceDelegatedActivity): boolean {
   return activity.activeCount > 0 || activity.queuedCount > 0;
 }
 
-export function isSidebarSubAgentActive(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isActionableTaskExecutionStatus(workspace.taskExecutionStatus) ||
-    workspace.taskStatus === "queued" ||
-    workspace.taskStatus === "starting" ||
-    workspace.taskStatus === "running" ||
-    workspace.taskStatus === "awaiting_report"
-  );
-}
-
 export function isSidebarSubAgentRunning(
   workspace: FrontendWorkspaceMetadata,
   options: DelegatedActivityOptions = {}

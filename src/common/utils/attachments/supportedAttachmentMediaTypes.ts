@@ -90,14 +90,6 @@ function sanitizeStagedAttachmentMediaType(mediaType: string): string | null {
   return normalized;
 }
 
-export function isSupportedStagedAttachmentMediaType(mediaType: string): boolean {
-  const normalized = normalizeAttachmentMediaType(mediaType);
-  return (
-    ZIP_MEDIA_TYPES.includes(normalized as (typeof ZIP_MEDIA_TYPES)[number]) ||
-    sanitizeStagedAttachmentMediaType(normalized) != null
-  );
-}
-
 export function getSupportedStagedAttachmentMediaType(args: {
   mediaType?: string | null;
   filename?: string | null;

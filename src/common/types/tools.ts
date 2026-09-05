@@ -67,8 +67,6 @@ export type AgentSkillReadFileToolArgs = z.infer<
   typeof TOOL_DEFINITIONS.agent_skill_read_file.schema
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
-
-export type MCPPromptGetToolArgs = z.infer<typeof TOOL_DEFINITIONS.mcp_prompt_get.schema>;
 export type MCPPromptGetToolResult = z.infer<typeof MCPPromptGetToolResultSchema>;
 
 // agent_skill_list args + result
@@ -182,7 +180,6 @@ export type IntuitionToolResult = z.infer<typeof IntuitionToolResultSchema>;
 export type IntuitionMemory = z.infer<typeof IntuitionMemorySchema>;
 export type IntuitionCandidate = z.infer<typeof IntuitionCandidateSchema>;
 export type IntuitionStats = z.infer<typeof IntuitionStatsSchema>;
-export type MemoryReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory_read.schema>;
 export type IntuitionReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition_report.schema>;
 
 // AttachFileToolResult derived from Zod schema (single source of truth)
@@ -349,10 +346,6 @@ export type TaskWorkspaceLifecycleToolArgs = z.infer<typeof TaskWorkspaceLifecyc
 export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
   typeof TaskWorkspaceLifecycleToolResultSchema
 >;
-
-export type TaskWorkspaceLifecycleToolResult =
-  | TaskWorkspaceLifecycleToolSuccessResult
-  | ToolErrorResult;
 
 // One per-target outcome row, discriminated on `status` (12 lifecycle states).
 export type TaskWorkspaceLifecycleTargetResult =

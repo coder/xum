@@ -1,7 +1,6 @@
 import type { z } from "zod";
 import type {
   GoalBoardEntrySchema,
-  GoalBoardSectionSchema,
   GoalBoardSnapshotSchema,
   GoalBoardV1Schema,
   GoalHistoryEndReasonSchema,
@@ -37,7 +36,6 @@ export type GoalSnapshot = z.infer<typeof GoalSnapshotSchema>;
 export type GoalHistoryEndReason = z.infer<typeof GoalHistoryEndReasonSchema>;
 export type GoalHistoryEntry = z.infer<typeof GoalHistoryEntrySchema>;
 export type GoalBoardV1 = z.infer<typeof GoalBoardV1Schema>;
-export type GoalBoardSection = z.infer<typeof GoalBoardSectionSchema>;
 export type GoalBoardEntry = z.infer<typeof GoalBoardEntrySchema>;
 export type GoalBoardSnapshot = z.infer<typeof GoalBoardSnapshotSchema>;
 
@@ -62,7 +60,7 @@ export type GoalSetError = z.infer<typeof GoalSetErrorSchema>;
  * — those live on the per-workspace `goal-board.json` side table so the
  * existing single-goal `goal.json` storage and agent contract stay
  * unchanged. The UI gets the lifecycle by combining sources via
- * `GoalBoardSection` instead of squinting at one flat enum.
+ * `GoalBoardSectionSchema` instead of squinting at one flat enum.
  */
 export type GoalLifecycle = "active" | "complete";
 
@@ -121,14 +119,6 @@ export function isGoalLifecycleActive(status: GoalStatus): boolean {
 
 export function isGoalRunning(status: GoalStatus): boolean {
   return goalActiveMode(status) === "running";
-}
-
-export function isGoalPaused(status: GoalStatus): boolean {
-  return goalActiveMode(status) === "paused";
-}
-
-export function isGoalBudgetLimited(status: GoalStatus): boolean {
-  return goalActiveMode(status) === "budget_limited";
 }
 
 export function isGoalPendingPersistence(goal: GoalSnapshot | null | undefined): boolean {

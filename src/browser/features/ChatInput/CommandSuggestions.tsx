@@ -6,8 +6,6 @@ import { FileIcon } from "@/browser/components/FileIcon/FileIcon";
 
 export const COMMAND_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
 
-export const FILE_SUGGESTION_KEYS = COMMAND_SUGGESTION_KEYS;
-
 function HighlightedText({
   text,
   query,

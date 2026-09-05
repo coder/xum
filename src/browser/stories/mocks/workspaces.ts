@@ -111,15 +111,6 @@ export function createArchivedWorkspace(
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROJECT FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface ProjectFixture {
-  path: string;
-  workspaces: FrontendWorkspaceMetadata[];
-}
-
 /** Create project config from workspaces */
 export function createProjectConfig(workspaces: FrontendWorkspaceMetadata[]): ProjectConfig {
   return {
