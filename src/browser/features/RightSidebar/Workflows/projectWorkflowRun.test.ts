@@ -807,6 +807,27 @@ describe("projectWorkflowRun — declared phase manifest", () => {
     ]);
   });
 
+  test("a revisited dynamic phase re-anchors after the latest declared phase", () => {
+    // scope → detour → verify → detour: the rail must show detour where the run
+    // currently is (after verify), not where it was first seen.
+    const view = projectWorkflowRun(
+      manifestRun({
+        events: [
+          phaseEvent(1, "scope"),
+          phaseEvent(2, "detour"),
+          phaseEvent(3, "verify"),
+          phaseEvent(4, "detour"),
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "completed"],
+      ["detour", "running"],
+      ["synthesize", "pending"],
+    ]);
+  });
+
   test("out-of-order declared visits keep manifest order; loop re-entry re-activates a phase", () => {
     const view = projectWorkflowRun(
       manifestRun({

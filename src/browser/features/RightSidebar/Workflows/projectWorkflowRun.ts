@@ -314,31 +314,34 @@ function collapsePhaseTransitions(events: readonly WorkflowRunEvent[]): string[]
  * (truth). Declared phases always keep manifest order — out-of-order visits do
  * NOT reorder the rail. A dynamic (observed-but-undeclared) phase is inserted
  * immediately after its anchor: the most recent declared phase observed before
- * it; dynamic phases sharing an anchor keep observation order, and a dynamic
- * phase observed before any declared phase anchors at the head of the rail.
+ * its LATEST visit (`scope → detour → verify → detour` places `detour` after
+ * `verify`, where the run currently is); dynamic phases sharing an anchor keep
+ * the order of those latest visits, and a dynamic phase observed before any
+ * declared phase anchors at the head of the rail.
  */
 function mergeManifestPhaseOrder(
   manifest: WorkflowPhaseManifest,
   transitions: readonly string[]
 ): string[] {
   const declaredNames = new Set(manifest.phases.map((phase) => phase.name));
-  const dynamicByAnchor = new Map<string | null, string[]>();
-  const seenDynamic = new Set<string>();
+  const anchorByDynamic = new Map<string, string | null>();
   let currentAnchor: string | null = null;
   for (const name of transitions) {
     if (declaredNames.has(name)) {
       currentAnchor = name;
       continue;
     }
-    if (seenDynamic.has(name)) {
-      continue;
-    }
-    seenDynamic.add(name);
-    const bucket = dynamicByAnchor.get(currentAnchor);
+    // Delete-then-set so re-entry moves the phase to the end of its (new) anchor group.
+    anchorByDynamic.delete(name);
+    anchorByDynamic.set(name, currentAnchor);
+  }
+  const dynamicByAnchor = new Map<string | null, string[]>();
+  for (const [name, anchor] of anchorByDynamic) {
+    const bucket = dynamicByAnchor.get(anchor);
     if (bucket != null) {
       bucket.push(name);
     } else {
-      dynamicByAnchor.set(currentAnchor, [name]);
+      dynamicByAnchor.set(anchor, [name]);
     }
   }
 

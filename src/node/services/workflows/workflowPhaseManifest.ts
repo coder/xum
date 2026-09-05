@@ -149,7 +149,9 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   }
   // The runner's prelude exposes its primitives as `__workflow*` / `__mux*`
   // globals; `__workflowPhase("hidden")` emits a phase the `phase` identifier
-  // walk never sees, so any reference into that namespace voids inference.
+  // walk never sees. Any reference into that namespace — by identifier, by a
+  // string naming it (`globalThis["__workflowPhase"]`), or via a route to the
+  // global object (`globalThis`, `this`, `Function`) — voids inference.
   if (referencesRuntimeInternals(ts, sourceFile)) {
     return undefined;
   }
@@ -354,11 +356,30 @@ function mentionsIdentifier(ts: TypeScriptModule, root: ts.Node, name: string): 
   return check(root);
 }
 
+const RUNTIME_INTERNAL_PREFIXES = ["__workflow", "__mux"];
+const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function"]);
+
 function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
-  const check = (node: ts.Node): boolean =>
-    (ts.isIdentifier(node) &&
-      (node.text.startsWith("__workflow") || node.text.startsWith("__mux"))) ||
-    ts.forEachChild(node, check) === true;
+  const namesInternal = (text: string): boolean =>
+    RUNTIME_INTERNAL_PREFIXES.some((prefix) => text.startsWith(prefix));
+  const check = (node: ts.Node): boolean => {
+    if (
+      ts.isIdentifier(node) &&
+      (namesInternal(node.text) || GLOBAL_OBJECT_ROUTES.has(node.text))
+    ) {
+      return true;
+    }
+    if (node.kind === ts.SyntaxKind.ThisKeyword) {
+      return true;
+    }
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      namesInternal(node.text)
+    ) {
+      return true;
+    }
+    return ts.forEachChild(node, check) === true;
+  };
   return check(sourceFile);
 }
 

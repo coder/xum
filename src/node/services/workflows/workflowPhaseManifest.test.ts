@@ -180,9 +180,11 @@ describe("inferPhaseManifest", () => {
     ).toBeUndefined();
     // Parenthesized callee is still a direct eval (the Reference survives).
     expect(phaseNames(legacyWorkflow(`((eval))("phase = () => {}"); phase("b");`))).toBeUndefined();
-    // Indirect eval / member calls named eval do not share the lexical scope.
+    // A member call named eval on an ordinary object is not a direct eval.
     expect(
-      phaseNames(legacyWorkflow(`phase("a"); const g = globalThis; log(g.eval("1"));`))
+      phaseNames(
+        legacyWorkflow(`phase("a"); const util = { eval: (x) => x }; log(util.eval("1"));`)
+      )
     ).toEqual(["a"]);
   });
 
@@ -227,6 +229,18 @@ describe("inferPhaseManifest", () => {
       phaseNames(legacyWorkflow(`__workflowPhase("hidden"); phase("visible");`))
     ).toBeUndefined();
     expect(phaseNames(legacyWorkflow(`phase("a"); log(__muxWorkflow);`))).toBeUndefined();
+    // Computed access: no internal identifier in the AST, but the string names one,
+    // and any route to the global object could reach it.
+    expect(
+      phaseNames(legacyWorkflow(`globalThis["__workflowPhase"]("hidden"); phase("visible");`))
+    ).toBeUndefined();
+    expect(
+      phaseNames(legacyWorkflow(`const g = globalThis; phase("visible"); log(g);`))
+    ).toBeUndefined();
+    expect(
+      phaseNames(legacyWorkflow(`const k = "__work" + "flowPhase"; log(Function); phase("a");`))
+    ).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase("a"); log(this);`))).toBeUndefined();
   });
 
   test("bails on with statements, which resolve identifiers dynamically", () => {
