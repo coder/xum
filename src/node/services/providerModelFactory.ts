@@ -1837,6 +1837,7 @@ export class ProviderModelFactory {
           if (shouldRouteThroughCodexOauth && effectiveWireFormat !== "chatCompletions") {
             // OAuth can consume paid Business workspace credits. Keep API-equivalent cost estimates;
             // authentication does not prove that usage is free.
+            // Apply this policy to new requests only. Do not migrate historical usage.
 
             // Codex OAuth requires store=false and must override any request-level
             // setting to avoid unresolved item_reference lookups.
