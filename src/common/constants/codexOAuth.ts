@@ -112,6 +112,10 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
+  // GPT-6 Astra (September 3, 2026): served in Codex for ChatGPT subscribers and
+  // in the public API. Without this entry an OAuth-only user selecting Astra
+  // falls to the API-key path and fails with api_key_not_found.
+  "gpt-6-astra",
   "gpt-5.2-codex",
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
@@ -145,6 +149,9 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-5.6-sol": 372_000,
   "gpt-5.6-terra": 372_000,
   "gpt-5.6-luna": 372_000,
+  // Astra shares the GPT-5.6 Codex cap: the catalog lists the same window for
+  // Astra and Sol.
+  "gpt-6-astra": 372_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {

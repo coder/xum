@@ -114,6 +114,26 @@ describe("getEffectiveContextLimit", () => {
     }
   });
 
+  test("caps GPT-6 Astra on the OAuth route but keeps the API window for API-key auth", () => {
+    const oauthOnlyLimit = getEffectiveContextLimit(
+      "openai:gpt-6-astra",
+      false,
+      providersWithOpenAI({ codexOauthSet: true })
+    );
+    expect(oauthOnlyLimit).toBe(372_000);
+
+    const apiKeyLimit = getEffectiveContextLimit(
+      "openai:gpt-6-astra",
+      false,
+      providersWithOpenAI({
+        apiKeySet: true,
+        codexOauthSet: true,
+        codexOauthDefaultAuth: "apiKey",
+      })
+    );
+    expect(apiKeyLimit).toBe(1_050_000);
+  });
+
   test("does not apply the GPT-5.5 OAuth cap to gateway-routed models", () => {
     const limit = getEffectiveContextLimit(
       "openrouter:openai/gpt-5.5",
