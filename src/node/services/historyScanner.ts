@@ -21,6 +21,26 @@ import {
   type HistorySnapshot,
 } from "./historyCursor";
 
+const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
+const resetTokenPattern = new RegExp(
+  [resetKeyToken, resetValueToken]
+    .map((token) =>
+      [...token]
+        .map((character) => {
+          const hex = character
+            .charCodeAt(0)
+            .toString(16)
+            .padStart(4, "0")
+            .replace(/[a-f]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+          return `(?:${character}|\\\\u${hex})`;
+        })
+        .join("")
+    )
+    .concat(":")
+    .join("|"),
+  "g"
+);
+
 function compactResetProbe(text: string): string {
   // Corruption may insert raw or escaped control separators where JSON permits
   // whitespace. Remove them before retaining overlap, including long runs.
@@ -147,6 +167,7 @@ export async function scanHistoryFilesBounded(
           skippingOversized: false,
           oversizedRowEnd: null,
           resetProbe: "",
+          resetStage: 0,
           possibleReset: false,
           archiveWatermark: -1,
           anchorSequence: null,
@@ -174,6 +195,7 @@ export async function scanHistoryFilesBounded(
       skippingOversized: boolean;
       oversizedRowEnd: number | null;
       resetProbe: string;
+      resetStage: 0 | 1 | 2;
       possibleReset: boolean;
     }
     // Read chunks with at most one line of carryover. An incomplete ordinary
@@ -199,6 +221,7 @@ export async function scanHistoryFilesBounded(
       let size = 0;
       let skipping = position.skippingOversized;
       let resetProbe = position.resetProbe;
+      let resetStage = position.resetStage;
       let possibleReset = position.possibleReset;
       const deliver = (edge: number): boolean => {
         const start = reverse ? edge : rowEdge;
@@ -253,9 +276,11 @@ export async function scanHistoryFilesBounded(
         skipping = false;
         if (message) {
           resetProbe = "";
+          resetStage = 0;
           possibleReset = false;
         }
         position.resetProbe = resetProbe;
+        position.resetStage = resetStage;
         position.possibleReset = possibleReset;
         rowEdge = edge;
         position.byteOffset = edge;
@@ -281,12 +306,30 @@ export async function scanHistoryFilesBounded(
           // Oversized tool outputs remain traversable. Only a potential reset
           // marker is a fail-closed privacy barrier. Match raw bytes (including
           // nested objects conservatively) without parsing or retaining the row.
-          // Keep raw overlap large enough for a fully Unicode-escaped marker.
-          // Decode only this chunk plus overlap, so split escapes survive both
-          // reverse/forward chunk edges and page boundaries without line buffering.
+          // Keep only token-sized raw overlap plus a three-stage recognizer.
+          // Junk of arbitrary size may separate intact tokens in unreadable rows;
+          // valid rows isolate their own evidence in deliver() and reset this state.
           const raw = segment.toString("latin1");
-          const probe = compactResetProbe(reverse ? raw + resetProbe : resetProbe + raw);
-          possibleReset ||= hasRawResetMarker(probe);
+          const previousLength = resetProbe.length;
+          const probe = reverse ? raw + resetProbe : resetProbe + raw;
+          const tokens = [...probe.matchAll(resetTokenPattern)];
+          if (reverse) tokens.reverse();
+          for (const match of tokens) {
+            // Ignore tokens entirely inside already-consumed overlap. Otherwise
+            // replaying overlap could manufacture the opposite token ordering.
+            if (
+              reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength
+            )
+              continue;
+            const token = match[0].replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
+              String.fromCharCode(Number.parseInt(hex, 16))
+            );
+            if (token === (reverse ? resetValueToken : resetKeyToken)) {
+              if (resetStage === 0) resetStage = 1;
+            } else if (token === ":" && resetStage === 1) resetStage = 2;
+            else if (token === (reverse ? resetKeyToken : resetValueToken) && resetStage === 2)
+              possibleReset = true;
+          }
           resetProbe = reverse
             ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
             : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
@@ -325,6 +368,7 @@ export async function scanHistoryFilesBounded(
       position.skippingOversized = skipping;
       if (skipping) {
         position.resetProbe = resetProbe;
+        position.resetStage = resetStage;
         position.possibleReset = possibleReset;
       }
       return false;
@@ -341,6 +385,7 @@ export async function scanHistoryFilesBounded(
           skippingOversized: false,
           oversizedRowEnd: null,
           resetProbe: "",
+          resetStage: 0,
           possibleReset: false,
         };
       }
@@ -445,6 +490,7 @@ export async function scanHistoryFilesBounded(
         state.skippingOversized = false;
         state.oversizedRowEnd = null;
         state.resetProbe = "";
+        state.resetStage = 0;
         state.possibleReset = false;
       } else if (!completed) break;
       else if (reverse && artifact === "chat") {
@@ -454,6 +500,7 @@ export async function scanHistoryFilesBounded(
         state.phase = "browse";
         state.byteOffset = 0;
         state.resetProbe = "";
+        state.resetStage = 0;
         state.possibleReset = false;
       } else if (artifact === "archive") {
         state.artifact = "chat";

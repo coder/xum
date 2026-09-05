@@ -774,6 +774,84 @@ describe("session_history real disk recovery", () => {
     ).toEqual(["opening facts"]);
   });
 
+  for (const junk of [
+    "X",
+    "???/#",
+    "unexpected words",
+    "[]{}=,",
+    "😀",
+    "printable-junk".repeat(200000),
+  ]) {
+    test(`malformed separator ${junk.slice(0, 24)} preserves initial and appended reset privacy`, async () => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      const key =
+        junk.length > 1000 ? unicodeEscapes("contextBoundaryKind") : "contextBoundaryKind";
+      const value = junk.length > 1000 ? unicodeEscapes("reset") : "reset";
+      await fs.appendFile(
+        chatPath,
+        `{"id":"junk-reset","role":"assistant","metadata":{"${key}"${junk}:${junk}"${value}"},"parts":[]}\n` +
+          JSON.stringify(createMuxMessage("after-junk-reset", "assistant", "public facts")) +
+          "\n"
+      );
+      let cursor = first.nextCursor;
+      let result: SessionHistoryResult;
+      let pageCount = 0;
+      do {
+        result = await call({ action: "search", query: "facts", cursor });
+        if (result.success) {
+          expect(result.items).toEqual([]);
+          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+        }
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
+          SESSION_HISTORY_MAX_RESULT_BYTES
+        );
+        cursor = result.nextCursor;
+        expect(++pageCount).toBeLessThan(12);
+      } while (cursor);
+      expect(result.error).toBe("stale_cursor");
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    });
+  }
+
+  test("valid non-reset fields cannot be joined by the malformed-token recognizer", async () => {
+    await fs.appendFile(
+      chatPath,
+      JSON.stringify(
+        createMuxMessage("not-a-reset", "assistant", "facts remain readable", {
+          contextBoundaryKind: undefined,
+        })
+      ).replace('"metadata":{}', '"metadata":{"contextBoundaryKind":"normal","other":"reset"}') +
+        "\n"
+    );
+    expect(
+      (await pages({ action: "read_item", item_id: "0" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["opening facts"]);
+  });
+
+  test.each([
+    '"reset" junk : junk "contextBoundaryKind"',
+    '"contextBoundaryKinds" junk : junk "reset"',
+    '"contextBoundaryKind" junk : junk "resume"',
+  ])("unrelated malformed tokens do not create a reset: %s", async (fragment) => {
+    await fs.appendFile(chatPath, fragment + "\n");
+    expect(
+      (await pages({ action: "read_item", item_id: "0" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["opening facts"]);
+  });
+
   for (const separator of [
     String.fromCharCode(0),
     String.fromCharCode(11),
