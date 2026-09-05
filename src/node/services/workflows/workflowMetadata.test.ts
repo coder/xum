@@ -125,21 +125,38 @@ describe("parseDeclaredPhasesFromSource", () => {
     ).toEqual([{ name: "a" }]);
   });
 
-  test("rejects a declared meta the static parser cannot read instead of treating it as absent", () => {
-    // Shorthand property referencing a runtime binding: `meta` exists, so a
-    // silently-ignored `phases` would run undeclared without telling the author.
-    const source = 'const phases = [{ name: "a" }];\nexport const meta = { phases };\n' + body;
-    try {
-      parseDeclaredPhasesFromSource(source);
-      expect.unreachable("non-static meta must be rejected");
-    } catch (error) {
-      expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
-      expect((error as WorkflowDeclaredPhasesValidationError).issues).toHaveLength(1);
-      expect(String(error)).toContain("static object literal");
+  test("rejects an unreadable meta that declares phases instead of treating it as absent", () => {
+    // `meta` exists and names `phases`, so a silently-ignored declaration would run
+    // undeclared without telling the author — whatever form the value takes.
+    for (const declaration of [
+      'const phases = [{ name: "a" }];\nexport const meta = { phases };\n',
+      'export const meta = { description: "x", phases: buildPhases() };\n',
+      'export const meta = { "phases": [...shared] };\n',
+    ]) {
+      const source = declaration + body;
+      try {
+        parseDeclaredPhasesFromSource(source);
+        expect.unreachable("non-static meta.phases must be rejected");
+      } catch (error) {
+        expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
+        expect((error as WorkflowDeclaredPhasesValidationError).issues).toHaveLength(1);
+        expect(String(error)).toContain("static object literal");
+      }
+      // The lenient reader still degrades to null for the same source, so the two
+      // must not be conflated by callers.
+      expect(parseWorkflowMetadata(source)).toBeNull();
     }
-    // The lenient reader still degrades to null for the same source, so the two
-    // must not be conflated by callers.
-    expect(parseWorkflowMetadata(source)).toBeNull();
+  });
+
+  test("keeps ignoring unreadable meta that does not declare phases (legacy workflows stay startable)", () => {
+    for (const declaration of [
+      'const description = "x";\nexport const meta = { description };\n',
+      "export const meta = { argsSchema: buildSchema(), nested: { phases: 1 } };\n",
+      // Not even an object literal: nothing to declare phases in.
+      "export const meta = sharedMeta;\n",
+    ]) {
+      expect(parseDeclaredPhasesFromSource(declaration + body)).toBeUndefined();
+    }
   });
 });
 

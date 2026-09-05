@@ -328,7 +328,22 @@ describe("WorkflowService request orchestration", () => {
     expect(runs.some((run) => run.workflow.name === "bad-phases")).toBe(false);
   });
 
-  test("rejects run creation when meta is declared but not statically readable", async () => {
+  test("still starts legacy workflows whose unreadable meta declares no phases", async () => {
+    const { context } = createContext();
+    fs.writeFileSync(
+      path.join(projectPath, "workflows", "dynamic-description.js"),
+      'const description = "Legacy";\nexport const meta = { description };\n' +
+        'export default function workflow({ phase }) { phase("a"); return { reportMarkdown: "ok" }; }\n'
+    );
+    const result = await startWorkflowRun(context, {
+      workspaceId: "workspace-1",
+      scriptPath: "./workflows/dynamic-description.js",
+      args: {},
+    });
+    expect(result.status).toBe("completed");
+  });
+
+  test("rejects run creation when meta declares phases but is not statically readable", async () => {
     const { context } = createContext();
     fs.writeFileSync(
       path.join(projectPath, "workflows", "dynamic-meta.js"),

@@ -14,8 +14,8 @@ import assert from "@/common/utils/assert";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   STATIC_METADATA_ERROR,
-  hasStaticWorkflowMetadataDeclaration,
   parseStaticWorkflowMetadataLiteral,
+  staticMetadataLiteralHasKey,
 } from "./staticWorkflowMetadata";
 
 export function parseWorkflowMetadata(source: string): WorkflowMetadata | null {
@@ -48,18 +48,20 @@ const DECLARED_PHASE_KNOWN_KEYS = new Set(["name", "label", "description", "para
  * Read and validate `meta.phases` straight from workflow source. This is the
  * entry point for run creation and read-path hydration.
  *
- * Unlike {@link parseWorkflowMetadata}, a declared `export const meta` that the
- * static parser cannot read is reported as INVALID rather than as "no metadata":
+ * Unlike {@link parseWorkflowMetadata}, a `meta` literal the static parser cannot
+ * read is reported as INVALID when it lexically declares a `phases` key:
  * `const phases = [...]; export const meta = { phases };` would otherwise start
  * undeclared (and the read path could even hydrate an inferred rail for it)
- * instead of surfacing the static-literal requirement to the author.
+ * instead of surfacing the static-literal requirement to the author. Unreadable
+ * meta WITHOUT a `phases` key keeps its legacy behavior — ignored — so existing
+ * workflows stay startable across the upgrade.
  */
 export function parseDeclaredPhasesFromSource(source: string): WorkflowDeclaredPhase[] | undefined {
   let rawMetadata: unknown;
   try {
     rawMetadata = parseStaticWorkflowMetadataLiteral(source);
   } catch {
-    if (!hasStaticWorkflowMetadataDeclaration(source)) {
+    if (!staticMetadataLiteralHasKey(source, "phases")) {
       return undefined;
     }
     throw new WorkflowDeclaredPhasesValidationError([

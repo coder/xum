@@ -76,7 +76,7 @@ export const meta = {
 Rules:
 
 - `name` (required) must match the string passed to `phase(name)` at runtime; names must be unique and non-empty (max 120 chars, max 64 phases). `label` and `description` are optional display metadata; `parallel: true` renders a fan-out badge. Unknown keys are rejected.
-- Invalid declarations fail run creation with every issue enumerated; omitting `meta.phases` changes nothing. `meta` itself must stay a static object literal — a `meta` the static parser cannot read (e.g. `export const meta = { phases }` referencing a variable) is also rejected at run start rather than silently treated as undeclared.
+- Invalid declarations fail run creation with every issue enumerated; omitting `meta.phases` changes nothing. `meta.phases` must be part of a static object literal — a `meta` the static parser cannot read that still names `phases` (e.g. `export const meta = { phases }` referencing a variable) is rejected at run start rather than silently treated as undeclared.
 - Reconciliation is lenient: phases the script visits but did not declare still render (inserted chronologically), declared-but-unvisited phases show as skipped/not-reached once the run settles, and revisiting a phase (loops) is fine.
 - Workflows without `meta.phases` whose `phase()` calls are all static string literals get a best-effort inferred rail; dynamic phase names (`"implement-" + key`) cannot be inferred — declare them instead.
 

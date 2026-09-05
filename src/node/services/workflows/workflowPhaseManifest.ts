@@ -154,6 +154,18 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   if (!hasCanonicalPhaseBinding(ts, workflowFn)) {
     return undefined;
   }
+  // Parameter initializers run before the body and may already call the
+  // destructured `phase` (`{ phase, fallback = phase("setup") }`); the runtime
+  // context never supplies such defaults, so those calls DO emit. Bail rather
+  // than model default-evaluation order.
+  if (workflowFn.parameters.some((parameter) => initializersMention(ts, parameter, "phase"))) {
+    return undefined;
+  }
+  // `arguments[0]` is the original context object, so `arguments[0].phase(...)`
+  // emits a phase the identifier walk classifies as a mere member name.
+  if (mentionsIdentifier(ts, workflowFn.body, "arguments")) {
+    return undefined;
+  }
 
   const names: string[] = [];
   const seen = new Set<string>();
@@ -287,6 +299,30 @@ function findImmutableFunctionBinding(
     }
   }
   return undefined;
+}
+
+/** Whether any default-value initializer in a parameter/binding pattern mentions `name`. */
+function initializersMention(
+  ts: TypeScriptModule,
+  node: ts.ParameterDeclaration | ts.BindingElement,
+  name: string
+): boolean {
+  if (node.initializer != null && mentionsIdentifier(ts, node.initializer, name)) {
+    return true;
+  }
+  if (ts.isIdentifier(node.name)) {
+    return false;
+  }
+  return node.name.elements.some(
+    (element) => !ts.isOmittedExpression(element) && initializersMention(ts, element, name)
+  );
+}
+
+/** Whether any identifier named `name` appears within `root` (including as a member name). */
+function mentionsIdentifier(ts: TypeScriptModule, root: ts.Node, name: string): boolean {
+  const check = (node: ts.Node): boolean =>
+    (ts.isIdentifier(node) && node.text === name) || ts.forEachChild(node, check) === true;
+  return check(root);
 }
 
 function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {

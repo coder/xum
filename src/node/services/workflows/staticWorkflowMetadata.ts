@@ -56,16 +56,6 @@ function findRequiredStaticMetadataLiteral(source: string): MetadataLiteralRange
 const META_DECLARATION_PATTERN = /(^|[;\n}])\s*export\s+(?:const|let|var)\s+meta\s*=/mu;
 
 /**
- * Whether the source declares a top-level `export const meta =` at all,
- * regardless of whether its value is statically parseable. Lets callers tell
- * "no metadata" apart from "metadata we cannot read" — the parser throws the
- * same error for both.
- */
-export function hasStaticWorkflowMetadataDeclaration(source: string): boolean {
-  return matchTopLevelMetaDeclaration(maskStaticJavaScriptSource(source)) != null;
-}
-
-/**
  * Locate `export const meta =` at module top level. The depth check runs at the
  * declaration start — AFTER the separator — so a preceding `}` that closes a
  * top-level block is consumed rather than leaving the scan one level deep.
@@ -78,6 +68,93 @@ function matchTopLevelMetaDeclaration(
   const declarationStart = match.index + (match[1]?.length ?? 0);
   if (!isTopLevelStaticMatch(maskedSource, declarationStart)) return null;
   return { declarationStart, end: match.index + match[0].length };
+}
+
+/**
+ * Whether the top-level `export const meta = { ... }` literal lexically declares
+ * `key` among its own (depth-0) properties, tolerating non-static values such as
+ * `{ phases }` or `{ phases: buildPhases() }` that the strict parser rejects.
+ * False when no object literal can be located at all (`export const meta = x`).
+ * Lets run creation tell "unreadable meta that declares phases" apart from
+ * legacy unreadable meta that must keep being ignored.
+ */
+export function staticMetadataLiteralHasKey(source: string, key: string): boolean {
+  let metadata: MetadataLiteralRange | null;
+  try {
+    metadata = findStaticMetadataLiteral(source);
+  } catch {
+    return false;
+  }
+  if (metadata == null) return false;
+  // Structure (depth, comments, string bodies) comes from the masked text, which
+  // preserves indexes; key tokens are read from the original source.
+  const masked = maskStaticJavaScriptSource(source);
+  let depth = 0;
+  let expectKey = true;
+  for (let index = metadata.start + 1; index < metadata.end; index += 1) {
+    const char = masked[index];
+    if (char === "{" || char === "[" || char === "(") {
+      depth += 1;
+      continue;
+    }
+    if (char === "}" || char === "]" || char === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (char === ",") {
+      expectKey = true;
+      continue;
+    }
+    if (!expectKey || /\s/u.test(char ?? "")) continue;
+    expectKey = false;
+    try {
+      const token = readStaticObjectKey(source, index);
+      if (token.value === key) return true;
+      index = token.end - 1;
+    } catch {
+      // Computed or otherwise unreadable key: skip to the next top-level comma.
+    }
+  }
+  return false;
+}
+
+/** Reads an identifier or quoted object key at `start` (used to scan the meta literal's top-level keys). */
+function readStaticObjectKey(source: string, start: number): { value: string; end: number } {
+  const index = skipStaticWhitespace(source, start);
+  const char = source[index];
+  if (char === '"' || char === "'") {
+    return readStaticStringLiteral(source, index, char);
+  }
+  const match = /^[A-Za-z_$][A-Za-z0-9_$-]*/u.exec(source.slice(index));
+  if (match == null) throw new Error(STATIC_METADATA_ERROR);
+  return { value: match[0], end: index + match[0].length };
+}
+
+function readStaticStringLiteral(
+  source: string,
+  start: number,
+  quote: string
+): { value: string; end: number } {
+  let index = start + 1;
+  let value = "";
+  while (index < source.length) {
+    const char = source[index];
+    if (char === quote) return { value, end: index + 1 };
+    if (isStaticTemplateInterpolationStart(source, index, quote)) {
+      throw new Error(STATIC_METADATA_ERROR);
+    }
+    if (char === "\\") {
+      const escape = source[index + 1];
+      if (escape == null) throw new Error(STATIC_METADATA_ERROR);
+      value += "\\" + escape;
+      index += 2;
+      continue;
+    }
+    value += char;
+    index += 1;
+  }
+  throw new Error(STATIC_METADATA_ERROR);
 }
 
 function findStaticMetadataLiteral(source: string): MetadataLiteralRange | null {

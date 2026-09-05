@@ -186,6 +186,28 @@ describe("inferPhaseManifest", () => {
     ).toEqual(["a"]);
   });
 
+  test("bails when a parameter initializer already uses phase", () => {
+    // Defaults evaluate before the body and the runtime context supplies no
+    // `fallback`, so `setup` really is emitted — but only the body is scanned.
+    expect(
+      phaseNames(
+        `export default function workflow({ phase, fallback = phase("setup") }) { phase("run"); return {}; }\n`
+      )
+    ).toBeUndefined();
+    // Initializers that do not touch phase are fine.
+    expect(
+      phaseNames(
+        `export default function workflow({ phase, quick = false }) { phase("run"); return {}; }\n`
+      )
+    ).toEqual(["run"]);
+  });
+
+  test("bails when the body reaches the context through arguments", () => {
+    expect(
+      phaseNames(legacyWorkflow(`arguments[0].phase("hidden"); phase("visible");`))
+    ).toBeUndefined();
+  });
+
   test("bails on with statements, which resolve identifiers dynamically", () => {
     expect(
       phaseNames(legacyWorkflow(`with ({ phase: () => {} }) { phase("shadowed"); } phase("b");`))
