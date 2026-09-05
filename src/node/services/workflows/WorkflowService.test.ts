@@ -743,6 +743,41 @@ export default function workflow({ args }) {
     expect(runs.map((run) => run.id)).toEqual(["wfr_workspace_1"]);
   });
 
+  test("getRun and listRuns hydrate the phase manifest on the service itself", async () => {
+    // workflow_run/workflow_resume call these directly (not the oRPC wrappers) and
+    // embed the result in persisted tool output that reloaded cards render as-is.
+    using tmp = new DisposableTempDir("workflow-service-hydrate");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    await runStore.createRun({
+      id: "wfr_hydrated",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "built-in", executable: true },
+      source:
+        'export const meta = { phases: [{ name: "a" }] };\n' +
+        'export default function workflow({ phase }) { phase("a"); return {}; }\n',
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      runnerId: "runner-a",
+    });
+
+    const expected = { provenance: "declared" as const, phases: [{ name: "a" }] };
+    const run = await service.getRun({ workspaceId: "workspace-1", runId: "wfr_hydrated" });
+    expect(run?.workflow.phaseManifest).toEqual(expected);
+    const [listed] = await service.listRuns({ workspaceId: "workspace-1" });
+    expect(listed?.workflow.phaseManifest).toEqual(expected);
+    // The store record itself stays manifest-free.
+    expect((await runStore.getRun("wfr_hydrated")).workflow.phaseManifest).toBeUndefined();
+  });
+
   test("rejects resuming untrusted workspace-file workflow runs", async () => {
     using tmp = new DisposableTempDir("workflow-service-trust");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });

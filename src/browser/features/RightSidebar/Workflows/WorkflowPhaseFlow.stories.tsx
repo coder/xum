@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect } from "@storybook/test";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 
@@ -10,6 +11,17 @@ const meta = {
   parameters: {
     layout: "centered",
     backgrounds: { default: "dark" },
+    viewport: {
+      options: {
+        // Mirrors Pixel's named `phone` viewport (390px) so local inspection and
+        // CI snapshots exercise the same width.
+        phone390: {
+          name: "Phone 390",
+          styles: { width: "390px", height: "844px" },
+          type: "mobile",
+        },
+      },
+    },
   },
   decorators: [
     // Width tracks the viewport (capped at the sidebar's ~430px) so the
@@ -116,12 +128,18 @@ export const InferredRail: Story = {
 /** Narrow-container wrap behavior at phone width. */
 export const MobileNarrow: Story = {
   globals: {
-    viewport: { value: "mobile1", isRotated: false },
+    viewport: { value: "phone390", isRotated: false },
   },
   parameters: {
     pixel: {
       matrix: { viewports: ["phone"] },
     },
+  },
+  // Static contract: the pinned Pixel variant and the local viewport must stay
+  // paired, or this story silently snapshots the wrong width.
+  play: async ({ parameters, globals }) => {
+    await expect(parameters).toMatchObject({ pixel: { matrix: { viewports: ["phone"] } } });
+    await expect(globals).toMatchObject({ viewport: { value: "phone390" } });
   },
   args: {
     nodes: [

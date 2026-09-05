@@ -142,3 +142,26 @@ describe("parseDeclaredPhasesFromSource", () => {
     expect(parseWorkflowMetadata(source)).toBeNull();
   });
 });
+
+describe("meta declaration detection after a block statement", () => {
+  const body = 'export default function workflow({ phase }) { phase("a"); return {}; }\n';
+
+  test("a static meta following a same-line block is still parsed", () => {
+    const source =
+      'const ready = true; if (ready) {} export const meta = { phases: [{ name: "a" }] };\n' + body;
+    expect(parseDeclaredPhasesFromSource(source)).toEqual([{ name: "a" }]);
+  });
+
+  test("a non-static meta following a same-line block is rejected, not treated as absent", () => {
+    const source =
+      'const phases = [{ name: "a" }]; if (phases) {} export const meta = { phases };\n' + body;
+    expect(() => parseDeclaredPhasesFromSource(source)).toThrow(
+      WorkflowDeclaredPhasesValidationError
+    );
+  });
+
+  test("a meta declaration nested inside a block is not a top-level declaration", () => {
+    const source = "if (true) { const meta = { phases: [] }; }\n" + body;
+    expect(parseDeclaredPhasesFromSource(source)).toBeUndefined();
+  });
+});

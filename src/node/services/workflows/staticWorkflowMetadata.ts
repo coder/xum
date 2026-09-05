@@ -50,7 +50,10 @@ function findRequiredStaticMetadataLiteral(source: string): MetadataLiteralRange
   return metadata;
 }
 
-const META_DECLARATION_PATTERN = /(^|[;\n])\s*export\s+(?:const|let|var)\s+meta\s*=/mu;
+// A top-level `export const meta` may follow a line start, a `;`, or a
+// self-terminating block (`if (x) {} export const meta = ...`); the depth check
+// in isTopLevelStaticMatch still rejects declarations nested inside braces.
+const META_DECLARATION_PATTERN = /(^|[;\n}])\s*export\s+(?:const|let|var)\s+meta\s*=/mu;
 
 /**
  * Whether the source declares a top-level `export const meta =` at all,
@@ -59,17 +62,30 @@ const META_DECLARATION_PATTERN = /(^|[;\n])\s*export\s+(?:const|let|var)\s+meta\
  * same error for both.
  */
 export function hasStaticWorkflowMetadataDeclaration(source: string): boolean {
-  const maskedSource = maskStaticJavaScriptSource(source);
+  return matchTopLevelMetaDeclaration(maskStaticJavaScriptSource(source)) != null;
+}
+
+/**
+ * Locate `export const meta =` at module top level. The depth check runs at the
+ * declaration start — AFTER the separator — so a preceding `}` that closes a
+ * top-level block is consumed rather than leaving the scan one level deep.
+ */
+function matchTopLevelMetaDeclaration(
+  maskedSource: string
+): { declarationStart: number; end: number } | null {
   const match = META_DECLARATION_PATTERN.exec(maskedSource);
-  return match != null && isTopLevelStaticMatch(maskedSource, match.index);
+  if (match == null) return null;
+  const declarationStart = match.index + (match[1]?.length ?? 0);
+  if (!isTopLevelStaticMatch(maskedSource, declarationStart)) return null;
+  return { declarationStart, end: match.index + match[0].length };
 }
 
 function findStaticMetadataLiteral(source: string): MetadataLiteralRange | null {
   const maskedSource = maskStaticJavaScriptSource(source);
-  const match = META_DECLARATION_PATTERN.exec(maskedSource);
-  if (match != null && isTopLevelStaticMatch(maskedSource, match.index)) {
-    const declarationStart = match.index + (match[1]?.length ?? 0);
-    const start = skipStaticWhitespace(source, match.index + match[0].length);
+  const match = matchTopLevelMetaDeclaration(maskedSource);
+  if (match != null) {
+    const { declarationStart } = match;
+    const start = skipStaticWhitespace(source, match.end);
     const end = readObjectLiteralEnd(source, start);
     let declarationEnd = skipStaticHorizontalWhitespace(source, end);
     if (source[declarationEnd] === ";") {

@@ -13,7 +13,7 @@
  * WorkflowRunStore.writeRunFile) and read-path failures never throw — they
  * memoize a negative result so old/hand-edited runs keep loading.
  */
-import ts from "typescript";
+import type ts from "typescript";
 import { LRUCache } from "lru-cache";
 
 import type {
@@ -30,6 +30,22 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
+
+type TypeScriptModule = typeof ts;
+let tsModule: TypeScriptModule | undefined;
+
+/**
+ * Lazy-load the TypeScript compiler (~9 MB) the way sharp/QuickJS are: this
+ * module sits on the oRPC router's import graph, which the `xum api` CLI bundle
+ * carries only to generate commands — it never runs inference. A static import
+ * both broke that ESM bundle (typescript.js is CJS-only) and added ~280 ms to
+ * every CLI start; the Makefile marks `typescript` external for that bundle.
+ */
+function loadTypeScript(): TypeScriptModule {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  tsModule ??= require("typescript") as TypeScriptModule;
+  return tsModule;
+}
 
 export type WorkflowPhaseManifestOutcome =
   | { kind: "manifest"; manifest: WorkflowPhaseManifest }
@@ -117,6 +133,7 @@ export function hydrateWorkflowRunPhaseManifest(run: WorkflowRunRecord): Workflo
  * `undefined` when the scanner bails (see module doc for the bail gate).
  */
 export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | undefined {
+  const ts = loadTypeScript();
   const sourceFile = ts.createSourceFile(
     "workflow.js",
     source,
@@ -124,11 +141,11 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     /* setParentNodes */ true,
     ts.ScriptKind.JS
   );
-  const workflowFn = findDefaultExportedFunction(sourceFile);
+  const workflowFn = findDefaultExportedFunction(ts, sourceFile);
   if (workflowFn?.body == null) {
     return undefined;
   }
-  if (!hasCanonicalPhaseBinding(workflowFn)) {
+  if (!hasCanonicalPhaseBinding(ts, workflowFn)) {
     return undefined;
   }
 
@@ -140,7 +157,7 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   // of `phase` anywhere bails.
   const visit = (node: ts.Node, insideNestedScope: boolean): boolean => {
     if (ts.isIdentifier(node) && node.text === "phase") {
-      const classification = classifyPhaseIdentifier(node);
+      const classification = classifyPhaseIdentifier(ts, node);
       if (classification === "ignore") {
         return true;
       }
@@ -153,7 +170,7 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
       const call = node.parent;
       assert(ts.isCallExpression(call), "inferPhaseManifest: direct-call must be a CallExpression");
       const firstArg = call.arguments[0];
-      const name = staticStringArgument(firstArg);
+      const name = staticStringArgument(ts, firstArg);
       if (name == null) {
         return false;
       }
@@ -163,7 +180,7 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
       }
       return true;
     }
-    const nested = insideNestedScope || introducesFunctionOrClassScope(node);
+    const nested = insideNestedScope || introducesFunctionOrClassScope(ts, node);
     for (const child of node.getChildren(sourceFile)) {
       if (!visit(child, nested)) {
         return false;
@@ -186,7 +203,10 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
 
 type WorkflowFunctionNode = ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
 
-function findDefaultExportedFunction(sourceFile: ts.SourceFile): WorkflowFunctionNode | undefined {
+function findDefaultExportedFunction(
+  ts: TypeScriptModule,
+  sourceFile: ts.SourceFile
+): WorkflowFunctionNode | undefined {
   for (const statement of sourceFile.statements) {
     if (
       ts.isFunctionDeclaration(statement) &&
@@ -196,13 +216,14 @@ function findDefaultExportedFunction(sourceFile: ts.SourceFile): WorkflowFunctio
       return statement;
     }
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
-      return resolveFunctionExpression(sourceFile, statement.expression);
+      return resolveFunctionExpression(ts, sourceFile, statement.expression);
     }
   }
   return undefined;
 }
 
 function resolveFunctionExpression(
+  ts: TypeScriptModule,
   sourceFile: ts.SourceFile,
   expression: ts.Expression
 ): WorkflowFunctionNode | undefined {
@@ -213,11 +234,19 @@ function resolveFunctionExpression(
     return undefined;
   }
   // `export default run;` referencing a top-level function or const initializer.
+  // The binding must be immutable AND never reassigned: `let run = a; run = b;`
+  // would make the initializer describe a function the runtime never executes.
+  if (isReassigned(ts, sourceFile, expression.text)) {
+    return undefined;
+  }
   for (const statement of sourceFile.statements) {
     if (ts.isFunctionDeclaration(statement) && statement.name?.text === expression.text) {
       return statement;
     }
-    if (ts.isVariableStatement(statement)) {
+    if (
+      ts.isVariableStatement(statement) &&
+      (statement.declarationList.flags & ts.NodeFlags.Const) !== 0
+    ) {
       for (const declaration of statement.declarationList.declarations) {
         if (
           ts.isIdentifier(declaration.name) &&
@@ -234,6 +263,31 @@ function resolveFunctionExpression(
   return undefined;
 }
 
+/** Any assignment or ++/-- targeting the top-level identifier `name` anywhere in the file. */
+function isReassigned(ts: TypeScriptModule, sourceFile: ts.SourceFile, name: string): boolean {
+  const targets = (node: ts.Node): boolean => {
+    if (ts.isBinaryExpression(node)) {
+      const kind = node.operatorToken.kind;
+      if (
+        kind >= ts.SyntaxKind.FirstAssignment &&
+        kind <= ts.SyntaxKind.LastAssignment &&
+        ts.isIdentifier(node.left) &&
+        node.left.text === name
+      ) {
+        return true;
+      }
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      ts.isIdentifier(node.operand) &&
+      node.operand.text === name
+    ) {
+      return true;
+    }
+    return ts.forEachChild(node, targets) === true;
+  };
+  return targets(sourceFile);
+}
+
 function hasModifier(node: ts.FunctionDeclaration, kind: ts.SyntaxKind): boolean {
   return node.modifiers?.some((modifier) => modifier.kind === kind) === true;
 }
@@ -244,14 +298,17 @@ function hasModifier(node: ts.FunctionDeclaration, kind: ts.SyntaxKind): boolean
  * parameter. Renames (`{ phase: p }`), bindings of the NAME `phase` from other
  * properties, or `phase` bindings anywhere else in the parameter list bail.
  */
-function hasCanonicalPhaseBinding(fn: WorkflowFunctionNode): boolean {
+function hasCanonicalPhaseBinding(ts: TypeScriptModule, fn: WorkflowFunctionNode): boolean {
   const firstParam = fn.parameters[0];
   if (firstParam == null || !ts.isObjectBindingPattern(firstParam.name)) {
     return false;
   }
   let canonical = false;
   for (const element of firstParam.name.elements) {
-    const propertyName = bindingPropertyNameText(element);
+    const propertyName = bindingPropertyNameText(ts, element);
+    if (propertyName === COMPUTED_BINDING_KEY) {
+      return false; // { [key]: phase } — the bound capability cannot be proven statically
+    }
     const boundName = ts.isIdentifier(element.name) ? element.name.text : null;
     if (propertyName === "phase" || (propertyName == null && boundName === "phase")) {
       if (boundName !== "phase") {
@@ -260,7 +317,7 @@ function hasCanonicalPhaseBinding(fn: WorkflowFunctionNode): boolean {
       canonical = true;
     } else if (boundName === "phase") {
       return false; // { other: phase } binds a misleading local named phase
-    } else if (containsPhaseBinding(element.name)) {
+    } else if (containsPhaseBinding(ts, element.name)) {
       return false; // nested pattern binding a `phase` local
     }
   }
@@ -268,21 +325,26 @@ function hasCanonicalPhaseBinding(fn: WorkflowFunctionNode): boolean {
     return false;
   }
   // Any OTHER parameter binding a `phase` local would shadow ambiguously.
-  return fn.parameters.slice(1).every((parameter) => !containsPhaseBinding(parameter.name));
+  return fn.parameters.slice(1).every((parameter) => !containsPhaseBinding(ts, parameter.name));
 }
 
-function bindingPropertyNameText(element: ts.BindingElement): string | null {
+/** Sentinel for `{ [computed]: local }` keys, which have no static identity. */
+const COMPUTED_BINDING_KEY = Symbol("computed-binding-key");
+
+function bindingPropertyNameText(
+  ts: TypeScriptModule,
+  element: ts.BindingElement
+): string | typeof COMPUTED_BINDING_KEY | null {
   const propertyName = element.propertyName;
   if (propertyName == null) {
     return null;
   }
   return ts.isIdentifier(propertyName) || ts.isStringLiteral(propertyName)
     ? propertyName.text
-    : // Computed property key: cannot statically prove it is not "phase".
-      "phase";
+    : COMPUTED_BINDING_KEY;
 }
 
-function containsPhaseBinding(name: ts.BindingName): boolean {
+function containsPhaseBinding(ts: TypeScriptModule, name: ts.BindingName): boolean {
   if (ts.isIdentifier(name)) {
     return name.text === "phase";
   }
@@ -290,11 +352,11 @@ function containsPhaseBinding(name: ts.BindingName): boolean {
     if (ts.isOmittedExpression(element)) {
       return false;
     }
-    return containsPhaseBinding(element.name);
+    return containsPhaseBinding(ts, element.name);
   });
 }
 
-function introducesFunctionOrClassScope(node: ts.Node): boolean {
+function introducesFunctionOrClassScope(ts: TypeScriptModule, node: ts.Node): boolean {
   return (
     ts.isFunctionDeclaration(node) ||
     ts.isFunctionExpression(node) ||
@@ -318,7 +380,10 @@ type PhaseIdentifierClassification =
   // Any other reference (argument, return, alias, member base, `phase?.()`) → bail.
   | "other-reference";
 
-function classifyPhaseIdentifier(node: ts.Identifier): PhaseIdentifierClassification {
+function classifyPhaseIdentifier(
+  ts: TypeScriptModule,
+  node: ts.Identifier
+): PhaseIdentifierClassification {
   const parent = node.parent;
   // Non-reference name positions.
   if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
@@ -364,7 +429,10 @@ function classifyPhaseIdentifier(node: ts.Identifier): PhaseIdentifierClassifica
   return "other-reference";
 }
 
-function staticStringArgument(argument: ts.Expression | undefined): string | null {
+function staticStringArgument(
+  ts: TypeScriptModule,
+  argument: ts.Expression | undefined
+): string | null {
   if (argument == null) {
     return null;
   }

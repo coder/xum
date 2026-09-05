@@ -208,7 +208,9 @@ export class WorkflowService {
           }
         })
     );
-    return runs.filter((run): run is WorkflowRunRecord => run != null);
+    return runs
+      .filter((run): run is WorkflowRunRecord => run != null)
+      .map(hydrateWorkflowRunPhaseManifest);
   }
 
   async resumeCrashedRuns(input: {
@@ -243,7 +245,10 @@ export class WorkflowService {
     assert(input.runId.length > 0, "WorkflowService.getRun: runId is required");
     try {
       const run = await this.runStore.getRun(input.runId);
-      return run.workspaceId === input.workspaceId ? run : null;
+      // Hydrate here, not only in the oRPC wrappers: workflow_run/workflow_resume
+      // embed this record in persisted tool output, and a reloaded terminal card
+      // renders that snapshot without any live fetch.
+      return run.workspaceId === input.workspaceId ? hydrateWorkflowRunPhaseManifest(run) : null;
     } catch {
       return null;
     }
@@ -1122,8 +1127,7 @@ export async function resolveWorkflowContext(
 export async function listWorkflowRuns(context: WorkflowServiceContext, workspaceId: string) {
   const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
   await service.resumeCrashedRuns({ workspaceId, projectTrusted });
-  // Phase manifests are hydrated on outbound copies only (never persisted).
-  return (await service.listRuns({ workspaceId })).map(hydrateWorkflowRunPhaseManifest);
+  return await service.listRuns({ workspaceId });
 }
 
 export async function getWorkflowRun(
@@ -1131,8 +1135,7 @@ export async function getWorkflowRun(
   input: { workspaceId: string; runId: string }
 ) {
   const { service } = await resolveWorkflowContext(context, input.workspaceId);
-  const run = await service.getRun(input);
-  return run == null ? null : hydrateWorkflowRunPhaseManifest(run);
+  return await service.getRun(input);
 }
 
 export async function interruptWorkflowRun(

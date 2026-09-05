@@ -101,6 +101,40 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(`export default function workflow({ other: phase }) { phase("x"); return {}; }\n`)
     ).toBeUndefined();
+    // Computed key: `key` may resolve to another capability (agent, log, …), so the
+    // local named `phase` cannot be proven to be the phase primitive.
+    expect(
+      phaseNames(
+        `const key = "agent";\nexport default function workflow({ [key]: phase }) { phase("x"); return {}; }\n`
+      )
+    ).toBeUndefined();
+  });
+
+  test("bails on mutable or reassigned default-export bindings", () => {
+    // `let` initializer replaced before export: the runtime executes `b`, not `a`.
+    expect(
+      phaseNames(
+        `let run = ({ phase }) => { phase("a"); return {}; };\n` +
+          `run = ({ phase }) => { phase("b"); return {}; };\n` +
+          `export default run;\n`
+      )
+    ).toBeUndefined();
+    // Even an un-reassigned `let` is not an immutable binding.
+    expect(
+      phaseNames(`let run = ({ phase }) => { phase("a"); return {}; };\nexport default run;\n`)
+    ).toBeUndefined();
+    // A function declaration reassigned later is equally untrustworthy.
+    expect(
+      phaseNames(
+        `function run({ phase }) { phase("a"); return {}; }\n` +
+          `run = ({ phase }) => { phase("b"); return {}; };\n` +
+          `export default run;\n`
+      )
+    ).toBeUndefined();
+    // Immutable + untouched bindings still resolve (see "supports ... indirection").
+    expect(
+      phaseNames(`function run({ phase }) { phase("fn"); return {}; }\nexport default run;\n`)
+    ).toEqual(["fn"]);
   });
 
   test("bails on shadowing declarations", () => {
