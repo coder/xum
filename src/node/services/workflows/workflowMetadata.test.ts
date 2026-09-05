@@ -138,6 +138,10 @@ describe("parseDeclaredPhasesFromSource", () => {
       'export const meta = { ["pha\\u0073es"]: buildPhases() };\n',
       // An interpolated template elsewhere in meta must not hide the phases key.
       "export const meta = { description: `x ${name}`, phases: buildPhases() };\n",
+      // Anything that MAY supply phases at runtime counts: spreads and dynamic keys.
+      "export const meta = { ...{ phases: buildPhases() } };\n",
+      "export const meta = { description: 'x', ...shared };\n",
+      'export const meta = { [key]: [{ name: "a" }], description: "x" };\n',
     ]) {
       const source = declaration + body;
       try {
@@ -158,13 +162,45 @@ describe("parseDeclaredPhasesFromSource", () => {
     for (const declaration of [
       'const description = "x";\nexport const meta = { description };\n',
       "export const meta = { argsSchema: buildSchema(), nested: { phases: 1 } };\n",
-      // Dynamic computed key: cannot be shown to name phases.
-      'export const meta = { [key]: [{ name: "a" }], description: "x" };\n',
       // Not even an object literal: nothing to declare phases in.
       "export const meta = sharedMeta;\n",
     ]) {
       expect(parseDeclaredPhasesFromSource(declaration + body)).toBeUndefined();
     }
+  });
+});
+
+describe("declared phases require an immutable meta binding", () => {
+  const body = 'export default function workflow({ phase }) { phase("a"); return {}; }\n';
+  const phases = '{ phases: [{ name: "a" }] }';
+
+  test("rejects let/var declarations and any later mention of meta", () => {
+    for (const declaration of [
+      `export let meta = ${phases};\nmeta = { phases: [{ name: "b" }] };\n`,
+      `export let meta = ${phases};\n`,
+      `export const meta = ${phases};\nmeta.phases.push({ name: "b" });\n`,
+      `export const meta = ${phases};\nconst alias = meta;\n`,
+    ]) {
+      expect(() => parseDeclaredPhasesFromSource(declaration + body)).toThrow(
+        /immutable declaration/u
+      );
+    }
+  });
+
+  test("accepts const meta and ignores the word in strings or as a member name", () => {
+    expect(
+      parseDeclaredPhasesFromSource(
+        `export const meta = { description: "about meta", phases: [{ name: "a" }] };\n` +
+          "const x = ctx.meta;\n" +
+          body
+      )
+    ).toEqual([{ name: "a" }]);
+  });
+
+  test("mutability is only enforced when phases are declared", () => {
+    expect(
+      parseDeclaredPhasesFromSource('export let meta = { description: "x" };\nmeta = {};\n' + body)
+    ).toBeUndefined();
   });
 });
 

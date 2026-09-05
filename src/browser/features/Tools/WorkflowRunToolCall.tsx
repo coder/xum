@@ -1654,16 +1654,31 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
 
   // Tool output redaction can strip `run.source` from completed cards; fetch the full durable
   // run lazily when the user expands the card so the Script source disclosure remains useful.
+  // Snapshots persisted by pre-manifest builds embed `source` but no
+  // `workflow.phaseManifest`, and terminal cards never subscribe — so a missing
+  // manifest also triggers one hydrated fetch per run, or historical rails would
+  // never appear after upgrading. Only sources that could possibly derive a
+  // manifest qualify (a declared `phases` key or a `phase(` call both need the
+  // token); anything else would be a guaranteed-empty round trip.
+  const runPhaseManifest = run?.workflow.phaseManifest;
+  const manifestHydrationAttemptedFor = useRef<string | null>(null);
   useEffect(() => {
+    const needsSource = runSource == null;
+    const needsManifest =
+      runPhaseManifest == null &&
+      runSource != null &&
+      /\bphases?\b/u.test(runSource) &&
+      manifestHydrationAttemptedFor.current !== runId;
     if (
       !expanded ||
       apiState?.api == null ||
       runId == null ||
       workflowWorkspaceId == null ||
-      runSource != null
+      (!needsSource && !needsManifest)
     ) {
       return;
     }
+    manifestHydrationAttemptedFor.current = runId;
 
     let ignore = false;
     const refresh = async () => {
@@ -1684,7 +1699,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     return () => {
       ignore = true;
     };
-  }, [apiState?.api, expanded, runId, runSource, workflowWorkspaceId]);
+  }, [apiState?.api, expanded, runId, runPhaseManifest, runSource, workflowWorkspaceId]);
 
   useEffect(() => {
     if (

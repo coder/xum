@@ -2078,6 +2078,78 @@ describe("WorkflowRunToolCall", () => {
     expect(view.getByText(/Inline workflow received ok/)).toBeTruthy();
   });
 
+  test("hydrates the phase rail once for pre-upgrade snapshots that embed source without a manifest", async () => {
+    // Persisted by a build before phase manifests existed: terminal, has `source`,
+    // no `workflow.phaseManifest`. Terminal cards never subscribe, so without a
+    // one-shot fetch the declared rail would never appear after upgrading.
+    const source =
+      'export const meta = { phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }] };\n' +
+      'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n';
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source,
+      sourceHash: "sha256:pre-upgrade",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }],
+        },
+      },
+    };
+    const getRun = mock(async () => hydrated);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: legacySnapshot.id,
+                result: { reportMarkdown: "ok" },
+                run: legacySnapshot,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        runId: legacySnapshot.id,
+      })
+    );
+    // The declared-but-unvisited phase exists only on the hydrated rail.
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+
+    // Collapsing and re-expanding must not refetch: hydration is attempted once per run.
+    fireEvent.click(getWorkflowHeader(view));
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+    expect(getRun).toHaveBeenCalledTimes(1);
+  });
+
   test("renders attached foreground workflow runs without heuristic discovery", async () => {
     const attachedRun = {
       id: "wfr_attached",

@@ -14,8 +14,9 @@ import assert from "@/common/utils/assert";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   STATIC_METADATA_ERROR,
+  isStaticMetadataBindingImmutable,
   parseStaticWorkflowMetadataLiteral,
-  staticMetadataLiteralHasKey,
+  staticMetadataLiteralMayDeclareKey,
 } from "./staticWorkflowMetadata";
 
 export function parseWorkflowMetadata(source: string): WorkflowMetadata | null {
@@ -49,26 +50,36 @@ const DECLARED_PHASE_KNOWN_KEYS = new Set(["name", "label", "description", "para
  * entry point for run creation and read-path hydration.
  *
  * Unlike {@link parseWorkflowMetadata}, a `meta` literal the static parser cannot
- * read is reported as INVALID when it lexically declares a `phases` key:
- * `const phases = [...]; export const meta = { phases };` would otherwise start
- * undeclared (and the read path could even hydrate an inferred rail for it)
- * instead of surfacing the static-literal requirement to the author. Unreadable
- * meta WITHOUT a `phases` key keeps its legacy behavior — ignored — so existing
- * workflows stay startable across the upgrade.
+ * read is reported as INVALID when it may declare `phases` (a top-level `phases`
+ * key, a dynamic computed key, or a spread): `const phases = [...]; export const
+ * meta = { phases };` would otherwise start undeclared (and the read path could
+ * even hydrate an inferred rail for it) instead of surfacing the static-literal
+ * requirement to the author. Unreadable meta that cannot declare phases keeps
+ * its legacy behavior — ignored — so existing workflows stay startable.
+ *
+ * A declaration that DOES parse must also be immutable: `export let meta` or a
+ * later mention of `meta` (reassignment, mutation, aliasing) could change the
+ * exported phases after the static read, so those are rejected too.
  */
 export function parseDeclaredPhasesFromSource(source: string): WorkflowDeclaredPhase[] | undefined {
   let rawMetadata: unknown;
   try {
     rawMetadata = parseStaticWorkflowMetadataLiteral(source);
   } catch {
-    if (!staticMetadataLiteralHasKey(source, "phases")) {
+    if (!staticMetadataLiteralMayDeclareKey(source, "phases")) {
       return undefined;
     }
     throw new WorkflowDeclaredPhasesValidationError([
       `${STATIC_METADATA_ERROR}; meta.phases cannot be read from this meta declaration`,
     ]);
   }
-  return parseDeclaredPhases(isPlainObject(rawMetadata) ? rawMetadata : null);
+  const phases = parseDeclaredPhases(isPlainObject(rawMetadata) ? rawMetadata : null);
+  if (phases != null && !isStaticMetadataBindingImmutable(source)) {
+    throw new WorkflowDeclaredPhasesValidationError([
+      "meta.phases requires an immutable declaration: use `export const meta` and do not reference `meta` elsewhere in the script",
+    ]);
+  }
+  return phases;
 }
 
 /**

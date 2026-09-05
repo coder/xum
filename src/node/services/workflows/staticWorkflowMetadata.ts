@@ -71,14 +71,16 @@ function matchTopLevelMetaDeclaration(
 }
 
 /**
- * Whether the top-level `export const meta = { ... }` literal lexically declares
- * `key` among its own (depth-0) properties, tolerating non-static values such as
+ * Whether the top-level `export const meta = { ... }` literal MAY declare `key`
+ * among its own (depth-0) properties, tolerating non-static values such as
  * `{ phases }` or `{ phases: buildPhases() }` that the strict parser rejects.
- * False when no object literal can be located at all (`export const meta = x`).
- * Lets run creation tell "unreadable meta that declares phases" apart from
- * legacy unreadable meta that must keep being ignored.
+ * Conservative by construction: a top-level spread (`...x`) or a dynamic computed
+ * key (`[k]`) could supply the key at runtime, so both count as "may". False when
+ * no object literal can be located at all (`export const meta = x`). Lets run
+ * creation tell "unreadable meta that may declare phases" apart from legacy
+ * unreadable meta that must keep being ignored.
  */
-export function staticMetadataLiteralHasKey(source: string, key: string): boolean {
+export function staticMetadataLiteralMayDeclareKey(source: string, key: string): boolean {
   // Structure (depth, comments, string/template bodies) comes from the masked
   // text, which preserves indexes; key tokens are read from the original source.
   // The strict locator is NOT used for the object extent: it throws on template
@@ -95,24 +97,27 @@ export function staticMetadataLiteralHasKey(source: string, key: string): boolea
   for (let index = start + 1; index < end; index += 1) {
     const char = masked[index];
     if (depth === 0 && expectKey && char === "[") {
-      // Computed key with a static string literal: `["phases"]: ...`. Anything else
-      // inside the brackets (`[key]`) is dynamic and treated as unreadable.
+      // Computed key. A static string literal names the key outright
+      // (`["phases"]`, escapes decoded by the strict parser); anything dynamic
+      // (`[k]`) could evaluate to it, so it counts as "may declare".
       const close = masked.indexOf("]", index);
-      if (close === -1) return false;
+      if (close === -1) return true;
       expectKey = false;
       try {
-        // The strict literal parser decodes escapes (`"pha\\u0073es"` → `phases`)
-        // and rejects anything that is not a lone static string.
         const decoded = new StaticMetadataLiteralParser(
           source.slice(index + 1, close),
           new Set()
         ).parseValue();
         if (decoded === key) return true;
       } catch {
-        // Dynamic or unreadable computed key: skip it.
+        return true;
       }
       index = close;
       continue;
+    }
+    if (depth === 0 && expectKey && masked.startsWith("...", index)) {
+      // Top-level spread: the spread object may carry the key.
+      return true;
     }
     if (char === "{" || char === "[" || char === "(") {
       depth += 1;
@@ -176,6 +181,26 @@ function readStaticStringLiteral(
     index += 1;
   }
   throw new Error(STATIC_METADATA_ERROR);
+}
+
+/**
+ * Whether the `meta` export is declared with `const` and the identifier `meta` is
+ * mentioned nowhere else in the (comment/string-masked) source. `export let meta`
+ * or any later `meta = …` / `meta.phases.push(…)` / `helper(meta)` could change
+ * the exported phases after the static read, so callers reject those.
+ */
+export function isStaticMetadataBindingImmutable(source: string): boolean {
+  const masked = maskStaticJavaScriptSource(source);
+  const match = matchTopLevelMetaDeclaration(masked);
+  if (match == null) return false;
+  const declaration = masked.slice(match.declarationStart, match.end);
+  if (!/\bconst\b/u.test(declaration)) return false;
+  const mentions = masked.matchAll(/(?<![\w$.])meta(?![\w$])/gu);
+  for (const mention of mentions) {
+    const inDeclaration = mention.index >= match.declarationStart && mention.index < match.end;
+    if (!inDeclaration) return false;
+  }
+  return true;
 }
 
 /** Index just past the `}` matching the `{` at `start` in masked source, or -1. */

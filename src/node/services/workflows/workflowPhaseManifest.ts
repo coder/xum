@@ -5,9 +5,17 @@
  *  1. `meta.phases` (declared) — validated strictly at run creation
  *     (WorkflowService) and leniently here on read paths.
  *  2. Best-effort static inference from `phase("literal")` callsites for legacy
- *     scripts without a declaration. Inference is all-or-nothing: any dynamic
- *     name, aliasing, shadowing, or nested-scope use of the `phase` binding
- *     bails to no manifest, because a wrong inferred rail is worse than none.
+ *     scripts without a declaration. This is NOT a JavaScript semantic
+ *     interpreter: it recognizes a conservative safe subset — a canonical
+ *     `{ phase }` binding on an immutable default export, called directly with
+ *     string literals from the function's own body — and returns a manifest only
+ *     when the whole script stays inside that subset. Anything that could emit
+ *     or rebind a phase outside the scanner's view (dynamic names, aliasing,
+ *     shadowing, nested scopes, parameter-time evaluation, `eval`/`with`,
+ *     `arguments`, routes to the global object, the runner's `__workflow*`/`__mux*`
+ *     internals, mutable/reassigned exports) bails to no manifest: observed-only
+ *     rendering, exactly as before this feature. A wrong or incomplete inferred
+ *     rail is worse than none.
  *
  * The manifest is derived data: it is NEVER persisted (see
  * WorkflowRunStore.writeRunFile) and read-path failures never throw — they
