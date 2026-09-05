@@ -175,7 +175,7 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   // TypeScript recovers from syntax errors and still yields an AST; the runner
   // will refuse to compile such a script, so a rail inferred from it would
   // describe code that never executed.
-  if (sourceFileHasParseDiagnostics(ts, sourceFile)) {
+  if (sourceFileHasParseDiagnostics(sourceFile)) {
     return undefined;
   }
   // A sloppy-mode `with` block resolves `phase` dynamically through its object;
@@ -425,12 +425,18 @@ function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceF
   return check(sourceFile);
 }
 
-function sourceFileHasParseDiagnostics(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
-  // `parseDiagnostics` is populated by createSourceFile but is not on the public
-  // SourceFile type; the program-level alternative would require a full Program.
-  const diagnostics = (sourceFile as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] })
-    .parseDiagnostics;
-  return Array.isArray(diagnostics) && diagnostics.length > 0;
+/**
+ * `parseDiagnostics` is populated by createSourceFile but is not on the public
+ * SourceFile type (the public route would need a full Program). Read it through
+ * a structural type guard rather than an assertion so a future TypeScript that
+ * renames the field degrades to "no diagnostics" instead of a type lie.
+ */
+function sourceFileHasParseDiagnostics(sourceFile: ts.SourceFile): boolean {
+  const hasParseDiagnostics = (
+    value: ts.SourceFile
+  ): value is ts.SourceFile & { parseDiagnostics: readonly unknown[] } =>
+    "parseDiagnostics" in value && Array.isArray(value.parseDiagnostics);
+  return hasParseDiagnostics(sourceFile) && sourceFile.parseDiagnostics.length > 0;
 }
 
 function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {

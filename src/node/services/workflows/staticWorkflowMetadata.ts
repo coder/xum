@@ -487,13 +487,13 @@ class StaticMetadataLiteralParser {
   private readEscapeSequence(): string {
     const char = this.source[this.index];
     this.index += 1;
+    // `/` is included because JSON permits an escaped solidus (`"https:\\/\\/…"`);
+    // JSON.stringify output and hand-written URLs both use it.
     switch (char) {
       case '"':
       case "'":
       case "\\":
       case "`":
-      // JSON permits an escaped solidus (`"https:\\/\\/…"`); JSON.stringify output
-      // and hand-written URLs both use it, so the metadata contract must too.
       case "/":
         return char;
       case "b":
