@@ -181,6 +181,48 @@ describe("getEffectiveContextLimit", () => {
     expect(oauthOnlyLimit).toBe(272_000);
   });
 
+  test("honors a request-level Chat Completions wire format, with the stored value winning", () => {
+    const bothCredsOauthPreferred = providersWithOpenAI({
+      apiKeySet: true,
+      codexOauthSet: true,
+      codexOauthDefaultAuth: "oauth",
+    });
+    // Stored config leaves wireFormat unset; the request selects Chat Completions,
+    // so the factory uses the API key and the OAuth cap must not apply.
+    expect(
+      getEffectiveContextLimit("openai:gpt-5.5", false, bothCredsOauthPreferred, {
+        openaiWireFormat: "chatCompletions",
+      })
+    ).toBe(1_050_000);
+
+    // A stored Responses wire format wins over the request-level value.
+    expect(
+      getEffectiveContextLimit(
+        "openai:gpt-5.5",
+        false,
+        providersWithOpenAI({
+          apiKeySet: true,
+          codexOauthSet: true,
+          codexOauthDefaultAuth: "oauth",
+          wireFormat: "responses",
+        }),
+        { openaiWireFormat: "chatCompletions" }
+      )
+    ).toBe(272_000);
+
+    // OAuth only: no API key to fall back to, so the OAuth cap stays.
+    expect(
+      getEffectiveContextLimit(
+        "openai:gpt-5.5",
+        false,
+        providersWithOpenAI({ codexOauthSet: true }),
+        {
+          openaiWireFormat: "chatCompletions",
+        }
+      )
+    ).toBe(272_000);
+  });
+
   test("does not treat unresolved API-key files as active API-key auth", () => {
     const limit = getEffectiveContextLimit(
       "openai:gpt-5.5",

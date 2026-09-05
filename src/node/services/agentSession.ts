@@ -3691,6 +3691,7 @@ export class AgentSession {
           providersConfigForCompaction
         ),
         providersConfig: providersConfigForCompaction,
+        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
       });
 
       // On-send compaction uses the configured threshold directly so we compact
@@ -5974,6 +5975,7 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
+        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
       });
 
       if (shouldInterruptForCompaction) {

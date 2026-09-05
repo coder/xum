@@ -26,10 +26,7 @@ import {
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
-export interface ProModeAvailabilityOptions extends OpenAIDirectProviderOptionsAvailability {
-  /** Overrides the providersConfig-derived OpenAI wire format when provided. */
-  openaiWireFormat?: "responses" | "chatCompletions" | null;
-}
+export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability;
 
 export function openaiProModeAvailable(
   modelString: string,

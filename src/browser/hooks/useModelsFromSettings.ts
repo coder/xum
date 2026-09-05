@@ -9,7 +9,7 @@ import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
 import { isValidProvider } from "@/common/constants/providers";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
-import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { isGatewayModelAccessibleForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import {
   getExplicitGatewayPrefix,
   normalizeSelectedModel,
@@ -19,10 +19,7 @@ import { isModelAvailable, resolveRoute } from "@/common/routing";
 import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
-import {
-  isGatewayModelAccessibleFromAuthoritativeCatalog,
-  isProviderModelAccessibleFromAuthoritativeCatalog,
-} from "@/common/utils/providers/gatewayModelCatalog";
+import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
 const BUILT_IN_MODELS: string[] = Object.values(KNOWN_MODELS).map((m) => m.id);
@@ -197,17 +194,7 @@ export function useModelsFromSettings() {
 
   const isGatewayModelAccessible = useCallback(
     (gateway: string, modelId: string) =>
-      // Mirror the backend's routing-time policy gate
-      // (createGatewayModelAccessibilityChecker): a gateway model the policy
-      // disallows falls back to other routes, so it must not count as a route here.
-      isModelAllowedByPolicy(effectivePolicy, `${gateway}:${modelId}`) &&
-      isGatewayModelAccessibleFromAuthoritativeCatalog(
-        gateway,
-        modelId,
-        config?.[gateway]?.models,
-        config?.[gateway]?.discoveredModels,
-        config?.[gateway]?.removedModels
-      ),
+      isGatewayModelAccessibleForUi(effectivePolicy, config, gateway, modelId),
     [config, effectivePolicy]
   );
 
