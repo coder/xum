@@ -9,6 +9,7 @@ import {
   waitFor,
 } from "../helpers";
 
+import { buildMockStreamStartGateMessage } from "@/node/services/mock/mockAiRouter";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import type { MuxMessage } from "@/common/types/message";
@@ -59,6 +60,115 @@ describe("Persistent sub-agent compaction", () => {
       repoPath = undefined;
     }
   });
+
+  test.each(["tool-end", "turn-end"] as const)(
+    "parent guidance stays attached to a reawakened execution with %s dispatch",
+    async (queueDispatchMode) => {
+      if (!env || !repoPath) throw new Error("Test environment not initialized");
+      const testEnv = env;
+      const parent = await createWorkspace(env, repoPath, generateBranchName("guidance-parent"));
+      if (!parent.success) throw new Error(parent.error);
+      const parentId = parent.metadata.id;
+      workspaceIds.push(parentId);
+      const child = await createWorkspace(env, repoPath, generateBranchName("guidance-child"));
+      if (!child.success) throw new Error(child.error);
+      const childId = child.metadata.id;
+      workspaceIds.push(childId);
+      await env.config.addWorkspace(repoPath, {
+        ...child.metadata,
+        parentWorkspaceId: parentId,
+        agentId: "explore",
+        agentType: "explore",
+        taskStatus: "reported",
+        taskModelString: HAIKU_MODEL,
+        title: "Reviewer",
+      });
+      const historyService = new HistoryService(env.config);
+      const reactivated = await env.services.taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childId,
+        buildMockStreamStartGateMessage("Review the initial changes."),
+        "tool-end"
+      );
+      if (!reactivated.success || reactivated.data.delivery !== "reactivated") {
+        throw new Error("Expected a reactivated child execution");
+      }
+      const handleId = reactivated.data.executionTaskId;
+      if (!handleId) throw new Error("Expected a reactivated execution task ID");
+      try {
+        // Hold the real session at stream preparation, so guidance deterministically queues.
+        expect(
+          await waitFor(
+            () => testEnv.services.workspaceService.getOrCreateSession(childId).isPreparingTurn(),
+            10_000
+          )
+        ).toBe(true);
+        const guidance = await env.services.taskService.sendMessageToDescendantAgentTask(
+          parentId,
+          childId,
+          "Check lifecycle behavior before reporting.",
+          queueDispatchMode
+        );
+        const correlation =
+          await env.services.workspaceTurnManager.getActiveWorkspaceTurnMuxMetadataForWorkspace(
+            childId
+          );
+        if (!correlation) throw new Error("Missing active correlation");
+        expect(
+          env.services.workspaceService.hasPendingWorkspaceTurnContinuation(childId, correlation)
+        ).toBe(true);
+        expect(guidance).toMatchObject({ success: true, data: { delivery: "queued" } });
+      } finally {
+        env.services.aiService.releaseMockStreamStartGate(childId);
+      }
+
+      expect(
+        await waitFor(async () => {
+          const snapshot =
+            await testEnv.services.taskService.getDescendantAgentTaskExecutionSnapshot(
+              parentId,
+              childId
+            );
+          return (
+            snapshot?.record.status === "completed" ||
+            snapshot?.record.status === "interrupted" ||
+            snapshot?.record.status === "error"
+          );
+        }, 15_000)
+      ).toBe(true);
+      const result = await env.services.workspaceTurnManager.waitForWorkspaceTurn(handleId, {
+        requestingWorkspaceId: parentId,
+        backgroundOnMessageQueued: false,
+        timeoutMs: 10_000,
+      });
+      expect(result.reportMarkdown).toContain("Check lifecycle behavior before reporting.");
+      expect(findWorkspace(env, childId)).toMatchObject({
+        taskExecutionId: handleId,
+        taskExecutionStatus: "completed",
+      });
+      expect(
+        await waitFor(async () => {
+          const history = await historyService.getLastMessages(parentId, 30);
+          return (
+            history.success &&
+            history.data.some((message) => extractText(message).includes("<mux_subagent_report>"))
+          );
+        }, 10_000)
+      ).toBe(true);
+      const parentHistory = await historyService.getLastMessages(parentId, 30);
+      if (!parentHistory.success) throw new Error(parentHistory.error);
+      const reports = parentHistory.data.filter((message) =>
+        extractText(message).includes("<mux_subagent_report>")
+      );
+      expect(reports).toHaveLength(1);
+      expect(extractText(reports[0])).toContain("Check lifecycle behavior before reporting.");
+      expect(
+        parentHistory.data.some((message) =>
+          extractText(message).includes("<mux_subagent_failure>")
+        )
+      ).toBe(false);
+    }
+  );
 
   test("reawakens a compacted child in place and settles its continuation without a live LLM", async () => {
     if (!env || !repoPath) throw new Error("Test environment not initialized");

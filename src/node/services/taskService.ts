@@ -4687,6 +4687,12 @@ export class TaskService implements AgentTaskIntegration {
 
         const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
         const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
+        // Parent guidance continues the delegated execution, rather than superseding it and
+        // stranding its report. Use the normal continuation guards for earlier manual input.
+        const workspaceTurnMuxMetadata =
+          await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+            taskId
+          );
         let accepted = false;
         const sendResult = await this.workspaceService.sendMessage(
           taskId,
@@ -4703,18 +4709,41 @@ export class TaskService implements AgentTaskIntegration {
             reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
             experiments: entry.workspace.taskExperiments,
             queueDispatchMode,
+            ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
           {
             synthetic: true,
             agentInitiated: true,
             startStreamInBackground: true,
+            workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+            ...(workspaceTurnMuxMetadata != null
+              ? {
+                  onCanceled: async (reason: string) => {
+                    await clearGuidanceReservation(true);
+                    await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+                      taskId,
+                      workspaceTurnMuxMetadata,
+                      "interrupted",
+                      reason
+                    );
+                  },
+                }
+              : {}),
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
             preTurnMessages: options?.preTurnMessages,
-            onAcceptedPreStreamFailure: async () => {
+            onAcceptedPreStreamFailure: async (error: SendMessageError) => {
               // If the replacement turn cannot start, remove the settlement reservation and restore
               // an idle child to completion recovery instead of leaving it permanently running.
               await clearGuidanceReservation(true);
+              if (workspaceTurnMuxMetadata != null) {
+                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+                  taskId,
+                  workspaceTurnMuxMetadata,
+                  "error",
+                  formatSendMessageError(error).message
+                );
+              }
             },
             onAccepted: async () => {
               await clearGuidanceReservation(false);
