@@ -206,6 +206,12 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(legacyWorkflow(`arguments[0].phase("hidden"); phase("visible");`))
     ).toBeUndefined();
+    // A parameter default can reach it too — before the body even runs.
+    expect(
+      phaseNames(
+        `export default function workflow({ phase }, hidden = arguments[0]["phase"]("setup")) { phase("run"); return {}; }\n`
+      )
+    ).toBeUndefined();
   });
 
   test("bails on with statements, which resolve identifiers dynamically", () => {

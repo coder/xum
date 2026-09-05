@@ -162,8 +162,9 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     return undefined;
   }
   // `arguments[0]` is the original context object, so `arguments[0].phase(...)`
-  // emits a phase the identifier walk classifies as a mere member name.
-  if (mentionsIdentifier(ts, workflowFn.body, "arguments")) {
+  // emits a phase the identifier walk classifies as a mere member name — from the
+  // body or from a parameter default, so scan the whole function.
+  if (mentionsIdentifier(ts, workflowFn, "arguments")) {
     return undefined;
   }
 

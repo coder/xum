@@ -1223,25 +1223,35 @@ function normalizeWorkflowRunRecord(rawRun: unknown): unknown {
   if (!isRecord(rawRun)) {
     return rawRun;
   }
-  if (rawRun.workflow != null && rawRun.source != null && rawRun.sourceHash != null) {
-    return rawRun;
+  const run = stripPersistedPhaseManifest(rawRun);
+  if (run.workflow != null && run.source != null && run.sourceHash != null) {
+    return run;
   }
-  if (
-    rawRun.definition == null &&
-    rawRun.definitionSource == null &&
-    rawRun.definitionHash == null
-  ) {
-    return rawRun;
+  if (run.definition == null && run.definitionSource == null && run.definitionHash == null) {
+    return run;
   }
 
   // Older run.json snapshots used definition* fields. Normalize before schema parsing so
   // existing durable runs stay visible/resumable long enough to hydrate source from disk.
   return {
-    ...rawRun,
-    workflow: rawRun.workflow ?? rawRun.definition,
-    source: rawRun.source ?? rawRun.definitionSource,
-    sourceHash: rawRun.sourceHash ?? rawRun.definitionHash,
+    ...run,
+    workflow: run.workflow ?? run.definition,
+    source: run.source ?? run.definitionSource,
+    sourceHash: run.sourceHash ?? run.definitionHash,
   };
+}
+
+/**
+ * `workflow.phaseManifest` is derived on read and never written by this store, so
+ * any persisted value (hand-edited or corrupted run.json) is dropped BEFORE schema
+ * validation: a malformed one must not make the durable run unreadable.
+ */
+function stripPersistedPhaseManifest(rawRun: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(rawRun.workflow) || !("phaseManifest" in rawRun.workflow)) {
+    return rawRun;
+  }
+  const { phaseManifest: _persisted, ...workflow } = rawRun.workflow;
+  return { ...rawRun, workflow };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

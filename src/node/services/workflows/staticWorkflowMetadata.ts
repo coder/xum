@@ -93,6 +93,27 @@ export function staticMetadataLiteralHasKey(source: string, key: string): boolea
   let expectKey = true;
   for (let index = metadata.start + 1; index < metadata.end; index += 1) {
     const char = masked[index];
+    if (depth === 0 && expectKey && char === "[") {
+      // Computed key with a static string literal: `["phases"]: ...`. Anything else
+      // inside the brackets (`[key]`) is dynamic and treated as unreadable.
+      const close = masked.indexOf("]", index);
+      if (close === -1) return false;
+      expectKey = false;
+      const inner = skipStaticWhitespace(source, index + 1);
+      const quote = source[inner];
+      if (quote === '"' || quote === "'" || quote === "`") {
+        try {
+          const literal = readStaticStringLiteral(source, inner, quote);
+          if (skipStaticWhitespace(source, literal.end) === close && literal.value === key) {
+            return true;
+          }
+        } catch {
+          // Unreadable literal: fall through and skip the computed key.
+        }
+      }
+      index = close;
+      continue;
+    }
     if (char === "{" || char === "[" || char === "(") {
       depth += 1;
       continue;
@@ -113,7 +134,7 @@ export function staticMetadataLiteralHasKey(source: string, key: string): boolea
       if (token.value === key) return true;
       index = token.end - 1;
     } catch {
-      // Computed or otherwise unreadable key: skip to the next top-level comma.
+      // Dynamic or otherwise unreadable key: skip to the next top-level comma.
     }
   }
   return false;

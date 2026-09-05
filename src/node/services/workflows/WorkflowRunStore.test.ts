@@ -74,6 +74,26 @@ describe("WorkflowRunStore", () => {
     expect(run.workflow.phaseManifest).toBeUndefined();
   });
 
+  test("a malformed persisted phaseManifest never makes run.json unreadable", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-malformed-manifest");
+    const store = await createStore(tmp.path);
+    const runFile = path.join(tmp.path, "workflows", "wfr_123", "run.json");
+    const currentRun = JSON.parse(await fs.readFile(runFile, "utf-8")) as {
+      workflow: Record<string, unknown>;
+    };
+    // Derived data with an invalid shape (hand-edited / corrupted): stripped before
+    // schema validation, so the durable run still loads and lists.
+    currentRun.workflow.phaseManifest = { provenance: "bogus", phases: "not-an-array" };
+    await fs.writeFile(runFile, JSON.stringify(currentRun, null, 2), "utf-8");
+
+    const run = await store.getRun("wfr_123");
+    expect(run.workflow.phaseManifest).toBeUndefined();
+    expect(run.id).toBe("wfr_123");
+    expect((await store.listRunStatusSnapshots()).map((snapshot) => snapshot.id)).toContain(
+      "wfr_123"
+    );
+  });
+
   test("loads legacy workflow source snapshot filenames", async () => {
     using tmp = new DisposableTempDir("workflow-runs-legacy-source-filename");
     const store = await createStore(tmp.path);

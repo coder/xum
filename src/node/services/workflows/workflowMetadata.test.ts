@@ -132,6 +132,9 @@ describe("parseDeclaredPhasesFromSource", () => {
       'const phases = [{ name: "a" }];\nexport const meta = { phases };\n',
       'export const meta = { description: "x", phases: buildPhases() };\n',
       'export const meta = { "phases": [...shared] };\n',
+      // Computed keys with a static string literal still name the key.
+      'export const meta = { ["phases"]: [{ name: "setup" }] };\n',
+      "export const meta = { description: 'x', [`phases`]: [{ name: 'setup' }] };\n",
     ]) {
       const source = declaration + body;
       try {
@@ -152,6 +155,8 @@ describe("parseDeclaredPhasesFromSource", () => {
     for (const declaration of [
       'const description = "x";\nexport const meta = { description };\n',
       "export const meta = { argsSchema: buildSchema(), nested: { phases: 1 } };\n",
+      // Dynamic computed key: cannot be shown to name phases.
+      'export const meta = { [key]: [{ name: "a" }], description: "x" };\n',
       // Not even an object literal: nothing to declare phases in.
       "export const meta = sharedMeta;\n",
     ]) {
