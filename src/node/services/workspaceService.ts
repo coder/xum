@@ -11090,6 +11090,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
+            promoteAheadOfHiddenTurnEnd: internal?.promoteAheadOfHiddenTurnEnd,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: continuationSendState.onCanceled,

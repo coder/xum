@@ -7069,6 +7069,8 @@ export class AgentSession {
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
       removableDedupeKey?: boolean;
+      /** Queue ahead of hidden turn-end predecessors (see MessageQueue). */
+      promoteAheadOfHiddenTurnEnd?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;

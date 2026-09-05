@@ -56,7 +56,11 @@ import {
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import type { AgentPeerMessageMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
+import {
+  AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
+  AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  agentReportProgressDedupePrefix,
+} from "@/constants/agentMessaging";
 import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -8120,11 +8124,21 @@ export class TaskService implements AgentTaskIntegration {
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
       // results can immediately background a foreground wait or queue behind a busy parent turn.
+      // The key is scoped to the active continuation execution (when any) so that execution's
+      // terminal settlement drops exactly the updates it superseded.
+      const dedupePrefix = agentReportProgressDedupePrefix(
+        childWorkspaceId,
+        continuationActive ? continuationRecord?.handleId : undefined
+      );
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
         parentEntry,
         content: reportContent,
-        queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
+        queueDedupeKey: `${dedupePrefix}${toolCallId}`,
+        // Only the queue head's dispatch mode can cut the parent's stream. A child's earlier
+        // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
+        // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
+        promoteAheadOfHiddenTurnEnd: true,
       });
       if (!wakeResult.success) {
         throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);
@@ -8151,6 +8165,8 @@ export class TaskService implements AgentTaskIntegration {
     content: string;
     /** Coalesces repeated wakes for the same source (e.g. one agent_report tool call). */
     queueDedupeKey?: string;
+    /** Queue ahead of hidden turn-end predecessors (see SendMessageInternalOptions). */
+    promoteAheadOfHiddenTurnEnd?: boolean;
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
@@ -8203,6 +8219,9 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
         ...(params.queueDedupeKey != null
           ? { queueDedupeKey: params.queueDedupeKey, removableQueueDedupeKey: true }
+          : {}),
+        ...(params.promoteAheadOfHiddenTurnEnd === true
+          ? { promoteAheadOfHiddenTurnEnd: true }
           : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
@@ -12546,8 +12565,8 @@ export class TaskService implements AgentTaskIntegration {
 
     const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
       parentWorkspaceId,
-      `agent-report:${childWorkspaceId}:`,
-      { cancelReason: "Incremental sub-agent update superseded by the terminal report." }
+      agentReportProgressDedupePrefix(childWorkspaceId),
+      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON }
     );
     if (!queuedProgressRemoval.success) {
       log.warn("Failed to remove queued incremental sub-agent reports", {

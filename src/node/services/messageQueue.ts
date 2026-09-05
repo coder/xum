@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
@@ -129,6 +130,14 @@ interface QueuedMessageInternalOptions {
   sealed?: boolean;
   /** Dedupe-keyed maintenance sends are removable by prefix without changing global queue rules. */
   removableDedupeKey?: boolean;
+  /**
+   * Enqueue this tool-end entry ahead of hidden (non-user-authored) turn-end entries queued
+   * before it. Only the FIFO head's mode can cut the active stream, so a background turn-end
+   * predecessor (e.g. a child's ancestor-bound peer message) would otherwise hold a tool-end
+   * sub-agent progress report until the turn ends naturally. A user-authored turn-end entry
+   * still governs: the user's visible "wait for turn end" choice is never pulled forward.
+   */
+  promoteAheadOfHiddenTurnEnd?: boolean;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
@@ -223,6 +232,9 @@ interface QueueEntry {
  *   so renderer/restoration projections can omit background work precisely.
  * - Compaction entries stay open: a follow-up typed behind a pending /compact
  *   batches under the compaction request (long-standing behavior).
+ * - Only the FIFO head's dispatch mode can cut the active stream. Tool-end sends flagged
+ *   promoteAheadOfHiddenTurnEnd (sub-agent progress reports) therefore enqueue ahead of
+ *   hidden turn-end predecessors, never ahead of a user-authored entry.
  *
  * Display logic:
  * - A single-message compaction or agent-skill entry shows its rawCommand
@@ -451,7 +463,7 @@ export class MessageQueue {
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: QueuedMessageInternalOptions
   ): boolean {
-    return this.addInternal(message, options, internal);
+    return this.addInternal(message, options, internal) != null;
   }
 
   /**
@@ -489,24 +501,25 @@ export class MessageQueue {
       return false;
     }
 
-    const didAdd = this.addInternal(message, options, internal);
-    if (didAdd && dedupeKey !== undefined) {
-      this.entries[this.entries.length - 1].dedupeKeys.add(dedupeKey);
+    const entry = this.addInternal(message, options, internal);
+    if (entry != null && dedupeKey !== undefined) {
+      entry.dedupeKeys.add(dedupeKey);
     }
-    return didAdd;
+    return entry != null;
   }
 
+  /** Returns the entry the message landed in, or undefined when nothing was queued. */
   private addInternal(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: QueuedMessageInternalOptions
-  ): boolean {
+  ): QueueEntry | undefined {
     const trimmedMessage = message.trim();
     const hasFiles = options?.fileParts && options.fileParts.length > 0;
 
     // Reject if both text and file parts are empty
     if (trimmedMessage.length === 0 && !hasFiles) {
-      return false;
+      return undefined;
     }
 
     const incomingHasAcceptedCallbacks =
@@ -572,6 +585,9 @@ export class MessageQueue {
         lastAddedAtMs: 0,
       };
       this.entries.push(entry);
+      if (internal?.promoteAheadOfHiddenTurnEnd === true && incomingMode === "tool-end") {
+        this.promoteAheadOfHiddenTurnEndPredecessors(entry);
+      }
     }
 
     if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
@@ -650,7 +666,36 @@ export class MessageQueue {
       entry.agentInitiatedCount += 1;
     }
 
-    return true;
+    return entry;
+  }
+
+  /**
+   * Move a freshly pushed tool-end entry ahead of the hidden turn-end entries immediately
+   * before it (see QueuedMessageInternalOptions.promoteAheadOfHiddenTurnEnd). Stops at the
+   * first user-authored or tool-end predecessor, so FIFO order is preserved among entries
+   * that either carry the user's explicit choice or would already cut at a step boundary.
+   */
+  private promoteAheadOfHiddenTurnEndPredecessors(entry: QueueEntry): void {
+    const currentIndex = this.entries.length - 1;
+    assert(
+      this.entries[currentIndex] === entry && entry.dispatchMode === "tool-end",
+      "promoteAheadOfHiddenTurnEndPredecessors requires the tool-end tail entry"
+    );
+    let insertIndex = currentIndex;
+    while (insertIndex > 0) {
+      const predecessor = this.entries[insertIndex - 1];
+      if (predecessor.userAuthored || predecessor.dispatchMode !== "turn-end") {
+        break;
+      }
+      insertIndex -= 1;
+    }
+    if (insertIndex === currentIndex) {
+      return;
+    }
+    this.entries.splice(currentIndex, 1);
+    this.entries.splice(insertIndex, 0, entry);
+    // The skipped entries now follow an unrelated predecessor (same as prioritizeNextUserEntry).
+    this.revalidateWorkspaceTurnCorrelations();
   }
 
   /**

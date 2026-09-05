@@ -520,6 +520,107 @@ describe("MessageQueue", () => {
     });
   });
 
+  describe("promoteAheadOfHiddenTurnEnd", () => {
+    const validOptions: SendMessageOptions = { model: "gpt-4", agentId: "exec" };
+    const hidden = { synthetic: true, agentInitiated: true, sealed: true };
+
+    it("moves a tool-end progress report ahead of hidden turn-end predecessors so it cuts the turn", () => {
+      queue.addOnce(
+        "peer message",
+        { ...validOptions, queueDispatchMode: "turn-end" },
+        "agent-msg:child:1",
+        hidden
+      );
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
+
+      expect(
+        queue.addOnce(
+          "progress report",
+          { ...validOptions, queueDispatchMode: "tool-end" },
+          "agent-report:child:call-1",
+          { ...hidden, removableDedupeKey: true, promoteAheadOfHiddenTurnEnd: true }
+        )
+      ).toBe(true);
+
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
+      expect(queue.getMessages()).toEqual(["progress report", "peer message"]);
+      // The dedupe key follows the promoted entry, not the old tail.
+      expect(queue.removeByDedupeKeyPrefix("agent-report:child:").removedCount).toBe(1);
+      expect(queue.getMessages()).toEqual(["peer message"]);
+    });
+
+    it("never overtakes a user-authored turn-end entry", () => {
+      queue.add("hidden turn-end", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+      queue.add("user wait for turn end", { ...validOptions, queueDispatchMode: "turn-end" });
+      queue.add(
+        "later hidden turn-end",
+        { ...validOptions, queueDispatchMode: "turn-end" },
+        hidden
+      );
+
+      queue.add(
+        "progress report",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, promoteAheadOfHiddenTurnEnd: true }
+      );
+
+      expect(queue.getMessages()).toEqual([
+        "hidden turn-end",
+        "user wait for turn end",
+        "progress report",
+        "later hidden turn-end",
+      ]);
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
+    });
+
+    it("keeps FIFO order behind an earlier tool-end entry and without the flag", () => {
+      queue.add("hidden tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+      queue.add("hidden turn-end", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+      queue.add(
+        "promoted",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, promoteAheadOfHiddenTurnEnd: true }
+      );
+      queue.add("plain tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+
+      expect(queue.getMessages()).toEqual([
+        "hidden tool-end",
+        "promoted",
+        "hidden turn-end",
+        "plain tool-end",
+      ]);
+    });
+
+    it("strips a skipped continuation's correlation, matching other reorders", () => {
+      const onCanceled = () => undefined;
+      queue.add(
+        "continuation report",
+        {
+          ...validOptions,
+          queueDispatchMode: "turn-end",
+          muxMetadata: {
+            type: "workspace-turn-task",
+            taskHandleId: "wst_followup",
+            ownerWorkspaceId: "parent-workspace",
+            turnId: "turn-1",
+          },
+        },
+        { ...hidden, workspaceTurnContinuation: true, onCanceled }
+      );
+      queue.add(
+        "progress report",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, promoteAheadOfHiddenTurnEnd: true }
+      );
+
+      expect(queue.dequeueNext().message).toBe("progress report");
+      const skipped = queue.dequeueNext();
+      expect(skipped.message).toBe("continuation report");
+      expect(skipped.options?.muxMetadata).toBeUndefined();
+      expect(skipped.internal?.onCanceled).toBeUndefined();
+    });
+  });
+
   describe("workspace turn metadata", () => {
     const metadata: MuxMessageMetadata = {
       type: "workspace-turn-task",

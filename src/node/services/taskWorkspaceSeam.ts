@@ -355,6 +355,12 @@ export interface SendMessageInternalOptions {
   /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
   removableQueueDedupeKey?: boolean;
   /**
+   * For queued tool-end sends: enqueue ahead of hidden (non-user-authored) turn-end entries so
+   * a background turn-end predecessor cannot hold this send until the turn ends naturally.
+   * Never overtakes a user-authored entry. See MessageQueue.promoteAheadOfHiddenTurnEnd.
+   */
+  promoteAheadOfHiddenTurnEnd?: boolean;
+  /**
    * For queued sends: quietly drop the message (success) when other messages are already
    * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
    * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
