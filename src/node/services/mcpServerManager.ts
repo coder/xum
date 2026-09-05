@@ -536,8 +536,6 @@ async function extractBearerOauthChallenge(options: {
   };
 }
 
-export type { MCPTestResult } from "@/common/types/mcp";
-
 /** Shell command + exec options composed for a stdio server launch. */
 interface StdioLaunch {
   command: string;

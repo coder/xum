@@ -19,14 +19,6 @@ export const DEFAULT_TASK_SETTINGS: TaskSettings = {
   preserveSubagentsUntilArchive: true,
 };
 
-export {
-  BACKGROUND_WORK_ATTENTION_POLICIES,
-  BackgroundWorkAttentionPolicySchema,
-  DEFAULT_BACKGROUND_WORK_ATTENTION_POLICY,
-  resolveBackgroundWorkAttentionPolicy,
-  type BackgroundWorkAttentionPolicy,
-} from "./backgroundWorkAttention";
-
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return fallback;

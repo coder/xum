@@ -251,14 +251,6 @@ Manage servers in Settings → MCP.
 // #endregion SYSTEM_PROMPT_DOCS
 
 /**
- * Get the system directory where global Xum configuration lives.
- * Users can place global AGENTS.md and PLAN.md files here.
- */
-function getSystemDirectory(): string {
-  return getXumHome();
-}
-
-/**
  * Extract tool-specific instructions from instruction sources.
  * Searches agent instructions first, then context (workspace/project), then global.
  *
@@ -507,7 +499,7 @@ export async function loadInstructionSources(
           path.join(os.homedir(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
         )
       : Promise.resolve(null),
-    readInstructionSet(getSystemDirectory(), INSTRUCTION_SCOPE.GLOBAL),
+    readInstructionSet(getXumHome(), INSTRUCTION_SCOPE.GLOBAL),
   ]);
   const global = [claudeCompatGlobal, nativeGlobal].filter(
     (set): set is InstructionSet => set != null

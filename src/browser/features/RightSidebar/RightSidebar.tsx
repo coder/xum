@@ -59,7 +59,6 @@ import {
 } from "@/browser/stores/WorkspaceStore";
 import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
-  RIGHT_SIDEBAR_TABS,
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
@@ -119,9 +118,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
-
-// Re-export for consumers
-export type { ReviewStats };
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -201,9 +197,6 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
     </div>
   );
 };
-
-export { RIGHT_SIDEBAR_TABS, isTabType };
-export type { TabType };
 
 function getGoalSetErrorMessage(error: GoalSetError): string {
   if (error.type === "goal_conflict") {

@@ -8,7 +8,7 @@ import { hasProviderReplayableContent } from "@/common/utils/messages/providerEl
 
 import type { MuxMessage } from "@/common/types/message";
 
-export { CONTEXT_BOUNDARY_KINDS, type ContextBoundaryKind };
+export { CONTEXT_BOUNDARY_KINDS };
 
 export function isDurableCompactedMarker(
   value: unknown

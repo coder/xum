@@ -111,7 +111,6 @@ export const MuxFilePartSchema = FilePartSchema.extend({
 
 // Export types inferred from schemas for reuse across app/test code.
 export type FilePart = z.infer<typeof FilePartSchema>;
-export type MuxFilePart = z.infer<typeof MuxFilePartSchema>;
 
 const CompactionEpochSchema = z.optional(
   z.preprocess(

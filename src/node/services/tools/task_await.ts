@@ -105,10 +105,6 @@ function buildTaskAwaitSequencingError(taskId: string, suggestedTaskIds: string[
   };
 }
 
-function parseWorkflowRun(value: unknown): WorkflowRunRecord {
-  return WorkflowRunRecordSchema.parse(value);
-}
-
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
   const createdAtMs = parseTimestampMs(run.createdAt);
   if (createdAtMs == null) {
@@ -404,7 +400,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         if (run == null) {
           return null;
         }
-        return parseWorkflowRun(run);
+        return WorkflowRunRecordSchema.parse(run);
       };
 
       const markWorkflowTerminalAttentionConsumed = async (

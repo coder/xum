@@ -72,10 +72,6 @@ import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-
-// Types derive from the oRPC schemas (z.infer single source) so node-side
-// fields can never silently be stripped by output validation.
-export type { MemoryConsolidationTrigger };
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
 type MemoryHarvestRecord = MemoryHarvestRecordPayload;

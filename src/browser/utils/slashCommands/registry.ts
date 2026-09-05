@@ -75,9 +75,6 @@ function parseCommandHeaderBody(rawInput: string): CommandHeaderBody {
   };
 }
 
-// Re-export MODEL_ABBREVIATIONS from constants for backwards compatibility
-export { MODEL_ABBREVIATIONS };
-
 // Suggestion helper functions
 function filterAndMapSuggestions<T extends SuggestionDefinition>(
   definitions: readonly T[],

@@ -8,9 +8,6 @@ import {
   MUX_GATEWAY_CLIENT_SECRET,
 } from "@/common/constants/muxGatewayOAuth";
 
-// Re-export gateway credentials for use by governor
-export { MUX_GATEWAY_CLIENT_ID, MUX_GATEWAY_CLIENT_SECRET };
-
 /**
  * Normalize a user-entered URL to an origin (scheme + host + port).
  * Throws if URL is invalid or uses unsupported scheme.

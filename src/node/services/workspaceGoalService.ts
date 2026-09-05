@@ -145,7 +145,7 @@ export interface SetGoalInput {
   editInPlace?: boolean | null;
 }
 
-export type { GoalContinuationSkipReason, GoalStreamOriginKind } from "./goalContinuationPolicy";
+export type { GoalStreamOriginKind } from "./goalContinuationPolicy";
 
 export interface GoalContinuationRuntimeState {
   isInitializing?: boolean;

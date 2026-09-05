@@ -3,7 +3,6 @@ import type { WorkflowRunToolAttachment } from "@/common/orpc/schemas/message";
 export type {
   CodeExecutionConsoleRecord as ConsoleRecord,
   CodeExecutionResult,
-  CodeExecutionToolCallRecord as ToolCallRecord,
 } from "@/common/types/codeExecution";
 
 /** Nested tool call shape from streaming aggregator */

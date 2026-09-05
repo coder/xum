@@ -169,7 +169,7 @@ describe("buildSystemMessage", () => {
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(globalDir, { recursive: true });
 
-    // Mock homedir to return our test directory (getSystemDirectory will append .mux)
+    // Mock homedir to return our test directory (getXumHome will append .mux)
     mockHomedir = spyOn(os, "homedir");
     mockHomedir.mockReturnValue(tempDir);
 

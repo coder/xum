@@ -9,10 +9,8 @@ import { hasLegacyPtcExclusiveOverride } from "@/browser/contexts/ExperimentsCon
 
 // Re-export reactive hooks from context for convenience
 export {
-  useExperiment,
   useExperimentValue,
   useExperimentOverrideValue,
-  useSetExperiment,
 } from "@/browser/contexts/ExperimentsContext";
 
 /**
