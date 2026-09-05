@@ -763,12 +763,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wakes and peer-message wake triggers are synthetic machine rows and should not
-      // interrupt navigation between human prompts (payloads themselves are assistant rows).
+      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
       if (
         message.type === "user" &&
         message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null
+        message.agentPeerMessageTrigger == null &&
+        message.contextBudgetWarning == null
       ) {
         userHistoryIds.push(message.historyId);
       }
