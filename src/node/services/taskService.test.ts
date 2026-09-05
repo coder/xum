@@ -68,7 +68,7 @@ import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/age
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   buildWorkflowRunCardMessage,
@@ -25443,6 +25443,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
+    hasPendingWorkspaceTurnContinuation.mockReturnValue(false);
     await internal.handleStreamEnd({
       type: "stream-end",
       workspaceId: "childworkspace",
@@ -28457,6 +28458,159 @@ describe("TaskService", () => {
       reasoningMode: "pro",
     });
   });
+
+  test.each([
+    ["tool-end", "report"],
+    ["turn-end", "report"],
+    ["tool-end", "canceled"],
+    ["tool-end", "failed"],
+  ] as const)(
+    "parent guidance preserves a reawakened child's execution through %s dispatch (%s)",
+    async (queueDispatchMode, outcome) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const childTaskId = "child-parent-guidance";
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project);
+        project.workspaces.push(
+          projectWorkspace(projectPath, "child", childTaskId, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            title: "Reviewer",
+          })
+        );
+        return cfg;
+      });
+      type SendArgs = Parameters<WorkspaceHost["sendMessage"]>;
+      let pendingGuidance: SendArgs | undefined;
+      let initialSend: SendArgs | undefined;
+      const sendMessage = mock(async (...args: SendArgs): Promise<Result<void>> => {
+        if (args[0] === childTaskId) {
+          if (initialSend != null) {
+            pendingGuidance = args;
+            return Ok(undefined);
+          }
+          initialSend = args;
+        }
+        await args[3]?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        hasPendingQueuedOrPreparingTurn: mock(() => pendingGuidance != null),
+        hasPendingWorkspaceTurnContinuation: mock(
+          (_workspaceId: string, metadata: unknown) =>
+            pendingGuidance != null &&
+            JSON.stringify(pendingGuidance[2]?.muxMetadata) === JSON.stringify(metadata)
+        ),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const reactivated = await taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childTaskId,
+        "Review the changes.",
+        "tool-end"
+      );
+      assert(reactivated.success && reactivated.data.delivery === "reactivated");
+      const handleId = reactivated.data.executionTaskId;
+      assert(handleId);
+      assert(initialSend);
+      const initialMetadata = initialSend[2]?.muxMetadata as MuxMessageMetadata | undefined;
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(
+          parentId,
+          childTaskId,
+          "Also check lifecycle behavior.",
+          queueDispatchMode
+        )
+      ).toEqual(Ok({ delivery: "queued", queueDispatchMode }));
+
+      // Drive the real settlement path using correlation captured at the send boundary,
+      // not a hand-authored continuation that would hide a missing metadata regression.
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "before-parent-guidance",
+        metadata: {
+          model: "anthropic:claude-sonnet-4-6",
+          finishReason: queueDispatchMode === "tool-end" ? "tool-calls" : "stop",
+          muxMetadata: initialMetadata,
+        },
+        parts: [{ type: "text", text: "Initial review" }],
+      });
+      await flushTerminalAttentionDrains(taskService);
+      expect(await workspaceTurnSnapshot(taskService, parentId, handleId)).toMatchObject({
+        status: "running",
+      });
+      const parentBeforeReport = await collectFullHistory(historyService, parentId);
+      expect(JSON.stringify(parentBeforeReport)).not.toContain("<mux_subagent_failure>");
+      expect(JSON.stringify(parentBeforeReport)).not.toContain("<mux_subagent_report>");
+
+      assert(pendingGuidance);
+      const guidance = pendingGuidance;
+      pendingGuidance = undefined;
+      if (outcome !== "report") {
+        const reason = "Guidance could not run";
+        if (outcome === "canceled") {
+          assert(guidance[3]?.onCanceled);
+          await guidance[3].onCanceled(reason);
+        } else {
+          assert(guidance[3]?.onAcceptedPreStreamFailure);
+          await guidance[3].onAcceptedPreStreamFailure({ type: "unknown", raw: reason });
+        }
+        expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
+        expect(await workspaceTurnSnapshot(taskService, parentId, handleId)).toMatchObject({
+          status: outcome === "canceled" ? "interrupted" : "error",
+          error: reason,
+        });
+        const failure: unknown = await workspaceTurnManagerFor(taskService)
+          .waitForWorkspaceTurn(handleId, {
+            requestingWorkspaceId: parentId,
+            timeoutMs: 100,
+          })
+          .then(
+            () => undefined,
+            (error: unknown) => error
+          );
+        expect(failure).toEqual(new Error(reason));
+        await flushTerminalAttentionDrains(taskService);
+        return;
+      }
+      await guidance[3]?.onAccepted?.();
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "after-parent-guidance",
+        metadata: {
+          model: "anthropic:claude-sonnet-4-6",
+          finishReason: "stop",
+          muxMetadata: guidance[2]?.muxMetadata as MuxMessageMetadata | undefined,
+        },
+        parts: [{ type: "text", text: "Reviewed changes and lifecycle behavior." }],
+      });
+      await flushTerminalAttentionDrains(taskService);
+      const execution = await taskService.getDescendantAgentTaskExecutionSnapshot(
+        parentId,
+        childTaskId
+      );
+      assert(execution);
+      expect(
+        await workspaceTurnManagerFor(taskService).waitForWorkspaceTurn(execution.record.handleId, {
+          requestingWorkspaceId: parentId,
+          ownerWorkspaceId: execution.ownerWorkspaceId,
+          timeoutMs: 100,
+        })
+      ).toMatchObject({ reportMarkdown: "Reviewed changes and lifecycle behavior." });
+      const parentHistory = JSON.stringify(await collectFullHistory(historyService, parentId));
+      expect(parentHistory).not.toContain("<mux_subagent_failure>");
+      expect(parentHistory.match(/<mux_subagent_report>/g)).toHaveLength(1);
+    }
+  );
 
   test("reactivated children can report progress while retaining their completed task status", async () => {
     const config = await createTestConfig(rootDir);
