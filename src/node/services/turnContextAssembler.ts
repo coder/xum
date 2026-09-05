@@ -67,7 +67,9 @@ export function prepareProviderRequestMessages(
   contextBoundarySlicedCount: number;
 } {
   // Workflow display rows are durable UI history, not main-agent context.
-  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
+  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages).filter(
+    (message) => !message.metadata?.contextBudgetRejected
+  );
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
     sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)

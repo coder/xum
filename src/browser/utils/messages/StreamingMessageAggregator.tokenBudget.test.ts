@@ -38,6 +38,12 @@ describe("token-budget replay", () => {
         historySequence: 6,
         contextBoundaryKind: "reset",
       }),
+      createMuxMessage("budget-continue", "user", "Continue", {
+        historySequence: 7,
+        synthetic: true,
+        uiVisible: false,
+        muxMetadata: { type: "normal", contextBudgetContinuation: true },
+      }),
     ];
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages(

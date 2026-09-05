@@ -1,6 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { OUTPUT_RESERVE_TOKENS } from "@/common/constants/contextBudget";
+import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -270,7 +270,7 @@ describe("TurnRequestBuilder assembled preflight", () => {
       if (!(error instanceof ContextBudgetExceededError)) throw error;
       expect(error.details.type).toBe("context_budget_exceeded");
       expect(error.details.model).toBe("openai:custom-context-model");
-      expect(error.details.hardCeiling).toBe(10000 - OUTPUT_RESERVE_TOKENS);
+      expect(error.details.hardCeiling).toBe(getContextBudgetHardCeiling(10000));
       expect(error.details.estimate).toBeGreaterThan(error.details.hardCeiling);
     }
   });

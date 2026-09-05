@@ -308,6 +308,7 @@ describe("session_history real disk recovery", () => {
 
   test("suppresses hidden synthetic requests, copied tails and reasoning; redacts media and nested history", async () => {
     await append("hidden", "private needle", { synthetic: true });
+    await append("rejected", "private needle", { contextBudgetRejected: true });
     await append("copy", "private needle", { rlmPreservedTailCopy: true });
     await append("compact-request", "private needle", {
       muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },

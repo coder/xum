@@ -53,25 +53,29 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
 export function buildBudgetWarningText(
   contextTokens: number,
   maxTokens: number,
-  memoryWritable: boolean
+  memoryWritable: boolean,
+  sessionHistoryAvailable: boolean
 ): string {
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
   return `Context window ~${Math.round((contextTokens / maxTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${maxTokens} tokens). ${
     memoryWritable
       ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (essential state first, at most 8 KiB), then continue the current task without commentary.`
-      : "Memory writes are unavailable for this turn. Use session_history to retrieve prior windows after rollover, and continue the current task."
+      : sessionHistoryAvailable
+        ? "Memory writes are unavailable for this turn. Use session_history to retrieve prior windows after rollover, and continue the current task."
+        : "Memory writes and history recovery are unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
   }`;
 }
 
 export function createContextBudgetWarning(
   contextTokens: number,
   maxTokens: number,
-  memoryWritable: boolean
+  memoryWritable: boolean,
+  sessionHistoryAvailable: boolean
 ): MuxMessage {
   return createMuxMessage(
     createUserMessageId(),
     "user",
-    buildBudgetWarningText(contextTokens, maxTokens, memoryWritable),
+    buildBudgetWarningText(contextTokens, maxTokens, memoryWritable, sessionHistoryAvailable),
     {
       timestamp: Date.now(),
       synthetic: true,

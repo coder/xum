@@ -4,11 +4,11 @@ import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPol
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  OUTPUT_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   estimateFreshRequestTokens,
+  getContextBudgetHardCeiling,
 } from "@/common/utils/compaction/contextBudget";
 import {
   buildLeadInText,
@@ -773,6 +773,7 @@ export class AgentSession {
   private contextBudgetGeneration = 0;
   // Unknown after restart: do not spend the window's warning on guessed permissions.
   private contextBudgetMemoryWritable: boolean | undefined;
+  private contextBudgetHistoryAvailable = false;
   private readonly onContextWindowRollover?: () => void;
   private lastSystemMessageTokens?: number;
 
@@ -2039,7 +2040,7 @@ export class AgentSession {
   }
 
   private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
-    if (message.role !== "user") {
+    if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
       return false;
     }
 
@@ -2058,6 +2059,7 @@ export class AgentSession {
     if (message.metadata?.synthetic === true) {
       return (
         message.metadata?.uiVisible === true ||
+        message.metadata.muxMetadata?.contextBudgetContinuation === true ||
         isCompactionRequestMetadata(message.metadata?.muxMetadata)
       );
     }
@@ -3774,7 +3776,10 @@ export class AgentSession {
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
-        ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
+        ...(internal?.synthetic && {
+          synthetic: true,
+          uiVisible: !typedMuxMetadata?.contextBudgetContinuation,
+        }),
       },
       additionalParts
     );
@@ -4091,14 +4096,19 @@ export class AgentSession {
       );
     }
     if (tokenBudgetActive) {
-      const batch = [
-        ...contextBudgetPrefix,
+      const requestPrelude = [
         ...(snapshotResult?.snapshotMessage ? [snapshotResult.snapshotMessage] : []),
         ...skillSnapshotMessages,
         ...mcpPromptSnapshotMessages,
         ...(internal?.preTurnMessages ?? []),
-        userMessage,
       ];
+      if (requestPrelude.length > 0) {
+        userMessage.metadata = {
+          ...userMessage.metadata,
+          requestPreludeMessageIds: requestPrelude.map((row) => row.id),
+        };
+      }
+      const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
       try {
         if (contextRollover) {
           if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -4207,6 +4217,12 @@ export class AgentSession {
         contextBudgetPrefix.length > 0 ||
         userMessage.metadata?.muxMetadata?.type === "context-budget-warning";
       this.pendingBudgetWarning = undefined;
+    }
+
+    // Rollover clears old tracking before append; register only the snapshot that
+    // actually survived into the accepted window, using the bytes already read.
+    for (const file of snapshotResult?.fileStates ?? []) {
+      await this.recordFileState(file.path, file.state);
     }
 
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
@@ -4678,6 +4694,7 @@ export class AgentSession {
     this.pendingBudgetWarning = undefined;
     this.contextBudgetWarningClaimed = false;
     this.contextBudgetMemoryWritable = undefined;
+    this.contextBudgetHistoryAvailable = false;
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY);
   }
@@ -4816,6 +4833,40 @@ export class AgentSession {
           },
         },
       };
+      // Snapshot/payload rows are part of the accepted request, not just its
+      // fixed trigger. Preserve their roles and rebind server-owned ID references.
+      const preludeIds = new Set(user.metadata?.requestPreludeMessageIds ?? []);
+      const requestPrelude = [...preludeIds].map((id) => {
+        const row = history.data.findLast((message) => message.id === id);
+        assert(row, "accepted request prelude must remain in its active window");
+        assert(
+          isSyntheticSnapshotUserMessage(row) ||
+            (row.role === "assistant" && row.metadata?.synthetic === true),
+          "request prelude must preserve snapshot or assistant provenance"
+        );
+        const newId = randomUUID();
+        continuation.parts = continuation.parts.map((part) =>
+          part.type === "text" ? { ...part, text: part.text.replaceAll(id, newId) } : part
+        );
+        const { historySequence: _preludeSequence, ...rowMetadata } = row.metadata!;
+        return {
+          ...row,
+          id: newId,
+          metadata: {
+            ...rowMetadata,
+            uiVisible: false,
+            ...(rowMetadata.mcpPromptSnapshot
+              ? {
+                  mcpPromptSnapshot: {
+                    ...rowMetadata.mcpPromptSnapshot,
+                    invokingMessageId: continuation.id,
+                  },
+                }
+              : {}),
+          },
+        };
+      });
+      continuation.metadata!.requestPreludeMessageIds = requestPrelude.map((row) => row.id);
       await this.applyContextResetSideEffects();
       if (
         this.activeStreamContext !== context ||
@@ -4831,13 +4882,18 @@ export class AgentSession {
         const snapshot = history.data.findLast(
           (row) => row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
         );
-        if (!snapshot) return [];
+        if (!snapshot || preludeIds.has(snapshot.id)) return [];
         const { historySequence: _snapshotSequence, ...snapshotMetadata } = snapshot.metadata!;
         return [
           { ...snapshot, id: createAgentSkillSnapshotMessageId(), metadata: snapshotMetadata },
         ];
       });
-      const rows = [...createRolloverPrefix(rollover), ...skillSnapshots, continuation];
+      const rows = [
+        ...createRolloverPrefix(rollover),
+        ...skillSnapshots,
+        ...requestPrelude,
+        continuation,
+      ];
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
       if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
       this.clearContextBudgetState();
@@ -4934,8 +4990,9 @@ export class AgentSession {
       attachments,
       leadIn: rollover ? buildLeadInText(rollover) : undefined,
       systemFloorTokens,
+      modelContextLimit: maxTokens,
     });
-    if (freshEstimate >= maxTokens - OUTPUT_RESERVE_TOKENS) {
+    if (freshEstimate >= getContextBudgetHardCeiling(maxTokens)) {
       return Err({
         type: "context_budget_blocked",
         message: `This message plus the system context does not fit in a fresh context window for ${options.model}; shorten it, remove attachments, or use a larger model.`,
@@ -4974,7 +5031,13 @@ export class AgentSession {
       (this.pendingBudgetWarning != null || decision.decision === "warn")
     ) {
       return Ok([
-        createContextBudgetWarning(decision.projected, maxTokens, this.contextBudgetMemoryWritable),
+        createContextBudgetWarning(
+          decision.projected,
+          maxTokens,
+          this.contextBudgetMemoryWritable,
+          this.contextBudgetHistoryAvailable &&
+            !isSessionHistoryExplicitlyDisabled(options.toolPolicy)
+        ),
       ]);
     }
     return Ok([]);
@@ -4994,6 +5057,7 @@ export class AgentSession {
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
     this.contextBudgetMemoryWritable = step.memoryWritable;
+    this.contextBudgetHistoryAvailable = step.sessionHistoryAvailable;
     const usage = createDisplayUsage(step.usage, step.model, step.providerMetadata);
     const maxTokens = getEffectiveContextLimit(
       step.model,
@@ -5044,7 +5108,10 @@ export class AgentSession {
           ...context.options,
           model: step.model,
           queueDispatchMode: "tool-end",
-          muxMetadata: context.workspaceTurnMetadata,
+          muxMetadata: {
+            ...(context.workspaceTurnMetadata ?? { type: "normal" }),
+            contextBudgetContinuation: true,
+          },
         },
         warning ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
         {
@@ -5118,6 +5185,7 @@ export class AgentSession {
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
           timestamp: Date.now(),
+          ...(rejection.type === "context_budget_blocked" ? { contextBudgetRejected: true } : {}),
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
@@ -9010,13 +9078,16 @@ export class AgentSession {
    * their content. The snapshot is persisted to history so subsequent sends don't
    * re-read the files (which would bust prompt cache if files changed).
    *
-   * Also registers file state for change detection via <system-file-update> diffs.
+   * Captures file state for registration after acceptance, so rollover cleanup
+   * cannot erase the new snapshot's <system-file-update> tracking.
    *
    * @returns The snapshot message and list of materialized mentions, or null if no mentions found
    */
-  private async materializeFileAtMentionsSnapshot(
-    messageText: string
-  ): Promise<{ snapshotMessage: MuxMessage; materializedTokens: string[] } | null> {
+  private async materializeFileAtMentionsSnapshot(messageText: string): Promise<{
+    snapshotMessage: MuxMessage;
+    materializedTokens: string[];
+    fileStates: Array<{ path: string; state: FileState }>;
+  } | null> {
     // Guard for test mocks that may not implement getWorkspaceMetadata
     if (typeof this.aiService.getWorkspaceMetadata !== "function") {
       return null;
@@ -9042,16 +9113,16 @@ export class AgentSession {
       return null;
     }
 
-    // Register file state for each successfully read file (for change detection)
+    const fileStates: Array<{ path: string; state: FileState }> = [];
     for (const mention of materialized) {
       if (
         mention.content !== undefined &&
         mention.modifiedTimeMs !== undefined &&
         mention.resolvedPath
       ) {
-        await this.recordFileState(mention.resolvedPath, {
-          content: mention.content,
-          timestamp: mention.modifiedTimeMs,
+        fileStates.push({
+          path: mention.resolvedPath,
+          state: { content: mention.content, timestamp: mention.modifiedTimeMs },
         });
       }
     }
@@ -9067,7 +9138,7 @@ export class AgentSession {
       fileAtMentionSnapshot: tokens,
     });
 
-    return { snapshotMessage, materializedTokens: tokens };
+    return { snapshotMessage, materializedTokens: tokens, fileStates };
   }
 
   private async materializeMcpPromptSnapshots(

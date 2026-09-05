@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { OUTPUT_RESERVE_TOKENS } from "@/common/constants/contextBudget";
-import { evaluateStepBudget } from "@/common/utils/compaction/contextBudget";
+import {
+  evaluateStepBudget,
+  getContextBudgetHardCeiling,
+} from "@/common/utils/compaction/contextBudget";
 import { getAutoCompactionLabel, type AutoCompactionConfig } from "./ThresholdSlider";
 
 function displayedThreshold(config: AutoCompactionConfig): number {
@@ -37,14 +39,18 @@ describe("automatic context threshold labels", () => {
   });
 
   test("the displayed rollover bound allows a smaller model's hard ceiling to win", () => {
-    const threshold = 70;
-    const modelContextLimit = OUTPUT_RESERVE_TOKENS * 2;
+    const threshold = 90;
+    const modelContextLimit = 16_384;
     const displayedPercent = displayedThreshold({
       threshold,
       rolloverEnabled: true,
       setThreshold: () => undefined,
     });
-    const evaluation = evaluateAt(OUTPUT_RESERVE_TOKENS, threshold, modelContextLimit);
+    const evaluation = evaluateAt(
+      getContextBudgetHardCeiling(modelContextLimit),
+      threshold,
+      modelContextLimit
+    );
     expect(evaluation.decision).toBe("rollover");
     expect((evaluation.projected / modelContextLimit) * 100).toBeLessThan(displayedPercent);
   });

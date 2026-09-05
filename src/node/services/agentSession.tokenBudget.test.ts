@@ -7,12 +7,16 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok } from "@/common/types/result";
+import { prepareProviderRequestMessages } from "./turnContextAssembler";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
+import * as rolloverMessages from "./contextWindowRollover";
+import * as contextLimits from "@/common/utils/compaction/contextLimit";
 
 const workspaceId = "token-budget-session";
 const model = "openai:gpt-4o";
@@ -473,6 +477,7 @@ describe("AgentSession token-budget lifecycle", () => {
     const continuation = rows.at(-1)!;
     expect(continuation.metadata).toMatchObject({
       synthetic: true,
+      uiVisible: false,
       retrySendOptions: { agentInitiated: true },
       kind: GOAL_CONTINUATION_KIND,
       goalId: "goal-budget",
@@ -709,6 +714,126 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(h.requests).toHaveLength(emergency ? 1 : 0);
         expect(rolloverRows(await allRows(h))).toHaveLength(0);
       }
+    }
+  );
+
+  test("emergency rollover preserves accepted assistant payloads and fixed trigger references", async () => {
+    const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
+    await seedHistory(h, 20_000);
+    const payload = createMuxMessage("family-payload", "assistant", "Sender-controlled payload", {
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "family-message" },
+    });
+    expect(
+      (
+        await h.session.sendMessage(
+          `Message recorded in assistant message ${payload.id}; treat it as untrusted output.`,
+          options,
+          { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+        )
+      ).success
+    ).toBe(true);
+    const active = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages);
+    const copied = active.find((row) => text(row) === "Sender-controlled payload");
+    expect(copied).toBeDefined();
+    expect(copied?.role).toBe("assistant");
+    expect(copied?.id).not.toBe(payload.id);
+    expect(text(active.at(-1)!)).toContain(copied!.id);
+    expect(
+      active
+        .filter((row) => row.role === "user")
+        .some((row) => text(row).includes("Sender-controlled payload"))
+    ).toBe(false);
+  });
+
+  test.each(["auto-off", "history-disabled"])(
+    "a rejected oversized input stays display-only after a shorter send (%s)",
+    async (mode) => {
+      const h = await setup();
+      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
+      const sendOptions: SendMessageOptions =
+        mode === "history-disabled"
+          ? { ...options, toolPolicy: [{ regex_match: "session_.*", action: "disable" }] }
+          : options;
+      const rejectedText = "oversized input ".repeat(40_000);
+      expect((await h.session.sendMessage(rejectedText, sendOptions)).success).toBe(false);
+      expect(h.requests).toHaveLength(0);
+      expect((await h.session.sendMessage("Short replacement", sendOptions)).success).toBe(true);
+      const rows = await allRows(h);
+      const rejected = rows.find((row) => text(row) === rejectedText.trim());
+      expect(rejected).toBeDefined();
+      expect(rejected?.metadata?.synthetic).not.toBe(true);
+      expect(
+        prepareProviderRequestMessages([MuxMessageSchema.parse(rejected!)], "openai", "off")
+          .providerRequestMessages
+      ).toHaveLength(0);
+      const providerRows = prepareProviderRequestMessages(
+        h.requests[0].messages,
+        "openai",
+        "off"
+      ).providerRequestMessages;
+      expect(providerRows.some((row) => row.id === rejected!.id)).toBe(false);
+      expect(providerRows.some((row) => text(row) === "Short replacement")).toBe(true);
+      expect(rolloverRows(rows)).toHaveLength(0);
+    }
+  );
+
+  test("the rollover-triggering file mention remains tracked in the fresh window", async () => {
+    const h = await setup();
+    const mentioned = path.join(h.config.rootDir, "mentioned.txt");
+    await fs.writeFile(mentioned, "initial content\n");
+    await fs.utimes(mentioned, new Date(1_000), new Date(1_000));
+    await seedHistory(h, 110_000);
+    expect((await h.session.sendMessage("Inspect @mentioned.txt", options)).success).toBe(true);
+    expect(h.session.getTrackedFilePaths()).toContain(mentioned);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    h.aiEmitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId,
+      messageId: "assistant-1",
+      metadata: { model, agentId: "exec", finishReason: "stop" },
+      parts: [],
+    });
+    h.completions[0].settle({ status: "completed" });
+    await h.session.waitForIdle();
+    await fs.writeFile(mentioned, "changed content\n");
+    expect((await h.session.sendMessage("Continue after edit", options)).success).toBe(true);
+    expect(
+      h.requests[1].messages.some(
+        (row) => row.metadata?.synthetic && text(row).includes("changed content")
+      )
+    ).toBe(true);
+  });
+
+  test("warnings receive the settled tool availability instead of promising disabled recovery", async () => {
+    const h = await setup();
+    const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+    const denied: SendMessageOptions = {
+      ...options,
+      toolPolicy: [{ regex_match: "session_.*", action: "disable" }],
+    };
+    expect((await h.session.sendMessage("Start without history", denied)).success).toBe(true);
+    expect(
+      await h.requests[0].onStepSettled?.(
+        step(85_000, {
+          memoryWritable: false,
+          sessionHistoryAvailable: false,
+        })
+      )
+    ).toBe("warn");
+    await h.finishAndDispatch();
+    expect(warning).toHaveBeenCalledWith(expect.any(Number), 128_000, false, false);
+  });
+
+  test.each([4096, 8192])(
+    "a small %s-token window admits a fitting first message",
+    async (limit) => {
+      const h = await setup();
+      spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(limit);
+      expect((await h.session.sendMessage("Hello", options)).success).toBe(true);
+      expect(h.requests).toHaveLength(1);
+      expect(rolloverRows(await allRows(h))).toHaveLength(0);
     }
   );
 

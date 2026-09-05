@@ -29,6 +29,7 @@ export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_histo
  */
 function historicalText(message: MuxMessage): string {
   if (
+    message.metadata?.contextBudgetRejected ||
     message.metadata?.muxMetadata?.type === "compaction-request" ||
     (message.metadata?.synthetic && !message.metadata.uiVisible) ||
     message.metadata?.rlmPreservedTailCopy

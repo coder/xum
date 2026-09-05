@@ -26,7 +26,7 @@ describe("context window rollover recovery", () => {
     expect(hasRolloverEligibleMessages([old])).toBe(true);
     expect(hasRolloverEligibleMessages([old, boundary])).toBe(false);
     expect(hasRolloverEligibleMessages([old, boundary, leadIn])).toBe(false);
-    const warning = createContextBudgetWarning(80_000, 128_000, true);
+    const warning = createContextBudgetWarning(80_000, 128_000, true, true);
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
     expect(
       hasRolloverEligibleMessages([
@@ -45,7 +45,11 @@ describe("context window rollover recovery", () => {
     first.metadata!.historySequence = 4;
     second.metadata!.historySequence = 12;
     expect(
-      currentContextWindowId([first, second, createContextBudgetWarning(80_000, 128_000, true)])
+      currentContextWindowId([
+        first,
+        second,
+        createContextBudgetWarning(80_000, 128_000, true, true),
+      ])
     ).toBe("w:12");
     expect(currentContextWindowId([first])).not.toBe(currentContextWindowId([second]));
   });

@@ -62,6 +62,13 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       historySequence: 5,
       timestamp: STABLE_TIMESTAMP,
     }),
+    createMuxMessage("budget-continue", "user", "Continue", {
+      historySequence: 6,
+      timestamp: STABLE_TIMESTAMP,
+      synthetic: true,
+      uiVisible: false,
+      muxMetadata: { type: "normal", contextBudgetContinuation: true },
+    }),
   ];
   return setupSimpleChatStory({
     workspaceId: WORKSPACE_ID,
@@ -69,7 +76,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {
-        historySequence: 6,
+        historySequence: 7,
         timestamp: STABLE_TIMESTAMP,
         model: MODEL,
         contextUsage: { inputTokens, outputTokens: 100 },
@@ -121,6 +128,7 @@ export const Rollover: AppStory = {
       boundary.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING
     ).not.toBe(0);
     await expect(canvas.queryByText(LEAD_IN)).not.toBeInTheDocument();
+    await expect(canvas.queryByText("Continue", { exact: true })).not.toBeInTheDocument();
     await expect(canvas.queryByText(WARNING)).not.toBeInTheDocument();
     const warning = await canvas.findByRole("button", { name: /Context budget warning/ });
     await userEvent.click(warning);

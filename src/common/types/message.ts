@@ -563,6 +563,8 @@ interface MuxMessageMetadataBase {
    */
   agentSkillRefs?: AgentSkillReference[];
   mcpPromptRefs?: MCPPromptReference[];
+  /** Internal budget control turn; retains delegation metadata without a human prompt bubble. */
+  contextBudgetContinuation?: true;
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }
@@ -804,7 +806,12 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
 /** Rollover internals do not make an otherwise empty window eligible for another reset. */
 export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
   const type = message.metadata?.muxMetadata?.type;
-  return type === "context-window-lead-in" || type === "context-budget-warning";
+  return (
+    type === "context-window-lead-in" ||
+    type === "context-budget-warning" ||
+    (message.metadata?.synthetic === true &&
+      message.metadata.muxMetadata?.contextBudgetContinuation === true)
+  );
 }
 
 export function isRolloverBoundary(message: MuxMessage): boolean {
@@ -984,6 +991,10 @@ export interface MuxMetadata {
    * Set this flag for synthetic notices that should be visible to users.
    */
   uiVisible?: boolean;
+  /** Display-only input rejected by the token-budget gate before provider submission. */
+  contextBudgetRejected?: true;
+  /** Accepted snapshots and assistant payloads that must travel with this turn on retry. */
+  requestPreludeMessageIds?: string[];
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
   error?: string; // Error message if stream failed
