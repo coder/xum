@@ -77,3 +77,16 @@ export function applyToolPolicy(
     Object.entries(tools).filter(([toolName]) => enabledToolNames.has(toolName))
   );
 }
+
+/** Recovery is baseline access, not an implicit agent allowlist capability.
+ * Only an explicit by-name rule may turn it off; rollover uses this same gate.
+ */
+export function isSessionHistoryExplicitlyDisabled(policy?: ToolPolicy): boolean {
+  let disabled = false;
+  for (const rule of policy ?? []) {
+    if (rule.regex_match.replace(/^\^/, "").replace(/\$$/, "") === "session_history") {
+      disabled = rule.action === "disable";
+    }
+  }
+  return disabled;
+}

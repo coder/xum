@@ -1,3 +1,4 @@
+import { scanHistoryFilesBounded, type BoundedHistoryScanOptions } from "./historyScanner";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
@@ -209,6 +210,40 @@ interface SubagentTranscriptDependencies {
 }
 
 export class HistoryService {
+  /** Bounded, read-only recovery browser; never nests the history write lock. */
+  scanHistoryBounded(workspaceId: string, options: BoundedHistoryScanOptions) {
+    assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
+    return this.fileLocks.withLock(workspaceId, async () => {
+      // Recovery rewrites history and takes the write lock. This read-only tool
+      // must instead fail closed while a truncate transaction is unresolved.
+      const assertNoTruncate = async () => {
+        for (const marker of [
+          this.getTruncateTransactionPath(workspaceId),
+          `${this.getChatArchivePath(workspaceId)}.truncate`,
+        ]) {
+          const exists = await fs.stat(marker).then(
+            () => true,
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+              return false;
+            }
+          );
+          if (exists) throw new Error("stale_cursor");
+        }
+      };
+      await assertNoTruncate();
+      const result = await scanHistoryFilesBounded(
+        {
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        },
+        options
+      );
+      await assertNoTruncate();
+      return result;
+    });
+  }
+
   private readonly CHAT_FILE = CHAT_FILE_NAME;
   private readonly CHAT_ARCHIVE_FILE = CHAT_ARCHIVE_FILE_NAME;
   private readonly PARTIAL_FILE = "partial.json";

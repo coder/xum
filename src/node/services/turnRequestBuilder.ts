@@ -2175,6 +2175,7 @@ export class TurnRequestBuilder {
       // Agent memory (memory experiment): per-scope write policy derived from
       // the agent class (exec-like / plan-like / read-only). Project memory is
       // host-local under xumHome, keyed by the stable project identity.
+      historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess: resolveMemoryAccessPolicy({
         planLike: agentIsPlanLike,

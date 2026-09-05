@@ -20,6 +20,7 @@ type SendMessageExperiments = SendMessageOptions["experiments"];
 
 import {
   applyToolPolicy,
+  isSessionHistoryExplicitlyDisabled,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
   type ToolPolicy,
@@ -95,6 +96,7 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   effectiveToolPolicy: ToolPolicy | undefined;
   /** PTC experiment flags. */
   experiments?: {
+    tokenBudget?: boolean;
     programmaticToolCalling?: boolean;
     /**
      * RLM mode: graduate code_execution onto the persistent per-workspace
@@ -148,6 +150,7 @@ export function resolveBackendGatedPtcExperiments(
       experiments?.programmaticToolCalling ??
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
+    tokenBudget: experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
   };
 }
 
@@ -185,6 +188,12 @@ export async function applyToolPolicyAndExperiments(
   // respects allow/deny filters. The policy-filtered tools are passed to
   // ToolBridge so the mux.* API only exposes policy-allowed tools.
   const policyFilteredTools = applyToolPolicy(grantFilteredTools, effectiveToolPolicy);
+  const historyExplicitlyDisabled = isSessionHistoryExplicitlyDisabled(effectiveToolPolicy);
+  if (experiments?.tokenBudget) {
+    if (historyExplicitlyDisabled) delete policyFilteredTools.session_history;
+    else if (grantFilteredTools.session_history)
+      policyFilteredTools.session_history = grantFilteredTools.session_history;
+  }
 
   // The bridge is built from the PRE-grant policy-filtered set: ToolBridge
   // must see grant-denied tools so it can stub them with a catchable
@@ -193,6 +202,11 @@ export async function applyToolPolicyAndExperiments(
   const policyFilteredPreGrant = opts.capabilityGrants
     ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
     : policyFilteredTools;
+  if (experiments?.tokenBudget) {
+    if (historyExplicitlyDisabled) delete policyFilteredPreGrant.session_history;
+    else if (allToolsWithExtra.session_history)
+      policyFilteredPreGrant.session_history = allToolsWithExtra.session_history;
+  }
 
   // Handle PTC experiment — replace bridgeable tools with code_execution.
   let toolsForModel = policyFilteredTools;
