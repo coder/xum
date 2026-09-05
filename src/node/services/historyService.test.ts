@@ -2283,6 +2283,32 @@ describe("HistoryService", () => {
       expect(full.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2", "boundary-1", "post-0"]);
     });
 
+    it("deduplicates verified reset copies while preserving their post-reset archive", async () => {
+      await appendNumberedMessages(service, wsId, 2);
+      await service.appendToHistory(
+        wsId,
+        createMuxMessage("manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
+      );
+      await service.appendToHistory(
+        wsId,
+        createMuxMessage("after-reset", "user", "still recoverable")
+      );
+      await service.appendToHistory(wsId, boundaryMessage("later-boundary", 1));
+      const archived = await fs.readFile(archivePath(wsId), "utf8");
+      const active = await fs.readFile(chatPath(wsId), "utf8");
+      await fs.writeFile(chatPath(wsId), archived + active);
+      const restarted = new HistoryService(config);
+      expect((await restarted.getHistoryFromLatestBoundary(wsId)).success).toBe(true);
+      expect(await fs.readFile(archivePath(wsId), "utf8")).toBe(archived);
+      expect((await collectFullHistory(restarted, wsId)).map((message) => message.id)).toEqual([
+        "msg-0",
+        "msg-1",
+        "manual-reset",
+        "after-reset",
+        "later-boundary",
+      ]);
+    });
+
     it("returns the tail across the archive seam from getLastMessages", async () => {
       await appendNumberedMessages(service, wsId, 3); // seq 0..2
       await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3

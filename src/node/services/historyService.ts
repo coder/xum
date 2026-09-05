@@ -1105,7 +1105,7 @@ export class HistoryService {
 
   /**
    * Read a history file from start to end in chunks, calling visitor with each
-   * batch of parsed messages. Uses raw byte scanning for \n to handle
+   * batch of parsed messages and the original trimmed lines. Uses raw byte scanning for \n to handle
    * multi-byte UTF-8 safely at chunk boundaries.
    *
    * Returns false when the visitor stopped iteration early, true otherwise —
@@ -1113,7 +1113,10 @@ export class HistoryService {
    */
   private async iterateForward(
     filePath: string,
-    visitor: (messages: MuxMessage[]) => boolean | void | Promise<boolean | void>
+    visitor: (
+      messages: MuxMessage[],
+      rawLines: readonly string[]
+    ) => boolean | void | Promise<boolean | void>
   ): Promise<boolean> {
     let fileSize: number;
     try {
@@ -1165,9 +1168,11 @@ export class HistoryService {
         carryoverBytes = Buffer.from(buffer.subarray(lastNewline + 1));
 
         const messages: MuxMessage[] = [];
-        for (const line of completeText.split("\n")) {
-          const trimmed = line.trim();
-          if (trimmed.length === 0) continue;
+        const rawLines = completeText
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+        for (const trimmed of rawLines) {
           try {
             messages.push(normalizeLegacyMuxMetadata(JSON.parse(trimmed) as MuxMessage));
           } catch {
@@ -1176,7 +1181,7 @@ export class HistoryService {
         }
 
         if (messages.length > 0) {
-          const shouldContinue = await visitor(messages);
+          const shouldContinue = await visitor(messages, rawLines);
           if (shouldContinue === false) return false;
         }
       }
@@ -1187,7 +1192,7 @@ export class HistoryService {
         if (line.length > 0) {
           try {
             const msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
-            const shouldContinue = await visitor([msg]);
+            const shouldContinue = await visitor([msg], [line]);
             if (shouldContinue === false) return false;
           } catch {
             // Skip malformed line
@@ -1790,8 +1795,8 @@ export class HistoryService {
    *
    * Crash safety: archived lines are fsynced before chat.jsonl is rewritten, so
    * a crash in between leaves duplicated rows in archive + chat.jsonl. The next
-   * rotation deduplicates by skipping prefix rows whose historySequence is
-   * already covered by the archive.
+   * rotation deduplicates sequence-covered prefix rows only after verifying
+   * that the archive contains the same complete row identity.
    */
   private async rotateSealedHistoryUnlocked(workspaceId: string): Promise<void> {
     const chatPath = this.getChatHistoryPath(workspaceId);
@@ -1806,26 +1811,44 @@ export class HistoryService {
     const sealedPrefix = fileBuffer.subarray(0, boundaryOffset).toString("utf-8");
     const activeTail = fileBuffer.subarray(boundaryOffset);
 
-    // Crash-replay dedupe: find the newest sequence already archived.
+    // Sequence coverage only identifies possible crash-replay copies. A repaired
+    // row (especially a reset) may reuse an old sequence without being archived.
     const archivedMaxSequence = await this.getArchiveTailMaxSequence(workspaceId);
-
-    const linesToArchive: string[] = [];
-    for (const line of sealedPrefix.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed.length === 0) {
-        continue;
-      }
-      try {
-        const message = JSON.parse(trimmed) as MuxMessage;
-        const sequence = message.metadata?.historySequence;
-        if (isNonNegativeInteger(sequence) && sequence <= archivedMaxSequence) {
-          continue; // Already archived by a rotation that crashed before the chat rewrite.
+    const candidates = new Set<string>();
+    // Parsed equality loses duplicate-key reset markers. Verify the original
+    // row bytes (trimmed consistently with rotation), never a reserialization.
+    const fingerprint = (line: string) => createHash("sha256").update(line).digest("hex");
+    const prefixRows = sealedPrefix
+      .split("\n")
+      .flatMap<{ line: string; fingerprint: string | undefined }>((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return [];
+        try {
+          const message = JSON.parse(trimmed) as MuxMessage;
+          const sequence = message.metadata?.historySequence;
+          if (isNonNegativeInteger(sequence) && sequence <= archivedMaxSequence) {
+            const key = fingerprint(trimmed);
+            candidates.add(key);
+            return [{ line: trimmed, fingerprint: key }];
+          }
+        } catch {
+          // Preserve malformed fragments verbatim apart from surrounding whitespace.
         }
-      } catch {
-        // Malformed line — preserve it in the archive (read paths skip it anyway).
-      }
-      linesToArchive.push(trimmed);
+        return [{ line: trimmed, fingerprint: undefined }];
+      });
+    const verifiedCopies = new Set<string>();
+    if (candidates.size > 0) {
+      await this.iterateForward(archivePath, (_messages, rawLines) => {
+        for (const line of rawLines) {
+          const key = fingerprint(line);
+          if (candidates.delete(key)) verifiedCopies.add(key);
+        }
+        return candidates.size > 0;
+      });
     }
+    const linesToArchive = prefixRows
+      .filter((row) => row.fingerprint === undefined || !verifiedCopies.has(row.fingerprint))
+      .map((row) => row.line);
 
     if (linesToArchive.length > 0) {
       // Append + fsync BEFORE rewriting chat.jsonl: a crash must never lose

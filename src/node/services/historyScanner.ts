@@ -21,12 +21,17 @@ import {
   type HistorySnapshot,
 } from "./historyCursor";
 
+function compactResetProbe(text: string): string {
+  // Corruption may insert raw or escaped control separators where JSON permits
+  // whitespace. Remove them before retaining overlap, including long runs.
+  return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\u00(?:[0189][\da-f]|20|7f)/gi, "");
+}
+
 function hasRawResetMarker(text: string): boolean {
-  const decoded = text
-    .replace(/[ \t\r\n]/g, "")
-    .replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
-      String.fromCharCode(Number.parseInt(hex, 16))
-    );
+  const decoded = compactResetProbe(text).replace(
+    /\\u([\da-fA-F]{4})/g,
+    (_match: string, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))
+  );
   return decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
 }
 
@@ -279,8 +284,8 @@ export async function scanHistoryFilesBounded(
           // Keep raw overlap large enough for a fully Unicode-escaped marker.
           // Decode only this chunk plus overlap, so split escapes survive both
           // reverse/forward chunk edges and page boundaries without line buffering.
-          const compact = segment.toString("latin1").replace(/[ \t\r\n]/g, "");
-          const probe = reverse ? compact + resetProbe : resetProbe + compact;
+          const raw = segment.toString("latin1");
+          const probe = compactResetProbe(reverse ? raw + resetProbe : resetProbe + raw);
           possibleReset ||= hasRawResetMarker(probe);
           resetProbe = reverse
             ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)

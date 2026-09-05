@@ -774,6 +774,165 @@ describe("session_history real disk recovery", () => {
     ).toEqual(["opening facts"]);
   });
 
+  for (const separator of [
+    String.fromCharCode(0),
+    String.fromCharCode(11),
+    String.fromCharCode(12),
+    String.fromCharCode(31),
+    String.fromCharCode(127),
+    "\\u0000",
+  ]) {
+    test(`control separator ${separator.charCodeAt(0)} cannot hide a reset in initial or appended scans`, async () => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      const marker = `"contextBoundaryKind"${separator}:${separator}"reset"`;
+      await fs.appendFile(
+        chatPath,
+        `{"id":"control-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n` +
+          JSON.stringify(createMuxMessage("public", "assistant", "public facts")) +
+          "\n"
+      );
+      expect(
+        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
+      ).toBe("stale_cursor");
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    });
+  }
+
+  test.each([String.fromCharCode(0), "\\u0000"])(
+    "oversized control separators retain a bounded reset probe across pages",
+    async (separator) => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      const marker =
+        '"contextBoundaryKind"' +
+        separator.repeat(Math.ceil(SESSION_HISTORY_MAX_SCAN_BYTES / separator.length)) +
+        ':"' +
+        unicodeEscapes("reset") +
+        '"';
+      await fs.appendFile(
+        chatPath,
+        `{"id":"giant-control-reset","role":"assistant","parts":[],"metadata":{${marker}},"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`
+      );
+      let cursor = first.nextCursor;
+      let result: SessionHistoryResult;
+      let pageCount = 0;
+      do {
+        result = await call({ action: "search", query: "facts", cursor });
+        if (result.success) {
+          expect(result.items).toEqual([]);
+          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+        }
+        cursor = result.nextCursor;
+        expect(++pageCount).toBeLessThan(10);
+      } while (cursor);
+      expect(result.error).toBe("stale_cursor");
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    }
+  );
+
+  test("rotation does not normalize away raw reset evidence in a sequence-covered row", async () => {
+    await append("private", "private facts");
+    await append("sealed-boundary", "summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const original = (await fs.readFile(archivePath, "utf8")).split("\n")[0];
+    const repaired = original.replace(
+      '"metadata":',
+      '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
+    );
+    await fs.appendFile(chatPath, repaired + "\n");
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createRolloverPrefix(validRollover)[0]
+    );
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  for (const mode of ["append", "batch", "lazy", "update"] as const) {
+    test(`${mode} rotation preserves a manual reset below the archive sequence watermark`, async () => {
+      await append("private", "private facts");
+      await append("sealed-boundary", "summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      const reset = createMuxMessage(
+        mode === "batch" ? "first" : "repaired-reset",
+        "assistant",
+        "",
+        {
+          contextBoundaryKind: "reset",
+          historySequence: 0,
+        }
+      );
+      await fs.appendFile(chatPath, JSON.stringify(reset) + "\n");
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+      const [boundary, leadIn] = createRolloverPrefix(validRollover);
+      if (mode === "append") await fixture.historyService.appendToHistory(workspaceId, boundary);
+      else if (mode === "batch")
+        await fixture.historyService.appendManyToHistory(workspaceId, [boundary, leadIn]);
+      else if (mode === "lazy") {
+        boundary.metadata = { ...boundary.metadata, historySequence: 3 };
+        await fs.appendFile(chatPath, JSON.stringify(boundary) + "\n");
+        expect(
+          (await fixture.historyService.getHistoryFromLatestBoundary(workspaceId)).success
+        ).toBe(true);
+      } else {
+        const pending = await append("pending-boundary", "pending");
+        expect(
+          (
+            await fixture.historyService.updateHistory(workspaceId, {
+              ...boundary,
+              id: pending.id,
+              metadata: {
+                ...boundary.metadata,
+                historySequence: pending.metadata!.historySequence,
+              },
+            })
+          ).success
+        ).toBe(true);
+      }
+      await append("public-after-rotation", "public facts");
+      const archivedRows = (await fs.readFile(archivePath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as MuxMessage);
+      expect(
+        archivedRows.find(
+          (row) => row.id === reset.id && row.metadata?.contextBoundaryKind === "reset"
+        )
+      ).toMatchObject(reset);
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    });
+  }
+
   const fragmentedResetMarkers = [
     { name: "after the key", marker: '"contextBoundaryKind"\n:"reset"' },
     { name: "after the colon", marker: '"contextBoundaryKind":\n"reset"' },
