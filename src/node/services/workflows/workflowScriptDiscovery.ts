@@ -11,6 +11,7 @@ import { log } from "@/node/services/log";
 
 import { buildWorkflowScriptDescriptor } from "./WorkflowService";
 import { parseWorkflowMetadata, summarizeWorkflowArgs } from "./workflowMetadata";
+import { resolveWorkflowPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowPlugins, resolveWorkflowScript } from "./workflowScriptResolver";
 
 /** Conventional entry file for a workflow-bearing skill (e.g. deep-research). */
@@ -91,10 +92,21 @@ export async function discoverWorkflowScripts(
         includeAgentPlugins: input.includeAgentPlugins,
         skillStorageContext: input.skillStorageContext,
       });
+      const descriptor = buildWorkflowScriptDescriptor(resolved);
+      // Pre-run phase preview. An invalid meta.phases declaration must not hide
+      // the script from the launcher: surface a warning instead (run creation
+      // rejects with the same enumerated issues).
+      const manifestOutcome = resolveWorkflowPhaseManifest(resolved.source, resolved.sourceHash);
+      if (manifestOutcome.kind === "manifest") {
+        descriptor.phaseManifest = manifestOutcome.manifest;
+      }
       available.push({
-        descriptor: buildWorkflowScriptDescriptor(resolved),
+        descriptor,
         scriptPath: resolved.canonicalScriptPath,
         args: summarizeWorkflowArgs(parseWorkflowMetadata(resolved.source)) ?? [],
+        ...(manifestOutcome.kind === "invalid"
+          ? { phaseManifestWarning: manifestOutcome.warning }
+          : {}),
       });
     } catch {
       // Skip non-workflow skills (no workflow.js), untrusted project skills, AND scripts whose

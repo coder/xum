@@ -55,6 +55,8 @@ import {
   registerInProcessWorkflowRun,
 } from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
+import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
+import { hydrateWorkflowRunPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
 import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
@@ -206,7 +208,9 @@ export class WorkflowService {
           }
         })
     );
-    return runs.filter((run): run is WorkflowRunRecord => run != null);
+    return runs
+      .filter((run): run is WorkflowRunRecord => run != null)
+      .map(hydrateWorkflowRunPhaseManifest);
   }
 
   async resumeCrashedRuns(input: {
@@ -241,7 +245,10 @@ export class WorkflowService {
     assert(input.runId.length > 0, "WorkflowService.getRun: runId is required");
     try {
       const run = await this.runStore.getRun(input.runId);
-      return run.workspaceId === input.workspaceId ? run : null;
+      // Hydrate here, not only in the oRPC wrappers: workflow_run/workflow_resume
+      // embed this record in persisted tool output, and a reloaded terminal card
+      // renders that snapshot without any live fetch.
+      return run.workspaceId === input.workspaceId ? hydrateWorkflowRunPhaseManifest(run) : null;
     } catch {
       return null;
     }
@@ -743,6 +750,9 @@ export class WorkflowService {
     const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
     });
+    // Fail fast on invalid meta.phases before the durable run record exists,
+    // mirroring argsSchema validation above (all issues enumerated at once).
+    parseDeclaredPhasesFromSource(input.script.source);
     return await this.runStore.createRun({
       id: runId,
       workspaceId: input.workspaceId,
@@ -901,6 +911,8 @@ export class WorkflowService {
     );
     const script = await resolveScript(input.spec.scriptPath);
     const normalized = normalizeWorkflowArgsForSource(script.source, input.spec.args);
+    // Same fail-fast declared-phase gate as top-level run creation.
+    parseDeclaredPhasesFromSource(script.source);
     return await this.runStore.createRunIfAbsent({
       id: childRunId,
       workspaceId: parentRun.workspaceId,
@@ -1115,7 +1127,7 @@ export async function resolveWorkflowContext(
 export async function listWorkflowRuns(context: WorkflowServiceContext, workspaceId: string) {
   const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
   await service.resumeCrashedRuns({ workspaceId, projectTrusted });
-  return service.listRuns({ workspaceId });
+  return await service.listRuns({ workspaceId });
 }
 
 export async function getWorkflowRun(
@@ -1123,7 +1135,7 @@ export async function getWorkflowRun(
   input: { workspaceId: string; runId: string }
 ) {
   const { service } = await resolveWorkflowContext(context, input.workspaceId);
-  return service.getRun(input);
+  return await service.getRun(input);
 }
 
 export async function interruptWorkflowRun(
@@ -1131,7 +1143,10 @@ export async function interruptWorkflowRun(
   input: { workspaceId: string; runId: string }
 ) {
   const { service } = await resolveWorkflowContext(context, input.workspaceId);
-  return service.interruptRun(input);
+  // The tool card installs this response as its newest snapshot; it ties with the
+  // hydrated subscription update on updatedAt/sequence, so an unhydrated record
+  // here would win the tie and drop the phase rail from the interrupted card.
+  return hydrateWorkflowRunPhaseManifest(await service.interruptRun(input));
 }
 
 export async function getWorkflowRunStatuses(
@@ -1164,7 +1179,8 @@ export function subscribeWorkflowRuns(
     },
     subscribe: (push) =>
       workflowRunStreamHub.subscribe(workspaceId, (run) => {
-        if (run.parentWorkflow == null) push({ type: "run-changed", run });
+        if (run.parentWorkflow == null)
+          push({ type: "run-changed", run: hydrateWorkflowRunPhaseManifest(run) });
       }),
     initial: async () => ({
       type: "snapshot" as const,

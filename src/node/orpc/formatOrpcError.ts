@@ -4,6 +4,7 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { inspect } from "node:util";
 import { DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE } from "@/node/services/workflows/WorkflowService";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
+import { WorkflowDeclaredPhasesValidationError } from "@/node/services/workflows/workflowMetadata";
 
 export interface FormattedOrpcError {
   /**
@@ -404,6 +405,7 @@ export function formatOrpcError(error: unknown, interceptorOptions?: unknown): F
 export function throwWorkflowOrpcError(error: unknown): never {
   if (
     error instanceof WorkflowArgsValidationError ||
+    error instanceof WorkflowDeclaredPhasesValidationError ||
     (error instanceof Error && error.message === DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE)
   ) {
     throw new ORPCError("BAD_REQUEST", { message: error.message });

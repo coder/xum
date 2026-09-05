@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/require-await */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -970,6 +970,8 @@ describe("WorkflowRunToolCall", () => {
                 sourceKind: "skill",
                 sourceHash: "sha256:parent",
                 executable: true,
+                // Server-shaped record: already hydrated (none derivable).
+                phaseManifest: null,
               },
               source: "export default function workflow() { return null; }",
               sourceHash: "sha256:parent",
@@ -2078,6 +2080,196 @@ describe("WorkflowRunToolCall", () => {
     expect(view.getByText(/Inline workflow received ok/)).toBeTruthy();
   });
 
+  test("hydrates the phase rail once for pre-upgrade snapshots that embed source without a manifest", async () => {
+    // Persisted by a build before phase manifests existed: terminal, has `source`,
+    // no `workflow.phaseManifest`. Terminal cards never subscribe, so without a
+    // one-shot fetch the declared rail would never appear after upgrading.
+    const source =
+      'export const meta = { phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }] };\n' +
+      'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n';
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source,
+      sourceHash: "sha256:pre-upgrade",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }],
+        },
+      },
+    };
+    const getRun = mock(async () => hydrated);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: legacySnapshot.id,
+                result: { reportMarkdown: "ok" },
+                run: legacySnapshot,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        runId: legacySnapshot.id,
+      })
+    );
+    // The declared-but-unvisited phase exists only on the hydrated rail.
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+
+    // Collapsing and re-expanding must not refetch: hydration is attempted once per run.
+    fireEvent.click(getWorkflowHeader(view));
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+    expect(getRun).toHaveBeenCalledTimes(1);
+  });
+
+  test("retries pre-upgrade manifest hydration on the next expand after a failed fetch", async () => {
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade_retry",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source:
+        'export const meta = { phases: [{ name: "scope" }, { name: "later", label: "Later phase" }] };\n' +
+        'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:pre-upgrade-retry",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "later", label: "Later phase" }],
+        },
+      },
+    };
+    let calls = 0;
+    const getRun = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("transient");
+      }
+      return hydrated;
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const view = render(
+        <APIHarness client={{ workflows: { getRun } }}>
+          <ThemeProvider forcedTheme="dark">
+            <TooltipProvider>
+              <WorkflowRunToolCall
+                args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+                status="completed"
+                result={{
+                  status: "completed",
+                  runId: legacySnapshot.id,
+                  result: { reportMarkdown: "ok" },
+                  run: legacySnapshot,
+                }}
+                workspaceId={TEST_WORKSPACE_ID}
+              />
+            </TooltipProvider>
+          </ThemeProvider>
+        </APIHarness>
+      );
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(calls).toBe(1));
+      expect(view.queryByText("Later phase")).toBeNull();
+      // A failed attempt must not retire the fetch: collapsing and re-expanding retries.
+      fireEvent.click(getWorkflowHeader(view));
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(view.getByText("Later phase")).toBeTruthy());
+      expect(calls).toBe(2);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("does not fetch for snapshots already hydrated to an explicit null manifest", async () => {
+    const hydratedNone: WorkflowRunRecord = {
+      id: "wfr_hydrated_none",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: {
+        name: "plain",
+        description: "Plain",
+        scope: "project",
+        executable: true,
+        phaseManifest: null,
+      },
+      source: 'export default function workflow() { return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:hydrated-none",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const getRun = mock(async () => hydratedNone);
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/plain.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: hydratedNone.id,
+                result: { reportMarkdown: "ok" },
+                run: hydratedNone,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Script source")).toBeTruthy());
+    expect(getRun).not.toHaveBeenCalled();
+  });
+
   test("renders attached foreground workflow runs without heuristic discovery", async () => {
     const attachedRun = {
       id: "wfr_attached",
@@ -3010,6 +3202,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:action-ordered",
@@ -3956,6 +4150,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -4076,6 +4272,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -4401,6 +4599,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:test",
@@ -4459,6 +4659,8 @@ describe("WorkflowRunToolCall", () => {
                     description: "Deep research",
                     scope: "built-in",
                     executable: true,
+                    // Server-shaped record: already hydrated (none derivable).
+                    phaseManifest: null,
                   },
                   source: "export default function workflow() { return null; }",
                   sourceHash: "sha256:test",

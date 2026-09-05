@@ -863,6 +863,10 @@ export const WorkflowProgressPhaseSummarySchema = z
   .object({
     name: z.string().min(1),
     at: z.string(),
+    // Present only when the workflow declares meta.phases AND the latest phase
+    // matches a declared name ("phase 2/5"); dynamic phases fall back to name-only.
+    phaseIndex: z.number().int().positive().optional(),
+    declaredPhaseCount: z.number().int().positive().optional(),
   })
   .strict();
 
