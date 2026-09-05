@@ -2,6 +2,7 @@ import React, { useRef } from "react";
 import {
   AUTO_COMPACTION_THRESHOLD_MIN,
   AUTO_COMPACTION_THRESHOLD_MAX,
+  FORCE_COMPACTION_BUFFER_PERCENT,
 } from "@/common/constants/ui";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 
@@ -61,8 +62,9 @@ const applyThreshold = (pct: number, setThreshold: (v: number) => void): void =>
 /** Share the effective automatic policy label between the meter and its settings. */
 export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
   if (config.rolloverEnabled) {
+    // Match the evaluator's force threshold; "by" allows the hard ceiling to win earlier.
     return config.threshold < DISABLE_THRESHOLD
-      ? `Rolls over at ${config.threshold}%`
+      ? `Rolls over by ${config.threshold + FORCE_COMPACTION_BUFFER_PERCENT}%`
       : "Automatic rollover disabled";
   }
   return config.threshold < DISABLE_THRESHOLD

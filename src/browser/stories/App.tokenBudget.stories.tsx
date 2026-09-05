@@ -174,7 +174,7 @@ export const ContextSettings: AppStory = {
     await userEvent.click(button);
     const page = within(canvasElement.ownerDocument.body);
     const dialog = await page.findByRole("dialog");
-    await expect(within(dialog).getByText(/Rolls over at 70%/)).toBeVisible();
+    await expect(within(dialog).getByText(/Rolls over by 75%/)).toBeVisible();
     await expect(within(dialog).getByText("Idle compaction", { exact: true })).toBeVisible();
     await expect(within(dialog).getByText("/compact", { exact: true })).toBeVisible();
   },

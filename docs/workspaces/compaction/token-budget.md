@@ -7,7 +7,7 @@ Enable **Token-budget context windows** in **Settings → Experiments** to repla
 
 ## Threshold and precedence
 
-Use the existing context-usage slider to choose the per-model threshold. When rollover is active, it reads **Rolls over at N%**. Automatic rollover is evaluated when sending and after a settled tool step, using a force threshold **five percentage points above** the slider setting; the hard request ceiling takes precedence if reached first. Rollover starts a fresh window without summarizing earlier messages. The transcript shows a **Context window rollover** divider; earlier messages remain on disk, in the UI, and in exports.
+Use the existing context-usage slider to choose the per-model threshold. The **Rolls over by N%** label includes the five-percentage-point force buffer: a 70% slider setting displays **Rolls over by 75%**. Automatic rollover is evaluated when sending and after a settled tool step. The displayed percentage is an upper bound; the hard request ceiling takes precedence if reached first. Rollover starts a fresh window without summarizing earlier messages. The transcript shows a **Context window rollover** divider; earlier messages remain on disk, in the UI, and in exports.
 
 - Manual `/compact` and idle compaction still summarize normally.
 - Continuous compaction and effective RLM take precedence over rollover.
