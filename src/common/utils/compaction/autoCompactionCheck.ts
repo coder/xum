@@ -41,6 +41,9 @@ export interface AutoCompactionCheckResult {
   /** Current usage percentage - live when streaming, otherwise last completed */
   usagePercentage: number;
   thresholdPercentage: number;
+  contextTokens: number;
+  /** Undefined means the model limit is unknown, never unlimited. */
+  maxTokens: number | undefined;
 }
 
 /**
@@ -56,7 +59,7 @@ export interface AutoCompactionUsageState {
 }
 
 // Show warning this many percentage points before threshold
-const WARNING_ADVANCE_PERCENT = 10;
+export const WARNING_ADVANCE_PERCENT = 10;
 
 /**
  * Check if auto-compaction should trigger based on token usage
@@ -84,6 +87,12 @@ export function checkAutoCompaction(
   const thresholdPercentage = threshold * 100;
   const isEnabled = threshold < 1.0;
 
+  const currentUsage = usage?.liveUsage ?? usage?.lastContextUsage;
+  const contextTokens = currentUsage ? getContextTokens(currentUsage) : 0;
+  const maxTokens = model
+    ? (getEffectiveContextLimit(model, use1M, providersConfig) ?? undefined)
+    : undefined;
+
   // Short-circuit if auto-compaction is disabled or missing required data
   if (!isEnabled || !model || !usage) {
     return {
@@ -91,11 +100,10 @@ export function checkAutoCompaction(
       shouldForceCompact: false,
       usagePercentage: 0,
       thresholdPercentage,
+      contextTokens,
+      maxTokens,
     };
   }
-
-  // Determine max tokens for this model
-  const maxTokens = getEffectiveContextLimit(model, use1M, providersConfig);
 
   // No max tokens known - safe default (can't calculate percentage)
   if (!maxTokens) {
@@ -104,12 +112,13 @@ export function checkAutoCompaction(
       shouldForceCompact: false,
       usagePercentage: 0,
       thresholdPercentage,
+      contextTokens,
+      maxTokens,
     };
   }
 
   // Current usage: live when streaming, else last completed
   const lastUsage = usage.lastContextUsage;
-  const currentUsage = usage.liveUsage ?? lastUsage;
 
   // Usage percentage from current context (live when streaming, otherwise last completed)
   const usagePercentage = currentUsage ? (getContextTokens(currentUsage) / maxTokens) * 100 : 0;
@@ -129,5 +138,7 @@ export function checkAutoCompaction(
     shouldForceCompact,
     usagePercentage,
     thresholdPercentage,
+    contextTokens,
+    maxTokens,
   };
 }

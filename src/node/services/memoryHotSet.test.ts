@@ -76,6 +76,87 @@ describe("rankHotSetCandidates", () => {
   });
 });
 
+describe("reserved context notes", () => {
+  const notesPath = "/memories/workspace/context-notes.md";
+  const countTokens = (text: string) => Promise.resolve(Math.ceil(text.length / 3.5));
+
+  it("reserves one of eight slots ahead of more than eight pins without mutating candidates", async () => {
+    const candidates = Array.from({ length: 10 }, (_, index) =>
+      candidate({ path: `/memories/global/pin-${index}.md`, pinned: true })
+    );
+    candidates.push(candidate({ path: notesPath }));
+    const original = structuredClone(candidates);
+    const items = await selectHotMemories({
+      candidates,
+      readFile: () => Promise.resolve("facts"),
+      countTokens,
+      now: NOW,
+    });
+    expect(items).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS);
+    expect(items[0]).toMatchObject({
+      path: notesPath,
+      pinned: false,
+      content: "facts",
+      truncated: false,
+    });
+    expect(items.slice(1)).toHaveLength(7);
+    expect(candidates).toEqual(original);
+  });
+
+  it.each(["x".repeat(30_000), "界😀".repeat(8_000)])(
+    "bounds the rendered excerpt including its truncation marker",
+    async (content) => {
+      const items = await selectHotMemories({
+        candidates: [candidate({ path: notesPath })],
+        readFile: () => Promise.resolve(content),
+        countTokens,
+      });
+      expect(items).toHaveLength(1);
+      expect(items[0].truncated).toBe(true);
+      expect(content.startsWith(items[0].content)).toBe(true);
+      expect(items[0].content).not.toContain("\uFFFD");
+      const renderedFile = /<memory_file[\s\S]*<\/memory_file>/.exec(
+        formatHotMemoriesBlock(items)
+      )![0];
+      expect(renderedFile).toContain("[truncated:");
+      expect(Buffer.byteLength(renderedFile)).toBeLessThanOrEqual(8 * 1024);
+      expect(await countTokens(renderedFile)).toBeLessThanOrEqual(2000);
+    }
+  );
+
+  it("keeps the reserved excerpt within smaller shared byte and token budgets", async () => {
+    const items = await selectHotMemories({
+      candidates: [
+        candidate({ path: notesPath }),
+        candidate({ path: "/memories/global/pinned.md", pinned: true }),
+      ],
+      readFile: () => Promise.resolve("x".repeat(20_000)),
+      countTokens,
+      maxTotalBytes: 1000,
+      maxTotalTokens: 200,
+    });
+    expect(items[0]?.path).toBe(notesPath);
+    expect(await countTokens(formatHotMemoriesBlock(items))).toBeLessThanOrEqual(200);
+    expect(
+      items.reduce((sum, item) => sum + Buffer.byteLength(item.content), 0)
+    ).toBeLessThanOrEqual(1000);
+  });
+
+  it("does not reserve an absent global convention or attempt reads when no candidate exists", async () => {
+    const reads: string[] = [];
+    const items = await selectHotMemories({
+      candidates: [candidate({ path: "/memories/global/context-notes.md" })],
+      readFile: (path) => {
+        reads.push(path);
+        return Promise.resolve("facts");
+      },
+      countTokens,
+    });
+    expect(items).toEqual([]);
+    expect(reads).toEqual([]);
+  });
+});
+
 describe("selectHotMemories", () => {
   it("reads ranked candidates and returns their contents", async () => {
     const items = await selectHotMemories({

@@ -91,6 +91,9 @@ async function buildSystemContextForTest(args: {
   effectiveAdditionalInstructions?: string;
   planFilePath?: string;
   memoryToolAvailable?: boolean;
+  tokenBudgetEnabled?: boolean;
+  workspaceMemoryWritable?: boolean;
+  hotMemoriesBlock?: string;
   intuitionToolAvailable?: boolean;
 }) {
   return buildStreamSystemContext({
@@ -110,6 +113,9 @@ async function buildSystemContextForTest(args: {
     providersConfig: null,
     mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
+    tokenBudgetEnabled: args.tokenBudgetEnabled,
+    workspaceMemoryWritable: args.workspaceMemoryWritable,
+    hotMemoriesBlock: args.hotMemoriesBlock,
     intuitionToolAvailable: args.intuitionToolAvailable,
   });
 }
@@ -582,6 +588,50 @@ describe("buildStreamSystemContext", () => {
     // not steer the agent toward a tool the toolset does not have.
     const withoutMemory = await buildSystemContextForTest(buildArgs);
     expect(withoutMemory.systemMessage).not.toContain("<memory-tool-guidance>");
+    const notesBlock = "<hot_memories>preloaded notebook evidence</hot_memories>";
+    const writableNotes = await buildSystemContextForTest({
+      ...buildArgs,
+      memoryToolAvailable: true,
+      tokenBudgetEnabled: true,
+      workspaceMemoryWritable: true,
+      hotMemoriesBlock: notesBlock,
+    });
+    const readOnlyNotes = await buildSystemContextForTest({
+      ...buildArgs,
+      memoryToolAvailable: true,
+      tokenBudgetEnabled: true,
+      workspaceMemoryWritable: false,
+      hotMemoriesBlock: notesBlock,
+    });
+    const notesSection = (text: string) =>
+      text.split("<context-notes-guidance>")[1]?.split("</context-notes-guidance>")[0];
+    expect(notesSection(writableNotes.systemMessage)).toBeDefined();
+    expect(notesSection(readOnlyNotes.systemMessage)).toBeDefined();
+    expect(notesSection(readOnlyNotes.systemMessage)).not.toBe(
+      notesSection(writableNotes.systemMessage)
+    );
+    expect(memorySection(readOnlyNotes.systemMessage)).not.toEqual(
+      memorySection(writableNotes.systemMessage)
+    );
+    expect(readOnlyNotes.systemMessage).toContain(notesBlock);
+    expect(writableNotes.systemMessage).toContain(notesBlock);
+    expect(notesSection(withMemory.systemMessage)).toBeUndefined();
+    const deniedNotes = await buildSystemContextForTest({
+      ...buildArgs,
+      memoryToolAvailable: false,
+      tokenBudgetEnabled: true,
+      workspaceMemoryWritable: true,
+      hotMemoriesBlock: notesBlock,
+    });
+    expect(notesSection(deniedNotes.systemMessage)).toBeUndefined();
+    expect(deniedNotes.systemMessage).not.toContain(notesBlock);
+    for (const systemMessage of [readOnlyNotes.systemMessage, writableNotes.systemMessage]) {
+      const filtered = removeIntuitionGuidance(systemMessage + pluginContext, false, notesBlock);
+      expect(filtered).not.toContain(notesBlock);
+      expect(notesSection(filtered)).toBeUndefined();
+      expect(filtered).not.toContain("<memory-tool-guidance>");
+      expect(filtered).toContain(pluginContext);
+    }
   });
 
   test("uses the resolved agent discovery runtime for parent-only subagent prompts", async () => {
