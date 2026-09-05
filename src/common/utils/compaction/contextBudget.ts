@@ -5,6 +5,8 @@ import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFil
 import assert from "@/common/utils/assert";
 import {
   IMAGE_TOKEN_ESTIMATE,
+  MAX_OUTPUT_RESERVE_CONTEXT_RATIO,
+  MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_RESERVE_TOKENS,
@@ -14,6 +16,21 @@ import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchem
 
 export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
 
+/** Keep output headroom without making supported small context windows unusable. */
+export function getContextBudgetHardCeiling(modelContextLimit: number): number {
+  assert(
+    Number.isFinite(modelContextLimit) && modelContextLimit > 0,
+    "Context budget requires a finite positive model context limit"
+  );
+  return (
+    modelContextLimit -
+    Math.min(
+      OUTPUT_RESERVE_TOKENS,
+      Math.floor(modelContextLimit * MAX_OUTPUT_RESERVE_CONTEXT_RATIO)
+    )
+  );
+}
+
 /** Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
 export function checkAssembledRequestBudget(
   payload: Parameters<typeof estimateAssembledRequestTokens>[0],
@@ -21,7 +38,7 @@ export function checkAssembledRequestBudget(
 ): ContextBudgetExceeded | undefined {
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
-  const hardCeiling = limit - OUTPUT_RESERVE_TOKENS;
+  const hardCeiling = getContextBudgetHardCeiling(limit);
   const estimate = estimateAssembledRequestTokens(payload);
   return estimate > hardCeiling
     ? { type: "context_budget_exceeded", model: options.model, estimate, hardCeiling }
@@ -67,7 +84,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   const limit = input.modelContextLimit;
   const hardCeiling =
     limit != null && Number.isFinite(limit) && limit > 0
-      ? limit - OUTPUT_RESERVE_TOKENS
+      ? getContextBudgetHardCeiling(limit)
       : undefined;
   const result: StepBudgetEvaluation = {
     decision: "continue",
@@ -170,8 +187,24 @@ export function estimateFreshRequestTokens(input: {
   attachments?: readonly unknown[];
   leadIn?: string;
   systemFloorTokens?: number;
+  modelContextLimit?: number;
 }): number {
-  const systemFloorTokens = input.systemFloorTokens ?? SYSTEM_FLOOR_TOKENS_ESTIMATE;
+  if (input.modelContextLimit != null) {
+    assert(
+      Number.isFinite(input.modelContextLimit) && input.modelContextLimit > 0,
+      "Fresh request estimation requires a finite positive model context limit"
+    );
+  }
+  // Unknown system/schema overhead must leave room for a small model's request.
+  // A supplied measured floor is authoritative; final assembly still checks everything.
+  const fallbackSystemFloor =
+    input.modelContextLimit == null
+      ? SYSTEM_FLOOR_TOKENS_ESTIMATE
+      : Math.min(
+          SYSTEM_FLOOR_TOKENS_ESTIMATE,
+          Math.floor(input.modelContextLimit * MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO)
+        );
+  const systemFloorTokens = input.systemFloorTokens ?? fallbackSystemFloor;
   assert(
     Number.isFinite(systemFloorTokens) && systemFloorTokens >= 0,
     "System token floor must be finite and nonnegative"

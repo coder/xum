@@ -8,6 +8,7 @@ import {
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
+  getContextBudgetHardCeiling,
   estimateFreshRequestTokens,
   estimateAssembledRequestTokens,
   estimateToolResultSize,
@@ -95,6 +96,107 @@ describe("step budget decisions", () => {
       hardCeiling: 100_000 - OUTPUT_RESERVE_TOKENS,
     });
   });
+});
+
+describe("context budget reserve bounds", () => {
+  test.each([1, 3, 5, 4096, 8192, 32767, 32768, 100_000, 1_000_000])(
+    "leaves at least three quarters of a %d-token window usable",
+    (limit) => {
+      const ceiling = getContextBudgetHardCeiling(limit);
+      expect(ceiling).toBeGreaterThan(0);
+      expect(ceiling).toBeLessThanOrEqual(limit);
+      expect(limit - ceiling).toBeLessThanOrEqual(Math.floor(limit / 4));
+      expect(limit - ceiling).toBeLessThanOrEqual(OUTPUT_RESERVE_TOKENS);
+      if (limit >= OUTPUT_RESERVE_TOKENS * 4) {
+        expect(ceiling).toBe(limit - OUTPUT_RESERVE_TOKENS);
+      }
+    }
+  );
+
+  test.each([0, -1, NaN, Infinity, -Infinity])(
+    "rejects invalid known context limit %s",
+    (modelContextLimit) => {
+      expect(() => getContextBudgetHardCeiling(modelContextLimit)).toThrow();
+      expect(() => estimateFreshRequestTokens({ userText: "hello", modelContextLimit })).toThrow();
+    }
+  );
+
+  test("preserves the default system floor for unknown and large model windows", () => {
+    const defaultEstimate = estimateFreshRequestTokens({ userText: "hello" });
+    expect(estimateFreshRequestTokens({ userText: "hello", modelContextLimit: 100_000 })).toBe(
+      defaultEstimate
+    );
+    expect(estimateFreshRequestTokens({ userText: "hello", modelContextLimit: 1_000_000 })).toBe(
+      defaultEstimate
+    );
+  });
+});
+
+describe("small-model context budgets", () => {
+  test.each([4096, 8192])(
+    "keeps fitting requests usable with a %d-token window",
+    (modelContextLimit) => {
+      const hardCeiling = modelContextLimit * 0.75;
+      expect(evaluate({ contextTokens: 100, modelContextLimit })).toMatchObject({
+        decision: "continue",
+        hardCeiling,
+      });
+      const fitting = { system: "instructions", messages: [{ role: "user", content: "hello" }] };
+      expect(
+        checkAssembledRequestBudget(fitting, { model: "small-model", modelContextLimit })
+      ).toBeUndefined();
+      const freshInput = { userText: "hello", modelContextLimit };
+      expect(estimateFreshRequestTokens(freshInput)).toBeLessThan(hardCeiling);
+
+      const oversized = {
+        messages: [{ role: "user", content: "x".repeat(modelContextLimit * 4) }],
+      };
+      expect(
+        checkAssembledRequestBudget(oversized, { model: "small-model", modelContextLimit })
+      ).toEqual({
+        type: "context_budget_exceeded",
+        model: "small-model",
+        estimate: estimateAssembledRequestTokens(oversized),
+        hardCeiling,
+      });
+      expect(
+        estimateFreshRequestTokens({ ...freshInput, userText: "x".repeat(modelContextLimit * 4) })
+      ).toBeGreaterThan(hardCeiling);
+      expect(
+        evaluate({ modelContextLimit, contextTokens: hardCeiling, warningEmitted: true })
+      ).toMatchObject({ decision: "rollover", flushOpportunity: false });
+      expect(
+        evaluate({ modelContextLimit, contextTokens: hardCeiling - 1, warningEmitted: true })
+      ).toMatchObject({ decision: "continue" });
+    }
+  );
+
+  test.each([4096, 8192])(
+    "scales only the unknown system floor for %d tokens",
+    (modelContextLimit) => {
+      const input = { userText: "hello", modelContextLimit };
+      const textTokens = estimateFreshRequestTokens({ ...input, systemFloorTokens: 0 });
+      expect(estimateFreshRequestTokens(input) - textTokens).toBe(modelContextLimit / 2);
+      expect(estimateFreshRequestTokens({ ...input, systemFloorTokens: 8192 }) - textTokens).toBe(
+        8192
+      );
+      expect(estimateFreshRequestTokens({ ...input, systemFloorTokens: 100 }) - textTokens).toBe(
+        100
+      );
+    }
+  );
+
+  test.each([4096, 8192])(
+    "rolls over without a flush if the warning cannot fit in %d tokens",
+    (modelContextLimit) => {
+      expect(
+        evaluate({ modelContextLimit, contextTokens: Math.ceil(modelContextLimit * 0.6) })
+      ).toMatchObject({
+        decision: "rollover",
+        flushOpportunity: false,
+      });
+    }
+  );
 });
 
 describe("request estimates", () => {
@@ -185,7 +287,7 @@ describe("request estimates", () => {
   test("per-attempt preflight blocks smaller fallback windows and includes exact-ceiling semantics", () => {
     const payload = {
       system: "s".repeat(1000),
-      messages: [{ role: "user", content: "u".repeat(3500) }],
+      messages: [{ role: "user", content: "u".repeat(350_000) }],
     };
     const estimate = estimateAssembledRequestTokens(payload);
     expect(
