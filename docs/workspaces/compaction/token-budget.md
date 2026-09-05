@@ -26,4 +26,4 @@ The newest manual `/clear --soft` is a privacy floor: the tool cannot retrieve m
 
 Rollover stops only after a tool step settles, preserving tool call/result pairs. Only one rollover may be pending; it is handled on the next send. Restart leaves the workspace paused rather than resurrecting a queued continuation, and the next message re-evaluates pressure from history.
 
-The boundary, lead-in, and triggering message or continuation use one append operation. This is not an all-or-nothing filesystem transaction: a crash may leave a complete prefix. Requests too large even for a fresh window are blocked before contacting the provider; rollover cannot make oversized attachments or instructions fit.
+The boundary, lead-in, and triggering message or continuation are saved as one atomic, all-or-nothing batch. Recovery also tolerates incomplete batches in legacy or externally modified histories. Requests too large even for a fresh window are blocked before contacting the provider; rollover cannot make oversized attachments or instructions fit.
