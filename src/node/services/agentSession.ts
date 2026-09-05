@@ -4774,6 +4774,17 @@ export class AgentSession {
     }
   }
 
+  private async rejectActiveContextBudgetRequest(): Promise<Result<void, SendMessageError>> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return Err(createUnknownSendMessageError(history.error));
+    const trigger = history.data.findLast((row) => row.id === this.activeStreamUserMessageId);
+    if (!trigger) return Ok(undefined);
+    const updated = await this.historyService.rejectContextBudgetRequest(this.workspaceId, trigger);
+    if (!updated.success) return Err(createUnknownSendMessageError(updated.error));
+    for (const row of updated.data) this.emitChatEvent({ ...row, type: "message" });
+    return Ok(undefined);
+  }
+
   /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
   private async rolloverAfterBudgetFailure(
     model: string,
@@ -6328,19 +6339,9 @@ export class AgentSession {
         }
         // This row passed send-time admission but never fit the final request.
         // Keep it visible without poisoning subsequent sends (including after restart).
-        if (lastUserMessage) {
-          const updated = await this.historyService.rejectContextBudgetRequest(
-            this.workspaceId,
-            lastUserMessage
-          );
-          if (!updated.success) {
-            return await this.handleStreamWithHistoryFailure(
-              createUnknownSendMessageError(updated.error),
-              acpPromptId
-            );
-          }
-          for (const row of updated.data) this.emitChatEvent({ ...row, type: "message" });
-        }
+        const rejected = await this.rejectActiveContextBudgetRequest();
+        if (!rejected.success)
+          return await this.handleStreamWithHistoryFailure(rejected.error, acpPromptId);
         if (!rolled.success)
           return await this.handleStreamWithHistoryFailure(rolled.error, acpPromptId);
         return await this.handleStreamWithHistoryFailure(
@@ -6854,13 +6855,14 @@ export class AgentSession {
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     const context = this.activeStreamContext;
-    if (
+    const budgetFailure =
       context &&
       !hadCompactionRequest &&
       this.isTokenBudgetActive(context.options) &&
       ((data.errorType === "context_exceeded" && !this.activeStreamHadAnyDelta) ||
-        data.contextBudgetExceeded != null)
-    ) {
+        data.contextBudgetExceeded != null);
+    const rejectBudgetRequest = budgetFailure && !this.activeStreamHadAnyDelta;
+    if (budgetFailure) {
       const model = data.contextBudgetExceeded?.model ?? context.modelString;
       const rolled = await this.rolloverAfterBudgetFailure(
         model,
@@ -6905,6 +6907,14 @@ export class AgentSession {
       })
     ) {
       return; // retry set PREPARING
+    }
+
+    // Provider overflow arrives asynchronously, but must exclude the same
+    // undelivered request payloads as preflight rejection. Preserve started turns.
+    if (rejectBudgetRequest) {
+      const rejected = await this.rejectActiveContextBudgetRequest();
+      if (!rejected.success)
+        data = { ...data, ...buildStreamErrorEventData(rejected.error), messageId: data.messageId };
     }
 
     // Terminal error — no retry succeeded

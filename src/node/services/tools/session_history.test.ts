@@ -94,6 +94,48 @@ afterEach(async () => {
 });
 
 describe("session_history real disk recovery", () => {
+  test("budget rejection preserves unreadable reset floors and unrelated raw bytes", async () => {
+    await append("manual-reset", "", { contextBoundaryKind: "reset" });
+    const payload = createMuxMessage("rejected-payload", "assistant", "Rejected payload", {
+      synthetic: true,
+    });
+    const trigger = createMuxMessage("rejected-trigger", "user", "Rejected request", {
+      requestPreludeMessageIds: [payload.id],
+    });
+    expect(
+      (await fixture.historyService.appendManyToHistory(workspaceId, [payload, trigger])).success
+    ).toBe(true);
+    const raw = await fs.readFile(chatPath);
+    const boundaryEnd = raw.indexOf(10) + 1;
+    expect(boundaryEnd).toBeGreaterThan(0);
+    const malformed = Buffer.concat([
+      Buffer.from('{"role":"assistant","metadata":{"contextBoundaryKind":"reset"},'),
+      Buffer.from([0xff]),
+      Buffer.from("\n\n"),
+    ]);
+    await fs.writeFile(chatPath, Buffer.concat([malformed, raw.subarray(boundaryEnd)]));
+    expect(
+      (await pages({ action: "search", query: "opening facts" })).flatMap(
+        (page) => page.items ?? []
+      )
+    ).toEqual([]);
+    expect(
+      (await fixture.historyService.rejectContextBudgetRequest(workspaceId, trigger)).success
+    ).toBe(true);
+    const after = await fs.readFile(chatPath);
+    expect(after.subarray(0, malformed.length)).toEqual(malformed);
+    expect(
+      (await pages({ action: "search", query: "opening facts" })).flatMap(
+        (page) => page.items ?? []
+      )
+    ).toEqual([]);
+    expect(
+      (await pages({ action: "search", query: "Rejected" })).flatMap((page) => page.items ?? [])
+    ).toEqual([]);
+    const read = (await pages({ action: "read_item", item_id: "0" })).at(-1)!;
+    expect(read.error).toBe("item_not_found");
+  });
+
   for (const scenario of [
     { name: "oversized legacy ID", id: "x".repeat(20 * 1024), sequence: undefined },
     {

@@ -2587,10 +2587,26 @@ export class HistoryService {
       workspaceId,
       "Failed to reject context-budget request",
       async () => {
-        const messages = await this.readChatHistory(workspaceId);
+        const historyPath = this.getChatHistoryPath(workspaceId);
+        const raw = await fs.readFile(historyPath);
+        // Keep every unmodified line byte-for-byte: even unreadable reset rows
+        // remain privacy floors for session_history and must survive this rewrite.
+        const lines: Buffer[] = [];
+        for (let start = 0; start < raw.length; ) {
+          const newline = raw.indexOf(10, start);
+          const end = newline < 0 ? raw.length : newline + 1;
+          lines.push(raw.subarray(start, end));
+          start = end;
+        }
+        const messages = lines.map(
+          (line) =>
+            this.parseMessages(line.toString("utf8"), historyPath, (value) =>
+              normalizeLegacyMuxMetadata(value as MuxMessage)
+            )[0]
+        );
         const triggerIndex = messages.findIndex(
           (row) =>
-            row.id === trigger.id &&
+            row?.id === trigger.id &&
             row.metadata?.historySequence === trigger.metadata?.historySequence
         );
         const persisted = messages[triggerIndex];
@@ -2598,25 +2614,24 @@ export class HistoryService {
           return Err("Rejected request no longer exists");
         const preludeIds = new Set(persisted.metadata?.requestPreludeMessageIds ?? []);
         const rejected: MuxMessage[] = [];
-        const updated = messages.map((row, index) => {
+        const updated = lines.map((line, index) => {
+          const row = messages[index];
+          if (!row) return line;
           const ownedPrelude =
             index < triggerIndex &&
             preludeIds.has(row.id) &&
             !isDurableContextBoundaryMarker(row) &&
             (isSyntheticSnapshotUserMessage(row) ||
               (row.role === "assistant" && row.metadata?.synthetic === true));
-          if (index !== triggerIndex && !ownedPrelude) return row;
+          if (index !== triggerIndex && !ownedPrelude) return line;
           const marked: MuxMessage = {
             ...row,
             metadata: { ...row.metadata, contextBudgetRejected: true },
           };
           rejected.push(marked);
-          return marked;
+          return Buffer.from(this.serializeHistoryEntries([marked], workspaceId));
         });
-        await writeFileAtomic(
-          this.getChatHistoryPath(workspaceId),
-          this.serializeHistoryEntries(updated, workspaceId)
-        );
+        await writeFileAtomic(historyPath, Buffer.concat(updated));
         return Ok(rejected);
       }
     );

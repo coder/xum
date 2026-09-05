@@ -593,6 +593,77 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([
+    "auto-off",
+    "history-disabled",
+    "fresh-retry",
+    "assembled",
+    "had-delta",
+    "experiment-off",
+  ])("async terminal overflow rejects only unstarted budget requests (%s)", async (mode) => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    if (mode === "auto-off" || mode === "assembled") h.session.setAutoCompactionThreshold(1);
+    const sendOptions: SendMessageOptions = {
+      ...options,
+      ...(mode === "experiment-off" ? { experiments: { tokenBudget: false } } : {}),
+      ...(mode === "history-disabled"
+        ? { toolPolicy: [{ regex_match: "session_.*", action: "disable" as const }] }
+        : {}),
+    };
+    const payload = createMuxMessage("overflow-peer", "assistant", "Oversized peer payload", {
+      synthetic: true,
+      uiVisible: true,
+    });
+    expect(
+      (
+        await h.session.sendMessage("Peer trigger", sendOptions, {
+          synthetic: true,
+          preTurnMessages: [payload],
+        })
+      ).success
+    ).toBe(true);
+    if (mode === "had-delta")
+      h.aiEmitter.emit("stream-delta", {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "assistant-1",
+        delta: "Already answered",
+      });
+    const attempts = mode === "fresh-retry" ? 2 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const streamError = {
+        workspaceId,
+        messageId: `assistant-${attempt}`,
+        error: "context limit",
+        errorType: "context_exceeded" as const,
+        ...(mode === "assembled" ? { contextBudgetExceeded: exceeded } : {}),
+      };
+      h.aiEmitter.emit("error", streamError);
+      h.completions[attempt - 1].settle({ status: "failed", streamError });
+      expect(await h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId)).toBe(
+        attempt < attempts ? "retry-started" : "terminal"
+      );
+    }
+    await h.session.waitForIdle();
+    const shouldReject = mode !== "had-delta" && mode !== "experiment-off";
+    const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
+    const accepted = active.filter(
+      (row) => text(row) === "Peer trigger" || text(row) === "Oversized peer payload"
+    );
+    expect(accepted).toHaveLength(2);
+    expect(
+      prepareProviderRequestMessages(accepted, "openai", "off").providerRequestMessages
+    ).toHaveLength(shouldReject ? 0 : 2);
+    expect((await h.session.sendMessage("Unrelated follow-up", options)).success).toBe(true);
+    const next = prepareProviderRequestMessages(
+      h.requests.at(-1)!.messages,
+      "openai",
+      "off"
+    ).providerRequestMessages;
+    expect(next.some((row) => text(row) === "Oversized peer payload")).toBe(!shouldReject);
+  });
+
   test.each(["manual-reset", "interrupt"])(
     "%s clears queued budget continuation and pending rollover",
     async (action) => {
