@@ -1,3 +1,4 @@
+import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
 import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -346,6 +347,150 @@ describe("session_history real disk recovery", () => {
         .flatMap((page) => page.items ?? [])
         .map((item) => item.text)
     ).toEqual(["public facts"]);
+  });
+
+  const validRollover = {
+    type: "context-window-rollover" as const,
+    rolloverId: "validated-rollover",
+    reason: "on-send" as const,
+    previousWindowId: "w:0",
+    flushOpportunity: false,
+    contextTokens: 5000,
+    maxTokens: 6000,
+  };
+  const resetCandidates = [
+    { name: "user-role reset", role: "user", metadata: { contextBoundaryKind: "reset" } },
+    {
+      name: "user-role rollover",
+      role: "user",
+      metadata: { contextBoundaryKind: "reset", muxMetadata: validRollover },
+    },
+    { name: "invalid-role reset", role: "damaged", metadata: { contextBoundaryKind: "reset" } },
+    {
+      name: "array-shaped reset metadata",
+      role: "assistant",
+      metadata: [{ contextBoundaryKind: "reset" }],
+    },
+    {
+      name: "type-only rollover",
+      role: "assistant",
+      metadata: { contextBoundaryKind: "reset", muxMetadata: { type: "context-window-rollover" } },
+    },
+    ...Object.keys(validRollover).map((field) => {
+      const partial: Record<string, unknown> = { ...validRollover };
+      delete partial[field];
+      return {
+        name: `rollover missing ${field}`,
+        role: "assistant",
+        metadata: { contextBoundaryKind: "reset", muxMetadata: partial },
+      };
+    }),
+    ...[
+      { rolloverId: "" },
+      { previousWindowId: "" },
+      { reason: "unexpected" },
+      { flushOpportunity: "yes" },
+      { contextTokens: -1 },
+      { contextTokens: "5000" },
+      { maxTokens: 0 },
+    ].map((invalid) => ({
+      name: `rollover with invalid ${Object.keys(invalid)[0]}`,
+      role: "assistant",
+      metadata: { contextBoundaryKind: "reset", muxMetadata: { ...validRollover, ...invalid } },
+    })),
+  ];
+  for (const candidate of resetCandidates) {
+    test(`${candidate.name} remains a privacy floor for direct and resumed scans`, async () => {
+      const privateBoundary = await append("private-boundary", "summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      const hidden = await append("private-item", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      expect(first.nextCursor).toBeString();
+      // Decoded JSON keys/values must agree with compact raw-marker detection,
+      // including when malformed message/metadata shape makes the row unreadable.
+      const resetLine = JSON.stringify({ id: "candidate-reset", parts: [], ...candidate }).replace(
+        '"contextBoundaryKind":"reset"',
+        '"contextBoundary\\u004bind" \t: "r\\u0065set"'
+      );
+      await fs.appendFile(
+        chatPath,
+        resetLine +
+          "\n" +
+          JSON.stringify(createMuxMessage("after-candidate", "assistant", "public facts")) +
+          "\n"
+      );
+      expect(
+        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
+      ).toBe("stale_cursor");
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect(
+        (
+          await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })
+        ).at(-1)?.error
+      ).toBe("item_not_found");
+      expect(
+        (await pages({ action: "list_windows" }))
+          .flatMap((page) => page.windows ?? [])
+          .some(
+            (window) => window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
+          )
+      ).toBe(false);
+    });
+  }
+
+  test("deep parseable reset metadata cannot lose privacy during canonicalization", async () => {
+    const resetLine =
+      '{"id":"deep-reset","role":"user","parts":[],"metadata":{"contextBoundary\\u004bind":"reset"},"extra":' +
+      "[".repeat(10000) +
+      "0" +
+      "]".repeat(10000) +
+      "}";
+    await fs.appendFile(chatPath, resetLine + "\n");
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  test("a populated reset row cannot impersonate a complete rollover boundary", async () => {
+    await fs.appendFile(
+      chatPath,
+      JSON.stringify(
+        createMuxMessage("populated-rollover", "assistant", "not a boundary-only row", {
+          contextBoundaryKind: "reset",
+          muxMetadata: validRollover,
+        })
+      ) + "\n"
+    );
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  test("complete production rollover boundaries remain traversable in initial and appended scans", async () => {
+    await append("private-item", "older facts");
+    const first = await call({ action: "search", query: "facts", limit: 1 });
+    const [boundary, leadIn] = createRolloverPrefix(validRollover);
+    await fs.appendFile(
+      chatPath,
+      [boundary, leadIn, createMuxMessage("after-rollover", "assistant", "newer facts")]
+        .map((message) => JSON.stringify(message))
+        .join("\n") + "\n"
+    );
+    const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
+    expect(resumed.success).toBe(true);
+    expect(resumed.items?.map((item) => item.text)).toEqual(["older facts"]);
+    expect(
+      (await pages({ action: "search", query: "facts" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["opening facts", "older facts", "newer facts"]);
   });
 
   test("an appended malformed reset invalidates an existing cursor", async () => {

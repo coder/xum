@@ -1,5 +1,6 @@
-import { isRolloverBoundary, type MuxMessage } from "@/common/types/message";
-import { getContextBoundaryKind, isDurableContextBoundaryMarker } from "./compactionBoundary";
+import { z } from "zod";
+import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import { isDurableContextBoundaryMarker } from "./compactionBoundary";
 
 export function getHistoryItemId(message: MuxMessage): string {
   const sequence = message.metadata?.historySequence;
@@ -10,6 +11,33 @@ export function getContextWindowId(message?: MuxMessage): string {
     ? `w:${getHistoryItemId(message)}`
     : "w:0";
 }
-export function isManualHistoryReset(message: MuxMessage): boolean {
-  return getContextBoundaryKind(message) === "reset" && !isRolloverBoundary(message);
+const rolloverMetadataSchema: z.ZodType<
+  Extract<MuxMessageMetadata, { type: "context-window-rollover" }>
+> = z.object({
+  type: z.literal("context-window-rollover"),
+  rolloverId: z.string().trim().min(1),
+  reason: z.enum(["on-send", "mid-stream", "context-exceeded"]),
+  previousWindowId: z.string().trim().min(1),
+  flushOpportunity: z.boolean(),
+  contextTokens: z.number().finite().nonnegative(),
+  maxTokens: z.number().finite().positive(),
+});
+const rolloverBoundarySchema = z.object({
+  id: z.string().min(1),
+  role: z.literal("assistant"),
+  parts: z.tuple([]),
+  metadata: z.object({
+    contextBoundaryKind: z.literal("reset"),
+    muxMetadata: rolloverMetadataSchema,
+  }),
+});
+
+/** A reset is private unless the whole persisted row validates as a rollover.
+ * Raw evidence still protects malformed roles, metadata and unreadable rows.
+ */
+export function isManualHistoryReset(message: MuxMessage | null, possibleReset = false): boolean {
+  return (
+    (possibleReset || message?.metadata?.contextBoundaryKind === "reset") &&
+    !rolloverBoundarySchema.safeParse(message).success
+  );
 }

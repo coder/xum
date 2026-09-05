@@ -201,6 +201,15 @@ export async function scanHistoryFilesBounded(
             const raw: unknown = JSON.parse(
               Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8")
             );
+            // Canonicalize only this bounded row before shape validation so
+            // Unicode-escaped reset keys/values cannot bypass the raw probe.
+            try {
+              possibleReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
+            } catch {
+              // Deep corrupt JSON can parse but overflow stringify's stack.
+              // An unreadable reset candidate must remain a privacy floor.
+              possibleReset = true;
+            }
             if (
               !raw ||
               typeof raw !== "object" ||
@@ -316,8 +325,7 @@ export async function scanHistoryFilesBounded(
           check.snapshot.endOffsetSnapshot,
           state.validatedChatSnapshot.endOffsetSnapshot,
           (message, _start, _end, _oversized, possibleReset) => {
-            if ((!message && possibleReset) || (message && isManualHistoryReset(message)))
-              throw new Error("stale_cursor");
+            if (isManualHistoryReset(message, possibleReset)) throw new Error("stale_cursor");
             return true;
           }
         );
@@ -354,9 +362,9 @@ export async function scanHistoryFilesBounded(
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
-            if ((!message && possibleReset) || (message && isManualHistoryReset(message))) {
-              // Any unreadable row might contain a reset, even below the size cap.
-              // Fail closed rather than disclosing history before a malformed reset.
+            if (isManualHistoryReset(message, possibleReset)) {
+              // Corrupt reset rows are privacy floors even when they parse or
+              // carry a partial rollover tag. Only a validated rollover is exempt.
               floor = { offset: finish, windowId: message ? boundedWindowId(message) : "w:0" };
               return false;
             }
