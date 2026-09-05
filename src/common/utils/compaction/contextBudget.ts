@@ -81,7 +81,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     projected >= hardCeiling ||
     projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)
   ) {
-    return { ...result, decision: "rollover" };
+    return { ...result, decision: "rollover", flushOpportunity: projected < hardCeiling };
   }
   if (
     !input.warningEmitted &&

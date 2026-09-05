@@ -4109,7 +4109,7 @@ export class AgentSession {
           "rollover rows must be sequenced"
         );
         assert(
-          sequences[0]! < sequences[1]! && sequences[1]! < sequences[2]!,
+          sequences[0] < sequences[1] && sequences[1] < sequences[2],
           "rollover rows must be ordered"
         );
       }
@@ -4906,8 +4906,7 @@ export class AgentSession {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
     if (
-      !context ||
-      !context.options ||
+      !context?.options ||
       !this.isTokenBudgetActive(context.options) ||
       this.compactionMonitor.getThreshold() >= 1
     )

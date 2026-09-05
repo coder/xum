@@ -37,7 +37,7 @@ describe("step budget decisions", () => {
   ] as const)("threshold boundary at %d", (contextTokens, decision) => {
     const result = evaluate({ contextTokens });
     expect(result.decision).toBe(decision);
-    expect(result.flushOpportunity).toBe(decision === "warn");
+    expect(result.flushOpportunity).toBe(decision !== "continue");
   });
 
   test("projects output, rounded tool text, and media without dropping the context baseline", () => {
@@ -57,7 +57,10 @@ describe("step budget decisions", () => {
 
   test("hard ceiling overrides a higher configured threshold", () => {
     const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
-    expect(evaluate({ contextTokens: hardCeiling, threshold: 0.99 }).decision).toBe("rollover");
+    expect(evaluate({ contextTokens: hardCeiling, threshold: 0.99 })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: false,
+    });
     expect(
       evaluate({ contextTokens: hardCeiling - 1, threshold: 0.99, warningEmitted: true }).decision
     ).toBe("continue");
