@@ -79,19 +79,20 @@ function matchTopLevelMetaDeclaration(
  * legacy unreadable meta that must keep being ignored.
  */
 export function staticMetadataLiteralHasKey(source: string, key: string): boolean {
-  let metadata: MetadataLiteralRange | null;
-  try {
-    metadata = findStaticMetadataLiteral(source);
-  } catch {
-    return false;
-  }
-  if (metadata == null) return false;
-  // Structure (depth, comments, string bodies) comes from the masked text, which
-  // preserves indexes; key tokens are read from the original source.
+  // Structure (depth, comments, string/template bodies) comes from the masked
+  // text, which preserves indexes; key tokens are read from the original source.
+  // The strict locator is NOT used for the object extent: it throws on template
+  // interpolation, which would hide a `phases` key sitting next to one.
   const masked = maskStaticJavaScriptSource(source);
+  const match = matchTopLevelMetaDeclaration(masked);
+  if (match == null) return false;
+  const start = skipStaticWhitespace(masked, match.end);
+  if (masked[start] !== "{") return false;
+  const end = findMaskedObjectEnd(masked, start);
+  if (end === -1) return false;
   let depth = 0;
   let expectKey = true;
-  for (let index = metadata.start + 1; index < metadata.end; index += 1) {
+  for (let index = start + 1; index < end; index += 1) {
     const char = masked[index];
     if (depth === 0 && expectKey && char === "[") {
       // Computed key with a static string literal: `["phases"]: ...`. Anything else
@@ -175,6 +176,20 @@ function readStaticStringLiteral(
     index += 1;
   }
   throw new Error(STATIC_METADATA_ERROR);
+}
+
+/** Index just past the `}` matching the `{` at `start` in masked source, or -1. */
+function findMaskedObjectEnd(masked: string, start: number): number {
+  let depth = 0;
+  for (let index = start; index < masked.length; index += 1) {
+    const char = masked[index];
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return -1;
 }
 
 function findStaticMetadataLiteral(source: string): MetadataLiteralRange | null {

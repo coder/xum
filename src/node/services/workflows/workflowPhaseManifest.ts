@@ -147,6 +147,12 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   if (containsDynamicScope(ts, sourceFile)) {
     return undefined;
   }
+  // The runner's prelude exposes its primitives as `__workflow*` / `__mux*`
+  // globals; `__workflowPhase("hidden")` emits a phase the `phase` identifier
+  // walk never sees, so any reference into that namespace voids inference.
+  if (referencesRuntimeInternals(ts, sourceFile)) {
+    return undefined;
+  }
   const workflowFn = findDefaultExportedFunction(ts, sourceFile);
   if (workflowFn?.body == null) {
     return undefined;
@@ -346,6 +352,14 @@ function mentionsIdentifier(ts: TypeScriptModule, root: ts.Node, name: string): 
   const check = (node: ts.Node): boolean =>
     (ts.isIdentifier(node) && node.text === name) || ts.forEachChild(node, check) === true;
   return check(root);
+}
+
+function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
+  const check = (node: ts.Node): boolean =>
+    (ts.isIdentifier(node) &&
+      (node.text.startsWith("__workflow") || node.text.startsWith("__mux"))) ||
+    ts.forEachChild(node, check) === true;
+  return check(sourceFile);
 }
 
 function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {

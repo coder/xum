@@ -220,6 +220,15 @@ describe("inferPhaseManifest", () => {
     ).toBeUndefined();
   });
 
+  test("bails when the script reaches into the runtime's internal globals", () => {
+    // The prelude registers `__workflowPhase` (and other `__workflow*`/`__mux*`
+    // primitives) globally; calling them directly emits phases the walk never sees.
+    expect(
+      phaseNames(legacyWorkflow(`__workflowPhase("hidden"); phase("visible");`))
+    ).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase("a"); log(__muxWorkflow);`))).toBeUndefined();
+  });
+
   test("bails on with statements, which resolve identifiers dynamically", () => {
     expect(
       phaseNames(legacyWorkflow(`with ({ phase: () => {} }) { phase("shadowed"); } phase("b");`))

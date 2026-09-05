@@ -136,6 +136,8 @@ describe("parseDeclaredPhasesFromSource", () => {
       'export const meta = { ["phases"]: [{ name: "setup" }] };\n',
       "export const meta = { description: 'x', [`phases`]: [{ name: 'setup' }] };\n",
       'export const meta = { ["pha\\u0073es"]: buildPhases() };\n',
+      // An interpolated template elsewhere in meta must not hide the phases key.
+      "export const meta = { description: `x ${name}`, phases: buildPhases() };\n",
     ]) {
       const source = declaration + body;
       try {
