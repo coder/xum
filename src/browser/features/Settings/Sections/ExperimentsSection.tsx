@@ -33,6 +33,7 @@ const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 // nested panel under the parent toggle, since they are no-ops while memory is off.
 const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
   EXPERIMENT_IDS.MEMORY_HOT_SET,
+  EXPERIMENT_IDS.MEMORY_INTUITION,
   EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
 ];
 

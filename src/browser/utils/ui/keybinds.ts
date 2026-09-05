@@ -172,6 +172,11 @@ export const TERMINAL_CONTAINER_ATTR = "data-terminal-container";
  * keystrokes instead of having capture/bubble-phase app shortcuts steal them first.
  */
 export const BROWSER_VIEWPORT_ATTR = "data-browser-viewport";
+export const DESKTOP_VIEWPORT_ATTR = "data-desktop-viewport";
+
+export function isDesktopViewportFocused(target: EventTarget | null): boolean {
+  return hasClosestWithAttr(target, DESKTOP_VIEWPORT_ATTR);
+}
 
 /**
  * Data attribute used to opt an element (or one of its ancestors) into allowing Escape
@@ -531,6 +536,8 @@ export const KEYBINDS = {
   SETTINGS_BACKUP_RESTORE: { key: "r", code: "KeyR", ctrl: true, alt: true },
   SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: { key: "o", code: "KeyO", ctrl: true, alt: true },
   SETTINGS_BACKUP_APPROVE_COMMANDS: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

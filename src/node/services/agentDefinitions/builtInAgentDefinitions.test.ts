@@ -30,6 +30,14 @@ describe("built-in agent definitions", () => {
     expect(ids).toContain("plan");
   });
 
+  test("intuition cannot run as an interactive agent or child workspace", () => {
+    const intuition = getBuiltInAgentDefinitions().find((agent) => agent.id === "intuition");
+    expect(intuition?.frontmatter.ui?.hidden).toBe(true);
+    expect(intuition?.frontmatter.subagent?.runnable).toBe(false);
+    expect(intuition?.frontmatter.subagent?.workflow_runnable).not.toBe(true);
+    expect(intuition?.frontmatter.tools?.require).toEqual(["memory_read", "intuition_report"]);
+  });
+
   test("includes desktop built-in with desktop automation safeguards", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));

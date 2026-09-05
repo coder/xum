@@ -744,6 +744,12 @@ export const LEFT_SIDEBAR_COLLAPSED_KEY = "sidebarCollapsed";
 export const SIDEBAR_AGE_GROUPING_KEY = "sidebarAgeGrouping";
 
 /**
+ * When true, show all sidebar chats in one list instead of project folders.
+ * Format: "sidebarFlatMode" (boolean, default false)
+ */
+export const SIDEBAR_FLAT_MODE_KEY = "sidebarFlatMode";
+
+/**
  * Hide sub-agent rows in the left sidebar and summarize their activity on
  * parent rows instead.
  * Format: "sidebarHideSubAgents" (boolean, default false)

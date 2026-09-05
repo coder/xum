@@ -39,7 +39,8 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
     const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
 
     // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort — except
-    // GPT-5.6 Sol, where "max" is a distinct native effort above xhigh.
+    // native-max models (GPT-5.6 family, GPT-6 Astra), where "max" is a distinct
+    // native effort above xhigh.
     if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/")) {
       if (level === "max" && openaiSupportsNativeMaxEffort(modelString)) return "MAX";
       return "XHIGH";
@@ -265,15 +266,45 @@ export function isGpt56FamilyModel(modelString: string): boolean {
 }
 
 /**
+ * GPT-6 Astra matcher (released September 3, 2026 under the API id
+ * `gpt-6-astra`; there is no bare `gpt-6` alias). Accepts only the bare id or a
+ * dated snapshot (`-YYYY-MM-DD` / `-YYYYMMDD`, e.g. gpt-6-astra-2026-09-30) and
+ * is anchored so any other qualifier, named (`gpt-6-astra-mini`) or numeric
+ * (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside it. A false
+ * match would apply Astra's reasoning surface (native `max`, no `none`) to a
+ * model that may reject it.
+ */
+export function isGpt6AstraModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
+/**
  * Whether the given OpenAI model supports the native "max" reasoning effort.
  *
  * The GPT-5.6 GA launch (July 9, 2026) added a top reasoning effort above
  * xhigh for the whole family — Sol, Terra, Luna, and the bare `gpt-5.6` alias
  * (see the OpenAI changelog: "GPT-5.6 adds ... max reasoning effort, and Pro
  * mode"). Earlier preview coverage described it as Sol-only, which is stale.
+ *
+ * GPT-6 Astra keeps the native max effort (its model page lists
+ * low/medium/high/xhigh/max) but, unlike the GPT-5.6 family, rejects `none`; see
+ * openaiRejectsDisabledReasoning. Pro mode is not documented for it (see
+ * openaiSupportsProMode).
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString);
+  return isGpt56FamilyModel(modelString) || isGpt6AstraModel(modelString);
+}
+
+/**
+ * Whether the given OpenAI model rejects `reasoning.effort: "none"`.
+ *
+ * GPT-6 Astra returns HTTP 400 for `none` and lists no `minimal`; reasoning
+ * cannot be turned off. OpenAI's migration guidance for callers of either value
+ * is to send `low`, so the thinking policy drops "off" and clamps it to "low".
+ */
+export function openaiRejectsDisabledReasoning(modelString: string): boolean {
+  return isGpt6AstraModel(modelString);
 }
 
 /**
@@ -301,6 +332,15 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * pro mode is available on every GPT-5.6 model (Sol, Terra, Luna, and the bare
  * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
  * coverage.
+ *
+ * Excludes GPT-6 Astra for now: OpenAI's launch docs disagree with each other.
+ * The model guide lists pro mode among the GPT-5.6 capabilities Astra inherits,
+ * but the reasoning guide's "Reasoning mode" reference still names only GPT-5.6
+ * models, and the Astra model page does not mention `reasoning.mode` at all.
+ * OpenAI rejects parameters a model does not support, so enabling the toggle on
+ * the optimistic reading could fail every pro-mode request, whereas withholding
+ * it only costs an option. Flip once the reference lists Astra or a live
+ * Responses probe with `reasoning.mode: "pro"` succeeds.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
   return isGpt56FamilyModel(modelString);
@@ -393,14 +433,19 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
  * GPT-5.6 "off" maps to the explicit "none" effort: omitting the field defaults
  * the request to medium (live-verified 2026-07-10 — an effort-less request echoed
  * `effort: medium`), which would silently ignore the user's off selection.
+ *
+ * GPT-6 Astra shares the native "max" but rejects "none" with a 400 (see
+ * openaiRejectsDisabledReasoning). The thinking policy already excludes "off" for
+ * it; a stray "off" clamps to "low" here so a caller bypassing policy cannot
+ * trigger the error.
  */
 export function getOpenAIReasoningEffort(
   level: ThinkingLevel,
   modelString: string
 ): string | undefined {
-  if (isGpt56FamilyModel(modelString)) {
+  if (openaiSupportsNativeMaxEffort(modelString)) {
     if (level === "max") return "max";
-    if (level === "off") return "none";
+    if (level === "off") return openaiRejectsDisabledReasoning(modelString) ? "low" : "none";
   }
   return OPENAI_REASONING_EFFORT[level];
 }

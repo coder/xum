@@ -13,6 +13,7 @@ import {
   type HeartbeatTrigger,
 } from "@/constants/heartbeat";
 import type { Config } from "@/node/config";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { IdleDispatcher, type IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
@@ -20,8 +21,8 @@ import type { TaskService } from "./taskService";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import type { WorkspaceService } from "./workspaceService";
 
-const STARTUP_DELAY_MS = 60 * 1000; // 60s - let startup settle
-const CHECK_INTERVAL_MS = 30 * 1000; // 30s tick
+export const STARTUP_DELAY_MS = 60 * 1000; // 60s - let startup settle
+export const CHECK_INTERVAL_MS = 30 * 1000; // 30s tick
 const MAX_CONCURRENT_HEARTBEATS = 1;
 const HEARTBEAT_IDLE_CONSUMER_NAME = "heartbeat";
 const HEARTBEAT_IDLE_CONSUMER_PRIORITY = 50;
@@ -59,6 +60,12 @@ export class HeartbeatService {
   private readonly workspaceService: WorkspaceService;
   private readonly taskService: TaskService;
   private readonly idleDispatcher: IdleDispatcher;
+  /**
+   * Runs the lifecycle effects below (scope acquisition, scheduler fork, scope
+   * close). Context-bound in the app (so the scheduler fiber reads the
+   * runtime's `Clock` — a `TestClock` in tests); the global runtime by default.
+   */
+  private readonly runner: EffectRunner;
 
   private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
 
@@ -104,13 +111,15 @@ export class HeartbeatService {
     extensionMetadata: ExtensionMetadataService,
     workspaceService: WorkspaceService,
     taskService: TaskService,
-    idleDispatcher?: IdleDispatcher
+    idleDispatcher?: IdleDispatcher,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.config = config;
     this.extensionMetadata = extensionMetadata;
     this.workspaceService = workspaceService;
     this.taskService = taskService;
     this.idleDispatcher = idleDispatcher ?? new IdleDispatcher();
+    this.runner = runner;
 
     this.onActivity = (event) => this.handleActivityEvent(event);
     this.onMetadata = (event) => this.handleMetadataEvent(event);
@@ -200,7 +209,7 @@ export class HeartbeatService {
       // the scheduler up to its first sleep before returning, so the startup
       // timer is registered before start() returns (same observable ordering
       // as the previous setTimeout call).
-      Effect.runSync(Scope.provide(scope)(acquireResources));
+      this.runner.runSync(Scope.provide(scope)(acquireResources));
     } catch (error) {
       // Guaranteed cleanup on partial startup failure: close the scope so the
       // finalizers registered before the failing step run (the hand-rolled
@@ -210,7 +219,7 @@ export class HeartbeatService {
       this.startupTimeout = null;
       this.checkInterval = null;
       this.stopped = true;
-      Effect.runSync(Scope.close(scope, Exit.void));
+      this.runner.runSync(Scope.close(scope, Exit.void));
       throw error;
     }
 
@@ -239,7 +248,7 @@ export class HeartbeatService {
       // scheduler fiber interrupt (synchronously clearing its pending timer),
       // listeners off, consumer disposer — completing synchronously because
       // the fiber only ever suspends on its clock timer.
-      Effect.runSync(Scope.close(scope, Exit.void));
+      this.runner.runSync(Scope.close(scope, Exit.void));
     }
     this.startupTimeout = null;
     this.checkInterval = null;

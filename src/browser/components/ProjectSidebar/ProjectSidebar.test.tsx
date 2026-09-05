@@ -7,7 +7,11 @@ import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
-import { EXPANDED_PROJECTS_KEY, SIDEBAR_HIDE_SUBAGENTS_KEY } from "@/common/constants/storage";
+import {
+  EXPANDED_PROJECTS_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+} from "@/common/constants/storage";
 import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
@@ -124,6 +128,7 @@ interface MockAgentListItemProps {
   };
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
+  projectBadgeName?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -219,6 +224,7 @@ function useArchiveActions(
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         removeWorkspace: () => Promise.resolve({ success: true }),
@@ -312,6 +318,7 @@ function installProjectSidebarTestDoubles() {
         return (
           <div data-testid={`draft-item-${props.draft.draftId}`}>
             {props.draft.title ?? "Draft"}
+            {props.projectBadgeName != null && <span>{props.projectBadgeName}</span>}
           </div>
         );
       }
@@ -370,6 +377,7 @@ function installProjectSidebarTestDoubles() {
           )}
         >
           <span>{displayTitle}</span>
+          {props.projectBadgeName != null ? <span>{props.projectBadgeName}</span> : null}
           {hasCompletedChildren && props.onToggleCompletedChildren ? (
             <button
               type="button"
@@ -537,6 +545,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -769,6 +778,66 @@ describe("ProjectSidebar scratch chats", () => {
     expect(view.getByText("Explore an idea")).toBeTruthy();
   });
 
+  test("renders a global pinned-first list with project badges and restores folders when disabled", async () => {
+    const alpha = {
+      ...createWorkspace("alpha", { title: "Alpha chat" }),
+      projects: undefined,
+      projectPath: "/projects/alpha",
+      projectName: "alpha",
+      pinnedAt: "2026-01-02T00:00:00.000Z",
+    };
+    const beta = {
+      ...createWorkspace("beta", { title: "Beta chat" }),
+      projects: undefined,
+      projectPath: "/projects/beta",
+      projectName: "beta",
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/alpha", { displayName: "Alpha Project", color: "Blue", workspaces: [] }],
+        ["/projects/beta", { displayName: "Beta Project", color: "Green", workspaces: [] }],
+      ]),
+    });
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/alpha", [alpha]],
+            ["/projects/beta", [beta]],
+          ])
+        }
+        workspaceRecency={{ alpha: 1, beta: 2 }}
+      />
+    );
+
+    expect(view.queryByLabelText("Expand project alpha")).toBeNull();
+    // Badge names are asserted inside their rows: the project management
+    // headers below the flat list repeat the display names.
+    expect(
+      within(view.getByTestId(agentItemTestId("alpha"))).getByText("Alpha Project")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("beta"))).getByText("Beta Project")
+    ).toBeTruthy();
+    const workspaceRows = Array.from(
+      view.container.querySelectorAll('[data-testid^="agent-item-"]')
+    );
+    expect(workspaceRows.map((row) => row.getAttribute("data-testid"))).toEqual([
+      agentItemTestId("beta"),
+      agentItemTestId("alpha"),
+    ]);
+
+    act(() => updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false));
+    await waitFor(() => {
+      expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
+      expect(view.getByLabelText("Expand project beta")).toBeTruthy();
+    });
+  });
   test("Ctrl+N from a selected scratch chat opens a scratch draft, not a workdir project draft", () => {
     // Scratch rows are bucketed under the scratch config key while the
     // selection's projectPath is the app-managed workdir, so the keybind
@@ -788,6 +857,7 @@ describe("ProjectSidebar scratch chats", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: workspace.id,
             projectPath: scratchPath,
@@ -837,6 +907,477 @@ describe("ProjectSidebar scratch chats", () => {
     fireEvent.keyDown(window, { key: "n", ctrlKey: true });
 
     expect(createWorkspaceDraftMock).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+  });
+});
+
+describe("ProjectSidebar flat chat list", () => {
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    ({ default: ProjectSidebar } = require("./ProjectSidebar?project-sidebar-flat-test=1") as {
+      default: typeof ProjectSidebarComponent;
+    });
+    /* eslint-enable @typescript-eslint/no-require-imports */
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+  });
+
+  afterEach(cleanupProjectSidebarDom);
+
+  const singleProjectRefs = [
+    { projectPath: "/projects/demo-project", projectName: "demo-project" },
+  ];
+
+  test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const single = {
+      ...createWorkspace("single", { title: "Single chat" }),
+      projects: singleProjectRefs,
+    };
+    const multi = createWorkspace("multi", { title: "Multi chat" });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [single, multi]]])}
+        workspaceRecency={{ single: Date.now(), multi: Date.now() }}
+      />
+    );
+
+    expect(view.getByTestId(agentItemTestId("single"))).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("multi"))).toBeNull();
+  });
+
+  test("filters _multi drafts out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const workspace = {
+      ...createWorkspace("solo-draft-gate", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi", createdAt: Date.now() }],
+            "/projects/demo-project": [{ draftId: "draft-single", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Give both drafts persisted content so their rows would render.
+    updatePersistedState(getInputKey(getDraftScopeId("_multi", "draft-multi")), "Multi draft");
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-single")),
+      "Single draft"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-draft-gate": Date.now() }}
+      />
+    );
+
+    // The _multi draft follows the metadata gate: hidden while the experiment
+    // is off, while ordinary project drafts still render.
+    expect(view.getByTestId("draft-item-draft-single")).toBeTruthy();
+    expect(view.queryByTestId("draft-item-draft-multi")).toBeNull();
+  });
+
+  test("labels _multi drafts with the multi-project badge instead of the internal key", () => {
+    const workspace = {
+      ...createWorkspace("solo-multi-badge", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    updatePersistedState(
+      getInputKey(getDraftScopeId("_multi", "draft-multi-badge")),
+      "Multi draft"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-multi-badge": Date.now() }}
+      />
+    );
+
+    // The _multi bucket is a system key excluded from userProjects; the badge
+    // must show the explicit multi-project label, never the raw key.
+    const row = view.getByTestId("draft-item-draft-multi-badge");
+    expect(within(row).getByText("Multi-project")).toBeTruthy();
+    expect(within(row).queryByText(/_multi/)).toBeNull();
+  });
+
+  test("keeps project management headers reachable in flat mode without nesting chats", () => {
+    const workspace = {
+      ...createWorkspace("solo", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    // Grouped-mode expansion state must not nest chats under flat headers.
+    updatePersistedState(EXPANDED_PROJECTS_KEY, ["/projects/demo-project"]);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ solo: Date.now() }}
+      />
+    );
+
+    // Per-project creation and the options menu stay reachable via the
+    // compact header row; the expansion chevron is grouped-mode only.
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    expect(view.getByLabelText("Project options for demo-project")).toBeTruthy();
+    expect(view.queryByLabelText("Expand project demo-project")).toBeNull();
+    expect(view.queryByLabelText("Collapse project demo-project")).toBeNull();
+    // The chat renders once in the flat list, never nested under the header.
+    expect(view.getAllByTestId(agentItemTestId("solo"))).toHaveLength(1);
+  });
+
+  test("keeps sub-project management reachable in flat mode", () => {
+    const workspace = {
+      ...createWorkspace("solo-sub", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [
+              {
+                draftId: "draft-in-section",
+                createdAt: Date.now(),
+                subProjectPath: "/projects/demo-project/features",
+              },
+            ],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-sub": Date.now() }}
+      />
+    );
+
+    // SectionHeader is stubbed in this suite, so assert the management row's
+    // contract via its props: the flat row keeps the scoped controls but has
+    // no expansion toggle (nothing nests under it in flat mode), and its count
+    // includes section drafts like the grouped header.
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    const sectionHeaderCalls = (
+      SectionHeaderModule.SectionHeader as unknown as {
+        mock: {
+          calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]>;
+        };
+      }
+    ).mock.calls;
+    const sectionProps = sectionHeaderCalls
+      .map(([props]) => props)
+      .find((props) => props.section.id === "/projects/demo-project/features");
+    expect(sectionProps?.section.name).toBe("Features");
+    expect(sectionProps?.onToggleExpand).toBeUndefined();
+    expect(sectionProps?.workspaceCount).toBe(1);
+
+    // The management rows stay drop targets: the sub-project row assigns a
+    // dragged chat to the section, the project header clears the assignment.
+    const dropZoneCalls = (
+      WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone as unknown as {
+        mock: {
+          calls: Array<
+            [Parameters<typeof WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone>[0]]
+          >;
+        };
+      }
+    ).mock.calls.map(([props]) => props);
+    const sectionZone = dropZoneCalls.find(
+      (props) => props.sectionId === "/projects/demo-project/features"
+    );
+    expect(typeof sectionZone?.onDrop).toBe("function");
+    const clearZone = dropZoneCalls.find(
+      (props) => props.sectionId === null && props.projectPath === "/projects/demo-project"
+    );
+    expect(typeof clearZone?.onDrop).toBe("function");
+  });
+
+  test("badges flat rows with their sub-project identity, falling back when stale", () => {
+    const sectionScoped = {
+      ...createWorkspace("in-section", { title: "Scoped chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/features",
+    };
+    const staleScoped = {
+      ...createWorkspace("stale-section", { title: "Stale chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/deleted",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [sectionScoped, staleScoped]]])
+        }
+        workspaceRecency={{ "in-section": Date.now(), "stale-section": Date.now() }}
+      />
+    );
+
+    // A valid sub-project reference badges hierarchically (sub names are only
+    // unique within a parent); a stale (deleted) reference falls back to the
+    // parent project badge.
+    expect(
+      within(view.getByTestId(agentItemTestId("in-section"))).getByText("Demo / Features")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("stale-section"))).getByText("Demo")
+    ).toBeTruthy();
+  });
+
+  test("coalesces best-of children into a task group in the flat list", () => {
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const bestOfGroup = { groupId: "best-of-flat", index: 0, total: 2 } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Candidate",
+        bestOf: bestOfGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        title: "Candidate",
+        bestOf: { ...bestOfGroup, index: 1 },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childOne, childTwo]]])
+        }
+        workspaceRecency={{ parent: Date.now(), "child-1": Date.now(), "child-2": Date.now() }}
+      />
+    );
+
+    // Best-of workers render behind one collapsed group header, not as bare rows.
+    expect(view.getByTestId("task-group-best-of-flat")).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
+  });
+
+  test("keeps the pinned block above drafts in the flat list", () => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Non-empty drafts render as rows; empty ones stay hidden.
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-order")),
+      "Draft prompt"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+      />
+    );
+
+    // Pinned chats keep the top of the flat list: a new draft slots in
+    // between the pinned block and the unpinned chats, never above pins.
+    const rows = Array.from(
+      view.container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
+    ).map((row) => row.getAttribute("data-testid"));
+    expect(rows).toEqual([
+      agentItemTestId("pinned-chat"),
+      "draft-item-draft-order",
+      agentItemTestId("regular-chat"),
+    ]);
+  });
+
+  test("renders a promoted flat draft once as the live workspace row", () => {
+    const promotedWorkspace = {
+      ...createWorkspace("promoted", { title: "Promoted chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [{ draftId: "draft-promoted", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {
+            "/projects/demo-project": { "draft-promoted": promotedWorkspace },
+          },
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Give the draft persisted content so the draft row would render pre-substitution.
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-promoted")),
+      "Draft prompt"
+    );
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [promotedWorkspace]]])}
+        workspaceRecency={{}}
+      />
+    );
+
+    expect(
+      view.container.querySelectorAll(`[data-testid="${agentItemTestId("promoted")}"]`)
+    ).toHaveLength(1);
+    expect(view.queryByTestId("draft-item-draft-promoted")).toBeNull();
   });
 });
 
@@ -1794,6 +2335,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: "done-1",
             projectPath: "/projects/demo-project",
@@ -2624,6 +3166,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -2737,6 +3280,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -2773,6 +3317,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>

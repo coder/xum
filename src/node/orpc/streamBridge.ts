@@ -36,7 +36,7 @@
  * - **Laziness**: nothing (not even `validate`) runs until the consumer's
  *   first `next()` call, matching async-generator semantics.
  */
-import type { Cause } from "effect";
+import type { Cause, Context } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
 
@@ -55,6 +55,8 @@ export interface SubscriptionEmit<T> {
 }
 
 export interface SubscriptionStreamOptions<T> {
+  /** Runtime references (notably Clock); omitted for the original global-runtime path. */
+  context?: Context.Context<never>;
   signal?: AbortSignal;
   /** Runs first; a throw rejects the subscription before any resource is acquired. */
   validate?: () => void;
@@ -177,7 +179,11 @@ export function subscriptionIterable<T>(options: SubscriptionStreamOptions<T>): 
   return (async function* () {
     if (options.signal?.aborted) return;
 
-    const iterator = Stream.toAsyncIterable(subscriptionStream(options))[Symbol.asyncIterator]();
+    const stream = subscriptionStream(options);
+    const iterable = options.context
+      ? Stream.toAsyncIterableWith(stream, options.context)
+      : Stream.toAsyncIterable(stream);
+    const iterator = iterable[Symbol.asyncIterator]();
     // `return()` memoizes its close promise, so the extra call in `finally`
     // awaits the same teardown instead of re-running it.
     const onAbort = () => void iterator.return?.();

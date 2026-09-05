@@ -238,6 +238,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
+      setMessageQueued: mock(() => undefined),
     }) as unknown as BackgroundProcessManager;
     const service = createWorkspaceServiceForTest({
       config,
@@ -838,6 +839,106 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(queuedMode).toBe("tool-end");
       expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
       expect(afterIdle).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("withdrawing a queued monitor wake removes it and releases its dedupe key", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "withdrawn-wake-owner";
+    await config.addWorkspace("/tmp/withdrawn-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "withdrawn-wake-project",
+      projectPath: "/tmp/withdrawn-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const session = service.getOrCreateSession(workspaceId);
+    const queuedModes: Array<"tool-end" | "turn-end" | null> = [];
+    // The real sendMessage queues behind a busy session; mirror only that branch.
+    const sendMessage = mock(
+      (
+        _workspaceId: string,
+        prompt: string,
+        options: SendMessageOptions,
+        internal?: {
+          synthetic?: boolean;
+          agentInitiated?: boolean;
+          queueDedupeKey?: string;
+          removableQueueDedupeKey?: boolean;
+          cancelState?: { canceledBeforeAcceptance: boolean };
+          cancelSignal?: AbortSignal;
+          onCanceled?: (reason: string) => Promise<void> | void;
+        }
+      ) => {
+        queuedModes.push(
+          session.queueMessage(prompt, options, {
+            synthetic: internal?.synthetic,
+            agentInitiated: internal?.agentInitiated,
+            dedupeKey: internal?.queueDedupeKey,
+            removableDedupeKey: internal?.removableQueueDedupeKey,
+            cancelState: internal?.cancelState,
+            cancelSignal: internal?.cancelSignal,
+            onCanceled: internal?.onCanceled,
+          })
+        );
+        return Promise.resolve(Ok(undefined));
+      }
+    );
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        dedupeKey: string;
+        cancelSignal: AbortSignal;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    const dedupeKey = "bash-monitor-wake:" + workspaceId + ":dispatch-1";
+    const onDeferred = mock(() => Promise.resolve());
+    const dispatch = (cancelSignal: AbortSignal) =>
+      internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        dedupeKey,
+        cancelSignal,
+        onAccepted: () => Promise.resolve(),
+        onDeferred,
+      });
+    try {
+      internal.aiService = { isStreaming: () => true };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => true;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.sendMessage = sendMessage;
+
+      const controller = new AbortController();
+      expect(await dispatch(controller.signal)).toBe("in-flight");
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+
+      controller.abort("output already shown");
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, dedupeKey)).toEqual(Ok(0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(onDeferred).toHaveBeenCalledTimes(1);
+
+      // Already withdrawn at dispatch: never reaches the send, so nothing can be enqueued.
+      expect(await dispatch(controller.signal)).toBe("deferred");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(onDeferred).toHaveBeenCalledTimes(1);
+
+      expect(await dispatch(new AbortController().signal)).toBe("in-flight");
+      expect(queuedModes).toEqual(["tool-end", "tool-end"]);
     } finally {
       await cleanup();
     }
@@ -6242,6 +6343,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const fakeSession = {
         isBusy: mock(() => false),
         emitMetadata: mock(() => undefined),
+        drainQueuedMessagesIfIdle: mock(() => undefined),
         sendMessage: mock(
           (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
             capturedProbe = internal?.admissionStale;
@@ -7982,10 +8084,51 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Active when metadata was read, but archived (or removed) by a client before the
+    // scheduling loop ran: the live config decides, not the stale metadata.
+    const archivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-since-ws",
+      name: "Archived Since Read",
+    });
+    const removedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "removed-since-ws",
+      name: "Removed Since Read",
+    });
 
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, taskWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        taskWorkspace,
+        archivedWorkspace,
+        archivedSinceWorkspace,
+        removedSinceWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              { id: "task-ws", name: "task-ws", path: "/tmp/task-ws", taskStatus: "running" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "archived-since-ws",
+                name: "archived-since-ws",
+                path: "/tmp/archived-since-ws",
+                archivedAt: "2026-03-21T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -8036,6 +8179,70 @@ describe("WorkspaceService initialize", () => {
     try {
       await service.initialize();
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("removes stale orphaned scratch workdirs but keeps referenced and recent ones", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const scratchDirFor = (id: string) => path.join(realConfig.rootDir, "scratch", id);
+    const referencedDir = scratchDirFor("referenced-scratch");
+    const staleOrphanDir = scratchDirFor("stale-orphan-scratch");
+    // A scratch chat created while the sweep runs has a fresh workdir and, briefly, no
+    // config entry yet (createScratch persists config after mkdir).
+    const freshOrphanDir = scratchDirFor("fresh-orphan-scratch");
+    for (const dir of [referencedDir, staleOrphanDir, freshOrphanDir]) {
+      await fsPromises.mkdir(dir, { recursive: true });
+    }
+    const staleTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    for (const dir of [referencedDir, staleOrphanDir]) {
+      await fsPromises.utimes(dir, staleTime, staleTime);
+    }
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: referencedDir,
+            id: "referenced-scratch",
+            name: "scratch-referenced-scratch",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        projectKind: "system",
+        trusted: true,
+      });
+      return cfg;
+    });
+
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const startupAccess = service as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
+
+    const exists = (dir: string) =>
+      fsPromises.stat(dir).then(
+        () => true,
+        () => false
+      );
+
+    try {
+      await service.initialize();
+      expect(await exists(referencedDir)).toBe(true);
+      expect(await exists(freshOrphanDir)).toBe(true);
+      expect(await exists(staleOrphanDir)).toBe(false);
     } finally {
       await cleanup();
     }
@@ -8144,12 +8351,64 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Archived when metadata was read, but a client unarchived it (and produced new logs)
+    // before the sweep reached it: the live config decides.
+    const unarchivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "unarchived-since-ws",
+      name: "Unarchived Since Read",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
+    const archivedWithoutDataWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-no-data-ws",
+      name: "Archived Without DevTools Data",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        archivedWorkspace,
+        unarchivedSinceWorkspace,
+        archivedWithoutDataWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "unarchived-since-ws",
+                name: "unarchived-since-ws",
+                path: "/tmp/unarchived-since-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+                unarchivedAt: "2026-03-21T00:00:00.000Z",
+              },
+              {
+                id: "archived-no-data-ws",
+                name: "archived-no-data-ws",
+                path: "/tmp/archived-no-data-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const removeWorkspaceData = mock(() => Promise.resolve());
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: (workspaceId: string) =>
+        Promise.resolve(workspaceId !== "archived-no-data-ws"),
+      removeWorkspaceData,
+    });
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -8160,6 +8419,62 @@ describe("WorkspaceService initialize", () => {
 
     expect(removeWorkspaceData).toHaveBeenCalledTimes(1);
     expect(removeWorkspaceData).toHaveBeenCalledWith("archived-ws");
+  });
+
+  test("initialize schedules no recovery once shutdown has aborted it", async () => {
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "Live Workspace" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          { workspaces: [{ id: "live-ws", name: "live-ws", path: "/tmp/live-ws" }] },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+    const startupAccess = workspaceService as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    const startStartupRecoverySpy = spyOn(startupAccess, "startStartupRecovery").mockImplementation(
+      () => undefined
+    );
+    const shutdown = new AbortController();
+
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+
+    shutdown.abort();
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("beginShutdown disposes transient recovery sessions and halts the rest", () => {
+    const dispose = mock(() => undefined);
+    const beginShutdown = mock(() => undefined);
+    const startupAccess = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+      sessions: Map<string, AgentSession>;
+    };
+    startupAccess.transientStartupRecoverySessions.set("ws-a", {
+      dispose,
+    } as unknown as AgentSession);
+    startupAccess.transientStartupRecoverySessions.set("ws-b", {
+      dispose,
+    } as unknown as AgentSession);
+    // A recovery session promoted with a retry pending, or a client-created session that
+    // housekeeping scheduled recovery on: it may own a live stream, so it is not disposed.
+    startupAccess.sessions.set("ws-promoted", {
+      dispose,
+      beginShutdown,
+    } as unknown as AgentSession);
+
+    workspaceService.beginShutdown();
+
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(startupAccess.transientStartupRecoverySessions.size).toBe(0);
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    startupAccess.sessions.delete("ws-promoted");
   });
 
   test("disposes transient startup-recovery sessions that go idle", async () => {
@@ -8354,6 +8669,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
+    drainQueuedMessagesIfIdle: ReturnType<typeof mock>;
   };
 
   beforeEach(async () => {
@@ -8428,6 +8744,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
+      drainQueuedMessagesIfIdle: mock(() => undefined),
     };
 
     (
@@ -8471,6 +8788,260 @@ describe("WorkspaceService sendMessage status clearing", () => {
       expect.objectContaining({ model: "custom:unpriced-model", agentId: "exec" }),
       expect.objectContaining({ synthetic: undefined })
     );
+  });
+
+  test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
+    // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
+    // later send admitted against the idle snapshot would start a competing stream that
+    // StreamManager resolves by aborting the earlier turn. Both sends sit in preflight
+    // awaits here, so arrival order (not who checks first) must decide who yields.
+    fakeSession.isBusy.mockReturnValue(false);
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect((await secondResult).success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.queueMessage.mock.calls[0]?.[0]).toBe("second");
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("first");
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
+  });
+
+  test("entries queued behind a preflight send drain only once that send settles without a turn", async () => {
+    // Nothing else will drain them: the failed send never claimed PREPARING, so no stream
+    // end fires. Draining while the earlier send is still in preflight would let the queued
+    // entry jump ahead of it.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstSend.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+  });
+
+  test("the oldest preflight failing drains the entries queued behind it while a younger preflight is live", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6eaerl): waiting for every preflight to settle would let the
+    // younger send pass shouldQueue with no earlier ticket left and start ahead of the entry
+    // queued behind the failed one. Draining as soon as the head of the line settles makes
+    // the younger send observe the dispatched (busy) session instead.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+
+    const thirdPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => thirdPreflight.promise);
+    const thirdResult = workspaceService.sendMessage("test-workspace", "third", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 3);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstSend.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+
+    thirdPreflight.resolve();
+    expect((await thirdResult).success).toBe(true);
+  });
+
+  test("manual input is not queued behind a requireIdle send in preflight, which yields to it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6eaerm): a heartbeat's ticket is older, but queueing the
+    // user's message behind it would let the heartbeat take the turn first. The maintenance
+    // send is supersedable: the manual send goes direct and the heartbeat's own
+    // preflight-count skip refuses it.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const heartbeatPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const heartbeatResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      sendOptions,
+      {
+        synthetic: true,
+        agentInitiated: true,
+        requireIdle: true,
+      }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const manualSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("manual");
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    heartbeatPreflight.resolve();
+    expect((await heartbeatResult).success).toBe(false);
+    // The heartbeat never reached the session; only the manual send did.
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+
+    manualSend.resolve(Ok(undefined));
+    expect((await manualResult).success).toBe(true);
+  });
+
+  test("a failed send drains the entries queued behind it even when a supersedable preflight is older", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHT): the requireIdle send is physically oldest but nobody
+    // queues behind it, so it must not decide who drains. Otherwise the entry queued behind
+    // the failed manual send waits until the maintenance preflight settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const maintenancePreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => maintenancePreflight.promise);
+    const maintenanceResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      sendOptions,
+      { synthetic: true, agentInitiated: true, requireIdle: true }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const firstManual = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstManual.promise);
+    const firstManualResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSE): the maintenance send settling first (it yields to the
+    // manual send in preflight) must not drain either: "second" is queued behind "first",
+    // which is still live, and dispatching it now would start it ahead of "first".
+    maintenancePreflight.resolve();
+    expect((await maintenanceResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstManual.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstManualResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+  });
+
+  test("sends reach the queue in arrival order even when a later one finishes preflight first", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSR): with "first" in preflight, "third" can finish its
+    // pricing/settings awaits before "second"; enqueueing on completion order would make the
+    // user's third prompt dispatch before the second.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+
+    const secondPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => secondPreflight.promise);
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 2);
+    const thirdResult = workspaceService.sendMessage("test-workspace", "third", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 3);
+    await drainPendingDispatches();
+    // "third" finished its awaits but must wait for "second" to decide.
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    secondPreflight.resolve();
+    expect((await secondResult).success).toBe(true);
+    expect((await thirdResult).success).toBe(true);
+    expect((fakeSession.queueMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      "second",
+      "third",
+    ]);
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
+  });
+
+  test("a queue-mode heartbeat in preflight yields quietly to manual input instead of racing it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHa): queue-mode heartbeats set yieldToQueuedMessages, not
+    // requireIdle. The manual send must not queue behind the heartbeat, and the heartbeat
+    // must not start once that input is in preflight; its next slot fires anyway.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const heartbeatPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const heartbeatResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      { ...sendOptions, queueDispatchMode: "turn-end" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        skipAutoResumeReset: true,
+        queueDedupeKey: "heartbeat",
+        yieldToQueuedMessages: true,
+      }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const manualSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("manual");
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    heartbeatPreflight.resolve();
+    // Superseded heartbeats report success so the scheduler does not record a failure.
+    expect((await heartbeatResult).success).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+
+    manualSend.resolve(Ok(undefined));
+    expect((await manualResult).success).toBe(true);
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
@@ -8635,6 +9206,31 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test.each(["sendMessage", "resumeStream"] as const)(
+    "%s refuses the stream when desktop task admission fails",
+    async (operation) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          markInterruptedTaskRunning: mock(() =>
+            Promise.reject(new Error("Desktop is controlled by another child"))
+          ),
+          restoreInterruptedTaskAfterResumeFailure,
+        })
+      );
+      const options = { model: "openai:gpt-4o-mini", agentId: "exec" };
+      const result =
+        operation === "sendMessage"
+          ? await workspaceService.sendMessage("test-workspace", "hello", options)
+          : await workspaceService.resumeStream("test-workspace", options);
+      expect(result.success).toBe(false);
+      expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+      expect(fakeSession.resumeStream).not.toHaveBeenCalled();
+      expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
+    }
+  );
+
   // Send outcome drives interrupted-task rollback: a successful send keeps the
   // restored running status; a failed or thrown send rolls it back.
   test.each([
@@ -8670,7 +9266,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (expectSuccess) {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
@@ -8716,7 +9315,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(markInterruptedTaskRunning).toHaveBeenCalledWith("test-workspace");
 
     await startupFailureHandled.promise;
-    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+      "test-workspace",
+      undefined
+    );
   });
 
   // Resume outcome drives interrupted-task rollback: only a resume that actually
@@ -8754,7 +9356,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (resumeOutcome === "started") {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
@@ -8817,6 +9422,35 @@ describe("WorkspaceService sendMessage status clearing", () => {
     } else {
       expect(resetAutoResumeCount).not.toHaveBeenCalled();
     }
+  });
+
+  test("refuses to queue a send whose cancel signal already fired", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    const controller = new AbortController();
+    controller.abort("monitor withdrawn");
+    const onCanceled = mock(() => undefined);
+    const cancelState = { canceledBeforeAcceptance: false };
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "wake",
+      { model: "openai:gpt-4o-mini", agentId: "exec" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        cancelSignal: controller.signal,
+        cancelState,
+        onCanceled,
+        queueDedupeKey: "bash-monitor-wake:test-workspace:1",
+        removableQueueDedupeKey: true,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+    expect(onCanceled).toHaveBeenCalledTimes(1);
+    expect(onCanceled).toHaveBeenCalledWith("monitor withdrawn");
+    expect(cancelState.canceledBeforeAcceptance).toBe(true);
   });
 
   test("strips stale workspace-turn correlation behind an earlier queued entry", async () => {
@@ -9164,6 +9798,9 @@ describe("WorkspaceService pending auto-title", () => {
   let workspacePath: string;
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
+    hasQueuedMessages: ReturnType<typeof mock>;
+    hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
+    dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
@@ -9246,6 +9883,9 @@ describe("WorkspaceService pending auto-title", () => {
 
     fakeSession = {
       isBusy: mock(() => false),
+      hasQueuedMessages: mock(() => false),
+      hasQueuedOrDispatchingEntry: mock(() => false),
+      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
@@ -12407,16 +13047,27 @@ describe("WorkspaceService remove desktop session cleanup", () => {
   });
 
   test("remove() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+    let guard: ((workspaceId: string) => boolean) | undefined;
+    const guardDuringClose: { value?: boolean } = {};
+    const close = mock(() => {
+      // Desktop startups consult this guard synchronously; a borrower bridge connecting between
+      // the close and the awaited config deletion must be refused just like during archive.
+      guardDuringClose.value = guard?.(workspaceId);
+      return Promise.resolve(undefined);
+    });
     const desktopSessionManager = {
       close,
-      setWorkspaceArchiveGuard: () => undefined,
+      setWorkspaceArchiveGuard: (next: (workspaceId: string) => boolean) => {
+        guard = next;
+      },
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
+    expect(guard?.(workspaceId)).toBe(false);
 
     const result = await workspaceService.remove(workspaceId);
 
     expect(result.success).toBe(true);
+    expect(guardDuringClose.value).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -12735,6 +13386,44 @@ describe("WorkspaceService setPinned", () => {
     expect(emittedMetadata[1].metadata?.pinnedAt).toBeUndefined();
   });
 
+  test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {
+    // A parseable boundary timestamp has no representable +1ms successor; the
+    // global monotonic scan must ignore it rather than fail every future pin.
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = "+275760-09-13T00:00:00.000Z";
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const pinnedAt = getEntry(rootId)?.pinnedAt;
+    expect(pinnedAt).toBeDefined();
+    // The assigned timestamp is a normal near-now value, not a successor of
+    // the corrupted boundary.
+    expect(new Date(pinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
+  test("pinning heals a saturated boundary timestamp so keys stay unique", async () => {
+    // An existing pin at the sane cap has no strictly-greater sane successor;
+    // the write path renumbers pins instead of minting a duplicate key.
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = saneMax;
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const rootPinnedAt = getEntry(rootId)?.pinnedAt;
+    const otherPinnedAt = getEntry(otherRootId)?.pinnedAt;
+    expect(rootPinnedAt).toBeDefined();
+    expect(otherPinnedAt).toBeDefined();
+    expect(rootPinnedAt).not.toBe(otherPinnedAt);
+    // The healed pin sorts before the new pin and both are near-now values.
+    expect(new Date(otherPinnedAt ?? "").getTime()).toBeLessThan(
+      new Date(rootPinnedAt ?? "").getTime()
+    );
+    expect(new Date(rootPinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
   test("pin-when-pinned and unpin-when-unpinned are no-ops without event churn", async () => {
     const first = await workspaceService.setPinned(rootId, true);
     expect(first.success).toBe(true);
@@ -12970,9 +13659,10 @@ describe("WorkspaceService reorderPinned", () => {
     expect(emittedMetadata).toHaveLength(0);
   });
 
-  test("drops stale/unpinned/duplicate ids and appends omitted pins in current order", async () => {
+  test("drops stale/unpinned/duplicate ids and keeps omitted pins in place", async () => {
     // Client sends duplicates, an unpinned id, a sub-agent, an archived chat,
-    // and a ghost id, and omits B and C entirely.
+    // and a ghost id, and omits B entirely: C and A swap within the slots
+    // they occupy while omitted B keeps its position.
     const result = await workspaceService.reorderPinned([
       idC,
       idC,
@@ -12980,10 +13670,10 @@ describe("WorkspaceService reorderPinned", () => {
       childId,
       archivedId,
       "ws-ghost",
+      idA,
     ]);
     expect(result.success).toBe(true);
-    // C first, then omitted pins A, B keep their relative order.
-    expect(pinnedOrder()).toEqual([idC, idA, idB]);
+    expect(pinnedOrder()).toEqual([idC, idB, idA]);
     // Ineligible ids never gain pinnedAt.
     expect(getEntry(unpinnedId)?.pinnedAt).toBeUndefined();
     expect(getEntry(childId)?.pinnedAt).toBeUndefined();
@@ -13025,6 +13715,152 @@ describe("WorkspaceService reorderPinned", () => {
     const values = [idB, idC, idA].map((id) => Date.parse(getEntry(id)?.pinnedAt ?? ""));
     expect(values[0]).toBeLessThan(values[1]);
     expect(values[1]).toBeLessThan(values[2]);
+  });
+});
+
+describe("WorkspaceService reorderPinned across projects", () => {
+  const projectA = "/tmp/project-a";
+  const projectB = "/tmp/project-b";
+  const idA1 = "ws-a1";
+  const idA2 = "ws-a2";
+  const idA3 = "ws-a3";
+  const idB1 = "ws-b1";
+  const idB2 = "ws-b2";
+
+  let workspaceService: WorkspaceService;
+  let configState: ProjectsConfig;
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+
+  const findEntry = (id: string) => {
+    for (const [projectPath, project] of configState.projects) {
+      const entry = project.workspaces.find((w) => w.id === id);
+      if (entry) return { projectPath, entry };
+    }
+    return undefined;
+  };
+
+  /** Pinned ids across all projects in effective order (pinnedAt asc), as the flat sidebar sorts them. */
+  const globalPinnedOrder = () =>
+    [...configState.projects.values()]
+      .flatMap((project) => project.workspaces)
+      .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
+      .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
+      .map((w) => w.id);
+
+  beforeEach(async () => {
+    // Interleaved global pin order: a1, b1, a2, b2.
+    configState = {
+      projects: new Map([
+        [
+          projectA,
+          {
+            workspaces: [
+              { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
+              { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
+              { path: `${projectA}/${idA3}`, id: idA3 },
+            ],
+          },
+        ],
+        [
+          projectB,
+          {
+            workspaces: [
+              { path: `${projectB}/${idB1}`, id: idB1, pinnedAt: "2026-01-01T00:00:10.000Z" },
+              { path: `${projectB}/${idB2}`, id: idB2, pinnedAt: "2026-01-01T00:00:30.000Z" },
+            ],
+          },
+        ],
+      ]),
+    };
+
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      findWorkspace: mock((id: string) => {
+        const found = findEntry(id);
+        if (!found) return null;
+        return {
+          projectPath: found.projectPath,
+          workspacePath: found.entry.path,
+          parentWorkspaceId: found.entry.parentWorkspaceId,
+        };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        configState = fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+
+    workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+    });
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("persists a flat-mode reorder spanning project buckets", async () => {
+    const maxBefore = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+
+    // Drag b1 above a1 in the unified pinned block.
+    const result = await workspaceService.reorderPinned([idB1, idA1, idA2, idB2]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idB1, idA1, idA2, idB2]);
+
+    // The timestamp pool is re-dealt, not inflated.
+    const maxAfter = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+    expect(maxAfter).toBe(maxBefore);
+  });
+
+  test("setPinned appends after the global pinned max, not just its own bucket's", async () => {
+    // Give the other bucket the newest pin so a bucket-local max would sort the
+    // new pin above it in the flat sidebar's unified block.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    findEntry(idB2)!.entry.pinnedAt = future;
+
+    expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
+    expect(globalPinnedOrder().at(-1)).toBe(idA3);
+  });
+
+  test("partial cross-bucket reorder keeps omitted pins in their global slots", async () => {
+    // The grouped multi-project section sends only its own pinned ids, which
+    // can live in different project buckets. Swapping b1 and a2 must not
+    // displace the ordinary pins a1 and b2 in the flat global order.
+    const a1Before = findEntry(idA1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idB1]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idA1, idA2, idB1, idB2]);
+    // The untouched slots keep their exact timestamps.
+    expect(findEntry(idA1)?.entry.pinnedAt).toBe(a1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
+  });
+
+  test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {
+    const b1Before = findEntry(idB1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idA1]);
+    expect(result.success).toBe(true);
+
+    // Project A flipped within its own timestamp pool.
+    const a1 = Date.parse(findEntry(idA1)?.entry.pinnedAt ?? "");
+    const a2 = Date.parse(findEntry(idA2)?.entry.pinnedAt ?? "");
+    expect(a2).toBeLessThan(a1);
+    // Project B was not referenced, so its entries are byte-identical.
+    expect(findEntry(idB1)?.entry.pinnedAt).toBe(b1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
   });
 });
 
@@ -13133,6 +13969,33 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(editConfigSpy).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "archiving a %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1], {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        taskPrompt: "brief",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+      // A shared child must not stay an active borrower of the owner's desktop while archived;
+      // the queued brief survives for the reawaken path.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.archivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+      expect(entry?.taskPrompt).toBe("brief");
+    }
+  );
+
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
@@ -13185,6 +14048,26 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(entry?.archivedAt).toBeTruthy();
   });
 
+  test("archive() disposes a transient startup-recovery session once archivedAt is durable", async () => {
+    let editConfigCallsAtDispose = -1;
+    const dispose = mock(() => {
+      editConfigCallsAtDispose = editConfigSpy.mock.calls.length;
+    });
+    const access = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+    };
+    access.transientStartupRecoverySessions.set(workspaceId, {
+      dispose,
+    } as unknown as AgentSession);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(editConfigCallsAtDispose).toBe(1);
+    expect(access.transientStartupRecoverySessions.has(workspaceId)).toBe(false);
+  });
+
   test("archive() closes workspace terminal sessions on success", async () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
@@ -13218,17 +14101,31 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
   });
 
-  test("archive() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+  test("archive() releases desktop viewers before persisting the archived identity", async () => {
+    const started = createDeferred<void>();
+    const released = createDeferred<void>();
+    const close = mock(() => {
+      started.resolve();
+      return released.promise;
+    });
     const desktopSessionManager = {
       close,
       setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
-    const result = await workspaceService.archive(workspaceId);
+    const archiving = workspaceService.archive(workspaceId);
+    await started.promise;
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    try {
+      expect(entry?.archivedAt).toBeUndefined();
+    } finally {
+      released.resolve();
+    }
+    const result = await archiving;
 
     expect(result.success).toBe(true);
+    expect(entry?.archivedAt).toBeTruthy();
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -13294,7 +14191,10 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(entry?.archivedAt).toBeTruthy();
       return Promise.resolve();
     });
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
+      removeWorkspaceData,
+    });
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -13304,6 +14204,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive() stays successful when DevTools cleanup fails", async () => {
     workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
       removeWorkspaceData: mock(() => Promise.reject(new Error("disk error"))),
     });
 
@@ -14109,6 +15010,31 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
   afterEach(async () => {
     await cleanupHistory();
   });
+
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "unarchiving a legacy archived %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1], {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+      // Records archived before archive-time settlement must not resurface as a second active
+      // controller in the same edit that makes them visible again.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.unarchivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+    }
+  );
 
   test("persists unarchivedAt and runs afterUnarchive hooks (best-effort)", async () => {
     const hooks = new WorkspaceLifecycleHooks();
@@ -16227,6 +17153,87 @@ describe("WorkspaceService init cancellation", () => {
       // Keep init state intact so init-end can refresh metadata and clear isInitializing.
       expect(clearInMemoryStateMock).not.toHaveBeenCalled();
       expect(removeWorkspaceMock).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+      await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+  test("remove() holds turn admission on the session until removal settles", async () => {
+    const workspaceId = "ws-remove-holds-admission";
+    const projectPath = "/tmp/proj";
+
+    let releases = 0;
+    let releasesWhenRuntimeDeleted = -1;
+    const deleteWorkspaceMock = mock(() => {
+      releasesWhenRuntimeDeleted = releases;
+      return Promise.resolve({ success: false as const, error: "dirty" });
+    });
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace: deleteWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-hold-"));
+    try {
+      const mockAIService = {
+        ...createStreamLifecycleMocks(),
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok({
+              id: workspaceId,
+              name: "ws",
+              projectPath,
+              projectName: "proj",
+              runtimeConfig: { type: "local" },
+            })
+          )
+        ),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        on: mock(() => {}),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        off: mock(() => {}),
+      } as unknown as AIService;
+      const mockConfig: MockWorkspaceConfig = {
+        rootDir: path.join(tempRoot, "root"),
+        srcDir: "/tmp/src",
+        sessionsDir: tempRoot,
+        removeWorkspace: mock(() => Promise.resolve()),
+        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      };
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager as InitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager
+      );
+
+      // A session whose startup recovery may be one await away from dispatching.
+      const holdTurnAdmission = mock(() => ({
+        [Symbol.dispose]: () => {
+          releases += 1;
+        },
+      }));
+      const dispose = mock(() => undefined);
+      (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        workspaceId,
+        {
+          holdTurnAdmission,
+          dispose,
+        } as unknown as AgentSession
+      );
+
+      const result = await workspaceService.remove(workspaceId, false);
+      expect(result.success).toBe(false);
+      expect(holdTurnAdmission).toHaveBeenCalledTimes(1);
+      // Held across the runtime deletion, released once the failed removal settles so the
+      // still-configured workspace stays usable.
+      expect(releasesWhenRuntimeDeleted).toBe(0);
+      expect(releases).toBe(1);
+      expect(dispose).not.toHaveBeenCalled();
     } finally {
       createRuntimeSpy.mockRestore();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });

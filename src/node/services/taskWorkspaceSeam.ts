@@ -90,6 +90,8 @@ export interface TaskCreateArgs {
    * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
    */
   isolation?: TaskIsolation;
+  /** Desktop sharing is independent of checkout isolation. */
+  desktop?: "shared" | "isolated";
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
   /**
    * Model-refusal policy persisted on the child workspace. "fail" opts the task
@@ -450,7 +452,11 @@ export interface WorkspaceLifecycleHost {
     worktreeArchiveBehavior?: WorktreeArchiveBehavior,
     metadata?: WorkspaceMetadata
   ): boolean;
-  remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  remove(
+    workspaceId: string,
+    force?: boolean,
+    options?: { beforeRemove?: () => Promise<boolean> }
+  ): Promise<Result<void>>;
   removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
 }
 
@@ -515,7 +521,10 @@ export interface AgentTaskIntegration {
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
-  restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;
+  restoreInterruptedTaskAfterResumeFailure(
+    workspaceId: string,
+    previousStatus?: AgentTaskStatus | null
+  ): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
@@ -543,7 +552,10 @@ export interface WorkspaceTurnTaskHost {
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (
+      workspace: WorkspaceConfigEntry,
+      config: ReturnType<Config["loadConfigOrDefault"]>
+    ) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean>;
   emitWorkspaceMetadata(workspaceId: string): Promise<void>;

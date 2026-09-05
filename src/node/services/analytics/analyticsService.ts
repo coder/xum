@@ -200,6 +200,7 @@ interface AnalyticsFilterInput {
 
 export class AnalyticsService {
   private worker: Worker | null = null;
+  private workerExited = false;
   private messageIdCounter = 0;
   private readonly pendingPromises = new Map<
     number,
@@ -323,6 +324,7 @@ export class AnalyticsService {
   };
 
   private readonly onWorkerExit = (code: number): void => {
+    this.workerExited = true;
     if (code === 0) {
       return;
     }
@@ -840,13 +842,11 @@ export class AnalyticsService {
   }
 
   dispose(): Promise<void> {
-    this.disposePromise ??= Promise.resolve().then(() => {
-      this.disposeInternal();
-    });
+    this.disposePromise ??= Promise.resolve().then(() => this.disposeInternal());
     return this.disposePromise;
   }
 
-  private disposeInternal(): void {
+  private async disposeInternal(): Promise<void> {
     this.isDisposed = true;
 
     const disposedError = new Error("Analytics service is shutting down");
@@ -865,15 +865,38 @@ export class AnalyticsService {
     worker.off("error", this.onWorkerError);
     worker.off("exit", this.onWorkerExit);
 
-    // Shut down DuckDB from inside the worker thread first. The worker is
-    // already unref'd, so process shutdown does not wait for this cleanup.
+    // A worker that already exited (crash or clean stop) has nothing left to close.
+    if (this.workerExited) {
+      return;
+    }
+
+    // Shut down DuckDB from inside the worker thread first. The worker is unref'd, so the
+    // process would not wait for it on its own; wait for its actual exit here because the
+    // worker closes DuckDB only after in-flight ETL finishes, and exiting the process mid-sync
+    // (e.g. Ctrl-C during the startup sync) tears the thread down inside native DuckDB code and
+    // aborts the whole process. Deliberately unbounded: an ETL that outlives a local timeout
+    // would still be mid-query when the caller exits, so the hard-exit decision belongs to the
+    // outer quit budgets in cli/server.ts and desktop/main.ts, which race the whole dispose.
+    // Keep an error listener until exit: onWorkerError was detached above, and a worker
+    // `error` with no listener is rethrown by the parent EventEmitter, which would turn a
+    // failing DuckDB close into a crash of the shutting-down process.
+    worker.on("error", (error: Error) => {
+      log.warn("[AnalyticsService] Analytics worker error during shutdown", {
+        error: getErrorMessage(error),
+      });
+    });
+    const exited = new Promise<void>((resolve) => {
+      worker.once("exit", () => resolve());
+    });
     try {
       worker.postMessage({ type: "shutdown" } satisfies WorkerShutdownMessage);
     } catch (error) {
       log.warn("[AnalyticsService] Failed to post graceful shutdown message to analytics worker", {
         error: getErrorMessage(error),
       });
+      return;
     }
+    await exited;
   }
 
   clearWorkspace(

@@ -641,13 +641,13 @@ describe("ProvidersSection", () => {
     expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
   });
 
-  test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
-    // Regression: the "Settings: Login with Coder" palette command passes a
-    // one-shot startCoderLogin hint through SettingsContext; ProvidersSection
-    // must consume it by actually starting the OAuth flow, not just opening
-    // the Providers list. The hint is injected by spying on useSettings
-    // (a full-plumbing variant that clicked through a live SettingsProvider
-    // proved order-fragile in the monolithic CI process).
+  /**
+   * Browser-mode Coder login harness: no window.api (browser, not desktop), a
+   * configured deployment URL, and a fetch double standing in for the Xum
+   * server's /auth/coder/start route. Returns the recorded start requests and
+   * the waitForDesktopFlow mock the flow continues on.
+   */
+  function setupBrowserCoderLogin(opts: { hint: boolean }) {
     const providersConfig = createProvidersConfig();
     providersConfig.coder = {
       apiKeySet: false,
@@ -665,16 +665,37 @@ describe("ProvidersSection", () => {
         data: { flowId: "flow", authorizeUrl: "https://coder.example.com/oauth2/authorize" },
       })
     );
+    const waitForDesktopFlow = mock(
+      // Never resolves — the user would complete the login in the browser.
+      (_input: { flowId: string }) => new Promise<never>(() => undefined)
+    );
     (client as unknown as Record<string, unknown>).coderOauth = {
       startDesktopFlow,
-      // Never resolves — the user would complete the login in the browser.
-      waitForDesktopFlow: () => new Promise(() => undefined),
+      waitForDesktopFlow,
       cancelDesktopFlow: () => Promise.resolve(undefined),
     };
 
+    const startRequests: URL[] = [];
+    const fetchDouble = (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === "string" ? input : (input as URL).toString());
+      startRequests.push(url);
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            flowId: url.searchParams.get("flowId"),
+            authorizeUrl: "https://coder.example.com/oauth2/authorize",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    };
+    spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(fetchDouble, { preconnect: () => undefined }) as typeof fetch
+    );
+
     // Stateful hint: true until the section consumes it, so re-renders after
     // consumption do not re-trigger the login.
-    let startCoderLoginHint = true;
+    let startCoderLoginHint = opts.hint;
     const setProvidersStartCoderLogin = mock((start: boolean) => {
       startCoderLoginHint = start;
     });
@@ -685,7 +706,7 @@ describe("ProvidersSection", () => {
       close: () => undefined,
       setActiveSection: () => undefined,
       registerOnClose: () => () => undefined,
-      providersExpandedProvider: null,
+      providersExpandedProvider: opts.hint ? null : "coder",
       setProvidersExpandedProvider: () => undefined,
       providersStartCoderLogin: startCoderLoginHint,
       setProvidersStartCoderLogin,
@@ -697,20 +718,69 @@ describe("ProvidersSection", () => {
       setInstructionsProjectPath: () => undefined,
     }));
 
-    render(
+    const view = render(
       <SettingsSectionStory setup={() => client}>
         <ProvidersSection />
       </SettingsSectionStory>
     );
+    return {
+      view,
+      startDesktopFlow,
+      waitForDesktopFlow,
+      startRequests,
+      setProvidersStartCoderLogin,
+    };
+  }
+
+  test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
+    // Regression: the "Settings: Login with Coder" palette command passes a
+    // one-shot startCoderLogin hint through SettingsContext; ProvidersSection
+    // must consume it by actually starting the OAuth flow, not just opening
+    // the Providers list. The hint is injected by spying on useSettings
+    // (a full-plumbing variant that clicked through a live SettingsProvider
+    // proved order-fragile in the monolithic CI process).
+    const { startDesktopFlow, waitForDesktopFlow, startRequests, setProvidersStartCoderLogin } =
+      setupBrowserCoderLogin({ hint: true });
 
     await waitFor(() => {
-      expect(startDesktopFlow).toHaveBeenCalled();
+      expect(startRequests).toHaveLength(1);
     });
     // The hint is one-shot: consumed (cleared) exactly once, one flow started.
     expect(setProvidersStartCoderLogin).toHaveBeenCalledWith(false);
-    expect(startDesktopFlow).toHaveBeenCalledTimes(1);
-    expect(startDesktopFlow.mock.calls[0][0]).toMatchObject({
-      deploymentUrl: "https://coder.example.com",
+    // Browser mode: the server-hosted flow, not the desktop loopback one.
+    expect(startDesktopFlow).not.toHaveBeenCalled();
+    expect(startRequests[0].pathname).toBe("/auth/coder/start");
+    expect(startRequests[0].searchParams.get("deploymentUrl")).toBe("https://coder.example.com");
+    // The flow then continues on the shared oRPC wait with the started flow ID.
+    await waitFor(() => {
+      expect(waitForDesktopFlow).toHaveBeenCalledTimes(1);
     });
+    const startedFlowId = startRequests[0].searchParams.get("flowId");
+    expect(startedFlowId).toBeTruthy();
+    expect(waitForDesktopFlow.mock.calls[0][0].flowId).toBe(startedFlowId!);
+    expect(startRequests).toHaveLength(1);
+  });
+
+  test("offers Login with Coder on a remote Xum server and starts the server-hosted flow", async () => {
+    // Regression: remote browsers used to get an explanation instead of the
+    // login control ("the OAuth callback must reach this machine"). The
+    // callback now lands on the server's own origin, so the control renders
+    // and the start request targets that origin.
+    (window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
+      "https://xum.example.com/"
+    );
+    const { view, startRequests } = setupBrowserCoderLogin({ hint: false });
+
+    const loginButton = await view.findByRole("button", { name: "Login with Coder" });
+    expect(view.queryByText(/requires the desktop app/)).toBeNull();
+
+    fireEvent.click(loginButton);
+
+    await waitFor(() => {
+      expect(startRequests).toHaveLength(1);
+    });
+    expect(startRequests[0].origin).toBe("https://xum.example.com");
+    expect(startRequests[0].pathname).toBe("/auth/coder/start");
+    await view.findByText("Waiting for authorization...");
   });
 });

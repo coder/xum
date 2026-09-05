@@ -7,6 +7,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/browser/components/Dialog/Dialog";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { cn } from "@/common/lib/utils";
@@ -35,7 +36,6 @@ interface WorkflowLongTextProps {
  */
 export const WorkflowLongText: React.FC<WorkflowLongTextProps> = (props) => {
   const [expanded, setExpanded] = React.useState(false);
-  const [dialogOpen, setDialogOpen] = React.useState(false);
   const { preview, truncated, totalChars } = getWorkflowTextPreview(props.text, props.charLimit);
 
   const fullContent = props.markdown ? (
@@ -49,29 +49,34 @@ export const WorkflowLongText: React.FC<WorkflowLongTextProps> = (props) => {
   }
 
   return (
-    <div className={cn("flex min-w-0 flex-col gap-1", props.className)}>
-      {expanded ? fullContent : <span className="break-words whitespace-pre-wrap">{preview}…</span>}
-      <div className="flex items-center gap-1">
-        <button
-          type="button"
-          className={CONTROL_BUTTON_CLASS}
-          onClick={() => setExpanded((value) => !value)}
-          aria-expanded={expanded}
-          aria-label={expanded ? `Show less of ${props.title}` : `Show more of ${props.title}`}
-        >
-          {expanded ? "Show less" : `Show more (${formatCompactCount(totalChars)} chars)`}
-        </button>
-        <button
-          type="button"
-          className={CONTROL_BUTTON_CLASS}
-          onClick={() => setDialogOpen(true)}
-          aria-haspopup="dialog"
-          aria-label={`Open ${props.title} in full view`}
-        >
-          <Maximize2 className="h-2.5 w-2.5" /> Full view
-        </button>
-      </div>
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+    <Dialog>
+      <div className={cn("flex min-w-0 flex-col gap-1", props.className)}>
+        {expanded ? (
+          fullContent
+        ) : (
+          <span className="break-words whitespace-pre-wrap">{preview}…</span>
+        )}
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className={CONTROL_BUTTON_CLASS}
+            onClick={() => setExpanded((value) => !value)}
+            aria-expanded={expanded}
+            aria-label={expanded ? `Show less of ${props.title}` : `Show more of ${props.title}`}
+          >
+            {expanded ? "Show less" : `Show more (${formatCompactCount(totalChars)} chars)`}
+          </button>
+          {/* A registered trigger restores keyboard focus when the full view closes. */}
+          <DialogTrigger asChild>
+            <button
+              type="button"
+              className={CONTROL_BUTTON_CLASS}
+              aria-label={`Open ${props.title} in full view`}
+            >
+              <Maximize2 className="h-2.5 w-2.5" /> Full view
+            </button>
+          </DialogTrigger>
+        </div>
         <DialogContent
           className="flex max-h-[85vh] flex-col gap-3 overflow-hidden"
           maxWidth="56rem"
@@ -84,7 +89,7 @@ export const WorkflowLongText: React.FC<WorkflowLongTextProps> = (props) => {
           </DialogHeader>
           <div className="min-h-0 flex-1 overflow-y-auto text-[12.5px]">{fullContent}</div>
         </DialogContent>
-      </Dialog>
-    </div>
+      </div>
+    </Dialog>
   );
 };

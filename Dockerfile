@@ -56,7 +56,7 @@ COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
 COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/
 COPY docs/ docs/
-COPY index.html terminal.html vite.config.ts ./
+COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
 COPY static/ static/
 

@@ -424,6 +424,100 @@ This was typed by a user.
   });
 });
 
+describe("MessageRenderer subagent failure rows", () => {
+  beforeEach(() => {
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+    globalThis.localStorage = globalThis.window.localStorage;
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.window = undefined as unknown as Window & typeof globalThis;
+    globalThis.document = undefined as unknown as Document;
+    globalThis.localStorage = undefined as unknown as Storage;
+  });
+
+  function failureMessage(
+    errorType: string,
+    errorMessage: string
+  ): DisplayedMessage & { type: "user" } {
+    return {
+      type: "user",
+      id: "subagent-failure",
+      historyId: "subagent-failure",
+      historySequence: 26,
+      isSynthetic: true,
+      content: `<mux_subagent_failure>
+<task_id>task-failed</task_id>
+<execution_version>wst_123:interrupted:2026-09-04T12:04:40.370Z</execution_version>
+<execution_id>wst_123</execution_id>
+<agent_type>exec</agent_type>
+<error_type>${errorType}</error_type>
+<error_message>
+${errorMessage}
+</error_message>
+This sub-agent task failed terminally and will not produce a report. Do not re-await it.
+</mux_subagent_failure>`,
+    };
+  }
+
+  test("distinguishes superseded turns from failures and collapses diagnostic metadata", () => {
+    const message = failureMessage("workspace_turn_superseded", "New input superseded this turn.");
+    const view = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+    expect(view.queryAllByText(/mux_subagent_failure/).length).toBe(0);
+    expect(view.queryByText("auto")).toBeNull();
+    expect(view.getByText("New input took over")).toBeDefined();
+    expect(view.queryByText("Subagent task failed")).toBeNull();
+    const details = view.getByText("Technical details").closest("details");
+    expect(details).not.toBeNull();
+    expect(details?.hasAttribute("open")).toBe(false);
+    fireEvent.click(view.getByText("Technical details"));
+    expect(details?.hasAttribute("open")).toBe(true);
+    expect(view.getByText("task-failed")).toBeDefined();
+    expect(view.getByText("wst_123")).toBeDefined();
+    expect(view.getByText("New input superseded this turn.")).toBeDefined();
+  });
+
+  test("shows unknown failure reasons as escaped text without requiring execution metadata", () => {
+    const error = '<img src=x onerror="alert(1)">\nWorker exited unexpectedly.';
+    const message = failureMessage("unknown_future_error", error);
+    message.content = message.content.replace(/<execution_(?:version|id)>[^\n]*\n/g, "");
+    const view = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+    expect(view.queryAllByText(/mux_subagent_failure/).length).toBe(0);
+    expect(view.getByText("Subagent task failed")).toBeDefined();
+    expect(view.getByText(/Worker exited unexpectedly/).textContent).toBe(error);
+    expect(view.container.querySelector("img")).toBeNull();
+    expect(view.queryByText("Execution ID")).toBeNull();
+  });
+
+  test("leaves user-authored lookalikes and malformed synthetic envelopes untouched", () => {
+    const valid = failureMessage("failed", "An error occurred.");
+    for (const message of [
+      { ...valid, isSynthetic: false },
+      { ...valid, content: valid.content.replace("</error_message>", "") },
+      { ...valid, content: `${valid.content}\nAdditional context must not be lost.` },
+    ]) {
+      const view = render(
+        <TooltipProvider>
+          <MessageRenderer message={message} />
+        </TooltipProvider>
+      );
+      expect(view.queryByText("Technical details")).toBeNull();
+      expect(view.getAllByText(/mux_subagent_failure/).length).toBeGreaterThan(0);
+      view.unmount();
+    }
+  });
+});
+
 describe("MessageRenderer background work wake rows", () => {
   beforeEach(() => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;

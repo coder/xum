@@ -105,6 +105,7 @@ export default defineConfig(({ mode }) => {
         input: {
           main: path.resolve(__dirname, "index.html"),
           terminal: path.resolve(__dirname, "terminal.html"),
+          desktop: path.resolve(__dirname, "desktop.html"),
         },
         output: {
           format: "es",

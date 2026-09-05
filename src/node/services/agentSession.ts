@@ -47,6 +47,8 @@ import {
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -113,7 +115,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue } from "./messageQueue";
+import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -128,6 +130,7 @@ import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { CompactionHandler } from "./compactionHandler";
 import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
+import type { EffectRunner } from "./di/effectRunner";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
@@ -513,6 +516,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
  */
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
+const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
@@ -543,6 +547,13 @@ export interface AgentSessionStreamManager {
   isStreaming(workspaceId: string): boolean;
   getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
   replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+  /**
+   * The runner the stream manager's clock-driven fibers use; the session's
+   * `RetryManager` schedules its backoff on the same clock. Absent on test
+   * doubles and the AIService fallback, which leaves RetryManager on the
+   * global runtime.
+   */
+  readonly effectRunner?: EffectRunner;
 }
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
@@ -662,6 +673,7 @@ export class AgentSession {
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
   private disposed = false;
+  private shuttingDown = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
@@ -952,12 +964,23 @@ export class AgentSession {
       async () => {
         await this.retryActiveStream();
       },
-      (event) => this.handleRetryStatusChange(event)
+      (event) => this.handleRetryStatusChange(event),
+      this.streamManager.effectRunner
     );
 
     this.attachAiListeners();
     this.attachInitListeners();
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
+  }
+
+  /**
+   * Process shutdown for a session that stays alive through teardown (a live stream's partial must
+   * survive for the next startup's recovery, so dispose() and its abandonPartial are wrong here).
+   * Stops the retry timer and makes every internal dispatch boundary below bail like `disposed`.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+    this.retryManager.cancel();
   }
 
   dispose(): void {
@@ -1258,6 +1281,9 @@ export class AgentSession {
       typeof error.type === "string" && error.type.length > 0,
       "handleStreamFailureForAutoRetry requires a non-empty error.type"
     );
+    if (this.shuttingDown) {
+      return;
+    }
 
     // Load persisted preference before scheduling retries so an on-disk opt-out is
     // honored even when the first failure happens before startup recovery runs.
@@ -1302,6 +1328,12 @@ export class AgentSession {
       const request = this.lastAutoRetryResumeRequest;
       if (!request) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+        return;
+      }
+
+      // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
+      if (this.isWorkspaceArchivedOnDisk()) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
         return;
       }
 
@@ -2303,6 +2335,12 @@ export class AgentSession {
       this.startupAutoRetryDeferredRetryDelayMs = 0;
       return "deferred";
     }
+    if (this.isWorkspaceArchivedOnDisk()) {
+      log.debug("Startup auto-retry skipped: workspace is archived", {
+        workspaceId: this.workspaceId,
+      });
+      return "completed";
+    }
     await this.handleStreamFailureForAutoRetry({
       type: "unknown",
       message: "startup_interrupted_stream",
@@ -2402,7 +2440,7 @@ export class AgentSession {
   }
 
   async runStartupRecovery(): Promise<void> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return;
     }
 
@@ -2441,7 +2479,7 @@ export class AgentSession {
     }
 
     let deferredAttempts = 0;
-    while (!this.disposed) {
+    while (!this.disposed && !this.shuttingDown) {
       let outcome: StartupAutoRetryCheckOutcome;
       try {
         outcome = await this.scheduleStartupAutoRetryIfNeeded();
@@ -3161,12 +3199,8 @@ export class AgentSession {
         }
       }
 
-      const reason =
-        typeof cancelSignal.reason === "string"
-          ? cancelSignal.reason
-          : "Queued message canceled before acceptance.";
       cancellationHandled = true;
-      await internal?.onCanceled?.(reason);
+      await internal?.onCanceled?.(cancelReasonBeforeAcceptance(cancelSignal));
       if (internal?.cancelState != null) {
         internal.cancelState.canceledBeforeAcceptance = true;
       }
@@ -3451,6 +3485,9 @@ export class AgentSession {
       // completed mutation already discarded.
       if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      }
+      if (this.shuttingDown) {
+        return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
       }
 
       // Idle (or preempted to idle) now: hold busy-ness from here until the
@@ -3778,6 +3815,11 @@ export class AgentSession {
     // backstops for entry-accounting bypasses.
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+    // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
+    // while streamWithHistory's own latch check keeps its stream from ever running.
+    if (this.shuttingDown) {
+      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
     }
 
     // Persist snapshots only when this turn will be sent immediately.
@@ -4546,6 +4588,26 @@ export class AgentSession {
   }
 
   /**
+   * Startup recovery dispatches through this session's internal send path, which bypasses
+   * WorkspaceService.sendMessage's archived guard, so an archive that lands while a recovery
+   * step awaits disk I/O would otherwise start a hidden stream. Re-read the durable state right
+   * before dispatching: dispose() reaches only transient recovery sessions, not a session a
+   * client had already created when housekeeping scheduled the recovery on it.
+   */
+  private isWorkspaceArchivedOnDisk(): boolean {
+    try {
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
+      return (
+        entry != null &&
+        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      );
+    } catch {
+      // Partial Config mocks (see getCompactionResolverInputs); a real config never throws here.
+      return false;
+    }
+  }
+
+  /**
    * Layers for auto-compaction resolution. Defensive reads: tests construct
    * sessions with partial Config mocks, so missing methods degrade to empty
    * layers instead of throwing.
@@ -4830,6 +4892,9 @@ export class AgentSession {
       }
     } finally {
       this.midStreamCompactionPending = false;
+      // Preflight drains deferred to this pending compaction have no other retry: if the
+      // compaction request never became a turn, release the queue now (no-op when it did).
+      this.drainQueuedMessagesIfIdle();
     }
   }
 
@@ -4967,9 +5032,13 @@ export class AgentSession {
     // up its replacement's holder. Absent for internal retry paths.
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride
   ): Promise<AgentSessionResult<void>> {
-    const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
+    // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
+    // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
+    // detection, or history reads, and must not reach the provider afterwards.
+    const isStreamStartAborted = (): boolean =>
+      this.disposed || this.shuttingDown || abortSignal?.aborted === true;
 
-    if (this.disposed || isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -4998,7 +5067,7 @@ export class AgentSession {
       );
     }
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5011,7 +5080,7 @@ export class AgentSession {
     // abort or append failure therefore re-detects the same change (nothing is
     // dropped), while a successful append cannot produce a duplicate row.
     const fileChangeDetection = await this.fileChangeTracker.getChangedAttachments();
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
     if (fileChangeDetection.attachments.length > 0) {
@@ -5028,7 +5097,7 @@ export class AgentSession {
     }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5089,7 +5158,7 @@ export class AgentSession {
       options
     );
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5098,7 +5167,7 @@ export class AgentSession {
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -6513,13 +6582,16 @@ export class AgentSession {
     }
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches.
-    const effectiveDispatchMode = this.messageQueue.getNextQueueDispatchMode();
+    // only for tool-end dispatches. Return the same mode so the caller's foreground
+    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      effectiveDispatchMode === "tool-end"
+      nextDispatchableMode === "tool-end"
     );
-    return effectiveDispatchMode;
+    // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
+    // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
+    return nextDispatchableMode ?? null;
   }
 
   clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
@@ -6545,7 +6617,7 @@ export class AgentSession {
     // user-authored turn-end entry forward to a step boundary.
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     return true;
   }
@@ -6582,7 +6654,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
@@ -6610,17 +6682,16 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
   }
 
+  /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
-    return (
-      !this.messageQueue.isEmpty() &&
-      (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
-    );
+    const nextMode = this.messageQueue.getNextDispatchableMode();
+    return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -6789,8 +6860,11 @@ export class AgentSession {
       return false;
     }
 
+    // Physical check: withdrawn entries must still drain so their onCanceled fires.
     const shouldDispatch =
-      abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
+      abortReason !== "user" &&
+      !this.deferQueuedFlushUntilAfterEdit &&
+      !this.messageQueue.isEmpty();
     this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
@@ -6898,6 +6972,28 @@ export class AgentSession {
   }
 
   /**
+   * Drain the queue when no turn owns the next dispatch. For callers whose
+   * reservation kept a send invisible to isBusy() (WorkspaceService preflight)
+   * and that settled without a turn, so no stream end will drain what queued
+   * behind them. A turn in flight, a mid-stream compaction about to dispatch its
+   * request, or the edit flow still owns the next dispatch, so the queue keeps
+   * waiting for them. A scheduled auto-retry does not: this is the only drain
+   * the queued input gets, and the retry defers to the busy session
+   * (retry_deferred_busy) until stream success cancels it, matching the
+   * failed-startup drains elsewhere in this file.
+   */
+  drainQueuedMessagesIfIdle(): void {
+    if (
+      this.hasActiveOrPendingTurnWork() ||
+      this.deferQueuedFlushUntilAfterEdit ||
+      this.messageQueue.isEmpty()
+    ) {
+      return;
+    }
+    this.sendQueuedMessages();
+  }
+
+  /**
    * Send queued messages if any exist.
    * Called when the current turn ends or the user chooses to send immediately.
    */
@@ -6931,12 +7027,10 @@ export class AgentSession {
 
       // Re-arm dispatch signals for the remaining entries so the stream we are
       // about to start drains them at its next tool end (or stream end).
-      if (!this.messageQueue.isEmpty()) {
-        this.backgroundProcessManager.setMessageQueued(
-          this.workspaceId,
-          this.messageQueue.getNextQueueDispatchMode() === "tool-end"
-        );
-      }
+      this.backgroundProcessManager.setMessageQueued(
+        this.workspaceId,
+        this.messageQueue.getNextDispatchableMode() === "tool-end"
+      );
 
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
@@ -7068,7 +7162,7 @@ export class AgentSession {
    * proof of dispatch (no history rewrite needed).
    */
   private async dispatchPendingFollowUp(summaryMessageId?: string): Promise<boolean> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return false;
     }
 
@@ -7341,6 +7435,16 @@ export class AgentSession {
 
     if (metadata) {
       options.muxMetadata = metadata;
+    }
+
+    // Leave the follow-up pending on the summary: it dispatches on the next startup after an
+    // unarchive instead of running hidden now.
+    if (this.isWorkspaceArchivedOnDisk()) {
+      log.debug("Pending follow-up skipped: workspace is archived", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return false;
     }
 
     // The compaction summary is now the source of truth for the next live resume

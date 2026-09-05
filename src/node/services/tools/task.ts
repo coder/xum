@@ -151,6 +151,7 @@ interface SpawnedTaskInfo {
   status: "queued" | "starting" | "running";
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 interface PendingTaskInfo {
@@ -158,6 +159,7 @@ interface PendingTaskInfo {
   status: "queued" | "starting" | "running" | "completed" | "interrupted";
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 interface CompletedTaskInfo {
@@ -169,6 +171,7 @@ interface CompletedTaskInfo {
   agentType: string;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
+  desktopOwnerWorkspaceId?: string;
 }
 
 type ForegroundWaitOutcome =
@@ -224,6 +227,7 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
     agentType: report.agentType,
     modelString: report.modelString,
     thinkingLevel: report.thinkingLevel,
+    desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
   };
 }
 
@@ -277,6 +281,7 @@ function buildPendingTaskResult(params: {
       taskId: task.taskId,
       modelString: task.modelString,
       thinkingLevel: task.thinkingLevel,
+      desktopOwnerWorkspaceId: task.desktopOwnerWorkspaceId,
       note: params.note,
     };
   }
@@ -289,6 +294,7 @@ function buildPendingTaskResult(params: {
       status: task.status,
       modelString: task.modelString,
       thinkingLevel: task.thinkingLevel,
+      desktopOwnerWorkspaceId: task.desktopOwnerWorkspaceId,
     })),
     note: params.note,
     ...(serializedReports ? { reports: serializedReports } : {}),
@@ -311,6 +317,7 @@ function buildCompletedTaskResult(params: {
       agentType: report.agentType,
       modelString: report.modelString,
       thinkingLevel: report.thinkingLevel,
+      desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
     };
   }
 
@@ -337,6 +344,7 @@ function normalizePendingTaskStatuses(params: {
         status: "completed",
         modelString: completedReport.modelString ?? createdTask.modelString,
         thinkingLevel: completedReport.thinkingLevel ?? createdTask.thinkingLevel,
+        desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
       };
     }
 
@@ -354,6 +362,7 @@ function normalizePendingTaskStatuses(params: {
               : "running",
       modelString: createdTask.modelString,
       thinkingLevel: createdTask.thinkingLevel,
+      desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
     };
   });
 }
@@ -401,6 +410,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         model,
         thinking,
         isolation,
+        desktop,
         workspace,
       } = validatedArgs;
 
@@ -572,6 +582,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             ? { thinkingLevel: aiOverrides.thinkingLevel }
             : {}),
           ...(isolation != null ? { isolation } : {}),
+          ...(desktop != null ? { desktop } : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
           // Background launches are non-blocking with terminal wake-up; foreground/default block.
           attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
@@ -608,6 +619,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           status: created.data.status,
           modelString: created.data.modelString,
           thinkingLevel: created.data.thinkingLevel,
+          desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
         } satisfies SpawnedTaskInfo;
         createdTasks.push(task);
 
@@ -654,6 +666,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
                 // auto-handoffs to exec rewrites its task settings after launch.
                 modelString: report.model ?? createdTask.modelString,
                 thinkingLevel: report.thinkingLevel ?? createdTask.thinkingLevel,
+                desktopOwnerWorkspaceId: createdTask.desktopOwnerWorkspaceId,
               } satisfies CompletedTaskInfo,
             };
           } catch (error: unknown) {

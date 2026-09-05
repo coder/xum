@@ -15,6 +15,7 @@
  * preserved structurally rather than re-derived.
  */
 import * as crypto from "crypto";
+import type http from "node:http";
 import { Duration, Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -122,6 +123,79 @@ interface CoderLoginCommitResult {
   outcome: "committed" | "cancelled" | "failed";
   replacedAuth?: CoderOauthAuth;
   persistedAuthRetained?: boolean;
+}
+
+/**
+ * Where a login flow's authorization-code redirect lands. Desktop flows own a
+ * 127.0.0.1 loopback listener (`startLoopbackServer`); browser/server-mode
+ * flows are redirected to the Xum server's own `/auth/coder/callback` route,
+ * which hands the code over through a `ServerCallbackChannel`. Registration,
+ * exchange, and commit are channel-agnostic: only the redirect URI and the
+ * "answer the browser tab" hooks differ.
+ */
+interface CoderCallbackChannel {
+  redirectUri: string;
+  /** Loopback listener handed to the flow manager for cleanup; null for server-hosted callbacks. */
+  server: http.Server | null;
+  /** Resolves once the redirect carrying this flow's state arrived (or reported an error). */
+  result: Promise<Result<{ code: string }, string>>;
+  sendSuccessResponse: () => void;
+  sendFailureResponse: (error: string) => void;
+  close: () => Promise<void>;
+}
+
+/**
+ * Server-mode callback channel. The Xum server's callback route delivers the
+ * redirect parameters via `deliver`, which resolves the pending callback
+ * exactly once and returns the login outcome for the route to render. That
+ * outcome is raced against the flow's own completion so a Cancel or flow
+ * timeout winning mid-exchange settles the browser request instead of leaving
+ * it hanging (the loopback equivalent is the patched `server.close()` in
+ * startLoopbackServer).
+ */
+class ServerCallbackChannel implements CoderCallbackChannel {
+  readonly server = null;
+  private readonly callback = createDeferred<Result<{ code: string }, string>>();
+  private readonly response = createDeferred<Result<void, string>>();
+  private delivered = false;
+  readonly result = this.callback.promise;
+
+  constructor(
+    readonly redirectUri: string,
+    private readonly flowResult: Promise<Result<void, string>>
+  ) {}
+
+  /** Null when a redirect was already delivered for this flow (one-shot, like an auth code). */
+  deliver(input: {
+    code: string | null;
+    error: string | null;
+    errorDescription?: string;
+  }): Promise<Result<void, string>> | null {
+    if (this.delivered) {
+      return null;
+    }
+    this.delivered = true;
+    if (input.error) {
+      this.callback.resolve(
+        Err(input.errorDescription ? `${input.error}: ${input.errorDescription}` : input.error)
+      );
+    } else if (!input.code) {
+      this.callback.resolve(Err("Missing authorization code"));
+    } else {
+      this.callback.resolve(Ok({ code: input.code }));
+    }
+    return Promise.race([this.response.promise, this.flowResult]);
+  }
+
+  sendSuccessResponse = (): void => {
+    this.response.resolve(Ok(undefined));
+  };
+
+  sendFailureResponse = (error: string): void => {
+    this.response.resolve(Err(error));
+  };
+
+  close = (): Promise<void> => Promise.resolve();
 }
 
 function sha256Base64Url(value: string): string {
@@ -260,6 +334,11 @@ export class CoderOauthService {
   // as an orphan the UI can no longer reach. Keyed by caller-supplied flow ID
   // with an insertion timestamp for pruning.
   private readonly preCancelledFlowIds = new Map<string, number>();
+
+  // Server-mode flows' callback channels, keyed by flow ID (= OAuth state) so
+  // the unauthenticated /auth/coder/callback route can hand the redirect to
+  // its flow. Entries are removed when the flow settles (see registerFlow).
+  private readonly serverCallbacks = new Map<string, ServerCallbackChannel>();
 
   // Bumped by disconnect() so login attempts still in their pre-registration
   // probes (no flow entry yet — cancelAll cannot see them, and disconnect
@@ -509,15 +588,69 @@ export class CoderOauthService {
     return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect(input)));
   }
 
+  /**
+   * Browser/server-mode login: the same flow as startDesktopFlow, but the
+   * authorization redirect targets the Xum server's own callback route
+   * (`redirectUri`, built by the HTTP layer from the validated public host —
+   * never caller-supplied over RPC) instead of a loopback listener, so the
+   * user's browser completes the login against a remote Xum server. The flow
+   * is registered in the shared manager, so waitForDesktopFlow /
+   * cancelDesktopFlow / disconnect apply unchanged; the callback route hands
+   * the redirect over via handleServerCallback.
+   */
+  async startServerFlow(input: {
+    deploymentUrl: string;
+    flowId?: string;
+    redirectUri: string;
+  }): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
+    return Effect.runPromise(
+      Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect(input)))
+    );
+  }
+
+  /**
+   * Deliver an authorization redirect received by the server callback route to
+   * its flow, resolving with the login outcome once the exchange + commit
+   * settled (or the flow was cancelled/timed out). Unauthenticated callers
+   * reach this: `state` alone selects the flow, and the delivered code is only
+   * ever exchanged with this process's PKCE verifier and client secret.
+   */
+  async handleServerCallback(input: {
+    state: string | null;
+    code: string | null;
+    error: string | null;
+    errorDescription?: string;
+  }): Promise<Result<void, string>> {
+    if (!input.state) {
+      return Err("Missing OAuth state");
+    }
+    const channel = this.serverCallbacks.get(input.state);
+    if (!channel || !this.desktopFlows.has(input.state)) {
+      return Err("Unknown or expired OAuth state");
+    }
+    const outcome = channel.deliver(input);
+    if (outcome === null) {
+      return Err("This login was already completed");
+    }
+    return await outcome;
+  }
+
   private launchDesktopFlowEffect(input: {
     deploymentUrl: string;
     flowId?: string;
+    /** Server-hosted callback URL; a loopback listener is used when omitted. */
+    redirectUri?: string;
   }): Effect.Effect<{ flowId: string; authorizeUrl: string }, CoderOauthError> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       if (input.flowId !== undefined && !/^[A-Za-z0-9_-]{16,128}$/.test(input.flowId)) {
         return yield* Effect.fail(new CoderOauthError({ reason: "Invalid flow ID" }));
+      }
+      // The HTTP layer builds this from the validated public host; anything
+      // else here is a programming error, not user input.
+      if (input.redirectUri !== undefined && parseEndpointUrl(input.redirectUri) === null) {
+        return yield* Effect.fail(new CoderOauthError({ reason: "Invalid OAuth redirect URI" }));
       }
       const flowId = input.flowId ?? randomBase64Url();
       // Snapshot before the first await: a disconnect() during any of the
@@ -585,23 +718,31 @@ export class CoderOauthService {
         return yield* Effect.fail(new CoderOauthError({ reason: "Login was cancelled" }));
       }
 
-      // Ephemeral port: Coder requires exact redirect URI matching (OAuth 2.1),
-      // so the freshly bound URI is (re-)registered on the client below.
-      const loopback = yield* Effect.tryPromise({
-        try: () =>
-          startLoopbackServer({
-            port: 0,
-            host: "127.0.0.1",
-            callbackPath: CODER_OAUTH_CALLBACK_PATH,
-            validateLoopback: true,
-            expectedState: flowId,
-            deferSuccessResponse: true,
-          }),
-        catch: (error) =>
-          new CoderOauthError({
-            reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
-          }),
-      });
+      const resultDeferred = createDeferred<Result<void, string>>();
+
+      // Where the authorization redirect lands. Desktop: an ephemeral-port
+      // loopback listener — Coder requires exact redirect URI matching (OAuth
+      // 2.1), so the freshly bound URI is (re-)registered on the client below.
+      // Server mode: the Xum server's own callback route, wired to this flow
+      // through serverCallbacks right after registration.
+      const channel: CoderCallbackChannel =
+        input.redirectUri !== undefined
+          ? new ServerCallbackChannel(input.redirectUri, resultDeferred.promise)
+          : yield* Effect.tryPromise({
+              try: () =>
+                startLoopbackServer({
+                  port: 0,
+                  host: "127.0.0.1",
+                  callbackPath: CODER_OAUTH_CALLBACK_PATH,
+                  validateLoopback: true,
+                  expectedState: flowId,
+                  deferSuccessResponse: true,
+                }),
+              catch: (error) =>
+                new CoderOauthError({
+                  reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
+                }),
+            });
 
       // Last pre-registration checkpoint: this check and register() below run
       // with no intervening await, so a cancel (or disconnect) is either
@@ -610,11 +751,9 @@ export class CoderOauthService {
         self.consumePreCancelled(flowId) ||
         self.disconnectGeneration !== initialDisconnectGeneration
       ) {
-        yield* Effect.promise(() => loopback.close());
+        yield* Effect.promise(() => channel.close());
         return yield* Effect.fail(new CoderOauthError({ reason: "Login was cancelled" }));
       }
-
-      const resultDeferred = createDeferred<Result<void, string>>();
 
       // The flow is registered BEFORE the client-registration round-trip: the
       // loopback listener is already open, and this network await would
@@ -625,7 +764,7 @@ export class CoderOauthService {
       // first puts the whole window under the flow timeout, and finishing the
       // flow (cancel/timeout/shutdown) aborts the in-flight RPC below.
       self.desktopFlows.register(flowId, {
-        server: loopback.server,
+        server: channel.server,
         resultDeferred,
         // Keep server-side timeout tied to flow lifetime so abandoned flows
         // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
@@ -635,6 +774,17 @@ export class CoderOauthService {
           );
         }, DEFAULT_DESKTOP_TIMEOUT_MS),
       });
+      if (channel instanceof ServerCallbackChannel) {
+        // Same synchronous window as register(): the callback route can find
+        // the flow from the moment it exists. Detach when the flow settles;
+        // the identity guard protects a replacement flow reusing this ID.
+        self.serverCallbacks.set(flowId, channel);
+        void resultDeferred.promise.then(() => {
+          if (self.serverCallbacks.get(flowId) === channel) {
+            self.serverCallbacks.delete(flowId);
+          }
+        });
+      }
 
       // Aborts every network round-trip owned by this flow (client
       // registration, token exchange) when the flow finishes — Cancel, flow
@@ -673,7 +823,7 @@ export class CoderOauthService {
           self.ensureClientEffect(
             deploymentUrl,
             endpoints,
-            loopback.redirectUri,
+            channel.redirectUri,
             flowAbort.signal,
             ownsStoredClient,
             (clientId) => {
@@ -737,12 +887,12 @@ export class CoderOauthService {
       const authorizeUrl = buildCoderAuthorizeUrl({
         authorizationEndpoint: endpoints.authorizationEndpoint,
         clientId: client.clientId,
-        redirectUri: loopback.redirectUri,
+        redirectUri: channel.redirectUri,
         state: flowId,
         codeChallenge,
       });
 
-      // Background fiber: wait for the loopback callback, exchange code for
+      // Background fiber: wait for the callback redirect, exchange code for
       // tokens, then commit the login. Races against resultDeferred (which
       // resolves on cancel/timeout) so the fiber exits cleanly if the flow is
       // cancelled.
@@ -754,7 +904,7 @@ export class CoderOauthService {
           tokenEndpoint: endpoints.tokenEndpoint,
           client,
           codeVerifier,
-          loopback,
+          channel,
           resultDeferred,
           flowAbortSignal: flowAbort.signal,
         })
@@ -768,9 +918,9 @@ export class CoderOauthService {
 
   /**
    * Desktop-flow completion pipeline, forked from `launchDesktopFlowEffect`.
-   * Races the loopback callback against resultDeferred so that if the flow is
+   * Races the callback redirect against resultDeferred so that if the flow is
    * cancelled/timed out externally, this fiber exits cleanly instead of
-   * dangling on loopback.result.
+   * dangling on channel.result.
    */
   private desktopCallbackPipeline(args: {
     flowId: string;
@@ -779,7 +929,7 @@ export class CoderOauthService {
     tokenEndpoint: string;
     client: CoderOauthClient;
     codeVerifier: string;
-    loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
+    channel: CoderCallbackChannel;
     resultDeferred: ReturnType<typeof createDeferred<Result<void, string>>>;
     flowAbortSignal: AbortSignal;
   }): Effect.Effect<void> {
@@ -787,7 +937,7 @@ export class CoderOauthService {
     const self = this;
     return Effect.gen(function* () {
       const callbackResult = yield* Effect.promise(() =>
-        Promise.race([args.loopback.result, args.resultDeferred.promise.then((): null => null)])
+        Promise.race([args.channel.result, args.resultDeferred.promise.then((): null => null)])
       );
 
       // null means the flow was finished externally (cancel/timeout).
@@ -813,13 +963,13 @@ export class CoderOauthService {
           sessionId: randomBase64Url(16),
           client: args.client,
           code: callbackResult.data.code,
-          redirectUri: args.loopback.redirectUri,
+          redirectUri: args.channel.redirectUri,
           codeVerifier: args.codeVerifier,
         },
         args.flowAbortSignal
       );
       if (!tokenResult.success) {
-        args.loopback.sendFailureResponse(tokenResult.error);
+        args.channel.sendFailureResponse(tokenResult.error);
         yield* self.desktopFlows.finishEffect(args.flowId, Err(tokenResult.error));
         return;
       }
@@ -829,7 +979,7 @@ export class CoderOauthService {
         args.flowStartPersistedGeneration,
         args.deploymentUrl,
         tokenResult.auth,
-        args.loopback
+        args.channel
       );
 
       // Model discovery runs only after the flow is committed: Cancel is no
@@ -1415,10 +1565,7 @@ export class CoderOauthService {
     flowStartPersistedGeneration: number,
     deploymentUrl: string,
     auth: CoderOauthAuth,
-    loopback: Pick<
-      Awaited<ReturnType<typeof startLoopbackServer>>,
-      "sendSuccessResponse" | "sendFailureResponse"
-    >
+    channel: Pick<CoderCallbackChannel, "sendSuccessResponse" | "sendFailureResponse">
   ): Effect.Effect<boolean> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1433,7 +1580,7 @@ export class CoderOauthService {
           flowStartPersistedGeneration,
           deploymentUrl,
           auth,
-          loopback
+          channel
         );
 
         // Revocation is best-effort network I/O against a possibly stalled
@@ -1445,7 +1592,9 @@ export class CoderOauthService {
           // the flow timeout wins mid-commit, the flow manager closes the raw
           // loopback server, whose patched close() ends the deferred callback
           // response first (see startLoopbackServer) — so the awaited cancel RPC
-          // never hangs on server.close().
+          // never hangs on server.close(). A server-mode callback request is
+          // settled by the same flow completion (ServerCallbackChannel.deliver
+          // races it against the response hooks).
 
           // Every non-committed outcome revokes the exchanged tokens: a failed
           // persist (unwritable providers.jsonc, lock timeout) would otherwise
@@ -1485,10 +1634,7 @@ export class CoderOauthService {
     flowStartPersistedGeneration: number,
     deploymentUrl: string,
     auth: CoderOauthAuth,
-    loopback: Pick<
-      Awaited<ReturnType<typeof startLoopbackServer>>,
-      "sendSuccessResponse" | "sendFailureResponse"
-    >
+    channel: Pick<CoderCallbackChannel, "sendSuccessResponse" | "sendFailureResponse">
   ): Effect.Effect<CoderLoginCommitResult> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1510,7 +1656,7 @@ export class CoderOauthService {
               flowStartPersistedGeneration,
               deploymentUrl,
               auth,
-              loopback
+              channel
             ),
           catch: getErrorMessage,
         }).pipe(
@@ -1518,7 +1664,7 @@ export class CoderOauthService {
             Effect.gen(function* () {
               const fullMessage = `Failed to commit Coder login: ${message}`;
               log.warn(`[Coder OAuth] ${fullMessage}`);
-              loopback.sendFailureResponse(fullMessage);
+              channel.sendFailureResponse(fullMessage);
               yield* self.desktopFlows.finishEffect(flowId, Err(fullMessage));
               const failed: CoderLoginCommitResult = { outcome: "failed" };
               return failed;
@@ -1543,10 +1689,7 @@ export class CoderOauthService {
     flowStartPersistedGeneration: number,
     deploymentUrl: string,
     auth: CoderOauthAuth,
-    loopback: Pick<
-      Awaited<ReturnType<typeof startLoopbackServer>>,
-      "sendSuccessResponse" | "sendFailureResponse"
-    >
+    channel: Pick<CoderCallbackChannel, "sendSuccessResponse" | "sendFailureResponse">
   ): Promise<CoderLoginCommitResult> {
     return await this.fileLeaseManager.withCoderOauthLoginCommitLock(async () => {
       // The flow may have been cancelled (or timed out) while the exchange
@@ -1636,7 +1779,7 @@ export class CoderOauthService {
       });
       this.cachedAuth = null;
       if (!persistResult.success) {
-        loopback.sendFailureResponse(persistResult.error);
+        channel.sendFailureResponse(persistResult.error);
         await this.desktopFlows.finish(flowId, Err(persistResult.error));
         return { outcome: "failed" as const };
       }
@@ -1647,7 +1790,7 @@ export class CoderOauthService {
           // still live in this process — finish it so the waiter and browser
           // callback see the failure instead of hanging until the flow
           // timeout.
-          loopback.sendFailureResponse(commitRefusalMessage);
+          channel.sendFailureResponse(commitRefusalMessage);
           await this.desktopFlows.finish(flowId, Err(commitRefusalMessage));
           return { outcome: "failed" as const };
         }
@@ -1666,7 +1809,7 @@ export class CoderOauthService {
         return { outcome: "cancelled" as const, persistedAuthRetained: !cleared };
       }
 
-      loopback.sendSuccessResponse();
+      channel.sendSuccessResponse();
       this.windowService?.focusMainWindow();
       await this.desktopFlows.finish(flowId, Ok(undefined));
 

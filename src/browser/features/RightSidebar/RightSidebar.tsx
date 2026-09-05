@@ -46,6 +46,7 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -1066,7 +1067,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
 
-    if (apiState.status !== "connected" || !api) {
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    if (!api) {
       setDesktopAvailable(null);
       return;
     }
@@ -1089,7 +1091,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [api, apiState.status, desktopExperimentEnabled, workspaceId]);
+  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {
@@ -1398,6 +1400,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();

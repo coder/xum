@@ -31,8 +31,8 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
  * Map an agent class onto the per-scope memory write matrix
  * (see MemoryScopeAccess in src/common/constants/memory.ts):
  * - Plan-like and editing-capable (exec-like) agents get read-write everywhere;
- *   project memory is host-local and never mutates the repo checkout, so even
- *   plan agents may write it.
+ *   project memory is host-local (opt-in settings backup aside) and never
+ *   mutates the repo checkout, so even plan agents may write it.
  * - Everything else (explore/read-only agents) is view-only.
  */
 export function resolveMemoryAccessPolicy(options: {
@@ -59,17 +59,9 @@ function buildMemoryDescription(config: ToolConfiguration): string {
   return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(config.memoryIndexEntries)}`;
 }
 
-/**
- * Memory tool factory: dispatches the six Anthropic-style memory commands
- * (view, create, str_replace, insert, delete, rename) to the MemoryService.
- * Write policy is enforced per command + scope via config.memoryAccess.
- */
-export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
-  const memoryService = config.memoryService;
-  assert(memoryService != null, "memory tool requires config.memoryService");
-  const access = config.memoryAccess ?? READ_ONLY_ACCESS;
-
-  const ctx: MemoryScopeContext = {
+/** Share exactly the same scope identity between direct and headless memory reads. */
+export function memoryScopeContextFromToolConfig(config: ToolConfiguration): MemoryScopeContext {
+  return {
     runtime: config.runtime,
     // Storage is host-local; checkoutCwd is retained for the shared context shape only.
     checkoutCwd: config.cwd,
@@ -81,6 +73,19 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
   };
+}
+
+/**
+ * Memory tool factory: dispatches the six Anthropic-style memory commands
+ * (view, create, str_replace, insert, delete, rename) to the MemoryService.
+ * Write policy is enforced per command + scope via config.memoryAccess.
+ */
+export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
+  const memoryService = config.memoryService;
+  assert(memoryService != null, "memory tool requires config.memoryService");
+  const access = config.memoryAccess ?? READ_ONLY_ACCESS;
+
+  const ctx = memoryScopeContextFromToolConfig(config);
 
   /**
    * Returns a recoverable error result when the (parsed) scope is read-only

@@ -16,6 +16,7 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 // DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
+import { createIntuitionTool } from "@/node/services/tools/intuition";
 import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
@@ -61,7 +62,7 @@ import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
-import { withHooks, type HookConfig } from "@/node/services/tools/withHooks";
+import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
@@ -316,6 +317,16 @@ export interface ToolConfiguration {
   analyticsService?: {
     executeRawQuery(sql: string): Promise<unknown>;
   };
+  /** Pinned, host-only recall runtime; present only for eligible parent turns. */
+  intuitionRuntime?: {
+    modelString: string;
+    maxUsesPerTurn: number;
+    /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
+    usesThisTurn: number;
+    createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
+    resolveAgentBody: () => Promise<string | null>;
+    abortSignal: AbortSignal;
+  };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
   advisorRuntime?: {
     /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
@@ -484,36 +495,7 @@ function wrapToolsWithModelOnlyNotifications(
   return wrappedTools;
 }
 
-/**
- * Derive the hook config every hook-wrapped tool runs with, or null when
- * hooks must not run. Shared with the kernel file loader (mux.load) so the
- * bulk-ingestion path can never drift from the tool trust gate: hooks are
- * repo-controlled scripts, so they run only for trusted projects, and mux.load
- * must be hook-gated exactly when file_read is.
- */
-export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
-  // Skip hooks for untrusted projects — repo-controlled scripts must not run
-  if (config.trusted !== true) {
-    return null;
-  }
-
-  // Hooks require workspaceId, cwd, and runtime
-  if (!config.workspaceId || !config.cwd || !config.runtime) {
-    return null;
-  }
-
-  return {
-    runtime: config.runtime,
-    cwd: config.cwd,
-    runtimeTempDir: config.runtimeTempDir,
-    workspaceId: config.workspaceId,
-    // Match bash tool behavior: xumEnv is present and secrets override it.
-    env: {
-      ...(config.xumEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
-  };
-}
+export { deriveToolHookConfig } from "@/node/services/tools/withHooks";
 
 /**
  * Wrap tools with hook support.
@@ -853,6 +835,7 @@ export async function getToolsForModel(
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
     ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
+    ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService && config.experiments?.timeline
@@ -1028,6 +1011,7 @@ export async function getToolsForModel(
         config.workflowService && config.experiments?.dynamicWorkflows
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
+      enableIntuition: Boolean(config.intuitionRuntime),
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),

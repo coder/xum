@@ -1248,12 +1248,12 @@ body,
 @media (max-width: 768px) {
   .mobile-menu-btn {
     display: inline-flex !important;
-    justify-content: flex-start !important;
-    padding-left: 12px !important;
   }
 
+  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
+     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
   .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+    padding-left: 0.5rem !important;
   }
 
   /* Hand the bottom inset to a column that reserves its own clearance (see ChatPane and
@@ -1317,6 +1317,21 @@ body,
   /* Hide right sidebar on small screens so it never stacks below the chat pane. */
   .mobile-hide-right-sidebar {
     display: none !important;
+  }
+}
+
+/* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
+   would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
+   Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
+   the hover pill against the window edge. */
+@media (max-width: 768px) and (pointer: coarse) {
+  .mobile-menu-btn {
+    justify-content: flex-start !important;
+    padding-left: 12px !important;
+  }
+
+  .mobile-sticky-header:has(.mobile-menu-btn) {
+    padding-left: 0 !important;
   }
 }
 

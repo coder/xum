@@ -36,9 +36,9 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
     expect(result.explore).toBeUndefined();
   });
 
-  test("prunes nested fields equal to the base entry", () => {
+  test("prunes non-Exec nested fields equal to the base entry", () => {
     const result = normalizeAgentAiDefaults({
-      exec: {
+      explore: {
         modelString: "openai:gpt-5.6-sol",
         thinkingLevel: "high",
         subagent: {
@@ -48,11 +48,21 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
       },
     });
 
-    expect(result.exec).toEqual({
+    expect(result.explore).toEqual({
       modelString: "openai:gpt-5.6-sol",
       thinkingLevel: "high",
       subagent: { thinkingLevel: "xhigh" },
     });
+  });
+
+  test("keeps explicit Exec fields equal to global defaults", () => {
+    const profile = {
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high" as const,
+      reasoningMode: "standard" as const,
+    };
+    const result = normalizeAgentAiDefaults({ exec: { ...profile, subagent: profile } });
+    expect(result.exec?.subagent).toEqual(profile);
   });
 
   test("drops an empty nested subagent object", () => {

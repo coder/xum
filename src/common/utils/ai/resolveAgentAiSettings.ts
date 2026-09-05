@@ -5,7 +5,8 @@
  *
  *   1. explicit invocation overrides
  *   2. target workspace per-agent bucket
- *   3. target configured profile (delegated `subagent` override, then base)
+ *   3. target configured profile (delegated `subagent` override, then calling
+ *      workspace Exec settings for Exec sub-agents only, then base)
  *   4. target definition frontmatter `ai` defaults
  *   5. declared ancestors child to root (config profile, then definition
  *      defaults), then the implicit plan/exec fallback (reasoningMode only)
@@ -82,8 +83,7 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 
   const pushConfig = (agentId: string, reasoningOnly: boolean) => {
     const entry = defaults[agentId];
-    if (!entry) return;
-    if (input.profile === "subagent" && entry.subagent) {
+    if (input.profile === "subagent" && entry?.subagent) {
       candidates.push({
         values: {
           model: entry.subagent.modelString,
@@ -94,6 +94,20 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
         reasoningOnly,
       });
     }
+    // A chat's Exec choice outranks global defaults, but never explicit child
+    // overrides. Do not promote this context for Exec-derived custom agents.
+    if (
+      input.profile === "subagent" &&
+      input.targetAgentId === "exec" &&
+      agentId === "exec" &&
+      input.parentWorkspaceExecSettings
+    ) {
+      candidates.push({
+        values: input.parentWorkspaceExecSettings,
+        source: { tier: "parent-workspace-exec", agentId: "exec" },
+      });
+    }
+    if (!entry) return;
     candidates.push({
       values: {
         model: entry.modelString,

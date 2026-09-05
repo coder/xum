@@ -21,6 +21,7 @@ import {
   buildPlanInstructions,
   buildStreamSystemContext,
   prepareProviderRequestMessages,
+  removeIntuitionGuidance,
 } from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
@@ -90,6 +91,7 @@ async function buildSystemContextForTest(args: {
   effectiveAdditionalInstructions?: string;
   planFilePath?: string;
   memoryToolAvailable?: boolean;
+  intuitionToolAvailable?: boolean;
 }) {
   return buildStreamSystemContext({
     runtime: args.runtime,
@@ -108,6 +110,7 @@ async function buildSystemContextForTest(args: {
     providersConfig: null,
     mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
+    intuitionToolAvailable: args.intuitionToolAvailable,
   });
 }
 
@@ -543,6 +546,37 @@ describe("buildStreamSystemContext", () => {
       memoryToolAvailable: true,
     });
     expect(withMemory.systemMessage).toContain("<memory-tool-guidance>");
+    expect(withMemory.systemMessage).not.toContain("<intuition-guidance>");
+    const withIntuition = await buildSystemContextForTest({
+      ...buildArgs,
+      memoryToolAvailable: true,
+      intuitionToolAvailable: true,
+    });
+    expect(withIntuition.systemMessage).toContain("<intuition-guidance>");
+    // Intuition changes only the recall branch; notebook maintenance is preserved.
+    const memorySection = (text: string) =>
+      text.split("<memory-tool-guidance>")[1].split("</memory-tool-guidance>")[0].split("\n");
+    const before = memorySection(withMemory.systemMessage);
+    const after = memorySection(withIntuition.systemMessage);
+    expect(after).toHaveLength(before.length);
+    expect(after.filter((line, i) => line !== before[i])).toHaveLength(1);
+    const pluginContext = "\nPlugin-specific context to preserve.";
+    const lateFiltered = removeIntuitionGuidance(withIntuition.systemMessage + pluginContext, true);
+    expect(lateFiltered).not.toContain("<intuition-guidance>");
+    expect(memorySection(lateFiltered)).toEqual(before);
+    expect(lateFiltered).toContain(pluginContext);
+    const lateMemoryDenied = removeIntuitionGuidance(
+      withIntuition.systemMessage + pluginContext,
+      false
+    );
+    expect(lateMemoryDenied).not.toContain("<intuition-guidance>");
+    expect(lateMemoryDenied).not.toContain("<memory-tool-guidance>");
+    expect(lateMemoryDenied).toContain(pluginContext);
+    const deniedMemory = await buildSystemContextForTest({
+      ...buildArgs,
+      intuitionToolAvailable: true,
+    });
+    expect(deniedMemory.systemMessage).not.toContain("<intuition-guidance>");
 
     // Guidance must stay in lockstep with tool availability: a prompt must
     // not steer the agent toward a tool the toolset does not have.

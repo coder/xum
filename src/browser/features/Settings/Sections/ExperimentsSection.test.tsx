@@ -193,6 +193,27 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
   });
 
+  test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+    };
+    const view = render(<ExperimentsSection />);
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.getByLabelText("Toggle Memory Intuition").getAttribute("aria-checked")).toBe(
+      "true"
+    );
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    expect(experimentValues[EXPERIMENT_IDS.MEMORY_INTUITION]).toBe(true);
+  });
+
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
     experimentEnabled = false;
     experimentValues = {

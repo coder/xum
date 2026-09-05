@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -413,14 +414,12 @@ async function readAgentDescriptorFromFile(
   }
 }
 
-function buildBuiltInAgentDescriptor(
-  pkg: ReturnType<typeof getBuiltInAgentDefinitions>[number]
-): AgentDefinitionDescriptor {
+function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
   const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
 
   return {
     id: pkg.id,
-    scope: "built-in",
+    scope: pkg.scope,
     name: pkg.frontmatter.name,
     description: pkg.frontmatter.description,
     uiSelectable: selectable,
@@ -523,12 +522,12 @@ export async function discoverAgentDefinitions(
   for (const pkg of getBuiltInAgentDefinitions()) {
     if (dedupeById) {
       if (!byId.has(pkg.id)) {
-        byId.set(pkg.id, buildBuiltInAgentDescriptor(pkg));
+        byId.set(pkg.id, buildAgentDescriptor(pkg));
       }
       continue;
     }
 
-    discovered.push(buildBuiltInAgentDescriptor(pkg));
+    discovered.push(buildAgentDescriptor(pkg));
   }
 
   // Return all discovered agents (including those disabled by front-matter).
@@ -847,22 +846,16 @@ function deepMergeAgentFrontmatter(
 }
 
 /**
- * Resolve an agent's effective frontmatter by overlaying its base chain (base first, then child).
- *
- * Unlike prompt body inheritance, frontmatter inheritance is always applied when `base` is set.
- * This prevents same-name overrides (e.g. project exec.md with base: exec) from accidentally
- * dropping important base config like subagent.runnable or subagent.append_prompt.
+ * Resolve prompt and frontmatter in one base-chain walk so callers authorize
+ * and execute the same definition snapshot. Frontmatter always inherits when
+ * `base` is set, even when the child replaces the base prompt.
  */
-export async function resolveAgentFrontmatter(
+export async function resolveAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: {
-    roots?: AgentDefinitionsRoots;
-    includeAgentPlugins?: boolean;
-    skipScopesAbove?: AgentDefinitionScope;
-  }
-): Promise<AgentDefinitionPackage["frontmatter"]> {
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -896,7 +889,7 @@ export async function resolveAgentFrontmatter(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<AgentDefinitionPackage["frontmatter"]> {
+  ): Promise<AgentDefinitionPackage> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -917,16 +910,16 @@ export async function resolveAgentFrontmatter(
 
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return pkg.frontmatter;
+      return pkg;
     }
 
-    const baseFrontmatter = await resolve(
+    const base = await resolve(
       baseId,
       depth + 1,
       mergeSkipScopesAbove(skipScopesAbove, computeBaseSkipScope(baseId, id, pkg.scope))
     );
 
-    const mergedRaw = deepMergeAgentFrontmatter(baseFrontmatter, pkg.frontmatter, []);
+    const mergedRaw = deepMergeAgentFrontmatter(base.frontmatter, pkg.frontmatter, []);
     const merged = AgentDefinitionFrontmatterSchema.safeParse(mergedRaw);
     if (!merged.success) {
       throw new Error(
@@ -934,16 +927,65 @@ export async function resolveAgentFrontmatter(
       );
     }
 
-    return merged.data;
+    const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
+    return {
+      ...pkg,
+      frontmatter: merged.data,
+      body:
+        pkg.frontmatter.prompt?.append === false ? pkg.body : `${base.body}${separator}${pkg.body}`,
+    };
   }
 
   return resolve(agentId, 0, options?.skipScopesAbove);
 }
 
-export type AgentDefinitionsContext = Pick<
-  ORPCContext,
-  "config" | "aiService" | "experimentsService" | "initStateManager"
->;
+export async function resolveAgentFrontmatter(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage["frontmatter"]> {
+  return (await resolveAgentDefinition(runtime, workspacePath, agentId, options)).frontmatter;
+}
+
+/**
+ * Resolve a headless agent definition: a user override at <muxRoot>/agents/<agentId>.md
+ * (global agent scope) shadows the built-in definition, like any other agent.
+ * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
+ * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
+ * Host-side read only — headless runs are runtime-independent, so project-scope
+ * agent overrides (which need a live checkout) are intentionally not resolved.
+ * Shared with the debug CLI.
+ */
+export async function resolveHeadlessAgentDefinition(
+  muxRoot: string,
+  agentId: string
+): Promise<AgentDefinitionPackage | null> {
+  assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
+  try {
+    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
+      // Headless tools have no live checkout: never consult repo overrides or plugins.
+      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
+    });
+    const body = definition.body.trim();
+    // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
+    const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
+    return { ...definition, body: body || (fallbackBody ?? "") };
+  } catch (error) {
+    // Invalid inheritance must not silently send memory using another definition/model.
+    log.warn("[HeadlessAgent] failed to resolve definition", {
+      agentId,
+      error: getErrorMessage(error),
+    });
+    return null;
+  }
+}
+
+export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
+  aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
+  experimentsService: Pick<ORPCContext["experimentsService"], "isExperimentEnabled">;
+  initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
+};
 
 export async function resolveAgentDiscoveryContext(
   context: AgentDefinitionsContext,
@@ -990,17 +1032,23 @@ export async function listAgentDefinitions(
   });
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
-    descriptors.map(async (descriptor) => {
+    descriptors.map(async (listedDescriptor) => {
+      let descriptor = listedDescriptor;
       try {
-        const resolvedFrontmatter = await resolveAgentFrontmatter(
-          runtime,
-          discoveryPath,
-          descriptor.id,
-          {
+        // Settings must show the same host-only Intuition definition used for paid recall,
+        // regardless of a selected workspace's project or plugin overrides.
+        const headless =
+          descriptor.id === "intuition"
+            ? await resolveHeadlessAgentDefinition(context.config.rootDir, descriptor.id)
+            : undefined;
+        if (headless === null) return null;
+        if (headless) descriptor = buildAgentDescriptor(headless);
+        const resolvedFrontmatter =
+          headless?.frontmatter ??
+          (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
             includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
-          }
-        );
+          }));
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
           input.includeDisabled !== true

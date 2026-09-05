@@ -783,6 +783,7 @@ export const ExperimentsSchema = z.preprocess(
     advisorTool: z.boolean().optional(),
     dynamicWorkflows: z.boolean().optional(),
     memory: z.boolean().optional(),
+    memoryIntuition: z.boolean().optional(),
     timeline: z.boolean().optional(),
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),

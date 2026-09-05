@@ -78,6 +78,8 @@ import {
 } from "@/common/utils/providers/customProviders";
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import type { Result } from "@/common/types/result";
+import { CODER_OAUTH_SERVER_START_PATH } from "@/common/constants/coderOAuth";
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
@@ -118,6 +120,60 @@ interface OAuthMessage {
 function getServerAuthToken(): string | null {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
   return urlToken?.length ? urlToken : getStoredAuthToken();
+}
+
+/**
+ * Flow ID for a Coder login. It doubles as the OAuth `state` (CSRF token), so
+ * it must be unguessable: derived from getRandomValues, which — unlike
+ * Crypto.randomUUID — is available outside secure contexts too (Xum's browser
+ * UI can be served from a plain-HTTP remote origin, where randomUUID is
+ * undefined and would throw before the login even started).
+ */
+function createCoderLoginFlowId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Browser/server-mode "Login with Coder": the Xum server registers the flow
+ * with a redirect URI on its own origin (built server-side from the request
+ * host, so the OAuth callback reaches the server no matter where the browser
+ * runs). A raw HTTP route rather than oRPC because only the HTTP request
+ * carries that public host; the rest of the flow (wait/cancel) stays on oRPC.
+ */
+async function startCoderServerFlow(
+  backendBaseUrl: string,
+  deploymentUrl: string,
+  flowId: string
+): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
+  const startUrl = new URL(`${backendBaseUrl}${CODER_OAUTH_SERVER_START_PATH}`);
+  startUrl.searchParams.set("deploymentUrl", deploymentUrl);
+  startUrl.searchParams.set("flowId", flowId);
+  const authToken = getServerAuthToken();
+  const res = await fetch(startUrl, {
+    headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+  });
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    const prefix = (await res.text()).trim().slice(0, 80);
+    return {
+      success: false,
+      error: `Unexpected response from ${startUrl.pathname} (expected JSON, got ${
+        contentType || "unknown"
+      }): ${prefix}`,
+    };
+  }
+  const json = (await res.json()) as { authorizeUrl?: unknown; flowId?: unknown; error?: unknown };
+  if (!res.ok) {
+    return {
+      success: false,
+      error: typeof json.error === "string" ? json.error : `HTTP ${res.status}`,
+    };
+  }
+  if (typeof json.authorizeUrl !== "string" || typeof json.flowId !== "string") {
+    return { success: false, error: `Invalid response from ${startUrl.pathname}` };
+  }
+  return { success: true, data: { flowId: json.flowId, authorizeUrl: json.authorizeUrl } };
 }
 
 interface FieldConfig {
@@ -1215,12 +1271,16 @@ export function ProvidersSection() {
     // startDesktopFlow can stall on backend network calls, and Cancel must be
     // able to reach the attempt (the backend pre-cancels IDs it hasn't
     // registered yet) instead of abandoning only the frontend state.
-    const flowId = crypto.randomUUID();
+    const flowId = createCoderLoginFlowId();
     setCoderFlowId(flowId);
 
     try {
       setCoderLoginStatus("starting");
-      const startResult = await api.coderOauth.startDesktopFlow({ deploymentUrl, flowId });
+      // Desktop: loopback listener on this machine. Browser (local or remote
+      // server): the redirect lands on the Xum server's own callback route.
+      const startResult = isDesktop
+        ? await api.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
+        : await startCoderServerFlow(backendBaseUrl, deploymentUrl, flowId);
 
       if (attempt !== coderLoginAttemptRef.current) {
         // cancelCoderLogin already cancelled this flowId; nothing to clean up.
@@ -1257,7 +1317,7 @@ export function ProvidersSection() {
       setCoderLoginStatus("error");
       setCoderLoginError(getErrorMessage(err));
     }
-  }, [api, coderFlowId, coderDeploymentUrl, refresh]);
+  }, [api, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
 
   const disconnectCoderOauth = async () => {
     const attempt = ++coderLoginAttemptRef.current;
@@ -1335,10 +1395,8 @@ export function ProvidersSection() {
   // One-shot hint from the "Settings: Login with Coder" command: start the
   // OAuth login as soon as the providers config has loaded (startCoderLogin
   // reads the configured deployment URL from it — invoking earlier would
-  // always fail with "Set the deployment URL first."). Remote servers render
-  // an explanation instead of the login control, so the hint is consumed
-  // without starting a login there; startCoderLogin handles the remaining
-  // error cases (missing URL, no API) with inline feedback in the expanded
+  // always fail with "Set the deployment URL first."). startCoderLogin handles
+  // the error cases (missing URL, no API) with inline feedback in the expanded
   // Coder section.
   useEffect(() => {
     if (!providersStartCoderLogin || configLoading) {
@@ -1346,16 +1404,8 @@ export function ProvidersSection() {
     }
 
     setProvidersStartCoderLogin(false);
-    if (!isRemoteServer) {
-      void startCoderLogin();
-    }
-  }, [
-    providersStartCoderLogin,
-    setProvidersStartCoderLogin,
-    configLoading,
-    isRemoteServer,
-    startCoderLogin,
-  ]);
+    void startCoderLogin();
+  }, [providersStartCoderLogin, setProvidersStartCoderLogin, configLoading, startCoderLogin]);
 
   useEffect(() => {
     if (expandedProvider !== "mux-gateway" || !muxGatewayIsLoggedIn) {
@@ -2375,117 +2425,112 @@ export function ProvidersSection() {
                             </span>
                           </div>
 
-                          {isRemoteServer ? (
-                            <p className="text-muted text-xs">
-                              Login with Coder requires the desktop app or a locally hosted Xum
-                              server: the OAuth callback must reach this machine, and Coder has no
-                              device-authorization grant for remote logins.
-                            </p>
-                          ) : (
-                            <div className="space-y-2">
-                              <div className="flex flex-wrap items-center gap-2">
+                          <div className="space-y-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                size="sm"
+                                onClick={() => {
+                                  void startCoderLogin();
+                                }}
+                                disabled={!api || coderLoginInProgress}
+                              >
+                                {coderLoginStatus === "error"
+                                  ? "Try again"
+                                  : coderOauthIsConnected
+                                    ? "Re-login with Coder"
+                                    : "Login with Coder"}
+                              </Button>
+
+                              {coderLoginStatus === "waiting" && coderAuthorizeUrl && (
                                 <Button
                                   size="sm"
+                                  aria-label="Copy and open Coder authorization page"
                                   onClick={() => {
-                                    void startCoderLogin();
+                                    // Open first: navigator.clipboard is undefined outside
+                                    // secure contexts (plain-HTTP remote origins), and a throw
+                                    // there must not swallow the navigation.
+                                    window.open(coderAuthorizeUrl, "_blank", "noopener");
+                                    void navigator.clipboard?.writeText(coderAuthorizeUrl);
+                                  }}
+                                  className="h-8 px-3 text-xs"
+                                >
+                                  Copy & Open Coder
+                                </Button>
+                              )}
+
+                              {coderLoginInProgress && (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => {
+                                    void cancelCoderLogin();
+                                  }}
+                                >
+                                  Cancel
+                                </Button>
+                              )}
+
+                              {coderOauthIsConnected && (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => {
+                                    // Not fire-and-forget: failures stay observable by
+                                    // settling into coderModelRefreshState. The body
+                                    // handles its own errors; this catch surfaces any
+                                    // unexpected rejection in the same error state.
+                                    refreshCoderModels().catch((err: unknown) => {
+                                      setCoderModelRefreshState({
+                                        kind: "error",
+                                        message: getErrorMessage(err),
+                                      });
+                                    });
+                                  }}
+                                  disabled={
+                                    !api ||
+                                    coderLoginInProgress ||
+                                    coderModelRefreshState.kind === "refreshing"
+                                  }
+                                >
+                                  {coderModelRefreshState.kind === "refreshing"
+                                    ? "Refreshing..."
+                                    : "Refresh models"}
+                                </Button>
+                              )}
+
+                              {coderOauthCredentialStored && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => {
+                                    void disconnectCoderOauth();
                                   }}
                                   disabled={!api || coderLoginInProgress}
                                 >
-                                  {coderLoginStatus === "error"
-                                    ? "Try again"
-                                    : coderOauthIsConnected
-                                      ? "Re-login with Coder"
-                                      : "Login with Coder"}
+                                  Disconnect
                                 </Button>
-
-                                {coderLoginStatus === "waiting" && coderAuthorizeUrl && (
-                                  <Button
-                                    size="sm"
-                                    aria-label="Copy and open Coder authorization page"
-                                    onClick={() => {
-                                      void navigator.clipboard.writeText(coderAuthorizeUrl);
-                                      window.open(coderAuthorizeUrl, "_blank", "noopener");
-                                    }}
-                                    className="h-8 px-3 text-xs"
-                                  >
-                                    Copy & Open Coder
-                                  </Button>
-                                )}
-
-                                {coderLoginInProgress && (
-                                  <Button
-                                    variant="secondary"
-                                    size="sm"
-                                    onClick={() => {
-                                      void cancelCoderLogin();
-                                    }}
-                                  >
-                                    Cancel
-                                  </Button>
-                                )}
-
-                                {coderOauthIsConnected && (
-                                  <Button
-                                    variant="secondary"
-                                    size="sm"
-                                    onClick={() => {
-                                      // Not fire-and-forget: failures stay observable by
-                                      // settling into coderModelRefreshState. The body
-                                      // handles its own errors; this catch surfaces any
-                                      // unexpected rejection in the same error state.
-                                      refreshCoderModels().catch((err: unknown) => {
-                                        setCoderModelRefreshState({
-                                          kind: "error",
-                                          message: getErrorMessage(err),
-                                        });
-                                      });
-                                    }}
-                                    disabled={
-                                      !api ||
-                                      coderLoginInProgress ||
-                                      coderModelRefreshState.kind === "refreshing"
-                                    }
-                                  >
-                                    {coderModelRefreshState.kind === "refreshing"
-                                      ? "Refreshing..."
-                                      : "Refresh models"}
-                                  </Button>
-                                )}
-
-                                {coderOauthCredentialStored && (
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => {
-                                      void disconnectCoderOauth();
-                                    }}
-                                    disabled={!api || coderLoginInProgress}
-                                  >
-                                    Disconnect
-                                  </Button>
-                                )}
-                              </div>
-
-                              {coderLoginStatus === "waiting" && (
-                                <p className="text-muted inline-flex items-center gap-2 text-xs">
-                                  <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" />
-                                  Waiting for authorization...
-                                </p>
-                              )}
-
-                              {coderLoginStatus === "error" && coderLoginError && (
-                                <p className="text-destructive text-xs">
-                                  Login failed: {coderLoginError}
-                                </p>
-                              )}
-
-                              {coderModelRefreshState.kind === "error" && (
-                                <p className="text-destructive text-xs">
-                                  Model refresh failed: {coderModelRefreshState.message}
-                                </p>
                               )}
                             </div>
-                          )}
+
+                            {coderLoginStatus === "waiting" && (
+                              <p className="text-muted inline-flex items-center gap-2 text-xs">
+                                <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" />
+                                Waiting for authorization...
+                              </p>
+                            )}
+
+                            {coderLoginStatus === "error" && coderLoginError && (
+                              <p className="text-destructive text-xs">
+                                Login failed: {coderLoginError}
+                              </p>
+                            )}
+
+                            {coderModelRefreshState.kind === "error" && (
+                              <p className="text-destructive text-xs">
+                                Model refresh failed: {coderModelRefreshState.message}
+                              </p>
+                            )}
+                          </div>
                         </div>
                       )}
 

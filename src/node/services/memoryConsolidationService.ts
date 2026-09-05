@@ -63,8 +63,8 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
-import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
+import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
@@ -118,20 +118,28 @@ interface ModelFactoryLike {
 }
 
 /**
- * Resolve the model for a dream run — the inherit cascade from PRD #3534
- * (uniform with other agents): per-workspace dream override → global dream
- * default → workspace session model → app default. Shared with the debug CLI.
+ * Resolve a headless agent model — the inherit cascade from PRD #3534
+ * (uniform with other agents): per-workspace agent override → global agent
+ * default → definition AI defaults → pinned selected model (or legacy workspace
+ * session fallback) → app default. Interactive callers supply their fully resolved model so unrelated
+ * agent buckets cannot change the route. Shared with the debug CLI.
  */
-export function resolveDreamModelString(config: Config, workspaceId: string): string {
+export function resolveHeadlessAgentModelString(
+  config: Config,
+  workspaceId: string,
+  agentId: string,
+  selectedModel?: string,
+  definitionAiDefaults?: AgentDefinitionPackage["frontmatter"]["ai"]
+): string {
   const cfg = config.loadConfigOrDefault();
   const workspace = config.findWorkspace(workspaceId);
   const workspaceEntry = workspace
     ? cfg.projects.get(workspace.projectPath)?.workspaces.find((entry) => entry.id === workspaceId)
     : undefined;
-  // Model-only: the dream runtime ignores thinking and reasoning parameters.
-  const dreamBucket = workspaceEntry?.aiSettingsByAgent?.dream;
-  // Route confinement (r31 security): absent an explicit dream override
-  // (workspace bucket above, global dream default inside the resolver), the
+  // Model-only: headless runtimes ignore thinking and reasoning parameters.
+  const agentBucket = workspaceEntry?.aiSettingsByAgent?.[agentId];
+  // Route confinement (r31 security): absent an explicit agent override
+  // (workspace bucket above, global agent default inside the resolver), the
   // fallback must stay on the workspace's SELECTED route. The old fallback
   // read only legacy `aiSettings`, which updateAgentAISettings never rewrites
   // — a workspace whose current model is a per-agent private/gateway route
@@ -139,52 +147,40 @@ export function resolveDreamModelString(config: Config, workspaceId: string): st
   // ship transcript-derived content off-route. Same candidate derivation as
   // branch summaries: selected agent's model, other per-agent models, then
   // the legacy model as a compatibility fallback.
-  const fallbackModels = workspaceEntry ? deriveSideChannelModelCandidates(workspaceEntry) : [];
+  // Interactive headless tools pin the already-resolved parent route, including
+  // global agent defaults. Other buckets may be stale or belong to another provider.
+  // Legacy callers (dream) retain their existing session fallback.
+  const fallbackModels = selectedModel
+    ? [selectedModel]
+    : workspaceEntry
+      ? deriveSideChannelModelCandidates(workspaceEntry)
+      : [];
   return resolveAgentAiSettings({
-    targetAgentId: "dream",
+    targetAgentId: agentId,
     profile: "interactive",
     agentAiDefaults: cfg.agentAiDefaults,
-    targetWorkspaceSettings: dreamBucket ? { model: dreamBucket.model } : undefined,
+    targetDefinitionAiDefaults: definitionAiDefaults,
+    targetWorkspaceSettings: agentBucket ? { model: agentBucket.model } : undefined,
     fallbacks: fallbackModels.length > 0 ? fallbackModels.map((model) => ({ model })) : undefined,
     defaultModel,
   }).selected.model;
 }
 
-/**
- * Resolve the dream agent prompt body: a user override at <muxRoot>/agents/dream.md
- * (global agent scope) shadows the built-in definition, like any other agent.
- * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
- * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
- * Host-side read only — dream runs are runtime-independent, so project-scope
- * agent overrides (which need a live checkout) are intentionally not resolved.
- * Shared with the debug CLI.
- */
-export async function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
-  const overridePath = path.join(muxRoot, "agents", "dream.md");
-  try {
-    const content = await fsPromises.readFile(overridePath, "utf-8");
-    const parsed = parseAgentDefinitionMarkdown({
-      content,
-      byteSize: Buffer.byteLength(content, "utf8"),
-    });
-    const body = parsed.body.trim();
-    if (body.length > 0) return body;
-    log.warn("[MemoryConsolidation] dream override has an empty body; using built-in", {
-      overridePath,
-    });
-  } catch (error) {
-    // Missing override is the normal case; anything else (malformed
-    // frontmatter, permissions) deserves a warning instead of a silent
-    // fallback the user cannot debug.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("[MemoryConsolidation] failed to read dream override; using built-in", {
-        overridePath,
-        error: getErrorMessage(error),
-      });
-    }
-  }
-  const dream = getBuiltInAgentDefinitions().find((definition) => definition.id === "dream");
-  return dream?.body ?? null;
+export { resolveHeadlessAgentDefinition };
+
+export async function resolveHeadlessAgentBody(
+  muxRoot: string,
+  agentId: string
+): Promise<string | null> {
+  return (await resolveHeadlessAgentDefinition(muxRoot, agentId))?.body ?? null;
+}
+
+export function resolveDreamModelString(config: Config, workspaceId: string): string {
+  return resolveHeadlessAgentModelString(config, workspaceId, "dream");
+}
+
+export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
+  return resolveHeadlessAgentBody(muxRoot, "dream");
 }
 
 export function resolveConsolidationProjectPath(workspace: {

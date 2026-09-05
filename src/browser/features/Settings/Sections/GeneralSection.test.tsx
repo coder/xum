@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { installDom } from "../../../../../tests/ui/dom";
-import { BASH_COLLAPSED_SUMMARY_MODE_KEY } from "@/common/constants/storage";
+import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -318,6 +318,18 @@ describe("GeneralSection", () => {
       expect(trigger.textContent).toContain(optionText);
     });
   }
+
+  test("persists flat chat list mode from the Sidebar group", () => {
+    const { view } = renderGeneralSection();
+    const sidebarHeading = view.getByRole("heading", { name: "Sidebar" });
+    const sidebarGroup = sidebarHeading.parentElement;
+    expect(sidebarGroup).not.toBeNull();
+    const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
+
+    fireEvent.click(toggle);
+
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+  });
 
   test("persists the collapsed bash summaries display mode", async () => {
     const { view } = renderGeneralSection();

@@ -18,6 +18,7 @@ export const EXPERIMENT_IDS = {
   DYNAMIC_WORKFLOWS: "dynamic-workflows",
   MEMORY: "memory",
   MEMORY_HOT_SET: "memory-hot-set",
+  MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
   TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
@@ -181,6 +182,13 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   // site; Settings nests it under the Agent Memory toggle). Without it, memories
   // stay pull-based like skills: index advertised in the memory tool description,
   // contents fetched on demand.
+  [EXPERIMENT_IDS.MEMORY_INTUITION]: {
+    id: EXPERIMENT_IDS.MEMORY_INTUITION,
+    name: "Memory Intuition",
+    description: "Recall relevant memories with a bounded, read-only intuition agent",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
     id: EXPERIMENT_IDS.MEMORY_HOT_SET,
     name: "Memory Hot Set",

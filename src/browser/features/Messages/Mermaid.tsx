@@ -3,6 +3,7 @@ import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import mermaid from "mermaid";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 
 const MIN_HEIGHT = 300;
@@ -219,6 +220,7 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
 }) => {
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();

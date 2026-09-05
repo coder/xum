@@ -3,7 +3,11 @@
  */
 
 import { describe, test, expect } from "@jest/globals";
-import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import {
+  KNOWN_MODELS,
+  MODEL_ABBREVIATIONS,
+  TOKENIZER_MODEL_OVERRIDES,
+} from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
 import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
@@ -19,8 +23,8 @@ describe("Known Models Integration", () => {
     }
   });
 
-  test("gemini-flash resolves to the stable Gemini 3.7 Flash model", () => {
-    expect(MODEL_ABBREVIATIONS["gemini-flash"]).toBe("google:gemini-3.7-flash");
+  test("gemini-flash resolves to the stable Gemini 3.8 Flash model", () => {
+    expect(MODEL_ABBREVIATIONS["gemini-flash"]).toBe("google:gemini-3.8-flash");
   });
 
   test("gpt alias tracks the GPT-5.6 flagship tier alongside the tier aliases", () => {
@@ -31,6 +35,21 @@ describe("Known Models Integration", () => {
     // The bare gpt-5.5 alias retired with the entry; openai:gpt-5.5 still
     // resolves as a custom model string via models-extra stats.
     expect(MODEL_ABBREVIATIONS["gpt-5.5"]).toBeUndefined();
+  });
+
+  test("astra aliases resolve to the GPT-6 Astra entry without moving gpt", () => {
+    expect(MODEL_ABBREVIATIONS.astra).toBe("openai:gpt-6-astra");
+    expect(MODEL_ABBREVIATIONS["gpt-6-astra"]).toBe("openai:gpt-6-astra");
+    // Astra is additive: the flagship alias keeps tracking the cheaper GPT-5.6
+    // Sol, and Astra is not warmed at startup (its tokenizer is warmed via GPT).
+    expect(MODEL_ABBREVIATIONS.gpt).toBe(KNOWN_MODELS.GPT.id);
+    expect(KNOWN_MODELS.GPT_6_ASTRA.warm).toBeUndefined();
+    // Sol must stay ahead of Astra: compaction "switch model" suggestions pick the
+    // first registry entry with the largest context, and both assume 1.05M.
+    const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
+    expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_ASTRA.id));
+    // Approximate tokenizer: GPT-6's tokenizer is unpublished, so reuse gpt-5.
+    expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-astra"]).toBe("openai/gpt-5");
   });
 
   test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {

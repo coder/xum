@@ -3,6 +3,9 @@ import { getModelKey } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { normalizeModelPreference } from "./buildSendMessageOptions";
 
 let cleanupDom: (() => void) | null = null;
@@ -19,6 +22,19 @@ describe("getSendOptionsFromStorage", () => {
     cleanupDom?.();
     cleanupDom = null;
   });
+
+  test.each([true, false])(
+    "captures the latest memoryIntuition override %s before host persistence",
+    (enabled) => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), enabled);
+      const options = getSendOptionsFromStorage("ws-intuition");
+      expect(options.experiments?.memoryIntuition).toBe(enabled);
+      expect(
+        SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).experiments
+          ?.memoryIntuition
+      ).toBe(enabled);
+    }
+  );
 
   test("preserves explicit gateway-scoped stored model preferences", () => {
     const workspaceId = "ws-1";

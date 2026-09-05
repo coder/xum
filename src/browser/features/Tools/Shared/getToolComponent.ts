@@ -26,6 +26,7 @@ import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
 import { AgentSkillListToolCall } from "../AgentSkillListToolCall";
 import { FileReadToolCall } from "../FileReadToolCall";
 import { MemoryToolCall } from "../MemoryToolCall";
+import { IntuitionToolCall } from "../IntuitionToolCall";
 import { WebFetchToolCall } from "../WebFetchToolCall";
 import { WebSearchToolCall } from "../WebSearchToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
@@ -75,6 +76,7 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   bash: BashToolCall,
   file_read: FileReadToolCall,
   memory: MemoryToolCall,
+  intuition: IntuitionToolCall,
   attach_file: AttachFileToolCall,
   desktop_screenshot: DesktopScreenshotToolCall,
   desktop_move_mouse: DesktopActionToolCall,

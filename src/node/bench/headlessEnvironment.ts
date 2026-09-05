@@ -115,6 +115,9 @@ export async function createHeadlessEnvironment(
   services.windowService.setMainWindow(mockWindow);
 
   const dispose = async () => {
+    // Release the container (background processes, bridges, the Effect runtime
+    // scope) before deleting the directory it writes into.
+    await services.dispose();
     sentEvents.length = 0;
     await disposeRootDir();
   };

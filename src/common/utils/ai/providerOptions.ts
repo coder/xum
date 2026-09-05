@@ -34,7 +34,10 @@ import {
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
 } from "@/common/types/thinking";
-import { isGeminiFlashThinkingLevelModelName } from "@/common/utils/thinking/policy";
+import {
+  isGeminiFlashMinimalRejectingModelName,
+  isGeminiFlashThinkingLevelModelName,
+} from "@/common/utils/thinking/policy";
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
@@ -448,12 +451,14 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: the GPT-5.6 family maps ThinkingLevel "max" to the native
-    // "max" effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
+    // Model-aware: native-max models (the GPT-5.6 family and GPT-6 Astra, see
+    // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
+    // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
     // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
     // and Chat Completions, so both wire formats now preserve the selected level.
-    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium.
+    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium;
+    // Astra rejects "none", so its "off" clamps to "low".
     const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
@@ -550,7 +555,11 @@ export function buildProviderOptions(
     if (isGeminiFlashThinkingModel && effectiveThinking === "off") {
       // Gemini Flash chat models default to medium and do not support true thinking-off;
       // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
-      thinkingConfig = { thinkingLevel: "minimal" };
+      // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
+      // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
+      thinkingConfig = isGeminiFlashMinimalRejectingModelName(capBareModelName)
+        ? { includeThoughts: true, thinkingLevel: "low" }
+        : { thinkingLevel: "minimal" };
     } else if (effectiveThinking !== "off") {
       thinkingConfig = {
         includeThoughts: true,
@@ -703,8 +712,9 @@ export function buildProviderOptions(
   if (origin === "openai" && formatProvider !== origin) {
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
-    // explicit-none support, so degrade GPT-5.6 "max" to xhigh (the pre-5.6 top
-    // effort) and "none" back to omission instead of risking a rejection.
+    // explicit-none support, so degrade native-max models' (GPT-5.6 family, GPT-6
+    // Astra) "max" to xhigh (the pre-5.6 top effort) and GPT-5.6's "none" back to
+    // omission instead of risking a rejection.
     const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
     const reasoningEffort =
       nativeReasoningEffort === "max"

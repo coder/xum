@@ -27,6 +27,7 @@ import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
   TERMINAL_BADGE_CONFIG_KEY,
   normalizeTerminalBadgeConfig,
   type TerminalBadgeConfig,
@@ -719,6 +720,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
           updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+        },
+      },
+      {
+        id: CommandIds.navToggleFlatChatList(),
+        title: "Toggle Flat Chat List",
+        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        section: section.navigation,
+        keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
+        run: () => {
+          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
         },
       },
       {

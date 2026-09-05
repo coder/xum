@@ -64,7 +64,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { reassignPinnedTimestamps } from "@/common/utils/pin";
+import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
@@ -485,6 +485,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     options?: { acknowledgedUntrackedPaths?: string[] }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /**
+   * Workspaces with an archive preflight or archive request in flight. Archive can take tens
+   * of seconds server-side (snapshot + worktree removal), so this lives here rather than in
+   * the component that started it: the sidebar row and the menu bar both show "Archiving..."
+   * no matter which one the user clicked.
+   */
+  archivingWorkspaceIds: ReadonlySet<string>;
   refreshWorkspaceMetadata: () => Promise<void>;
   setWorkspaceMetadata: React.Dispatch<
     React.SetStateAction<Map<string, FrontendWorkspaceMetadata>>
@@ -545,6 +552,38 @@ export const WorkspaceContext = {
 
 interface WorkspaceProviderProps {
   children: ReactNode;
+}
+
+/**
+ * Keeps `workspaceId` in the archiving set while `run` is outstanding. Requests for one
+ * workspace can overlap (the sidebar shortcut fires while a header-started archive is still
+ * in flight), so the id is reference-counted and only removed when the last one settles.
+ */
+async function trackArchivingRequest<T>(
+  counts: Map<string, number>,
+  setArchivingWorkspaceIds: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>,
+  workspaceId: string,
+  run: () => Promise<T>
+): Promise<T> {
+  counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+  setArchivingWorkspaceIds((prev) =>
+    prev.has(workspaceId) ? prev : new Set(prev).add(workspaceId)
+  );
+  try {
+    return await run();
+  } finally {
+    const remaining = (counts.get(workspaceId) ?? 1) - 1;
+    if (remaining > 0) {
+      counts.set(workspaceId, remaining);
+    } else {
+      counts.delete(workspaceId);
+      setArchivingWorkspaceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(workspaceId);
+        return next;
+      });
+    }
+  }
 }
 
 /**
@@ -1509,36 +1548,44 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
       if (!api) return { success: false, error: "API not connected" };
 
-      let previousPinnedAt: string | undefined;
-      let applied = false;
+      let previousPinnedAtById: Map<string, string | undefined> | null = null;
       setWorkspaceMetadata((prev) => {
         const meta = prev.get(workspaceId);
         if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
-        previousPinnedAt = meta.pinnedAt;
-        applied = true;
-        // Mirror the server's append-only ordering: strictly greater than every
-        // existing pin in the same project so rapid pins stay in click order.
+        const touched = new Map<string, string | undefined>([[workspaceId, meta.pinnedAt]]);
+        const next = new Map(prev);
+        // Mirror the server's global append-only ordering (all projects, not
+        // just this one), including its write-path healing of corrupted pin
+        // timestamps, so every row sits where authoritative metadata will
+        // keep it.
         let optimisticPinnedAt: string | undefined;
         if (pinned) {
-          let pinnedAtMs = Date.now();
-          for (const other of prev.values()) {
-            if (other.projectPath !== meta.projectPath || !other.pinnedAt) continue;
-            const otherMs = new Date(other.pinnedAt).getTime();
-            if (Number.isFinite(otherMs) && otherMs >= pinnedAtMs) pinnedAtMs = otherMs + 1;
+          const { changed, pinnedAt } = appendPinnedTimestamp(
+            [...prev.values()]
+              .filter((other) => other.pinnedAt)
+              .map((other) => ({ id: other.id, pinnedAt: other.pinnedAt }))
+          );
+          for (const [id, healedPinnedAt] of changed) {
+            const other = next.get(id);
+            if (!other) continue;
+            touched.set(id, other.pinnedAt);
+            next.set(id, { ...other, pinnedAt: healedPinnedAt });
           }
-          optimisticPinnedAt = new Date(pinnedAtMs).toISOString();
+          optimisticPinnedAt = pinnedAt;
         }
-        const next = new Map(prev);
         next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });
+        previousPinnedAtById = touched;
         return next;
       });
       const revert = () => {
-        if (!applied) return;
+        const touched: Map<string, string | undefined> | null = previousPinnedAtById;
+        if (!touched) return;
         setWorkspaceMetadata((prev) => {
-          const meta = prev.get(workspaceId);
-          if (!meta) return prev;
           const next = new Map(prev);
-          next.set(workspaceId, { ...meta, pinnedAt: previousPinnedAt });
+          for (const [id, priorPinnedAt] of touched) {
+            const meta = next.get(id);
+            if (meta) next.set(id, { ...meta, pinnedAt: priorPinnedAt });
+          }
           return next;
         });
       };
@@ -1637,6 +1684,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api, setWorkspaceMetadata]
   );
 
+  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
+  const archivingRequestCounts = useRef(new Map<string, number>());
+
   const preflightArchiveWorkspace = useCallback(
     async (
       workspaceId: string
@@ -1644,7 +1696,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.preflightArchive({ workspaceId });
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
+          workspaceId,
+          () => api.workspace.preflightArchive({ workspaceId })
+        );
         if (result.success) {
           return { success: true, data: result.data };
         }
@@ -1664,10 +1721,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.archive({
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
           workspaceId,
-          acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-        });
+          () =>
+            api.workspace.archive({
+              workspaceId,
+              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+            })
+        );
         if (result.success) {
           // Older mocks/story fixtures may still return `{ success: true }` without the newer
           // typed archive payload. Treat that legacy success shape as an ordinary archive so
@@ -2030,6 +2093,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,
@@ -2056,6 +2120,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,

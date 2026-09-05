@@ -46,12 +46,18 @@ function renderBackupSection(
       localOnlyFiles: ["agents/local-only.md"],
       redactions: ["mcp.jsonc: github.headers.Authorization"],
       commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
     },
     backupRestore: {
       commit: "def5678",
       snapshotPath: "/tmp/mux-backup-snapshot",
       changedFiles: ["preferences.json"],
       localOnlyFiles: ["agents/local.md"],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
     },
     ...overrides,
   });
@@ -117,6 +123,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/other.git",
         branch: "release",
         path: "shared/",
+        includeProjects: false,
       })
     );
     await canvas.findByText("Backup to repository");
@@ -344,6 +351,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/new.git",
         branch: "main",
         path: "mux/",
+        includeProjects: false,
         approvedSecretDigest: undefined,
       })
     );
@@ -478,6 +486,9 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -539,6 +550,9 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -583,6 +597,9 @@ describe("BackupSection", () => {
         snapshotPath: "/tmp/mux-backup-snapshot",
         changedFiles: [],
         localOnlyFiles: [],
+        projectImportResults: [],
+        projectBundleSkipped: false,
+        unapprovedProjectImports: [],
       },
     });
 
@@ -610,5 +627,348 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
 
     await canvas.findByText("Could not persist backup settings");
+  });
+
+  test("sends only approved project imports with their target paths on restore", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      gitRemote: "git@github.com:dev/rocket.git",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const unapproved = {
+      sourcePath: "/home/dev/src/probe",
+      name: "probe",
+      memoryFileCount: 0,
+      token: "probe-token",
+    };
+    const { client, view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [candidate, unapproved],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+      backupRestore: {
+        commit: "def5678",
+        snapshotPath: "/tmp/mux-backup-snapshot",
+        changedFiles: [],
+        localOnlyFiles: [],
+        projectImportResults: [
+          {
+            sourcePath: candidate.sourcePath,
+            targetPath: "/home/other/rocket",
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: ["memory/project/rocket-abc/notes.md"],
+            skippedFiles: [],
+            registered: true,
+          },
+        ],
+        projectBundleSkipped: false,
+        unapprovedProjectImports: [],
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    // The remote is rendered as inert text, never a link.
+    expect(canvas.getByText(/git@github\.com:dev\/rocket\.git/)).toBeTruthy();
+    expect(canvas.queryByRole("link")).toBeNull();
+
+    const restore = jest.spyOn(client.backup, "restore");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    const targetInputs = canvas.getAllByLabelText("Local project directory");
+    fireEvent.change(targetInputs[0]!, { target: { value: "/home/other/rocket" } });
+    await confirmRestore(canvas);
+
+    await waitFor(() =>
+      expect(restore).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectImports: [{ token: "rocket-token", targetPath: "/home/other/rocket" }],
+        })
+      )
+    );
+    await canvas.findByText("Project import results");
+    expect(canvas.getByText(/Imported: rocket/)).toBeTruthy();
+  });
+
+  test("reports a conflicted import as partial and keeps its candidate on offer", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [candidate],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+      backupRestore: {
+        commit: "def5678",
+        snapshotPath: "/tmp/mux-backup-snapshot",
+        changedFiles: [],
+        localOnlyFiles: [],
+        projectImportResults: [
+          {
+            sourcePath: candidate.sourcePath,
+            targetPath: "/home/other/rocket",
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: ["memory/project/rocket-abc/notes.md"],
+            skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+            // Imported into a project that already existed: nothing to unregister.
+            registered: false,
+          },
+        ],
+        projectBundleSkipped: false,
+        // The backend re-offers a conflicted import; the UI must not call it done.
+        unapprovedProjectImports: [candidate],
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+
+    await canvas.findByText("Project import results");
+    expect(canvas.getByText(/Partially imported: rocket/)).toBeTruthy();
+    expect(canvas.queryByText(/^Imported: rocket/)).toBeNull();
+    // The undo guidance names only what this run created: files, not a registration.
+    expect(canvas.queryByText(/Newly registered project/)).toBeNull();
+    expect(canvas.queryByText(/remove the projects marked as newly registered/)).toBeNull();
+    // Still offered for a retry after the conflicts are resolved.
+    expect(canvas.getByRole("checkbox", { name: "Import project rocket" })).toBeTruthy();
+  });
+
+  test("keeps an earlier attempt's added files and registration on a retry", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const attempt = (attemptResult: {
+      writtenFiles: string[];
+      skippedFiles: string[];
+      registered: boolean;
+    }) => ({
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [
+        {
+          sourcePath: candidate.sourcePath,
+          targetPath: "/home/other/rocket",
+          name: candidate.name,
+          status: "imported" as const,
+          ...attemptResult,
+        },
+      ],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
+    });
+    const { view } = renderBackupSection(
+      {
+        backupPreview: {
+          pushChanges: [],
+          restoreChanges: [],
+          localOnlyFiles: [],
+          redactions: [],
+          commandApprovals: [],
+          projectImports: [candidate],
+          projectBundleSkipped: false,
+          pushError: null,
+        },
+      },
+      (client) => {
+        // The first attempt registers the project and adds one file before a conflict; the
+        // retry finds that file in place and reports only what it added itself.
+        jest
+          .spyOn(client.backup, "restore")
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/notes.md"],
+              skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+              registered: true,
+            }),
+          })
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/conflict.md"],
+              skippedFiles: [],
+              registered: false,
+            }),
+          });
+      }
+    );
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/Partially imported: rocket/);
+    // The undo list names the files, not a count.
+    expect(
+      canvas.getByText(/Added memory file: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/^Imported: rocket/);
+    // One card for the import, listing both attempts' files and the registration the first
+    // attempt made — the retry alone would say nothing was registered.
+    expect(canvas.queryByText(/Partially imported: rocket/)).toBeNull();
+    expect(
+      canvas.getByText(
+        /Added memory files: memory\/project\/rocket-abc\/notes\.md, memory\/project\/rocket-abc\/conflict\.md/
+      )
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
+    expect(canvas.getByText(/remove the projects marked as newly registered/)).toBeTruthy();
+
+    // Saving different settings drops the preview and its approvals, not this: the files and
+    // the registration are still there to undo.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(
+      canvas.getByText(/Added memory files: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
+  });
+
+  test("re-presents fresh candidates when import approval goes stale", async () => {
+    const staleCandidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 1,
+      token: "stale-token",
+    };
+    const freshCandidate = { ...staleCandidate, token: "fresh-token" };
+    const { client, view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [staleCandidate],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+
+    const restore = jest.spyOn(client.backup, "restore").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "PROJECT_IMPORT_APPROVAL_REQUIRED",
+        message: "The approved project imports no longer match the backup.",
+        projectImports: [freshCandidate],
+      },
+    });
+    await confirmRestore(canvas);
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(1));
+
+    // The fresh candidate replaced the stale one and starts unapproved, so an immediate
+    // second restore sends no imports.
+    await canvas.findByText("Projects to reimport");
+    const checkbox = canvas.getByRole("checkbox", { name: "Import project rocket" });
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    await confirmRestore(canvas);
+    await waitFor(() =>
+      expect(restore).toHaveBeenLastCalledWith(expect.objectContaining({ projectImports: [] }))
+    );
+  });
+
+  test("drops stale project import candidates after a push replaces the remote bundle", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [
+          {
+            sourcePath: "/home/dev/src/rocket",
+            name: "rocket",
+            memoryFileCount: 1,
+            token: "rocket-token",
+          },
+        ],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+
+    // The push rewrote the remote bundle; the candidates' tokens describe the old one.
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await canvas.findByText(/Backed up settings at/);
+    expect(canvas.queryByText("Projects to reimport")).toBeNull();
+  });
+
+  test("reports a skipped project bundle after a preview", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: true,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/carries a project bundle, but project backup is disabled/);
   });
 });

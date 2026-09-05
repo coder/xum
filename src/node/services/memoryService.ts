@@ -299,6 +299,16 @@ export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
 }
 
 /**
+ * The uniqueness suffix of a project memory directory name. A pure string hash of the
+ * project path, so it is host-independent: the settings backup's project bundle validates
+ * recorded memory directory names against this same function, which must therefore never
+ * incorporate anything filesystem- or platform-specific.
+ */
+export function projectPathHashSuffix(projectPath: string): string {
+  return createHash("sha256").update(projectPath).digest("hex").slice(0, 12);
+}
+
+/**
  * Filesystem-safe directory name for a project's host-local memory root
  * (<xumHome>/memory/project/<dirName>). The sanitized basename keeps the dir
  * human-recognizable; the path hash guarantees uniqueness across same-named
@@ -306,7 +316,7 @@ export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
  */
 export function projectMemoryDirName(projectPath: string): string {
   assert(projectPath !== "", "projectMemoryDirName requires a project identity");
-  const hash = createHash("sha256").update(projectPath).digest("hex").slice(0, 12);
+  const hash = projectPathHashSuffix(projectPath);
   // getProjectName falls back to "unknown" and sanitization maps (never
   // drops) disallowed chars, so base is always non-empty.
   const base = PlatformPaths.getProjectName(projectPath)
@@ -603,6 +613,13 @@ export class MemoryService extends EventEmitter {
     }
   }
 
+  /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
+  async recordRecall(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
+    const parsed = parseMemoryPath(virtualPath);
+    const scope = this.requireFilePath(parsed, virtualPath);
+    await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
+  }
+
   private async recordRename(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -667,7 +684,9 @@ export class MemoryService extends EventEmitter {
         }
         // Host-local private notes about the project: keyed by stable project
         // identity (never the per-workspace checkout), so they survive
-        // re-checkouts and never appear in the repo.
+        // re-checkouts and never appear in the repo. The settings backup may
+        // carry this directory, but only when the user opts into its project
+        // bundle (see src/node/services/backup/payload.ts).
         return new LocalMemoryStore(
           path.join(this.config.rootDir, "memory", "project", projectMemoryDirName(ctx.projectPath))
         );
@@ -884,6 +903,27 @@ export class MemoryService extends EventEmitter {
       actor,
       workspaceId: ctx.workspaceId,
       projectPath: ctx.projectPath,
+    };
+    this.emit("change", event);
+  }
+
+  /**
+   * Announces that a project's memory was mutated outside this service. The settings-backup
+   * restore writes memory files directly (under the shared memory mutation lock), and
+   * subscribers only refresh from disk on change events, so without this an open memory
+   * browser keeps showing pre-restore contents. One event per project, addressed to the
+   * scope root: subscribers refetch the whole scope per event, so per-file events for a
+   * bulk restore would only multiply identical refreshes.
+   */
+  notifyExternalProjectChange(projectPath: string): void {
+    const event: MemoryChangeEvent = {
+      scope: "project",
+      path: toVirtualPath("project", ""),
+      actor: "user",
+      // No originating workspace; the change filter only consults workspaceId for
+      // workspace-scope events.
+      workspaceId: "",
+      projectPath,
     };
     this.emit("change", event);
   }

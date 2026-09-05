@@ -4167,6 +4167,211 @@ describe("CoderOauthService", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // startServerFlow / handleServerCallback (browser + remote Xum server)
+  // -------------------------------------------------------------------------
+
+  describe("startServerFlow", () => {
+    const SERVER_REDIRECT_URI = "https://xum.example.com/auth/coder/callback";
+
+    /** Deployment mocks for the server flow; `onTokens` customizes the exchange. */
+    function mockServerFlowDeployment(opts: {
+      registerCalls?: unknown[];
+      onTokens?: (init?: RequestInit) => Promise<Response>;
+      onRevoke?: (init?: RequestInit) => void;
+    }): void {
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          opts.registerCalls?.push(JSON.parse(fetchBodyText(init)));
+          return jsonResponse({ client_id: "client_srv", client_secret: "secret_srv" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          if (opts.onTokens) return opts.onTokens(init);
+          return jsonResponse({
+            access_token: "at_srv",
+            refresh_token: "rt_srv",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
+          opts.onRevoke?.(init);
+          return new Response(null, { status: 200 });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return aiProvidersResponse();
+        }
+        if (url.startsWith(`${DEPLOYMENT_URL}/api/v2/aibridge/`)) {
+          return jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] });
+        }
+        // No loopback listener may be involved: any 127.0.0.1 request is a bug.
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
+    }
+
+    it("registers the server callback URL instead of a loopback listener and commits via handleServerCallback", async () => {
+      const registerCalls: unknown[] = [];
+      let exchangeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        registerCalls,
+        onTokens: (init) => {
+          exchangeBody = new URLSearchParams(fetchBodyText(init));
+          return Promise.resolve(
+            jsonResponse({
+              access_token: "at_srv",
+              refresh_token: "rt_srv",
+              expires_in: 86400,
+              token_type: "Bearer",
+            })
+          );
+        },
+      });
+
+      const flowId = "server-flow-0123456789abcdef";
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        flowId,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+
+      const authorize = new URL(startResult.data.authorizeUrl);
+      expect(startResult.data.flowId).toBe(flowId);
+      expect(authorize.searchParams.get("state")).toBe(flowId);
+      // Exact redirect URI matching: the server route URL is what gets
+      // registered and what the authorize request names.
+      expect(authorize.searchParams.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect((registerCalls[0] as { redirect_uris: string[] }).redirect_uris).toEqual([
+        SERVER_REDIRECT_URI,
+      ]);
+
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      // Unknown state is refused before any exchange.
+      const unknown = await service.handleServerCallback({
+        state: "not-a-registered-flow",
+        code: "code",
+        error: null,
+      });
+      expect(unknown.success).toBe(false);
+
+      // The callback route's outcome is the committed login.
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(callbackResult).toEqual(Ok(undefined));
+      expect(await waitPromise).toEqual(Ok(undefined));
+
+      expect(exchangeBody!.get("code")).toBe("auth_code_srv");
+      expect(exchangeBody!.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect(sha256Base64Url(exchangeBody!.get("code_verifier")!)).toBe(
+        authorize.searchParams.get("code_challenge")!
+      );
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_srv");
+      expect(coderSection.deploymentUrl).toBe(DEPLOYMENT_URL);
+
+      // An authorization code is single-use; so is its delivery. The finished
+      // flow is gone from the manager, so a replayed redirect is refused.
+      const replay = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(replay.success).toBe(false);
+    });
+
+    it("fails the flow when the redirect carries an OAuth error", async () => {
+      mockServerFlowDeployment({});
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: null,
+        error: "access_denied",
+        errorDescription: "User declined",
+      });
+      expect(callbackResult).toEqual(Err("access_denied: User declined"));
+      expect(await waitPromise).toEqual(Err("access_denied: User declined"));
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("settles the pending callback request when the flow is cancelled mid-exchange", async () => {
+      let releaseExchange!: () => void;
+      const exchangeGate = new Promise<void>((resolve) => (releaseExchange = resolve));
+      let exchangeStarted!: () => void;
+      const exchangeStartedPromise = new Promise<void>((resolve) => (exchangeStarted = resolve));
+      let revokeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        onTokens: async () => {
+          exchangeStarted();
+          await exchangeGate;
+          return jsonResponse({
+            access_token: "at_raced",
+            refresh_token: "rt_raced",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        },
+        onRevoke: (init) => {
+          revokeBody = new URLSearchParams(fetchBodyText(init));
+        },
+      });
+
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+
+      // The Express route awaits this; Cancel must resolve it rather than
+      // leave the browser tab hanging until the flow timeout.
+      const callbackPromise = service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_raced",
+        error: null,
+      });
+      await exchangeStartedPromise;
+      await service.cancelDesktopFlow(flowId);
+      const callbackResult = await callbackPromise;
+      expect(callbackResult.success).toBe(false);
+      releaseExchange();
+
+      await waitUntil(() => revokeBody !== null);
+      expect(revokeBody!.get("token")).toBe("rt_raced");
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("rejects a non-http(s) redirect URI without network calls", async () => {
+      mockFetch(() => Promise.reject(new Error("network must not be reached")));
+      const result = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: "javascript:alert(1)",
+      });
+      expect(result).toEqual(Err("Invalid OAuth redirect URI"));
+    });
+  });
+
   describe("cancelDesktopFlow", () => {
     it("resolves waitForDesktopFlow with cancellation error", async () => {
       mockFetch((input) => {

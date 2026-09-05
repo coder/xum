@@ -1,5 +1,10 @@
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
+import {
+  resolveHeadlessAgentDefinition,
+  resolveHeadlessAgentModelString,
+} from "@/node/services/memoryConsolidationService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
@@ -35,6 +40,7 @@ import {
 import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
+import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -172,6 +178,7 @@ import {
   buildStreamSystemContext,
   formatMcpWarningPrefix,
   prepareProviderRequestMessages,
+  removeIntuitionGuidance,
 } from "./turnContextAssembler";
 export { prepareProviderRequestMessages };
 import {
@@ -1221,6 +1228,10 @@ export class TurnRequestBuilder {
       experiments?.toolSearch ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
         true;
+    const memoryIntuitionExperimentEnabled =
+      experiments?.memoryIntuition ??
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
+        true;
     const memoryHotSetExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) ===
       true;
@@ -1446,8 +1457,25 @@ export class TurnRequestBuilder {
     // below so the prompt never advertises an absent tool.
     const memoryToolEligible =
       memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
+    // Gate and execute the same global-only definition snapshot: edits during
+    // turn assembly must not swap the body after its enablement was checked.
+    const intuitionDefinition =
+      memoryToolEligible && memoryIntuitionExperimentEnabled && !isSubagentWorkspace
+        ? await resolveHeadlessAgentDefinition(this.dependencies.config.rootDir, "intuition")
+        : null;
+    const intuitionToolEligible =
+      intuitionDefinition !== null &&
+      !isAgentEffectivelyDisabled({
+        cfg,
+        agentId: "intuition",
+        resolvedFrontmatter: intuitionDefinition.frontmatter,
+      });
     const buildStreamSystemContextForToolset = (
-      toolset: { advisorToolAvailable: boolean; memoryToolAvailable: boolean },
+      toolset: {
+        advisorToolAvailable: boolean;
+        memoryToolAvailable: boolean;
+        intuitionToolAvailable: boolean;
+      },
       modelStringForSystem: string = modelString,
       contextForModel: MemorySessionContext | undefined = memoryContext
     ) =>
@@ -1471,6 +1499,7 @@ export class TurnRequestBuilder {
         loadDesktopCapability,
         advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
+        intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         agentPluginsEnabled: agentPluginsExperimentEnabled,
@@ -1483,6 +1512,7 @@ export class TurnRequestBuilder {
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
       advisorToolAvailable: advisorToolEligible,
       memoryToolAvailable: memoryToolEligible,
+      intuitionToolAvailable: intuitionToolEligible,
     });
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
     const { agentSystemPromptSections, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
@@ -1654,7 +1684,7 @@ export class TurnRequestBuilder {
     // providerMetadata, so remember the resolved billing mode from model creation and
     // re-stamp it before converting usage into display/session costs.
     const toolModelCostsIncludedByModelString = new Map<string, boolean>();
-    // Creation-time pricing identity for tool-created models (advisor): a
+    // Creation-time pricing identity for tool-created models (advisor and intuition): a
     // Coder catalog refresh can remove/retag the instance while the tool
     // request runs, and resolving the identity from live config at
     // completion would price/persist the usage under a different provider.
@@ -1854,8 +1884,90 @@ export class TurnRequestBuilder {
     const assistantMessageId = createAssistantMessageId();
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-    // Hoisted so the refusal-fallback prepare() can rebuild the toolset for a
-    // different model with identical context (only the model string varies).
+    // Share creation-time provider/pricing snapshots for both headless tools.
+    const createToolModel = async (ms: string) => {
+      const toolModelString = ms.trim();
+      assert(
+        toolModelString.length > 0,
+        "tool model string must be non-empty when creating a tool model"
+      );
+      // ONE config snapshot for both SDK model creation and the
+      // pinned pricing identity: two independent reads would let
+      // a catalog refresh land between them, running the request
+      // on one wire while recording usage under another type.
+      const toolProvidersConfig =
+        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
+      // View snapshot captured at creation time for option
+      // building (buildProviderOptions takes the oRPC view, not
+      // the raw config shape).
+      const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
+      const toolModel = await this.dependencies.createModel(toolModelString, undefined, {
+        workspaceId,
+        providersConfig: toolProvidersConfig,
+        agentInitiated: true,
+      });
+      if (!toolModel.success) {
+        throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
+      }
+      toolModelCostsIncludedByModelString.set(toolModelString, modelCostsIncluded(toolModel.data));
+      // Same effective-route rule as createModelWithPinnedMetadata:
+      // a coder: selection whose gateway is unavailable falls away
+      // to a direct provider inside createModel, and identity or
+      // options derived from the raw selection (instance type)
+      // would diverge from the model actually created.
+      const toolEffectiveModelString =
+        this.dependencies.providerModelFactory.resolveEffectiveModelString(
+          toolModelString,
+          undefined,
+          toolProvidersConfig
+        );
+      const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
+      // Creation-time identity from the SAME snapshot the model
+      // was created from (see map declaration).
+      toolModelMetadataModelByModelString.set(
+        toolModelString,
+        resolveModelForMetadata(
+          toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
+          toolProvidersConfig
+        )
+      );
+      // Wire-resolved identity for option construction, same
+      // snapshot: a raw coder: string carries no wire info, so
+      // buildProviderOptions would emit the wrong (or no)
+      // namespace for custom-named/cross-typed instances. Mirrors
+      // resolveOptionsCanonicalModel's shadow + wire rules.
+      const toolOptionsModelString = (() => {
+        // Custom providers keep their RAW identity: with the
+        // pinned snapshot below, buildProviderOptions remaps the
+        // wire namespace itself while still resolving
+        // mappedToModel alias metadata from the custom entry.
+        if (!toolModelString.startsWith("coder:")) {
+          return toolModelString;
+        }
+        const coderSection = toolProvidersConfig.coder;
+        if (isCustomProviderConfig(coderSection)) {
+          return toolModelString;
+        }
+        if (!toolOnCoderRoute) {
+          // Fallback-away: options must target the route that
+          // actually serves the request, not the instance's wire.
+          return normalizeToCanonical(toolEffectiveModelString);
+        }
+        const wire = resolveCoderWireCanonicalModel(
+          toolModelString.slice("coder:".length),
+          coderSection as
+            | { discoveredProviders?: unknown; additionalProviders?: unknown }
+            | undefined
+        );
+        return wire ? `${wire.origin}:${wire.modelId}` : toolModelString;
+      })();
+      return {
+        model: toolModel.data,
+        optionsModelString: toolOptionsModelString,
+        optionsProvidersConfig: toolOptionsProvidersConfig,
+      };
+    };
+    // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
       runtime,
@@ -1892,98 +2004,25 @@ export class TurnRequestBuilder {
                 assert(snapshot.toolName === "advisor", "advisor snapshot must belong to advisor");
                 return snapshot;
               },
-              createModel: async (ms: string) => {
-                const advisorModelString = ms.trim();
-                assert(
-                  advisorModelString.length > 0,
-                  "advisor model string must be non-empty when creating an advisor model"
-                );
-                // ONE config snapshot for both SDK model creation and the
-                // pinned pricing identity: two independent reads would let
-                // a catalog refresh land between them, running the request
-                // on one wire while recording usage under another type.
-                const advisorProvidersConfig =
-                  this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-                // View snapshot captured at creation time for option
-                // building (buildProviderOptions takes the oRPC view, not
-                // the raw config shape).
-                const advisorOptionsProvidersConfig = this.dependencies.providerService.getConfig();
-                const advisorModel = await this.dependencies.createModel(
-                  advisorModelString,
-                  undefined,
-                  {
-                    workspaceId,
-                    providersConfig: advisorProvidersConfig,
-                  }
-                );
-                if (!advisorModel.success) {
-                  throw new Error(
-                    `Failed to create advisor model: ${getErrorMessage(advisorModel.error)}`
-                  );
-                }
-                toolModelCostsIncludedByModelString.set(
-                  advisorModelString,
-                  modelCostsIncluded(advisorModel.data)
-                );
-                // Same effective-route rule as createModelWithPinnedMetadata:
-                // a coder: selection whose gateway is unavailable falls away
-                // to a direct provider inside createModel, and identity or
-                // options derived from the raw selection (instance type)
-                // would diverge from the model actually created.
-                const advisorEffectiveModelString =
-                  this.dependencies.providerModelFactory.resolveEffectiveModelString(
-                    advisorModelString,
-                    undefined,
-                    advisorProvidersConfig
-                  );
-                const advisorOnCoderRoute = advisorEffectiveModelString.startsWith("coder:");
-                // Creation-time identity from the SAME snapshot the model
-                // was created from (see map declaration).
-                toolModelMetadataModelByModelString.set(
-                  advisorModelString,
-                  resolveModelForMetadata(
-                    advisorOnCoderRoute
-                      ? advisorModelString
-                      : normalizeToCanonical(advisorEffectiveModelString),
-                    advisorProvidersConfig
-                  )
-                );
-                // Wire-resolved identity for option construction, same
-                // snapshot: a raw coder: string carries no wire info, so
-                // buildProviderOptions would emit the wrong (or no)
-                // namespace for custom-named/cross-typed instances. Mirrors
-                // resolveOptionsCanonicalModel's shadow + wire rules.
-                const advisorOptionsModelString = (() => {
-                  // Custom providers keep their RAW identity: with the
-                  // pinned snapshot below, buildProviderOptions remaps the
-                  // wire namespace itself while still resolving
-                  // mappedToModel alias metadata from the custom entry.
-                  if (!advisorModelString.startsWith("coder:")) {
-                    return advisorModelString;
-                  }
-                  const coderSection = advisorProvidersConfig.coder;
-                  if (isCustomProviderConfig(coderSection)) {
-                    return advisorModelString;
-                  }
-                  if (!advisorOnCoderRoute) {
-                    // Fallback-away: options must target the route that
-                    // actually serves the request, not the instance's wire.
-                    return normalizeToCanonical(advisorEffectiveModelString);
-                  }
-                  const wire = resolveCoderWireCanonicalModel(
-                    advisorModelString.slice("coder:".length),
-                    coderSection as
-                      | { discoveredProviders?: unknown; additionalProviders?: unknown }
-                      | undefined
-                  );
-                  return wire ? `${wire.origin}:${wire.modelId}` : advisorModelString;
-                })();
-                return {
-                  model: advisorModel.data,
-                  optionsModelString: advisorOptionsModelString,
-                  optionsProvidersConfig: advisorOptionsProvidersConfig,
-                };
-              },
+              createModel: createToolModel,
+              abortSignal: combinedAbortSignal,
+            },
+          }
+        : {}),
+      ...(intuitionToolEligible
+        ? {
+            intuitionRuntime: {
+              modelString: resolveHeadlessAgentModelString(
+                this.dependencies.config,
+                workspaceId,
+                "intuition",
+                modelString,
+                intuitionDefinition?.frontmatter.ai
+              ),
+              maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
+              usesThisTurn: 0,
+              createModel: createToolModel,
+              resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
               abortSignal: combinedAbortSignal,
             },
           }
@@ -2244,6 +2283,9 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
 
+        // Intuition's internal memory_read must not bypass a policy denying memory.
+        if (attemptTools.memory === undefined) delete attemptTools.intuition;
+
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2271,6 +2313,7 @@ export class TurnRequestBuilder {
           }
         }
 
+        const intuitionToolAvailable = attemptTools.intuition !== undefined;
         const advisorToolAvailable = attemptTools.advisor !== undefined;
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
@@ -2281,12 +2324,13 @@ export class TurnRequestBuilder {
           options.reusePrePolicySystemContext &&
           advisorToolAvailable === advisorToolEligible &&
           memoryToolAvailable === memoryToolEligible &&
+          intuitionToolAvailable === intuitionToolEligible &&
           memoryContextForModel === memoryContext;
         const rebuildSystemStartedAt = Date.now();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
           : await buildStreamSystemContextForToolset(
-              { advisorToolAvailable, memoryToolAvailable },
+              { advisorToolAvailable, memoryToolAvailable, intuitionToolAvailable },
               seed.rawModelString,
               memoryContextForModel
             );
@@ -2321,6 +2365,17 @@ export class TurnRequestBuilder {
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
             }).tools;
+          }
+          // Middleware may filter tools too, but must not restore policy-denied
+          // recall or leave its private memory reader available without memory.
+          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
+            delete attemptTools.intuition;
+          }
+          if (attemptTools.intuition === undefined) {
+            assembleCtx.systemMessage = removeIntuitionGuidance(
+              assembleCtx.systemMessage,
+              attemptTools.memory !== undefined
+            );
           }
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;

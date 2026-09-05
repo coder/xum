@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import assert from "node:assert/strict";
 
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import type {
   SubagentGitPatchArtifact,
   SubagentGitProjectPatchArtifact,
@@ -14,6 +14,7 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { log } from "@/node/services/log";
+import { isActiveWorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
@@ -330,12 +331,14 @@ export class GitPatchArtifactService {
    *
    * @param onComplete - called after generation finishes (success *or* failure),
    *   typically used to trigger reported-leaf-task cleanup.
+   * @param options.config - config snapshot to resolve the child/parent entries from; callers that
+   *   iterate many tasks (startup recovery) pass one instead of reloading config.json per task.
    */
   async maybeStartGeneration(
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     return await this.withOperationLock(childWorkspaceId, async () => {
       await this.maybeStartGenerationUnlocked(
@@ -351,7 +354,7 @@ export class GitPatchArtifactService {
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     assert(
       parentWorkspaceId.length > 0,
@@ -371,7 +374,7 @@ export class GitPatchArtifactService {
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
     const nowMs = Date.now();
-    const cfg = this.config.loadConfigOrDefault();
+    const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
     if (childEntry?.workspace.kind === "scratch") {
@@ -407,6 +410,21 @@ export class GitPatchArtifactService {
 
     if (!shouldGeneratePatch || !childEntry) {
       return;
+    }
+
+    if (options?.config != null) {
+      // The caller's snapshot can predate a client removing or reactivating this task. Only a
+      // task with no artifact yet or a crash-left pending one would actually be generated below
+      // (a completed artifact is left untouched), so re-read config for exactly those. A removed
+      // task gets no artifact, and a reactivated one (live execution handle, so its checkout is
+      // changing again) is left to the continuation refresh that runs when that execution settles.
+      const existing = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
+      if (existing == null || existing.status === "pending") {
+        const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (live == null || isActiveWorkspaceTurnTaskStatus(live.workspace.taskExecutionStatus)) {
+          return;
+        }
+      }
     }
 
     const pendingProjectArtifacts = buildPendingProjectArtifacts({

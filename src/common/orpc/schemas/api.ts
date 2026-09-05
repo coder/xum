@@ -2076,6 +2076,7 @@ export const tasks = {
       .object({
         parentWorkspaceId: z.string(),
         kind: z.literal("agent"),
+        desktop: z.enum(["shared", "isolated"]).optional(),
         agentId: AgentIdSchema.optional(),
         /** @deprecated Legacy alias for agentId (kept for downgrade compatibility). */
         agentType: z.string().min(1).optional(),
@@ -2102,6 +2103,7 @@ export const tasks = {
         taskId: z.string(),
         kind: z.literal("agent"),
         status: z.enum(["queued", "starting", "running"]),
+        desktopOwnerWorkspaceId: z.string().optional(),
       }),
       z.string()
     ),
@@ -3167,6 +3169,7 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
     width: z.number(),
     height: z.number(),
     sessionId: z.string(),
+    sharedDesktop: z.object({ ownerWorkspaceId: z.string(), ownerName: z.string() }).optional(),
   }),
   z.object({
     available: z.literal(false),
@@ -3180,7 +3183,38 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
   }),
 ]);
 
+const DesktopWindowInputSchema = z.object({
+  workspaceId: z.string().min(1),
+  instanceId: z.string().min(1),
+});
+const DesktopWindowStateSchema = z.object({ instanceId: z.string().min(1) });
+
+export const DesktopViewerEventSchema = z.object({
+  type: z.enum(["ready", "release"]),
+  viewerId: z.string().min(1),
+});
+
 export const desktop = {
+  watchViewer: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(DesktopViewerEventSchema),
+  },
+  acknowledgeViewerRelease: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
+  openWindow: {
+    input: DesktopWindowInputSchema,
+    output: DesktopWindowStateSchema,
+  },
+  closeWindow: {
+    input: DesktopWindowInputSchema,
+    output: z.void(),
+  },
+  getWindow: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: DesktopWindowStateSchema.nullable(),
+  },
   getPrereqStatus: {
     input: z.void(),
     output: DesktopPrereqStatusSchema,
