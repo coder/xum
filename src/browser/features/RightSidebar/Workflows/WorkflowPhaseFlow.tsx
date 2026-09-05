@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import { Check, GitBranch, Minus, Pause, X } from "lucide-react";
 
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { useReducedMotion } from "@/browser/hooks/useReducedMotion";
 import type { WorkflowPhaseManifest } from "@/common/types/workflow";
 
 import { WorkflowLiveDot } from "./WorkflowBadges";
@@ -132,7 +133,8 @@ const LIFECYCLE_HINT: Record<WorkflowPhaseLifecycle, string> = {
 
 const PhaseFlowNode: React.FC<{
   node: WorkflowPhaseFlowNode;
-  activeLayoutId: string;
+  /** Shared layoutId for the active pill; null renders the highlight statically. */
+  activeLayoutId: string | null;
   onSelect?: (name: string) => void;
 }> = (props) => {
   const node = props.node;
@@ -144,9 +146,10 @@ const PhaseFlowNode: React.FC<{
     <>
       {node.lifecycle === "running" && (
         // Shared layoutId per rail: when the active phase advances, the pill
-        // animates from the previous node to the next one.
+        // animates from the previous node to the next one. Under
+        // prefers-reduced-motion the same pill is drawn in place with no motion.
         <motion.span
-          layoutId={props.activeLayoutId}
+          layoutId={props.activeLayoutId ?? undefined}
           className="absolute inset-0 rounded-full"
           style={{ background: "color-mix(in srgb, var(--color-accent) 12%, transparent)" }}
           transition={{ type: "spring", stiffness: 500, damping: 40 }}
@@ -187,7 +190,9 @@ const PhaseFlowNode: React.FC<{
 export const WorkflowPhaseFlow: React.FC<WorkflowPhaseFlowProps> = (props) => {
   // Unique per rail instance so simultaneous rails (nested runs, several cards)
   // never animate their active pills into each other.
-  const activeLayoutId = React.useId();
+  const layoutId = React.useId();
+  const prefersReducedMotion = useReducedMotion();
+  const activeLayoutId = prefersReducedMotion ? null : layoutId;
   if (props.nodes.length === 0) {
     return null;
   }

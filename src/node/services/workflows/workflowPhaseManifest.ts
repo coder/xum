@@ -142,8 +142,9 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
     ts.ScriptKind.JS
   );
   // Direct `eval` can read or reassign the lexical `phase` binding from a string
-  // the scanner cannot see, so any direct eval call in the file voids inference.
-  if (containsDirectEval(ts, sourceFile)) {
+  // the scanner cannot see, and a sloppy-mode `with` block resolves `phase`
+  // dynamically through its object; either anywhere in the file voids inference.
+  if (containsDynamicScope(ts, sourceFile)) {
     return undefined;
   }
   const workflowFn = findDefaultExportedFunction(ts, sourceFile);
@@ -288,12 +289,15 @@ function findImmutableFunctionBinding(
   return undefined;
 }
 
-function containsDirectEval(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
+function containsDynamicScope(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
   // `(eval)(x)` is still a direct eval — parentheses preserve the Reference —
   // whereas `(0, eval)(x)` and `obj.eval(x)` are indirect and out of scope.
   const unwrap = (node: ts.Expression): ts.Expression =>
     ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node;
   const check = (node: ts.Node): boolean => {
+    if (ts.isWithStatement(node)) {
+      return true;
+    }
     if (ts.isCallExpression(node)) {
       const callee = unwrap(node.expression);
       if (ts.isIdentifier(callee) && callee.text === "eval") {
@@ -342,6 +346,9 @@ function hasCanonicalPhaseBinding(ts: TypeScriptModule, fn: WorkflowFunctionNode
   }
   let canonical = false;
   for (const element of firstParam.name.elements) {
+    if (element.dotDotDotToken != null && containsPhaseBinding(ts, element.name)) {
+      return false; // { ...phase } binds the leftover context object, not the primitive
+    }
     const propertyName = bindingPropertyNameText(ts, element);
     if (propertyName === COMPUTED_BINDING_KEY) {
       return false; // { [key]: phase } — the bound capability cannot be proven statically

@@ -101,6 +101,15 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(`export default function workflow({ other: phase }) { phase("x"); return {}; }\n`)
     ).toBeUndefined();
+    // Rest element: `phase` is the leftover context object, not the primitive.
+    expect(
+      phaseNames(`export default function workflow({ ...phase }) { phase("x"); return {}; }\n`)
+    ).toBeUndefined();
+    expect(
+      phaseNames(
+        `export default function workflow({ agent, ...phase }) { phase("x"); return {}; }\n`
+      )
+    ).toBeUndefined();
     // Computed key: `key` may resolve to another capability (agent, log, …), so the
     // local named `phase` cannot be proven to be the phase primitive.
     expect(
@@ -175,6 +184,12 @@ describe("inferPhaseManifest", () => {
     expect(
       phaseNames(legacyWorkflow(`phase("a"); const g = globalThis; log(g.eval("1"));`))
     ).toEqual(["a"]);
+  });
+
+  test("bails on with statements, which resolve identifiers dynamically", () => {
+    expect(
+      phaseNames(legacyWorkflow(`with ({ phase: () => {} }) { phase("shadowed"); } phase("b");`))
+    ).toBeUndefined();
   });
 
   test("bails on shadowing declarations", () => {

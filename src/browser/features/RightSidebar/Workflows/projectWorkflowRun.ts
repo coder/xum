@@ -745,16 +745,15 @@ export function getActiveWorkflowPhase(
   phases: readonly WorkflowPhaseView[]
 ): WorkflowPhaseView | null {
   return (
-    // Lifecycle "running" is the latest-visited phase of an active run (or the ""
-    // bucket while its steps run). It must win over a phase that merely still has
-    // a live step: after `phase(A); agent(...); phase(B)` both A and B have work in
-    // flight, and rail order would otherwise regress the header to "phase 1/N".
-    phases.find((phase) => phase.lifecycle === "running") ??
-    // `latest` follows event order, not rail order — `phases.findLast(...)`
-    // would name `verify` after a `scope → verify → scope` loop re-entry.
+    // `latest` is the phase entered most recently in EVENT order: on an active run
+    // it is the one with lifecycle "running", on a terminal run the final position.
+    // It beats both rail order (`findLast` would name `verify` after a
+    // `scope → verify → scope` loop) and phases that merely still have a live step
+    // (`phase(A); agent(...); phase(B)` must read as B, not regress to "phase 1/N").
     phases.find((phase) => phase.latest) ??
     // Steps observed before any phase event sit in the "" bucket, which is
-    // chronologically first — so it is the position only when nothing else was visited.
+    // chronologically first — so it is the position only when nothing else was
+    // visited, even while its steps are still running.
     phases.find((phase) => phase.name === "") ??
     null
   );

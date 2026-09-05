@@ -994,4 +994,35 @@ describe("projectWorkflowRun — declared phase manifest", () => {
     expect(view.phases.map((phase) => phase.name)).toEqual([""]);
     expect(getActiveWorkflowPhase(view.phases)?.label).toBe("Steps");
   });
+
+  test("a running unphased step does not outrank the latest named phase", () => {
+    // The "" bucket is unshifted to the front with lifecycle "running" while its
+    // step is live; the header must still name the phase the run has entered.
+    const view = projectWorkflowRun(
+      manifestRun({
+        events: [
+          {
+            sequence: 1,
+            type: "task",
+            at: at(1),
+            stepId: "s0",
+            taskId: "t0",
+            status: "started",
+            title: "Unphased warmup",
+          },
+          phaseEvent(2, "scope"),
+        ],
+        steps: [
+          { stepId: "s0", inputHash: "h", status: "started", taskId: "t0", startedAt: at(1) },
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["", "running"],
+      ["scope", "running"],
+      ["verify", "pending"],
+      ["synthesize", "pending"],
+    ]);
+    expect(getActiveWorkflowPhase(view.phases)?.name).toBe("scope");
+  });
 });
