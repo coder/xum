@@ -88,10 +88,18 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
   const masked = maskStaticJavaScriptSource(source);
   const match = matchTopLevelMetaDeclaration(masked);
   if (match == null) return false;
-  const start = skipStaticWhitespace(masked, match.end);
+  // Transparent parentheses around the literal (`meta = ({ ... })`) change nothing.
+  let start = skipStaticWhitespace(masked, match.end);
+  while (masked[start] === "(") {
+    start = skipStaticWhitespace(masked, start + 1);
+  }
   if (masked[start] !== "{") return false;
   const end = findMaskedObjectEnd(masked, start);
   if (end === -1) return false;
+  // An identifier escape (`pha\u0073es:`) defeats textual key reading; the
+  // masked text has no string/comment/regex bodies, so any remaining backslash
+  // is one, and the literal may declare anything.
+  if (masked.slice(start, end).includes("\\")) return true;
   let depth = 0;
   let expectKey = true;
   for (let index = start + 1; index < end; index += 1) {
@@ -195,6 +203,10 @@ export function isStaticMetadataBindingImmutable(source: string): boolean {
   if (match == null) return false;
   const declaration = masked.slice(match.declarationStart, match.end);
   if (!/\bconst\b/u.test(declaration)) return false;
+  // Identifier escapes (`m\u0065ta = …`) resolve to the same binding but defeat a
+  // textual scan; masked code keeps no string/comment/regex bodies, so any
+  // backslash left is one — treat the binding as not provably immutable.
+  if (masked.includes("\\")) return false;
   const mentions = masked.matchAll(/(?<![\w$.])meta(?![\w$])/gu);
   for (const mention of mentions) {
     const inDeclaration = mention.index >= match.declarationStart && mention.index < match.end;

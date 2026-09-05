@@ -398,20 +398,23 @@ describe("hydrateWorkflowRunPhaseManifest", () => {
     });
   });
 
-  test("returns the run unchanged when no manifest resolves", () => {
+  test("marks hydrated records with an explicit null when no manifest resolves", () => {
+    // null = "hydrated, none derivable"; clients use it to tell a hydrated record
+    // apart from a pre-upgrade snapshot that simply lacks the field.
     const run = makeRun(`export default function workflow(ctx) { return {}; }\n`);
-    expect(hydrateWorkflowRunPhaseManifest(run)).toBe(run);
+    const hydrated = hydrateWorkflowRunPhaseManifest(run);
+    expect(hydrated.workflow.phaseManifest).toBeNull();
+    expect(run.workflow.phaseManifest).toBeUndefined();
   });
 
-  test("strips a stale persisted manifest when the source derives none", () => {
-    // Hand-edited/corrupted run.json: the record schema tolerates the field so the
-    // store can strip it, but the read boundary must not echo it back to clients.
+  test("replaces a stale persisted manifest with null when the source derives none", () => {
+    // Hand-edited/corrupted run.json: the store strips it before schema validation,
+    // but the read boundary must never echo such a value back to clients either.
     const stale = { provenance: "declared" as const, phases: [{ name: "attacker-phase" }] };
     const run = makeRun(`export default function workflow(ctx) { return {}; }\n`);
     const corrupted = { ...run, workflow: { ...run.workflow, phaseManifest: stale } };
     const hydrated = hydrateWorkflowRunPhaseManifest(corrupted);
-    expect(hydrated.workflow.phaseManifest).toBeUndefined();
-    expect("phaseManifest" in hydrated.workflow).toBe(false);
+    expect(hydrated.workflow.phaseManifest).toBeNull();
     expect(corrupted.workflow.phaseManifest).toBe(stale);
   });
 

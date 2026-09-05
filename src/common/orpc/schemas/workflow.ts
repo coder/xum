@@ -104,8 +104,12 @@ export const WorkflowScriptDescriptorSchema = z
     sourceHash: z.string().min(1).optional(),
     executable: z.boolean(),
     blockedReason: z.string().min(1).optional(),
-    /** Hydrated on read; never written to disk. */
-    phaseManifest: WorkflowPhaseManifestSchema.optional(),
+    /**
+     * Hydrated on read; never written to disk. `null` means "hydrated, none
+     * derivable"; absent means the snapshot predates hydration (pre-upgrade
+     * tool output) and a client may fetch the hydrated record once.
+     */
+    phaseManifest: WorkflowPhaseManifestSchema.nullish(),
   })
   .refine((value) => value.executable || value.blockedReason != null, {
     message: "Non-executable workflow scripts must include a blocked reason",

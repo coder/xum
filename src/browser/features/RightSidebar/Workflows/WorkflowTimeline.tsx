@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { WorkflowJsonBlock } from "@/browser/features/Tools/WorkflowToolShared";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useReducedMotion } from "@/browser/hooks/useReducedMotion";
 import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -413,7 +414,13 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         <Layers className="h-3 w-3" />
       </span>
       {phase.label.length > 0 && (
-        <span className="text-content-primary text-[13px] font-semibold">{phase.label}</span>
+        // Declared labels may run to 120 chars: truncate so the count/status/disclosure
+        // cells stay on-card at narrow widths, with the full text one hover away.
+        <TooltipIfPresent tooltip={phase.label}>
+          <span className="text-content-primary min-w-0 truncate text-[13px] font-semibold">
+            {phase.label}
+          </span>
+        </TooltipIfPresent>
       )}
       {phase.total > 0 && (
         <span className="text-muted text-[11px] tabular-nums">
@@ -452,13 +459,13 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
-          className="hover:bg-surface-secondary flex w-full items-center gap-2 rounded-md py-1.5 text-left"
+          className="hover:bg-surface-secondary flex w-full min-w-0 items-center gap-2 rounded-md py-1.5 text-left"
           aria-expanded={open}
         >
           {headerContent}
         </button>
       ) : (
-        <div className="flex items-center gap-2 py-1.5">{headerContent}</div>
+        <div className="flex min-w-0 items-center gap-2 py-1.5">{headerContent}</div>
       )}
       {open && hasInfo && (
         <div className="mb-1.5 ml-[30px] flex flex-col gap-1">

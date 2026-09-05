@@ -73,7 +73,18 @@ export function parseDeclaredPhasesFromSource(source: string): WorkflowDeclaredP
       `${STATIC_METADATA_ERROR}; meta.phases cannot be read from this meta declaration`,
     ]);
   }
-  const phases = parseDeclaredPhases(isPlainObject(rawMetadata) ? rawMetadata : null);
+  if (!isPlainObject(rawMetadata)) {
+    // The literal parsed but is not a plain object (e.g. a `__proto__` key gave
+    // the accumulator a custom prototype). Its phases are unreadable, so treat
+    // it exactly like an unreadable literal that may declare them.
+    if (staticMetadataLiteralMayDeclareKey(source, "phases")) {
+      throw new WorkflowDeclaredPhasesValidationError([
+        `${STATIC_METADATA_ERROR}; meta must be a plain object to declare phases`,
+      ]);
+    }
+    return undefined;
+  }
+  const phases = parseDeclaredPhases(rawMetadata);
   if (phases != null && !isStaticMetadataBindingImmutable(source)) {
     throw new WorkflowDeclaredPhasesValidationError([
       "meta.phases requires an immutable declaration: use `export const meta` and do not reference `meta` elsewhere in the script",

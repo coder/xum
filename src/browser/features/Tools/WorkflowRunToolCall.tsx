@@ -1654,20 +1654,22 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
 
   // Tool output redaction can strip `run.source` from completed cards; fetch the full durable
   // run lazily when the user expands the card so the Script source disclosure remains useful.
-  // Snapshots persisted by pre-manifest builds embed `source` but no
-  // `workflow.phaseManifest`, and terminal cards never subscribe — so a missing
-  // manifest also triggers one hydrated fetch per run, or historical rails would
-  // never appear after upgrading. Only sources that could possibly derive a
-  // manifest qualify (a declared `phases` key or a `phase(` call both need the
-  // token); anything else would be a guaranteed-empty round trip.
+  // Snapshots persisted by pre-manifest builds embed `source` but the
+  // `workflow.phaseManifest` field is ABSENT (hydrated records carry a manifest
+  // or an explicit null). Active cards subscribe and receive hydrated records,
+  // but terminal cards never do — so an absent field on a terminal snapshot also
+  // triggers one hydrated fetch per run, or historical rails would never appear
+  // after upgrading.
   const runPhaseManifest = run?.workflow.phaseManifest;
+  const runStatus = run?.status;
   const manifestHydrationAttemptedFor = useRef<string | null>(null);
   useEffect(() => {
     const needsSource = runSource == null;
     const needsManifest =
-      runPhaseManifest == null &&
       runSource != null &&
-      /\bphases?\b/u.test(runSource) &&
+      runStatus != null &&
+      !isActiveWorkflowRunStatus(runStatus) &&
+      runPhaseManifest === undefined &&
       manifestHydrationAttemptedFor.current !== runId;
     if (
       !expanded ||
@@ -1699,7 +1701,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     return () => {
       ignore = true;
     };
-  }, [apiState?.api, expanded, runId, runPhaseManifest, runSource, workflowWorkspaceId]);
+  }, [apiState?.api, expanded, runId, runPhaseManifest, runSource, runStatus, workflowWorkspaceId]);
 
   useEffect(() => {
     if (

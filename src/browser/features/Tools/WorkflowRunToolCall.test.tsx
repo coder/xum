@@ -970,6 +970,8 @@ describe("WorkflowRunToolCall", () => {
                 sourceKind: "skill",
                 sourceHash: "sha256:parent",
                 executable: true,
+                // Server-shaped record: already hydrated (none derivable).
+                phaseManifest: null,
               },
               source: "export default function workflow() { return null; }",
               sourceHash: "sha256:parent",
@@ -2150,6 +2152,53 @@ describe("WorkflowRunToolCall", () => {
     expect(getRun).toHaveBeenCalledTimes(1);
   });
 
+  test("does not fetch for snapshots already hydrated to an explicit null manifest", async () => {
+    const hydratedNone: WorkflowRunRecord = {
+      id: "wfr_hydrated_none",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: {
+        name: "plain",
+        description: "Plain",
+        scope: "project",
+        executable: true,
+        phaseManifest: null,
+      },
+      source: 'export default function workflow() { return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:hydrated-none",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const getRun = mock(async () => hydratedNone);
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/plain.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: hydratedNone.id,
+                result: { reportMarkdown: "ok" },
+                run: hydratedNone,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Script source")).toBeTruthy());
+    expect(getRun).not.toHaveBeenCalled();
+  });
+
   test("renders attached foreground workflow runs without heuristic discovery", async () => {
     const attachedRun = {
       id: "wfr_attached",
@@ -3082,6 +3131,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:action-ordered",
@@ -4028,6 +4079,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -4148,6 +4201,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -4473,6 +4528,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:test",
@@ -4531,6 +4588,8 @@ describe("WorkflowRunToolCall", () => {
                     description: "Deep research",
                     scope: "built-in",
                     executable: true,
+                    // Server-shaped record: already hydrated (none derivable).
+                    phaseManifest: null,
                   },
                   source: "export default function workflow() { return null; }",
                   sourceHash: "sha256:test",

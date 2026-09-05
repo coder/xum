@@ -142,6 +142,11 @@ describe("parseDeclaredPhasesFromSource", () => {
       "export const meta = { ...{ phases: buildPhases() } };\n",
       "export const meta = { description: 'x', ...shared };\n",
       'export const meta = { [key]: [{ name: "a" }], description: "x" };\n',
+      // Transparent parentheses and identifier escapes cannot hide the key either.
+      "export const meta = ({ phases: buildPhases() });\n",
+      "export const meta = { pha\\u0073es: buildPhases() };\n",
+      // Parses, but a `__proto__` key makes the value a non-plain object.
+      'export const meta = { __proto__: {}, phases: [{ name: "setup" }] };\n',
     ]) {
       const source = declaration + body;
       try {
@@ -180,6 +185,8 @@ describe("declared phases require an immutable meta binding", () => {
       `export let meta = ${phases};\n`,
       `export const meta = ${phases};\nmeta.phases.push({ name: "b" });\n`,
       `export const meta = ${phases};\nconst alias = meta;\n`,
+      // An identifier escape names the same binding; a textual scan cannot prove otherwise.
+      `export const meta = ${phases};\nm\\u0065ta.phases[0].name = "changed";\n`,
     ]) {
       expect(() => parseDeclaredPhasesFromSource(declaration + body)).toThrow(
         /immutable declaration/u

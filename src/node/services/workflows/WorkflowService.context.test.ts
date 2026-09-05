@@ -297,9 +297,8 @@ describe("WorkflowService request orchestration", () => {
       provenance: "inferred",
       phases: [{ name: "a" }, { name: "b" }],
     });
-    expect(
-      runs.find((run) => run.id === "wfr_legacy_dynamic")?.workflow.phaseManifest
-    ).toBeUndefined();
+    // Hydrated-but-none is an explicit null (absent = pre-upgrade snapshot).
+    expect(runs.find((run) => run.id === "wfr_legacy_dynamic")?.workflow.phaseManifest).toBeNull();
   });
 
   test("rejects run creation when meta.phases is invalid, enumerating every issue", async () => {

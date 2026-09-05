@@ -119,20 +119,23 @@ function computePhaseManifestOutcome(source: string): WorkflowPhaseManifestOutco
 
 /**
  * Return an outbound copy of the run whose `workflow.phaseManifest` is derived
- * from the snapshotted source — set when a manifest resolves, otherwise absent.
- * The source is the only authority: a `phaseManifest` already present on the
- * incoming record (hand-edited or otherwise corrupted run.json — the record
- * schema tolerates the field so the store can strip it) is never passed through,
- * so persisted corruption self-heals at the read boundary. Callers must not feed
- * the hydrated copy back into WorkflowRunStore writes.
+ * from the snapshotted source — the manifest when one resolves, else `null`
+ * ("hydrated, none"). The explicit null lets clients tell a hydrated record
+ * apart from a pre-upgrade snapshot that simply lacks the field. The source is
+ * the only authority: a `phaseManifest` already present on the incoming record
+ * (hand-edited run.json — the store strips it before schema validation, but be
+ * defensive) is never passed through. Callers must not feed the hydrated copy
+ * back into WorkflowRunStore writes.
  */
 export function hydrateWorkflowRunPhaseManifest(run: WorkflowRunRecord): WorkflowRunRecord {
   const outcome = resolveWorkflowPhaseManifest(run.source, run.sourceHash);
-  const { phaseManifest: _stale, ...workflow } = run.workflow;
-  if (outcome.kind !== "manifest") {
-    return _stale === undefined ? run : { ...run, workflow };
-  }
-  return { ...run, workflow: { ...workflow, phaseManifest: outcome.manifest } };
+  return {
+    ...run,
+    workflow: {
+      ...run.workflow,
+      phaseManifest: outcome.kind === "manifest" ? outcome.manifest : null,
+    },
+  };
 }
 
 /**
