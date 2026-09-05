@@ -20,7 +20,6 @@ type SendMessageExperiments = SendMessageOptions["experiments"];
 
 import {
   applyToolPolicy,
-  isSessionHistoryExplicitlyDisabled,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
   type ToolPolicy,
@@ -188,12 +187,6 @@ export async function applyToolPolicyAndExperiments(
   // respects allow/deny filters. The policy-filtered tools are passed to
   // ToolBridge so the mux.* API only exposes policy-allowed tools.
   const policyFilteredTools = applyToolPolicy(grantFilteredTools, effectiveToolPolicy);
-  const historyExplicitlyDisabled = isSessionHistoryExplicitlyDisabled(effectiveToolPolicy);
-  if (experiments?.tokenBudget) {
-    if (historyExplicitlyDisabled) delete policyFilteredTools.session_history;
-    else if (grantFilteredTools.session_history)
-      policyFilteredTools.session_history = grantFilteredTools.session_history;
-  }
 
   // The bridge is built from the PRE-grant policy-filtered set: ToolBridge
   // must see grant-denied tools so it can stub them with a catchable
@@ -202,11 +195,6 @@ export async function applyToolPolicyAndExperiments(
   const policyFilteredPreGrant = opts.capabilityGrants
     ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
     : policyFilteredTools;
-  if (experiments?.tokenBudget) {
-    if (historyExplicitlyDisabled) delete policyFilteredPreGrant.session_history;
-    else if (allToolsWithExtra.session_history)
-      policyFilteredPreGrant.session_history = allToolsWithExtra.session_history;
-  }
 
   // Handle PTC experiment — replace bridgeable tools with code_execution.
   let toolsForModel = policyFilteredTools;

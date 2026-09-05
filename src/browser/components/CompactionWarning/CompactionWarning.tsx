@@ -52,7 +52,7 @@ export const CompactionWarning: React.FC<{
 
   return (
     <div
-      className={`text-right text-[10px] ${
+      className={`counter-nums text-right text-[10px] ${
         isUrgent ? "text-plan-mode font-semibold" : "text-muted"
       }`}
     >

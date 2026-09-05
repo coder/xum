@@ -550,13 +550,16 @@ describe("token budget history policy", () => {
   test.each(["plan", "explore", "custom"])(
     "%s allowlist omission does not hide recovery",
     async (agent) => {
-      const policy = resolveToolPolicyForAgent({
-        agents: [
-          { tools: { add: agent === "plan" ? ["file_read", "propose_plan"] : ["file_read"] } },
-        ],
-        isSubagent: agent === "explore",
-        disableTaskToolsForDepth: false,
-      });
+      const resolvePolicy = (sessionHistoryEnabled: boolean) =>
+        resolveToolPolicyForAgent({
+          agents: [
+            { tools: { add: agent === "plan" ? ["file_read", "propose_plan"] : ["file_read"] } },
+          ],
+          isSubagent: agent === "explore",
+          disableTaskToolsForDepth: false,
+          sessionHistoryEnabled,
+        });
+      const policy = resolvePolicy(true);
       expect(isSessionHistoryExplicitlyDisabled(policy)).toBe(false);
       const history = executableTool("History");
       const result = await applyToolPolicyAndExperiments({
@@ -568,7 +571,7 @@ describe("token budget history policy", () => {
       expect(result.session_history).toBe(history);
       const off = await applyToolPolicyAndExperiments({
         allTools: { session_history: history },
-        effectiveToolPolicy: policy,
+        effectiveToolPolicy: resolvePolicy(false),
         experiments: { tokenBudget: false },
         emitNestedToolEvent: () => undefined,
       });
@@ -576,11 +579,12 @@ describe("token budget history policy", () => {
     }
   );
 
-  test.each(["session_history", "^session_history$"])(
+  test.each(["session_history", "^session_history$", "session_.*", ".*"])(
     "explicit %s disable blocks assembly and rollover gate",
     async (name) => {
       const policy = resolveToolPolicyForAgent({
         agents: [{ tools: { remove: [name] } }, { tools: { add: [".*"] } }],
+        sessionHistoryEnabled: true,
         isSubagent: false,
         disableTaskToolsForDepth: false,
       });
@@ -595,7 +599,7 @@ describe("token budget history policy", () => {
     }
   );
 
-  test("only a later by-name enable overrides an explicit history disable", async () => {
+  test("the last matching regex rule controls history access", async () => {
     const policy = [
       { regex_match: "session_history", action: "disable" as const },
       { regex_match: ".*", action: "enable" as const },
@@ -607,13 +611,11 @@ describe("token budget history policy", () => {
         experiments: { tokenBudget: true },
         emitNestedToolEvent: () => undefined,
       });
-    expect((await assemble(policy)).session_history).toBeUndefined();
-    const explicitlyEnabled = [
-      ...policy,
-      { regex_match: "session_history", action: "enable" as const },
-    ];
-    expect(isSessionHistoryExplicitlyDisabled(explicitlyEnabled)).toBe(false);
-    expect((await assemble(explicitlyEnabled)).session_history).toBeDefined();
+    expect(isSessionHistoryExplicitlyDisabled(policy)).toBe(false);
+    expect((await assemble(policy)).session_history).toBeDefined();
+    const disabledAgain = [...policy, { regex_match: "session_.*", action: "disable" as const }];
+    expect(isSessionHistoryExplicitlyDisabled(disabledAgain)).toBe(true);
+    expect((await assemble(disabledAgain)).session_history).toBeUndefined();
   });
 
   test("PTC leaves recovery direct and does not offer it inside the sandbox", async () => {
@@ -625,6 +627,7 @@ describe("token budget history policy", () => {
       effectiveToolPolicy: [
         { regex_match: ".*", action: "disable" },
         { regex_match: "file_read", action: "enable" },
+        { regex_match: "session_history", action: "enable" },
       ],
       experiments: { tokenBudget: true, programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,

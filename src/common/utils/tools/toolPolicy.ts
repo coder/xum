@@ -78,15 +78,7 @@ export function applyToolPolicy(
   );
 }
 
-/** Recovery is baseline access, not an implicit agent allowlist capability.
- * Only an explicit by-name rule may turn it off; rollover uses this same gate.
- */
+/** Rollover must honor the same last-match regex policy as tool assembly. */
 export function isSessionHistoryExplicitlyDisabled(policy?: ToolPolicy): boolean {
-  let disabled = false;
-  for (const rule of policy ?? []) {
-    if (rule.regex_match.replace(/^\^/, "").replace(/\$$/, "") === "session_history") {
-      disabled = rule.action === "disable";
-    }
-  }
-  return disabled;
+  return applyToolPolicyToNames(["session_history"], policy).length === 0;
 }

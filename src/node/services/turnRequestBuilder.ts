@@ -1259,6 +1259,8 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
+    const sessionHistoryEnabled =
+      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1313,6 +1315,7 @@ export class TurnRequestBuilder {
         onPreStartError?.(event);
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
+      sessionHistoryEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
@@ -1344,7 +1347,7 @@ export class TurnRequestBuilder {
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
     const tokenBudgetEnabled =
       !isCompactionRequest &&
-      (experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
+      sessionHistoryEnabled &&
       !(
         experiments?.continuousCompaction ??
         isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)

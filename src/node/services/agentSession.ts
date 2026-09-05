@@ -19,6 +19,7 @@ import {
   estimateLastStepToolResults,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
+import { resolveAgentForStream } from "./agentResolution";
 import type { SettledStepBudget } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
@@ -769,9 +770,9 @@ export class AgentSession {
   private pendingRollover?: ContextWindowRollover;
   private contextBudgetWarningClaimed = false;
   private pendingBudgetWarning?: true;
-  private pendingRolloverMissingHistory = false;
   private contextBudgetGeneration = 0;
-  private contextBudgetMemoryWritable = false;
+  // Unknown after restart: do not spend the window's warning on guessed permissions.
+  private contextBudgetMemoryWritable: boolean | undefined;
   private readonly onContextWindowRollover?: () => void;
   private lastSystemMessageTokens?: number;
 
@@ -4009,7 +4010,8 @@ export class AgentSession {
       try {
         skillSnapshotMessages = await this.materializeAgentSkillSnapshots(
           typedMuxMetadata,
-          options?.disableWorkspaceAgents
+          options?.disableWorkspaceAgents,
+          contextRollover
         );
         mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
           typedMuxMetadata,
@@ -4098,7 +4100,16 @@ export class AgentSession {
         userMessage,
       ];
       try {
-        if (contextRollover) await this.applyContextResetSideEffects();
+        if (contextRollover) {
+          if (await cancelBeforeAcceptance()) return Ok(undefined);
+          if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
+            return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+          }
+          // Fail closed before publication: a crash must not reopen a fresh window
+          // with stale carryover/kernel state. An append failure may leave the old
+          // transcript with disposable context state cleared (ADR-0005).
+          await this.applyContextResetSideEffects();
+        }
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
@@ -4666,7 +4677,7 @@ export class AgentSession {
     this.pendingRollover = undefined;
     this.pendingBudgetWarning = undefined;
     this.contextBudgetWarningClaimed = false;
-    this.pendingRolloverMissingHistory = false;
+    this.contextBudgetMemoryWritable = undefined;
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY);
   }
@@ -4704,6 +4715,47 @@ export class AgentSession {
     }
   }
 
+  private async checkContextBudgetHistoryAccess(
+    options: SendMessageOptions | undefined
+  ): Promise<Result<void, SendMessageError>> {
+    const blocked: Result<void, SendMessageError> = Err({
+      type: "context_budget_blocked",
+      message:
+        "Context budget reached, but session_history is disabled. Enable it, use /compact, or /clear --soft.",
+    });
+    if (isSessionHistoryExplicitlyDisabled(options?.toolPolicy)) {
+      return blocked;
+    }
+    // Agent removals are absent from caller options. Resolve them before sealing
+    // history, including after restart or switching agents between turns.
+    try {
+      const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (!metadata.success) return Err(createUnknownSendMessageError(metadata.error));
+      const resolved = await resolveAgentForStream({
+        workspaceId: this.workspaceId,
+        metadata: metadata.data,
+        ...createRuntimeContextForWorkspace(metadata.data),
+        requestedAgentId: options?.agentId,
+        strictAgentResolution: options?.strictAgentResolution,
+        disableWorkspaceAgents: options?.disableWorkspaceAgents ?? false,
+        callerToolPolicy: options?.toolPolicy,
+        cfg: this.config.loadConfigOrDefault(),
+        emitError: () => undefined,
+        isAdvisorExperimentEnabled:
+          options?.experiments?.advisorTool ??
+          this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
+        includeAgentPlugins: this.aiService.isAgentPluginsEnabled?.() ?? false,
+        sessionHistoryEnabled: true,
+      });
+      if (!resolved.success) return Err(resolved.error);
+      return isSessionHistoryExplicitlyDisabled(resolved.data.effectiveToolPolicy)
+        ? blocked
+        : Ok(undefined);
+    } catch (error) {
+      return Err(createUnknownSendMessageError(getErrorMessage(error)));
+    }
+  }
+
   /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
   private async rolloverAfterBudgetFailure(
     model: string,
@@ -4721,13 +4773,8 @@ export class AgentSession {
       this.shuttingDown
     )
       return Ok(false);
-    if (isSessionHistoryExplicitlyDisabled(context.options?.toolPolicy)) {
-      return Err({
-        type: "context_budget_blocked",
-        message:
-          "Context budget reached, but session_history is disabled. Enable it, use /compact, or /clear --soft.",
-      });
-    }
+    const access = await this.checkContextBudgetHistoryAccess(context.options);
+    if (!access.success) return access;
     try {
       // StreamManager's completion settles after teardown. Commit its error partial,
       // including any settled fallback tool outputs, before sealing the old window.
@@ -4778,7 +4825,19 @@ export class AgentSession {
         this.shuttingDown
       )
         return Ok(false);
-      const rows = [...createRolloverPrefix(rollover), continuation];
+      // Retry the accepted skill instructions, not their dynamic commands. They
+      // may have been deduped against a snapshot elsewhere in the sealed window.
+      const skillSnapshots = extractAgentSkillRefs(user.metadata?.muxMetadata).flatMap((ref) => {
+        const snapshot = history.data.findLast(
+          (row) => row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
+        );
+        if (!snapshot) return [];
+        const { historySequence: _snapshotSequence, ...snapshotMetadata } = snapshot.metadata!;
+        return [
+          { ...snapshot, id: createAgentSkillSnapshotMessageId(), metadata: snapshotMetadata },
+        ];
+      });
+      const rows = [...createRolloverPrefix(rollover), ...skillSnapshots, continuation];
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
       if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
       this.clearContextBudgetState();
@@ -4846,15 +4905,9 @@ export class AgentSession {
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover");
-    if (
-      shouldRollover &&
-      (isSessionHistoryExplicitlyDisabled(options.toolPolicy) || this.pendingRolloverMissingHistory)
-    ) {
-      return Err({
-        type: "context_budget_blocked",
-        message:
-          "Context budget reached, but session_history is disabled. Enable session_history, use /compact, or /clear --soft before continuing.",
-      });
+    if (shouldRollover) {
+      const access = await this.checkContextBudgetHistoryAccess(options);
+      if (!access.success) return access;
     }
     const rollover: ContextWindowRollover | undefined =
       shouldRollover && hasRolloverEligibleMessages(history.data)
@@ -4916,6 +4969,7 @@ export class AgentSession {
     }
     if (
       !this.contextBudgetWarningClaimed &&
+      this.contextBudgetMemoryWritable !== undefined &&
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingBudgetWarning != null || decision.decision === "warn")
     ) {
@@ -4963,7 +5017,6 @@ export class AgentSession {
     });
     if (decision.decision === "continue") return "continue";
     if (decision.decision === "rollover") {
-      this.pendingRolloverMissingHistory = !step.sessionHistoryAvailable;
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
@@ -9073,7 +9126,8 @@ export class AgentSession {
 
   private async materializeAgentSkillSnapshots(
     muxMetadata: MuxMessageMetadata | undefined,
-    disableWorkspaceAgents: boolean | undefined
+    disableWorkspaceAgents: boolean | undefined,
+    freshContext = false
   ): Promise<MuxMessage[]> {
     const refs = extractAgentSkillRefs(muxMetadata);
     if (refs.length === 0) {
@@ -9104,7 +9158,10 @@ export class AgentSession {
     // Dedupe per skill against recent persisted snapshots. A wider window keeps multi-skill
     // turns from reloading snapshots that were persisted together on the previous turn.
     const recentSnapshots: Array<{ skillName: string; sha256: string }> = [];
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 10);
+    // Sealed-window snapshots cannot satisfy a skill invocation in the fresh request.
+    const historyResult = freshContext
+      ? Ok<MuxMessage[]>([])
+      : await this.historyService.getLastMessages(this.workspaceId, 10);
     if (historyResult.success) {
       for (const msg of historyResult.data) {
         const metadata = msg.metadata;

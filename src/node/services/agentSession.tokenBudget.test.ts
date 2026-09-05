@@ -133,6 +133,16 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     });
     harnesses.push(h);
+    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: workspaceId,
+        name: "budget",
+        projectName: "project",
+        projectPath: h.config.rootDir,
+        namedWorkspacePath: h.config.rootDir,
+        runtimeConfig: { type: "local" },
+      } as FrontendWorkspaceMetadata)
+    );
     h.session.setAutoCompactionThreshold(0.7);
     const finishAndDispatch = async () => {
       h.aiEmitter.emit("stream-end", {
@@ -204,7 +214,7 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   });
 
-  test("on-send usage below the force buffer warns without prematurely resetting history", async () => {
+  test("on-send usage below the force buffer preserves history while warning permissions are unknown", async () => {
     const h = await setup();
     await seedHistory(h, 95_000);
     expect(
@@ -214,10 +224,49 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
     expect(
       rows.filter((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
   });
+
+  test.each([false, true])(
+    "rollover retains a deduped skill snapshot (emergency=%s)",
+    async (emergency) => {
+      const h = await setup();
+      const skillDir = path.join(h.config.rootDir, ".xum", "skills", "repeat-skill");
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: repeat-skill\ndescription: Repeated skill\n---\nKeep these instructions.\n"
+      );
+      const skillOptions: SendMessageOptions = {
+        ...options,
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/repeat-skill",
+          skillName: "repeat-skill",
+          scope: "project",
+        },
+      };
+      expect((await h.session.sendMessage("Use the skill", skillOptions)).success).toBe(true);
+      h.session.dispose();
+      const resumed = await setup({
+        previous: h,
+        failure: emergency ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
+      });
+      await seedHistory(resumed, emergency ? 20_000 : 110_000);
+      expect((await resumed.session.sendMessage("Use it again", skillOptions)).success).toBe(true);
+      const rows = await allRows(resumed);
+      const snapshots = rows.filter((row) => row.metadata?.agentSkillSnapshot);
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[1].metadata?.agentSkillSnapshot?.sha256).toBe(
+        snapshots[0].metadata?.agentSkillSnapshot?.sha256
+      );
+      const active = sliceMessagesForProviderFromLatestContextBoundary(rows);
+      expect(active.some((row) => row.id === snapshots[1].id)).toBe(true);
+      expect(active.some((row) => row.id === snapshots[0].id)).toBe(false);
+    }
+  );
 
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
@@ -311,11 +360,13 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("failed atomic append preserves the pending rollover for the next attempt", async () => {
+  test("failed atomic append preserves history and retry after fail-closed cleanup", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
+    const cleanup = spyOn(h.session, "applyContextResetSideEffects");
     const append = spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
       async () => {
+        expect(cleanup).toHaveBeenCalledTimes(1);
         await Promise.resolve();
         throw new Error("disk unavailable");
       }
@@ -368,6 +419,26 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(h.requests).toHaveLength(2);
     }
   );
+
+  test("restart defers its first warning until settled memory availability is known", async () => {
+    const h = await setup();
+    await seedHistory(h, 85_000);
+    expect((await h.session.sendMessage("Resume work", options)).success).toBe(true);
+    expect(
+      (await allRows(h)).filter(
+        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+      )
+    ).toHaveLength(0);
+    expect(await h.requests[0].onStepSettled?.(step(85_000, { memoryWritable: true }))).toBe(
+      "warn"
+    );
+    await h.finishAndDispatch();
+    expect(
+      (await allRows(h)).filter(
+        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+      )
+    ).toHaveLength(1);
+  });
 
   test("settled warning is durable once per window and retains delegated continuation attribution", async () => {
     const h = await setup();
@@ -572,17 +643,74 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("explicit session_history disable blocks rollover before a stream starts", async () => {
+  test.each(["session_history", "session_.*", ".*"])(
+    "explicit %s disable blocks rollover before a stream starts",
+    async (regex_match) => {
+      const h = await setup();
+      await seedHistory(h, 110_000);
+      const result = await h.session.sendMessage("Keep my transcript reachable", {
+        ...options,
+        toolPolicy: [{ regex_match, action: "disable" }],
+      });
+      expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      expect(h.requests).toHaveLength(0);
+      expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    }
+  );
+
+  test("restoring history access unblocks a settled rollover without resetting first", async () => {
     const h = await setup();
-    await seedHistory(h, 110_000);
-    const result = await h.session.sendMessage("Keep my transcript reachable", {
+    const disabled: SendMessageOptions = {
       ...options,
-      toolPolicy: [{ regex_match: "session_history", action: "disable" }],
+      toolPolicy: [{ regex_match: "session_.*", action: "disable" }],
+    };
+    expect((await h.session.sendMessage("Start", disabled)).success).toBe(true);
+    expect(
+      await h.requests[0].onStepSettled?.(step(110_000, { sessionHistoryAvailable: false }))
+    ).toBe("rollover");
+    const blocked = Promise.withResolvers<void>();
+    const unsubscribe = h.session.onChatEvent(({ message }) => {
+      if (message.type === "stream-error") blocked.resolve();
     });
-    expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
-    expect(h.requests).toHaveLength(0);
+    h.aiEmitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId,
+      messageId: "assistant-1",
+      metadata: { model, agentId: "exec", finishReason: "tool-calls" },
+      parts: [],
+    });
+    h.completions[0].settle({ status: "completed" });
+    await blocked.promise;
+    await h.session.waitForIdle();
+    unsubscribe();
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    expect((await h.session.sendMessage("History enabled again", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    expect(h.requests).toHaveLength(2);
   });
+
+  test.each(["session_.*", ".*"])(
+    "agent-only %s removal blocks both on-send and emergency rollover",
+    async (pattern) => {
+      for (const emergency of [false, true]) {
+        const h = await setup(emergency ? { failure: () => exceeded } : undefined);
+        const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
+        await fs.mkdir(agentsDir, { recursive: true });
+        await fs.writeFile(
+          path.join(agentsDir, "restricted.md"),
+          `---\nname: Restricted\nbase: exec\ntools:\n  remove: ["${pattern}"]\n---\nRestricted agent.\n`
+        );
+        await seedHistory(h, emergency ? 20_000 : 110_000);
+        const result = await h.session.sendMessage("Preserve access", {
+          ...options,
+          agentId: "restricted",
+        });
+        expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+        expect(h.requests).toHaveLength(emergency ? 1 : 0);
+        expect(rolloverRows(await allRows(h))).toHaveLength(0);
+      }
+    }
+  );
 
   test("auto-disabled budget never warns or rolls over", async () => {
     const h = await setup();
