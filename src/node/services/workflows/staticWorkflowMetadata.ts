@@ -207,6 +207,9 @@ export function isStaticMetadataBindingImmutable(source: string): boolean {
   // textual scan; masked code keeps no string/comment/regex bodies, so any
   // backslash left is one — treat the binding as not provably immutable.
   if (masked.includes("\\")) return false;
+  // Direct eval / the Function constructor can name the binding from inside a
+  // string the masker blanked; neither is provably absent from the mentions below.
+  if (/(?<![\w$.])(eval|Function)(?![\w$])/u.test(masked)) return false;
   const mentions = masked.matchAll(/(?<![\w$.])meta(?![\w$])/gu);
   for (const mention of mentions) {
     const inDeclaration = mention.index >= match.declarationStart && mention.index < match.end;

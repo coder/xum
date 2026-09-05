@@ -407,6 +407,22 @@ describe("hydrateWorkflowRunPhaseManifest", () => {
     expect(run.workflow.phaseManifest).toBeUndefined();
   });
 
+  test("memoizes on the handed source, not the record's own sourceHash", () => {
+    // A record whose sourceHash went stale (any producer other than the store, which
+    // recomputes it) must not be served a manifest computed for other source text.
+    const staleHash = freshHash();
+    const first = { ...makeRun(legacyWorkflow(`phase("first");`)), sourceHash: staleHash };
+    const second = { ...makeRun(legacyWorkflow(`phase("second");`)), sourceHash: staleHash };
+    expect(hydrateWorkflowRunPhaseManifest(first).workflow.phaseManifest).toEqual({
+      provenance: "inferred",
+      phases: [{ name: "first" }],
+    });
+    expect(hydrateWorkflowRunPhaseManifest(second).workflow.phaseManifest).toEqual({
+      provenance: "inferred",
+      phases: [{ name: "second" }],
+    });
+  });
+
   test("replaces a stale persisted manifest with null when the source derives none", () => {
     // Hand-edited/corrupted run.json: the store strips it before schema validation,
     // but the read boundary must never echo such a value back to clients either.

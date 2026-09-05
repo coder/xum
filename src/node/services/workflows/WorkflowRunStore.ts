@@ -1328,7 +1328,7 @@ function mergeWorkflowStepTimeoutMetadata(
   return previous.timeout;
 }
 
-function hashSource(source: string): string {
+export function hashSource(source: string): string {
   return `sha256:${crypto.createHash("sha256").update(source).digest("hex")}`;
 }
 

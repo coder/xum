@@ -38,6 +38,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
+import { hashSource } from "./WorkflowRunStore";
 
 type TypeScriptModule = typeof ts;
 let tsModule: TypeScriptModule | undefined;
@@ -128,7 +129,11 @@ function computePhaseManifestOutcome(source: string): WorkflowPhaseManifestOutco
  * back into WorkflowRunStore writes.
  */
 export function hydrateWorkflowRunPhaseManifest(run: WorkflowRunRecord): WorkflowRunRecord {
-  const outcome = resolveWorkflowPhaseManifest(run.source, run.sourceHash);
+  // Memoize on a hash of the source we were actually handed, not the record's
+  // own `sourceHash`: the store recomputes that field from disk on every read,
+  // but any other producer of a record could pass a stale one and would
+  // otherwise be served a manifest computed for different source text.
+  const outcome = resolveWorkflowPhaseManifest(run.source, hashSource(run.source));
   return {
     ...run,
     workflow: {

@@ -187,6 +187,9 @@ describe("declared phases require an immutable meta binding", () => {
       `export const meta = ${phases};\nconst alias = meta;\n`,
       // An identifier escape names the same binding; a textual scan cannot prove otherwise.
       `export const meta = ${phases};\nm\\u0065ta.phases[0].name = "changed";\n`,
+      // Direct eval / Function can name the binding from inside a masked string.
+      `export const meta = ${phases};\neval("meta.phases[0].name = 'b'");\n`,
+      `export const meta = ${phases};\nFunction("meta.phases.length = 0")();\n`,
     ]) {
       expect(() => parseDeclaredPhasesFromSource(declaration + body)).toThrow(
         /immutable declaration/u
