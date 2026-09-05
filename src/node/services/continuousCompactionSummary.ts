@@ -1,3 +1,5 @@
+import { prepareProviderRequestMessages } from "./turnContextAssembler";
+import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { streamText, wrapLanguageModel } from "ai";
 import assert from "@/common/utils/assert";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -97,8 +99,13 @@ export async function summarizeContinuousCompaction(args: {
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
     args.signal.throwIfAborted();
+    const prepared = prepareProviderRequestMessages(
+      args.head,
+      created.data.metadataModel.split(":", 1)[0],
+      thinkingLevel
+    );
     const messages = await prepareMessagesForProvider({
-      messagesWithSentinel: args.head,
+      messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,

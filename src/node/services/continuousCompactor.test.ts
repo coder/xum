@@ -552,6 +552,7 @@ describe("ContinuousCompactor", () => {
   async function seedLiveTurn(committedTail = false, splitCommitted = false) {
     const earlier = createMuxMessage("committed-tail", "assistant", "", {
       stepStartPartIndices: [0],
+      partial: true,
     });
     earlier.parts = [
       {
@@ -755,6 +756,9 @@ describe("ContinuousCompactor", () => {
     expect(journal.liveTailCopySpec.partIndex).toBe(0);
     expect(journal.firstTailToolCallId).toBe("tail-tool");
     expect(journal.prefixSourceRows).toEqual([journal.boundary, ...journal.staticCopies]);
+    const retainedAssistant = journal.staticCopies.find((row) => row.role === "assistant");
+    expect(retainedAssistant?.metadata?.partial).toBe(true);
+    expect(journal.liveTailCopySpec.metadataTemplate?.partial).toBeUndefined();
     expect(JSON.stringify(journal.prefix)).not.toContain("old-committed-tool");
     expect(JSON.stringify(journal.prefix)).toContain("committed-tool");
     expect(fastApply).not.toHaveBeenCalled();

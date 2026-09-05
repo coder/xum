@@ -1,3 +1,5 @@
+import { prepareProviderRequestMessages } from "./turnContextAssembler";
+import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
 import { promises as fs } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
@@ -57,10 +59,15 @@ export async function rebuildContinuousPrefix(
   journal: ContinuousCompactionJournal,
   workspaceId: string
 ): Promise<ModelMessage[]> {
+  const prepared = prepareProviderRequestMessages(
+    journal.prefixSourceRows,
+    journal.preparation.providerForMessages,
+    journal.preparation.effectiveThinkingLevel
+  );
   const messages = await prepareMessagesForProvider({
     ...journal.preparation,
     workspaceId,
-    messagesWithSentinel: journal.prefixSourceRows,
+    messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
     postCompactionAttachments: journal.postCompactionAttachments,
   });
   const prefix = stripMessageCacheControl(messages);
@@ -120,6 +127,61 @@ export class ContinuousCompactionJournalStore {
               log.warn("[continuous-compaction] invalid journal cleanup failed", cleanupError)
             );
         }
+        return null;
+      }
+    });
+  }
+
+  recordFallbackPrefix(
+    journal: ContinuousCompactionJournal,
+    request: {
+      modelString: string;
+      prefix: ModelMessage[];
+      providerOptions?: Record<string, unknown>;
+      system?: string | ModelMessage;
+    },
+    isCurrent: () => boolean
+  ): Promise<ContinuousCompactionJournal | null> {
+    const generation = this.generation;
+    return this.enqueue(async () => {
+      try {
+        const current = ContinuousCompactionJournalSchema.parse(
+          JSON.parse(await fs.readFile(this.path, "utf8"))
+        );
+        if (generation !== this.generation || !isCurrent() || !isDeepStrictEqual(current, journal))
+          return null;
+        const prefix = request.prefix.map(exactJson);
+        const parsedPrefix = prefix.map((message) => modelMessageSchema.parse(message));
+        assert(
+          isDeepStrictEqual(exactJson(parsedPrefix), prefix),
+          "Fallback prefix schema dropped request fields"
+        );
+        const payload = exactJson({
+          ...current,
+          fallbackPrefixes: [...(current.fallbackPrefixes ?? []), { ...request, prefix }],
+        });
+        const updated = ContinuousCompactionJournalSchema.parse(payload);
+        assert(
+          isDeepStrictEqual(exactJson(updated), payload),
+          "Fallback journal dropped request fields"
+        );
+        if (generation !== this.generation || !isCurrent()) return null;
+        await writeFileAtomic(this.path, JSON.stringify(payload), { mode: 0o600 });
+        const reread = ContinuousCompactionJournalSchema.parse(
+          JSON.parse(await fs.readFile(this.path, "utf8"))
+        );
+        assert(
+          isDeepStrictEqual(exactJson(reread), payload),
+          "Fallback journal round-trip mismatch"
+        );
+        return generation === this.generation && isCurrent() ? reread : null;
+      } catch (error) {
+        // Unlike the initial write, this record already describes a consumed request.
+        // Failure must keep it available for P1's durable fold or startup recovery.
+        log.warn(
+          "[continuous-compaction] fallback prefix not swapped: journal update failed",
+          error
+        );
         return null;
       }
     });

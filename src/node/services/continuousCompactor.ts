@@ -486,9 +486,7 @@ export class ContinuousCompactor {
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
     // A live template must never replay costs, boundary/error flags, or stale partial state.
-    for (const copy of copies) {
-      if (copy.metadata) delete copy.metadata.partial;
-    }
+    if (liveCopy.metadata) delete liveCopy.metadata.partial;
     const partIndex =
       staged.cut.stepCut?.messageId === live.messageId ? staged.cut.stepCut.partIndex : 0;
     try {

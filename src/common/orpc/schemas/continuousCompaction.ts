@@ -87,6 +87,17 @@ export const ContinuousCompactionJournalSchema = z
     postCompactionAttachments: z.array(attachment),
     // JSON wire prefix when representable; otherwise the pinned pipeline inputs below rebuild it.
     prefix: z.array(z.json()).optional(),
+    // Preserve the initial request too: a fallback can rebuild system/tool context.
+    fallbackPrefixes: z
+      .array(
+        z.object({
+          modelString: z.string(),
+          prefix: z.array(z.json()),
+          providerOptions: z.json().optional(),
+          system: z.json().optional(),
+        })
+      )
+      .optional(),
     prefixSourceRows: z.array(row),
     systemPrefix: z.array(z.json()),
     cacheEnabled: z.boolean(),

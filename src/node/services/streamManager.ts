@@ -1,4 +1,8 @@
-import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import {
+  applyCacheControl,
+  getAnthropicCacheTtl,
+  supportsAnthropicCache,
+} from "@/common/utils/ai/cacheStrategy";
 import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
@@ -2334,6 +2338,7 @@ export class StreamManager {
       !stream ||
       stream.messageId !== swap.journal.streamMessageId ||
       stream.model !== swap.journal.parentModel ||
+      (stream.thinkingLevel ?? "off") !== swap.journal.preparation.effectiveThinkingLevel ||
       stream.stepTracker.pendingPrefixSwap ||
       stream.stepTracker.consumedPrefixSwap
     )
@@ -2414,25 +2419,43 @@ export class StreamManager {
         }
         // The staged prefix was prepared under the previous thinking options.
         // Keep full context if those options change before the swap is consumed.
-        if (stepTracker && request.thinkingOverrideState?.pending != null) {
+        const pendingSwap = stepTracker?.pendingPrefixSwap;
+        const appliedThinking = request.thinkingOverrideState?.applied;
+        if (
+          stepTracker &&
+          (request.thinkingOverrideState?.pending != null ||
+            (pendingSwap &&
+              appliedThinking != null &&
+              appliedThinking !== pendingSwap.journal.preparation.effectiveThinkingLevel))
+        ) {
           stepTracker.pendingPrefixSwap = undefined;
         }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
           const swapped = this.swapPrefix(effectiveMessages, swap);
           if (swapped) {
-            const journal = await this.historyService
-              .getContinuousCompactionJournal(stepTracker.workspaceId)
-              .write(
-                { ...swap.journal, stepNumber },
-                swap.prefix,
-                () => stepTracker.pendingPrefixSwap === swap && !abortController.signal.aborted
-              );
-            if (journal && stepTracker.pendingPrefixSwap === swap) {
+            const store = this.historyService.getContinuousCompactionJournal(
+              stepTracker.workspaceId
+            );
+            const thinkingLevel = request.thinkingOverrideState?.applied;
+            const isCurrent = () =>
+              stepTracker.pendingPrefixSwap === swap &&
+              !abortController.signal.aborted &&
+              request.thinkingOverrideState?.pending == null &&
+              request.thinkingOverrideState?.applied === thinkingLevel;
+            const journal = await store.write(
+              { ...swap.journal, stepNumber },
+              swap.prefix,
+              isCurrent
+            );
+            if (journal && isCurrent()) {
               swap.journal = journal;
               swap.consumed = true;
               stepTracker.consumedPrefixSwap = swap;
               effectiveMessages = swapped;
+            } else if (journal && stepTracker.pendingPrefixSwap === swap) {
+              // A thinking change can also arrive after write()'s last fence.
+              await store.clear();
             }
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
@@ -3365,11 +3388,52 @@ export class StreamManager {
       ).split(":", 1)[0];
       // Fallback preparation can combine consecutive tool-only steps from the live
       // Mux row. An internal cut is no longer a provable wire-message boundary.
-      const messages =
+      let messages: ModelMessage[] | null = null;
+      if (
         family === consumedSwap.journal.providerFamily &&
-        consumedSwap.journal.liveTailCopySpec.partIndex === 0
-          ? this.swapPrefix(nextRequest.messages, consumedSwap)
-          : null;
+        consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
+        (prepared.data.thinkingLevel ?? "off") ===
+          consumedSwap.journal.preparation.effectiveThinkingLevel
+      ) {
+        const conversation = stripMessageCacheControl(
+          consumedSwap.prefix.filter((message) => message.role !== "system")
+        );
+        const prefix = [
+          ...nextRequest.messages.filter((message) => message.role === "system"),
+          ...(nextRequest.cacheEnabled
+            ? applyCacheControl(
+                conversation,
+                "anthropic:prefix",
+                getAnthropicCacheTtl(nextRequest.providerOptions)
+              )
+            : conversation),
+        ];
+        const swapped = this.swapPrefix(nextRequest.messages, { ...consumedSwap, prefix });
+        if (swapped) {
+          const appliedThinking = nextRequest.thinkingOverrideState?.applied;
+          const isCurrent = () =>
+            streamInfo.stepTracker.consumedPrefixSwap === consumedSwap &&
+            !streamInfo.abortController.signal.aborted &&
+            nextRequest.thinkingOverrideState?.pending == null &&
+            nextRequest.thinkingOverrideState?.applied === appliedThinking;
+          const journal = await this.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .recordFallbackPrefix(
+              consumedSwap.journal,
+              {
+                modelString: prepared.data.modelString,
+                prefix,
+                providerOptions: nextRequest.providerOptions,
+                system: nextRequest.system,
+              },
+              isCurrent
+            );
+          if (journal && isCurrent()) {
+            consumedSwap.journal = journal;
+            messages = swapped;
+          }
+        }
+      }
       if (messages) nextRequest.messages = messages;
       else streamInfo.stepTracker.prefixSwapInvalidated = true;
     }

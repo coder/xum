@@ -1,3 +1,6 @@
+import { z } from "zod";
+import { assemblePromptPayload } from "./turnContextAssembler";
+import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as ai from "ai";
@@ -14,6 +17,7 @@ import { StreamManager } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   exactJson,
+  stripMessageCacheControl,
   rebuildContinuousPrefix,
   type ContinuousPrefixSwap,
 } from "./continuousCompactionJournal";
@@ -292,6 +296,125 @@ describe("continuous prefix prepareStep and journal", () => {
     expect((await store.read())?.prefixSourceRows).toEqual(swap.journal.prefixSourceRows);
   });
 
+  it.each(["during-write", "after-write"] as const)(
+    "thinking change %s rejects the old prefix and still rebuilds step zero",
+    async (phase) => {
+      const { manager, tracker, store, swap } = await setup();
+      swap.journal.preparation.effectiveThinkingLevel = "high";
+      swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
+      const state: ActiveTurnThinkingOverride = { applied: "high" };
+      const providerOptions = { anthropic: { thinking: { type: "enabled", budgetTokens: 1024 } } };
+      const rebuilt = mock(() => Promise.resolve(originalMessages));
+      const { run } = prepareHarness(manager, tracker, {
+        thinkingOverrideState: state,
+        providerOptions,
+        rebuildProviderOptionsForThinkingLevel: () => ({
+          effectiveLevel: "off",
+          providerOptions: { anthropic: { thinking: { type: "disabled" } } },
+        }),
+        rebuildFirstStepForThinkingLevel: rebuilt,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const enteredWrite = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      if (phase === "during-write") {
+        const atomic = atomicWrite.default;
+        spyOn(atomicWrite, "default").mockImplementationOnce(
+          Object.assign(
+            async (filename: string, data: string | Buffer) => {
+              await atomic(filename, data);
+              entered();
+              await gate;
+            },
+            { sync: atomic.sync }
+          )
+        );
+      } else {
+        const write = store.write.bind(store);
+        spyOn(store, "write").mockImplementationOnce(async (...args) => {
+          const journal = await write(...args);
+          state.pending = "off";
+          return journal;
+        });
+      }
+      const preparing = run(originalMessages, 0);
+      if (phase === "during-write") {
+        await enteredWrite;
+        state.pending = "off";
+        release();
+      }
+      const result = await preparing;
+      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(tracker.pendingPrefixSwap).toBeUndefined();
+      expect(await store.read()).toBeNull();
+      expect(rebuilt).toHaveBeenCalledTimes(1);
+      expect(result?.messages).toEqual(originalMessages);
+      expect(result?.providerOptions).toEqual({ anthropic: { thinking: { type: "disabled" } } });
+    }
+  );
+
+  it("rejects a prefix whose prepared thinking level is stale at activation or consumption", async () => {
+    const { manager, tracker, store, swap } = await setup();
+    swap.journal.preparation.effectiveThinkingLevel = "high";
+    const streams = Reflect.get(manager, "workspaceStreams") as Map<string, unknown>;
+    streams.set(workspaceId, {
+      messageId: swap.journal.streamMessageId,
+      model: swap.journal.parentModel,
+      thinkingLevel: "off",
+      stepTracker: {},
+    });
+    expect(manager.setPrefixSwap(workspaceId, swap)).toBe(false);
+    const { run } = prepareHarness(manager, tracker, { thinkingOverrideState: { applied: "off" } });
+    expect(await run()).toBeUndefined();
+    expect(tracker.consumedPrefixSwap).toBeUndefined();
+    expect(await store.read()).toBeNull();
+  });
+
+  it.each(["off", "high"] as const)(
+    "prefix replay uses normal provider filtering and interrupted context under %s thinking",
+    async (thinking) => {
+      const journal = journalFixture();
+      journal.preparation.effectiveThinkingLevel = thinking;
+      const interrupted = createMuxMessage("interrupted", "assistant", "Interrupted answer", {
+        partial: true,
+      });
+      const display = createMuxMessage("workflow-display", "user", "UI-only workflow content", {
+        muxMetadata: {
+          type: "workflow-trigger-display",
+          rawCommand: "/flow",
+          commandPrefix: "/flow",
+          runId: "wfr_test",
+        },
+      });
+      const reasoning = createMuxMessage("reasoning-only", "assistant", "", { partial: true });
+      reasoning.parts = [{ type: "reasoning", text: "old reasoning" }];
+      journal.prefixSourceRows = [
+        journal.boundary,
+        interrupted,
+        display,
+        reasoning,
+        createMuxMessage("next-assistant", "assistant", "Later answer"),
+      ];
+      const expected = await assemblePromptPayload({
+        ...journal.preparation,
+        workspaceId,
+        history: journal.prefixSourceRows,
+        systemMessage: "",
+        postCompactionAttachments: journal.postCompactionAttachments,
+      });
+      const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+        (message) => message.role !== "system"
+      );
+      expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+      expect(JSON.stringify(actual)).not.toContain("UI-only workflow content");
+    }
+  );
+
   it("does not return a swap when atomic journal persistence fails", async () => {
     const { run, tracker, store } = await setup();
     spyOn(atomicWrite, "default").mockImplementationOnce(
@@ -397,11 +520,17 @@ describe("continuous prefix prepareStep and journal", () => {
   }
 
   for (const family of ["anthropic", "openai"]) {
-    for (const mode of ["pending", "whole-row", "static-cut", "sliced-row"] as const) {
+    for (const mode of [
+      "pending",
+      "whole-row",
+      "static-cut",
+      "sliced-row",
+      "journal-failure",
+    ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
       it(`${family} fallback ${mode} preserves the correct view and emits only after reset`, async () => {
-        const { tracker, manager, run, swap } = await setup();
+        const { tracker, manager, run, swap, store } = await setup();
         if (sliced) {
           swap.journal.headEnd = { id: "live", sequence: 1 };
           swap.journal.headPartIndex = 2;
@@ -485,11 +614,17 @@ describe("continuous prefix prepareStep and journal", () => {
           },
           { type: "text", text: "refused response after swap" },
         ];
-        const preparedMessages = await prepareMessagesForProvider({
+        const payload = await assemblePromptPayload({
           ...swap.journal.preparation,
+          modelString: nextModel,
           providerForMessages: family,
+          systemMessage: `Fresh fallback system for ${nextModel} with nextTool`,
+          tools: {
+            nextTool: ai.tool({ description: "Fallback-only tool", inputSchema: z.object({}) }),
+          },
+          anthropicCacheTtl: "1h",
           workspaceId,
-          messagesWithSentinel: [
+          history: [
             ...(committed
               ? [createMuxMessage("earlier-prompt", "user", "earlier request"), committed]
               : []),
@@ -497,6 +632,11 @@ describe("continuous prefix prepareStep and journal", () => {
             rebuilt,
           ],
         });
+        const preparedMessages = payload.messages;
+        const fallbackOptions =
+          family === "anthropic"
+            ? { anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } } }
+            : undefined;
         if (sliced) {
           const containing = preparedMessages.find(
             (message) =>
@@ -535,7 +675,15 @@ describe("continuous prefix prepareStep and journal", () => {
                 expect(tracker.pendingPrefixSwap).toBeUndefined();
                 return Promise.resolve({
                   success: true,
-                  data: { model, modelString: nextModel, messages: preparedMessages },
+                  data: {
+                    model,
+                    modelString: nextModel,
+                    messages: preparedMessages,
+                    system: payload.system,
+                    tools: payload.tools,
+                    providerOptions: fallbackOptions,
+                    thinkingLevel: "off",
+                  },
                 });
               },
             },
@@ -561,17 +709,42 @@ describe("continuous prefix prepareStep and journal", () => {
           reason: string,
           options: { preserveParts: boolean }
         ) => Promise<{ kind: string }>;
+        if (mode === "journal-failure" && family === "anthropic") {
+          spyOn(atomicWrite, "default").mockImplementationOnce(
+            Object.assign(() => Promise.reject(new Error("fallback journal disk full")), {
+              sync: atomicWrite.default.sync,
+            })
+          );
+        }
         expect(
           await fallback.call(manager, workspaceId, stream, "content-filter", {
             preserveParts: true,
           })
         ).toEqual({ kind: "swapped" });
         expect(events).toEqual(
-          consumed && (family === "openai" || sliced) ? ["prefix-swap-invalidated"] : []
+          consumed && (family === "openai" || sliced || mode === "journal-failure")
+            ? ["prefix-swap-invalidated"]
+            : []
         );
-        if (consumed && family === "anthropic" && !sliced) {
+        if (consumed && family === "anthropic" && !sliced && mode !== "journal-failure") {
           expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
-          expect(stream.request.messages.slice(0, swap.prefix.length)).toEqual(swap.prefix);
+          const systems = preparedMessages.filter((message) => message.role === "system");
+          expect(stream.request.messages.filter((message) => message.role === "system")).toEqual(
+            systems
+          );
+          const sentPrefix = stream.request.messages.slice(
+            0,
+            systems.length + swap.prefix.filter((message) => message.role !== "system").length
+          );
+          expect(
+            stripMessageCacheControl(sentPrefix.filter((message) => message.role !== "system"))
+          ).toEqual(
+            stripMessageCacheControl(swap.prefix.filter((message) => message.role !== "system"))
+          );
+          const persisted = await store.read();
+          expect(persisted?.prefix).toEqual(swap.prefix.map(exactJson));
+          expect(persisted?.fallbackPrefixes?.at(-1)?.prefix).toEqual(sentPrefix.map(exactJson));
+          expect(persisted?.fallbackPrefixes?.at(-1)?.modelString).toBe(nextModel);
           if (committed) {
             const calls = stream.request.messages.flatMap((message) =>
               message.role === "assistant" && Array.isArray(message.content)
@@ -585,7 +758,14 @@ describe("continuous prefix prepareStep and journal", () => {
         } else {
           expect(stream.request.messages).toEqual(preparedMessages);
         }
-        if (consumed && (family === "openai" || sliced)) {
+        if (mode === "journal-failure") {
+          const preserved = await store.read();
+          expect(preserved?.prefix).toEqual(swap.prefix.map(exactJson));
+          expect(preserved?.fallbackPrefixes).toBeUndefined();
+        }
+        expect(Reflect.get(stream.request, "system")).toEqual(payload.system);
+        expect(Reflect.get(stream.request, "tools")).toHaveProperty("nextTool");
+        if (consumed && (family === "openai" || sliced || mode === "journal-failure")) {
           const blocked = prepareHarness(manager, tracker);
           const result = blocked.run().catch((error: unknown) => error);
           blocked.controller.abort(new Error("stop for durable fold"));
@@ -594,6 +774,58 @@ describe("continuous prefix prepareStep and journal", () => {
       });
     }
   }
+
+  it("retains original and successive fallback prefixes and refuses stale or lossy updates", async () => {
+    const { run, store, swap } = await setup();
+    await run();
+    const initial = swap.journal;
+    const prefix: ai.ModelMessage[] = [
+      { role: "system", content: "First fallback system" },
+      ...swap.prefix.filter((message) => message.role !== "system"),
+    ];
+    const first = await store.recordFallbackPrefix(
+      initial,
+      { modelString: "anthropic:first", prefix },
+      () => true
+    );
+    assert(first, "Expected first fallback record");
+    const nextPrefix: ai.ModelMessage[] = [
+      { role: "system", content: "Second fallback system" },
+      ...prefix.filter((message) => message.role !== "system"),
+    ];
+    const second = await store.recordFallbackPrefix(
+      first,
+      { modelString: "anthropic:second", prefix: nextPrefix },
+      () => true
+    );
+    assert(second, "Expected second fallback record");
+    expect(second.prefix).toEqual(initial.prefix);
+    expect(second.fallbackPrefixes?.map((entry) => entry.prefix)).toEqual([
+      prefix.map(exactJson),
+      nextPrefix.map(exactJson),
+    ]);
+    const bytes = await readFile(store.path, "utf8");
+    expect(
+      await store.recordFallbackPrefix(
+        initial,
+        { modelString: "anthropic:stale", prefix },
+        () => true
+      )
+    ).toBeNull();
+    expect(
+      await store.recordFallbackPrefix(
+        second,
+        {
+          modelString: "anthropic:lossy",
+          prefix,
+          providerOptions: { invalid: () => "must not disappear" },
+        },
+        () => true
+      )
+    ).toBeNull();
+    expect(await readFile(store.path, "utf8")).toBe(bytes);
+    expect(await store.read()).toEqual(second);
+  });
 
   it("schema validates and self-heals corrupt journal files", async () => {
     const { store, swap } = await setup();

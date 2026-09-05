@@ -970,9 +970,10 @@ export class AgentSession {
         // RLM keep-recent floor: tail copies after the boundary mean the
         // summary is no longer the last row; stash its ID so the stream-end
         // follow-up dispatch can target it directly.
-        if ((metadata.preservedTailMessageCount ?? 0) > 0) {
-          this.pendingCompactionFollowUpSummaryId = metadata.summaryMessageId;
-        }
+        // Reset on every completion: a resumeless continuous fold may precede a
+        // legacy compaction whose current follow-up is on its final summary row.
+        this.pendingCompactionFollowUpSummaryId =
+          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null;
         onCompactionComplete?.(metadata);
       },
       onIdleCompactionOutcome,

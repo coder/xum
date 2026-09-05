@@ -1,3 +1,4 @@
+import type { CompactionHandler } from "./compactionHandler";
 import assert from "@/common/utils/assert";
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -287,6 +288,49 @@ describe("AgentSession continuous compaction wiring", () => {
     ) as ConstructorParameters<typeof ContinuousCompactor>[0];
     assert(deps.prepareSwap !== undefined, "Expected session prefix preparation");
     expect(await deps.prepareSwap([])).toBeNull();
+  });
+
+  test("resumeless continuous fold cannot divert a later legacy compaction's saved follow-up", async () => {
+    const h = await setup();
+    const retained = createMuxMessage("retained-user", "user", "Earlier task");
+    await h.historyService.appendToHistory(workspaceId, retained);
+    const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+    expect(
+      await handler.persistContinuousCompaction({
+        messages: await rows(h),
+        text: "Continuous summary",
+        model,
+        tail: [retained],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+      })
+    ).toBe(true);
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("legacy-request", "user", "Please compact", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: { text: "Current saved follow-up", model, agentId: "exec" } },
+        },
+      })
+    );
+    Reflect.set(h.session, "activeCompactionRequest", { id: "legacy-request", modelString: model });
+    const completion = h.session.waitForPendingCompactionCompletionDecision("legacy-summary");
+    h.aiEmitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId,
+      messageId: "legacy-summary",
+      metadata: { model, agentId: "compact", finishReason: "stop" },
+      parts: [{ type: "text", text: "Legacy summary" }],
+    });
+    expect(await completion).toBe(true);
+    const current = await rows(h);
+    expect(current.at(-1)?.role).toBe("user");
+    expect(current.at(-1)?.parts).toMatchObject([
+      { type: "text", text: "Current saved follow-up" },
+    ]);
   });
 
   test("on-send apply preserves the new user turn without running a compact turn", async () => {
@@ -720,6 +764,20 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("headless summaries use the compact model and account usage with its pinned identity", async () => {
     const { h, args } = await summarySetup();
+    args.head.push(
+      createMuxMessage("display-only", "user", "UI-only summarizer bait", {
+        muxMetadata: {
+          type: "workflow-trigger-display",
+          rawCommand: "/flow",
+          commandPrefix: "/flow",
+          runId: "wfr_test",
+        },
+      }),
+      createMuxMessage("interrupted-head", "assistant", "unfinished investigation", {
+        partial: true,
+      }),
+      createMuxMessage("later-head", "assistant", "later investigation")
+    );
     const requests: LanguageModelV3CallOptions[] = [];
     const sdkModel = new MockLanguageModelV3({
       doStream: (request) => {
@@ -740,6 +798,17 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(create.mock.calls[0]?.[0]).toBe(args.compactOptions.model);
     expect(result?.model).toBe(args.compactOptions.model);
     expect(requests[0].tools ?? []).toHaveLength(0);
+    expect(JSON.stringify(requests[0].prompt)).not.toContain("UI-only summarizer bait");
+    const interruptedIndex = requests[0].prompt.findIndex(
+      (message) =>
+        message.role === "assistant" &&
+        message.content.some(
+          (part) => part.type === "text" && part.text === "unfinished investigation"
+        )
+    );
+    expect(interruptedIndex).toBeGreaterThan(-1);
+    expect(requests[0].prompt[interruptedIndex + 1].role).toBe("user");
+    expect(requests[0].prompt[interruptedIndex + 2].role).toBe("assistant");
     expect(
       requests[0].prompt.some(
         (message) =>
