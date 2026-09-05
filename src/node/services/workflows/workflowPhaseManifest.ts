@@ -154,11 +154,23 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   if (!hasCanonicalPhaseBinding(ts, workflowFn)) {
     return undefined;
   }
-  // Parameter initializers run before the body and may already call the
-  // destructured `phase` (`{ phase, fallback = phase("setup") }`); the runtime
-  // context never supplies such defaults, so those calls DO emit. Bail rather
-  // than model default-evaluation order.
-  if (workflowFn.parameters.some((parameter) => initializersMention(ts, parameter, "phase"))) {
+  // Parameters evaluate before the body and may already use the destructured
+  // `phase` — in a default (`fallback = phase("setup")`), a computed key
+  // (`{ [phase("setup")]: x } = {}`), anywhere. Any `phase` identifier in the
+  // parameter list other than the canonical binding itself bails rather than
+  // modelling parameter-evaluation order.
+  const canonicalBinding = findCanonicalPhaseBinding(ts, workflowFn);
+  if (canonicalBinding == null) {
+    return undefined;
+  }
+  const allowedParameterMentions = new Set<ts.Node>(
+    [canonicalBinding.name, canonicalBinding.propertyName].filter((node) => node != null)
+  );
+  if (
+    workflowFn.parameters.some((parameter) =>
+      mentionsIdentifierOutside(ts, parameter, "phase", allowedParameterMentions)
+    )
+  ) {
     return undefined;
   }
   // `arguments[0]` is the original context object, so `arguments[0].phase(...)`
@@ -302,20 +314,30 @@ function findImmutableFunctionBinding(
   return undefined;
 }
 
-/** Whether any default-value initializer in a parameter/binding pattern mentions `name`. */
-function initializersMention(
+/** Whether an identifier named `name` appears within `root` outside the `allowed` nodes. */
+function mentionsIdentifierOutside(
   ts: TypeScriptModule,
-  node: ts.ParameterDeclaration | ts.BindingElement,
-  name: string
+  root: ts.Node,
+  name: string,
+  allowed: ReadonlySet<ts.Node>
 ): boolean {
-  if (node.initializer != null && mentionsIdentifier(ts, node.initializer, name)) {
-    return true;
+  const check = (node: ts.Node): boolean =>
+    (ts.isIdentifier(node) && node.text === name && !allowed.has(node)) ||
+    ts.forEachChild(node, check) === true;
+  return check(root);
+}
+
+/** The `{ phase }` / `{ phase: phase }` element of the first parameter, once validated. */
+function findCanonicalPhaseBinding(
+  ts: TypeScriptModule,
+  fn: WorkflowFunctionNode
+): ts.BindingElement | undefined {
+  const firstParam = fn.parameters[0];
+  if (firstParam == null || !ts.isObjectBindingPattern(firstParam.name)) {
+    return undefined;
   }
-  if (ts.isIdentifier(node.name)) {
-    return false;
-  }
-  return node.name.elements.some(
-    (element) => !ts.isOmittedExpression(element) && initializersMention(ts, element, name)
+  return firstParam.name.elements.find(
+    (element) => ts.isIdentifier(element.name) && element.name.text === "phase"
   );
 }
 
@@ -360,10 +382,7 @@ function hasOtherReferences(
   name: string,
   allowed: ReadonlySet<ts.Node>
 ): boolean {
-  const check = (node: ts.Node): boolean =>
-    (ts.isIdentifier(node) && node.text === name && !allowed.has(node)) ||
-    ts.forEachChild(node, check) === true;
-  return check(sourceFile);
+  return mentionsIdentifierOutside(ts, sourceFile, name, allowed);
 }
 
 function hasModifier(node: ts.FunctionDeclaration, kind: ts.SyntaxKind): boolean {

@@ -131,6 +131,17 @@ const LIFECYCLE_HINT: Record<WorkflowPhaseLifecycle, string> = {
   "not-visited": "Not visited",
 };
 
+/**
+ * Tooltip body for a rail node. The label leads: pills are width-capped and
+ * truncate, and labels may run to 120 chars, so the tooltip is the only place
+ * the full text is guaranteed readable.
+ */
+export function phaseNodeTooltip(node: WorkflowPhaseFlowNode): string {
+  return [node.label, LIFECYCLE_HINT[node.lifecycle], node.description]
+    .filter((part) => part != null && part.length > 0)
+    .join(" — ");
+}
+
 const PhaseFlowNode: React.FC<{
   node: WorkflowPhaseFlowNode;
   /** Shared layoutId for the active pill; null renders the highlight statically. */
@@ -139,9 +150,7 @@ const PhaseFlowNode: React.FC<{
 }> = (props) => {
   const node = props.node;
   const style = getPhaseNodeStyle(node.lifecycle);
-  const tooltip = [LIFECYCLE_HINT[node.lifecycle], node.description]
-    .filter((part) => part != null && part.length > 0)
-    .join(" — ");
+  const tooltip = phaseNodeTooltip(node);
   const content = (
     <>
       {node.lifecycle === "running" && (

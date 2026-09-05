@@ -132,9 +132,10 @@ describe("parseDeclaredPhasesFromSource", () => {
       'const phases = [{ name: "a" }];\nexport const meta = { phases };\n',
       'export const meta = { description: "x", phases: buildPhases() };\n',
       'export const meta = { "phases": [...shared] };\n',
-      // Computed keys with a static string literal still name the key.
+      // Computed keys with a static string literal still name the key — escapes decoded.
       'export const meta = { ["phases"]: [{ name: "setup" }] };\n',
       "export const meta = { description: 'x', [`phases`]: [{ name: 'setup' }] };\n",
+      'export const meta = { ["pha\\u0073es"]: buildPhases() };\n',
     ]) {
       const source = declaration + body;
       try {

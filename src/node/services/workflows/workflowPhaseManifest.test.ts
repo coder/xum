@@ -200,6 +200,12 @@ describe("inferPhaseManifest", () => {
         `export default function workflow({ phase, quick = false }) { phase("run"); return {}; }\n`
       )
     ).toEqual(["run"]);
+    // A computed destructuring key in another parameter evaluates phase too.
+    expect(
+      phaseNames(
+        `export default function workflow({ phase }, { [phase("setup")]: ignored } = {}) { phase("run"); return {}; }\n`
+      )
+    ).toBeUndefined();
   });
 
   test("bails when the body reaches the context through arguments", () => {

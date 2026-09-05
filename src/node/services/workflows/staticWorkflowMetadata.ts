@@ -99,17 +99,16 @@ export function staticMetadataLiteralHasKey(source: string, key: string): boolea
       const close = masked.indexOf("]", index);
       if (close === -1) return false;
       expectKey = false;
-      const inner = skipStaticWhitespace(source, index + 1);
-      const quote = source[inner];
-      if (quote === '"' || quote === "'" || quote === "`") {
-        try {
-          const literal = readStaticStringLiteral(source, inner, quote);
-          if (skipStaticWhitespace(source, literal.end) === close && literal.value === key) {
-            return true;
-          }
-        } catch {
-          // Unreadable literal: fall through and skip the computed key.
-        }
+      try {
+        // The strict literal parser decodes escapes (`"pha\\u0073es"` → `phases`)
+        // and rejects anything that is not a lone static string.
+        const decoded = new StaticMetadataLiteralParser(
+          source.slice(index + 1, close),
+          new Set()
+        ).parseValue();
+        if (decoded === key) return true;
+      } catch {
+        // Dynamic or unreadable computed key: skip it.
       }
       index = close;
       continue;

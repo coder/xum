@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { WorkflowJsonBlock } from "@/browser/features/Tools/WorkflowToolShared";
+import { useReducedMotion } from "@/browser/hooks/useReducedMotion";
 import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
@@ -574,8 +575,11 @@ export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
   // phases live on the rail (pending/skipped/…), not as empty step sections.
   const visitedPhases = view.phases.filter((phase) => !isUnvisitedPhaseLifecycle(phase.lifecycle));
   const phaseSectionRefs = React.useRef(new Map<string, HTMLDivElement>());
+  const prefersReducedMotion = useReducedMotion();
   const scrollToPhase = (name: string) => {
-    phaseSectionRefs.current.get(name)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    phaseSectionRefs.current
+      .get(name)
+      ?.scrollIntoView({ behavior: prefersReducedMotion ? "auto" : "smooth", block: "start" });
   };
   return (
     <div className="flex flex-col gap-4">

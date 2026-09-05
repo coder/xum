@@ -6,9 +6,10 @@ import type { WorkflowPhaseManifest } from "@/common/types/workflow";
 
 import {
   WorkflowPhaseFlow,
+  type WorkflowPhaseFlowNode,
   phaseFlowNodesFromManifest,
   phaseFlowNodesFromView,
-  type WorkflowPhaseFlowNode,
+  phaseNodeTooltip,
 } from "./WorkflowPhaseFlow";
 import type { WorkflowPhaseView } from "./projectWorkflowRun";
 
@@ -128,6 +129,18 @@ describe("WorkflowPhaseFlow", () => {
     expect(
       rendered.getByRole("list").querySelectorAll(':scope > [aria-hidden="true"]')
     ).toHaveLength(0);
+  });
+
+  test("the tooltip carries the full label so truncated pills stay readable", () => {
+    // Pills are width-capped; a long label without a description would otherwise
+    // be unreadable anywhere on the rail.
+    const label = "a-very-long-phase-name-that-will-certainly-be-truncated-in-a-160px-pill";
+    expect(phaseNodeTooltip({ name: "long", label, lifecycle: "pending" })).toBe(
+      `${label} — Pending`
+    );
+    expect(
+      phaseNodeTooltip({ name: "s", label: "Scope", lifecycle: "running", description: "Pick" })
+    ).toBe("Scope — Running — Pick");
   });
 
   test("renders nothing for an empty node list", () => {
