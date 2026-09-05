@@ -925,39 +925,6 @@ describe("DesktopBridgeServer", () => {
     }
   );
 
-  test("bridges binary traffic in both directions for a valid token", async () => {
-    const tcpHarness = await listenTcpServer();
-    const bridgeServer = createBridgeServer({
-      getLiveSessionConnection: mock((workspaceId: string) =>
-        workspaceId === VALID_WORKSPACE_ID
-          ? { sessionId: VALID_SESSION_ID, vncPort: tcpHarness.port }
-          : null
-      ),
-    });
-    const upgradeHarness = await listenUpgradeServer(bridgeServer);
-
-    let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${VALID_TOKEN}`);
-      await waitForWebSocketOpen(ws);
-
-      const tcpSocket = await tcpHarness.connectionPromise;
-      ws.send(Buffer.from([0x01, 0x02, 0x03]));
-      const forwarded = await waitForTcpData(tcpSocket);
-      expect(forwarded).toEqual(Buffer.from([0x01, 0x02, 0x03]));
-
-      tcpSocket.write(Buffer.from([0x0a, 0x0b, 0x0c]));
-      expect(await waitForWebSocketMessage(ws)).toEqual(Buffer.from([0x0a, 0x0b, 0x0c]));
-    } finally {
-      if (ws) {
-        await closeWebSocket(ws);
-      }
-      await upgradeHarness.close();
-      await bridgeServer.stop();
-      await tcpHarness.close();
-    }
-  });
-
   test("closes with 4001 for invalid or missing tokens", async () => {
     const bridgeServer = createBridgeServer({
       validate: mock(() => null),

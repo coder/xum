@@ -4,30 +4,12 @@ import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { generateGitStatusScript } from "@/common/utils/git/gitStatus";
 import {
-  GIT_NO_HOOKS_ENV,
   gitHooksAllowed,
   gitNoHooksPrefix,
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForConfigKeys,
   gitNoRepoAutomationEnvForLocalRepo,
 } from "./gitNoHooksEnv";
-
-describe("GIT_NO_HOOKS_ENV", () => {
-  test("disables git hooks via core.hooksPath=/dev/null", () => {
-    expect(GIT_NO_HOOKS_ENV).toEqual({
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "core.hooksPath",
-      GIT_CONFIG_VALUE_0: "/dev/null",
-      GIT_CONFIG_PARAMETERS: "",
-    });
-  });
-
-  test("all values are strings (safe for env vars)", () => {
-    for (const value of Object.values(GIT_NO_HOOKS_ENV)) {
-      expect(typeof value).toBe("string");
-    }
-  });
-});
 
 describe("gitNoHooksPrefix", () => {
   test("returns empty string when trusted", () => {

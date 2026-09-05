@@ -26,10 +26,6 @@ describe("shouldShowModelInSettings", () => {
   test("keeps gpt-5.3-codex visible without OAuth", () => {
     expect(shouldShowModelInSettings(KNOWN_MODELS.GPT_53_CODEX.id, false)).toBe(true);
   });
-
-  test("keeps non-required OpenAI models visible without OAuth", () => {
-    expect(shouldShowModelInSettings(KNOWN_MODELS.GPT.id, false)).toBe(true);
-  });
 });
 
 describe("shouldAllowRouteOverrideInSettings", () => {

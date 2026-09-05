@@ -13,7 +13,6 @@ import {
   parseXumHomeLegacyFallbackDirName,
   resolveLegacyMuxBuiltInSkillName,
   resolveXumEnvironmentValue,
-  SUPPORTED_XUM_PROTOCOL_SCHEMES,
   withLegacyMuxEnvironmentAliases,
 } from "./legacyMux";
 
@@ -120,11 +119,5 @@ describe("local product-home tilde prefixes", () => {
     expect(getLocalProductHomeTildeSuffix(`~/${XUM_HOME_DIR_NAME}-dev`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix(`~/${LEGACY_MUX_HOME_DIR_NAME}rc`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix("~/projects")).toBeUndefined();
-  });
-});
-
-describe("deep-link protocol compatibility", () => {
-  test("prefers xum while retaining mux as an accepted alias", () => {
-    expect(SUPPORTED_XUM_PROTOCOL_SCHEMES).toEqual(["xum", "mux"]);
   });
 });

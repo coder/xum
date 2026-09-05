@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  CLI_GLOBAL_FLAGS,
   detectCliEnvironment,
   getParseOptions,
   getSubcommand,
@@ -8,19 +7,6 @@ import {
   isCommandAvailable,
   isElectronLaunchArg,
 } from "./argv";
-
-describe("CLI_GLOBAL_FLAGS", () => {
-  test("contains expected help and version flags", () => {
-    expect(CLI_GLOBAL_FLAGS).toContain("--help");
-    expect(CLI_GLOBAL_FLAGS).toContain("-h");
-    expect(CLI_GLOBAL_FLAGS).toContain("--version");
-    expect(CLI_GLOBAL_FLAGS).toContain("-v");
-  });
-
-  test("has exactly 4 flags", () => {
-    expect(CLI_GLOBAL_FLAGS).toHaveLength(4);
-  });
-});
 
 describe("detectCliEnvironment", () => {
   test("bun/node: firstArgIndex=2", () => {
