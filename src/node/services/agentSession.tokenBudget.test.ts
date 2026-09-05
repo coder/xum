@@ -767,6 +767,74 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  async function seedRolloverEligibilityState(
+    h: AgentSessionHarness,
+    contents: "empty" | "internal-only" | "old-context"
+  ) {
+    if (contents === "old-context") {
+      await seedHistory(h, 20_000);
+    } else if (contents === "internal-only") {
+      expect(
+        (
+          await h.historyService.appendManyToHistory(
+            workspaceId,
+            createRolloverPrefix({
+              type: "context-window-rollover",
+              rolloverId: "existing-boundary",
+              reason: "mid-stream",
+              previousWindowId: "w:0",
+              flushOpportunity: false,
+              contextTokens: 110_000,
+              maxTokens: 128_000,
+            })
+          )
+        ).success
+      ).toBe(true);
+    }
+  }
+
+  test.each(["empty", "internal-only", "old-context"] as const)(
+    "a fitting large send requires history access only when sealing old content (%s)",
+    async (contents) => {
+      const h = await setup();
+      await seedRolloverEligibilityState(h, contents);
+      const before = rolloverRows(await allRows(h)).length;
+      const result = await h.session.sendMessage("x".repeat(350_000), {
+        ...options,
+        toolPolicy: [{ regex_match: "session_history", action: "disable" }],
+      });
+      expect(result.success).toBe(contents !== "old-context");
+      expect(h.requests).toHaveLength(contents === "old-context" ? 0 : 1);
+      expect(rolloverRows(await allRows(h))).toHaveLength(before);
+      if (contents === "old-context") {
+        expect(result).toMatchObject({ error: { type: "context_budget_blocked" } });
+      }
+    }
+  );
+
+  test.each(["empty", "internal-only"] as const)(
+    "fresh emergency overflow reports the same failure regardless of history access (%s)",
+    async (contents) => {
+      const results = [];
+      for (const historyDenied of [false, true]) {
+        const h = await setup({ failure: () => exceeded });
+        await seedRolloverEligibilityState(h, contents);
+        const before = rolloverRows(await allRows(h)).length;
+        const result = await h.session.sendMessage("Too large after final assembly", {
+          ...options,
+          ...(historyDenied
+            ? { toolPolicy: [{ regex_match: "session_history", action: "disable" as const }] }
+            : {}),
+        });
+        expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+        expect(h.requests).toHaveLength(1);
+        expect(rolloverRows(await allRows(h))).toHaveLength(before);
+        results.push(result);
+      }
+      expect(results[1]).toEqual(results[0]);
+    }
+  );
+
   test.each(["session_history", "session_.*", ".*"])(
     "explicit %s disable blocks rollover before a stream starts",
     async (regex_match) => {

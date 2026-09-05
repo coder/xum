@@ -4803,8 +4803,6 @@ export class AgentSession {
       this.shuttingDown
     )
       return Ok(false);
-    const access = await this.checkContextBudgetHistoryAccess(context.options);
-    if (!access.success) return access;
     try {
       // StreamManager's completion settles after teardown. Commit its error partial,
       // including any settled fallback tool outputs, before sealing the old window.
@@ -4825,6 +4823,8 @@ export class AgentSession {
         { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
       );
       if (maxTokens == null || maxTokens <= 0) return Ok(false);
+      const access = await this.checkContextBudgetHistoryAccess(context.options);
+      if (!access.success) return access;
       const rollover: ContextWindowRollover = {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -4992,10 +4992,6 @@ export class AgentSession {
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover");
-    if (shouldRollover) {
-      const access = await this.checkContextBudgetHistoryAccess(options);
-      if (!access.success) return access;
-    }
     const rollover: ContextWindowRollover | undefined =
       shouldRollover && hasRolloverEligibleMessages(history.data)
         ? (this.pendingRollover ?? {
@@ -5008,6 +5004,12 @@ export class AgentSession {
             maxTokens,
           })
         : undefined;
+    // Recovery access is required only when sealing old context, not for a
+    // first request that crosses the proactive threshold but still fits below.
+    if (rollover) {
+      const access = await this.checkContextBudgetHistoryAccess(options);
+      if (!access.success) return access;
+    }
     const firstAssistant = history.data.find(
       (row) => row.role === "assistant" && row.metadata?.contextUsage
     );
