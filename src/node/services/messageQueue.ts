@@ -585,10 +585,8 @@ export class MessageQueue {
         lastAddedAtMs: 0,
       };
       this.entries.push(entry);
-      if (internal?.promoteAheadOfHiddenTurnEnd === true && incomingMode === "tool-end") {
-        this.promoteAheadOfHiddenTurnEndPredecessors(entry);
-      }
     }
+    const createdNewEntry = entry !== tail;
 
     if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
       entry.preTurnMessages = [...(entry.preTurnMessages ?? []), ...internal.preTurnMessages];
@@ -664,6 +662,17 @@ export class MessageQueue {
     }
     if (internal?.agentInitiated === true) {
       entry.agentInitiatedCount += 1;
+    }
+
+    // Reorder only after muxMetadata/callbacks are populated: correlation revalidation must see
+    // the promoted entry's own workspace-turn metadata, or skipped same-turn continuations would
+    // be stripped as if an unrelated message had overtaken them.
+    if (
+      createdNewEntry &&
+      internal?.promoteAheadOfHiddenTurnEnd === true &&
+      entry.dispatchMode === "tool-end"
+    ) {
+      this.promoteAheadOfHiddenTurnEndPredecessors(entry);
     }
 
     return entry;

@@ -11902,7 +11902,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   removeQueuedMessagesByDedupeKeyPrefix(
     workspaceId: string,
     prefix: string,
-    options?: { cancelReason?: string }
+    options?: { cancelReason?: string; skipCancelCallbacks?: boolean }
   ): Result<number> {
     try {
       const session = this.sessions.get(workspaceId.trim());
@@ -11912,7 +11912,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Ok(
         session.removeQueuedMessagesByDedupeKeyPrefix(
           prefix,
-          options?.cancelReason ?? "Queued message superseded before dispatch."
+          options?.cancelReason ?? "Queued message superseded before dispatch.",
+          options?.skipCancelCallbacks === true ? { skipCancelCallbacks: true } : undefined
         )
       );
     } catch (error) {

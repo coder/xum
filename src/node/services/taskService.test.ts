@@ -18796,7 +18796,10 @@ describe("TaskService", () => {
     expect(removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
       parentId,
       `agent-report:${childId}:`,
-      { cancelReason: "Incremental sub-agent update superseded by the terminal report." }
+      {
+        cancelReason: "Incremental sub-agent update superseded by the terminal report.",
+        skipCancelCallbacks: true,
+      }
     );
   });
 
@@ -28747,7 +28750,10 @@ describe("TaskService", () => {
     expect(removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
       parentWorkspaceId,
       `agent-report:${childTaskId}:${handleId}:`,
-      { cancelReason: "Incremental sub-agent update superseded by the terminal report." }
+      {
+        cancelReason: "Incremental sub-agent update superseded by the terminal report.",
+        skipCancelCallbacks: true,
+      }
     );
     // A parent whose task_await just returned must not be cut by a now-stale update.
     expect(removalsWhenWaiterResolved).toBe(

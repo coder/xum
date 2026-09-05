@@ -12563,10 +12563,12 @@ export class TaskService implements AgentTaskIntegration {
 
     await this.maybeStartPatchGenerationForReportedTask(childWorkspaceId);
 
+    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
+    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
     const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
       parentWorkspaceId,
       agentReportProgressDedupePrefix(childWorkspaceId),
-      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON }
+      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
     );
     if (!queuedProgressRemoval.success) {
       log.warn("Failed to remove queued incremental sub-agent reports", {

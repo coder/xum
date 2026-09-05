@@ -2400,10 +2400,12 @@ export class WorkspaceTurnManager {
         // outcome supersedes them; left queued, each would later dispatch as a stale "in
         // progress" turn. Drop them before waiters resolve so an owner whose task_await just
         // returned cannot be cut at its next step boundary by an update it already outran.
+        // skipCancelCallbacks: when the owner itself runs as a delegated turn, each queued report
+        // carries continuation callbacks that would settle that live turn as interrupted.
         const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
           params.record.ownerWorkspaceId,
           agentReportProgressDedupePrefix(params.record.workspaceId, params.record.handleId),
-          { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON }
+          { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
         );
         if (!queuedProgressRemoval.success) {
           log.warn("Failed to remove queued incremental sub-agent reports at settlement", {

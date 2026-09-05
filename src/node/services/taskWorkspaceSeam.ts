@@ -421,7 +421,15 @@ export interface TurnAdmissionHost {
   removeQueuedMessagesByDedupeKeyPrefix(
     workspaceId: string,
     prefix: string,
-    options?: { cancelReason?: string }
+    options?: {
+      cancelReason?: string;
+      /**
+       * Drop the entries without invoking their onCanceled/onAcceptedPreStreamFailure callbacks.
+       * For supersession (the entry's source produced a later, authoritative message) rather than
+       * withdrawal: a workspace-turn continuation the entry carried must not be settled as failed.
+       */
+      skipCancelCallbacks?: boolean;
+    }
   ): Result<number>;
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
   countQueuedAgentPeerMessages(workspaceId: string): number;

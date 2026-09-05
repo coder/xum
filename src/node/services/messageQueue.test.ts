@@ -619,6 +619,41 @@ describe("MessageQueue", () => {
       expect(skipped.options?.muxMetadata).toBeUndefined();
       expect(skipped.internal?.onCanceled).toBeUndefined();
     });
+
+    it("keeps same-turn correlation on skipped entries when the promoted report continues that turn", () => {
+      // Parent runs as a delegated workspace turn: both the child's ancestor-bound peer message
+      // and its later progress report continue the same turn. Promotion must revalidate with the
+      // promoted entry's own metadata populated, or the peer message would be stripped and later
+      // supersede the turn instead of continuing it.
+      const turnMetadata: MuxMessageMetadata = {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_parent",
+        ownerWorkspaceId: "grandparent",
+        turnId: "turn-1",
+      };
+      const peerCanceled = () => undefined;
+      queue.add(
+        "peer message",
+        { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
+      );
+      queue.add(
+        "progress report",
+        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
+      );
+
+      expect(queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1")).toBe(
+        true
+      );
+      const promoted = queue.dequeueNext();
+      expect(promoted.message).toBe("progress report");
+      expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
+      const skipped = queue.dequeueNext();
+      expect(skipped.message).toBe("peer message");
+      expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
+      expect(skipped.internal?.onCanceled).toBe(peerCanceled);
+    });
   });
 
   describe("workspace turn metadata", () => {
