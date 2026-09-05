@@ -150,7 +150,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
-    await seedHistory(h, 95_000);
+    await seedHistory(h, 110_000);
     const skillDir = path.join(h.config.rootDir, ".xum", "skills", "budget-test");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(
@@ -204,6 +204,21 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   });
 
+  test("on-send usage below the force buffer warns without prematurely resetting history", async () => {
+    const h = await setup();
+    await seedHistory(h, 95_000);
+    expect(
+      (await h.session.sendMessage("Keep working below the force band", options)).success
+    ).toBe(true);
+    const rows = await allRows(h);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    expect(
+      rows.filter((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
+    ).toHaveLength(1);
+    expect(h.requests).toHaveLength(1);
+    expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
+  });
+
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
     await seedHistory(first, 30_000, 300_000);
@@ -232,6 +247,8 @@ describe("AgentSession token-budget lifecycle", () => {
       stepStartPartIndices: [0],
       contextUsage: { inputTokens: 30_000, outputTokens: 10, totalTokens: 30_010 },
     });
+    // StreamManager first persists an assistant placeholder to reserve its history sequence.
+    expect((await first.historyService.appendToHistory(workspaceId, partial)).success).toBe(true);
     partial.parts = [
       {
         type: "dynamic-tool",
@@ -245,7 +262,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
     first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.sendMessage("Resume safely", options)).success).toBe(true);
+    expect(await h.session.sendMessage("Resume safely", options)).toMatchObject({ success: true });
     const rows = await allRows(h);
     const persistedPartial = rows.find((row) => row.id === partial.id)!;
     expect(persistedPartial.parts).toEqual(partial.parts);
@@ -254,7 +271,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(persistedPartial.metadata!.historySequence!).toBeLessThan(
       boundary.metadata!.historySequence!
     );
-    expect(await h.historyService.readPartial(workspaceId)).toEqual(Ok(null));
+    expect(await h.historyService.readPartial(workspaceId)).toBeNull();
     expect(
       sliceMessagesForProviderFromLatestContextBoundary(h.requests[0].messages).some(
         (row) => row.id === partial.id
@@ -266,7 +283,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "restart after %i prefix rows never writes another boundary",
     async (prefixLength) => {
       const first = await setup();
-      await seedHistory(first, 95_000);
+      await seedHistory(first, 110_000);
       const rollover: ContextWindowRollover = {
         type: "context-window-rollover",
         rolloverId: "crash-rollover",
@@ -296,9 +313,12 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("failed atomic append preserves the pending rollover for the next attempt", async () => {
     const h = await setup();
-    await seedHistory(h, 95_000);
-    const append = spyOn(h.historyService, "appendManyToHistory").mockRejectedValueOnce(
-      new Error("disk unavailable")
+    await seedHistory(h, 110_000);
+    const append = spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
+      async () => {
+        await Promise.resolve();
+        throw new Error("disk unavailable");
+      }
     );
     expect((await h.session.sendMessage("Retry me", options)).success).toBe(false);
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
@@ -317,7 +337,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup();
       expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
       h.session.queueMessage("Real queued instruction", { ...options, queueDispatchMode });
-      expect(await h.requests[0].onStepSettled?.(step(95_000))).toBe("rollover");
+      expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
       await h.finishAndDispatch();
       const rows = await allRows(h);
@@ -361,8 +381,8 @@ describe("AgentSession token-budget lifecycle", () => {
     const continuation = rows.at(-1)!;
     expect(continuation.metadata).toMatchObject({
       synthetic: true,
-      agentInitiated: true,
-      goalKind: GOAL_CONTINUATION_KIND,
+      retrySendOptions: { agentInitiated: true },
+      kind: GOAL_CONTINUATION_KIND,
       goalId: "goal-budget",
       muxMetadata: correlation,
     });
@@ -373,7 +393,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
-  test.each([95_000, 127_000])(
+  test.each([110_000, 127_000])(
     "force/ceiling at %i tokens suppresses warning and preserves continuation correlation",
     async (inputTokens) => {
       const h = await setup();
@@ -389,7 +409,7 @@ describe("AgentSession token-budget lifecycle", () => {
       );
       expect(rows.at(-1)?.metadata).toMatchObject({
         synthetic: true,
-        agentInitiated: true,
+        retrySendOptions: { agentInitiated: true },
         muxMetadata: correlation,
       });
     }
@@ -399,7 +419,7 @@ describe("AgentSession token-budget lifecycle", () => {
     type: "context_budget_exceeded",
     model,
     estimate: 127_000,
-    limit: 128_000,
+    hardCeiling: 119_808,
   };
   test.each([false, true])(
     "preflight retries once; fresh overflow blocked=%s",
@@ -423,7 +443,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("a primary on-send rollover followed by fresh preflight overflow is blocked without a second reset", async () => {
     const h = await setup({ failure: () => exceeded });
-    await seedHistory(h, 95_000);
+    await seedHistory(h, 110_000);
     const result = await h.session.sendMessage("Still too big after assembly", options);
     expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
     expect(h.requests).toHaveLength(1);
@@ -479,7 +499,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (action) => {
       const h = await setup();
       expect((await h.session.sendMessage("Work", options)).success).toBe(true);
-      expect(await h.requests[0].onStepSettled?.(step(95_000))).toBe("rollover");
+      expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
       expect(h.session.hasPendingManualFollowUp()).toBe(true);
       if (action === "manual-reset") {
         h.session.clearUsageState();
@@ -533,7 +553,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("explicit session_history disable blocks rollover before a stream starts", async () => {
     const h = await setup();
-    await seedHistory(h, 95_000);
+    await seedHistory(h, 110_000);
     const result = await h.session.sendMessage("Keep my transcript reachable", {
       ...options,
       toolPolicy: [{ regex_match: "session_history", action: "disable" }],
@@ -546,7 +566,7 @@ describe("AgentSession token-budget lifecycle", () => {
   test("auto-disabled budget never warns or rolls over", async () => {
     const h = await setup();
     h.session.setAutoCompactionThreshold(1);
-    await seedHistory(h, 95_000);
+    await seedHistory(h, 110_000);
     expect((await h.session.sendMessage("Manual only", options)).success).toBe(true);
     expect(await h.requests[0].onStepSettled?.(step(127_000))).toBe("continue");
     const rows = await allRows(h);
