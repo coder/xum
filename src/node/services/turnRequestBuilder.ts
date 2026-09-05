@@ -1259,13 +1259,6 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const tokenBudgetEnabled =
-      (experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
-      !(
-        experiments?.continuousCompaction ??
-        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
-      ) &&
-      !isRlmModeEnabled(experiments, isExperimentEnabled);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1340,6 +1333,23 @@ export class TurnRequestBuilder {
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
     } = agentResult.data;
+    // Explicit summaries remain recovery operations, not token-budget turns.
+    // Inspect this request's last effective user row, never an older compact command.
+    const latestUserMessage = providerRequestMessages.findLast(
+      (message) => message.role === "user"
+    );
+    const isCompactionRequest =
+      effectiveAgentId === "compact" ||
+      muxMetadata?.type === "compaction-request" ||
+      latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    const tokenBudgetEnabled =
+      !isCompactionRequest &&
+      (experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
+      !(
+        experiments?.continuousCompaction ??
+        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
+      ) &&
+      !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
     const memoryAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,

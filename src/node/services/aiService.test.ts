@@ -1269,6 +1269,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     mock.restore();
   });
 
+  it.each(["request-row", "idle-row", "agent", "send-metadata", "ordinary", "historical"] as const)(
+    "keeps oversized compaction recovery outside token-budget preflight: %s",
+    async (identity) => {
+      using xumHome = new DisposableTempDir("ai-service-compaction-budget");
+      const metadata = createLocalWorkspaceMetadata("compaction-budget", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const compactionMetadata = {
+        type: "compaction-request" as const,
+        rawCommand: "/compact",
+        parsed: {},
+        ...(identity === "idle-row" ? { source: "idle-compaction" as const } : {}),
+      };
+      if (identity === "agent") {
+        const resolved = resolvedAgentResultFor(metadata);
+        if (!resolved.success) throw new Error("Expected resolved agent");
+        resolved.data.effectiveAgentId = "compact";
+        resolved.data.effectiveMode = "compact";
+        spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      }
+      const currentRowIsCompaction = identity === "request-row" || identity === "idle-row";
+      const messages = [
+        createMuxMessage("large-history", "user", "x".repeat(2_000_000)),
+        ...(identity === "historical"
+          ? [
+              createMuxMessage("previous-compact", "user", "summarize", {
+                muxMetadata: compactionMetadata,
+              }),
+            ]
+          : []),
+        createMuxMessage("latest-user", "user", "continue", {
+          ...(currentRowIsCompaction ? { muxMetadata: compactionMetadata } : {}),
+          ...(identity === "send-metadata" ? { synthetic: true } : {}),
+        }),
+      ];
+      const result = await harness.service.streamMessage({
+        workspaceId: metadata.id,
+        messages,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true },
+        ...(identity === "send-metadata" ? { muxMetadata: compactionMetadata } : {}),
+      });
+      const shouldBypass = identity !== "ordinary" && identity !== "historical";
+      expect(result.success).toBe(shouldBypass);
+      expect(harness.startStreamCalls).toHaveLength(shouldBypass ? 1 : 0);
+      expect(harness.preparedPayloadMessageIds[0]).toContain("large-history");
+      if (!shouldBypass && !result.success) {
+        expect(result.error.type).toBe("context_budget_exceeded");
+      }
+    }
+  );
+
   it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-disabled");
     const projectPath = path.join(xumHome.path, "project");
