@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
-import { mkdir } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { CHAT_FILE_NAME } from "@/common/constants/paths";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -277,6 +279,39 @@ describe("WorkspaceTurnManager settlement authorization", () => {
     expect(await h.waiter).toBeInstanceOf(Error);
     expect(h.workspaceMocks.remove).toHaveBeenCalledTimes(1);
   });
+
+  test.each([undefined, null, 42, "", " \t"])(
+    "malformed persisted manual input id %j conservatively interrupts instead of stranding waiters",
+    async (id) => {
+      const h = await startTurn();
+      // Corruption can be valid JSON but not a valid MuxMessage; exercise the real disk parser.
+      await appendFile(
+        join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+        JSON.stringify({
+          ...createMuxMessage("manual-input", "user", "Redirect the child", {
+            historySequence: 1,
+          }),
+          id,
+        }) + "\n"
+      );
+      await h.append(
+        createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "Manual response", {
+          ...h.uncorrelatedEnd.metadata,
+        })
+      );
+      const { causes } = observeCauseInsideLock(h.manager);
+      const reads = spyOn(h.historyService, "getHistoryFromLatestBoundary");
+      expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+      expect(causes).toHaveBeenCalledWith({
+        kind: "uncorrelated-conservative-fallback",
+        reason: "invalid-manual-input-id",
+      });
+      expect(reads).toHaveBeenCalledTimes(1);
+      expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+      expect(await h.waiter).toBeInstanceOf(Error);
+      expect(h.workspaceMocks.remove).toHaveBeenCalledTimes(1);
+    }
+  );
 
   test.each(["history-read-failed", "missing-stream-end", "missing-turn-anchor"] as const)(
     "conservative %s fallback interrupts with one history read and its exact internal reason",

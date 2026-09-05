@@ -132,7 +132,11 @@ type WorkspaceTurnSettlementCause =
   | { kind: "manual-supersession"; messageId: string }
   | {
       kind: "uncorrelated-conservative-fallback";
-      reason: "history-read-failed" | "missing-stream-end" | "missing-turn-anchor";
+      reason:
+        | "history-read-failed"
+        | "missing-stream-end"
+        | "missing-turn-anchor"
+        | "invalid-manual-input-id";
     };
 
 const WORKSPACE_TURN_SETTLEMENT_CAUSES: Record<WorkspaceTurnSettlementCause["kind"], true> = {
@@ -2187,7 +2191,8 @@ export class WorkspaceTurnManager {
       assert(
         cause.reason === "history-read-failed" ||
           cause.reason === "missing-stream-end" ||
-          cause.reason === "missing-turn-anchor",
+          cause.reason === "missing-turn-anchor" ||
+          cause.reason === "invalid-manual-input-id",
         "Uncorrelated conservative fallback requires a recognized reason"
       );
     }
@@ -4442,10 +4447,15 @@ export class WorkspaceTurnManager {
       .slice(turnAnchorIndex + 1, streamEndIndex)
       .find(isManualChildWorkspaceInput);
     if (manualSupersessionInput) {
-      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
-        kind: "manual-supersession",
-        messageId: manualSupersessionInput.id,
-      });
+      // Readable JSON can still contain a malformed message ID. Preserve conservative
+      // interruption without inventing manual evidence or letting corrupt history strand waiters.
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
+        record,
+        event,
+        coerceNonEmptyString(manualSupersessionInput.id) != null
+          ? { kind: "manual-supersession", messageId: manualSupersessionInput.id }
+          : { kind: "uncorrelated-conservative-fallback", reason: "invalid-manual-input-id" }
+      );
     }
     return true;
   }
