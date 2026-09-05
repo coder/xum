@@ -8949,6 +8949,109 @@ export class TaskService implements AgentTaskIntegration {
     return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).length > 0;
   }
 
+  /**
+   * List all descendant agent task IDs sorted deepest-first so callers can
+   * cascade-remove children before their parents without tripping the orphan guard.
+   */
+  listDescendantAgentTaskIdsDeepestFirst(workspaceId: string): string[] {
+    assert(
+      workspaceId.length > 0,
+      "listDescendantAgentTaskIdsDeepestFirst: workspaceId must be non-empty"
+    );
+
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    const ids = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId);
+
+    // Sort by depth (deepest first) so leaf children are removed before their parents.
+    // Ties are broken by insertion order (stable sort).
+    // Cap the parent-chain walk at ids.length to avoid hanging on corrupted
+    // parentWorkspaceId cycles (depth can never exceed the descendant count).
+    const maxDepth = ids.length;
+    const depthById = new Map<string, number>();
+    for (const id of ids) {
+      let depth = 0;
+      let current: string | undefined = id;
+      while (current != null && current !== workspaceId && depth < maxDepth) {
+        depth++;
+        current = index.parentById.get(current);
+      }
+      depthById.set(id, depth);
+    }
+
+    return ids.sort((a, b) => (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0));
+  }
+
+  /**
+   * Cascade-remove all inactive descendant agent tasks deepest-first.
+   * Must be called while the task-tree lifecycle lock is already held (the caller
+   * in WorkspaceService.remove() acquires it). Includes all safeguards from
+   * removeInactiveDescendantAgentTask: active/streaming checks, git-patch-artifact
+   * wait, tombstone persistence, and force-flag passthrough.
+   */
+  async cascadeRemoveInactiveDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    force: boolean
+  ): Promise<Result<void>> {
+    const descendantIds = this.listDescendantAgentTaskIdsDeepestFirst(workspaceId);
+
+    for (const descendantId of descendantIds) {
+      const config = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(config, descendantId);
+      if (entry == null) continue; // already removed
+
+      // Safety: active tasks should have been caught by the guard in removeUnlocked,
+      // but double-check to avoid removing a task that became active in the meantime.
+      if (
+        this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
+        this.aiService.isStreaming(descendantId)
+      ) {
+        return Err(
+          `Descendant workspace ${descendantId} is still active. Stop it before removing.`
+        );
+      }
+
+      const result = await this.gitPatchArtifactService.withOperationLock(
+        descendantId,
+        async () => {
+          // Wait for any in-flight format-patch job before removal so the artifact
+          // isn't lost. Refuse removal if a durable pending marker remains (needs the
+          // child worktree to recover).
+          await this.gitPatchArtifactService.waitForGeneration(descendantId);
+          const parentWsId = entry.workspace.parentWorkspaceId;
+          if (parentWsId) {
+            const patchArtifact = await readSubagentGitPatchArtifact(
+              path.join(this.config.sessionsDir, parentWsId),
+              descendantId
+            );
+            if (patchArtifact?.status === "pending") {
+              return Err(
+                `Cannot cascade-remove descendant ${descendantId}: git patch artifact is still pending.`
+              );
+            }
+          }
+
+          const tombstoneResult = await this.persistRemovedAgentTaskTombstones(descendantId);
+          if (!tombstoneResult.success) {
+            return Err(
+              `Failed to persist tombstones for descendant ${descendantId}: ${tombstoneResult.error}`
+            );
+          }
+
+          return await this.workspaceService.removeWhileTaskTreeLocked(descendantId, force);
+        }
+      );
+
+      if (!result.success) {
+        return Err(
+          `Failed to cascade-remove descendant workspace ${descendantId}: ${result.error}`
+        );
+      }
+    }
+
+    return Ok(undefined);
+  }
+
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean {
     assert(
       workspaceId.length > 0,

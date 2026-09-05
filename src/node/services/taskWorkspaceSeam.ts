@@ -516,6 +516,10 @@ export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
+  cascadeRemoveInactiveDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    force: boolean
+  ): Promise<Result<void>>;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;

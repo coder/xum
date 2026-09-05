@@ -12381,7 +12381,7 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
 });
 
 describe("WorkspaceService remove lifecycle coordination", () => {
-  test("checks descendant tasks while holding the task-tree lifecycle lock", async () => {
+  test("blocks removal when active descendant tasks exist", async () => {
     const workspaceId = "parent-remove-lifecycle";
     const workspaceService = createWorkspaceServiceForTest({
       config: {
@@ -12404,24 +12404,27 @@ describe("WorkspaceService remove lifecycle coordination", () => {
         insideLifecycleLock = false;
       }
     };
-    const hasDescendantAgentTasks = mock(() => {
+    const hasActiveDescendantAgentTasksForWorkspace = mock(() => {
       expect(insideLifecycleLock).toBe(true);
       return true;
     });
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
         withTaskTreeLifecycleLock: runWithTaskTreeLifecycleLock,
-        hasDescendantAgentTasks,
+        hasActiveDescendantAgentTasksForWorkspace,
+        cascadeRemoveInactiveDescendantsWhileTaskTreeLocked: mock(() =>
+          Promise.resolve(Ok(undefined))
+        ),
       })
     );
 
     expect(await workspaceService.remove(workspaceId, true)).toEqual(
       Err(
-        "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent."
+        "This workspace has active descendant sub-agent workspaces. Stop them before removing their parent."
       )
     );
     expect(withTaskTreeLifecycleLock).toHaveBeenCalledWith(workspaceId, expect.any(Function));
-    expect(hasDescendantAgentTasks).toHaveBeenCalledWith(workspaceId);
+    expect(hasActiveDescendantAgentTasksForWorkspace).toHaveBeenCalledWith(workspaceId);
   });
 });
 
