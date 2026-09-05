@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getModelKey } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { normalizeModelPreference } from "./buildSendMessageOptions";
 
@@ -35,6 +35,12 @@ describe("getSendOptionsFromStorage", () => {
       ).toBe(enabled);
     }
   );
+
+  test.each([true, false])("preserves explicit continuous compaction overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), enabled);
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBe(enabled);
+  });
 
   test("preserves explicit gateway-scoped stored model preferences", () => {
     const workspaceId = "ws-1";

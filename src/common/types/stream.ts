@@ -1,3 +1,4 @@
+import type { PrefixSwapInvalidatedEventSchema } from "@/common/orpc/schemas/stream";
 /**
  * Event types emitted by AIService
  */
@@ -92,3 +93,5 @@ export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSche
  * Used for both runtime readiness and generic startup breadcrumbs in the barrier UI.
  */
 export type RuntimeStatusEvent = z.infer<typeof RuntimeStatusEventSchema>;
+
+export type PrefixSwapInvalidatedEvent = z.infer<typeof PrefixSwapInvalidatedEventSchema>;

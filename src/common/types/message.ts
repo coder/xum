@@ -629,6 +629,8 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
     | {
         type: "compaction-summary";
+        /** Distinguishes eager prefix compaction from the existing full compaction flow. */
+        strategy?: "continuous";
         /**
          * Follow-up content to dispatch after compaction completes.
          * Stored on the summary so it survives crashes - the user message
@@ -890,6 +892,8 @@ export interface MuxMetadata {
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
+  /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
+  stepStartPartIndices?: number[];
   duration?: number;
   ttftMs?: number; // Time-to-first-token measured from stream start; omitted when unavailable
   finishReason?: string; // Provider/model finish reason for the final step (e.g. stop, length)
@@ -1280,6 +1284,7 @@ export type DisplayedMessage =
       boundaryKind?: ContextBoundaryKind;
       position: "start" | "end";
       compactionEpoch?: number;
+      strategy?: CompactionSummaryMetadata["strategy"];
     }
   | {
       type: "history-hidden";

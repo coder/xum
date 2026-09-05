@@ -53,16 +53,11 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage,
     } as unknown as AIService;
 
-    // Justified mock: deferred promise is essential for testing the dispose-during-write race.
-    // A real HistoryService completes appendToHistory synchronously (sub-ms), so we can't
-    // reproduce the race window without controlling when the promise resolves.
+    const history = await createTestHistoryService();
+    const historyService = history.historyService;
+    // Keep the write gate while exercising real history and journal lifecycle methods.
     const appendDeferred = createDeferred<Result<void>>();
-    const historyService: HistoryService = {
-      appendToHistory: mock(() => appendDeferred.promise),
-      // seedUsageStateFromHistory reads the last few messages on first send;
-      // return empty history so the test exercises the real code path.
-      getLastMessages: mock(() => Promise.resolve(Ok([]))),
-    } as unknown as HistoryService;
+    spyOn(historyService, "appendToHistory").mockImplementation(() => appendDeferred.promise);
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -133,6 +128,7 @@ describe("AgentSession disposal race conditions", () => {
         startTime: Date.now(),
       })
     ).not.toThrow();
+    await history.cleanup();
   });
 
   test("bails out of a send parked on the branch-summary await when removal disposes the session", async () => {

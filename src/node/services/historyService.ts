@@ -1,6 +1,8 @@
 import * as path from "path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { renameSync } from "node:fs";
 import * as fs from "fs/promises";
+import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -223,6 +225,20 @@ export class HistoryService {
 
   constructor(config: HistorySessionLocation) {
     this.config = config;
+  }
+
+  private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
+
+  getContinuousCompactionJournal(workspaceId: string): ContinuousCompactionJournalStore {
+    let journal = this.continuousJournals.get(workspaceId);
+    if (!journal) {
+      journal = new ContinuousCompactionJournalStore(
+        path.join(this.getSessionDir(workspaceId), "continuous-compaction.json"),
+        workspaceId
+      );
+      this.continuousJournals.set(workspaceId, journal);
+    }
+    return journal;
   }
 
   private getSessionDir(workspaceId: string): string {
@@ -2613,9 +2629,10 @@ export class HistoryService {
     workspaceId: string,
     summaryMessage: MuxMessage,
     tailCopies: readonly MuxMessage[],
-    updateExisting: boolean
+    updateExisting: boolean,
+    shouldPersist?: (messages: MuxMessage[]) => boolean
   ): Promise<Result<void>> {
-    assert(tailCopies.length > 0, "persistBoundaryWithTailCopies requires at least one tail copy");
+    // Continuous compaction may intentionally keep no tail when no complete turn fits.
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
@@ -2631,6 +2648,10 @@ export class HistoryService {
           const historyPath = this.getChatHistoryPath(workspaceId);
           const messages = await this.readChatHistory(workspaceId);
 
+          // Rolling summaries are prepared outside this lock. Edits, resets, and
+          // newly appended rows must win over a stale prepared boundary.
+          if (shouldPersist && !shouldPersist(messages)) return Err("Compaction snapshot changed");
+          const sourceMessages = messages.slice();
           let persistedSummary: MuxMessage | undefined;
           if (updateExisting) {
             // Same replace semantics as updateHistory: match by sequence and
@@ -2694,7 +2715,21 @@ export class HistoryService {
             messages.push(copy);
           }
 
-          await writeFileAtomic(historyPath, this.serializeHistoryEntries(messages, workspaceId));
+          const serialized = this.serializeHistoryEntries(messages, workspaceId);
+          if (shouldPersist) {
+            const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
+            try {
+              await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+              // Bulk I/O remains asynchronous, but the final generation check and
+              // publication must not yield to reset(), abandonment, or a new stream.
+              if (!shouldPersist(sourceMessages)) return Err("Compaction snapshot changed");
+              renameSync(stagedPath, historyPath);
+            } finally {
+              await fs.rm(stagedPath, { force: true });
+            }
+          } else {
+            await writeFileAtomic(historyPath, serialized);
+          }
 
           // Seal the previous epoch only after boundary + tail are durable.
           await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary);

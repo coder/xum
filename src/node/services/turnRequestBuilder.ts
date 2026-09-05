@@ -1350,20 +1350,16 @@ export class TurnRequestBuilder {
     // hooks.js modules with the event spine BEFORE request assembly so both
     // request.assemble and tool.execute middleware are in place for this
     // turn. Failure posture: a broken plugin never blocks a send.
-    try {
-      await agentPluginHookService.ensureWorkspaceHooks({
-        workspaceId,
-        sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
-        journal: this.dependencies.durableEventJournalFor(workspaceId),
-        enabled: this.dependencies.isAgentPluginsEnabled(),
-        xumHome: this.dependencies.config.rootDir,
-        // Project containers follow the same off-host gating as plugin MCP.
-        projectRoot: agentPluginsMcpContext?.projectRoot,
-        projectTrusted,
-      });
-    } catch (error) {
-      log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
-    }
+    await agentPluginHookService.ensureWorkspaceHooksForRequest({
+      workspaceId,
+      sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+      journal: this.dependencies.durableEventJournalFor(workspaceId),
+      enabled: this.dependencies.isAgentPluginsEnabled(),
+      xumHome: this.dependencies.config.rootDir,
+      // Project containers follow the same off-host gating as plugin MCP.
+      projectRoot: agentPluginsMcpContext?.projectRoot,
+      projectTrusted,
+    });
 
     const listMcpServersStartedAt = Date.now();
     const mcpServers = this.dependencies.bindings.mcpServerManager

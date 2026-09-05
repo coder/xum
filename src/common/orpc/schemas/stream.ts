@@ -672,7 +672,14 @@ export const RestoreToInputEventSchema = z.object({
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
 // XumMessages (user/assistant chat messages) are emitted with type: "message"
 // when loading from history or sending new messages.
+export const PrefixSwapInvalidatedEventSchema = z.object({
+  type: z.literal("prefix-swap-invalidated"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
+  PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
   HeartbeatEventSchema,
   CaughtUpMessageSchema,
@@ -787,6 +794,7 @@ export const ExperimentsSchema = z.preprocess(
     timeline: z.boolean().optional(),
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),
+    continuousCompaction: z.boolean().optional(),
   })
 );
 
