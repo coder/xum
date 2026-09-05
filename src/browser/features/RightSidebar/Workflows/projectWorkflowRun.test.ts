@@ -827,6 +827,32 @@ describe("projectWorkflowRun — declared phase manifest", () => {
     ]);
   });
 
+  test("active phase follows event order after a terminal loop re-entry", () => {
+    // scope → verify → scope, then the run ends: `verify` sits later on the rail,
+    // but the run's final position is `scope`.
+    const view = projectWorkflowRun(
+      manifestRun({
+        status: "completed",
+        events: [phaseEvent(1, "scope"), phaseEvent(2, "verify"), phaseEvent(3, "scope")],
+      })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.latest])).toEqual([
+      ["scope", true],
+      ["verify", false],
+      ["synthesize", false],
+    ]);
+    expect(getActiveWorkflowPhase(view.phases)?.name).toBe("scope");
+  });
+
+  test("no active phase before the first phase event on a declared run", () => {
+    // Pending / setup-failed declared runs seed an all-unvisited rail; a summary
+    // must not claim the last manifest phase ("phase 3/3") for them.
+    for (const status of ["pending", "running", "failed"] as const) {
+      const view = projectWorkflowRun(manifestRun({ status, events: [] }));
+      expect(getActiveWorkflowPhase(view.phases)).toBeNull();
+    }
+  });
+
   test("terminal completed run resolves unvisited declared phases to skipped", () => {
     const view = projectWorkflowRun(
       manifestRun({ status: "completed", events: [phaseEvent(1, "scope")] })
@@ -915,5 +941,26 @@ describe("projectWorkflowRun — declared phase manifest", () => {
       ["alpha", "completed"],
       ["beta", "running"],
     ]);
+  });
+
+  test("manifest-less runs with no phase events summarize the implicit step bucket", () => {
+    const view = projectWorkflowRun(
+      makeRun({
+        status: "completed",
+        events: [],
+        steps: [
+          {
+            stepId: "s1",
+            inputHash: "h",
+            status: "completed",
+            taskId: "t1",
+            startedAt: at(1),
+            completedAt: at(2),
+          },
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => phase.name)).toEqual([""]);
+    expect(getActiveWorkflowPhase(view.phases)?.label).toBe("Steps");
   });
 });

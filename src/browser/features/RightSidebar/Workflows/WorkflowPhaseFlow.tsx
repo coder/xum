@@ -6,6 +6,7 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import type { WorkflowPhaseManifest } from "@/common/types/workflow";
 
 import { WorkflowLiveDot } from "./WorkflowBadges";
+import { isUnvisitedPhaseLifecycle } from "./projectWorkflowRun";
 import type { WorkflowPhaseLifecycle, WorkflowPhaseView } from "./projectWorkflowRun";
 import { WORKFLOW_TONE_VAR } from "./workflowDisplay";
 
@@ -162,9 +163,13 @@ const PhaseFlowNode: React.FC<{
   );
   const sharedClassName =
     "relative flex max-w-[160px] min-w-0 items-center rounded-full px-2 py-0.5";
+  // Only visited phases have a step section to jump to (the timeline keeps
+  // pending/skipped/not-reached phases on the rail alone), so an unvisited node
+  // must not advertise a click/keyboard affordance that would do nothing.
+  const selectable = props.onSelect != null && !isUnvisitedPhaseLifecycle(node.lifecycle);
   return (
     <TooltipIfPresent tooltip={tooltip.length > 0 ? tooltip : undefined}>
-      {props.onSelect != null ? (
+      {selectable ? (
         <button
           type="button"
           onClick={() => props.onSelect?.(node.name)}

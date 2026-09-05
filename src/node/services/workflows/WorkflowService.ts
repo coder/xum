@@ -55,7 +55,7 @@ import {
   registerInProcessWorkflowRun,
 } from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
-import { parseDeclaredPhases, parseWorkflowMetadata } from "./workflowMetadata";
+import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
 import { hydrateWorkflowRunPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
@@ -747,7 +747,7 @@ export class WorkflowService {
     });
     // Fail fast on invalid meta.phases before the durable run record exists,
     // mirroring argsSchema validation above (all issues enumerated at once).
-    parseDeclaredPhases(parseWorkflowMetadata(input.script.source));
+    parseDeclaredPhasesFromSource(input.script.source);
     return await this.runStore.createRun({
       id: runId,
       workspaceId: input.workspaceId,
@@ -907,7 +907,7 @@ export class WorkflowService {
     const script = await resolveScript(input.spec.scriptPath);
     const normalized = normalizeWorkflowArgsForSource(script.source, input.spec.args);
     // Same fail-fast declared-phase gate as top-level run creation.
-    parseDeclaredPhases(parseWorkflowMetadata(script.source));
+    parseDeclaredPhasesFromSource(script.source);
     return await this.runStore.createRunIfAbsent({
       id: childRunId,
       workspaceId: parentRun.workspaceId,
@@ -1140,7 +1140,10 @@ export async function interruptWorkflowRun(
   input: { workspaceId: string; runId: string }
 ) {
   const { service } = await resolveWorkflowContext(context, input.workspaceId);
-  return service.interruptRun(input);
+  // The tool card installs this response as its newest snapshot; it ties with the
+  // hydrated subscription update on updatedAt/sequence, so an unhydrated record
+  // here would win the tie and drop the phase rail from the interrupted card.
+  return hydrateWorkflowRunPhaseManifest(await service.interruptRun(input));
 }
 
 export async function getWorkflowRunStatuses(

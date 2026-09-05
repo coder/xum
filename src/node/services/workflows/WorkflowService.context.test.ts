@@ -8,6 +8,7 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
+  interruptWorkflowRun,
   listWorkflowRuns,
   listWorkflowScripts,
   resumeWorkflowRun,
@@ -325,6 +326,68 @@ describe("WorkflowService request orchestration", () => {
     // No durable run record may exist for the refused start.
     const runs = await listWorkflowRuns(context, "workspace-1");
     expect(runs.some((run) => run.workflow.name === "bad-phases")).toBe(false);
+  });
+
+  test("rejects run creation when meta is declared but not statically readable", async () => {
+    const { context } = createContext();
+    fs.writeFileSync(
+      path.join(projectPath, "workflows", "dynamic-meta.js"),
+      'const phases = [{ name: "a" }];\nexport const meta = { phases };\n' +
+        'export default function workflow({ phase }) { phase("a"); return {}; }\n'
+    );
+    try {
+      await startWorkflowRun(context, {
+        workspaceId: "workspace-1",
+        scriptPath: "./workflows/dynamic-meta.js",
+        args: {},
+      });
+      expect.unreachable("non-static meta must fail run creation, not run undeclared");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
+      expect(String(error)).toContain("static object literal");
+    }
+    const runs = await listWorkflowRuns(context, "workspace-1");
+    expect(runs.some((run) => run.workflow.name === "dynamic-meta")).toBe(false);
+  });
+
+  test("interrupt responses carry the hydrated phase manifest like read paths", async () => {
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
+    await runStore.createRun({
+      id: "wfr_interrupt_hydrate",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "project" as const, executable: true },
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+      source:
+        'export const meta = { phases: [{ name: "a" }, { name: "b" }] };\n' +
+        'export default function workflow({ phase }) { phase("a"); return {}; }\n',
+    });
+
+    const { context } = createContext();
+    const interrupted = await interruptWorkflowRun(context, {
+      workspaceId: "workspace-1",
+      runId: "wfr_interrupt_hydrate",
+    });
+    expect(interrupted.status).toBe("interrupted");
+    // The tool card installs this response as a snapshot that ties with the hydrated
+    // subscription update; an unhydrated record here would drop the rail.
+    expect(interrupted.workflow.phaseManifest).toEqual({
+      provenance: "declared",
+      phases: [{ name: "a" }, { name: "b" }],
+    });
+    const rawRunFile = fs.readFileSync(
+      path.join(
+        config.sessionsDir,
+        "workspace-1",
+        "workflows",
+        "wfr_interrupt_hydrate",
+        "run.json"
+      ),
+      "utf-8"
+    );
+    expect(rawRunFile).not.toContain("phaseManifest");
   });
 
   test("discovery surfaces phase previews and never fails on invalid declarations", async () => {

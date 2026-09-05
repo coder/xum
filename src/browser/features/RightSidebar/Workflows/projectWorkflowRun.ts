@@ -116,6 +116,13 @@ export interface WorkflowPhaseView {
   running: boolean;
   failed: boolean;
   lifecycle: WorkflowPhaseLifecycle;
+  /**
+   * True for the phase the run entered most recently in EVENT order — the run's
+   * current (or, once terminal, final) position. `phases` is rail-ordered, so
+   * after `scope → verify → scope` this marks `scope` even though `verify` sits
+   * later in the array. Never set on the implicit "" bucket.
+   */
+  latest: boolean;
   /** Declared fan-out marker from meta.phases (presentational). */
   parallel?: boolean;
 }
@@ -255,6 +262,7 @@ function buildPhaseView(
   details: unknown,
   steps: WorkflowStepView[],
   lifecycle: WorkflowPhaseLifecycle,
+  latest: boolean,
   parallel?: boolean
 ): WorkflowPhaseView {
   return {
@@ -268,6 +276,7 @@ function buildPhaseView(
     running: steps.some((step) => step.status === "running"),
     failed: steps.some((step) => step.status === "failed"),
     lifecycle,
+    latest,
     ...(parallel === true ? { parallel: true } : {}),
   };
 }
@@ -653,6 +662,7 @@ export function projectWorkflowRun(
           hasFailedStep: phaseSteps.some((step) => step.status === "failed"),
           inferredProvenance,
         }),
+        name === latestVisited,
         declared?.parallel
       )
     );
@@ -670,7 +680,9 @@ export function projectWorkflowRun(
       : ungrouped.some((step) => step.status === "running")
         ? "running"
         : "completed";
-    phases.unshift(buildPhaseView("", label, undefined, undefined, ungrouped, bucketLifecycle));
+    phases.unshift(
+      buildPhaseView("", label, undefined, undefined, ungrouped, bucketLifecycle, false)
+    );
   }
 
   let result: WorkflowResult | null = null;
@@ -724,9 +736,10 @@ export function projectWorkflowRun(
 }
 
 /**
- * The phase a compact summary should name: the running phase, else the last
- * VISITED phase. With a declared manifest the raw last entry of `phases` can be
- * an unvisited (pending/skipped) rail node, which would misreport progress.
+ * The phase a compact summary should name: the running phase, else the phase
+ * visited most recently in EVENT order, else the implicit step bucket. Never an
+ * unvisited rail node: before the first phase event a pending (or setup-failed)
+ * declared run must read as "no phase", not "phase N/N".
  */
 export function getActiveWorkflowPhase(
   phases: readonly WorkflowPhaseView[]
@@ -736,8 +749,12 @@ export function getActiveWorkflowPhase(
     // lifecycle "running" additionally matches the latest-visited phase of an
     // active run even before its first step starts.
     phases.find((phase) => phase.running || phase.lifecycle === "running") ??
-    phases.findLast((phase) => !isUnvisitedPhaseLifecycle(phase.lifecycle)) ??
-    phases.at(-1) ??
+    // `latest` follows event order, not rail order — `phases.findLast(...)`
+    // would name `verify` after a `scope → verify → scope` loop re-entry.
+    phases.find((phase) => phase.latest) ??
+    // Steps observed before any phase event sit in the "" bucket, which is
+    // chronologically first — so it is the position only when nothing else was visited.
+    phases.find((phase) => phase.name === "") ??
     null
   );
 }

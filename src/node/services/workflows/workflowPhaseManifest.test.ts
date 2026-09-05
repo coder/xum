@@ -194,6 +194,20 @@ export default function workflow({ phase }) { phase("x"); return {}; }
     expect(outcome).toEqual({ kind: "none" });
   });
 
+  test("a declared but non-static meta is invalid, never silently inferred", () => {
+    // Static phase() literals would infer fine — but the author DECLARED meta, so
+    // presenting an inferred rail would hide that their declaration was unreadable.
+    const source = `const phases = [{ name: "x" }];
+export const meta = { phases };
+export default function workflow({ phase }) { phase("x"); return {}; }
+`;
+    const outcome = resolveWorkflowPhaseManifest(source, freshHash());
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind === "invalid") {
+      expect(outcome.warning).toContain("static object literal");
+    }
+  });
+
   test("memoizes by sourceHash", () => {
     const hash = freshHash();
     const first = resolveWorkflowPhaseManifest(legacyWorkflow(`phase("memo");`), freshHash());
@@ -241,5 +255,30 @@ describe("hydrateWorkflowRunPhaseManifest", () => {
   test("returns the run unchanged when no manifest resolves", () => {
     const run = makeRun(`export default function workflow(ctx) { return {}; }\n`);
     expect(hydrateWorkflowRunPhaseManifest(run)).toBe(run);
+  });
+
+  test("strips a stale persisted manifest when the source derives none", () => {
+    // Hand-edited/corrupted run.json: the record schema tolerates the field so the
+    // store can strip it, but the read boundary must not echo it back to clients.
+    const stale = { provenance: "declared" as const, phases: [{ name: "attacker-phase" }] };
+    const run = makeRun(`export default function workflow(ctx) { return {}; }\n`);
+    const corrupted = { ...run, workflow: { ...run.workflow, phaseManifest: stale } };
+    const hydrated = hydrateWorkflowRunPhaseManifest(corrupted);
+    expect(hydrated.workflow.phaseManifest).toBeUndefined();
+    expect("phaseManifest" in hydrated.workflow).toBe(false);
+    expect(corrupted.workflow.phaseManifest).toBe(stale);
+  });
+
+  test("replaces a stale persisted manifest with the source-derived one", () => {
+    const stale = { provenance: "declared" as const, phases: [{ name: "attacker-phase" }] };
+    const run = makeRun(legacyWorkflow(`phase("real");`));
+    const hydrated = hydrateWorkflowRunPhaseManifest({
+      ...run,
+      workflow: { ...run.workflow, phaseManifest: stale },
+    });
+    expect(hydrated.workflow.phaseManifest).toEqual({
+      provenance: "inferred",
+      phases: [{ name: "real" }],
+    });
   });
 });

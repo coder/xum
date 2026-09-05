@@ -29,7 +29,7 @@ import {
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { parseWorkflowMetadata, parseDeclaredPhases } from "./workflowMetadata";
+import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
 
 export type WorkflowPhaseManifestOutcome =
   | { kind: "manifest"; manifest: WorkflowPhaseManifest }
@@ -64,7 +64,7 @@ export function resolveWorkflowPhaseManifest(
 function computePhaseManifestOutcome(source: string): WorkflowPhaseManifestOutcome {
   let declared: WorkflowDeclaredPhase[] | undefined;
   try {
-    declared = parseDeclaredPhases(parseWorkflowMetadata(source));
+    declared = parseDeclaredPhasesFromSource(source);
   } catch (error) {
     // Read-path strictness would brick old runs; run creation is the strict gate.
     log.debug(
@@ -94,16 +94,21 @@ function computePhaseManifestOutcome(source: string): WorkflowPhaseManifestOutco
 }
 
 /**
- * Return an outbound copy of the run with `workflow.phaseManifest` hydrated,
- * or the run unchanged when no manifest resolves. Callers must not feed the
- * hydrated copy back into WorkflowRunStore writes.
+ * Return an outbound copy of the run whose `workflow.phaseManifest` is derived
+ * from the snapshotted source — set when a manifest resolves, otherwise absent.
+ * The source is the only authority: a `phaseManifest` already present on the
+ * incoming record (hand-edited or otherwise corrupted run.json — the record
+ * schema tolerates the field so the store can strip it) is never passed through,
+ * so persisted corruption self-heals at the read boundary. Callers must not feed
+ * the hydrated copy back into WorkflowRunStore writes.
  */
 export function hydrateWorkflowRunPhaseManifest(run: WorkflowRunRecord): WorkflowRunRecord {
   const outcome = resolveWorkflowPhaseManifest(run.source, run.sourceHash);
+  const { phaseManifest: _stale, ...workflow } = run.workflow;
   if (outcome.kind !== "manifest") {
-    return run;
+    return _stale === undefined ? run : { ...run, workflow };
   }
-  return { ...run, workflow: { ...run.workflow, phaseManifest: outcome.manifest } };
+  return { ...run, workflow: { ...workflow, phaseManifest: outcome.manifest } };
 }
 
 /**

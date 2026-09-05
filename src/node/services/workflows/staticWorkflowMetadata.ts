@@ -50,10 +50,23 @@ function findRequiredStaticMetadataLiteral(source: string): MetadataLiteralRange
   return metadata;
 }
 
+const META_DECLARATION_PATTERN = /(^|[;\n])\s*export\s+(?:const|let|var)\s+meta\s*=/mu;
+
+/**
+ * Whether the source declares a top-level `export const meta =` at all,
+ * regardless of whether its value is statically parseable. Lets callers tell
+ * "no metadata" apart from "metadata we cannot read" — the parser throws the
+ * same error for both.
+ */
+export function hasStaticWorkflowMetadataDeclaration(source: string): boolean {
+  const maskedSource = maskStaticJavaScriptSource(source);
+  const match = META_DECLARATION_PATTERN.exec(maskedSource);
+  return match != null && isTopLevelStaticMatch(maskedSource, match.index);
+}
+
 function findStaticMetadataLiteral(source: string): MetadataLiteralRange | null {
   const maskedSource = maskStaticJavaScriptSource(source);
-  const matchPattern = /(^|[;\n])\s*export\s+(?:const|let|var)\s+meta\s*=/mu;
-  const match = matchPattern.exec(maskedSource);
+  const match = META_DECLARATION_PATTERN.exec(maskedSource);
   if (match != null && isTopLevelStaticMatch(maskedSource, match.index)) {
     const declarationStart = match.index + (match[1]?.length ?? 0);
     const start = skipStaticWhitespace(source, match.index + match[0].length);

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   parseDeclaredPhases,
+  parseDeclaredPhasesFromSource,
   parseWorkflowMetadata,
   WorkflowDeclaredPhasesValidationError,
 } from "./workflowMetadata";
@@ -102,5 +103,42 @@ export default function workflow({ phase }) { phase("a"); phase("b"); return {};
         "meta.phases[1].description must be at most 500 characters",
       ]
     );
+  });
+});
+
+describe("parseDeclaredPhasesFromSource", () => {
+  const body = 'export default function workflow({ phase }) { phase("a"); return {}; }\n';
+
+  test("returns undefined when the script declares no meta at all", () => {
+    expect(parseDeclaredPhasesFromSource(body)).toBeUndefined();
+  });
+
+  test("returns undefined for a static meta without phases", () => {
+    expect(
+      parseDeclaredPhasesFromSource('export const meta = { description: "x" };\n' + body)
+    ).toBeUndefined();
+  });
+
+  test("reads phases from a static meta", () => {
+    expect(
+      parseDeclaredPhasesFromSource('export const meta = { phases: [{ name: "a" }] };\n' + body)
+    ).toEqual([{ name: "a" }]);
+  });
+
+  test("rejects a declared meta the static parser cannot read instead of treating it as absent", () => {
+    // Shorthand property referencing a runtime binding: `meta` exists, so a
+    // silently-ignored `phases` would run undeclared without telling the author.
+    const source = 'const phases = [{ name: "a" }];\nexport const meta = { phases };\n' + body;
+    try {
+      parseDeclaredPhasesFromSource(source);
+      expect.unreachable("non-static meta must be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
+      expect((error as WorkflowDeclaredPhasesValidationError).issues).toHaveLength(1);
+      expect(String(error)).toContain("static object literal");
+    }
+    // The lenient reader still degrades to null for the same source, so the two
+    // must not be conflated by callers.
+    expect(parseWorkflowMetadata(source)).toBeNull();
   });
 });

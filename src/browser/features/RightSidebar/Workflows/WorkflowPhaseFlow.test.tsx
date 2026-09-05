@@ -30,6 +30,7 @@ function phaseView(overrides: Partial<WorkflowPhaseView>): WorkflowPhaseView {
     running: false,
     failed: false,
     lifecycle: "pending",
+    latest: false,
     ...overrides,
   };
 }
@@ -78,6 +79,30 @@ describe("WorkflowPhaseFlow", () => {
 
     const withoutHandler = render(<WorkflowPhaseFlow nodes={nodes} provenance="declared" />);
     expect(withoutHandler.queryByRole("button")).toBeNull();
+  });
+
+  test("unvisited phases never become buttons — they have no timeline section to jump to", () => {
+    const onSelect = mock(() => undefined);
+    const rendered = render(
+      <WorkflowPhaseFlow
+        nodes={[
+          { name: "scope", label: "Scope", lifecycle: "completed" },
+          { name: "verify", label: "Verify", lifecycle: "running" },
+          { name: "a", label: "Pending", lifecycle: "pending" },
+          { name: "b", label: "Skipped", lifecycle: "skipped" },
+          { name: "c", label: "Not reached", lifecycle: "not-reached" },
+          { name: "d", label: "Not visited", lifecycle: "not-visited" },
+        ]}
+        provenance="declared"
+        onPhaseSelect={onSelect}
+      />
+    );
+    expect(rendered.getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "Scope",
+      "Verify",
+    ]);
+    // Unvisited nodes still render as plain rail labels.
+    expect(rendered.getByText("Skipped")).toBeTruthy();
   });
 
   test("renders nothing for an empty node list", () => {
