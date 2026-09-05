@@ -829,24 +829,6 @@ function parseAnthropicCacheTtl(value: unknown): AnthropicCacheTtl | undefined {
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Model cost tracking
-// ---------------------------------------------------------------------------
-
-const MUX_MODEL_COSTS_INCLUDED = Symbol("mux:modelCostsIncluded");
-
-type LanguageModelWithMuxCostsIncluded = LanguageModel & {
-  [MUX_MODEL_COSTS_INCLUDED]?: true;
-};
-
-function markModelCostsIncluded(model: LanguageModel): void {
-  (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] = true;
-}
-
-export function modelCostsIncluded(model: LanguageModel): boolean {
-  return (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] === true;
-}
-
 const CODEX_ALLOWED_PARAMS = new Set([
   "model",
   "input",
@@ -1853,7 +1835,9 @@ export class ProviderModelFactory {
           // Skip Codex OAuth routing for chatCompletions — the Codex endpoint
           // only accepts Responses API format, so chat-completions requests would fail.
           if (shouldRouteThroughCodexOauth && effectiveWireFormat !== "chatCompletions") {
-            markModelCostsIncluded(model);
+            // OAuth can consume paid Business workspace credits. Keep API-equivalent cost estimates;
+            // authentication does not prove that usage is free.
+            // Apply this policy to new requests only. Do not migrate historical usage.
 
             // Codex OAuth requires store=false and must override any request-level
             // setting to avoid unresolved item_reference lookups.

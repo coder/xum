@@ -909,8 +909,8 @@ export interface MuxMetadata {
   routedThroughGateway?: boolean;
   routeProvider?: string;
   /**
-   * True when usage costs are included in a subscription (e.g., ChatGPT subscription routing).
-   * Token counts are still tracked, but the UI should display costs as $0.
+   * Legacy marker for usage that the app classified as subscription-covered.
+   * The UI preserves token counts and $0 costs for these historical records.
    */
   costsIncluded?: boolean;
   // Total usage across all steps (for cost calculation)

@@ -19,7 +19,6 @@ import {
   buildAIProviderRequestHeaders,
   classifyCopilotInitiator,
   countAnthropicCacheBreakpoints,
-  modelCostsIncluded,
   XUM_AI_PROVIDER_USER_AGENT,
   normalizeCodexResponsesBody,
   markCodexOauthRoutedResponse,
@@ -1333,7 +1332,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         return;
       }
       expect(hasLanguageModelCleanup(result.data)).toBe(false);
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
@@ -1433,8 +1432,8 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   });
 });
 
-describe("ProviderModelFactory modelCostsIncluded", () => {
-  it("marks gpt-5.3-codex as subscription-covered when routed through Codex OAuth", async () => {
+describe("ProviderModelFactory Codex authentication", () => {
+  it("creates a Responses model with only Codex OAuth credentials", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -1454,7 +1453,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
@@ -1479,7 +1478,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
@@ -1525,7 +1524,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
     });
   });
 
-  it("does not mark gpt-5.3-codex as subscription-covered when routed through API key", async () => {
+  it("creates a Responses model with only API key credentials", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -1539,7 +1538,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(false);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 });

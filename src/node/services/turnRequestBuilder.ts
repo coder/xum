@@ -54,7 +54,6 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import type { StreamManager } from "./streamManager";
 import {
-  markProviderMetadataCostsIncluded,
   type ModelFallbackOptions,
   type StreamTextOnChunk,
   type TurnCompletion,
@@ -171,7 +170,6 @@ import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
-import { modelCostsIncluded } from "./providerModelFactory";
 import {
   assemblePromptPayload,
   buildPlanInstructions,
@@ -1676,10 +1674,6 @@ export class TurnRequestBuilder {
           return;
       }
     };
-    // Tool-side generateText() results do not consistently echo mux.costsIncluded in
-    // providerMetadata, so remember the resolved billing mode from model creation and
-    // re-stamp it before converting usage into display/session costs.
-    const toolModelCostsIncludedByModelString = new Map<string, boolean>();
     // Creation-time pricing identity for tool-created models (advisor and intuition): a
     // Coder catalog refresh can remove/retag the instance while the tool
     // request runs, and resolving the identity from live config at
@@ -1905,7 +1899,6 @@ export class TurnRequestBuilder {
       if (!toolModel.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
       }
-      toolModelCostsIncludedByModelString.set(toolModelString, modelCostsIncluded(toolModel.data));
       // Same effective-route rule as createModelWithPinnedMetadata:
       // a coder: selection whose gateway is unavailable falls away
       // to a direct provider inside createModel, and identity or
@@ -2088,10 +2081,7 @@ export class TurnRequestBuilder {
           assert(eventModel.length > 0, "tool model usage event model must be non-empty");
           // Persist tool-side model usage under its own model bucket so session costs keep
           // advisor/system-side pricing separate from the parent chat model.
-          const providerMetadata = markProviderMetadataCostsIncluded(
-            event.providerMetadata,
-            toolModelCostsIncludedByModelString.get(eventModel)
-          );
+          const providerMetadata = event.providerMetadata;
           // Prefer the creation-time identity captured when the tool model
           // was created; models not created through the tool runtime fall
           // back to live resolution (their identity is not coder-scoped).
@@ -2831,7 +2821,6 @@ export class TurnRequestBuilder {
                   ...(nextRequest.routeProvider != null
                     ? { routeProvider: nextRequest.routeProvider }
                     : {}),
-                  costsIncluded: modelCostsIncluded(nextRequest.model) ? true : undefined,
                   systemMessageTokens: nextRequest.systemMessageTokens,
                 },
               });
@@ -2902,7 +2891,6 @@ export class TurnRequestBuilder {
         ...(routeProvider != null ? { routeProvider } : {}),
         ...(muxMetadata !== undefined ? { muxMetadata } : {}),
         ...(acpPromptId != null ? { acpPromptId } : {}),
-        ...(modelCostsIncluded(modelResult.data.model) ? { costsIncluded: true } : {}),
       },
       providerOptions: streamProviderOptions,
       maxOutputTokens,

@@ -212,9 +212,8 @@ export class SessionUsageService {
     providerMetadata?: Record<string, unknown>,
     options?: {
       /**
-       * Subscription-covered routing (e.g. Codex OAuth). Stamps
-       * providerMetadata.mux.costsIncluded so createDisplayUsage prices the
-       * tokens at $0, mirroring the StreamManager path.
+       * Preserve legacy subscription-covered usage at $0.
+       * New OAuth requests use API-equivalent estimates instead.
        */
       costsIncluded?: boolean;
       /**

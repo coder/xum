@@ -2,7 +2,6 @@ import { streamText, tool } from "ai";
 import type { LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { Duration, Effect } from "effect";
-import { modelCostsIncluded } from "./providerModelFactory";
 import type { AIService } from "./aiService";
 import { log } from "./log";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
@@ -125,14 +124,12 @@ export interface GenerateWorkspaceStatusOptions extends BuildWorkspaceStatusProm
   /**
    * Best-effort cost telemetry: status generation bypasses StreamManager,
    * so the caller records the successful candidate's usage into
-   * session-usage.json. costsIncluded reflects subscription-covered routing
-   * (Codex OAuth) so those tokens are priced at $0.
+   * session-usage.json.
    */
   recordUsage?: (
     modelString: string,
     usage: LanguageModelV2Usage,
     options: {
-      costsIncluded: boolean;
       /**
        * Step-accumulated provider metadata. Anthropic reports billed
        * cache-write tokens only here (cacheCreationInputTokens), not in
@@ -317,7 +314,6 @@ function attemptCandidate(
         yield* Effect.tryPromise({
           try: async () =>
             options.recordUsage?.(modelString, usage, {
-              costsIncluded: modelCostsIncluded(created.model),
               providerMetadata: accumulateStepsProviderMetadata(steps),
               metadataModel: created.metadataModel,
             }),

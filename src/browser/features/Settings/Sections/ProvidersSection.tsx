@@ -2818,8 +2818,9 @@ export function ProvidersSection() {
                                 </ToggleGroup>
 
                                 <p className="text-muted text-xs">
-                                  ChatGPT OAuth uses subscription billing (costs included). API key
-                                  uses OpenAI platform billing.
+                                  ChatGPT OAuth costs use API-equivalent estimates. Your plan may
+                                  include usage or charge credits. API keys use OpenAI platform
+                                  billing.
                                 </p>
 
                                 {!codexOauthDefaultAuthIsEditable && (
