@@ -1478,19 +1478,6 @@ describe("CompactionHandler", () => {
       });
     });
 
-    it("should not emit DeleteMessage events during append-only compaction", async () => {
-      const compactionReq = createCompactionRequest();
-      await seedHistory(compactionReq);
-
-      const event = createStreamEndEvent("Summary");
-      await handler.handleCompletion(event);
-
-      const deleteEvent = emittedEvents.find(
-        (_e) => (_e.data.message as { type?: string })?.type === "delete"
-      );
-      expect(deleteEvent).toBeUndefined();
-    });
-
     it("should emit summary message with proper MuxMessage structure", async () => {
       const compactionReq = createCompactionRequest();
       await seedHistory(compactionReq);

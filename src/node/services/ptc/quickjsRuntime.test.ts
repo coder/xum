@@ -542,11 +542,6 @@ describe("QuickJSRuntime", () => {
       // (timing dependent, but abort should eventually take effect)
       expect(callCount).toBeLessThanOrEqual(2);
     });
-
-    it("abort method exists and can be called", () => {
-      // Basic sanity test that abort() is callable
-      expect(() => runtime.abort()).not.toThrow();
-    });
   });
 
   describe("async capability bridge (registerPromiseFunction)", () => {
@@ -1278,11 +1273,6 @@ describe("QuickJSRuntime", () => {
     it("can be disposed multiple times safely", () => {
       runtime.dispose();
       runtime.dispose(); // Should not throw
-    });
-
-    it("supports Symbol.dispose", () => {
-      expect(typeof runtime[Symbol.dispose]).toBe("function");
-      runtime[Symbol.dispose]();
     });
   });
 

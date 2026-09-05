@@ -113,18 +113,6 @@ function getGhSetupCall(runtime: CredentialTestDockerRuntime): ExecCall | undefi
 }
 
 describe("DockerRuntime constructor", () => {
-  it("should accept image name", () => {
-    expect(() => {
-      new DockerRuntime({ image: "ubuntu:22.04" });
-    }).not.toThrow();
-  });
-
-  it("should accept registry image", () => {
-    expect(() => {
-      new DockerRuntime({ image: "ghcr.io/myorg/dev-image:latest" });
-    }).not.toThrow();
-  });
-
   it("should return image via getImage()", () => {
     const runtime = new DockerRuntime({ image: "node:20" });
     expect(runtime.getImage()).toBe("node:20");

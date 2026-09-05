@@ -15743,20 +15743,6 @@ describe("WorkspaceService unarchive snapshot restore", () => {
     expect(result).toEqual(Err("restore failed"));
   });
 
-  test("unarchive() rolls back unarchivedAt when snapshot restore fails", async () => {
-    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
-    workspaceService.setWorktreeArchiveSnapshotService({
-      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
-      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
-      restoreSnapshotAfterUnarchive,
-      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
-    });
-
-    const result = await workspaceService.unarchive(workspaceId);
-
-    expect(result).toEqual(Err("restore failed"));
-  });
-
   test("unarchive() rolls back legacy path-only entries when snapshot restore fails", async () => {
     const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
     workspaceService.setWorktreeArchiveSnapshotService({

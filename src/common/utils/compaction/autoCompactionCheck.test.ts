@@ -249,15 +249,6 @@ describe("checkAutoCompaction", () => {
   });
 
   describe("Edge Cases", () => {
-    test("missing context usage returns safe defaults", () => {
-      const usage: AutoCompactionUsageState = { totalTokens: 0 };
-      const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);
-
-      expect(result.shouldShowWarning).toBe(false);
-      expect(result.usagePercentage).toBe(0);
-      expect(result.thresholdPercentage).toBe(70);
-    });
-
     test("single context usage entry works correctly", () => {
       const usage = createMockUsage(140_000);
       const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);

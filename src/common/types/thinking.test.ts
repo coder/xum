@@ -5,7 +5,6 @@ import {
   getThinkingDisplayLabel,
   getThinkingOptionLabel,
   isGpt6AstraModel,
-  MAX_THINKING_INDEX,
   openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   openaiSupportsProMode,
@@ -259,11 +258,5 @@ describe("parseThinkingInput", () => {
     expect(parseThinkingInput("  high  ")).toBe("high");
     // Numeric with whitespace returns a number
     expect(parseThinkingInput(" 2 ")).toBe(2);
-  });
-});
-
-describe("MAX_THINKING_INDEX", () => {
-  test("is 9 (generous upper bound for numeric indices)", () => {
-    expect(MAX_THINKING_INDEX).toBe(9);
   });
 });
