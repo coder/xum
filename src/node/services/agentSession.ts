@@ -4,7 +4,6 @@ import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPol
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  CONTEXT_NOTES_MEMORY_PATH,
   OUTPUT_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
@@ -4817,7 +4816,10 @@ export class AgentSession {
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover");
-    if (shouldRollover && (isSessionHistoryExplicitlyDisabled(options.toolPolicy) || this.pendingRolloverMissingHistory)) {
+    if (
+      shouldRollover &&
+      (isSessionHistoryExplicitlyDisabled(options.toolPolicy) || this.pendingRolloverMissingHistory)
+    ) {
       return Err({
         type: "context_budget_blocked",
         message:
@@ -5956,6 +5958,12 @@ export class AgentSession {
       );
     }
 
+    if (this.isTokenBudgetActive(options)) {
+      this.contextBudgetWarningClaimed ||= historyResult.data.some(
+        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+      );
+    }
+
     // A crash between snapshot and user-row appends can leave orphaned prompt
     // expansions on disk; exclude them from every provider request.
     let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
@@ -6678,7 +6686,7 @@ export class AgentSession {
       );
       if (rolled.success && rolled.data) {
         this.setTurnPhase(TurnPhase.PREPARING);
-        await this.streamWithHistory(
+        const retry = await this.streamWithHistory(
           model,
           context.options,
           context.openaiTruncationModeOverride,
@@ -6690,7 +6698,10 @@ export class AgentSession {
           undefined,
           true
         );
-        this.resolveStreamErrorRecoveryDecision(data.messageId, "retry-started");
+        this.resolveStreamErrorRecoveryDecision(
+          data.messageId,
+          retry.success ? "retry-started" : "terminal"
+        );
         return;
       }
       if (!rolled.success)
@@ -6834,30 +6845,16 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
-        if (payload.toolName === "memory") {
-          const part = this.streamManager
-            .getStreamInfo(this.workspaceId)
-            ?.parts.find(
-              (part) => part.type === "dynamic-tool" && part.toolCallId === payload.toolCallId
-            );
-          if (
-            part?.type === "dynamic-tool" &&
-            part.state === "output-available" &&
-            typeof part.input === "object" &&
-            part.input != null &&
-            typeof part.output === "object" &&
-            part.output != null &&
-            "success" in part.output &&
-            part.output.success === true
-          ) {
-            const input = part.input as Record<string, unknown>;
-            if (
-              input.command !== "view" &&
-              [input.path, input.old_path, input.new_path].includes(CONTEXT_NOTES_MEMORY_PATH)
-            ) {
-              this.memoryContextByModelString.clear();
-            }
-          }
+        // Includes nested PTC calls and directory/rename mutations that affect notes.
+        // Reads can also change hot-set ranking; rebuild at the next request, not mid-step.
+        if (
+          payload.toolName === "memory" &&
+          typeof payload.result === "object" &&
+          payload.result != null &&
+          "success" in payload.result &&
+          payload.result.success === true
+        ) {
+          this.memoryContextByModelString.clear();
         }
         this.activeToolCallIds.delete(payload.toolCallId);
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
