@@ -45,7 +45,6 @@ import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
-import { modelCostsIncluded } from "./providerModelFactory";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createBranchSummaryMessageId } from "./utils/messageIds";
 
@@ -349,7 +348,6 @@ async function generateAbandonedBranchSummaryText(input: {
     modelString: string,
     usage: LanguageModelV2Usage,
     options: {
-      costsIncluded: boolean;
       providerMetadata?: Record<string, unknown>;
       metadataModel: string;
     }
@@ -565,7 +563,6 @@ async function generateAbandonedBranchSummaryText(input: {
                 input.workspaceId,
                 input
                   .recordUsage(modelString, usage, {
-                    costsIncluded: modelCostsIncluded(modelResult.data.model),
                     ...(providerMetadata !== undefined ? { providerMetadata } : {}),
                     metadataModel: modelResult.data.metadataModel,
                   })
@@ -753,7 +750,6 @@ export async function maybeAppendAbandonedBranchSummary(
               modelString: string,
               usage: LanguageModelV2Usage,
               options: {
-                costsIncluded: boolean;
                 providerMetadata?: Record<string, unknown>;
                 metadataModel: string;
               }
@@ -768,7 +764,6 @@ export async function maybeAppendAbandonedBranchSummary(
                 usage,
                 options.providerMetadata,
                 {
-                  costsIncluded: options.costsIncluded,
                   analyticsSource: "branch_summary",
                   metadataModel: options.metadataModel,
                 }

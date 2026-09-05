@@ -77,7 +77,6 @@ import {
 } from "@/node/services/memoryConsolidationService";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
-import { modelCostsIncluded } from "@/node/services/providerModelFactory";
 import {
   listRefinements,
   type RefinementEvent,
@@ -1061,7 +1060,6 @@ export class RefineService {
             usage,
             providerMetadata,
             {
-              costsIncluded: modelCostsIncluded(modelResult.data.model),
               analyticsSource: "refine",
               metadataModel: modelResult.data.metadataModel,
             }

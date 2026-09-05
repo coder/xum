@@ -37,7 +37,6 @@ import type { ContinuousCompactionContext } from "./continuousCompactor";
 import { looksLikeRawJsonObject } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
-import { modelCostsIncluded } from "./providerModelFactory";
 import type { SessionUsageService } from "./sessionUsageService";
 
 /** A headless compact-agent call: no workspace stream or compaction request row. */
@@ -208,7 +207,6 @@ export async function summarizeContinuousCompaction(args: {
       providerMetadata,
       {
         metadataModel: created.data.metadataModel,
-        costsIncluded: modelCostsIncluded(created.data.model),
         analyticsSource: "continuous-compaction",
       }
     );

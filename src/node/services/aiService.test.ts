@@ -8,12 +8,13 @@ import * as path from "node:path";
 
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
 import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
   buildAppAttributionHeaders,
-  type ProviderModelFactory,
+  ProviderModelFactory,
 } from "./providerModelFactory";
 import { HistoryService } from "./historyService";
 import { InitStateManager } from "./initStateManager";
@@ -2120,6 +2121,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  it.each([
+    { auth: "oauth", model: KNOWN_MODELS.GPT_53_CODEX.id },
+    { auth: "oauth", model: "openai:team-codex" },
+    { auth: "apiKey", model: KNOWN_MODELS.GPT_53_CODEX.id },
+  ] as const)("keeps $auth chat usage priced for $model", async ({ auth, model }) => {
+    using xumHome = new DisposableTempDir("ai-service-codex-costs");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-codex-costs";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const providersConfig = {
+      openai: {
+        ...(auth === "oauth" ? { codexOauth: TEST_CODEX_OAUTH } : { apiKey: "sk-test" }),
+        models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+      },
+    };
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig(providersConfig);
+
+    // Use real model creation so authentication participates in the pricing regression.
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: model,
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const stream = harness.startStreamCalls[0];
+    if (!stream) throw new Error("Expected stream options");
+    const initialMetadata = initialMetadataFromStartStreamCall(stream);
+    expect(initialMetadata.costsIncluded).toBeUndefined();
+
+    const usage = createDisplayUsage(
+      { inputTokens: 1500, cachedInputTokens: 500, outputTokens: 450, reasoningTokens: 150 },
+      stream.modelString,
+      { mux: initialMetadata },
+      resolveModelForMetadata(stream.modelString, stream.providersConfigSnapshot ?? null)
+    );
+    expect(usage).toBeDefined();
+    if (!usage) throw new Error("Expected display usage");
+    expect(usage.costsIncluded).toBeUndefined();
+    expect(usage.input.cost_usd).toBeGreaterThan(0);
+    expect(usage.cached.cost_usd).toBeGreaterThan(0);
+    expect(usage.output.cost_usd).toBeGreaterThan(0);
+    expect(usage.reasoning.cost_usd).toBeGreaterThan(0);
+  });
+
   it("passes the resolved routeProvider into initial stream metadata", async () => {
     using xumHome = new DisposableTempDir("ai-service-route-provider-present");
     const projectPath = path.join(xumHome.path, "project");
@@ -2505,13 +2558,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   });
 
   it.each(["advisor", "intuition"] as const)(
-    "zeros %s tool usage costs for costs-included models before persisting",
+    "records API-equivalent costs for %s tool usage through Codex OAuth",
     async (toolName) => {
-      using xumHome = new DisposableTempDir("ai-service-tool-model-usage-costs-included");
+      using xumHome = new DisposableTempDir("ai-service-tool-model-usage-oauth");
       const projectPath = path.join(xumHome.path, "project");
       await fs.mkdir(projectPath, { recursive: true });
 
-      const workspaceId = "workspace-tool-model-usage-costs-included";
+      const workspaceId = "workspace-tool-model-usage-oauth";
       const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
       const recordUsage = mock(() => Promise.resolve(undefined));
       const getSessionUsage = mock(() => Promise.resolve(undefined));
@@ -2582,7 +2635,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         agentInitiated: true,
         workspaceId,
       });
-      // A live config refresh must not change the already-created model's billing mode.
+      // Cost estimates must remain available after an authentication change.
       new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
         openai: { apiKey: "new-direct-key" },
       });
@@ -2610,18 +2663,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         },
         timestamp: Date.now(),
       };
-      const expectedDisplayUsage = createDisplayUsage(event.usage, event.model, {
-        ...(event.providerMetadata ?? {}),
-        mux: { costsIncluded: true },
-      });
+      const expectedDisplayUsage = createDisplayUsage(
+        event.usage,
+        event.model,
+        event.providerMetadata
+      );
       expect(expectedDisplayUsage).toBeDefined();
       if (!expectedDisplayUsage) {
         throw new Error("Expected tool usage event to produce display usage");
       }
-      expect(expectedDisplayUsage.costsIncluded).toBe(true);
-      expect(expectedDisplayUsage.input.cost_usd).toBe(0);
-      expect(expectedDisplayUsage.output.cost_usd).toBe(0);
-      expect(expectedDisplayUsage.reasoning.cost_usd).toBe(0);
+      expect(expectedDisplayUsage.costsIncluded).toBeUndefined();
+      expect(expectedDisplayUsage.input.cost_usd).toBeGreaterThan(0);
+      expect(expectedDisplayUsage.output.cost_usd).toBeGreaterThan(0);
+      expect(expectedDisplayUsage.reasoning.cost_usd).toBeGreaterThan(0);
 
       reportModelUsage(event);
       await Promise.resolve();
