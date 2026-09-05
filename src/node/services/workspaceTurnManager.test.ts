@@ -4439,11 +4439,13 @@ describe("WorkspaceTurnManager", () => {
       settleWorkspaceTurn: (params: {
         record: WorkspaceTurnTaskHandleRecord;
         next: WorkspaceTurnTaskHandleRecord;
+        cause: { kind: "user-stream-abort" };
         waiterSettlement: { status: "error"; error: Error };
       }) => Promise<void>;
     };
 
     await internal.settleWorkspaceTurn({
+      cause: { kind: "user-stream-abort" },
       record: staleSnapshot,
       next: {
         ...staleSnapshot,
