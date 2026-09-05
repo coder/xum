@@ -5,6 +5,14 @@ import {
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
+/** IDs must fit tool inputs and their JSON/cursor envelopes without lossy aliases. */
+export function isHistoryIdentifierRepresentable(id: string): boolean {
+  return (
+    id.length <= SESSION_HISTORY_MAX_ID_CHARS &&
+    Buffer.byteLength(JSON.stringify(id)) <= SESSION_HISTORY_MAX_ID_CHARS
+  );
+}
+
 const offset = z.number().int().nonnegative().safe();
 export const HistoryArtifactSchema = z.enum(["chat", "archive"]);
 export type HistoryArtifact = z.infer<typeof HistoryArtifactSchema>;
@@ -31,7 +39,8 @@ export const HistoryScanStateSchema = z
     possibleReset: z.boolean(),
     archiveWatermark: z.number().int().min(-1).safe(),
     anchorSequence: offset.nullable(),
-    windowId: z.string().max(SESSION_HISTORY_MAX_ID_CHARS),
+    // null means an unaddressable persisted window, not an alias for the root.
+    windowId: z.string().refine(isHistoryIdentifierRepresentable).nullable(),
     windowPending: z.boolean(),
     appendCheck: z
       .object({

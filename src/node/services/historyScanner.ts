@@ -13,7 +13,12 @@ import type { MuxMessage } from "@/common/types/message";
 import { getContextWindowId, isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
-import type { HistoryArtifact, HistoryScanState, HistorySnapshot } from "./historyCursor";
+import {
+  isHistoryIdentifierRepresentable,
+  type HistoryArtifact,
+  type HistoryScanState,
+  type HistorySnapshot,
+} from "./historyCursor";
 
 export interface BoundedHistoryRow {
   message: MuxMessage;
@@ -45,6 +50,12 @@ export async function scanHistoryFilesBounded(
     oversizedLines: 0,
     malformedLines: 0,
     privacyFloorReached: false,
+  };
+  const boundedWindowId = (message: MuxMessage): string | null => {
+    const id = getContextWindowId(message);
+    if (isHistoryIdentifierRepresentable(id)) return id;
+    result.malformedLines++;
+    return null;
   };
   const handles = new Map<HistoryArtifact, fs.FileHandle>();
   try {
@@ -331,7 +342,7 @@ export async function scanHistoryFilesBounded(
       const artifact = state.artifact;
       const reverse = state.phase === "floor";
       const end = state.snapshots[artifact].endOffsetSnapshot;
-      let floor: { offset: number; windowId: string } | undefined;
+      let floor: { offset: number; windowId: string | null } | undefined;
       const completed = await scan(
         artifact,
         state,
@@ -346,19 +357,28 @@ export async function scanHistoryFilesBounded(
             if ((!message && possibleReset) || (message && isManualHistoryReset(message))) {
               // Any unreadable row might contain a reset, even below the size cap.
               // Fail closed rather than disclosing history before a malformed reset.
-              floor = { offset: finish, windowId: message ? getContextWindowId(message) : "w:0" };
+              floor = { offset: finish, windowId: message ? boundedWindowId(message) : "w:0" };
               return false;
             }
             return true;
           }
           if (!message) return true;
           const sequence = message.metadata?.historySequence;
-          if (artifact === "chat" && sequence != null && sequence <= state.archiveWatermark)
+          const anchorSequence =
+            Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
+          if (
+            artifact === "chat" &&
+            anchorSequence != null &&
+            anchorSequence <= state.archiveWatermark
+          )
             return true;
           const windowId = isDurableContextBoundaryMarker(message)
-            ? getContextWindowId(message)
+            ? boundedWindowId(message)
             : state.windowId;
+          // Consume unaddressable windows without persisting oversized IDs in
+          // cursors or silently assigning their rows to a different window.
           if (
+            windowId !== null &&
             !options.visit({
               message,
               windowId,
@@ -368,7 +388,7 @@ export async function scanHistoryFilesBounded(
             return false;
           state.windowId = windowId;
           state.windowPending = false;
-          state.anchorSequence = Number.isSafeInteger(sequence) ? sequence! : null;
+          state.anchorSequence = anchorSequence;
           return true;
         }
       );

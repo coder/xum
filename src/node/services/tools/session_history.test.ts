@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import {
   SESSION_HISTORY_MAX_RESULT_BYTES,
+  SESSION_HISTORY_MAX_ID_CHARS,
+  SESSION_HISTORY_MAX_CURSOR_CHARS,
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_SCAN_ROWS,
 } from "@/common/constants/contextBudget";
@@ -43,6 +45,15 @@ async function pages(input: SessionHistoryArgs) {
     expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
       SESSION_HISTORY_MAX_RESULT_BYTES
     );
+    for (const item of result.items ?? []) {
+      expect(item.itemId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+      expect(item.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+    }
+    for (const window of result.windows ?? []) {
+      expect(window.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+    }
+    if (result.nextCursor)
+      expect(result.nextCursor.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_CURSOR_CHARS);
     results.push(result);
     cursor = result.nextCursor;
     expect(results.length).toBeLessThan(40);
@@ -82,6 +93,143 @@ afterEach(async () => {
 });
 
 describe("session_history real disk recovery", () => {
+  for (const scenario of [
+    { name: "oversized legacy ID", id: "x".repeat(20 * 1024), sequence: undefined },
+    {
+      name: "oversized ID with an invalid sequence",
+      id: "x".repeat(20 * 1024),
+      sequence: Number.MAX_SAFE_INTEGER + 1,
+    },
+    { name: "JSON-expanded control-character ID", id: "\u0000".repeat(1000), sequence: undefined },
+  ]) {
+    test(`search consumes ${scenario.name} without aliasing or blocking valid older items`, async () => {
+      const addressablePrefix = scenario.id.slice(0, 100);
+      await fs.appendFile(
+        chatPath,
+        [
+          createMuxMessage(scenario.id, "assistant", "match unaddressable", {
+            historySequence: scenario.sequence,
+          }),
+          createMuxMessage(addressablePrefix, "assistant", "match addressable prefix"),
+          createMuxMessage("later", "assistant", "match later"),
+        ]
+          .map((message) => JSON.stringify(message))
+          .join("\n") + "\n"
+      );
+      const result = (await pages({ action: "search", query: "match", limit: 1 })).flatMap(
+        (page) => page.items ?? []
+      );
+      expect(result.map((item) => item.text)).toEqual(["match addressable prefix", "match later"]);
+      expect(
+        (await pages({ action: "read_item", item_id: `m:${addressablePrefix}` }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["match addressable prefix"]);
+      expect(
+        (await pages({ action: "read_item", item_id: "0" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["opening facts"]);
+    });
+  }
+
+  test.each([
+    { manualReset: false, id: "b".repeat(20 * 1024) },
+    { manualReset: true, id: "b".repeat(20 * 1024) },
+    { manualReset: false, id: "\u0000".repeat(1000) },
+    { manualReset: true, id: "\u0000".repeat(1000) },
+  ])(
+    "unaddressable legacy window IDs allow cursor progress without crossing a reset",
+    async ({ manualReset, id }) => {
+      const boundary = createMuxMessage(
+        id,
+        "assistant",
+        "",
+        manualReset
+          ? { contextBoundaryKind: "reset", synthetic: true }
+          : { compacted: true, compactionBoundary: true, compactionEpoch: 1 }
+      );
+      const rows = [
+        boundary,
+        ...Array.from({ length: 650 }, (_, i) =>
+          createMuxMessage(
+            `unaddressable-window-${i}`,
+            "assistant",
+            "facts in unaddressable window"
+          )
+        ),
+        createMuxMessage("addressable-boundary", "assistant", "", rollover),
+        createMuxMessage("public", "assistant", "public facts"),
+      ];
+      await fs.appendFile(
+        chatPath,
+        rows.map((message) => JSON.stringify(message)).join("\n") + "\n"
+      );
+      const windows = await pages({ action: "list_windows", limit: 1 });
+      expect(windows.length).toBeGreaterThan(2);
+      expect(
+        windows.flatMap((page) => page.windows ?? []).map((window) => window.windowId)
+      ).toEqual(manualReset ? ["w:m:addressable-boundary"] : ["w:0", "w:m:addressable-boundary"]);
+      const matches = await pages({ action: "search", query: "facts", limit: 1 });
+      expect(matches.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual(
+        manualReset ? ["public facts"] : ["opening facts", "public facts"]
+      );
+      const older = await pages({ action: "read_item", item_id: "0" });
+      if (manualReset) {
+        expect(older.at(-1)?.error).toBe("item_not_found");
+      } else {
+        expect(older.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+          "opening facts",
+        ]);
+      }
+    }
+  );
+
+  test("negative persisted sequences use legacy IDs without invalidating the next cursor", async () => {
+    await fs.appendFile(
+      chatPath,
+      [
+        createMuxMessage("negative-sequence", "assistant", "match negative", {
+          historySequence: -1,
+        }),
+        createMuxMessage("after-negative", "assistant", "match after"),
+      ]
+        .map((message) => JSON.stringify(message))
+        .join("\n") + "\n"
+    );
+    expect(
+      (await pages({ action: "search", query: "match", limit: 1 }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.itemId)
+    ).toEqual(["m:negative-sequence", "m:after-negative"]);
+  });
+
+  test("oversized persisted IDs remain addressable through safe sequences", async () => {
+    const id = "s".repeat(20 * 1024);
+    await fs.appendFile(
+      chatPath,
+      [
+        createMuxMessage(id, "assistant", "", {
+          compacted: true,
+          compactionBoundary: true,
+          compactionEpoch: 1,
+          historySequence: 42,
+        }),
+        createMuxMessage(id + "-item", "assistant", "sequenced facts", { historySequence: 43 }),
+      ]
+        .map((message) => JSON.stringify(message))
+        .join("\n") + "\n"
+    );
+    expect(
+      (await pages({ action: "list_windows", limit: 1 }))
+        .flatMap((page) => page.windows ?? [])
+        .map((window) => window.windowId)
+    ).toEqual(["w:0", "w:42"]);
+    expect(
+      (await pages({ action: "read_item", item_id: "43" })).flatMap((page) => page.items ?? [])
+    ).toEqual([{ itemId: "43", windowId: "w:42", role: "assistant", text: "sequenced facts" }]);
+  });
+
   test("scanner fails closed when a reset races a page or a truncate is unresolved", async () => {
     expect(
       await fixture.historyService
