@@ -2427,6 +2427,7 @@ export class TurnRequestBuilder {
             tools: attemptTools,
             modelString: seed.rawModelString,
             routeProvider: seed.routeProvider,
+            openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             providerForMessages: seed.wireProviderName,
             effectiveThinkingLevel: level,
             effectiveAgentId,

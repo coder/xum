@@ -24,6 +24,7 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { TaskSettings } from "@/common/types/tasks";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
@@ -108,6 +109,8 @@ export interface AssemblePromptPayloadOptions {
   tools?: Record<string, Tool>;
   modelString: string;
   routeProvider?: string;
+  /** Effective request wire format; Chat Completions keeps API-key auth over Codex OAuth. */
+  openaiWireFormat?: OpenAIWireFormat | null;
   providerForMessages: string;
   effectiveThinkingLevel: ThinkingLevel;
   effectiveAgentId: string;
@@ -159,7 +162,8 @@ export async function assemblePromptPayload(
         options.systemMessage,
         options.modelString,
         options.routeProvider,
-        options.providersConfig ?? null
+        options.providersConfig ?? null,
+        { openaiWireFormat: options.openaiWireFormat }
       ) ?? options.systemMessage;
   }
 

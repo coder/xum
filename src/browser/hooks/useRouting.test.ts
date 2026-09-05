@@ -4,8 +4,9 @@ import { GlobalWindow } from "happy-dom";
 import React from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { PolicyGetResponse, ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
@@ -19,6 +20,12 @@ let configGetConfig: () => Promise<{
   routeOverrides: Record<string, string>;
 }>;
 let updateRoutePreferencesImpl: () => Promise<undefined>;
+const POLICY_DISABLED: PolicyGetResponse = {
+  source: "none",
+  status: { state: "disabled" },
+  policy: null,
+};
+let policyResponse: PolicyGetResponse = POLICY_DISABLED;
 
 async function* emptyStream() {
   await Promise.resolve();
@@ -38,16 +45,22 @@ function createStubApiClient(): APIClient {
       onConfigChanged: () => Promise.resolve(emptyStream()),
       updateRoutePreferences: () => updateRoutePreferencesImpl(),
     },
+    policy: {
+      get: () => Promise.resolve(policyResponse),
+      onChanged: () => Promise.resolve(emptyStream()),
+    },
   } as unknown as APIClient;
 }
 
 const stubClient = createStubApiClient();
 
+// useRouting reads the policy (like AppLoader provides in the real app), so the
+// hook test tree needs a PolicyProvider under the API provider.
 const wrapper: React.FC<{ children: React.ReactNode }> = (props) =>
   React.createElement(
     APIProvider,
     { client: stubClient } as React.ComponentProps<typeof APIProvider>,
-    props.children
+    React.createElement(PolicyProvider, null, props.children)
   );
 
 describe("useRouting", () => {
@@ -66,6 +79,7 @@ describe("useRouting", () => {
     routeOverrides = {};
     configGetConfig = () => Promise.resolve({ routePriority, routeOverrides });
     updateRoutePreferencesImpl = () => Promise.resolve(undefined);
+    policyResponse = POLICY_DISABLED;
   });
 
   afterEach(() => {
@@ -110,6 +124,48 @@ describe("useRouting", () => {
       route: "direct",
       isAuto: true,
       displayName: "Direct",
+    });
+  });
+
+  test("an enforced policy that blocks the gateway model removes that route", async () => {
+    providersConfig = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    routePriority = ["mux-gateway", "direct"];
+    // The policy allows the canonical OpenAI models but lets the gateway serve
+    // only Sol. The backend rejects the gateway for GPT Pro at send time, so the
+    // UI must not offer or resolve that route either.
+    policyResponse = {
+      source: "env",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          { id: "openai", allowedModels: null },
+          { id: "mux-gateway", allowedModels: [`openai/${KNOWN_MODELS.GPT.providerModelId}`] },
+        ],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    };
+    getProvidersConfigStore().setClient(stubClient);
+    getAppConfigStore().setClient(stubClient);
+
+    const { result } = renderHook(() => useRouting(), { wrapper });
+
+    const viaGateway = (modelId: string) =>
+      result.current.availableRoutes(modelId).some((route) => route.route === "mux-gateway");
+    await waitFor(() => {
+      expect(viaGateway(KNOWN_MODELS.GPT_PRO.id)).toBe(false);
+      expect(result.current.resolveRoute(KNOWN_MODELS.GPT_PRO.id).route).toBe("direct");
+      expect(viaGateway(KNOWN_MODELS.GPT.id)).toBe(true);
+      expect(result.current.resolveRoute(KNOWN_MODELS.GPT.id).route).toBe("mux-gateway");
     });
   });
 

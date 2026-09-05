@@ -3,7 +3,10 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGpt56FamilyModel } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
+import {
+  wouldRouteOpenAIThroughCodexOauth,
+  type CodexOauthRoutingOptions,
+} from "@/common/utils/providers/codexOauthRouting";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import {
   customProviderWireOrigin,
@@ -256,7 +259,8 @@ function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
 export function openaiExplicitPromptCachingAvailable(
   modelString: string,
   routeProvider: string | undefined,
-  providersConfig: ProvidersConfigMap | null
+  providersConfig: ProvidersConfigMap | null,
+  options?: CodexOauthRoutingOptions
 ): boolean {
   if (routeProvider !== "openai") {
     return false;
@@ -293,7 +297,7 @@ export function openaiExplicitPromptCachingAvailable(
     return false;
   }
 
-  if (wouldRouteOpenAIThroughCodexOauth(normalized, providersConfig)) {
+  if (wouldRouteOpenAIThroughCodexOauth(normalized, providersConfig, options)) {
     return false;
   }
 
@@ -323,11 +327,12 @@ export function createOpenAICachedSystemMessage(
   systemContent: string,
   modelString: string,
   routeProvider: string | undefined,
-  providersConfig: ProvidersConfigMap | null
+  providersConfig: ProvidersConfigMap | null,
+  options?: CodexOauthRoutingOptions
 ): SystemModelMessage | null {
   if (
     !systemContent ||
-    !openaiExplicitPromptCachingAvailable(modelString, routeProvider, providersConfig)
+    !openaiExplicitPromptCachingAvailable(modelString, routeProvider, providersConfig, options)
   ) {
     return null;
   }

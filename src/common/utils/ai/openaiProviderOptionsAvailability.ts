@@ -3,6 +3,7 @@
  * forwarded by gateway or Codex OAuth routes.
  */
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
@@ -12,6 +13,8 @@ export interface OpenAIDirectProviderOptionsAvailability {
   resolvedRouteProvider?: string | null;
   /** Providers config for explicit gateway and Codex OAuth route detection. */
   providersConfig?: ProvidersConfigMap | null;
+  /** Request-level OpenAI wire format; the stored config value wins when set. */
+  openaiWireFormat?: OpenAIWireFormat | null;
 }
 
 export function openaiDirectProviderOptionsAvailable(
@@ -50,6 +53,8 @@ export function openaiDirectProviderOptionsAvailable(
   // API-only provider options, so toggles for those options must fail closed.
   return !(
     options?.providersConfig != null &&
-    wouldRouteOpenAIThroughCodexOauth(normalized, options.providersConfig)
+    wouldRouteOpenAIThroughCodexOauth(normalized, options.providersConfig, {
+      openaiWireFormat: options.openaiWireFormat,
+    })
   );
 }

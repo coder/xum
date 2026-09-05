@@ -3792,6 +3792,7 @@ export class AgentSession {
           providersConfigForCompaction
         ),
         providersConfig: providersConfigForCompaction,
+        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
       });
 
       const continuousContext = this.getContinuousCompactionContext(
@@ -6453,6 +6454,7 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
+        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
       });
 
       if (shouldInterruptForCompaction) {
