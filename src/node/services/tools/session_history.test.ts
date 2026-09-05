@@ -774,6 +774,135 @@ describe("session_history real disk recovery", () => {
     ).toEqual(["opening facts"]);
   });
 
+  const fragmentedResetMarkers = [
+    { name: "after the key", marker: '"contextBoundaryKind"\n:"reset"' },
+    { name: "after the colon", marker: '"contextBoundaryKind":\n"reset"' },
+    { name: "at both lexical gaps", marker: '"contextBoundaryKind"\r\n \t:\r\n "reset"' },
+    {
+      name: "with escaped tokens",
+      marker: `"${unicodeEscapes("contextBoundaryKind")}"\n:\n"${unicodeEscapes("reset")}"`,
+    },
+    {
+      name: "across a row-budget page",
+      marker:
+        '"contextBoundaryKind"\n' + " \t\n".repeat(SESSION_HISTORY_MAX_SCAN_ROWS + 3) + ':"reset"',
+    },
+    {
+      name: "across a byte-budget page",
+      marker:
+        `"${unicodeEscapes("contextBoundaryKind")}"\n` +
+        " ".repeat(SESSION_HISTORY_MAX_SCAN_BYTES + 256) +
+        `:\n"${unicodeEscapes("reset")}"`,
+    },
+  ];
+  for (const fragment of fragmentedResetMarkers) {
+    test(`reset fragmented ${fragment.name} blocks initial and resumed recovery`, async () => {
+      const hidden = await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      await fs.appendFile(
+        chatPath,
+        `{"id":"fragmented-reset","role":"assistant","parts":[],"metadata":{${fragment.marker}}}\n` +
+          JSON.stringify(createMuxMessage("public-after-fragments", "assistant", "public facts")) +
+          "\n"
+      );
+      let cursor = first.nextCursor;
+      let result: SessionHistoryResult;
+      let pageCount = 0;
+      do {
+        result = await call({ action: "search", query: "facts", cursor });
+        if (result.success) {
+          expect(result.items).toEqual([]);
+          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+        }
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
+          SESSION_HISTORY_MAX_RESULT_BYTES
+        );
+        cursor = result.nextCursor;
+        expect(++pageCount).toBeLessThan(12);
+      } while (cursor);
+      expect(result.error).toBe("stale_cursor");
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect(
+        (
+          await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })
+        ).at(-1)?.error
+      ).toBe("item_not_found");
+    });
+  }
+
+  test("valid-row isolation does not discard a raw reset hidden by duplicate keys", async () => {
+    await fs.appendFile(
+      chatPath,
+      '{"id":"duplicate-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset","contextBoundaryKind":"normal"}}\n'
+    );
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  test("a fully pretty-printed reset still protects the earlier transcript", async () => {
+    await fs.appendFile(
+      chatPath,
+      JSON.stringify(
+        createMuxMessage("pretty-reset", "assistant", "", { contextBoundaryKind: "reset" }),
+        null,
+        2
+      ) +
+        "\n" +
+        JSON.stringify(createMuxMessage("after-pretty-reset", "assistant", "public facts")) +
+        "\n"
+    );
+    expect(
+      (await pages({ action: "search", query: "facts" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["public facts"]);
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  test("a new append cannot finish an older malformed reset without expiring the cursor", async () => {
+    await append("private", "private facts");
+    await fs.appendFile(
+      chatPath,
+      '{"id":"cross-snapshot-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind"\n'
+    );
+    const first = await call({ action: "search", query: "facts", limit: 1 });
+    await fs.appendFile(chatPath, ':"reset"}}\n');
+    expect((await call({ action: "search", query: "facts", cursor: first.nextCursor })).error).toBe(
+      "stale_cursor"
+    );
+  });
+
+  test.each([false, true])(
+    "valid rows break malformed-fragment continuity (rollover: %s)",
+    async (useRollover) => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      const separatingRow = useRollover
+        ? createRolloverPrefix(validRollover)[0]
+        : createMuxMessage("separator", "assistant", "ordinary data");
+      await fs.appendFile(
+        chatPath,
+        '"contextBoundaryKind"\n' + JSON.stringify(separatingRow) + '\n:"reset"\n'
+      );
+      const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
+      expect(resumed.success).toBe(true);
+      expect(resumed.items?.map((item) => item.text)).toEqual(["private facts"]);
+      expect(
+        (await pages({ action: "read_item", item_id: "0" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["opening facts"]);
+    }
+  );
+
   function unicodeEscapes(text: string): string {
     return [...text]
       .map((character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)

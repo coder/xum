@@ -21,6 +21,15 @@ import {
   type HistorySnapshot,
 } from "./historyCursor";
 
+function hasRawResetMarker(text: string): boolean {
+  const decoded = text
+    .replace(/[ \t\r\n]/g, "")
+    .replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16))
+    );
+  return decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
+}
+
 export interface BoundedHistoryRow {
   message: MuxMessage;
   windowId: string;
@@ -184,8 +193,8 @@ export async function scanHistoryFilesBounded(
       let parts: Buffer[] = [];
       let size = 0;
       let skipping = position.skippingOversized;
-      let resetProbe = skipping ? position.resetProbe : "";
-      let possibleReset = skipping && position.possibleReset;
+      let resetProbe = position.resetProbe;
+      let possibleReset = position.possibleReset;
       const deliver = (edge: number): boolean => {
         const start = reverse ? edge : rowEdge;
         const finish = reverse ? (position.oversizedRowEnd ?? rowEdge) : edge;
@@ -196,19 +205,22 @@ export async function scanHistoryFilesBounded(
         }
         result.rowsScanned++;
         let message: MuxMessage | null = null;
+        let rowReset = false;
         if (skipping) result.oversizedLines++;
         else {
           try {
-            const raw: unknown = JSON.parse(
-              Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8")
-            );
+            const line = Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8");
+            rowReset = hasRawResetMarker(line);
+            const raw: unknown = JSON.parse(line);
             // Canonicalize only this bounded row before shape validation so
             // Unicode-escaped reset keys/values cannot bypass the raw probe.
             try {
-              possibleReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
+              rowReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
+              possibleReset ||= rowReset;
             } catch {
               // Deep corrupt JSON can parse but overflow stringify's stack.
               // An unreadable reset candidate must remain a privacy floor.
+              rowReset = true;
               possibleReset = true;
             }
             if (
@@ -227,12 +239,19 @@ export async function scanHistoryFilesBounded(
             result.malformedLines++;
           }
         }
+        // Only adjacent unreadable fragments may form a marker. A valid row
+        // supplies its own decoded evidence and breaks the fragment chain.
+        if (message) possibleReset = rowReset;
         if (!visit(message, start, finish, skipping, possibleReset)) return false;
         parts = [];
         size = 0;
         skipping = false;
-        resetProbe = "";
-        possibleReset = false;
+        if (message) {
+          resetProbe = "";
+          possibleReset = false;
+        }
+        position.resetProbe = resetProbe;
+        position.possibleReset = possibleReset;
         rowEdge = edge;
         position.byteOffset = edge;
         position.skippingOversized = false;
@@ -262,10 +281,7 @@ export async function scanHistoryFilesBounded(
           // reverse/forward chunk edges and page boundaries without line buffering.
           const compact = segment.toString("latin1").replace(/[ \t\r\n]/g, "");
           const probe = reverse ? compact + resetProbe : resetProbe + compact;
-          const decoded = probe.replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
-            String.fromCharCode(Number.parseInt(hex, 16))
-          );
-          possibleReset ||= decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
+          possibleReset ||= hasRawResetMarker(probe);
           resetProbe = reverse
             ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
             : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
@@ -298,11 +314,14 @@ export async function scanHistoryFilesBounded(
         position.oversizedRowEnd = null;
         return true;
       }
-      // Carry only the skip bit across calls, not transcript bytes in a cursor.
+      // Rewinding an ordinary partial row also restores its start-of-row probe;
+      // only oversized rows persist mid-line state. Carryover stays bounded.
       position.byteOffset = skipping ? cursor : rowEdge;
       position.skippingOversized = skipping;
-      position.resetProbe = resetProbe;
-      position.possibleReset = possibleReset;
+      if (skipping) {
+        position.resetProbe = resetProbe;
+        position.possibleReset = possibleReset;
+      }
       return false;
     };
 
@@ -323,18 +342,25 @@ export async function scanHistoryFilesBounded(
       if (state.appendCheck) {
         const check = state.appendCheck;
         await snapshot("chat", check.snapshot);
+        let reachedValidatedRow = false;
         const completed = await scan(
           "chat",
           check,
           true,
           check.snapshot.endOffsetSnapshot,
-          state.validatedChatSnapshot.endOffsetSnapshot,
-          (message, _start, _end, _oversized, possibleReset) => {
+          0,
+          (message, _start, finish, _oversized, possibleReset) => {
+            // A new append can finish the prior snapshot's malformed tail.
+            // Continue through that tail, stopping at the first valid old row.
+            if (message && finish <= state.validatedChatSnapshot.endOffsetSnapshot) {
+              reachedValidatedRow = true;
+              return false;
+            }
             if (isManualHistoryReset(message, possibleReset)) throw new Error("stale_cursor");
             return true;
           }
         );
-        if (!completed) {
+        if (!completed && !reachedValidatedRow) {
           result.cursor = state;
           return await finish();
         }
@@ -413,6 +439,8 @@ export async function scanHistoryFilesBounded(
         state.windowPending = true;
         state.skippingOversized = false;
         state.oversizedRowEnd = null;
+        state.resetProbe = "";
+        state.possibleReset = false;
       } else if (!completed) break;
       else if (reverse && artifact === "chat") {
         state.artifact = "archive";
@@ -420,6 +448,8 @@ export async function scanHistoryFilesBounded(
       } else if (reverse) {
         state.phase = "browse";
         state.byteOffset = 0;
+        state.resetProbe = "";
+        state.possibleReset = false;
       } else if (artifact === "archive") {
         state.artifact = "chat";
         state.byteOffset = 0;
