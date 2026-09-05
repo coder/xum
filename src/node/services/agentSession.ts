@@ -1,3 +1,4 @@
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPolicy";
@@ -4889,7 +4890,9 @@ export class AgentSession {
       // may have been deduped against a snapshot elsewhere in the sealed window.
       const skillSnapshots = extractAgentSkillRefs(user.metadata?.muxMetadata).flatMap((ref) => {
         const snapshot = history.data.findLast(
-          (row) => row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
+          (row) =>
+            !row.metadata?.contextBudgetRejected &&
+            row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
         );
         if (!snapshot || preludeIds.has(snapshot.id)) return [];
         const { historySequence: _snapshotSequence, ...snapshotMetadata } = snapshot.metadata!;
@@ -6326,18 +6329,17 @@ export class AgentSession {
         // This row passed send-time admission but never fit the final request.
         // Keep it visible without poisoning subsequent sends (including after restart).
         if (lastUserMessage) {
-          const rejected: MuxMessage = {
-            ...lastUserMessage,
-            metadata: { ...lastUserMessage.metadata, contextBudgetRejected: true },
-          };
-          const updated = await this.historyService.updateHistory(this.workspaceId, rejected);
+          const updated = await this.historyService.rejectContextBudgetRequest(
+            this.workspaceId,
+            lastUserMessage
+          );
           if (!updated.success) {
             return await this.handleStreamWithHistoryFailure(
               createUnknownSendMessageError(updated.error),
               acpPromptId
             );
           }
-          this.emitChatEvent({ ...rejected, type: "message" });
+          for (const row of updated.data) this.emitChatEvent({ ...row, type: "message" });
         }
         if (!rolled.success)
           return await this.handleStreamWithHistoryFailure(rolled.error, acpPromptId);
@@ -9259,9 +9261,9 @@ export class AgentSession {
       ? Ok<MuxMessage[]>([])
       : await this.historyService.getLastMessages(this.workspaceId, 10);
     if (historyResult.success) {
-      for (const msg of historyResult.data) {
+      for (const msg of sliceMessagesForProviderFromLatestContextBoundary(historyResult.data)) {
         const metadata = msg.metadata;
-        if (metadata?.synthetic && metadata.agentSkillSnapshot) {
+        if (metadata?.synthetic && metadata.agentSkillSnapshot && !metadata.contextBudgetRejected) {
           recentSnapshots.push({
             skillName: metadata.agentSkillSnapshot.skillName,
             sha256: metadata.agentSkillSnapshot.sha256,

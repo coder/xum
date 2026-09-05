@@ -819,6 +819,88 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([false, true])(
+    "terminal rejection excludes accepted preludes across restart (retry=%s)",
+    async (retry) => {
+      const h = await setup({ failure: () => exceeded });
+      if (retry) await seedHistory(h, 20_000);
+      else h.session.setAutoCompactionThreshold(1);
+      await fs.writeFile(path.join(h.config.rootDir, "rejected.txt"), "Rejected file payload");
+      const skillDir = path.join(h.config.rootDir, ".xum", "skills", "rejected-skill");
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: rejected-skill\ndescription: Test skill\n---\n\nRejected skill payload.\n"
+      );
+      const payload = createMuxMessage("rejected-peer", "assistant", "Rejected peer payload", {
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: { type: "family-message" },
+      });
+      const skillMetadata = {
+        type: "agent-skill" as const,
+        rawCommand: "/rejected-skill",
+        skillName: "rejected-skill",
+        scope: "project" as const,
+      };
+      expect(
+        await h.session.sendMessage(
+          "Read @rejected.txt",
+          { ...options, muxMetadata: skillMetadata },
+          {
+            synthetic: true,
+            preTurnMessages: [payload],
+          }
+        )
+      ).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
+      const trigger = active.findLast((row) => text(row) === "Read @rejected.txt")!;
+      const preludeIds = new Set(trigger.metadata?.requestPreludeMessageIds);
+      expect(preludeIds.size).toBe(3);
+      const preludes = active.filter((row) => preludeIds.has(row.id));
+      expect(
+        prepareProviderRequestMessages(preludes, "openai", "off").providerRequestMessages
+      ).toHaveLength(0);
+      h.session.dispose();
+      const resumed = await setup({ previous: h });
+      expect((await resumed.session.sendMessage("Unrelated replacement", options)).success).toBe(
+        true
+      );
+      const providerRows = prepareProviderRequestMessages(
+        resumed.requests[0].messages,
+        "openai",
+        "off"
+      ).providerRequestMessages;
+      expect(providerRows.some((row) => preludeIds.has(row.id))).toBe(false);
+      resumed.aiEmitter.emit("stream-end", {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        metadata: { model, agentId: "exec", finishReason: "stop" },
+        parts: [],
+      });
+      resumed.completions[0].settle({ status: "completed" });
+      await resumed.session.waitForIdle();
+      // Re-invoking a rejected skill must materialize it, not dedupe against hidden instructions.
+      expect(
+        (
+          await resumed.session.sendMessage("Try skill again", {
+            ...options,
+            muxMetadata: skillMetadata,
+          })
+        ).success
+      ).toBe(true);
+      const next = prepareProviderRequestMessages(
+        resumed.requests[1].messages,
+        "openai",
+        "off"
+      ).providerRequestMessages;
+      expect(
+        next.some((row) => row.metadata?.agentSkillSnapshot?.skillName === "rejected-skill")
+      ).toBe(true);
+    }
+  );
+
   test.each(["missing-payload", "old-user"])(
     "emergency rollover skips damaged prelude reference %s and keeps valid payloads",
     async (damagedId) => {

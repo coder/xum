@@ -11,6 +11,7 @@ import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import {
   isCompactionSummaryMetadata,
+  isSyntheticSnapshotUserMessage,
   type MuxMessage,
   type MuxMetadata,
 } from "@/common/types/message";
@@ -2569,6 +2570,55 @@ export class HistoryService {
   async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
       this.updateHistoryUnderWriteLock(workspaceId, message)
+    );
+  }
+
+  /** Reject a request and its owned preludes in one commit, never leaving replayable orphan payloads. */
+  async rejectContextBudgetRequest(
+    workspaceId: string,
+    trigger: MuxMessage
+  ): Promise<Result<MuxMessage[]>> {
+    assert(trigger.role === "user", "context-budget rejection requires a user trigger");
+    assert(
+      isNonNegativeInteger(trigger.metadata?.historySequence),
+      "rejected trigger must be persisted"
+    );
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to reject context-budget request",
+      async () => {
+        const messages = await this.readChatHistory(workspaceId);
+        const triggerIndex = messages.findIndex(
+          (row) =>
+            row.id === trigger.id &&
+            row.metadata?.historySequence === trigger.metadata?.historySequence
+        );
+        const persisted = messages[triggerIndex];
+        if (!persisted || persisted.role !== "user")
+          return Err("Rejected request no longer exists");
+        const preludeIds = new Set(persisted.metadata?.requestPreludeMessageIds ?? []);
+        const rejected: MuxMessage[] = [];
+        const updated = messages.map((row, index) => {
+          const ownedPrelude =
+            index < triggerIndex &&
+            preludeIds.has(row.id) &&
+            !isDurableContextBoundaryMarker(row) &&
+            (isSyntheticSnapshotUserMessage(row) ||
+              (row.role === "assistant" && row.metadata?.synthetic === true));
+          if (index !== triggerIndex && !ownedPrelude) return row;
+          const marked: MuxMessage = {
+            ...row,
+            metadata: { ...row.metadata, contextBudgetRejected: true },
+          };
+          rejected.push(marked);
+          return marked;
+        });
+        await writeFileAtomic(
+          this.getChatHistoryPath(workspaceId),
+          this.serializeHistoryEntries(updated, workspaceId)
+        );
+        return Ok(rejected);
+      }
     );
   }
 
