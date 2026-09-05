@@ -27,7 +27,7 @@ import {
   getModelProvider,
   supports1MContext,
 } from "@/common/utils/ai/models";
-import { getAllowedProvidersForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import {
@@ -157,8 +157,14 @@ export function ModelsSection() {
     setLastProvider(allowedProviders[0] ?? "");
   }, [config, allowedProviders, lastProvider, setLastProvider]);
 
-  const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
-    useModelsFromSettings();
+  const {
+    defaultModel,
+    setDefaultModel,
+    hiddenModels,
+    hideModel,
+    unhideModel,
+    isAllowedByPolicyOnActiveRoute,
+  } = useModelsFromSettings();
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
@@ -383,6 +389,8 @@ export function ModelsSection() {
 
   // Get built-in models from KNOWN_MODELS.
   // Filter by policy so the settings table doesn't list models users can't ever select.
+  // The policy applies to the active route's identity (like the backend), so a
+  // gateway-only policy keeps rows whose route is that gateway.
   const builtInModels = Object.values(KNOWN_MODELS)
     .map((model) => ({
       provider: model.provider,
@@ -399,7 +407,7 @@ export function ModelsSection() {
           .some((route) => route.route !== "direct" && route.isConfigured)
       )
     )
-    .filter((model) => isModelAllowedByPolicy(effectivePolicy, model.fullId));
+    .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
 
   const customModels = getCustomModels();
 

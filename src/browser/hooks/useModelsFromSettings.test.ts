@@ -572,6 +572,44 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
   });
 
+  test("a gateway-only policy keeps models whose active route is that gateway", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: SEEDED_OPENAI_CUSTOM_MODELS,
+      },
+      "mux-gateway": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        couponCodeSet: true,
+      },
+    };
+    // The policy lists only the gateway. The backend checks the resolved route
+    // identity (mux-gateway:openai/...), so the picker must keep those models
+    // while the gateway is their active route.
+    enforcedPolicy = buildEnforcedPolicy([{ id: "mux-gateway", allowedModels: null }]);
+
+    routePriority = ["mux-gateway", "direct"];
+    const viaGateway = renderHook(() => useModelsFromSettings());
+    expect(viaGateway.result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(viaGateway.result.current.models).toContain(KNOWN_MODELS.GPT.id);
+    expect(viaGateway.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_PRO.id)).toBe(
+      true
+    );
+
+    // Direct-only routing resolves to openai:*, which this policy does not allow.
+    routePriority = ["direct"];
+    const direct = renderHook(() => useModelsFromSettings());
+    expect(direct.result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(direct.result.current.models).not.toContain(KNOWN_MODELS.GPT.id);
+    expect(direct.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_PRO.id)).toBe(
+      false
+    );
+  });
+
   test("exposes OpenAI auth state flags", () => {
     providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true },

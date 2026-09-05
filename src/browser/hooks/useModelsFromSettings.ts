@@ -16,7 +16,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
-import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
+import type { EffectivePolicy, ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
 import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
@@ -120,6 +120,31 @@ function resolvesToDirectOpenAI(
     resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
       .routeProvider === "openai"
   );
+}
+
+/**
+ * Policy check on the identity the backend enforces. createModel resolves the
+ * route first and then checks `isModelAllowed(routeProvider, routeModelId)`,
+ * so a policy that lists only a gateway permits a canonical model whose active
+ * route is that gateway. A model with no active route resolves to direct and is
+ * checked under its canonical identity.
+ */
+function isModelAllowedByPolicyOnActiveRoute(
+  policy: EffectivePolicy | null,
+  modelId: string,
+  routePriority: string[],
+  routeOverrides: Record<string, string>,
+  isConfigured: (provider: string) => boolean,
+  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+): boolean {
+  const route = resolveRoute(
+    modelId,
+    routePriority,
+    routeOverrides,
+    isConfigured,
+    isGatewayModelAccessible
+  );
+  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`);
 }
 
 export function getDefaultModel(): string {
@@ -228,6 +253,16 @@ export function useModelsFromSettings() {
   const openaiApiKeySet = config === null ? null : config.openai?.apiKeySet === true;
   const codexOauthSet = config === null ? null : config.openai?.codexOauthSet === true;
 
+  const isAllowedByPolicyOnActiveRoute = (modelId: string) =>
+    isModelAllowedByPolicyOnActiveRoute(
+      effectivePolicy,
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      isGatewayModelAccessible
+    );
+
   const requiresCodexOauth = (modelId: string) =>
     isCodexOauthRequiredModel(modelId, config) &&
     resolvesToDirectOpenAI(
@@ -325,10 +360,17 @@ export function useModelsFromSettings() {
               )
           );
 
+    const allowedByPolicy = (modelId: string) =>
+      isModelAllowedByPolicyOnActiveRoute(
+        effectivePolicy,
+        modelId,
+        routePriority,
+        routeOverrides,
+        isConfigured,
+        isGatewayModelAccessible
+      );
     if (config == null) {
-      return effectivePolicy
-        ? providerFiltered.filter((m) => isModelAllowedByPolicy(effectivePolicy, m))
-        : providerFiltered;
+      return effectivePolicy ? providerFiltered.filter(allowedByPolicy) : providerFiltered;
     }
     const hasOpenaiApiKey = openaiApiKeySet === true;
     const hasCodexOauth = codexOauthSet === true;
@@ -368,7 +410,7 @@ export function useModelsFromSettings() {
       return !isCodexOauthRequiredModel(modelId, config);
     });
 
-    return effectivePolicy ? next.filter((m) => isModelAllowedByPolicy(effectivePolicy, m)) : next;
+    return effectivePolicy ? next.filter(allowedByPolicy) : next;
   }, [
     config,
     hiddenModels,
@@ -482,5 +524,6 @@ export function useModelsFromSettings() {
     openaiApiKeySet,
     codexOauthSet,
     requiresCodexOauth,
+    isAllowedByPolicyOnActiveRoute,
   };
 }
