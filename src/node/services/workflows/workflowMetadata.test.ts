@@ -186,6 +186,9 @@ describe("parseDeclaredPhasesFromSource", () => {
       "export const meta = { *items() {}, get: 1, async: 2 };\n",
       'const description = "x";\nexport const meta = { description };\n',
       "export const meta = { argsSchema: buildSchema(), nested: { phases: 1 } };\n",
+      // A computed no-substitution template key is decoded to its static name.
+      // (A bare `` `helper`: `` key is a SyntaxError, not a legacy shape.)
+      "export const meta = { [`helper`]: buildMetadata(), description: 'x' };\n",
       // Not even an object literal: nothing to declare phases in.
       "export const meta = sharedMeta;\n",
     ]) {
@@ -204,6 +207,10 @@ describe("declared phases require an immutable meta binding", () => {
       `export let meta = ${phases};\n`,
       `export const meta = ${phases};\nmeta.phases.push({ name: "b" });\n`,
       `export const meta = ${phases};\nconst alias = meta;\n`,
+      // Template interpolations are executable code, not string text: a mutation
+      // hidden in one (even nested in an inner template) must still be seen.
+      `export const meta = ${phases};\nlog(\`\${(meta.phases[0].name = "changed")}\`);\n`,
+      `export const meta = ${phases};\nlog(\`outer \${ \`inner \${ helper(meta) }\` }\`);\n`,
       // An identifier escape names the same binding; a textual scan cannot prove otherwise.
       `export const meta = ${phases};\nm\\u0065ta.phases[0].name = "changed";\n`,
       // Direct eval / Function can name the binding from inside a masked string.
@@ -221,6 +228,9 @@ describe("declared phases require an immutable meta binding", () => {
       parseDeclaredPhasesFromSource(
         `export const meta = { description: "about meta", phases: [{ name: "a" }] };\n` +
           "const x = ctx.meta;\n" +
+          // Interpolation code is scanned, but template text and braces inside it
+          // (`${ { meta: 1 }.other }` would count; `{ ...args }` does not) stay inert.
+          "const banner = `meta ${ ({ ...args }).title } ${ ctx.meta }`;\n" +
           body
       )
     ).toEqual([{ name: "a" }]);

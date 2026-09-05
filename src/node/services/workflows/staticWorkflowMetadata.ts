@@ -712,100 +712,141 @@ function staticAssert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+/**
+ * Blanks comment, string, template-text, and regex bodies (index-preserving) so
+ * structural scans see only code. Template interpolations (`${…}`) ARE code —
+ * `\`${(meta.phases[0].name = "x")}\`` mutates the binding just like a bare
+ * statement — so their contents stay visible (with nested strings/comments/regex
+ * masked recursively) and the `${` / `}` delimiters are kept to hold brace depth
+ * balanced for the depth trackers.
+ */
 function maskStaticJavaScriptSource(source: string): string {
   let output = "";
   let index = 0;
-  while (index < source.length) {
-    const current = source[index];
-    const next = source[index + 1];
-    staticAssert(current != null, "maskStaticJavaScriptSource: current character is required");
-    if (current === "/" && next === "/") {
-      output += "  ";
-      index += 2;
-      while (index < source.length && source[index] !== "\n") {
-        output += " ";
-        index += 1;
-      }
-      continue;
-    }
-    if (current === "/" && next === "*") {
-      output += "  ";
-      index += 2;
-      while (index < source.length) {
-        const blockCurrent = source[index];
-        const blockNext = source[index + 1];
-        staticAssert(
-          blockCurrent != null,
-          "maskStaticJavaScriptSource: block character is required"
-        );
-        if (blockCurrent === "*" && blockNext === "/") {
-          output += "  ";
-          index += 2;
-          break;
+
+  // Masks a string/template literal starting at `index` (which points at the
+  // opening quote). Template interpolations hand control back to maskCode.
+  const maskStringLiteral = (quote: string): void => {
+    // Keep the quote delimiters (mask only the contents) so isRegExpLiteralStart
+    // still sees a value token after the literal and `"10" / 2` stays division.
+    output += quote;
+    index += 1;
+    while (index < source.length) {
+      const stringCurrent = source[index];
+      staticAssert(
+        stringCurrent != null,
+        "maskStaticJavaScriptSource: string character is required"
+      );
+      if (isStaticTemplateInterpolationStart(source, index, quote)) {
+        output += "${";
+        index += 2;
+        maskCode(true);
+        if (index < source.length) {
+          // maskCode stopped at the `}` closing the interpolation.
+          output += "}";
+          index += 1;
         }
-        output += blockCurrent === "\n" ? "\n" : " ";
-        index += 1;
+        continue;
       }
-      continue;
+      index += 1;
+      if (stringCurrent === quote) {
+        output += quote;
+        break;
+      }
+      output += stringCurrent === "\n" ? "\n" : " ";
+      if (stringCurrent === "\\") {
+        if (index < source.length) {
+          const escaped = source[index];
+          staticAssert(
+            escaped != null,
+            "maskStaticJavaScriptSource: escaped character is required"
+          );
+          output += escaped === "\n" ? "\n" : " ";
+          index += 1;
+        }
+      }
     }
-    if (current === "/" && isRegExpLiteralStart(output)) {
-      // Mask regex literal bodies: characters like "//", "(", or "[" inside a regex
-      // (e.g. /https:\/\// or /\/\*[\s\S]*?\*\//) must not be misread as comments or
-      // counted toward bracket depth, which would unbalance the masked source.
-      // Regex literals cannot span lines, so a candidate without a closing "/" on the
-      // same line must be division whose left operand the heuristic did not recognize
-      // (e.g. `count++ / total` or `{ valueOf() {...} } / 2`); leave it unmasked
-      // instead of swallowing the rest of the line and hiding real exports.
-      const closingIndex = findRegExpLiteralEnd(source, index);
-      if (closingIndex !== -1) {
-        // Keep the "/" delimiters (mask only the body) so isRegExpLiteralStart still
-        // sees the literal as a value and `/x/ / 2` stays division.
-        output += "/";
-        index += 1;
-        while (index < closingIndex) {
+  };
+
+  // Masks code until the source ends or, inside a template interpolation, until
+  // the unmatched `}` that closes it (left unconsumed for maskStringLiteral).
+  const maskCode = (inInterpolation: boolean): void => {
+    let braceDepth = 0;
+    while (index < source.length) {
+      const current = source[index];
+      const next = source[index + 1];
+      staticAssert(current != null, "maskStaticJavaScriptSource: current character is required");
+      if (current === "/" && next === "/") {
+        output += "  ";
+        index += 2;
+        while (index < source.length && source[index] !== "\n") {
           output += " ";
           index += 1;
         }
-        output += "/";
-        index += 1;
         continue;
       }
-    }
-    if (current === '"' || current === "'" || current === "`") {
-      const quote = current;
-      // Keep the quote delimiters (mask only the contents) so isRegExpLiteralStart
-      // still sees a value token after the literal and `"10" / 2` stays division.
-      output += quote;
-      index += 1;
-      while (index < source.length) {
-        const stringCurrent = source[index];
-        staticAssert(
-          stringCurrent != null,
-          "maskStaticJavaScriptSource: string character is required"
-        );
-        index += 1;
-        if (stringCurrent === quote) {
-          output += quote;
-          break;
+      if (current === "/" && next === "*") {
+        output += "  ";
+        index += 2;
+        while (index < source.length) {
+          const blockCurrent = source[index];
+          const blockNext = source[index + 1];
+          staticAssert(
+            blockCurrent != null,
+            "maskStaticJavaScriptSource: block character is required"
+          );
+          if (blockCurrent === "*" && blockNext === "/") {
+            output += "  ";
+            index += 2;
+            break;
+          }
+          output += blockCurrent === "\n" ? "\n" : " ";
+          index += 1;
         }
-        output += stringCurrent === "\n" ? "\n" : " ";
-        if (stringCurrent === "\\") {
-          if (index < source.length) {
-            const escaped = source[index];
-            staticAssert(
-              escaped != null,
-              "maskStaticJavaScriptSource: escaped character is required"
-            );
-            output += escaped === "\n" ? "\n" : " ";
+        continue;
+      }
+      if (current === "/" && isRegExpLiteralStart(output)) {
+        // Mask regex literal bodies: characters like "//", "(", or "[" inside a regex
+        // (e.g. /https:\/\// or /\/\*[\s\S]*?\*\//) must not be misread as comments or
+        // counted toward bracket depth, which would unbalance the masked source.
+        // Regex literals cannot span lines, so a candidate without a closing "/" on the
+        // same line must be division whose left operand the heuristic did not recognize
+        // (e.g. `count++ / total` or `{ valueOf() {...} } / 2`); leave it unmasked
+        // instead of swallowing the rest of the line and hiding real exports.
+        const closingIndex = findRegExpLiteralEnd(source, index);
+        if (closingIndex !== -1) {
+          // Keep the "/" delimiters (mask only the body) so isRegExpLiteralStart still
+          // sees the literal as a value and `/x/ / 2` stays division.
+          output += "/";
+          index += 1;
+          while (index < closingIndex) {
+            output += " ";
             index += 1;
           }
+          output += "/";
+          index += 1;
+          continue;
         }
       }
-      continue;
+      if (current === '"' || current === "'" || current === "`") {
+        maskStringLiteral(current);
+        continue;
+      }
+      if (inInterpolation) {
+        // Braces inside the interpolation (object literals, arrow bodies) nest;
+        // the first unmatched `}` ends the interpolation.
+        if (current === "{") braceDepth += 1;
+        else if (current === "}") {
+          if (braceDepth === 0) return;
+          braceDepth -= 1;
+        }
+      }
+      output += current;
+      index += 1;
     }
-    output += current;
-    index += 1;
-  }
+  };
+
+  maskCode(false);
   staticAssert(output.length === source.length, "maskStaticJavaScriptSource must preserve indexes");
   return output;
 }
