@@ -125,6 +125,8 @@ export const formatSendMessageError = (
  * Stream-error payload helpers.
  */
 export interface StreamErrorPayload {
+  /** Internal per-attempt preflight failure; not part of the renderer wire payload. */
+  contextBudgetExceeded?: Extract<SendMessageError, { type: "context_budget_exceeded" }>;
   messageId: string;
   error: string;
   errorType?: StreamErrorType;

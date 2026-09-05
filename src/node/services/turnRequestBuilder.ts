@@ -1,3 +1,4 @@
+import type { OnStepSettled } from "./streamManager";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
@@ -280,6 +281,7 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  onStepSettled?: OnStepSettled;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -744,6 +746,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      onStepSettled,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2908,6 +2911,7 @@ export class TurnRequestBuilder {
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
       hasQueuedMessages,
+      onStepSettled,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

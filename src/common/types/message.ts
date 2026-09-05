@@ -540,6 +540,8 @@ export interface TranscriptAnchor {
 
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
+  /** Correlates a rollover continuation without replacing its original attribution. */
+  rolloverId?: string;
   /** Structured review data for rich UI display (orthogonal to message type) */
   reviews?: ReviewNoteDataForDisplay[];
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
@@ -612,6 +614,10 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         flushOpportunity: boolean;
         contextTokens: number;
         maxTokens: number;
+      }
+    | {
+        type: "context-window-continuation";
+        rolloverId: string;
       }
     | {
         type: "context-window-lead-in";
