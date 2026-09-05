@@ -123,6 +123,12 @@ export function buildWorkspaceStatusPrompt(
 
 export interface GenerateWorkspaceStatusOptions extends BuildWorkspaceStatusPromptOptions {
   /**
+   * Workspace the status belongs to; forwarded to model creation so
+   * provider-level session grouping (e.g. OpenRouter session_id) covers
+   * status traffic too.
+   */
+  workspaceId?: string;
+  /**
    * Best-effort cost telemetry: status generation bypasses StreamManager,
    * so the caller records the successful candidate's usage into
    * session-usage.json. costsIncluded reflects subscription-covered routing
@@ -211,6 +217,7 @@ function generateWorkspaceStatusEffect(
       const modelResult = yield* Effect.promise(async () =>
         aiService.createModelWithPinnedMetadata(modelString, {
           agentInitiated: true,
+          ...(options.workspaceId != null ? { workspaceId: options.workspaceId } : {}),
         })
       );
       if (!modelResult.success) {
