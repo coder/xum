@@ -153,6 +153,64 @@ describe("session_history real disk recovery", () => {
     expect((await call({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
+  test.each([
+    '{"id":"broken-reset","role":"assistant","metadata":{"contextBoundaryKind" : "reset"},"parts":[',
+    '{"role":"assistant","metadata":{"contextBoundaryKind":"reset"},"parts":[]}',
+  ])("unreadable reset rows below the size cap protect list/search/read: %s", async (resetLine) => {
+    const olderWindow = await append("private-boundary", "private summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const hidden = await append("private-item", "private-before-malformed-reset");
+    await fs.appendFile(chatPath, resetLine + "\n");
+    const publicBoundary = createMuxMessage("public-boundary", "assistant", "", {
+      ...rollover,
+      historySequence: 100,
+    });
+    await fs.appendFile(
+      chatPath,
+      [
+        JSON.stringify(publicBoundary),
+        "unrelated malformed row",
+        JSON.stringify(
+          createMuxMessage("public-item", "assistant", "public facts", { historySequence: 101 })
+        ),
+      ].join("\n") + "\n"
+    );
+    const windows = (await pages({ action: "list_windows" })).flatMap((page) => page.windows ?? []);
+    expect(windows.map((window) => window.windowId)).toEqual(["w:100"]);
+    expect(
+      windows.some(
+        (window) => window.windowId === `w:${String(olderWindow.metadata!.historySequence)}`
+      )
+    ).toBe(false);
+    expect(
+      (await pages({ action: "search", query: "private" })).flatMap((page) => page.items ?? [])
+    ).toEqual([]);
+    expect(
+      (await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })).at(
+        -1
+      )?.error
+    ).toBe("item_not_found");
+    expect(
+      (await pages({ action: "search", query: "public facts" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["public facts"]);
+  });
+
+  test("an appended malformed reset invalidates an existing cursor", async () => {
+    await append("one", "match one");
+    await append("two", "match two");
+    const first = await call({ action: "search", query: "match", limit: 1 });
+    expect(first.nextCursor).toBeString();
+    await fs.appendFile(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},"parts":[\n');
+    expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
+      "stale_cursor"
+    );
+  });
+
   test("lists root, sequenced compactions, heartbeat/rollover windows and legacy IDs", async () => {
     const compact = await append("compact", "summary", {
       compacted: "user",

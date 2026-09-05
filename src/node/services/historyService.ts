@@ -2506,6 +2506,10 @@ export class HistoryService {
             historyPath,
             healedExisting + this.serializeHistoryEntries(messages, workspaceId)
           );
+          // Publish the entire batch before sealing its previous epoch. Rotation
+          // is best-effort: a storage failure must not invite a duplicate batch.
+          const boundary = messages.findLast(isDurableContextBoundaryMarker);
+          if (boundary) await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary);
           return Ok(undefined);
         } catch (error) {
           return Err(`Failed to append to history: ${getErrorMessage(error)}`);

@@ -304,8 +304,8 @@ export async function scanHistoryFilesBounded(
           true,
           check.snapshot.endOffsetSnapshot,
           state.validatedChatSnapshot.endOffsetSnapshot,
-          (message, _start, _end, oversized, possibleReset) => {
-            if ((oversized && possibleReset) || (message && isManualHistoryReset(message)))
+          (message, _start, _end, _oversized, possibleReset) => {
+            if ((!message && possibleReset) || (message && isManualHistoryReset(message)))
               throw new Error("stale_cursor");
             return true;
           }
@@ -338,14 +338,14 @@ export async function scanHistoryFilesBounded(
         reverse,
         end,
         0,
-        (message, _start, finish, oversized, possibleReset) => {
+        (message, _start, finish, _oversized, possibleReset) => {
           if (reverse) {
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
-            if ((oversized && possibleReset) || (message && isManualHistoryReset(message))) {
-              // An unreadable oversized row might contain a reset. Fail closed at
-              // its newer edge rather than making older transcript data reachable.
+            if ((!message && possibleReset) || (message && isManualHistoryReset(message))) {
+              // Any unreadable row might contain a reset, even below the size cap.
+              // Fail closed rather than disclosing history before a malformed reset.
               floor = { offset: finish, windowId: message ? getContextWindowId(message) : "w:0" };
               return false;
             }
