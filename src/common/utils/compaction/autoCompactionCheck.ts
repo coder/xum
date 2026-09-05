@@ -22,6 +22,7 @@ import {
   FORCE_COMPACTION_BUFFER_PERCENT,
 } from "@/common/constants/ui";
 import { getEffectiveContextLimit } from "./contextLimit";
+import type { CodexOauthRoutingOptions } from "@/common/utils/providers/codexOauthRouting";
 
 /**
  * Get context window tokens (input only).
@@ -74,6 +75,7 @@ export const WARNING_ADVANCE_PERCENT = 10;
  * @param threshold - Usage percentage threshold (0.0-1.0, default 0.7 = 70%). If >= 1.0, auto-compaction is considered disabled.
  * @param warningAdvancePercent - Show warning this many percentage points before threshold (default 10)
  * @param providersConfig - Provider config used for custom model context overrides
+ * @param routingOptions - Request-level routing inputs (backend send path only)
  * @returns Check result with warning flag and usage percentage
  */
 export function checkAutoCompaction(
@@ -82,7 +84,8 @@ export function checkAutoCompaction(
   use1M: boolean,
   threshold: number = DEFAULT_AUTO_COMPACTION_THRESHOLD,
   warningAdvancePercent: number = WARNING_ADVANCE_PERCENT,
-  providersConfig: ProvidersConfigMap | null = null
+  providersConfig: ProvidersConfigMap | null = null,
+  routingOptions?: CodexOauthRoutingOptions
 ): AutoCompactionCheckResult {
   const thresholdPercentage = threshold * 100;
   const isEnabled = threshold < 1.0;
@@ -90,7 +93,7 @@ export function checkAutoCompaction(
   const currentUsage = usage?.liveUsage ?? usage?.lastContextUsage;
   const contextTokens = currentUsage ? getContextTokens(currentUsage) : 0;
   const maxTokens = model
-    ? (getEffectiveContextLimit(model, use1M, providersConfig) ?? undefined)
+    ? (getEffectiveContextLimit(model, use1M, providersConfig, routingOptions) ?? undefined)
     : undefined;
 
   // Short-circuit if auto-compaction is disabled or missing required data

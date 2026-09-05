@@ -3859,6 +3859,7 @@ export class AgentSession {
           providersConfigForCompaction
         ),
         providersConfig: providersConfigForCompaction,
+        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
       });
 
       const continuousContext = this.getContinuousCompactionContext(
@@ -4820,7 +4821,8 @@ export class AgentSession {
       const maxTokens = getEffectiveContextLimit(
         model,
         this.is1MContextEnabledForModel(model, context.options, context.providersConfig),
-        context.providersConfig
+        context.providersConfig,
+        { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
       );
       if (maxTokens == null || maxTokens <= 0) return Ok(false);
       const rollover: ContextWindowRollover = {
@@ -4954,7 +4956,8 @@ export class AgentSession {
     const maxTokens = getEffectiveContextLimit(
       options.model,
       this.is1MContextEnabledForModel(options.model, options, providersConfig),
-      providersConfig
+      providersConfig,
+      { openaiWireFormat: options.providerOptions?.openai?.wireFormat }
     );
     if (maxTokens == null || maxTokens <= 0) {
       log.warn("Token budget has no known model context limit", { model: options.model });
@@ -5090,7 +5093,8 @@ export class AgentSession {
     const maxTokens = getEffectiveContextLimit(
       step.model,
       this.is1MContextEnabledForModel(step.model, context.options, context.providersConfig ?? null),
-      context.providersConfig ?? null
+      context.providersConfig ?? null,
+      { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
     );
     if (maxTokens == null || maxTokens <= 0) {
       log.warn("Token budget has no known model context limit", { model: step.model });
@@ -7185,6 +7189,7 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
+        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
       });
 
       if (shouldInterruptForCompaction) {

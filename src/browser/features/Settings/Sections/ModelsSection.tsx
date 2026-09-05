@@ -27,7 +27,7 @@ import {
   getModelProvider,
   supports1MContext,
 } from "@/common/utils/ai/models";
-import { getAllowedProvidersForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import {
@@ -102,16 +102,22 @@ function buildProviderModelEntry(
   return entry;
 }
 
-export function shouldShowModelInSettings(modelId: string, codexOauthConfigured: boolean): boolean {
+export function shouldShowModelInSettings(
+  modelId: string,
+  codexOauthConfigured: boolean,
+  // A configured gateway (mux-gateway, openrouter, ...) supplies its own
+  // credentials, so the row must stay visible for users to pick that route.
+  hasConfiguredGatewayRoute = false
+): boolean {
   // OpenAI OAuth gating only applies to OpenAI-routed models; other providers can
   // reuse the same providerModelId string without requiring OpenAI OAuth.
   if (getModelProvider(modelId) !== "openai") {
     return true;
   }
 
-  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected,
-  // so users don't pick defaults that fail at send time.
-  return codexOauthConfigured || !isCodexOauthRequiredModelId(modelId);
+  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected
+  // or a gateway can serve them, so users don't pick defaults that fail at send time.
+  return codexOauthConfigured || hasConfiguredGatewayRoute || !isCodexOauthRequiredModelId(modelId);
 }
 
 export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
@@ -151,8 +157,14 @@ export function ModelsSection() {
     setLastProvider(allowedProviders[0] ?? "");
   }, [config, allowedProviders, lastProvider, setLastProvider]);
 
-  const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
-    useModelsFromSettings();
+  const {
+    defaultModel,
+    setDefaultModel,
+    hiddenModels,
+    hideModel,
+    unhideModel,
+    isAllowedByPolicyOnActiveRoute,
+  } = useModelsFromSettings();
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
@@ -377,6 +389,8 @@ export function ModelsSection() {
 
   // Get built-in models from KNOWN_MODELS.
   // Filter by policy so the settings table doesn't list models users can't ever select.
+  // The policy applies to the active route's identity (like the backend), so a
+  // gateway-only policy keeps rows whose route is that gateway.
   const builtInModels = Object.values(KNOWN_MODELS)
     .map((model) => ({
       provider: model.provider,
@@ -384,8 +398,16 @@ export function ModelsSection() {
       fullId: model.id,
       aliases: model.aliases,
     }))
-    .filter((model) => shouldShowModelInSettings(model.fullId, codexOauthConfigured))
-    .filter((model) => isModelAllowedByPolicy(effectivePolicy, model.fullId));
+    .filter((model) =>
+      shouldShowModelInSettings(
+        model.fullId,
+        codexOauthConfigured,
+        routing
+          .availableRoutes(model.fullId)
+          .some((route) => route.route !== "direct" && route.isConfigured)
+      )
+    )
+    .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
 
   const customModels = getCustomModels();
 

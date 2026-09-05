@@ -434,7 +434,8 @@ export async function assembleBudgetCheckedPromptPayload(
         budget.providerOptions,
         options.providersConfig
       ),
-      options.providersConfig
+      options.providersConfig,
+      { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
     );
     if (modelContextLimit == null) {
       log.warn("Context budget preflight unavailable: model context limit is unknown", {
@@ -2495,6 +2496,7 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
+              openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
               providerForMessages: seed.wireProviderName,
               effectiveThinkingLevel: level,
               effectiveAgentId,

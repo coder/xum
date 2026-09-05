@@ -521,7 +521,10 @@ export function buildProviderOptions(
           openaiExplicitPromptCachingAvailable(
             modelString,
             routeProvider,
-            providersConfig ?? null
+            providersConfig ?? null,
+            {
+              openaiWireFormat: wireFormat,
+            }
           ) && { promptCacheKey }),
         // Conditionally add reasoning configuration
         ...(reasoningEffort && {

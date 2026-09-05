@@ -13,3 +13,6 @@ import type { MuxProviderOptionsSchema } from "../orpc/schemas";
  */
 
 export type MuxProviderOptions = z.infer<typeof MuxProviderOptionsSchema>;
+
+/** OpenAI wire format selected in provider settings or per request. */
+export type OpenAIWireFormat = NonNullable<NonNullable<MuxProviderOptions["openai"]>["wireFormat"]>;

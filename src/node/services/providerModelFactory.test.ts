@@ -1483,6 +1483,48 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
     });
   });
 
+  it("uses the API key for Chat Completions even when Codex OAuth is preferred", async () => {
+    await withTempConfig(async (config, factory) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+          wireFormat: "chatCompletions",
+          codexOauthDefaultAuth: "oauth",
+          codexOauth: {
+            type: "oauth",
+            access: "test-access-token",
+            refresh: "test-refresh-token",
+            expires: Date.now() + 60_000,
+            accountId: "test-account-id",
+          },
+        },
+      });
+
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      let capturedApiKey: string | undefined;
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedApiKey = options?.apiKey;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+
+      try {
+        // Codex OAuth serves only the Responses API, so the factory must hand the
+        // SDK the real key instead of the "codex-oauth" placeholder.
+        const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+        expect(result.success).toBe(true);
+        expect(capturedApiKey).toBe("sk-test");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
   it("does not mark gpt-5.3-codex as subscription-covered when routed through API key", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({

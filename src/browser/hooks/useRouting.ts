@@ -8,8 +8,9 @@ import {
   type AvailableRoute,
   type RouteContext,
 } from "@/common/routing";
+import { usePolicy } from "@/browser/contexts/PolicyContext";
+import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 
 import { useProvidersConfig } from "./useProvidersConfig";
 
@@ -65,6 +66,9 @@ export interface RoutingState {
 export function useRouting(): RoutingState {
   const { api } = useAPI();
   const { config: providersConfig } = useProvidersConfig();
+  const policyState = usePolicy();
+  const effectivePolicy =
+    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
   // app session) instead of per-mount fetches: surfaces render one picker per
   // row, so per-instance subscriptions fanned out O(rows) backend reads.
@@ -80,16 +84,12 @@ export function useRouting(): RoutingState {
     [providersConfig]
   );
 
+  // Policy-aware so route pickers, availability, and resolution never offer a
+  // gateway route the backend rejects at send time.
   const isGatewayModelAccessible = useCallback(
     (gateway: string, modelId: string) =>
-      isGatewayModelAccessibleFromAuthoritativeCatalog(
-        gateway,
-        modelId,
-        providersConfig?.[gateway]?.models,
-        providersConfig?.[gateway]?.discoveredModels,
-        providersConfig?.[gateway]?.removedModels
-      ),
-    [providersConfig]
+      isGatewayModelAccessibleForUi(effectivePolicy, providersConfig, gateway, modelId),
+    [effectivePolicy, providersConfig]
   );
 
   const persistRoutePreferences = useCallback(

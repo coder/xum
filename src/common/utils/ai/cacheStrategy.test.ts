@@ -418,6 +418,28 @@ describe("cacheStrategy", () => {
       ).toBe(true);
     });
 
+    it("accepts a request-level Chat Completions wire format that falls back to the API key", () => {
+      // Stored config prefers OAuth and leaves wireFormat unset; the request selects
+      // Chat Completions, which Codex OAuth cannot serve, so the API key is used.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(true);
+      // The stored wire format wins over the request-level value.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true, wireFormat: "responses" }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(false);
+    });
+
     it("rejects when the providers config view is unavailable", () => {
       expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", null)).toBe(
         false

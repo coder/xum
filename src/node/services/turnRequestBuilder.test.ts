@@ -287,6 +287,30 @@ describe("TurnRequestBuilder assembled preflight", () => {
     expect(error).toBeInstanceOf(ContextBudgetExceededError);
   });
 
+  it("uses the request-level auth route when checking the assembled context ceiling", async () => {
+    const base = options("openai:gpt-6-astra");
+    const request = {
+      ...base,
+      systemMessage: "x".repeat(1_500_000),
+      providersConfig: {
+        openai: {
+          ...base.providersConfig.openai,
+          codexOauthSet: true,
+          codexOauthDefaultAuth: "oauth" as const,
+        },
+      },
+    };
+    const error = await assembleBudgetCheckedPromptPayload(request, { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    expect(error).toBeInstanceOf(ContextBudgetExceededError);
+    const payload = await assembleBudgetCheckedPromptPayload(
+      { ...request, openaiWireFormat: "chatCompletions" },
+      { enabled: true, providerOptions: { openai: { wireFormat: "chatCompletions" } } }
+    );
+    expect(payload.messages.length).toBeGreaterThan(0);
+  });
+
   it("leaves legacy behavior unchanged when the effective budget flag is disabled", async () => {
     const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
     expect(payload.messages.length).toBeGreaterThan(0);
