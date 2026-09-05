@@ -7069,6 +7069,8 @@ export class AgentSession {
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
       removableDedupeKey?: boolean;
+      /** Queue ahead of hidden turn-end predecessors (see MessageQueue). */
+      promoteAheadOfHiddenTurnEnd?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -7154,7 +7156,11 @@ export class AgentSession {
     });
   }
 
-  removeQueuedMessagesByDedupeKeyPrefix(prefix: string, cancelReason: string): number {
+  removeQueuedMessagesByDedupeKeyPrefix(
+    prefix: string,
+    cancelReason: string,
+    options?: { skipCancelCallbacks?: boolean }
+  ): number {
     this.assertNotDisposed("removeQueuedMessagesByDedupeKeyPrefix");
     assert(prefix.length > 0, "removeQueuedMessagesByDedupeKeyPrefix requires prefix");
     const removal = this.messageQueue.removeByDedupeKeyPrefix(prefix);
@@ -7166,8 +7172,15 @@ export class AgentSession {
       this.workspaceId,
       this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
-    for (const callbacks of removal.callbacks) {
-      this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    // Supersession is not withdrawal: a sub-agent progress report dropped because its child's
+    // terminal outcome arrived carries workspace-turn continuation callbacks that would settle
+    // this session's still-active delegated turn as interrupted (see
+    // TaskService.wakeParentWorkspaceWithSyntheticMessage). The terminal delivery is that
+    // turn's next wake, so the caller opts out of the failure notification.
+    if (options?.skipCancelCallbacks !== true) {
+      for (const callbacks of removal.callbacks) {
+        this.notifyQueuedMessageCleared(callbacks, cancelReason);
+      }
     }
     return removal.removedCount;
   }

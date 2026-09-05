@@ -18747,6 +18747,7 @@ describe("TaskService", () => {
         agentInitiated: true,
         startStreamInBackground: true,
         queueDedupeKey: "agent-report:child-progress:progress-1",
+        promoteAheadOfHiddenTurnEnd: true,
       })
     );
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
@@ -18795,7 +18796,10 @@ describe("TaskService", () => {
     expect(removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
       parentId,
       `agent-report:${childId}:`,
-      { cancelReason: "Incremental sub-agent update superseded by the terminal report." }
+      {
+        cancelReason: "Incremental sub-agent update superseded by the terminal report.",
+        skipCancelCallbacks: true,
+      }
     );
   });
 
@@ -28655,14 +28659,106 @@ describe("TaskService", () => {
     await taskService.reportAgentProgress(childTaskId, "progress-call", {
       reportMarkdown: "The regression is in the effect cleanup path.",
     });
-    expect(
-      sendMessage.mock.calls.some(
-        (call) =>
-          call[0] === parentWorkspaceId &&
-          typeof call[1] === "string" &&
-          call[1].includes("effect cleanup path")
-      )
-    ).toBe(true);
+    const progressSend = sendMessage.mock.calls.find(
+      (call) =>
+        call[0] === parentWorkspaceId &&
+        typeof call[1] === "string" &&
+        call[1].includes("effect cleanup path")
+    );
+    assert(progressSend, "progress report must wake the continuation owner");
+    // Execution-scoped key: this continuation's settlement drops exactly its own queued
+    // updates, and the report may overtake hidden turn-end predecessors in the owner's queue.
+    expect(progressSend[3]).toMatchObject({
+      queueDedupeKey: `agent-report:${childTaskId}:wst_reactivatehandle:progress-call`,
+      removableQueueDedupeKey: true,
+      promoteAheadOfHiddenTurnEnd: true,
+    });
+  });
+
+  test("continuation settlement drops that execution's queued progress before waiters resolve", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["settlehandle", "settleturn"]);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-settled-progress";
+    const childTaskId = "child-settled-progress";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          title: "Mobile UI Engineer",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(1));
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage,
+      removeQueuedMessagesByDedupeKeyPrefix,
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const reactivated = await taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      childTaskId,
+      "Implement the transcript refinements.",
+      "tool-end"
+    );
+    expect(reactivated.success).toBe(true);
+    const handleId = "wst_settlehandle";
+    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+      .taskHandleStore;
+    const activeRecord = await taskHandleStore.getWorkspaceTurn(parentWorkspaceId, handleId);
+    assert(activeRecord, "reactivated workspace-turn record is required");
+
+    let removalsWhenWaiterResolved = -1;
+    const waiter = workspaceTurnManagerFor(taskService)
+      .waitForWorkspaceTurn(handleId, {
+        requestingWorkspaceId: parentWorkspaceId,
+        ownerWorkspaceId: parentWorkspaceId,
+        timeoutMs: 5_000,
+      })
+      .then((result) => {
+        removalsWhenWaiterResolved = removeQueuedMessagesByDedupeKeyPrefix.mock.calls.length;
+        return result;
+      });
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "reactivated-final",
+      metadata: {
+        model: "anthropic:claude-sonnet-4-6",
+        finishReason: "stop",
+        muxMetadata: workspaceTurnMuxMetadata(parentWorkspaceId, handleId, activeRecord.turnId),
+      },
+      parts: [{ type: "text", text: "Committed the transcript refinements." }],
+    });
+
+    expect(await waiter).toMatchObject({ reportMarkdown: "Committed the transcript refinements." });
+    expect(removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      `agent-report:${childTaskId}:${handleId}:`,
+      {
+        cancelReason: "Incremental sub-agent update superseded by the terminal report.",
+        skipCancelCallbacks: true,
+      }
+    );
+    // A parent whose task_await just returned must not be cut by a now-stale update.
+    expect(removalsWhenWaiterResolved).toBe(
+      removeQueuedMessagesByDedupeKeyPrefix.mock.calls.length
+    );
   });
 
   test("reawakened child stays active through compaction and settles from its correlated follow-up", async () => {

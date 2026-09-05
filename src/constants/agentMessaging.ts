@@ -28,6 +28,29 @@ export const MAX_QUEUED_PEER_MESSAGES_PER_TARGET = 10;
 export const AGENT_PEER_MESSAGE_DEDUPE_PREFIX = "agent-msg:";
 
 /**
+ * Queue dedupe-key prefix for incremental `agent_report` updates queued behind a busy parent.
+ * Full key: `agent-report:<child>:<toolCallId>` for a child's original run, or
+ * `agent-report:<child>:<executionId>:<toolCallId>` while a reawakened child runs as a
+ * workspace-turn continuation, so a terminal settlement can drop exactly the updates that
+ * execution superseded (a successor execution's updates keep their own prefix).
+ */
+export const AGENT_REPORT_PROGRESS_DEDUPE_PREFIX = "agent-report:";
+
+/** Prefix matching every queued incremental update from one child (optionally one execution). */
+export function agentReportProgressDedupePrefix(
+  childWorkspaceId: string,
+  executionId?: string
+): string {
+  return executionId == null
+    ? `${AGENT_REPORT_PROGRESS_DEDUPE_PREFIX}${childWorkspaceId}:`
+    : `${AGENT_REPORT_PROGRESS_DEDUPE_PREFIX}${childWorkspaceId}:${executionId}:`;
+}
+
+/** onCanceled reason for queued incremental updates dropped by the child's terminal outcome. */
+export const AGENT_REPORT_PROGRESS_SUPERSEDED_REASON =
+  "Incremental sub-agent update superseded by the terminal report.";
+
+/**
  * Max peer messages admitted for a target without any user-authored input or parent guidance in
  * between; at the cap the target is deemed to need user attention. Charged when a send is
  * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.
