@@ -250,6 +250,14 @@ describe("inferPhaseManifest", () => {
       phaseNames(legacyWorkflow(`const k = "__work" + "flowPhase"; log(Function); phase("a");`))
     ).toBeUndefined();
     expect(phaseNames(legacyWorkflow(`phase("a"); log(this);`))).toBeUndefined();
+    // Reflective route to the Function constructor.
+    expect(
+      phaseNames(
+        legacyWorkflow(
+          `await [].filter.constructor("return __work" + "flowPhase('hidden')")(); phase("visible");`
+        )
+      )
+    ).toBeUndefined();
   });
 
   test("bails on with statements, which resolve identifiers dynamically", () => {

@@ -172,7 +172,8 @@ export function inferPhaseManifest(source: string): WorkflowDeclaredPhase[] | un
   // walk never sees. Any reference into that namespace — by identifier, by a
   // string naming it (`globalThis["__workflowPhase"]`), or via a route to the
   // global object (`globalThis`, `this`, `Function`, direct or indirect `eval`,
-  // which can also read or rebind the lexical `phase`) — voids inference.
+  // which can also read or rebind the lexical `phase`, or any `constructor`
+  // access, which reaches Function reflectively) — voids inference.
   if (referencesRuntimeInternals(ts, sourceFile)) {
     return undefined;
   }
@@ -379,8 +380,9 @@ function mentionsIdentifier(ts: TypeScriptModule, root: ts.Node, name: string): 
 
 const RUNTIME_INTERNAL_PREFIXES = ["__workflow", "__mux"];
 // `eval` in ANY position: direct eval sees the lexical `phase` binding, and
-// indirect eval (`(0, eval)("this")`) returns the global object.
-const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function", "eval"]);
+// indirect eval (`(0, eval)("this")`) returns the global object. `constructor`
+// reaches the Function constructor reflectively (`[].filter.constructor(src)`).
+const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function", "eval", "constructor"]);
 
 function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
   const namesInternal = (text: string): boolean =>

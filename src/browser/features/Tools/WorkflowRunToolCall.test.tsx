@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/require-await */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -2150,6 +2150,77 @@ describe("WorkflowRunToolCall", () => {
     fireEvent.click(getWorkflowHeader(view));
     await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
     expect(getRun).toHaveBeenCalledTimes(1);
+  });
+
+  test("retries pre-upgrade manifest hydration on the next expand after a failed fetch", async () => {
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade_retry",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source:
+        'export const meta = { phases: [{ name: "scope" }, { name: "later", label: "Later phase" }] };\n' +
+        'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:pre-upgrade-retry",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "later", label: "Later phase" }],
+        },
+      },
+    };
+    let calls = 0;
+    const getRun = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("transient");
+      }
+      return hydrated;
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const view = render(
+        <APIHarness client={{ workflows: { getRun } }}>
+          <ThemeProvider forcedTheme="dark">
+            <TooltipProvider>
+              <WorkflowRunToolCall
+                args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+                status="completed"
+                result={{
+                  status: "completed",
+                  runId: legacySnapshot.id,
+                  result: { reportMarkdown: "ok" },
+                  run: legacySnapshot,
+                }}
+                workspaceId={TEST_WORKSPACE_ID}
+              />
+            </TooltipProvider>
+          </ThemeProvider>
+        </APIHarness>
+      );
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(calls).toBe(1));
+      expect(view.queryByText("Later phase")).toBeNull();
+      // A failed attempt must not retire the fetch: collapsing and re-expanding retries.
+      fireEvent.click(getWorkflowHeader(view));
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(view.getByText("Later phase")).toBeTruthy());
+      expect(calls).toBe(2);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   test("does not fetch for snapshots already hydrated to an explicit null manifest", async () => {

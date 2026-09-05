@@ -145,9 +145,16 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
     try {
       const token = readStaticObjectKey(source, index);
       if (token.value === key) return true;
+      // A bare identifier followed by another key token or `(` is property
+      // syntax the strict parser never accepts (`get phases() {}`, `async
+      // phases() {}`, `phases() {}`, `*phases() {}`): the real key comes next,
+      // so conservatively count it as "may declare".
+      const next = skipStaticWhitespace(masked, token.end);
+      if (masked[next] !== ":" && masked[next] !== "," && masked[next] !== "}") return true;
       index = token.end - 1;
     } catch {
-      // Dynamic or otherwise unreadable key: skip to the next top-level comma.
+      // Dynamic or otherwise unreadable key (`*gen() {}` etc.): may declare anything.
+      return true;
     }
   }
   return false;

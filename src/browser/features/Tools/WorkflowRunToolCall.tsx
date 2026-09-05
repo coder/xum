@@ -1680,7 +1680,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     ) {
       return;
     }
-    manifestHydrationAttemptedFor.current = runId;
 
     let ignore = false;
     const refresh = async () => {
@@ -1690,6 +1689,9 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
           runId,
         });
         if (!ignore && nextRun != null) {
+          // Only a delivered hydrated record retires the manifest fetch; a
+          // rejection or null leaves it eligible for the next expand.
+          manifestHydrationAttemptedFor.current = runId;
           setRefreshedRun((current) => getNewestWorkflowRunSnapshot(current, nextRun));
         }
       } catch (error) {

@@ -147,6 +147,10 @@ describe("parseDeclaredPhasesFromSource", () => {
       "export const meta = { pha\\u0073es: buildPhases() };\n",
       // Parses, but a `__proto__` key makes the value a non-plain object.
       'export const meta = { __proto__: {}, phases: [{ name: "setup" }] };\n',
+      // Accessor / method / generator property syntax the strict parser never accepts.
+      "export const meta = { get phases() { return buildPhases(); } };\n",
+      'export const meta = { description: "x", async phases() { return []; } };\n',
+      "export const meta = { *phases() {} };\n",
     ]) {
       const source = declaration + body;
       try {
