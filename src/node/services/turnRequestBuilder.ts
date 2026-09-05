@@ -2559,6 +2559,8 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
+          contextBudgetMemoryWritable:
+            memoryAccess.workspace === "readwrite" && attemptTools.memory !== undefined,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
@@ -2889,6 +2891,7 @@ export class TurnRequestBuilder {
                 messages: nextRequest.messages,
                 system: nextRequest.engineSystem,
                 tools: nextRequest.engineTools,
+                contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
                 providerOptions: nextRequest.providerOptions,
                 headers: nextHeaders,
                 callSettingsOverrides: nextRequest.resolvedOverrides.standard,
@@ -2972,6 +2975,7 @@ export class TurnRequestBuilder {
       messageId: assistantMessageId,
       abortSignal: combinedAbortSignal,
       tools: toolsForStream,
+      contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
       initialMetadata: {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         systemMessageTokens,
