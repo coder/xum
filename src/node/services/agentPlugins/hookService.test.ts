@@ -1,3 +1,11 @@
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
+import { summarizeContinuousCompaction } from "../continuousCompactionSummary";
+import { createAgentSessionHarness } from "../agentSession.testHarness";
+import { attachLanguageModelCleanup } from "../languageModelCleanup";
+import { createMuxMessage } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 /**
  * QuickJS-heavy integration tests for Tier-1 sandboxed plugin hooks: real
  * hooks.js files, real sandbox mounts, real spine middleware. Runs in an
@@ -7,12 +15,13 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   EventSpine,
+  eventSpine,
   type RequestAssembleContext,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
@@ -28,7 +37,11 @@ import {
 } from "@/node/services/replay/replayFixture";
 import { collectFullHistory, replayVerifySession } from "@/node/services/replay/replayVerify";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { AgentPluginHookService, readHookSourceCapped } from "./hookService";
+import {
+  AgentPluginHookService,
+  agentPluginHookService,
+  readHookSourceCapped,
+} from "./hookService";
 import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 
@@ -51,13 +64,16 @@ interface Harness {
 
 const harnesses: Harness[] = [];
 
-async function createHarness(opts?: { hookTimeoutMs?: number }): Promise<Harness> {
+async function createHarness(opts?: {
+  hookTimeoutMs?: number;
+  spine?: EventSpine;
+}): Promise<Harness> {
   const tmp = new DisposableTempDir("plugin-hooks");
   const container = path.join(tmp.path, "plugins");
   const sessionDir = path.join(tmp.path, "session");
   await fs.mkdir(container, { recursive: true });
   await fs.mkdir(sessionDir, { recursive: true });
-  const spine = new EventSpine();
+  const spine = opts?.spine ?? new EventSpine();
   const sandboxHost = new SandboxHostService();
   const journal = new DurableEventJournal(sessionDir);
   const service = new AgentPluginHookService({
@@ -325,6 +341,146 @@ describe("AgentPluginHookService", () => {
     const result = ctx.result as { ok: boolean; hook_output?: string };
     expect(result.ok).toBe(true);
     expect(result.hook_output).toBe("[plugin:auditor] observed ok=true");
+  });
+
+  test.each([
+    "enabled",
+    "disabled",
+    "abort-after-load",
+    "abort-after-assembly",
+    "assembly-error",
+  ] as const)("headless compaction shares the plugin policy lifecycle: %s", async (mode) => {
+    const enabled = mode !== "disabled";
+    const controller = new AbortController();
+    const harness = await createHarness({ spine: eventSpine });
+    const h = await createAgentSessionHarness({
+      workspaceId: WORKSPACE_ID,
+      aiServiceOverrides: { isAgentPluginsEnabled: () => enabled },
+    });
+    const policy = "Do not disclose repository secrets in summaries.";
+    await writeHookPlugin(
+      harness.container,
+      "summary-policy",
+      `({ "request.assemble": () => ({ context: ${JSON.stringify(policy)} }) })`
+    );
+    const ensure = spyOn(agentPluginHookService, "ensureWorkspaceHooks").mockImplementation(
+      async (args) => {
+        await harness.service.ensureWorkspaceHooks(args);
+        if (mode === "abort-after-load") controller.abort();
+      }
+    );
+    const removeMiddleware = eventSpine.useAfter("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== WORKSPACE_ID) return;
+      if (mode === "abort-after-assembly" || mode === "assembly-error") {
+        expect(ctx.systemMessage).toContain(policy);
+        if (mode === "assembly-error") throw new Error("Assembly policy rejected request");
+        controller.abort();
+      }
+    });
+    const subProjectPath = path.join(h.config.rootDir, "subproject");
+    await fs.mkdir(subProjectPath, { recursive: true });
+    const metadata = spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: WORKSPACE_ID,
+        name: h.config.rootDir,
+        projectName: "test",
+        projectPath: h.config.rootDir,
+        subProjectPath,
+        runtimeConfig: { type: "local" },
+      })
+    );
+    const requests: LanguageModelV3CallOptions[] = [];
+    const cleanup = mock(() => undefined);
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "summary" },
+              {
+                type: "text-delta",
+                id: "summary",
+                delta: "Sanitized summary of the investigation.",
+              },
+              { type: "text-end", id: "summary" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 20, noCache: 20, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 5, text: 5, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        });
+      },
+    });
+    attachLanguageModelCleanup(sdkModel, cleanup);
+    const create = spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
+      Ok({ model: sdkModel, metadataModel: "openai:gpt-4o" })
+    );
+    const record = mock(() => Promise.resolve(undefined));
+    try {
+      expect(ensure).not.toHaveBeenCalled();
+      const result = await summarizeContinuousCompaction({
+        workspaceId: WORKSPACE_ID,
+        config: h.config,
+        aiService: h.aiService,
+        sessionUsageService: { recordHeadlessUsage: record },
+        head: [createMuxMessage("head", "user", "Summarize the investigation")],
+        signal: controller.signal,
+        context: {
+          enabled: true,
+          model: "openai:gpt-4o",
+          contextWindowTokens: 128_000,
+          thresholdPercent: 70,
+        },
+        baseOptions: { model: "openai:gpt-4o", agentId: "exec" },
+        compactOptions: { model: "openai:gpt-4o", agentId: "compact" },
+      }).then(
+        (data) => ({ success: true as const, data }),
+        (error: unknown) => ({ success: false as const, error })
+      );
+      expect(ensure).toHaveBeenCalledTimes(1);
+      expect(ensure.mock.calls[0][0]).toMatchObject({
+        projectRoot: h.config.rootDir,
+        projectTrusted: false,
+        enabled,
+      });
+      if (mode !== "enabled" && mode !== "disabled") {
+        expect(result.success).toBe(false);
+        if (result.success) throw new Error("Canceled or failed assembly published a summary");
+        expect(result.error).toBeInstanceOf(Error);
+        expect(requests).toHaveLength(0);
+        expect(record).not.toHaveBeenCalled();
+        expect(cleanup).toHaveBeenCalledTimes(mode === "abort-after-load" ? 0 : 1);
+        expect(create).toHaveBeenCalledTimes(mode === "abort-after-load" ? 0 : 1);
+        return;
+      }
+      if (!result.success) throw result.error;
+      expect(result.data?.text).toContain("Sanitized summary");
+      expect(requests).toHaveLength(1);
+      expect(
+        requests[0].prompt.some(
+          (message) => message.role === "system" && message.content.includes(policy)
+        )
+      ).toBe(enabled);
+      const journal = sharedDurableEventJournal(path.join(h.config.sessionsDir, WORKSPACE_ID));
+      const rows = await journal.read();
+      expect(rows.filter((row) => row.kind === "hook-context")).toHaveLength(enabled ? 1 : 0);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      removeMiddleware();
+      ensure.mockRestore();
+      metadata.mockRestore();
+      create.mockRestore();
+      await harness.service.disposeWorkspace(WORKSPACE_ID);
+      h.session.dispose();
+      await h.cleanup();
+    }
   });
 
   test("request.assemble context is journaled as a hook-context row, then applied", async () => {

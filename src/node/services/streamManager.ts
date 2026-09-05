@@ -2367,14 +2367,17 @@ export class StreamManager {
   }
 
   private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
-    const index = messages.findIndex(
+    // Providers can reuse IDs across turns. Only the newest assistant call is
+    // the live anchor; its following tool-result must never win this lookup.
+    const index = messages.findLastIndex(
       (message) =>
+        message.role === "assistant" &&
         Array.isArray(message.content) &&
         message.content.some(
-          (part) => "toolCallId" in part && part.toolCallId === swap.firstTailToolCallId
+          (part) => part.type === "tool-call" && part.toolCallId === swap.firstTailToolCallId
         )
     );
-    if (index < 0 || messages[index].role !== "assistant") {
+    if (index < 0) {
       log.warn("[continuous-compaction] prefix locator missing; retaining full context");
       return null;
     }

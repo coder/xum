@@ -174,12 +174,21 @@ export class AgentPluginHookService {
     this.computeContainers = deps.computeContainers ?? computeAgentPluginContainers;
   }
 
+  /** Normal and headless requests share the same broken-plugin isolation posture. */
+  async ensureWorkspaceHooksForRequest(args: EnsureWorkspaceHooksArgs): Promise<void> {
+    try {
+      await this.ensureWorkspaceHooks(args);
+    } catch (error) {
+      log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
+    }
+  }
+
   /**
    * Reconcile the workspace's registered plugin hooks with what discovery
    * finds on disk. Cheap when nothing changed (fingerprint over hooks.js
    * sources + grants); loads sandbox mounts and (re)registers spine middleware
-   * only on change. Callers wrap this in try/catch: a broken plugin system
-   * must never block a send.
+   * only on change. Request callers use ensureWorkspaceHooksForRequest to
+   * isolate discovery failures: a broken plugin system must never block a send.
    */
   async ensureWorkspaceHooks(args: EnsureWorkspaceHooksArgs): Promise<void> {
     await using _guard = await this.lockFor(args.workspaceId).acquire();

@@ -1,3 +1,9 @@
+import * as path from "node:path";
+import { agentPluginHookService } from "./agentPlugins/hookService";
+import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
+import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { streamText, wrapLanguageModel } from "ai";
@@ -17,7 +23,10 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import type { Config } from "@/node/config";
-import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
+import {
+  createRuntimeContextForWorkspace,
+  resolveWorkspaceRootPath,
+} from "@/node/runtime/runtimeHelpers";
 import type { AgentSessionAIService } from "./agentSession";
 import { resolveAgentForStream } from "./agentResolution";
 import {
@@ -69,6 +78,21 @@ export async function summarizeContinuousCompaction(args: {
   if (!metadata.success) throw new Error(metadata.error);
   args.signal.throwIfAborted();
   const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata.data);
+  const pluginContext = resolveAgentPluginsMcpContext(
+    metadata.data,
+    resolveWorkspaceRootPath(metadata.data, runtime)
+  );
+  const sessionDir = path.join(args.config.sessionsDir, args.workspaceId);
+  await agentPluginHookService.ensureWorkspaceHooksForRequest({
+    workspaceId: args.workspaceId,
+    sessionDir,
+    journal: sharedDurableEventJournal(sessionDir),
+    enabled: args.aiService.isAgentPluginsEnabled?.() === true,
+    xumHome: args.config.rootDir,
+    projectRoot: pluginContext?.projectRoot,
+    projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
+  });
+  args.signal.throwIfAborted();
   const agent = await resolveAgentForStream({
     workspaceId: args.workspaceId,
     metadata: metadata.data,
@@ -120,6 +144,16 @@ export async function summarizeContinuousCompaction(args: {
       content: `${buildCompactionMessageText({})}\nThe most recent steps remain verbatim after this summary.`,
     });
     args.signal.throwIfAborted();
+    const assembleContext: RequestAssembleContext = {
+      workspaceId: args.workspaceId,
+      modelString,
+      systemMessage: system,
+      tools: {},
+    };
+    if (eventSpine.hasMiddleware("request.assemble")) {
+      await eventSpine.run("request.assemble", assembleContext);
+    }
+    args.signal.throwIfAborted();
     assert(
       typeof created.data.model !== "string",
       "Pinned model creation must return a model instance"
@@ -140,7 +174,8 @@ export async function summarizeContinuousCompaction(args: {
           },
         },
       }),
-      system,
+      system: assembleContext.systemMessage,
+      tools: Object.keys(assembleContext.tools).length > 0 ? assembleContext.tools : undefined,
       messages,
       abortSignal: args.signal,
       providerOptions: buildProviderOptions(

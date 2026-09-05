@@ -217,6 +217,40 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
   });
 
+  it("anchors the newest assistant tool call when IDs repeat across turns, not its tool result", async () => {
+    const { run, swap } = await setup();
+    const currentTail: ai.ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Current live step" },
+          { type: "tool-call", toolCallId: "keep", toolName: "bash", input: { step: "current" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "keep",
+            toolName: "bash",
+            output: { type: "text", value: "Current result" },
+          },
+        ],
+      },
+    ];
+    const messages = [
+      ...originalMessages,
+      { role: "user" as const, content: "New turn after obsolete head" },
+      ...currentTail,
+    ];
+    const result = await run(messages);
+    assert(result?.messages, "Expected a prefix swap at the live step");
+    expect(result.messages.slice(swap.prefix.length)).toEqual(currentTail);
+    expect(JSON.stringify(result.messages)).not.toContain("kept output");
+    expect(JSON.stringify(result.messages)).not.toContain("New turn after obsolete head");
+  });
+
   it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
     const { run, tracker, store, swap } = await setup();
     const committed = createMuxMessage("committed", "assistant", "", {
@@ -614,6 +648,17 @@ describe("continuous prefix prepareStep and journal", () => {
           },
           { type: "text", text: "refused response after swap" },
         ];
+        const obsolete = createMuxMessage("obsolete-assistant", "assistant", "");
+        obsolete.parts = [
+          {
+            type: "dynamic-tool",
+            toolCallId: "keep",
+            toolName: "bash",
+            state: "output-available",
+            input: { obsolete: true },
+            output: { result: "obsolete result" },
+          },
+        ];
         const payload = await assemblePromptPayload({
           ...swap.journal.preparation,
           modelString: nextModel,
@@ -625,6 +670,8 @@ describe("continuous prefix prepareStep and journal", () => {
           anthropicCacheTtl: "1h",
           workspaceId,
           history: [
+            createMuxMessage("obsolete-user", "user", "Obsolete turn"),
+            obsolete,
             ...(committed
               ? [createMuxMessage("earlier-prompt", "user", "earlier request"), committed]
               : []),
@@ -638,7 +685,7 @@ describe("continuous prefix prepareStep and journal", () => {
             ? { anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } } }
             : undefined;
         if (sliced) {
-          const containing = preparedMessages.find(
+          const containing = preparedMessages.findLast(
             (message) =>
               message.role === "assistant" &&
               JSON.stringify(message.content).includes('"toolCallId":"keep"')
@@ -728,6 +775,7 @@ describe("continuous prefix prepareStep and journal", () => {
         );
         if (consumed && family === "anthropic" && !sliced && mode !== "journal-failure") {
           expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
+          expect(JSON.stringify(stream.request.messages)).not.toContain("obsolete result");
           const systems = preparedMessages.filter((message) => message.role === "system");
           expect(stream.request.messages.filter((message) => message.role === "system")).toEqual(
             systems
