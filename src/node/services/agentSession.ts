@@ -4836,14 +4836,23 @@ export class AgentSession {
       // Snapshot/payload rows are part of the accepted request, not just its
       // fixed trigger. Preserve their roles and rebind server-owned ID references.
       const preludeIds = new Set(user.metadata?.requestPreludeMessageIds ?? []);
-      const requestPrelude = [...preludeIds].map((id) => {
+      const requestPrelude = [...preludeIds].flatMap((id) => {
         const row = history.data.findLast((message) => message.id === id);
-        assert(row, "accepted request prelude must remain in its active window");
-        assert(
-          isSyntheticSnapshotUserMessage(row) ||
-            (row.role === "assistant" && row.metadata?.synthetic === true),
-          "request prelude must preserve snapshot or assistant provenance"
-        );
+        // Tolerant history parsing can drop a damaged snapshot or payload while
+        // retaining its trigger. Don't let stale references prevent recovery.
+        if (
+          !id ||
+          !row ||
+          !(
+            isSyntheticSnapshotUserMessage(row) ||
+            (row.role === "assistant" && row.metadata?.synthetic === true)
+          )
+        ) {
+          log.warn("Skipping damaged context-budget request prelude", {
+            workspaceId: this.workspaceId,
+          });
+          return [];
+        }
         const newId = randomUUID();
         continuation.parts = continuation.parts.map((part) =>
           part.type === "text" ? { ...part, text: part.text.replaceAll(id, newId) } : part
@@ -6300,9 +6309,7 @@ export class AgentSession {
           streamResult.error.model,
           streamResult.error.estimate
         );
-        if (!rolled.success)
-          return await this.handleStreamWithHistoryFailure(rolled.error, acpPromptId);
-        if (rolled.data) {
+        if (rolled.success && rolled.data) {
           return this.streamWithHistory(
             streamResult.error.model,
             options,
@@ -6316,6 +6323,24 @@ export class AgentSession {
             true
           );
         }
+        // This row passed send-time admission but never fit the final request.
+        // Keep it visible without poisoning subsequent sends (including after restart).
+        if (lastUserMessage) {
+          const rejected: MuxMessage = {
+            ...lastUserMessage,
+            metadata: { ...lastUserMessage.metadata, contextBudgetRejected: true },
+          };
+          const updated = await this.historyService.updateHistory(this.workspaceId, rejected);
+          if (!updated.success) {
+            return await this.handleStreamWithHistoryFailure(
+              createUnknownSendMessageError(updated.error),
+              acpPromptId
+            );
+          }
+          this.emitChatEvent({ ...rejected, type: "message" });
+        }
+        if (!rolled.success)
+          return await this.handleStreamWithHistoryFailure(rolled.error, acpPromptId);
         return await this.handleStreamWithHistoryFailure(
           {
             type: "context_budget_blocked",

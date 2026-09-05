@@ -103,16 +103,18 @@ describe("AgentSession token-budget lifecycle", () => {
 
   async function setup(args?: {
     previous?: AgentSessionHarness;
-    failure?: (attempt: number) => SendMessageError | undefined;
+    failure?: (
+      attempt: number
+    ) => SendMessageError | undefined | Promise<SendMessageError | undefined>;
   }) {
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
     const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
-    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(async (request) => {
       requests.push(request);
       if (requests.length === 2) secondRequest.resolve(request);
-      const error = args?.failure?.(requests.length);
-      if (error) return Promise.resolve(Err(error));
+      const error = await args?.failure?.(requests.length);
+      if (error) return Err(error);
       h.aiEmitter.emit("stream-start", {
         type: "stream-start",
         workspaceId,
@@ -776,6 +778,94 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(providerRows.some((row) => row.id === rejected!.id)).toBe(false);
       expect(providerRows.some((row) => text(row) === "Short replacement")).toBe(true);
       expect(rolloverRows(rows)).toHaveLength(0);
+    }
+  );
+
+  test.each(["auto-off", "fresh", "retry", "on-send", "history-disabled"])(
+    "terminal assembled-budget rejection stays display-only after restart (%s)",
+    async (mode) => {
+      const h = await setup({
+        failure: (attempt) => (attempt <= (mode === "retry" ? 2 : 1) ? exceeded : undefined),
+      });
+      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
+      if (mode !== "fresh") await seedHistory(h, mode === "on-send" ? 110_000 : 20_000);
+      const sendOptions: SendMessageOptions =
+        mode === "history-disabled"
+          ? { ...options, toolPolicy: [{ regex_match: "session_.*", action: "disable" }] }
+          : options;
+      const rejectedText = "Fits cheap preflight but overflows after assembly";
+      expect(await h.session.sendMessage(rejectedText, sendOptions)).toMatchObject({
+        success: false,
+        error: { type: "context_budget_blocked" },
+      });
+      expect(h.requests).toHaveLength(mode === "retry" ? 2 : 1);
+      const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
+      const rejected = active.findLast((row) => text(row) === rejectedText);
+      expect(rejected).toBeDefined();
+      expect(
+        prepareProviderRequestMessages([MuxMessageSchema.parse(rejected!)], "openai", "off")
+          .providerRequestMessages
+      ).toHaveLength(0);
+      h.session.dispose();
+      const resumed = await setup({ previous: h });
+      expect((await resumed.session.sendMessage("Short replacement", options)).success).toBe(true);
+      const providerRows = prepareProviderRequestMessages(
+        resumed.requests[0].messages,
+        "openai",
+        "off"
+      ).providerRequestMessages;
+      expect(providerRows.some((row) => text(row) === rejectedText)).toBe(false);
+      expect(providerRows.some((row) => text(row) === "Short replacement")).toBe(true);
+    }
+  );
+
+  test.each(["missing-payload", "old-user"])(
+    "emergency rollover skips damaged prelude reference %s and keeps valid payloads",
+    async (damagedId) => {
+      const h = await setup({
+        failure: async (attempt) => {
+          if (attempt !== 1) return undefined;
+          const user = (await allRows(h)).at(-1)!;
+          expect(
+            (
+              await h.historyService.updateHistory(workspaceId, {
+                ...user,
+                metadata: {
+                  ...user.metadata,
+                  requestPreludeMessageIds: [
+                    ...(user.metadata?.requestPreludeMessageIds ?? []),
+                    damagedId,
+                  ],
+                },
+              })
+            ).success
+          ).toBe(true);
+          return exceeded;
+        },
+      });
+      await seedHistory(h, 20_000);
+      const payload = createMuxMessage("valid-payload", "assistant", "Accepted peer content", {
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: { type: "family-message" },
+      });
+      expect(
+        (
+          await h.session.sendMessage(`Read assistant message ${payload.id}`, options, {
+            synthetic: true,
+            agentInitiated: true,
+            preTurnMessages: [payload],
+          })
+        ).success
+      ).toBe(true);
+      expect(h.requests).toHaveLength(2);
+      const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
+      const copied = active.find((row) => text(row) === "Accepted peer content")!;
+      expect(copied.role).toBe("assistant");
+      expect(active.at(-1)?.metadata?.requestPreludeMessageIds).toEqual([copied.id]);
+      expect(text(active.at(-1)!)).toContain(copied.id);
+      expect(active.some((row) => row.id === damagedId)).toBe(false);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
     }
   );
 
