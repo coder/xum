@@ -83,6 +83,19 @@ export type WorkflowPhaseManifestOutcome =
 const outcomeBySourceHash = new LRUCache<string, WorkflowPhaseManifestOutcome>({ max: 4096 });
 
 /**
+ * Hard bound on the cached/wire `warning`. parseDeclaredPhases already caps its
+ * enumerated issues (WORKFLOW_PHASE_ISSUES_MAX × bounded messages ≈ 6 KB), so a
+ * clip here should never trigger; it exists so an attacker-controlled script
+ * discovered from a trusted project can never grow a memoized entry — or the
+ * renderer payload that repeats it per script — past a few kilobytes.
+ */
+const WARNING_MAX_LENGTH = 8192;
+
+function boundWarning(message: string): string {
+  return message.length > WARNING_MAX_LENGTH ? `${message.slice(0, WARNING_MAX_LENGTH)}…` : message;
+}
+
+/**
  * Resolve the phase manifest for a workflow source. Never throws: invalid
  * declarations are reported as `kind: "invalid"`, everything else degrades to
  * `kind: "none"`. Results (including negative ones) are memoized by sourceHash.
@@ -110,7 +123,7 @@ function computePhaseManifestOutcome(source: string): WorkflowPhaseManifestOutco
     log.debug(
       `workflowPhaseManifest: invalid meta.phases ignored on read: ${getErrorMessage(error)}`
     );
-    return { kind: "invalid", warning: getErrorMessage(error) };
+    return { kind: "invalid", warning: boundWarning(getErrorMessage(error)) };
   }
   if (declared != null) {
     return {

@@ -4,6 +4,7 @@ import {
   parseDeclaredPhases,
   parseDeclaredPhasesFromSource,
   parseWorkflowMetadata,
+  WORKFLOW_PHASE_ISSUES_MAX,
   WorkflowDeclaredPhasesValidationError,
 } from "./workflowMetadata";
 
@@ -88,6 +89,37 @@ export default function workflow({ phase }) { phase("a"); phase("b"); return {};
         "meta.phases[4].parallel must be a boolean",
       ]
     );
+  });
+
+  test("bounds the enumerated diagnostics for hostile declarations", () => {
+    // Discovery scans attacker-controlled scripts: neither entry count nor key
+    // count nor key length may grow the error (and thus the cached/wire
+    // warning) without bound.
+    const collect = (metadata: Record<string, unknown>): WorkflowDeclaredPhasesValidationError => {
+      try {
+        parseDeclaredPhases(metadata);
+        return expect.unreachable("must reject");
+      } catch (error) {
+        expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
+        return error as WorkflowDeclaredPhasesValidationError;
+      }
+    };
+
+    const manyScalars = collect({ phases: Array.from({ length: 50_000 }, () => 0) });
+    expect(manyScalars.issues).toHaveLength(WORKFLOW_PHASE_ISSUES_MAX + 1);
+    expect(manyScalars.issues[0]).toContain("at most 64 phases");
+    // Only the first 64 entries are inspected: 1 count issue + 64 entry issues
+    // → 32 recorded + "… and 33 more".
+    expect(manyScalars.issues.at(-1)).toBe("… and 33 more issue(s)");
+    expect(manyScalars.issues.some((issue) => issue.includes("meta.phases[64]"))).toBe(false);
+
+    const longKey = "k".repeat(10_000);
+    const manyKeys = collect({
+      phases: [Object.fromEntries(Array.from({ length: 5_000 }, (_, i) => [`${longKey}${i}`, 1]))],
+    });
+    expect(manyKeys.issues).toHaveLength(WORKFLOW_PHASE_ISSUES_MAX + 1);
+    expect(manyKeys.message.length).toBeLessThan(WORKFLOW_PHASE_ISSUES_MAX * 200);
+    expect(manyKeys.issues[0]).toContain(`"${"k".repeat(40)}…"`);
   });
 
   test("rejects invalid label and over-length description", () => {

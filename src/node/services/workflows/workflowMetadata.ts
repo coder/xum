@@ -46,6 +46,42 @@ export class WorkflowDeclaredPhasesValidationError extends Error {
 const DECLARED_PHASE_KNOWN_KEYS = new Set(["name", "label", "description", "parallel"]);
 
 /**
+ * Diagnostics are enumerated for the author, but the declaration is attacker-
+ * controlled on the discovery path (a trusted project's workflows/ directory is
+ * scanned automatically): a valid ~1 MiB script can hold ~500k scalar phase
+ * entries or one phase object with ~100k unknown keys, each of which would emit
+ * a diagnostic that is then memoized and shipped to the renderer. Only the first
+ * WORKFLOW_DECLARED_PHASES_MAX entries are inspected, at most this many issues
+ * are recorded (plus one "… and N more" line), and echoed key names are clipped,
+ * so the error message — and therefore the cached/wire warning — stays bounded.
+ */
+export const WORKFLOW_PHASE_ISSUES_MAX = 32;
+const ECHOED_KEY_MAX_LENGTH = 40;
+
+class BoundedIssueList {
+  private readonly issues: string[] = [];
+  private overflow = 0;
+
+  push(issue: string): void {
+    if (this.issues.length >= WORKFLOW_PHASE_ISSUES_MAX) {
+      this.overflow += 1;
+      return;
+    }
+    this.issues.push(issue);
+  }
+
+  toArray(): string[] {
+    return this.overflow > 0
+      ? [...this.issues, `… and ${this.overflow} more issue(s)`]
+      : [...this.issues];
+  }
+}
+
+function clipEchoedKey(key: string): string {
+  return key.length > ECHOED_KEY_MAX_LENGTH ? `${key.slice(0, ECHOED_KEY_MAX_LENGTH)}…` : key;
+}
+
+/**
  * Read and validate `meta.phases` straight from workflow source. This is the
  * entry point for run creation and read-path hydration.
  *
@@ -110,7 +146,7 @@ export function parseDeclaredPhases(
     return undefined;
   }
 
-  const issues: string[] = [];
+  const issues = new BoundedIssueList();
   if (!Array.isArray(rawPhases)) {
     throw new WorkflowDeclaredPhasesValidationError(["meta.phases must be an array"]);
   }
@@ -123,15 +159,19 @@ export function parseDeclaredPhases(
 
   const phases: WorkflowDeclaredPhase[] = [];
   const seenNames = new Set<string>();
-  rawPhases.forEach((rawPhase, index) => {
+  // Entries past the cap can never be accepted, so they are not inspected (see
+  // WORKFLOW_PHASE_ISSUES_MAX). The inspected window is still walked in full —
+  // work is bounded by the source the parser already read — so the overflow
+  // count in the trailing "… and N more" line is exact for that window.
+  for (const [index, rawPhase] of rawPhases.slice(0, WORKFLOW_DECLARED_PHASES_MAX).entries()) {
     const where = `meta.phases[${index}]`;
     if (!isPlainObject(rawPhase)) {
       issues.push(`${where} must be an object`);
-      return;
+      continue;
     }
     for (const key of Object.keys(rawPhase)) {
       if (!DECLARED_PHASE_KNOWN_KEYS.has(key)) {
-        issues.push(`${where} has unknown key "${key}"`);
+        issues.push(`${where} has unknown key "${clipEchoedKey(key)}"`);
       }
     }
     const name = validateBoundedString(
@@ -175,10 +215,11 @@ export function parseDeclaredPhases(
         ...(typeof rawPhase.parallel === "boolean" ? { parallel: rawPhase.parallel } : {}),
       });
     }
-  });
+  }
 
-  if (issues.length > 0) {
-    throw new WorkflowDeclaredPhasesValidationError(issues);
+  const collected = issues.toArray();
+  if (collected.length > 0) {
+    throw new WorkflowDeclaredPhasesValidationError(collected);
   }
   // Second-algorithm check: the wire schema must accept everything the manual
   // validator accepted, so the two cannot drift.
@@ -189,7 +230,7 @@ function validateBoundedString(
   value: unknown,
   where: string,
   maxLength: number,
-  issues: string[]
+  issues: BoundedIssueList
 ): string | null {
   if (typeof value !== "string" || value.length === 0) {
     issues.push(`${where} must be a non-empty string`);

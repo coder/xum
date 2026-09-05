@@ -367,6 +367,20 @@ export default function workflow({ phase }) { phase("x"); return {}; }
     }
   });
 
+  test("a hostile declaration yields a bounded warning (memoized and sent to the renderer)", () => {
+    // A trusted project's workflows/ is discovered automatically; ~1 MiB of
+    // scalar phase entries must not become megabytes of cached warning text.
+    const source = `export const meta = { phases: [${"0,".repeat(200_000)}] };
+export default function workflow({ phase }) { phase("x"); return {}; }
+`;
+    const outcome = resolveWorkflowPhaseManifest(source, freshHash());
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind === "invalid") {
+      expect(outcome.warning).toContain("at most 64 phases");
+      expect(outcome.warning.length).toBeLessThan(8192);
+    }
+  });
+
   test("unparseable source degrades to none without throwing", () => {
     const outcome = resolveWorkflowPhaseManifest("this is not (valid js", freshHash());
     expect(outcome).toEqual({ kind: "none" });
