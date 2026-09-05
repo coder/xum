@@ -4963,10 +4963,15 @@ export class AgentSession {
     const lastAssistant = history.data.findLast(
       (row) => row.role === "assistant" && row.metadata?.contextUsage
     );
+    // History parsing is tolerant: discard corrupt counters at this boundary,
+    // while the final assembled-request preflight still enforces the hard limit.
+    const tokenCount = (value: unknown): number | undefined =>
+      isNonNegativeInteger(value) && Number.isSafeInteger(value) ? value : undefined;
     const usage = this.lastUsageState?.lastContextUsage;
-    const contextTokens = usage
-      ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
-      : 0;
+    const contextTokens =
+      (tokenCount(usage?.input.tokens) ?? 0) +
+      (tokenCount(usage?.cached.tokens) ?? 0) +
+      (tokenCount(usage?.cacheCreate.tokens) ?? 0);
     const userText = userMessage.parts
       .filter((part) => part.type === "text")
       .map((part) => part.text)
@@ -4975,7 +4980,7 @@ export class AgentSession {
     const decision = evaluateStepBudget({
       contextTokens:
         contextTokens + estimateFreshRequestTokens({ userText, attachments, systemFloorTokens: 0 }),
-      outputTokens: lastAssistant?.metadata?.contextUsage?.outputTokens ?? 0,
+      outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
       ...estimateLastStepToolResults(lastAssistant),
       modelContextLimit: maxTokens,
       threshold: this.compactionMonitor.getThreshold(),
@@ -5006,7 +5011,7 @@ export class AgentSession {
     // Only a single-step first response gives a known first-request input floor.
     const systemFloorTokens =
       firstAssistant && (firstAssistant.metadata?.stepStartPartIndices?.length ?? 1) <= 1
-        ? firstAssistant.metadata?.contextUsage?.inputTokens
+        ? tokenCount(firstAssistant.metadata?.contextUsage?.inputTokens)
         : undefined;
     const freshEstimate = estimateFreshRequestTokens({
       userText,

@@ -164,6 +164,52 @@ describe("AgentSession token-budget lifecycle", () => {
     return { ...h, requests, completions, streamMessage, secondRequest, finishAndDispatch };
   }
 
+  for (const field of [
+    "inputTokens",
+    "outputTokens",
+    "cachedInputTokens",
+    "cacheCreationInputTokens",
+  ]) {
+    test.each(["invalid", "1000", -1, {}, [10], true, 1e100])(
+      `invalid persisted ${field}=%j does not block subsequent sends`,
+      async (invalid) => {
+        const h = await setup();
+        expect(
+          (
+            await h.historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("user", "user", "Previous request")
+            )
+          ).success
+        ).toBe(true);
+        const damaged = {
+          ...createMuxMessage("damaged-usage", "assistant", "Preserved answer"),
+          metadata: {
+            model,
+            historySequence: 1,
+            ...(field === "cacheCreationInputTokens"
+              ? { contextProviderMetadata: { anthropic: { cacheCreationInputTokens: invalid } } }
+              : {}),
+            contextUsage: {
+              inputTokens: 1000,
+              outputTokens: 10,
+              totalTokens: 1010,
+              [field]: invalid,
+            },
+          },
+        };
+        await fs.appendFile(
+          path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
+          JSON.stringify(damaged) + "\n"
+        );
+        expect((await h.session.sendMessage("Short follow-up", options)).success).toBe(true);
+        expect(h.requests).toHaveLength(1);
+        expect(rolloverRows(await allRows(h))).toHaveLength(0);
+        expect(h.requests[0].messages.some((row) => text(row) === "Preserved answer")).toBe(true);
+      }
+    );
+  }
+
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
