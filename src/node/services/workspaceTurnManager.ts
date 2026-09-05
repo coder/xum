@@ -53,6 +53,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
@@ -281,6 +282,22 @@ const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after res
  */
 const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
+
+/** A human-authored child input that redirects the delegated turn. */
+function isManualChildWorkspaceInput(message: MuxMessage): boolean {
+  if (message.role !== "user") {
+    return false;
+  }
+  if (message.metadata?.synthetic !== true) {
+    return true;
+  }
+  const muxMetadata = message.metadata.muxMetadata;
+  return (
+    muxMetadata?.type === "compaction-request" &&
+    muxMetadata.source === "auto-compaction" &&
+    getCompactionFollowUpContent(muxMetadata)?.dispatchOptions?.source !== "internal-resume"
+  );
+}
 
 /**
  * Reason prefix persisted when the owner's OWN follow-up turn (task
@@ -4251,37 +4268,27 @@ export class WorkspaceTurnManager {
     };
   }
 
-  private async isStreamEndBeforeWorkspaceTurnPrompt(
+  private isWorkspaceTurnAnchorForRecord(
     record: WorkspaceTurnTaskHandleRecord,
-    event: StreamEndEvent
-  ): Promise<boolean> {
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
-    if (!historyResult.success) {
-      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
-        workspaceId: event.workspaceId,
-        handleId: record.handleId,
-        error: historyResult.error,
-      });
-      return false;
+    message: MuxMessage
+  ): boolean {
+    const muxMetadata = message.metadata?.muxMetadata;
+    if (muxMetadata?.type === "workspace-turn-task") {
+      return (
+        muxMetadata.taskHandleId === record.handleId &&
+        muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
+        muxMetadata.turnId === record.turnId
+      );
     }
-
-    let streamEndIndex = -1;
-    let promptIndex = -1;
-    for (const [index, message] of historyResult.data.entries()) {
-      if (message.id === event.messageId) {
-        streamEndIndex = index;
-      }
-      const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
-      if (
-        metadata?.taskHandleId === record.handleId &&
-        metadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        metadata.turnId === record.turnId
-      ) {
-        promptIndex = index;
-      }
+    if (muxMetadata?.type === "compaction-summary") {
+      const preserved = muxMetadata.pendingFollowUp?.workspaceTurnMetadata;
+      return (
+        preserved?.taskHandleId === record.handleId &&
+        preserved.ownerWorkspaceId === record.ownerWorkspaceId &&
+        preserved.turnId === record.turnId
+      );
     }
-
-    return streamEndIndex !== -1 && promptIndex !== -1 && streamEndIndex < promptIndex;
+    return false;
   }
 
   private async interruptWorkspaceTurnFromUncorrelatedStreamEnd(
@@ -4315,7 +4322,33 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    if (await this.isStreamEndBeforeWorkspaceTurnPrompt(record, event)) {
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+    if (!historyResult.success) {
+      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
+        workspaceId: event.workspaceId,
+        handleId: record.handleId,
+        error: historyResult.error,
+      });
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      return true;
+    }
+
+    let streamEndIndex = -1;
+    let turnAnchorIndex = -1;
+    for (const [index, message] of historyResult.data.entries()) {
+      if (message.id === event.messageId) {
+        streamEndIndex = index;
+      }
+      if (this.isWorkspaceTurnAnchorForRecord(record, message)) {
+        turnAnchorIndex = index;
+      }
+    }
+
+    if (streamEndIndex === -1 || turnAnchorIndex === -1) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      return true;
+    }
+    if (streamEndIndex < turnAnchorIndex) {
       log.debug("Ignoring stale uncorrelated stream-end before queued workspace turn prompt", {
         workspaceId: event.workspaceId,
         taskHandleId: record.handleId,
@@ -4324,6 +4357,19 @@ export class WorkspaceTurnManager {
       return true;
     }
 
+    const hasManualSupersessionInput = historyResult.data
+      .slice(turnAnchorIndex + 1, streamEndIndex)
+      .some(isManualChildWorkspaceInput);
+    if (hasManualSupersessionInput) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+    }
+    return true;
+  }
+
+  private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
+    record: WorkspaceTurnTaskHandleRecord,
+    event: StreamEndEvent
+  ): Promise<void> {
     const error = "Workspace turn superseded by an uncorrelated workspace stream-end";
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
@@ -4332,12 +4378,12 @@ export class WorkspaceTurnManager {
       messageId: event.messageId,
       error,
     };
+    delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
     });
-    return true;
   }
 
   /**
