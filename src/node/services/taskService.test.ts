@@ -27284,6 +27284,7 @@ describe("TaskService", () => {
       workspaceTurnStreamEndEvent(completed.parentId, "msg_done", "Done")
     );
     await completedInternal.settleWorkspaceTurn({
+      cause: { kind: "user-stream-abort" },
       record: staleRunningRecord,
       next: {
         ...staleRunningRecord,
@@ -27326,6 +27327,7 @@ describe("TaskService", () => {
         settleWorkspaceTurn: (params: unknown) => Promise<void>;
       }
     ).settleWorkspaceTurn({
+      cause: { kind: "correlated-stream-end" },
       record: staleInterruptedRecord,
       next: {
         ...staleInterruptedRecord,

@@ -110,6 +110,48 @@ import {
 // (delete_worktree/remove remain in the result schema for historical-transcript parsing only).
 type WorkspaceLifecycleAction = "archive" | "unarchive";
 
+// Internal evidence only: future terminal transitions must name and justify their cause.
+// An arbitrary synthetic stream-end is not completion; unknown history retains the existing
+// conservative interruption policy rather than pretending that a manual input was observed.
+type WorkspaceTurnSettlementCause =
+  | {
+      kind:
+        | "creation-admission-failure"
+        | "creation-validation-failure"
+        | "launch-canceled"
+        | "send-failure"
+        | "stale-history-recovery"
+        | "stale-restart"
+        | "correlated-stream-end"
+        | "user-stream-abort"
+        | "continuation-failure"
+        | "terminal-stream-error"
+        | "recovery-admission-failure"
+        | "explicit-interrupt";
+    }
+  | { kind: "manual-supersession"; messageId: string }
+  | {
+      kind: "uncorrelated-conservative-fallback";
+      reason: "history-read-failed" | "missing-stream-end" | "missing-turn-anchor";
+    };
+
+const WORKSPACE_TURN_SETTLEMENT_CAUSES: Record<WorkspaceTurnSettlementCause["kind"], true> = {
+  "creation-admission-failure": true,
+  "creation-validation-failure": true,
+  "launch-canceled": true,
+  "send-failure": true,
+  "stale-history-recovery": true,
+  "stale-restart": true,
+  "correlated-stream-end": true,
+  "user-stream-abort": true,
+  "continuation-failure": true,
+  "terminal-stream-error": true,
+  "recovery-admission-failure": true,
+  "explicit-interrupt": true,
+  "manual-supersession": true,
+  "uncorrelated-conservative-fallback": true,
+};
+
 interface WorkspaceLifecycleTarget {
   taskId?: string;
   workspaceId?: string;
@@ -1362,6 +1404,7 @@ export class WorkspaceTurnManager {
     if (typeof persisted === "object") {
       if (persistedHandle) {
         await this.settleWorkspaceTurn({
+          cause: { kind: "creation-admission-failure" },
           record,
           next: { ...record, status: "error", updatedAt: getIsoNow(), error: persisted.error },
           waiterSettlement: { status: "error", error: new Error(persisted.error) },
@@ -1408,6 +1451,7 @@ export class WorkspaceTurnManager {
         error: agentValidationError,
       };
       await this.settleWorkspaceTurn({
+        cause: { kind: "creation-validation-failure" },
         record,
         next,
         waiterSettlement: { status: "error", error: new Error(agentValidationError) },
@@ -1516,6 +1560,7 @@ export class WorkspaceTurnManager {
             error: reason,
           };
           await this.settleWorkspaceTurn({
+            cause: { kind: "launch-canceled" },
             record: current,
             next,
             waiterSettlement: { status: "error", error: new Error(reason) },
@@ -1540,6 +1585,7 @@ export class WorkspaceTurnManager {
             error,
           };
           await this.settleWorkspaceTurn({
+            cause: { kind: "send-failure" },
             record: current,
             next,
             waiterSettlement: { status: "error", error: new Error(error) },
@@ -1558,6 +1604,7 @@ export class WorkspaceTurnManager {
         error,
       };
       await this.settleWorkspaceTurn({
+        cause: { kind: "send-failure" },
         record,
         next,
         waiterSettlement: { status: "error", error: new Error(error) },
@@ -2124,7 +2171,30 @@ export class WorkspaceTurnManager {
     await markDirectParentResultDelivered();
   }
 
+  private assertWorkspaceTurnSettlementCause(cause: WorkspaceTurnSettlementCause): void {
+    assert(
+      cause != null &&
+        typeof cause.kind === "string" &&
+        Object.hasOwn(WORKSPACE_TURN_SETTLEMENT_CAUSES, cause.kind),
+      "Workspace turn settlement requires a recognized cause"
+    );
+    if (cause.kind === "manual-supersession") {
+      assert(
+        typeof cause.messageId === "string" && cause.messageId.trim().length > 0,
+        "Manual supersession requires the superseding input messageId"
+      );
+    } else if (cause.kind === "uncorrelated-conservative-fallback") {
+      assert(
+        cause.reason === "history-read-failed" ||
+          cause.reason === "missing-stream-end" ||
+          cause.reason === "missing-turn-anchor",
+        "Uncorrelated conservative fallback requires a recognized reason"
+      );
+    }
+  }
+
   private async settleWorkspaceTurn(params: {
+    cause: WorkspaceTurnSettlementCause;
     record: WorkspaceTurnTaskHandleRecord;
     next: WorkspaceTurnTaskHandleRecord;
     waiterSettlement:
@@ -2173,6 +2243,7 @@ export class WorkspaceTurnManager {
         settledRecord?: WorkspaceTurnTaskHandleRecord;
         foregroundWaiterWorkspaceIds?: Set<string>;
       } | null> => {
+        this.assertWorkspaceTurnSettlementCause(params.cause);
         const current = await this.taskHandleStore.getWorkspaceTurn(
           params.record.ownerWorkspaceId,
           params.record.handleId
@@ -3038,6 +3109,8 @@ export class WorkspaceTurnManager {
           status: "interrupted",
           updatedAt: getIsoNow(),
         };
+        // Keep explicit stop's latch/mirror ordering in this lock, not the central helper.
+        this.assertWorkspaceTurnSettlementCause({ kind: "explicit-interrupt" });
         await this.taskHandleStore.upsertWorkspaceTurn(next);
         interruptedRecord = next;
         // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
@@ -3883,6 +3956,7 @@ export class WorkspaceTurnManager {
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
+        cause: { kind: "stale-history-recovery" },
         record,
         next: recovered,
         waiterSettlement:
@@ -3912,6 +3986,7 @@ export class WorkspaceTurnManager {
       error: WORKSPACE_TURN_STALE_RESTART_ERROR,
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "stale-restart" },
       record,
       next,
       waiterSettlement: {
@@ -4329,7 +4404,10 @@ export class WorkspaceTurnManager {
         handleId: record.handleId,
         error: historyResult.error,
       });
-      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
+        kind: "uncorrelated-conservative-fallback",
+        reason: "history-read-failed",
+      });
       return true;
     }
 
@@ -4345,7 +4423,10 @@ export class WorkspaceTurnManager {
     }
 
     if (streamEndIndex === -1 || turnAnchorIndex === -1) {
-      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
+        kind: "uncorrelated-conservative-fallback",
+        reason: streamEndIndex === -1 ? "missing-stream-end" : "missing-turn-anchor",
+      });
       return true;
     }
     if (streamEndIndex < turnAnchorIndex) {
@@ -4357,18 +4438,25 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    const hasManualSupersessionInput = historyResult.data
+    const manualSupersessionInput = historyResult.data
       .slice(turnAnchorIndex + 1, streamEndIndex)
-      .some(isManualChildWorkspaceInput);
-    if (hasManualSupersessionInput) {
-      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      .find(isManualChildWorkspaceInput);
+    if (manualSupersessionInput) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
+        kind: "manual-supersession",
+        messageId: manualSupersessionInput.id,
+      });
     }
     return true;
   }
 
   private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
     record: WorkspaceTurnTaskHandleRecord,
-    event: StreamEndEvent
+    event: StreamEndEvent,
+    cause: Extract<
+      WorkspaceTurnSettlementCause,
+      { kind: "manual-supersession" | "uncorrelated-conservative-fallback" }
+    >
   ): Promise<void> {
     const error = "Workspace turn superseded by an uncorrelated workspace stream-end";
     const next: WorkspaceTurnTaskHandleRecord = {
@@ -4380,6 +4468,7 @@ export class WorkspaceTurnManager {
     };
     delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
+      cause,
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
@@ -4607,6 +4696,7 @@ export class WorkspaceTurnManager {
       }
     }
     await this.settleWorkspaceTurn({
+      cause: { kind: "correlated-stream-end" },
       record,
       next,
       waiterSettlement:
@@ -4649,6 +4739,7 @@ export class WorkspaceTurnManager {
       updatedAt: getIsoNow(),
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "user-stream-abort" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error("Workspace turn interrupted") },
@@ -4753,6 +4844,7 @@ export class WorkspaceTurnManager {
     };
     delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
+      cause: { kind: "continuation-failure" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
@@ -4814,6 +4906,7 @@ export class WorkspaceTurnManager {
       error: event.error,
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "terminal-stream-error" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(event.error) },
@@ -4924,6 +5017,7 @@ export class WorkspaceTurnManager {
             // active would reserve the desktop even after TaskService interrupts the task.
             const message = getErrorMessage(error);
             await this.settleWorkspaceTurn({
+              cause: { kind: "recovery-admission-failure" },
               record: normalized,
               next: { ...normalized, status: "error", updatedAt: getIsoNow(), error: message },
               waiterSettlement: { status: "error", error: new Error(message) },
