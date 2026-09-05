@@ -10,6 +10,9 @@ import {
   SESSION_HISTORY_MAX_CURSOR_CHARS,
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_SCAN_ROWS,
+  SESSION_HISTORY_SCAN_CHUNK_BYTES,
+  SESSION_HISTORY_ANCHOR_BYTES,
+  SESSION_HISTORY_MAX_LINE_BYTES,
 } from "@/common/constants/contextBudget";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
@@ -770,6 +773,163 @@ describe("session_history real disk recovery", () => {
         .map((item) => item.text)
     ).toEqual(["opening facts"]);
   });
+
+  function unicodeEscapes(text: string): string {
+    return [...text]
+      .map((character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)
+      .join("");
+  }
+
+  for (const [name, key, value] of [
+    ["escaped key", unicodeEscapes("contextBoundaryKind"), "reset"],
+    ["escaped value", "contextBoundaryKind", unicodeEscapes("reset")],
+    ["escaped key and value", unicodeEscapes("contextBoundaryKind"), unicodeEscapes("reset")],
+    [
+      "uppercase hex digits",
+      unicodeEscapes("contextBoundaryKind").replace(/[a-f]/g, (hex) => hex.toUpperCase()),
+      unicodeEscapes("reset"),
+    ],
+  ]) {
+    test(`oversized ${name} preserves privacy across whitespace and appended pages`, async () => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      const marker = `"${key}"` + " \t".repeat(SESSION_HISTORY_MAX_SCAN_BYTES) + ` : "${value}"`;
+      const row = `{"id":"escaped-reset","role":"assistant","metadata":{${marker}},"parts":[],"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`;
+      await fs.appendFile(
+        chatPath,
+        row +
+          JSON.stringify(createMuxMessage("after-escaped-reset", "assistant", "public facts")) +
+          "\n"
+      );
+      let cursor = first.nextCursor;
+      let result: SessionHistoryResult;
+      let pageCount = 0;
+      do {
+        result = await call({ action: "search", query: "facts", cursor });
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
+          SESSION_HISTORY_MAX_RESULT_BYTES
+        );
+        if (result.success) {
+          expect(result.items).toEqual([]);
+          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+        }
+        cursor = result.nextCursor;
+        expect(++pageCount).toBeLessThan(10);
+      } while (cursor);
+      expect(pageCount).toBeGreaterThan(1);
+      expect(result.error).toBe("stale_cursor");
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+    });
+  }
+
+  for (const [name, key, value] of [
+    [
+      "different value",
+      `"${unicodeEscapes("contextBoundaryKind")}"`,
+      `"${unicodeEscapes("resume")}"`,
+    ],
+    [
+      "different key",
+      `"${unicodeEscapes("contextBoundaryKinds")}"`,
+      `"${unicodeEscapes("reset")}"`,
+    ],
+    [
+      "literal escaped key",
+      JSON.stringify(unicodeEscapes("contextBoundaryKind")),
+      `"${unicodeEscapes("reset")}"`,
+    ],
+  ]) {
+    test(`oversized Unicode data with ${name} remains traversable`, async () => {
+      await fs.appendFile(
+        chatPath,
+        `{"id":"not-reset","role":"assistant","metadata":{${key}:${value}},"parts":[],"padding":"${"x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES)}"}\n`
+      );
+      expect(
+        (await pages({ action: "read_item", item_id: "0" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["opening facts"]);
+    });
+  }
+
+  for (const mode of ["chunk", "initial page", "appended page"] as const) {
+    for (const split of [1, 2, 3, 4, 5]) {
+      test(`escaped reset split after byte ${split} across a ${mode} boundary remains private`, async () => {
+        const appended = mode === "appended page";
+        const saved = appended
+          ? (await fixture.historyService.scanHistoryBounded(workspaceId, { visit: () => false }))
+              .cursor
+          : undefined;
+        // Initial scans read one chat snapshot; resumed append checks read four.
+        // Verify the resulting cursor offset below so fixture alignment is explicit.
+        const distance =
+          mode === "chunk"
+            ? SESSION_HISTORY_SCAN_CHUNK_BYTES
+            : SESSION_HISTORY_MAX_SCAN_BYTES - SESSION_HISTORY_ANCHOR_BYTES * (appended ? 8 : 2);
+        const publicLine =
+          JSON.stringify(createMuxMessage("public-after-split", "assistant", "public facts")) +
+          "\n";
+        const suffix = 'eset"},"tail":"';
+        const end = '"}\n' + publicLine;
+        const padding = distance - (6 - split + suffix.length + end.length);
+        const row =
+          '{"id":"split-reset","role":"assistant","parts":[],"padding":"' +
+          "x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES) +
+          '","metadata":{"contextBoundaryKind":"' +
+          "\\u0072" +
+          suffix +
+          "x".repeat(padding) +
+          end;
+        await fs.appendFile(chatPath, row);
+        const emitted: string[] = [];
+        const visit = ({ message }: { message: MuxMessage }) => {
+          emitted.push(message.id);
+          return true;
+        };
+        const first = await fixture.historyService.scanHistoryBounded(workspaceId, {
+          cursor: saved,
+          visit,
+        });
+        expect(first.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+        expect(first.cursor).toBeDefined();
+        if (mode === "chunk") expect(first.cursor?.possibleReset).toBe(true);
+        else {
+          const position = appended ? first.cursor?.appendCheck : first.cursor;
+          expect(position?.byteOffset).toBe((await fs.stat(chatPath)).size - distance);
+          expect(position?.possibleReset).toBe(false);
+        }
+        let cursor = first.cursor;
+        let stale = false;
+        let pageCount = 0;
+        while (cursor) {
+          try {
+            const next = await fixture.historyService.scanHistoryBounded(workspaceId, {
+              cursor,
+              visit,
+            });
+            expect(next.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+            expect(next.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+            cursor = next.cursor;
+          } catch (error) {
+            expect(error).toMatchObject({ message: "stale_cursor" });
+            stale = true;
+            break;
+          }
+          expect(++pageCount).toBeLessThan(10);
+        }
+        expect(stale).toBe(appended);
+        expect(emitted).toEqual(appended ? [] : ["public-after-split"]);
+      });
+    }
+  }
 
   test("oversized reset markers are a privacy floor, regardless of nested rollover metadata", async () => {
     const reset = createMuxMessage("oversized-reset", "assistant", "x".repeat(5 * 1024 * 1024), {

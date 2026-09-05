@@ -29,3 +29,5 @@ export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
+// Each marker character can occupy six raw characters as a JSON Unicode escape.
+export const SESSION_HISTORY_RESET_PROBE_CHARS = SESSION_HISTORY_RESET_NEEDLE.length * 6;

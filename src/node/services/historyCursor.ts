@@ -1,6 +1,6 @@
 import {
   SESSION_HISTORY_MAX_ID_CHARS,
-  SESSION_HISTORY_RESET_NEEDLE,
+  SESSION_HISTORY_RESET_PROBE_CHARS,
 } from "@/common/constants/contextBudget";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
@@ -35,7 +35,7 @@ export const HistoryScanStateSchema = z
     byteOffset: offset,
     skippingOversized: z.boolean(),
     oversizedRowEnd: offset.nullable(),
-    resetProbe: z.string().max(SESSION_HISTORY_RESET_NEEDLE.length),
+    resetProbe: z.string().max(SESSION_HISTORY_RESET_PROBE_CHARS),
     possibleReset: z.boolean(),
     archiveWatermark: z.number().int().min(-1).safe(),
     anchorSequence: offset.nullable(),
@@ -48,7 +48,7 @@ export const HistoryScanStateSchema = z
         byteOffset: offset,
         skippingOversized: z.boolean(),
         oversizedRowEnd: offset.nullable(),
-        resetProbe: z.string().max(SESSION_HISTORY_RESET_NEEDLE.length),
+        resetProbe: z.string().max(SESSION_HISTORY_RESET_PROBE_CHARS),
         possibleReset: z.boolean(),
       })
       .strict()

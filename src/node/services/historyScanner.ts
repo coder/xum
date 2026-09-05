@@ -6,6 +6,7 @@ import {
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
   SESSION_HISTORY_ANCHOR_BYTES,
   SESSION_HISTORY_RESET_NEEDLE,
+  SESSION_HISTORY_RESET_PROBE_CHARS,
   SESSION_HISTORY_MAX_SCAN_ROWS,
   SESSION_HISTORY_MAX_LINE_BYTES,
 } from "@/common/constants/contextBudget";
@@ -256,14 +257,18 @@ export async function scanHistoryFilesBounded(
           // Oversized tool outputs remain traversable. Only a potential reset
           // marker is a fail-closed privacy barrier. Match raw bytes (including
           // nested objects conservatively) without parsing or retaining the row.
-          // Writers serialize ASCII metadata keys verbatim; Unicode-escaped keys
-          // in externally edited oversized JSONL are outside this compact format.
+          // Keep raw overlap large enough for a fully Unicode-escaped marker.
+          // Decode only this chunk plus overlap, so split escapes survive both
+          // reverse/forward chunk edges and page boundaries without line buffering.
           const compact = segment.toString("latin1").replace(/[ \t\r\n]/g, "");
           const probe = reverse ? compact + resetProbe : resetProbe + compact;
-          possibleReset ||= probe.includes(SESSION_HISTORY_RESET_NEEDLE);
+          const decoded = probe.replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
+            String.fromCharCode(Number.parseInt(hex, 16))
+          );
+          possibleReset ||= decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
           resetProbe = reverse
-            ? probe.slice(0, SESSION_HISTORY_RESET_NEEDLE.length - 1)
-            : probe.slice(-(SESSION_HISTORY_RESET_NEEDLE.length - 1));
+            ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
+            : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
           size += segment.length;
           if (size > SESSION_HISTORY_MAX_LINE_BYTES) {
             position.oversizedRowEnd ??= rowEdge;
