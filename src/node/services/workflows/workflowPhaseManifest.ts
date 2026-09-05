@@ -387,11 +387,12 @@ const GLOBAL_OBJECT_ROUTES = new Set(["globalThis", "Function", "eval", "constru
 function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceFile): boolean {
   const namesInternal = (text: string): boolean =>
     RUNTIME_INTERNAL_PREFIXES.some((prefix) => text.startsWith(prefix));
+  // Identifiers AND string/template literals are checked against both lists:
+  // `obj["constructor"]` or `g["__workflowPhase"]` name the route in a string.
+  const namesRoute = (text: string): boolean =>
+    namesInternal(text) || GLOBAL_OBJECT_ROUTES.has(text);
   const check = (node: ts.Node): boolean => {
-    if (
-      ts.isIdentifier(node) &&
-      (namesInternal(node.text) || GLOBAL_OBJECT_ROUTES.has(node.text))
-    ) {
+    if (ts.isIdentifier(node) && namesRoute(node.text)) {
       return true;
     }
     if (node.kind === ts.SyntaxKind.ThisKeyword) {
@@ -399,7 +400,7 @@ function referencesRuntimeInternals(ts: TypeScriptModule, sourceFile: ts.SourceF
     }
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
-      namesInternal(node.text)
+      namesRoute(node.text)
     ) {
       return true;
     }
