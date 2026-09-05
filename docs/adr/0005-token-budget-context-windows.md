@@ -23,6 +23,8 @@ A once-per-window warning offers a settled tool step to write the conventional `
 
 The reset, lead-in, and triggering message or continuation are written in one append operation before continuation. This is not a filesystem transaction: a crash can leave a complete prefix. Request assembly must tolerate that prefix without duplicating rollover or resurrecting queued work. A payload that cannot fit even in a fresh window is rejected before a provider request.
 
+Only safe context-cache and sandbox clearing runs before append. Branch-summary clearing and epoch notification run after append; cleanup failure must prevent a provider request. When rollover invalidates other sends, its own caller must adopt the updated epoch before continuing.
+
 ## Consequences
 
 - `session_history` list/search/read is bounded: 16 KiB per tool result, 2 MiB scanned, 500 rows, and a 1 MiB per-line cap. Retrieval is scoped to the calling workspace and the manual-reset privacy floor.

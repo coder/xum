@@ -1207,6 +1207,11 @@ export type DisplayedMessage =
        * payload itself is a separate assistant row). Excluded from human-prompt navigation.
        */
       agentPeerMessageTrigger?: true;
+      /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
+      contextBudgetWarning?: {
+        contextTokens: number;
+        maxTokens: number;
+      };
     }
   | {
       type: "assistant";
@@ -1319,6 +1324,8 @@ export type DisplayedMessage =
       id: string; // Display ID for UI/React keys
       historySequence: number; // Sequence of the compaction summary this boundary belongs to
       boundaryKind?: ContextBoundaryKind;
+      /** Distinguishes automatic rollover from a manual reset without changing boundary semantics. */
+      contextWindowRollover?: true;
       position: "start" | "end";
       compactionEpoch?: number;
       strategy?: CompactionSummaryMetadata["strategy"];
