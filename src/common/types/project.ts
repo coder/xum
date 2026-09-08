@@ -109,6 +109,8 @@ export interface ProjectsConfig {
    * Absent = off; users opt in from Settings.
    */
   agentHeartbeatsEnabled?: boolean;
+  /** Anonymous usage telemetry opt-out: absent/true = enabled, false = disabled. */
+  telemetryEnabled?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
