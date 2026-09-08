@@ -67,6 +67,7 @@ import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.a
 import { SettingRow, SettingsGroup, SettingsMark } from "../Components/SettingsLayout";
 import { CompactionStrategySetting } from "./CompactionStrategySetting";
 import { KeepScreenAwakeSetting } from "./KeepScreenAwakeSetting";
+import { UsageTelemetrySetting } from "./UsageTelemetrySetting";
 import { TaskLimitInput } from "./TaskLimitInput";
 
 const INHERIT = "__inherit__";
@@ -1392,7 +1393,14 @@ function SaveError(props: { error: string | null }) {
 
 /** Settings → Behavior. */
 export function AgentBehaviorSection() {
-  return <TasksSection part="behavior" />;
+  // The telemetry switch sits outside the task settings fieldset: a privacy control must not
+  // lock while (or because) the task settings load.
+  return (
+    <div className="min-w-0 space-y-8">
+      <TasksSection part="behavior" />
+      <UsageTelemetrySetting />
+    </div>
+  );
 }
 
 /** Settings → Agents (route id `tasks`, kept so existing deep links still land here). */

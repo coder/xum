@@ -90,7 +90,8 @@ export const SETTINGS_SECTION_META: readonly SettingsSectionMeta[] = [
     label: "Behavior",
     group: "agents",
     icon: icon(SlidersHorizontal),
-    description: "Default agent, task limits, plan handoff, context compaction and screen sleep.",
+    description:
+      "Default agent, task limits, plan handoff, context compaction, screen sleep and usage telemetry.",
     keywords: ["tasks", "parallel", "nesting", "compaction", "context", "sleep"],
   },
   {
@@ -508,6 +509,12 @@ export const SETTING_DEFINITIONS = {
     description:
       "Prevents display and system sleep while any chat is streaming or waiting on background bash or workflow activity. Released as soon as all agents are idle.",
     keywords: ["sleep", "power", "display", "caffeinate"],
+  },
+  "usage-telemetry": {
+    section: "behavior",
+    label: "Usage Telemetry",
+    description: "Send anonymous usage events to help improve Xum — no code, paths, or prompts.",
+    keywords: ["privacy", "analytics", "tracking", "opt out", "posthog"],
   },
 
   // Runtimes
