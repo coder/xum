@@ -260,6 +260,49 @@ describe("Config telemetryEnabled persistence", () => {
     expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
   });
 
+  it("skips the rollback's marker restore when the lock was displaced during the rollback", async () => {
+    // The rollback is a mutation under the lock like the forward path: its
+    // field edit asserts ownership inside editConfig, and the marker restore
+    // that follows must re-validate too — a holder displaced during the
+    // awaited edit must not recreate or remove a peer's newer marker.
+    const config = new Config(tempDir);
+    const lockPath = path.join(tempDir, "locks", "project-registration.lock");
+    const withMarker = config as unknown as {
+      setTelemetryOptOutMarker: (disabled: boolean) => void;
+    };
+    const notifiable = config as unknown as { notifyConfigChanged: () => void };
+    const originalNotify = notifiable.notifyConfigChanged.bind(config);
+    let rollingBack = false;
+    // The forward marker sync fails once (after the verified field write),
+    // forcing the rollback; the rollback's own field edit notifies after its
+    // save — displace the lock in that window, before the marker restore.
+    const markerSpy = spyOn(withMarker, "setTelemetryOptOutMarker").mockImplementationOnce(() => {
+      rollingBack = true;
+      throw new Error("EIO");
+    });
+    const notifySpy = spyOn(notifiable, "notifyConfigChanged").mockImplementation(() => {
+      if (rollingBack && fsSync.existsSync(lockPath)) {
+        rollingBack = false;
+        fsSync.writeFileSync(lockPath, "424242:peer-reclaimed", "utf-8");
+      }
+      originalNotify();
+    });
+    let rejection: Error;
+    try {
+      rejection = await rejectionOf(config.setTelemetryEnabledPersisted(false));
+    } finally {
+      notifySpy.mockRestore();
+    }
+    // mockRestore() also clears the call history, so read it first.
+    const markerCalls = markerSpy.mock.calls.length;
+    markerSpy.mockRestore();
+    expect(rejection.message).toMatch(/opt-out marker/);
+    // The forward sync was attempted once; the displaced rollback never
+    // touched the marker.
+    expect(markerCalls).toBe(1);
+    expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
+  });
+
   it("a telemetry toggle does not deadlock against an in-flight unrelated edit", async () => {
     const config = new Config(tempDir);
     // An ordinary editConfig mid-save — holding its queue permit and its own
