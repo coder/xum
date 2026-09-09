@@ -4593,6 +4593,10 @@ export class Config {
             }
             return config;
           }, withinRegistrationLock);
+          // The awaited edit is a displacement window of its own: re-validate
+          // before this second mutation, or a stale rollback could recreate a
+          // marker over a peer's newer enable (or remove its downgrade backstop).
+          await lock.assertStillOwned();
           // Restore the downgrade backstop the marker sync may have
           // quarantined or removed.
           this.setTelemetryOptOutMarker(previousDisabled);

@@ -690,6 +690,34 @@ describe("router config transcript mutation", () => {
     expect(fs.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
   });
 
+  test("updateTelemetryEnabled applies the runtime toggle even when the client aborts mid-persist", async () => {
+    // Persistence and the live application are one uninterruptible section:
+    // a client abort while the field/marker write is pending must not leave
+    // the records changed and the running client untouched.
+    let started!: () => void;
+    const persistStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const persist = new Promise<void>((resolve) => (finish = resolve));
+    const persistSpy = spyOn(config, "setTelemetryEnabledPersisted").mockImplementation(() => {
+      started();
+      return persist;
+    });
+    try {
+      const client = createRouterClient(router(), { context: createContext() });
+      const controller = new AbortController();
+      const call = client.config
+        .updateTelemetryEnabled({ enabled: false }, { signal: controller.signal })
+        .catch((error: unknown) => error);
+      await persistStarted;
+      controller.abort();
+      finish();
+      await call;
+    } finally {
+      persistSpy.mockRestore();
+    }
+    expect(setConfigEnabledMock).toHaveBeenCalledWith(false);
+  });
+
   test("updateTelemetryEnabled rolls the config field back when verification cannot read it", async () => {
     const client = createRouterClient(router(), { context: createContext() });
 

@@ -709,14 +709,15 @@ export const router = (authToken?: string) => {
             // rollbacks live in Config behind a cross-process lock so the two
             // persisted records (telemetryEnabled + the sidecar marker) can
             // never diverge under concurrent toggles from peer processes.
-            yield* Effect.promise(async () =>
-              context.config.setTelemetryEnabledPersisted(input.enabled)
-            );
-            // Apply immediately: disabling shuts the client down mid-session,
-            // enabling re-runs the full enablement check (env vars still win).
-            yield* Effect.promise(async () =>
-              context.telemetryService.setConfigEnabled(input.enabled)
-            );
+            // Persistence and the live application are ONE uninterruptible
+            // section: a client abort while the write is pending must not
+            // leave the records changed and the running client untouched.
+            yield* atomicPromise(async () => {
+              await context.config.setTelemetryEnabledPersisted(input.enabled);
+              // Apply immediately: disabling shuts the client down mid-session,
+              // enabling re-runs the full enablement check (env vars still win).
+              await context.telemetryService.setConfigEnabled(input.enabled);
+            });
           })
         ),
       updateHeartbeatDefaultPrompt: t
