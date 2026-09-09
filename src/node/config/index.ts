@@ -4720,12 +4720,14 @@ export class Config {
         timeoutMs: TELEMETRY_RECONCILE_LOCK_TIMEOUT_MS,
         label: "project registration lock",
       });
-      void lock;
       const field = this.loadConfigOrDefault().telemetryEnabled;
-      if (field === false) {
-        this.setTelemetryOptOutMarker(true);
-      } else if (field === true) {
-        this.setTelemetryOptOutMarker(false);
+      if (field === false || field === true) {
+        // The field read is a displacement window too: a holder frozen past
+        // the lease can be reclaimed by a peer that completes a newer toggle,
+        // and mutating the marker afterwards would undo it — a removed opt-out
+        // marker is lost for good once an old build's save drops the field.
+        await lock.assertStillOwned();
+        this.setTelemetryOptOutMarker(field === false);
       }
     } catch {
       // Best-effort: an unwritable home leaves the records as they were; the
