@@ -303,6 +303,32 @@ describe("Config telemetryEnabled persistence", () => {
     expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
   });
 
+  it("leaves the marker alone when the startup reconciliation lock was displaced", async () => {
+    // Startup reconciliation mutates the marker from the explicit field. A hold
+    // displaced between the field read and that mutation (a peer completed a
+    // newer toggle meanwhile) must not create or remove the peer's marker.
+    const config = new Config(tempDir);
+    await fs.writeFile(path.join(tempDir, "config.json"), `{ "telemetryEnabled": false }`, "utf-8");
+    const lockPath = path.join(tempDir, "locks", "project-registration.lock");
+    const original = config.loadConfigOrDefault.bind(config);
+    const loadSpy = spyOn(config, "loadConfigOrDefault").mockImplementation(((options?: {
+      throwOnError?: boolean;
+    }) => {
+      const result = original(options);
+      // Displace the hold right after the field read, before the marker mutation.
+      if (fsSync.existsSync(lockPath)) {
+        fsSync.writeFileSync(lockPath, "424242:peer-reclaimed", "utf-8");
+      }
+      return result;
+    }) as typeof config.loadConfigOrDefault);
+    try {
+      await config.reconcileTelemetryOptOutMarker();
+    } finally {
+      loadSpy.mockRestore();
+    }
+    expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
+  });
+
   it("a telemetry toggle does not deadlock against an in-flight unrelated edit", async () => {
     const config = new Config(tempDir);
     // An ordinary editConfig mid-save — holding its queue permit and its own
