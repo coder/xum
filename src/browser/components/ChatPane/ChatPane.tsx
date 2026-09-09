@@ -1691,9 +1691,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   )}
                   {/* Replay feedback must not resize the in-flow dock: even a brief
                       catch-up would otherwise shift cached transcript rows on workspace switches.
+                      An active turn does not mean history has loaded, so retain feedback alongside it.
                       Keep it above the dock for both editable and read-only transcripts,
                       yielding to Jump to bottom while scrolled up so they cannot overlap on phones. */}
-                  {isHydratingTranscript && !shouldMountStreamingBarrier && autoScroll && (
+                  {isHydratingTranscript && autoScroll && (
                     <div className="pointer-events-none absolute inset-x-0 bottom-full">
                       <ChatDockSurface>
                         <div
