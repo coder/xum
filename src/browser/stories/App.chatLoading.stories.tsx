@@ -253,7 +253,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       }
     );
 
-    await step("Running init and stream preparation suppress the competing status", async () => {
+    await step("Running init finishes before replay feedback; active turns retain it", async () => {
       emitChat({
         type: "init-start",
         hookPath: "/project/.xum/init",
@@ -276,7 +276,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         phase: "preparing",
         hadAnyOutput: false,
       });
-      await waitFor(() => expect(getLoadingStatus(canvasElement), "preparing stream").toBeNull());
+      await expect(await canvas.findByText(/starting\.\.\./)).toBeVisible();
+      await checkLoadingLayout(canvasElement);
       emitChat({
         type: "stream-start",
         workspaceId: workspace.id,
@@ -286,7 +287,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         startTime: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await checkLoadingLayout(canvasElement);
       emitChat(history);
       emitChat({
         type: "caught-up",
@@ -319,12 +320,12 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier suppresses duplicate replay status", async () => {
+    await step("A monitor barrier retains replay feedback", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await checkLoadingLayout(canvasElement);
     });
 
     await step("Read-only cached transcripts retain aligned replay feedback", async () => {
