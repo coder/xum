@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
 import { buildFixture, generateFixture, type FixtureOptions } from "./generate-fixture";
 import { copyFixture, readFixture, summarize } from "./common";
-import { parseStartup } from "./run-server-bench";
+import { parseStartup, runLaunches } from "./run-server-bench";
 
 const options: FixtureOptions = {
   workspaces: 1801,
@@ -104,6 +104,40 @@ test("isolated copies preserve empty sessions and only active checkouts; existin
     }
     await writeFile(join(copy.root, "config.json"), "changed");
     expect(await readFile(join(root, "config.json"), "utf8")).toBe(pristine);
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("launches retain artifacts sequentially within each fresh repetition", async () => {
+  const container = await mkdtemp(join(tmpdir(), "xum-restart-test-"));
+  const template = join(container, "fixture");
+  const roots: string[] = [];
+  try {
+    await generateFixture(template, { ...options, workspaces: 3, projects: 1 });
+    for (let repetition = 0; repetition < 2; repetition++) {
+      const runs = await runLaunches(template, 2, async (root, launch) => {
+        roots.push(root);
+        const artifact = join(root, "patch-artifact");
+        const previous = await readFile(artifact, "utf8").catch(() => "missing");
+        expect(previous).toBe(launch === 1 ? "missing" : "1");
+        await writeFile(artifact, String(launch));
+        return launch;
+      });
+      expect(runs).toEqual([1, 2]);
+    }
+    expect(roots[0]).toBe(roots[1]);
+    expect(roots[2]).toBe(roots[3]);
+    expect(roots[0]).not.toBe(roots[2]);
+    for (const root of new Set(roots)) {
+      expect(
+        await access(root).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    }
+    expect(await readdir(template)).not.toContain("patch-artifact");
   } finally {
     await rm(container, { recursive: true, force: true });
   }

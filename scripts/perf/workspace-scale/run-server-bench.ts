@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -55,9 +55,10 @@ async function rss(pid: number) {
   return Number(kb) * 1024;
 }
 
-async function runOnce(template: string, label: string, repetition: number) {
-  await using fixture = await copyFixture(template);
-  const { workspaces, source } = await readFixture(fixture.root);
+async function runOnce(root: string, label: string, repetition: number, launch: number) {
+  const { workspaces, source } = await readFixture(root);
+  // A previous launch's startup record must not satisfy this launch's timing read.
+  await rm(join(root, "logs", "mux.log"), { force: true });
   const workspace = workspaces.findLast(
     (entry) =>
       !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt) && !entry.parentWorkspaceId
@@ -72,7 +73,7 @@ async function runOnce(template: string, label: string, repetition: number) {
     ["dist/cli/index.js", "server", "--host", "127.0.0.1", "--port", String(port), "--no-auth"],
     {
       cwd: repoRoot,
-      env: isolatedEnv(fixture.root),
+      env: isolatedEnv(root),
       stdio: ["ignore", "pipe", "pipe"],
     }
   );
@@ -110,7 +111,7 @@ async function runOnce(template: string, label: string, repetition: number) {
       }
       if (housekeepingMs != null && !startup) {
         // Read the file sink's JSON-serialized startup payload; console output may span lines.
-        const logfile = await readFile(join(fixture.root, "logs", "mux.log"), "utf8");
+        const logfile = await readFile(join(root, "logs", "mux.log"), "utf8");
         for (const line of logfile.split("\n").slice(0, -1)) {
           startup = parseStartup(line) ?? startup;
         }
@@ -177,24 +178,27 @@ async function runOnce(template: string, label: string, repetition: number) {
       clearTimeout(killTimer);
     }
     await mkdir(outputDir, { recursive: true });
-    await writeFile(join(outputDir, label + ".run-" + repetition + ".log"), output);
+    const suffix = launch === 1 ? "" : ".launch-" + launch;
+    await writeFile(join(outputDir, label + ".run-" + repetition + suffix + ".log"), output);
   }
   if (child.exitCode !== 0)
     throw new Error("Server did not shut down cleanly: " + child.signalCode);
   return result;
 }
 
-if (import.meta.main) {
-  const args = benchArgs(3);
-  await access(join(repoRoot, "dist/cli/index.js")).catch(() => {
-    throw new Error("Build the baseline first: make build-main");
-  });
-  const fixture = await readFixture(args.root);
-  const runs: Awaited<ReturnType<typeof runOnce>>[] = [];
-  for (let i = 0; i < args.repetitions; i++) {
-    console.log(args.label + ": server repetition " + (i + 1) + "/" + args.repetitions);
-    runs.push(await runOnce(args.root, args.label, i + 1));
-  }
+export async function runLaunches<T>(
+  template: string,
+  count: number,
+  launch: (root: string, index: number) => Promise<T>
+): Promise<T[]> {
+  // Retain task artifacts across launches so restart timings include persisted-state reuse.
+  await using fixture = await copyFixture(template);
+  const runs: T[] = [];
+  for (let i = 1; i <= count; i++) runs.push(await launch(fixture.root, i));
+  return runs;
+}
+
+function summarizeRuns(runs: Awaited<ReturnType<typeof runOnce>>[]) {
   const metrics = Object.fromEntries(
     (
       [
@@ -224,28 +228,75 @@ if (import.meta.main) {
       summarize(runs.map((run) => run.stepDurationsMs[name])),
     ])
   );
-  console.log("\n### " + args.label + " server");
-  printTable(
-    Object.entries(metrics).map(([name, stats]) => [
-      name,
-      stats,
-      name.endsWith("Bytes") ? "bytes" : "ms",
-    ])
+  return { configBytes: runs[0].configBytes, metrics, calls, steps, runs };
+}
+
+if (import.meta.main) {
+  const args = benchArgs(3);
+  await access(join(repoRoot, "dist/cli/index.js")).catch(() => {
+    throw new Error("Build the baseline first: make build-main");
+  });
+  const fixture = await readFixture(args.root);
+  const runsByLaunch: Awaited<ReturnType<typeof runOnce>>[][] = Array.from(
+    { length: args.launches },
+    () => []
   );
+  for (let i = 0; i < args.repetitions; i++) {
+    console.log(args.label + ": server repetition " + (i + 1) + "/" + args.repetitions);
+    const runs = await runLaunches(args.root, args.launches, (root, launch) =>
+      runOnce(root, args.label, i + 1, launch)
+    );
+    for (const [index, run] of runs.entries()) runsByLaunch[index].push(run);
+  }
+  const launches = runsByLaunch.map((runs, index) => ({
+    launch: index + 1,
+    ...summarizeRuns(runs),
+  }));
+  const first = launches[0];
+  console.log("\n### " + args.label + " server");
+  console.log(
+    "| Launch | Health ms | Housekeeping ms | Initialize ms | RSS startup MiB | RSS after calls MiB |\n| --- | ---: | ---: | ---: | ---: | ---: |"
+  );
+  for (const { launch, metrics } of launches) {
+    console.log(
+      "| " +
+        [
+          launch,
+          metrics.healthMs.median.toFixed(2),
+          metrics.housekeepingMs.median.toFixed(2),
+          metrics.initializeTotalMs.median.toFixed(2),
+          (metrics.rssStartupBytes.median / 2 ** 20).toFixed(2),
+          (metrics.rssAfterCallsBytes.median / 2 ** 20).toFixed(2),
+        ].join(" | ") +
+        " |"
+    );
+  }
+  console.log("\nFirst-launch RPCs (every launch's samples are in JSON):");
   printTable(
-    Object.entries(calls).flatMap(([name, stats]) => [
+    Object.entries(first.calls).flatMap(([name, stats]) => [
       [name, stats.ms, "ms"],
       [name + " payload", stats.bytes, "JSON bytes"],
     ])
   );
-  printTable(Object.entries(steps).map(([name, stats]) => [name, stats, "ms"]));
+  console.log(
+    "\n| Startup step | " +
+      launches.map(({ launch }) => "Launch " + launch + " ms").join(" | ") +
+      " |"
+  );
+  console.log("| --- | " + launches.map(() => "---:").join(" | ") + " |");
+  for (const name of Object.keys(first.steps)) {
+    console.log(
+      "| " +
+        name +
+        " | " +
+        launches.map(({ steps }) => steps[name].median.toFixed(2)).join(" | ") +
+        " |"
+    );
+  }
   await writeResults(args.label, {
     fixture: fixture.options,
     repetitions: args.repetitions,
-    configBytes: runs[0].configBytes,
-    metrics,
-    calls,
-    steps,
-    runs,
+    ...first,
+    launches,
   });
 }

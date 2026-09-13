@@ -426,12 +426,12 @@ PERF_REPETITIONS ?= 3
 .PHONY: perf-workspace-scale
 perf-workspace-scale: build-main ## Benchmark workspace-scale startup, RPCs, and config I/O (Linux)
 	@set -eu; fixtures=$$(mktemp -d); trap 'rm -rf "$$fixtures"' EXIT; \
-	for spec in "realistic 1801 41 0.70 real-1801-a70" "realistic 1801 41 0 real-1801-a0" "realistic 546 41 0 real-546-a0" "minimal 1801 41 0.70 min-1801-a70" "realistic 50 5 0 real-50-a0"; do \
-		read -r profile count projects archived label <<< "$$spec"; \
+	for spec in "realistic 1801 41 0.70 real-1801-a70 2" "realistic 1801 41 0 real-1801-a0 1" "realistic 546 41 0 real-546-a0 2" "minimal 1801 41 0.70 min-1801-a70 1" "realistic 50 5 0 real-50-a0 1"; do \
+		read -r profile count projects archived label launches <<< "$$spec"; \
 		root="$$fixtures/$$label"; \
 		bun scripts/perf/workspace-scale/generate-fixture.ts --root "$$root" --workspaces "$$count" --projects "$$projects" --archived "$$archived" --profile "$$profile"; \
 		bun scripts/perf/workspace-scale/config-micro.ts --root "$$root" --label "$$label"; \
-		bun scripts/perf/workspace-scale/run-server-bench.ts --root "$$root" --label "$$label" --repetitions $(PERF_REPETITIONS); \
+		bun scripts/perf/workspace-scale/run-server-bench.ts --root "$$root" --label "$$label" --repetitions $(PERF_REPETITIONS) --launches "$$launches"; \
 	done
 
 check-deadcode: node_modules/.installed ## Check for potential dead code (manual only, not in static-check)

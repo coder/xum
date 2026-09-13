@@ -16,15 +16,19 @@ export function benchArgs(defaultCount: number) {
       root: { type: "string" },
       label: { type: "string" },
       repetitions: { type: "string", default: String(defaultCount) },
+      launches: { type: "string", default: "1" },
     },
   });
   if (!values.root || !values.label || !/^[a-zA-Z0-9_-]+$/.test(values.label)) {
-    throw new Error("Required: --root <generated-fixture> --label <name> [--repetitions N]");
+    throw new Error(
+      "Required: --root <generated-fixture> --label <name> [--repetitions N] [--launches N]"
+    );
   }
   return {
     root: resolve(values.root),
     label: values.label,
     repetitions: z.coerce.number().int().min(1).parse(values.repetitions),
+    launches: z.coerce.number().int().min(1).parse(values.launches),
   };
 }
 
