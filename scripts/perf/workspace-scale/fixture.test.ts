@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
 import { buildFixture, generateFixture, type FixtureOptions } from "./generate-fixture";
 import { copyFixture, readFixture, summarize } from "./common";
-import { parseStartup, runLaunches } from "./run-server-bench";
+import { parseStartup, parseHousekeepingSettled, runLaunches } from "./run-server-bench";
 
 const options: FixtureOptions = {
   workspaces: 1801,
@@ -161,5 +161,19 @@ test("startup parser distinguishes unrelated logs and validates timing payloads"
   ).toEqual({ totalMs: 123, stepDurationsMs: { core: 40, workspaces: 80 } });
   expect(() =>
     parseStartup('[startup] ServiceContainer.initialize completed {"totalMs":"bad"}')
+  ).toThrow();
+});
+
+test("settled parser does not treat recovery completion as retention cleanup completion", () => {
+  expect(
+    parseHousekeepingSettled(
+      '[startup] ServiceContainer.initialize completed {"totalMs":1,"stepDurationsMs":{}}'
+    )
+  ).toBeUndefined();
+  expect(
+    parseHousekeepingSettled('[startup] ServiceContainer housekeeping settled {"durationMs":12}')
+  ).toEqual({ durationMs: 12 });
+  expect(() =>
+    parseHousekeepingSettled('[startup] ServiceContainer housekeeping settled {"durationMs":"bad"}')
   ).toThrow();
 });

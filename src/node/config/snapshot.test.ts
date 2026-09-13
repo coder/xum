@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import * as fs from "fs";
+import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
@@ -64,6 +64,8 @@ describe("Config snapshots", () => {
   });
 
   it("invalidates on atomic external replacement, including same-size bytes and mtime", () => {
+    const timestamp = new Date("2026-03-01T00:00:00.000Z");
+    fs.utimesSync(path.join(root, "config.json"), timestamp, timestamp);
     const snapshot = config.loadConfigOrDefault();
     const stat = fs.statSync(path.join(root, "config.json"));
     const replacement = path.join(root, "replacement.json");
@@ -71,7 +73,11 @@ describe("Config snapshots", () => {
       replacement,
       fs.readFileSync(path.join(root, "config.json"), "utf-8").replaceAll('"active"', '"latest"')
     );
-    fs.utimesSync(replacement, stat.atime, stat.mtime);
+    fs.utimesSync(replacement, timestamp, timestamp);
+    const replacementStat = fs.statSync(replacement);
+    expect(replacementStat.mtimeMs).toBe(stat.mtimeMs);
+    expect(replacementStat.size).toBe(stat.size);
+    expect(replacementStat.ino).not.toBe(stat.ino);
     fs.renameSync(replacement, path.join(root, "config.json"));
     const next = config.loadConfigOrDefault();
     expect(next).not.toBe(snapshot);
@@ -80,7 +86,7 @@ describe("Config snapshots", () => {
     expect(config.loadConfigOrDefault()).toBe(next);
   });
 
-  it("isolates edits and warms the saved snapshot without another file read", async () => {
+  it("isolates edits and reloads the saved snapshot once", async () => {
     const before = config.loadConfigOrDefault();
     const generation = await config.configFileWriteGeneration();
     const read = spyOn(fs, "readFileSync");
@@ -95,7 +101,7 @@ describe("Config snapshots", () => {
       expect(before.projects.get(projectPath)?.workspaces[0].title).toBeUndefined();
       expect(
         read.mock.calls.filter(([file]) => file === path.join(root, "config.json"))
-      ).toHaveLength(1);
+      ).toHaveLength(2);
       expect(await config.configFileWriteGeneration()).not.toBe(generation);
       expect(config.loadConfigOrDefault()).toBe(after);
     } finally {
@@ -104,7 +110,7 @@ describe("Config snapshots", () => {
     expect(config.loadConfigOrDefault()).toEqual(new Config(root).loadConfigOrDefault());
   });
 
-  it("warms the saved runtime projection with normalized keys and hierarchy", async () => {
+  it("reloads the saved runtime projection with normalized keys and hierarchy", async () => {
     await config.editConfig((snapshot) => {
       snapshot.projects.set(projectPath + "/child/", { workspaces: [workspace("child")] });
       return snapshot;
@@ -117,6 +123,40 @@ describe("Config snapshots", () => {
       snapshot.projects.get(projectPath)?.workspaces.find((entry) => entry.id === "child")
         ?.subProjectPath
     ).toBe(projectPath + "/child");
+  });
+
+  it("sees an external atomic replacement between our rename and save completion", async () => {
+    config.loadConfigOrDefault();
+    const configPath = path.join(root, "config.json");
+    const external = fs
+      .readFileSync(configPath, "utf8")
+      .replace('"name": "active"', '"name": "external"');
+    const rename = nativeFs.rename;
+    const filesystem: { rename: (...args: Parameters<typeof rename>) => void } = nativeFs;
+    let replaced = false;
+    const renameSpy = spyOn(filesystem, "rename").mockImplementation(
+      (source, destination, callback) => {
+        rename(source, destination, (error) => {
+          if (!error && destination === configPath) {
+            const replacement = path.join(root, "external.json");
+            fs.writeFileSync(replacement, external);
+            fs.renameSync(replacement, configPath);
+            replaced = true;
+          }
+          callback(error);
+        });
+      }
+    );
+    try {
+      await config.setUpdateChannel("nightly");
+      expect(replaced).toBe(true);
+      expect(await config.configFileWriteGeneration()).toBe(
+        await new Config(root).configFileWriteGeneration()
+      );
+      expect(config.findWorkspace("active")?.workspaceName).toBe("external");
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 
   it("does not reuse a lenient structurally invalid load for a strict read", () => {
@@ -221,9 +261,9 @@ describe("Config snapshots", () => {
     ]);
     const all = await config.getAllWorkspaceMetadata();
     const access = spyOn(fs.promises, "access");
-    const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockRejectedValue(
-      new Error("Unexpected full metadata enumeration")
-    );
+    const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() => {
+      throw new Error("Unexpected full metadata enumeration");
+    });
     try {
       expect(await config.getWorkspaceMetadataById("child")).toEqual(all[1]);
       expect(access.mock.calls.map(([file]) => file)).toEqual([path.join(root, "child")]);

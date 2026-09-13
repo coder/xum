@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, platform, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -118,7 +118,24 @@ export function printTable(rows: [string, ReturnType<typeof summarize>, string][
   }
 }
 
-export async function writeResults(label: string, result: unknown) {
+export async function readBuiltArtifact(root: string) {
+  const cli = join(repoRoot, "dist/cli/index.js");
+  return {
+    version: execFileSync("node", [cli, "--version"], {
+      cwd: repoRoot,
+      env: isolatedEnv(root),
+      encoding: "utf8",
+      timeout: 10_000,
+    }).trim(),
+    modifiedAt: (await stat(cli)).mtime.toISOString(),
+  };
+}
+
+export async function writeResults(
+  label: string,
+  result: unknown,
+  builtArtifact?: Awaited<ReturnType<typeof readBuiltArtifact>>
+) {
   await mkdir(outputDir, { recursive: true });
   const filename = join(outputDir, label + ".json");
   await writeFile(
@@ -130,6 +147,7 @@ export async function writeResults(label: string, result: unknown) {
           cwd: repoRoot,
           encoding: "utf8",
         }).trim(),
+        builtArtifact,
         machine: {
           platform: platform(),
           cpu: cpus()[0]?.model,

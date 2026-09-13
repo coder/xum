@@ -465,6 +465,7 @@ export class ServiceContainer {
   }
 
   private async runStartupHousekeepingSteps(): Promise<void> {
+    const housekeepingStartedAt = Date.now();
     const signal = this.startupHousekeepingAbort.signal;
     // Housekeeping is best-effort and may run while the server is already serving requests: a
     // failing step must not skip the periodic services below (startup-time rule: never let
@@ -545,6 +546,9 @@ export class ServiceContainer {
     } catch (error: unknown) {
       log.warn("[startup] Archived DevTools cleanup failed", { error });
     }
+    log.info("[startup] ServiceContainer housekeeping settled", {
+      durationMs: Date.now() - housekeepingStartedAt,
+    });
   }
 
   /**

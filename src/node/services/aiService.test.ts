@@ -461,9 +461,9 @@ describe("AIService workspace metadata lookup", () => {
       });
       return snapshot;
     });
-    const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockRejectedValue(
-      new Error("Unexpected enumeration")
-    );
+    const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() => {
+      throw new Error("Unexpected enumeration");
+    });
     const access = spyOn(fsPromises, "access");
     try {
       const result = await service.getWorkspaceMetadata("active");

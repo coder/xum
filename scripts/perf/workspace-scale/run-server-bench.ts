@@ -18,6 +18,7 @@ import {
   outputDir,
   printTable,
   readFixture,
+  readBuiltArtifact,
   repoRoot,
   summarize,
   writeResults,
@@ -33,6 +34,15 @@ export function parseStartup(line: string) {
   const index = line.indexOf(marker);
   if (index < 0) return undefined;
   return StartupSchema.parse(JSON.parse(line.slice(line.indexOf("{", index))));
+}
+
+export function parseHousekeepingSettled(line: string) {
+  const marker = "[startup] ServiceContainer housekeeping settled";
+  const index = line.indexOf(marker);
+  if (index < 0) return undefined;
+  return z
+    .object({ durationMs: z.number() })
+    .parse(JSON.parse(line.slice(line.indexOf("{", index))));
 }
 
 async function freePort() {
@@ -81,6 +91,8 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
   let output = "";
   let startup: z.infer<typeof StartupSchema> | undefined;
   let housekeepingMs: number | undefined;
+  let housekeepingSettledMs: number | undefined;
+  let settled: ReturnType<typeof parseHousekeepingSettled>;
   const capture = (chunk: string) => {
     output += chunk;
     if (
@@ -89,13 +101,25 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
     ) {
       housekeepingMs = performance.now() - start;
     }
+    if (
+      housekeepingSettledMs == null &&
+      output.includes("[startup] ServiceContainer housekeeping settled")
+    ) {
+      housekeepingSettledMs = performance.now() - start;
+    }
   };
   child.stdout.setEncoding("utf8").on("data", capture);
   child.stderr.setEncoding("utf8").on("data", capture);
   let result;
   try {
     let healthMs: number | undefined;
-    while (healthMs == null || housekeepingMs == null || !startup) {
+    while (
+      healthMs == null ||
+      housekeepingMs == null ||
+      housekeepingSettledMs == null ||
+      !startup ||
+      !settled
+    ) {
       if (child.exitCode != null || child.signalCode != null)
         throw new Error("Server exited: " + output.slice(-4000));
       if (performance.now() - start > 180_000)
@@ -109,14 +133,22 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
           /* Tolerate failed health probes until the startup deadline. */
         }
       }
-      if (housekeepingMs != null && !startup) {
+      if (housekeepingMs != null && (!startup || !settled)) {
         // Read the file sink's JSON-serialized startup payload; console output may span lines.
         const logfile = await readFile(join(root, "logs", "mux.log"), "utf8");
         for (const line of logfile.split("\n").slice(0, -1)) {
           startup = parseStartup(line) ?? startup;
+          settled = parseHousekeepingSettled(line) ?? settled;
         }
       }
-      if (healthMs == null || housekeepingMs == null || !startup) await delay(10);
+      if (
+        healthMs == null ||
+        housekeepingMs == null ||
+        housekeepingSettledMs == null ||
+        !startup ||
+        !settled
+      )
+        await delay(10);
     }
     if (!startup || !child.pid) throw new Error("Missing startup measurement");
     const rssStartupBytes = await rss(child.pid);
@@ -162,6 +194,7 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
     result = {
       healthMs,
       housekeepingMs,
+      housekeepingSettledMs,
       initializeTotalMs: startup.totalMs,
       stepDurationsMs: startup.stepDurationsMs,
       rssStartupBytes,
@@ -204,6 +237,7 @@ function summarizeRuns(runs: Awaited<ReturnType<typeof runOnce>>[]) {
       [
         "healthMs",
         "housekeepingMs",
+        "housekeepingSettledMs",
         "initializeTotalMs",
         "rssStartupBytes",
         "rssAfterCallsBytes",
@@ -237,6 +271,7 @@ if (import.meta.main) {
     throw new Error("Build the baseline first: make build-main");
   });
   const fixture = await readFixture(args.root);
+  const builtArtifact = await readBuiltArtifact(args.root);
   const runsByLaunch: Awaited<ReturnType<typeof runOnce>>[][] = Array.from(
     { length: args.launches },
     () => []
@@ -253,9 +288,9 @@ if (import.meta.main) {
     ...summarizeRuns(runs),
   }));
   const first = launches[0];
-  console.log("\n### " + args.label + " server");
+  console.log("\n### " + args.label + " server (built " + builtArtifact.version + ")");
   console.log(
-    "| Launch | Health ms | Housekeeping ms | Initialize ms | RSS startup MiB | RSS after calls MiB |\n| --- | ---: | ---: | ---: | ---: | ---: |"
+    "| Launch | Health ms | Housekeeping ms | Settled ms | Initialize ms | RSS startup MiB | RSS after calls MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
   );
   for (const { launch, metrics } of launches) {
     console.log(
@@ -264,6 +299,7 @@ if (import.meta.main) {
           launch,
           metrics.healthMs.median.toFixed(2),
           metrics.housekeepingMs.median.toFixed(2),
+          metrics.housekeepingSettledMs.median.toFixed(2),
           metrics.initializeTotalMs.median.toFixed(2),
           (metrics.rssStartupBytes.median / 2 ** 20).toFixed(2),
           (metrics.rssAfterCallsBytes.median / 2 ** 20).toFixed(2),
@@ -293,10 +329,14 @@ if (import.meta.main) {
         " |"
     );
   }
-  await writeResults(args.label, {
-    fixture: fixture.options,
-    repetitions: args.repetitions,
-    ...first,
-    launches,
-  });
+  await writeResults(
+    args.label,
+    {
+      fixture: fixture.options,
+      repetitions: args.repetitions,
+      ...first,
+      launches,
+    },
+    builtArtifact
+  );
 }

@@ -1578,9 +1578,7 @@ export class Config {
   }
 
   private normalizeParsedConfig(
-    parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
-    persistMigrations = true,
-    normalizedProjects?: Map<string, ProjectConfig>
+    parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
   ): ProjectsConfig {
     let configModified = false;
     let shouldInvalidateSessionUsageCaches = false;
@@ -1718,9 +1716,7 @@ export class Config {
       shouldInvalidateSessionUsageCaches = true;
     }
 
-    const projectsMap = deriveProjectHierarchy(
-      normalizedProjects ?? this.normalizeConfigProjects(parsed.projects)
-    );
+    const projectsMap = deriveProjectHierarchy(this.normalizeConfigProjects(parsed.projects));
 
     // Run before the subproject merge below so a hierarchy edge case
     // cannot relocate a legacy workspace into a parent project first.
@@ -1878,7 +1874,7 @@ export class Config {
       parsed.subagentAiDefaults
     );
 
-    if (persistMigrations && shouldInvalidateSessionUsageCaches) {
+    if (shouldInvalidateSessionUsageCaches) {
       // Invalidate stale usage caches only when model id formats changed.
       try {
         if (fs.existsSync(this.sessionsDir)) {
@@ -1904,7 +1900,7 @@ export class Config {
       }
     }
 
-    if (persistMigrations && configModified && this.migrationPersist == null) {
+    if (configModified && this.migrationPersist == null) {
       // Persist load-time migrations through the serialized editConfig queue instead of
       // writing `parsed` synchronously here: a sync write bypasses the queue, so a
       // concurrent editConfig write landing between this load's read and the write-back
@@ -2035,8 +2031,6 @@ export class Config {
         ensurePrivateDirSync(self.rootDir);
       }
 
-      // Keep the runtime projection separate from downgrade-only fields written to disk.
-      const normalizedProjects = new Map<string, ProjectConfig>();
       const data: Partial<Record<keyof AppConfigOnDisk, unknown>> & {
         projects: Array<[string, ProjectConfig]>;
       } = {
@@ -2044,7 +2038,6 @@ export class Config {
         writeId: crypto.randomUUID(),
         projects: Array.from(config.projects.entries()).map(([projectPath, projectConfig]) => {
           const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-          normalizedProjects.set(stripTrailingSlashes(projectPath), normalizedProjectConfig);
           const persistedProjectConfig = {
             ...normalizedProjectConfig,
             workspaces: normalizedProjectConfig.workspaces.map((workspace) => ({ ...workspace })),
@@ -2320,20 +2313,8 @@ export class Config {
         try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
         catch: (error) => error,
       });
-      const key = self.readConfigStatKey();
+      // A competing rename may already have replaced our write; only a fresh read can publish it.
       self.configSnapshot = undefined;
-      if (key !== undefined) {
-        try {
-          self.validateConfigStructure(data);
-          self.configSnapshot = {
-            key,
-            config: self.normalizeParsedConfig(data, false, normalizedProjects),
-            writeId: typeof data.writeId === "string" ? data.writeId : "-",
-          };
-        } catch (error) {
-          log.debug("Skipping saved config snapshot cache", { error });
-        }
-      }
       for (const workspaceId of self.legacyTaskVariantGroups.keys()) {
         if (!persistedWorkspaceIds.has(workspaceId)) {
           // A load-time settings migration can save before getAllWorkspaceMetadata's queued
