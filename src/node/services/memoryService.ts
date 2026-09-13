@@ -631,18 +631,26 @@ class LocalMemoryStore implements MemoryStore {
         if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
         // A filesystem may report DT_UNKNOWN: every type predicate is false
-        // and the entry would drop out of the walk. Strict callers (removal's
-        // legacy handover) would then see a complete listing that omits a
-        // regular note or a whole subtree, so they classify by lstat instead;
-        // an unclassifiable entry fails the listing like an unreadable dir.
+        // and the entry would drop out of the walk — a strict caller
+        // (removal's legacy handover) would see a complete listing that
+        // omits a regular note or a whole subtree, and the bounded legacy
+        // fingerprint would never notice an edit under it. Such entries are
+        // classified by lstat instead (one extra stat per untyped entry; the
+        // bounded walk stays capped). Strict callers fail the listing on an
+        // unclassifiable entry like on an unreadable dir; bounded ones treat
+        // it as "other", as before.
         let kind: "dir" | "file" | "other";
         if (entry.isDirectory()) {
           kind = "dir";
         } else if (entry.isFile()) {
           kind = "file";
-        } else if (options?.strict === true && isDirentTypeUnknown(entry)) {
-          const stat = await fsPromises.lstat(this.abs(childRel));
-          kind = stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
+        } else if (isDirentTypeUnknown(entry)) {
+          const stat = await fsPromises.lstat(this.abs(childRel)).catch((error: unknown) => {
+            if (options?.strict === true) throw error;
+            return null;
+          });
+          kind =
+            stat === null ? "other" : stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
         } else {
           kind = "other";
         }
@@ -1462,8 +1470,7 @@ export class MemoryService extends EventEmitter {
       // rather than reuse — or clear the pins of — a copy that may be a
       // sibling's.
       let siblingRecords: LegacyAdoptionRecord[] | null = null;
-      const siblingOwns = async (targetRelPath: string, liveStamp: string | null) => {
-        if (liveStamp === null) return false;
+      const siblingOwns = async (targetRelPath: string, liveStamp: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
         return siblingRecords.some(
           (record) =>
@@ -1749,7 +1756,10 @@ export class MemoryService extends EventEmitter {
           let siblings = false;
           if (!ours && priorContent === content) {
             try {
-              siblings = await siblingOwns(previous.target, currentStamp ?? null);
+              if (currentStamp === undefined) {
+                throw new Error(`cannot read the generation of adopted copy ${previous.target}`);
+              }
+              siblings = await siblingOwns(previous.target, currentStamp);
             } catch (error) {
               log.warn(
                 "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
@@ -2076,7 +2086,7 @@ export class MemoryService extends EventEmitter {
     childId: string,
     relPath: string,
     content: string,
-    siblingOwns: (targetRelPath: string, liveStamp: string | null) => Promise<boolean>
+    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>
   ): Promise<{ relPath: string; write: boolean } | null> {
     for (const candidate of [
       relPath,
@@ -2092,12 +2102,16 @@ export class MemoryService extends EventEmitter {
       if (destination === "free") return { relPath: candidate, write: true };
       // Identical: the owner's own note is reused (no slot, the owner's pin
       // stands); another descendant's adoption-created copy is not — this
-      // note gets its own copy at the next candidate.
-      if (
-        destination.content === content &&
-        !(await siblingOwns(candidate, await adoptionTargetStamp(store.physicalPath(candidate))))
-      ) {
-        return { relPath: candidate, write: false };
+      // note gets its own copy at the next candidate. That question needs
+      // the candidate's live generation: one that cannot be read right now
+      // (the lstat failed after the read succeeded) is unanswered, not
+      // "nobody's" — the note waits (the caller skips it transiently).
+      if (destination.content === content) {
+        const liveStamp = await adoptionTargetStamp(store.physicalPath(candidate));
+        if (liveStamp === null) {
+          throw new Error(`cannot read the generation of adoption destination ${candidate}`);
+        }
+        if (!(await siblingOwns(candidate, liveStamp))) return { relPath: candidate, write: false };
       }
     }
     return null;

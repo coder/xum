@@ -3594,6 +3594,105 @@ describe("MemoryService", () => {
       ).adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
     });
+
+    it("fingerprints notes under untyped dirents, so a nested downgrade edit re-runs the pass", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(path.join(legacyRoot, "nested"), { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "nested", "deep.md"), "v1");
+      // DT_UNKNOWN for everything under the legacy root, for the whole test.
+      const realReaddir = fsPromises.readdir.bind(fsPromises);
+      const untyped = spyOn(fsPromises, "readdir").mockImplementation((async (
+        target: string,
+        options: unknown
+      ) => {
+        const entries = (await realReaddir(
+          target,
+          options as { withFileTypes: true }
+        )) as unknown as Array<Record<string, unknown>>;
+        if (!String(target).startsWith(legacyRoot)) return entries;
+        const no = () => false;
+        return entries.map((entry) => ({
+          ...entry,
+          name: entry.name,
+          isFile: no,
+          isDirectory: no,
+          isSymbolicLink: no,
+          isFIFO: no,
+          isSocket: no,
+          isBlockDevice: no,
+          isCharacterDevice: no,
+        }));
+      }) as unknown as typeof fsPromises.readdir);
+      try {
+        const passes = spyOn(
+          fixture.service as unknown as {
+            readOrQuarantineAdoptionManifest: () => Promise<unknown>;
+          },
+          "readOrQuarantineAdoptionManifest"
+        );
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+        expect(await fsPromises.readFile(path.join(ownerRoot, "nested", "deep.md"), "utf-8")).toBe(
+          "v1"
+        );
+        // An in-place edit of the nested note moves neither the root's mtime
+        // nor anything the capped fingerprint would see if it dropped the
+        // untyped entries: the pass would stay memoized and the edit lost.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await fsPromises.writeFile(path.join(legacyRoot, "nested", "deep.md"), "v2 (downgrade)");
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+        expect(passes).toHaveBeenCalledTimes(2);
+        expect(await fsPromises.readFile(path.join(ownerRoot, "nested", "deep.md"), "utf-8")).toBe(
+          "v2 (downgrade)"
+        );
+      } finally {
+        untyped.mockRestore();
+      }
+    });
+
+    it("waits when an identical destination's generation cannot be read instead of reusing it", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "same");
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "same");
+      const ownerNote = path.join(ownerRoot, "note.md");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      // The content read succeeds, the generation stamp (the bigint lstat)
+      // fails: whether the identical file is a sibling's copy cannot be
+      // told, so it is not reused — that would settle a record (and fold
+      // pins) against a file that may be another descendant's.
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const flaky = spyOn(fsPromises, "lstat").mockImplementation(((
+        p: Parameters<typeof fsPromises.lstat>[0],
+        options?: { bigint?: boolean }
+      ) =>
+        String(p) === ownerNote && options?.bigint === true
+          ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
+          : (realLstat as (...args: unknown[]) => unknown)(p, options)) as never);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        flaky.mockRestore();
+      }
+      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(legacyRoot)))).toBe(false);
+      expect(await pathExists(path.join(ownerRoot, "imported"))).toBe(false);
+      // Transient: retried on the next access, which settles the reuse.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(2);
+      const record = (
+        await readLegacyAdoptionManifest(legacyAdoptionManifestPath(path.dirname(legacyRoot)))
+      ).get("note.md")!;
+      expect(record).toMatchObject({ target: "note.md", created: false });
+    });
   });
 
   describe("memory index entries", () => {
