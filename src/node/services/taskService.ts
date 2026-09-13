@@ -171,7 +171,10 @@ import {
   type AgentPeerMessageAdmissionError,
 } from "@/node/services/agentPeerMessageBroker";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
-import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
+import {
+  readSubagentGitPatchArtifact,
+  readSubagentGitPatchArtifactsFile,
+} from "@/node/services/subagentGitPatchArtifacts";
 import {
   readSubagentReportArtifact,
   readSubagentReportArtifactsFile,
@@ -2613,13 +2616,29 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     const patchGenerationRecoveryStartedAt = Date.now();
+    const patchArtifactsByParent = new Map<
+      string,
+      Awaited<ReturnType<typeof readSubagentGitPatchArtifactsFile>>
+    >();
     for (const task of completedReportTasks) {
       if (cancelled()) return;
       if (!task.parentWorkspaceId) continue;
+      // Archived checkouts may be absent; recover their artifacts after unarchive restores them.
+      if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) continue;
       // A reported task that is streaming again (a client reactivated it) may be committing;
       // the continuation refresh that runs when that turn ends generates its artifact.
       if (this.aiService.isStreaming(task.id!)) continue;
       try {
+        let artifacts = patchArtifactsByParent.get(task.parentWorkspaceId);
+        if (!artifacts) {
+          artifacts = await readSubagentGitPatchArtifactsFile(
+            path.join(this.config.sessionsDir, task.parentWorkspaceId)
+          );
+          patchArtifactsByParent.set(task.parentWorkspaceId, artifacts);
+        }
+        const artifact = artifacts.artifactsByChildTaskId[task.id!];
+        if (artifact != null && artifact.status !== "pending") continue;
+
         // Pass the loop snapshot: reloading config.json per reported task made this pass scale
         // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
@@ -10010,6 +10029,16 @@ export class TaskService implements AgentTaskIntegration {
     // queue and the sweep skips archived workspaces), so without this unarchive-time
     // reconciliation an idle owner would stay silent until the interval sweep.
     await this.sweepWorkflowRunTerminalAttention(workspaceId);
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      entry &&
+      hasCompletedAgentReport(entry.workspace) &&
+      !isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt) &&
+      !isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus) &&
+      !this.aiService.isStreaming(workspaceId)
+    ) {
+      await this.maybeStartPatchGenerationForReportedTask(workspaceId);
+    }
   }
 
   /**
@@ -13841,6 +13870,10 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "task_not_reported" };
     }
 
+    if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+      return { ok: false, reason: "archived" };
+    }
+
     // A reported task reactivated through an existing-workspace turn keeps taskStatus "reported"
     // while its execution mirror is already starting or running, before any stream registers.
     if (isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus)) {
@@ -13877,6 +13910,12 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "has_child_tasks" };
     }
 
+    // User-owned children persist unconditionally until task_remove. Workflow-owned workers remain
+    // transient implementation details because their workflow journal owns the durable result.
+    if (!isWorkflowOwnedTask) {
+      return { ok: false, reason: "preserved" };
+    }
+
     const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
     const patchArtifact = await readSubagentGitPatchArtifact(parentSessionDir, workspaceId);
     if (patchArtifact?.status === "pending") {
@@ -13885,12 +13924,6 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId,
       });
       return { ok: false, reason: "patch_pending" };
-    }
-
-    // User-owned children persist unconditionally until task_remove. Workflow-owned workers remain
-    // transient implementation details because their workflow journal owns the durable result.
-    if (!isWorkflowOwnedTask) {
-      return { ok: false, reason: "preserved" };
     }
 
     return { ok: true, parentWorkspaceId };

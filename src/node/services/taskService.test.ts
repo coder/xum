@@ -4295,6 +4295,121 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, reportedTaskId)).toBeUndefined();
   });
 
+  test("startup leaves archived reported tasks untouched and recovers them on unarchive", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-archive-recovery";
+    const childId = "child-archive-recovery";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          parentWorkspaceId: parentId,
+          agentType: "exec",
+          taskStatus: "reported",
+          archivedAt: "2026-08-10T00:00:00.000Z",
+          workflowTask: { runId: "wfr_archive_recovery", stepId: "exec" },
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { taskService, historyService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      gitPatchArtifactService: { maybeStartGeneration: (...args: unknown[]) => Promise<void> };
+    };
+    const generation = spyOn(
+      internal.gitPatchArtifactService,
+      "maybeStartGeneration"
+    ).mockResolvedValue();
+    const artifactRead = spyOn(subagentGitPatchArtifacts, "readSubagentGitPatchArtifact");
+    const partialRead = spyOn(historyService, "readPartial");
+    try {
+      await taskService.runStartupHousekeeping();
+      expect(generation).not.toHaveBeenCalled();
+      expect(artifactRead).not.toHaveBeenCalled();
+      expect(partialRead).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childId)).toBeDefined();
+      await config.editConfig((cfg) => {
+        const child = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === childId);
+        if (child) child.unarchivedAt = "2026-08-11T00:00:00.000Z";
+        return cfg;
+      });
+      await taskService.noteWorkspaceUnarchived(childId);
+      expect(generation).toHaveBeenCalledWith(parentId, childId, expect.any(Function), undefined);
+    } finally {
+      generation.mockRestore();
+      artifactRead.mockRestore();
+      partialRead.mockRestore();
+    }
+  });
+
+  test("startup batches settled artifacts and recovers pending or missing patches", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-settled-patches";
+    const children = ["settled-first", "settled-second", "pending-patch", "missing-patch"].map(
+      (id) =>
+        projectWorkspace(projectPath, id, id, {
+          parentWorkspaceId: parentId,
+          agentType: "exec",
+          taskStatus: "reported",
+        })
+    );
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [projectWorkspace(projectPath, "parent", parentId), ...children],
+      testTaskSettings()
+    );
+    for (const child of children.filter((child) => child.id !== "missing-patch")) {
+      await upsertSubagentGitPatchArtifact({
+        workspaceId: parentId,
+        workspaceSessionDir: path.join(config.sessionsDir, parentId),
+        childTaskId: child.id!,
+        updater: () => ({
+          childTaskId: child.id!,
+          parentWorkspaceId: parentId,
+          createdAtMs: 1,
+          status: child.id === "pending-patch" ? "pending" : "ready",
+          projectArtifacts: [
+            {
+              projectPath,
+              projectName: "repo",
+              storageKey: "repo",
+              status: child.id === "pending-patch" ? "pending" : "ready",
+            },
+          ],
+          readyProjectCount: 0,
+          failedProjectCount: 0,
+          skippedProjectCount: 0,
+          totalCommitCount: 0,
+        }),
+      });
+    }
+    const { taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      gitPatchArtifactService: { maybeStartGeneration: (...args: unknown[]) => Promise<void> };
+    };
+    const generation = spyOn(
+      internal.gitPatchArtifactService,
+      "maybeStartGeneration"
+    ).mockResolvedValue();
+    const artifactRead = spyOn(subagentGitPatchArtifacts, "readSubagentGitPatchArtifactsFile");
+    try {
+      await taskService.runStartupHousekeeping();
+      expect(generation.mock.calls.map((call) => call[1])).toEqual([
+        "pending-patch",
+        "missing-patch",
+      ]);
+      expect(artifactRead).toHaveBeenCalledTimes(1);
+    } finally {
+      generation.mockRestore();
+      artifactRead.mockRestore();
+    }
+  });
+
   test("initialize does not reload config.json per completed-report task", async () => {
     const countConfigLoadsDuringInitialize = async (reportedTaskCount: number): Promise<number> => {
       const runRootDir = path.join(rootDir, `run-${reportedTaskCount}`);
@@ -24786,7 +24901,7 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, grandparentTaskId)).toBeTruthy();
     });
 
-    test("pending patch artifacts still defer cleanup before retention checks", async () => {
+    test("persistent tasks skip patch reads even when their artifact is pending", async () => {
       const { config, remove, rootWorkspaceId, taskChain, internal } =
         await setupReportedTaskChain();
       const parentTaskId = taskChain[0]?.id;
@@ -24826,7 +24941,8 @@ describe("TaskService", () => {
 
       try {
         const cleanupEligibility = await internal.canCleanupReportedTask(childTaskId);
-        expect(cleanupEligibility).toEqual({ ok: false, reason: "patch_pending" });
+        expect(patchArtifactSpy).not.toHaveBeenCalled();
+        expect(cleanupEligibility).toEqual({ ok: false, reason: "preserved" });
 
         await internal.cleanupReportedLeafTask(childTaskId);
 
