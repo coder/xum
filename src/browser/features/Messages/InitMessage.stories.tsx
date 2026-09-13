@@ -178,3 +178,31 @@ export const RunningPhone: Story = {
     );
   },
 };
+export const GeneratingNameAfterInit: Story = {
+  // Init finished in milliseconds but the LLM title is still pending: the card stays open on
+  // the name step instead of collapsing to "Workspace created".
+  args: { message: SUCCESS_MESSAGE, nameGeneration: "pending" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByRole("button", { name: /Workspace created/ })).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    );
+    await expect(canvas.getByText("Generating name")).toBeVisible();
+    await expect(canvas.getByLabelText("In progress")).toBeVisible();
+    await expect(canvas.getAllByLabelText("Completed")).toHaveLength(4);
+  },
+};
+
+export const NameGenerated: Story = {
+  args: { message: SUCCESS_MESSAGE, nameGeneration: "done" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const header = canvas.getByRole("button", { name: /Workspace created/ });
+    await expect(header).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(header);
+    await expect(canvas.getByText("Generating name")).toBeVisible();
+    await expect(canvas.queryByLabelText("In progress")).not.toBeInTheDocument();
+    await expect(canvas.getAllByLabelText("Completed")).toHaveLength(5);
+  },
+};

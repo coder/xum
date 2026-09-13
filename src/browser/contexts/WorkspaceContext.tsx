@@ -2198,6 +2198,14 @@ export function useWorkspaceMetadata(): WorkspaceMetadataContextValue {
 }
 
 /**
+ * Metadata-only variant that returns undefined outside WorkspaceProvider, for transcript rows
+ * that are also rendered in Storybook or tests without the full provider tree.
+ */
+export function useWorkspaceMetadataOptional(): WorkspaceMetadataContextValue | undefined {
+  return useContext(WorkspaceMetadataContext) ?? undefined;
+}
+
+/**
  * Subscribe to workspace actions/selection/drafts only. This context value is
  * stable across metadata-Map changes, so sidebar-like components that don't
  * need the full Map can avoid re-renders.

@@ -39,7 +39,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -73,7 +73,11 @@ import {
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
+import {
+  useWorkspaceName,
+  type WorkspaceIdentity,
+  type WorkspaceNameState,
+} from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -260,6 +264,30 @@ function isWorkspaceDraftEmpty(workspaceId: string): boolean {
   );
 }
 
+/**
+ * Applies the LLM title once generation finishes after the workspace already exists. Not awaited:
+ * the send must not wait on it, and the sidebar and creation card follow the backend metadata
+ * event. A failed generation resolves null and leaves `pendingAutoTitle` set, so the backend
+ * retries from the first user message (the existing /fork and /new path).
+ */
+function applyDeferredTitle(
+  api: { workspace: Pick<APIClient["workspace"], "updateTitle"> },
+  workspaceId: string,
+  deferred: Promise<WorkspaceIdentity | null>
+): void {
+  deferred
+    .then(async (generated) => {
+      if (!generated) return;
+      const result = await api.workspace.updateTitle({ workspaceId, title: generated.title });
+      if (!result.success) {
+        console.warn("Failed to apply generated workspace title:", result.error);
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn("Failed to apply generated workspace title:", error);
+    });
+}
+
 // Persist a failed creation send's draft under the new workspace's keys so the
 // retry happens there instead of creating a duplicate workspace.
 function transferDraftToWorkspace(
@@ -383,7 +411,7 @@ export function useCreationWorkspace({
   });
 
   // Destructure name state functions for use in callbacks
-  const { waitForGeneration } = workspaceNameState;
+  const { resolveIdentityNow } = workspaceNameState;
 
   // Load branches - used on mount and after git init
   // Returns a cleanup function to track mounted state
@@ -531,16 +559,25 @@ export function useCreationWorkspace({
       let createdWorkspaceId: string | null = null;
 
       try {
-        // Wait for identity generation to complete (blocks if still in progress)
-        // Returns null if generation failed or manual name is empty (error already set in hook)
-        const identity = await waitForGeneration();
-        if (!identity) {
+        // Never block Send on the LLM name: when generation has not finished, the workspace is
+        // created under the slug fallback and the generated title is applied once it lands
+        // (user rationale: the chat window must appear immediately after pressing Send).
+        // Returns null when a manual name is required but empty (error already set in hook).
+        const resolvedIdentity = resolveIdentityNow();
+        if (!resolvedIdentity) {
           setIsSending(false);
           return { success: false };
         }
-
-        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
-        const createTitle = normalizedTitle || undefined;
+        let identity = resolvedIdentity.identity;
+        // Settles synchronously readable so a name that arrives while the trust prompt is open
+        // still becomes the branch name instead of the slug.
+        let settledDeferredIdentity: WorkspaceIdentity | null | undefined;
+        const deferredIdentity = resolvedIdentity.deferred
+          ? resolvedIdentity.deferred.then((generated) => {
+              settledDeferredIdentity = generated;
+              return generated;
+            })
+          : null;
 
         // Read send options fresh from localStorage at send time to avoid
         // race conditions with React state updates (requestAnimationFrame batching
@@ -620,6 +657,15 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
+        if (settledDeferredIdentity) {
+          identity = settledDeferredIdentity;
+        }
+        // Still generating: create without a title and let the backend mark the title pending
+        // (sidebar shows the slug in the pending style, the card lists "Generating name").
+        const titleDeferred = deferredIdentity !== null && settledDeferredIdentity === undefined;
+        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
+        const createTitle = titleDeferred ? undefined : normalizedTitle || undefined;
+
         const createResult =
           kind === "scratch"
             ? await api.workspace.createScratch({ title: createTitle })
@@ -630,6 +676,7 @@ export function useCreationWorkspace({
                 title: createTitle,
                 runtimeConfig,
                 subProjectPath: subProjectPath ?? undefined,
+                pendingAutoTitle: titleDeferred ? true : undefined,
               });
 
         if (!createResult.success) {
@@ -644,6 +691,10 @@ export function useCreationWorkspace({
 
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
+
+        if (titleDeferred && deferredIdentity !== null) {
+          applyDeferredTitle(api, metadata.id, deferredIdentity);
+        }
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -722,7 +773,9 @@ export function useCreationWorkspace({
               ? undefined
               : {
                   workspaceName: metadata.name,
-                  nameGenerated: workspaceNameState.autoGenerate,
+                  // A deferred name is listed by the card itself from the pending-title
+                  // metadata, so the stand-in must not add a finished step for it.
+                  nameGenerated: workspaceNameState.autoGenerate && !titleDeferred,
                   kind,
                   hookPath: projectPath,
                   timestamp: pendingUserMessage?.timestamp ?? Date.now(),
@@ -925,7 +978,7 @@ export function useCreationWorkspace({
       settings.thinkingLevel,
       settings.reasoningMode,
       settings.trunkBranch,
-      waitForGeneration,
+      resolveIdentityNow,
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,

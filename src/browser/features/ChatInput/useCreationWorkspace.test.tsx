@@ -258,6 +258,8 @@ type WorkflowGetRunResult = Awaited<ReturnType<APIClient["workflows"]["getRun"]>
 type WorkspaceCreateScratchArgs = Parameters<APIClient["workspace"]["createScratch"]>[0];
 type WorkspaceCreateScratchResult = Awaited<ReturnType<APIClient["workspace"]["createScratch"]>>;
 type WorkspaceCreateResult = Awaited<ReturnType<APIClient["workspace"]["create"]>>;
+type WorkspaceUpdateTitleArgs = Parameters<APIClient["workspace"]["updateTitle"]>[0];
+type WorkspaceUpdateTitleResult = Awaited<ReturnType<APIClient["workspace"]["updateTitle"]>>;
 type NameGenerationArgs = Parameters<APIClient["nameGeneration"]["generate"]>[0];
 type NameGenerationResult = Awaited<ReturnType<APIClient["nameGeneration"]["generate"]>>;
 type WorkspaceStageAttachmentArgs = Parameters<APIClient["workspace"]["stageAttachment"]>[0];
@@ -277,6 +279,7 @@ type MockOrpcWorkspaceClient = Pick<
   | "getGoal"
   | "setGoal"
   | "stageAttachment"
+  | "updateTitle"
 >;
 type MockOrpcWorkflowsClient = Pick<APIClient["workflows"], "start" | "getRun">;
 type MockOrpcNameGenerationClient = Pick<APIClient["nameGeneration"], "generate">;
@@ -334,6 +337,9 @@ interface SetupWindowOptions {
   stageAttachment?: ReturnType<
     typeof mock<(args: WorkspaceStageAttachmentArgs) => Promise<WorkspaceStageAttachmentResult>>
   >;
+  updateTitle?: ReturnType<
+    typeof mock<(args: WorkspaceUpdateTitleArgs) => Promise<WorkspaceUpdateTitleResult>>
+  >;
 }
 
 const setupWindow = ({
@@ -349,6 +355,7 @@ const setupWindow = ({
   workflowGetRun,
   nameGeneration,
   stageAttachment,
+  updateTitle,
 }: SetupWindowOptions = {}) => {
   // Sync the useProjectContext mock with the default trusted config.
   // Tests that need untrusted projects override mockProjectConfigMap directly.
@@ -480,6 +487,12 @@ const setupWindow = ({
       }
     );
 
+  const updateTitleMock =
+    updateTitle ??
+    mock<(args: WorkspaceUpdateTitleArgs) => Promise<WorkspaceUpdateTitleResult>>(() =>
+      Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateTitleResult)
+    );
+
   currentORPCClient = {
     projects: {
       list: () => listProjectsMock(),
@@ -503,6 +516,7 @@ const setupWindow = ({
       getGoal: (input: WorkspaceGetGoalArgs) => getGoalMock(input),
       setGoal: (input: WorkspaceSetGoalArgs) => setGoalMock(input),
       stageAttachment: (input: WorkspaceStageAttachmentArgs) => stageAttachmentMock(input),
+      updateTitle: (input: WorkspaceUpdateTitleArgs) => updateTitleMock(input),
     },
     workflows: {
       start: (input: WorkflowStartArgs) => workflowStartMock(input),
@@ -619,6 +633,7 @@ const setupWindow = ({
       getGoal: getGoalMock,
       setGoal: setGoalMock,
       stageAttachment: stageAttachmentMock,
+      updateTitle: updateTitleMock,
     },
     workflowsApi: { start: workflowStartMock, getRun: workflowGetRunMock },
     nameGenerationApi: { generate: nameGenerationMock },
@@ -1443,7 +1458,10 @@ describe("useCreationWorkspace", () => {
       (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
         Promise.resolve({ success: true, data: {} } as WorkspaceSendMessageResult)
     );
-    const { workspaceApi } = setupWindow({ setGoal: setGoalMock, sendMessage: sendMessageMock });
+    const { workspaceApi, nameGenerationApi } = setupWindow({
+      setGoal: setGoalMock,
+      sendMessage: sendMessageMock,
+    });
 
     const onWorkspaceCreated = mock(
       (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
@@ -1458,6 +1476,8 @@ describe("useCreationWorkspace", () => {
     });
 
     await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+    // The name is ready before Send here, so the stand-in card lists the finished step itself.
+    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
 
     let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
@@ -1584,6 +1604,177 @@ describe("useCreationWorkspace", () => {
     expect(createRequest?.branchName).toBe("security-scan");
     expect(createRequest?.title).toBe("security-scan");
     expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+  });
+
+  test("handleSend creates and navigates before name generation resolves, then applies the title", async () => {
+    let resolveGeneration: ((result: NameGenerationResult) => void) | undefined;
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        new Promise<NameGenerationResult>((resolve) => {
+          resolveGeneration = resolve;
+        })
+    );
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+    );
+    const updateTitleMock = mock(
+      (_args: WorkspaceUpdateTitleArgs): Promise<WorkspaceUpdateTitleResult> =>
+        Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateTitleResult)
+    );
+    const { workspaceApi } = setupWindow({
+      create: createMock,
+      nameGeneration: nameGenerationMock,
+      updateTitle: updateTitleMock,
+    });
+    const onWorkspaceCreated = mock(
+      (metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => metadata
+    );
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "Launch the workspace now",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    // Send inside the debounce window: generation starts here and stays pending.
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("Launch the workspace now");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    expect(nameGenerationMock.mock.calls.length).toBe(1);
+    expect(resolveGeneration).toBeDefined();
+    const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+    expect(createRequest?.branchName).toBe("launch-the-workspace-now");
+    expect(createRequest?.title).toBeUndefined();
+    expect(createRequest?.pendingAutoTitle).toBe(true);
+    expect(onWorkspaceCreated).toHaveBeenCalledTimes(1);
+    expect(onWorkspaceCreated.mock.calls[0]?.[1]?.pendingCreationInit?.nameGenerated).toBe(false);
+    expect(workspaceApi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(updateTitleMock).not.toHaveBeenCalled();
+
+    resolveGeneration!({
+      success: true,
+      data: {
+        name: "generated-name",
+        title: "Launch the workspace",
+        modelUsed: "anthropic:claude-haiku-4-5",
+      },
+    } as NameGenerationResult);
+
+    await waitFor(() =>
+      expect(updateTitleMock).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        title: "Launch the workspace",
+      })
+    );
+    // The branch keeps the slug: the workspace already exists under it.
+    expect(workspaceApi.create.mock.calls.length).toBe(1);
+  });
+
+  test("handleSend leaves the pending title to the backend when deferred generation fails", async () => {
+    let resolveGeneration: ((result: NameGenerationResult) => void) | undefined;
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        new Promise<NameGenerationResult>((resolve) => {
+          resolveGeneration = resolve;
+        })
+    );
+    const updateTitleMock = mock(
+      (_args: WorkspaceUpdateTitleArgs): Promise<WorkspaceUpdateTitleResult> =>
+        Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateTitleResult)
+    );
+    const { workspaceApi } = setupWindow({
+      nameGeneration: nameGenerationMock,
+      updateTitle: updateTitleMock,
+    });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "Launch the workspace now",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("Launch the workspace now");
+    });
+
+    expect(workspaceApi.create.mock.calls[0]?.[0]?.pendingAutoTitle).toBe(true);
+
+    resolveGeneration!({
+      success: false,
+      error: { type: "permission_denied", provider: "anthropic", raw: "Forbidden" },
+    } as NameGenerationResult);
+    // Let the deferred chain settle before asserting nothing was applied.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(updateTitleMock).not.toHaveBeenCalled();
+  });
+
+  test("handleSend uses a name that arrives while the trust dialog is open", async () => {
+    mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: false }]]);
+    let resolveGeneration: ((result: NameGenerationResult) => void) | undefined;
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        new Promise<NameGenerationResult>((resolve) => {
+          resolveGeneration = resolve;
+        })
+    );
+    const { workspaceApi } = setupWindow({ nameGeneration: nameGenerationMock });
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "trust check",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    let handleSendPromise: Promise<CreationSendResult> | null = null;
+    act(() => {
+      handleSendPromise = getHook().handleSend("trust check");
+    });
+
+    await waitFor(() => expect(getHook().trustDialog).not.toBeNull());
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+    // The LLM answers while the user reads the trust prompt.
+    resolveGeneration!({
+      success: true,
+      data: {
+        name: "generated-name",
+        title: "Trust check",
+        modelUsed: "anthropic:claude-haiku-4-5",
+      },
+    } as NameGenerationResult);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const trustDialog = getHook().trustDialog;
+    if (!trustDialog || typeof trustDialog !== "object" || !("props" in trustDialog)) {
+      throw new Error("Expected trust dialog props");
+    }
+    const trustDialogProps = trustDialog.props as { onConfirm: () => Promise<void> };
+    await act(async () => {
+      await trustDialogProps.onConfirm();
+    });
+
+    const handleSendResult = await (handleSendPromise as unknown as Promise<CreationSendResult>);
+    expect(handleSendResult).toEqual({ success: true });
+    const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+    expect(createRequest?.branchName).toBe("generated-name");
+    expect(createRequest?.title).toBe("Trust check");
+    expect(createRequest?.pendingAutoTitle).toBeUndefined();
   });
 
   test("handleSend shows trust dialog for untrusted projects", async () => {
@@ -1907,7 +2098,8 @@ describe("useCreationWorkspace", () => {
       },
       pendingCreationInit: {
         workspaceName: "demo-branch",
-        nameGenerated: true,
+        // Sent before the debounced generation ran: the card lists the name step itself.
+        nameGenerated: false,
         kind: undefined,
         hookPath: TEST_PROJECT_PATH,
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -2018,7 +2210,7 @@ describe("useCreationWorkspace", () => {
       },
       pendingCreationInit: {
         workspaceName: "demo-branch",
-        nameGenerated: true,
+        nameGenerated: false,
         kind: undefined,
         hookPath: TEST_PROJECT_PATH,
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment

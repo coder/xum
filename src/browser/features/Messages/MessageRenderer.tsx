@@ -19,7 +19,7 @@ import { ReasoningMessage } from "./ReasoningMessage";
 import { StreamErrorMessage } from "./StreamErrorMessage";
 import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
-import { InitMessage } from "./InitMessage";
+import { WorkspaceInitMessage } from "./InitMessage";
 import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
 import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
@@ -186,7 +186,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         );
         break;
       case "workspace-init":
-        renderedMessage = <InitMessage message={message} className={className} />;
+        renderedMessage = (
+          <WorkspaceInitMessage message={message} className={className} workspaceId={workspaceId} />
+        );
         break;
       case "plan-display":
         renderedMessage = (

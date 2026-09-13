@@ -86,9 +86,27 @@ export interface WorkspaceNameState {
   setName: (name: string) => void;
 }
 
+/** Identity to create with right now, plus the still-running generation when one was deferred. */
+export interface ResolvedWorkspaceIdentity {
+  identity: WorkspaceIdentity;
+  /**
+   * Set when generation had not finished for the current message: the identity above is the
+   * slug fallback and this resolves to the generated identity, or null when generation failed
+   * or was superseded (the fallback then stands).
+   */
+  deferred: Promise<WorkspaceIdentity | null> | null;
+}
+
 export interface UseWorkspaceNameReturn extends WorkspaceNameState {
   /** Wait for any pending generation to complete, returns both name and title */
   waitForGeneration: () => Promise<WorkspaceIdentity | null>;
+  /**
+   * Non-blocking variant of waitForGeneration for the send path: returns the finished identity
+   * when one exists for the current message, otherwise the slug fallback plus the in-flight
+   * generation so the caller can create immediately and apply the title later. Returns null when
+   * a manual name is required but empty (error already set).
+   */
+  resolveIdentityNow: () => ResolvedWorkspaceIdentity | null;
 }
 
 const WorkspaceNamePersistedStateSchema = z.object({
@@ -178,6 +196,9 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     resolve: (identity: WorkspaceIdentity | null) => void;
     requestId: number;
   } | null>(null);
+  // Last settled generation, readable by resolveIdentityNow before the persisted state
+  // re-renders (Send can follow the LLM reply within the same tick).
+  const lastGeneratedRef = useRef<{ identity: WorkspaceIdentity; forMessage: string } | null>(null);
 
   // Name shown in CreationControls UI: generated name when auto, manual when not
   const name = autoGenerate ? (generatedIdentity?.name ?? "") : manualName;
@@ -248,6 +269,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
             title: result.data.title,
           };
 
+          lastGeneratedRef.current = { identity, forMessage };
           setStored((prev) => ({
             ...prev,
             generatedIdentity: identity,
@@ -259,6 +281,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         }
 
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
+        lastGeneratedRef.current = { identity: fallbackIdentity, forMessage };
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
@@ -272,6 +295,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           return null;
         }
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
+        lastGeneratedRef.current = { identity: fallbackIdentity, forMessage };
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
@@ -341,6 +365,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     (enabled: boolean) => {
       if (enabled) {
         // Switching to auto: reset so debounced generation will trigger
+        lastGeneratedRef.current = null;
         setStored((prev) => ({ ...prev, autoGenerate: true, lastGeneratedFor: "" }));
         setError(null);
         return;
@@ -418,6 +443,53 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     return null;
   }, [autoGenerate, manualName, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
 
+  const resolveIdentityNow = useCallback((): ResolvedWorkspaceIdentity | null => {
+    if (!autoGenerate) {
+      if (!manualName.trim()) {
+        setError({ kind: "validation", message: "Please enter a workspace name" });
+        return null;
+      }
+      return { identity: { name: manualName.trim(), title: manualName.trim() }, deferred: null };
+    }
+
+    if (generatedIdentity && lastGeneratedFor === message) {
+      return { identity: generatedIdentity, deferred: null };
+    }
+    const lastGenerated = lastGeneratedRef.current;
+    if (lastGenerated?.forMessage === message) {
+      return { identity: lastGenerated.identity, deferred: null };
+    }
+
+    if (!message.trim()) {
+      return null;
+    }
+
+    // Start (or adopt) the generation without waiting for it. Sending right after typing
+    // usually lands inside the debounce window, so the LLM call has not even started yet.
+    let generation: Promise<WorkspaceIdentity | null>;
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+      const msg = pendingMessageRef.current || message;
+      pendingMessageRef.current = "";
+      generation = generateIdentity(msg);
+    } else if (generationPromiseRef.current) {
+      generation = generationPromiseRef.current.promise;
+    } else {
+      generation = generateIdentity(message);
+    }
+
+    const fallback = buildFallbackWorkspaceIdentity(message);
+    // generateIdentity resolves with the same fallback when every candidate fails; report that
+    // as null so callers keep the provisional identity instead of "applying" it again.
+    const deferred = generation.then((generated) =>
+      generated && (generated.name !== fallback.name || generated.title !== fallback.title)
+        ? generated
+        : null
+    );
+    return { identity: fallback, deferred };
+  }, [autoGenerate, manualName, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
+
   return useMemo(
     () => ({
       name,
@@ -428,6 +500,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       setAutoGenerate: handleSetAutoGenerate,
       setName: setNameManual,
       waitForGeneration,
+      resolveIdentityNow,
     }),
     [
       name,
@@ -438,6 +511,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       handleSetAutoGenerate,
       setNameManual,
       waitForGeneration,
+      resolveIdentityNow,
     ]
   );
 }

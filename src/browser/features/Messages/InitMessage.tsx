@@ -1,23 +1,71 @@
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
+import { useWorkspaceMetadataOptional } from "@/browser/contexts/WorkspaceContext";
 import { Loader2, GitBranch, ChevronRight, CheckCircle2, AlertCircle } from "lucide-react";
 import { Shimmer } from "../AIElements/Shimmer";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { ProgressBar } from "@/browser/components/ProgressBar/ProgressBar";
 
+type WorkspaceInitDisplayedMessage = Extract<DisplayedMessage, { type: "workspace-init" }>;
+
+/**
+ * Name generation that outlives creation: Send no longer waits for the LLM title, so the card
+ * lists it as its own step ("pending" while the backend still marks the title pending, "done"
+ * once the title landed). Omitted for workspaces whose name was ready before creation.
+ */
+export type InitNameGenerationState = "pending" | "done";
+
 interface InitMessageProps {
-  message: Extract<DisplayedMessage, { type: "workspace-init" }>;
+  message: WorkspaceInitDisplayedMessage;
   className?: string;
+  nameGeneration?: InitNameGenerationState;
+}
+
+interface WorkspaceInitMessageProps {
+  message: WorkspaceInitDisplayedMessage;
+  className?: string;
+  workspaceId?: string;
+}
+
+/**
+ * Transcript-connected card: derives the name-generation step from the workspace metadata so
+ * only this row re-renders on metadata changes. The "done" state is remembered locally because
+ * the metadata flag simply disappears once the title lands.
+ */
+export function WorkspaceInitMessage(props: WorkspaceInitMessageProps) {
+  const workspaceMetadata = useWorkspaceMetadataOptional()?.workspaceMetadata;
+  const metadata =
+    props.workspaceId === undefined ? undefined : workspaceMetadata?.get(props.workspaceId);
+  const namePending = metadata?.pendingAutoTitle === true;
+  const [sawNamePending, setSawNamePending] = useState(namePending);
+  if (namePending && !sawNamePending) {
+    setSawNamePending(true);
+  }
+  const nameGeneration: InitNameGenerationState | undefined = namePending
+    ? "pending"
+    : sawNamePending
+      ? "done"
+      : undefined;
+  return (
+    <InitMessage
+      message={props.message}
+      className={props.className}
+      nameGeneration={nameGeneration}
+    />
+  );
 }
 
 export function InitMessage(props: InitMessageProps) {
   const message = props.message;
   const isError = message.status === "error";
   const isRunning = message.status === "running";
+  const namePending = props.nameGeneration === "pending";
   const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null);
   const [detailsOverride, setDetailsOverride] = useState<boolean | null>(null);
-  const expanded = expandedOverride ?? message.status !== "success";
+  // Stay open while the name is still generating so the step's completion is visible even
+  // when init itself finished in a few hundred milliseconds.
+  const expanded = expandedOverride ?? (message.status !== "success" || namePending);
   const steps = message.lines.filter((line) => line.step === true);
   const rawLines = message.lines.filter((line) => line.step !== true);
   const detailsExpanded = steps.length === 0 || (detailsOverride ?? !isRunning);
@@ -69,8 +117,21 @@ export function InitMessage(props: InitMessageProps) {
             isError ? "border-init-error-border bg-init-error-bg" : "border-init-border bg-init-bg"
           )}
         >
-          {steps.length > 0 && (
+          {(steps.length > 0 || props.nameGeneration !== undefined) && (
             <ol className="m-0 mb-2 list-none space-y-2 p-0">
+              {props.nameGeneration !== undefined && (
+                <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2">
+                  {namePending ? (
+                    <Loader2
+                      aria-label="In progress"
+                      className="text-accent size-3.5 animate-spin"
+                    />
+                  ) : (
+                    <CheckCircle2 aria-label="Completed" className="text-accent size-3.5" />
+                  )}
+                  <span className="text-foreground truncate">Generating name</span>
+                </li>
+              )}
               {steps.map((step, index) => {
                 const isLast = index === steps.length - 1;
                 return (
