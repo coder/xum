@@ -464,6 +464,23 @@ function legacyImportSegment(childId: string): string {
  */
 const LEGACY_ADOPTION_STAGING_DIR_NAME = "memory-adoption-staging";
 
+/**
+ * Manifest key of the marker an in-place replacement leaves beside its
+ * pending record (`<prefix><relPath>`): the generation being replaced —
+ * hash and stamp of the owner file as `target`/`content`/`targetStamp`,
+ * `created: true`. A build that predates in-place replacement reads the
+ * pending record as an interrupted first adoption, finds the prior copy
+ * holding other bytes, and settles the edited note anew under imported/ —
+ * leaving the original copy visible with nobody's record naming it. That
+ * build keeps every record it does not list (the prefix is a control
+ * character the path grammar rejects, so no legacy note can be listed under
+ * it) and preserves these four fields, so once this build runs again it
+ * finds the marker, sees the note's record moved elsewhere, and removes the
+ * superseded original while it is still that generation. Dropped when the
+ * replacement settles here.
+ */
+const LEGACY_SUPERSEDED_MARKER_PREFIX = "\u0001superseded\u0001";
+
 function legacyAdoptionStagingDir(store: MemoryStore): string {
   return path.join(path.dirname(store.physicalRoot), LEGACY_ADOPTION_STAGING_DIR_NAME);
 }
@@ -1515,6 +1532,7 @@ export class MemoryService extends EventEmitter {
       // that succeeded above; a failed listing never reaches this point.
       const listed = new Set(files);
       for (const [relPath, previous] of adopted) {
+        if (relPath.startsWith(LEGACY_SUPERSEDED_MARKER_PREFIX)) continue; // handled below
         if (listed.has(relPath) || previous.deleted === true) continue;
         // Absence from the listing is not proof enough on its own: only a
         // provable ENOENT on the source itself counts; any other outcome
@@ -1655,6 +1673,77 @@ export class MemoryService extends EventEmitter {
         });
         manifestDirty = true;
       }
+      // Superseded originals (see LEGACY_SUPERSEDED_MARKER_PREFIX): a marker
+      // whose note's record still names the same target is either a
+      // replacement in flight here (pending: finished below, which drops the
+      // marker) or one resolved at that target (settled: the marker is
+      // stale). One whose record moved elsewhere — a prior build settled the
+      // edit under imported/ — or was tombstoned names a copy nobody
+      // represents any more: removed while it is still the generation the
+      // marker recorded (an owner-edited one is the owner's and stays).
+      for (const [key, marker] of adopted) {
+        if (!key.startsWith(LEGACY_SUPERSEDED_MARKER_PREFIX)) continue;
+        const relPath = key.slice(LEGACY_SUPERSEDED_MARKER_PREFIX.length);
+        const primary = adopted.get(relPath);
+        if (primary !== undefined && primary.deleted !== true && primary.target === marker.target) {
+          if (primary.pending !== true) {
+            adopted.delete(key);
+            manifestDirty = true;
+          }
+          continue;
+        }
+        let destination: "free" | { content: string | null } = "free";
+        try {
+          if (
+            await store.assertContained(marker.target).then(
+              () => true,
+              () => false
+            )
+          ) {
+            destination = await this.inspectAdoptionDestination(store, marker.target);
+          }
+        } catch (error) {
+          log.warn("[MemoryService] cannot inspect a superseded legacy note copy; retrying later", {
+            childId,
+            owner,
+            relPath,
+            target: marker.target,
+            error,
+          });
+          skipped++;
+          transientSkips++;
+          continue;
+        }
+        const current = destination === "free" ? null : destination.content;
+        const stamp = await adoptionTargetStamp(store.physicalPath(marker.target));
+        if (
+          current !== null &&
+          stamp !== null &&
+          sha256Hex(current) === marker.content &&
+          stamp === marker.targetStamp
+        ) {
+          await this.metaService.removeKeys(
+            memoryLogicalKey("workspace", marker.target, {
+              projectPath: ctx.projectPath,
+              workspaceId: owner,
+            })
+          );
+          await store.remove(marker.target);
+          remainingCapacity++;
+          adoptedCount++;
+          log.info(
+            "[MemoryService] removed a legacy note copy superseded by a prior build's re-adoption",
+            {
+              childId,
+              owner,
+              relPath,
+              target: marker.target,
+            }
+          );
+        }
+        adopted.delete(key);
+        manifestDirty = true;
+      }
       for (const relPath of files) {
         // Same gates as a memory command. Name first: a legacy file whose
         // name the path grammar rejects (traversal-looking segments, control
@@ -1748,13 +1837,15 @@ export class MemoryService extends EventEmitter {
           }
           if (!sharedReceipt) continue;
         }
-        // `generation`: the stamp of the copy an in-place replacement installs
-        // over, re-checked right before the install.
+        // `generation`/`supersedes`: stamp and hash of the copy an in-place
+        // replacement installs over — the stamp re-checked right before the
+        // install, both recorded in the superseded marker.
         let target: {
           relPath: string;
           write: boolean;
           replaces?: boolean;
           generation?: string;
+          supersedes?: string;
         } | null = null;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
@@ -1846,6 +1937,7 @@ export class MemoryService extends EventEmitter {
               write: true,
               replaces: true,
               generation: currentStamp,
+              supersedes: sha256Hex(priorContent),
             };
           }
         }
@@ -1943,6 +2035,15 @@ export class MemoryService extends EventEmitter {
                   targetStamp: stagedStamp,
                 }
           );
+          if (target.replaces === true) {
+            adopted.set(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`, {
+              content: target.supersedes ?? "",
+              sidecar: "",
+              target: target.relPath,
+              created: true,
+              targetStamp: target.generation,
+            });
+          }
           await writeManifest();
           // The destination as decided above, re-checked under the lock right
           // before the install: a fresh placement must still be free, a
@@ -1959,6 +2060,7 @@ export class MemoryService extends EventEmitter {
             await fsPromises.rm(stagingPath, { force: true });
             if (previous === undefined) adopted.delete(relPath);
             else adopted.set(relPath, previous);
+            adopted.delete(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`);
             await writeManifest();
           };
           if (!installable) {
@@ -2047,6 +2149,7 @@ export class MemoryService extends EventEmitter {
           }
         }
         adopted.set(relPath, record);
+        adopted.delete(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`);
         manifestDirty = true;
         adoptedCount++;
       }

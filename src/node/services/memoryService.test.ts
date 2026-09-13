@@ -3779,6 +3779,90 @@ describe("MemoryService", () => {
       );
       expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
     });
+
+    it("removes the original a prior build left behind after it re-adopted an interrupted in-place edit", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const stagingDir = path.join(path.dirname(ownerRoot), "memory-adoption-staging");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The downgraded build edits the note; this build's replacement pass
+      // dies between the pending manifest write and the install (the
+      // install fails and the record restore cannot run either).
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v2");
+      const crash = () => Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }));
+      const realRename = fsPromises.rename.bind(fsPromises);
+      const realRm = fsPromises.rm.bind(fsPromises);
+      const renameSpy = spyOn(fsPromises, "rename").mockImplementation(((
+        from: string,
+        to: string
+      ) => (String(from).startsWith(stagingDir) ? crash() : realRename(from, to))) as never);
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
+        target: string,
+        options?: unknown
+      ) =>
+        String(target).startsWith(stagingDir) && String(target) !== stagingDir
+          ? crash()
+          : (realRm as (...args: unknown[]) => unknown)(target, options)) as never);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        renameSpy.mockRestore();
+        rmSpy.mockRestore();
+      }
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
+      const pendingState = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(pendingState["note.md"]).toMatchObject({ target: "note.md", pending: true });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      // The prior build (in-place replacement unknown to it) runs next. It
+      // keeps every record — with the fields it knows — and, finding the
+      // prior copy holding other bytes, settles the edit anew under
+      // imported/. The original copy is left visible, named by no record.
+      const knownFields = ["content", "sidecar", "target", "created", "pending", "targetStamp"];
+      const asPriorBuild = Object.fromEntries(
+        Object.entries(pendingState).map(([key, record]) => [
+          key,
+          Object.fromEntries(
+            Object.entries(record).filter(([field]) => knownFields.includes(field))
+          ),
+        ])
+      );
+      const importedCopy = path.join(ownerRoot, "imported", "ws-child", "note.md");
+      await fsPromises.mkdir(path.dirname(importedCopy), { recursive: true });
+      await fsPromises.writeFile(importedCopy, "v2");
+      asPriorBuild["note.md"] = {
+        content: sha256Hex("v2"),
+        sidecar: "",
+        target: "imported/ws-child/note.md",
+        created: true,
+        targetStamp: (await adoptionTargetStamp(importedCopy))!,
+      };
+      await fsPromises.writeFile(manifestPath, JSON.stringify(asPriorBuild));
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      // Back on this build: the superseded original is recognized by its
+      // recorded generation and removed; one live copy with the new bytes.
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
+      expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("v2");
+      expect(
+        (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+          .filter((e) => e.scope === "workspace")
+          .map((e) => e.relPath)
+      ).toEqual(["imported/ws-child/note.md"]);
+      expect(
+        Object.keys(JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as object)
+      ).toEqual(["note.md"]);
+    });
   });
 
   describe("memory index entries", () => {
