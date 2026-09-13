@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -67,7 +68,14 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
   const [loaded, setLoaded] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
 
+  // The mount refresh, config-change refreshes, pre-write fetches, and saves all run
+  // concurrently, and the network does not preserve their order. Every request that installs
+  // presets takes a generation and only the newest one may apply its result, so an older
+  // response cannot land last and reinstate presets a restore or a save already replaced.
+  const generationRef = useRef(0);
+
   const refresh = useCallback(async (): Promise<void> => {
+    const generation = ++generationRef.current;
     if (!api) {
       setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
       setLoaded(true);
@@ -77,11 +85,14 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
 
     try {
       const remote = await api.uiLayouts.getAll();
+      if (generation !== generationRef.current) return;
       setLayoutPresets(getLayoutsConfigOrDefault(remote));
       setLoaded(true);
       setLoadFailed(false);
     } catch {
-      setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
+      if (generation !== generationRef.current) return;
+      // Keep the presets that last loaded: a transient failure on a later refresh must not
+      // blank hotkeys and palette entries. Before the first load the state is already the default.
       setLoaded(true);
       setLoadFailed(true);
     }
@@ -96,13 +107,16 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     //
     // This prevents stale in-memory state (captured by closures) from accidentally overwriting a
     // newer config when multiple writes happen in sequence (e.g., delete layout → clear hotkey).
+    const generation = ++generationRef.current;
     try {
       const remote = await api.uiLayouts.getAll();
       const normalized = getLayoutsConfigOrDefault(remote);
 
-      setLayoutPresets(normalized);
-      setLoaded(true);
-      setLoadFailed(false);
+      if (generation === generationRef.current) {
+        setLayoutPresets(normalized);
+        setLoaded(true);
+        setLoadFailed(false);
+      }
 
       return normalized;
     } catch {
@@ -119,7 +133,9 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         throw new Error("ORPC client not initialized");
       }
 
+      const generation = ++generationRef.current;
       await api.uiLayouts.saveAll({ layoutPresets: normalized });
+      if (generation !== generationRef.current) return;
       setLayoutPresets(normalized);
     },
     [api]
@@ -150,7 +166,6 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         iterator = subscribedIterator;
         for await (const _ of subscribedIterator) {
           if (signal.aborted) break;
-          // Awaited so two changes in quick succession cannot let the older response land last.
           await refresh();
         }
       } catch {

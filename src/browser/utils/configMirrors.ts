@@ -23,7 +23,8 @@ export type ConfigMirrorSource = Pick<
  * settings restore, which rewrites config behind the mirrors: without the re-seed the next
  * hide/unhide would persist the stale list over the restored one. The backend is authoritative,
  * so a value it no longer holds clears the mirror too; `skipKeys` protects local writes the
- * startup seed must not overwrite.
+ * startup seed must not overwrite (a toggle made while the initial getConfig is still pending
+ * would otherwise be reverted by that stale response).
  */
 export function seedConfigMirrors(
   cfg: ConfigMirrorSource,
@@ -36,6 +37,10 @@ export function seedConfigMirrors(
   if (!skipKeys.has(HIDDEN_MODELS_KEY)) {
     syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, cfg.hiddenModels);
   }
-  updatePersistedState(RUNTIME_ENABLEMENT_KEY, cfg.runtimeEnablement);
-  updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
+  if (!skipKeys.has(RUNTIME_ENABLEMENT_KEY)) {
+    updatePersistedState(RUNTIME_ENABLEMENT_KEY, cfg.runtimeEnablement);
+  }
+  if (!skipKeys.has(DEFAULT_RUNTIME_KEY)) {
+    updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
+  }
 }

@@ -33,10 +33,12 @@ import {
   getWorkspaceNameStateKey,
   migrateWorkspaceStorage,
   DEFAULT_MODEL_KEY,
+  DEFAULT_RUNTIME_KEY,
   GATEWAY_ENABLED_KEY,
   GATEWAY_MODELS_KEY,
   HIDDEN_MODELS_KEY,
   LAUNCH_BEHAVIOR_KEY,
+  RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
@@ -654,7 +656,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     let active = true;
     // Track writes, not just equality: toggling twice is still local intent.
     const dirtyKeys = new Set<string>();
-    const initialPreferences = [DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY].map((key) => ({
+    const initialPreferences = [
+      DEFAULT_MODEL_KEY,
+      HIDDEN_MODELS_KEY,
+      RUNTIME_ENABLEMENT_KEY,
+      DEFAULT_RUNTIME_KEY,
+    ].map((key) => ({
       key,
       value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
     }));

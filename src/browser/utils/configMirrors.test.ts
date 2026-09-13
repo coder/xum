@@ -57,13 +57,13 @@ describe("seedConfigMirrors", () => {
         runtimeEnablement: {},
         defaultRuntime: null,
       },
-      new Set([HIDDEN_MODELS_KEY])
+      new Set([HIDDEN_MODELS_KEY, RUNTIME_ENABLEMENT_KEY])
     );
 
     expect(readPersistedState<string | null>(DEFAULT_MODEL_KEY, null)).toBeNull();
     expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual(["openai:stale"]);
     expect(readPersistedState<unknown>(AGENT_AI_DEFAULTS_KEY, null)).toEqual({});
-    expect(readPersistedState<unknown>(RUNTIME_ENABLEMENT_KEY, null)).toEqual({});
+    expect(readPersistedState<unknown>(RUNTIME_ENABLEMENT_KEY, null)).toEqual({ docker: false });
     expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBeNull();
   });
 });
