@@ -296,4 +296,49 @@ describe("settingsProjection", () => {
       unsupported: ["settings (not an object)"],
     });
   });
+
+  it("reports values the on-disk schema accepts but normalization rejects instead of resetting", () => {
+    // Each of these passes the loose on-disk shape and normalizes to unset; a restore must keep the
+    // local value and name the key, not delete the target's setting.
+    const rejected = {
+      defaultModel: "garbage",
+      hiddenModels: ["anthropic:claude-plan", "garbage"],
+      modelFallbacks: { "openai:gpt-a": { models: ["openai:gpt-a"] } },
+      runtimeEnablement: { "runtime-from-a-newer-build": false },
+      layoutPresets: { version: 2, slots: [{ slot: 1, keybindOverride: { key: "a" } }] },
+    };
+    const read = readBackupSettings({ settings: rejected });
+    expect(read.unsupported).toEqual(Object.keys(rejected));
+    expect(read.settings).toEqual({});
+
+    const current: ProjectsConfig = {
+      projects: new Map(),
+      defaultModel: "anthropic:claude-local",
+      hiddenModels: ["openai:gpt-hidden"],
+      runtimeEnablement: { ssh: false },
+    };
+    expect(mergeBackupSettings(current, read.settings!)).toEqual(current);
+
+    // Empty spellings are still resets.
+    expect(
+      readBackupSettings({
+        settings: {
+          defaultModel: " ",
+          hiddenModels: [],
+          modelFallbacks: {},
+          runtimeEnablement: {},
+          layoutPresets: { version: 2, slots: [] },
+        },
+      })
+    ).toEqual({
+      settings: {
+        defaultModel: null,
+        hiddenModels: [],
+        modelFallbacks: null,
+        runtimeEnablement: null,
+        layoutPresets: null,
+      },
+      unsupported: [],
+    });
+  });
 });
