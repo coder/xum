@@ -1279,10 +1279,12 @@ describe("useCreationWorkspace", () => {
       getInputKey(TEST_WORKSPACE_ID),
       "fix the login bug",
     ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toBeUndefined();
+    // A text-only send leaves the workspace composer unlocked, so the transfer must not touch
+    // its attachments key: even a write of "nothing" would replace attachments added there
+    // meanwhile (oversized ones exist only in component state and are invisible here).
+    expect(
+      updatePersistedStateCalls.some(([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID))
+    ).toBe(false);
     const errorWrite = updatePersistedStateCalls.find(
       ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
     );
@@ -1327,6 +1329,50 @@ describe("useCreationWorkspace", () => {
       ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
     );
     expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+  });
+
+  test("handleSend locks the new workspace composer while an image-bearing first send is in flight", async () => {
+    // Provider file parts are handed back to the workspace composer if the send fails, and that
+    // write replaces whatever attachments the composer holds, so the composer must be locked
+    // for the whole send exactly like a staged-files send.
+    const lockObservedDuringSend: boolean[] = [];
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> => {
+        lockObservedDuringSend.push(isInitialStagingLocked(TEST_WORKSPACE_ID));
+        return Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        });
+      }
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "describe this screenshot",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const imagePart = {
+      type: "file" as const,
+      mediaType: "image/png",
+      url: "data:image/png;base64,iVBORw0KGgo=",
+      filename: "shot.png",
+    };
+    await act(async () => {
+      await getHook().handleSend("describe this screenshot", [imagePart]);
+    });
+
+    expect(lockObservedDuringSend).toEqual([true]);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    const attachmentsWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
+    );
+    expect(attachmentsWrite?.[1]).toEqual([
+      expect.objectContaining({ kind: "provider", url: imagePart.url }),
+    ]);
   });
 
   test("handleSend keeps small retryable files when trimming an over-cap transfer", async () => {

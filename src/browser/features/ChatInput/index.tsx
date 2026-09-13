@@ -2422,7 +2422,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
     if (disabled) {
       if (initialStagingLocked) {
-        return "Staging attached files...";
+        return "Sending attached files...";
       }
       const disabledReason = props.disabledReason;
       if (typeof disabledReason === "string" && disabledReason.trim().length > 0) {

@@ -1648,24 +1648,33 @@ describe("WorkspaceStore", () => {
       expect(state.messages.map((message) => message.type)).toEqual(["workspace-init"]);
     });
 
-    it("clears a card-only creation state when the initial /goal fails", () => {
-      const workspaceId = "workspace-goal-creation-failed";
+    it("keeps the creation card when the first send fails before init-start arrives", () => {
+      const workspaceId = "workspace-first-send-failed";
 
       createAndAddWorkspace(store, workspaceId);
-      store.markPendingCreationInit(workspaceId, {
-        workspaceName: "dark-mode",
-        nameGenerated: true,
-        kind: undefined,
-        hookPath: "/project",
-        timestamp: 1,
-      });
+      store.markPendingInitialSend(
+        workspaceId,
+        "openai:gpt-4o-mini",
+        { content: "Build the thing", timestamp: 1 },
+        {
+          workspaceName: "dark-mode",
+          nameGenerated: true,
+          kind: undefined,
+          hookPath: "/project",
+          timestamp: 1,
+        }
+      );
       expect(store.getWorkspaceState(workspaceId).messages.map((m) => m.type)).toEqual([
+        "user",
         "workspace-init",
       ]);
 
-      // No pending stream was ever marked; the failure path must still remove the card.
+      // The failure drops the prompt and the startup barrier; init is still running, so the
+      // card stays as the workspace's only provisioning status.
       store.clearPendingInitialSendState(workspaceId);
-      expect(store.getWorkspaceState(workspaceId).messages).toEqual([]);
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isStreamStarting).toBe(false);
+      expect(state.messages.map((m) => m.type)).toEqual(["workspace-init"]);
     });
 
     it("preserves optimistic startup across full replay resets", () => {

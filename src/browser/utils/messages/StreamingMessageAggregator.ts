@@ -1735,34 +1735,21 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Drop the presentation-only creation rows (pending first message and stand-in card). They
-   * are deliberately independent of the pending-stream marker: the stale-barrier heuristic in
+   * Drop the presentation-only first-message row. The creation rows are deliberately
+   * independent of the pending-stream marker: the stale-barrier heuristic in
    * clearPendingStreamStartIfNotOptimistic fires on a reconnect while the first send is still
-   * waiting on init, and an initial /goal never marks a pending stream at all. Only a visible
-   * user row, a real init-start, or an explicit creation failure may remove them.
+   * waiting on init, and an initial /goal never marks a pending stream at all. The row leaves
+   * with a transcript-visible user row or an explicit send failure; the stand-in card is
+   * replaced only by the real init-start (live or replayed), because init keeps running no
+   * matter how the send fared. Returns whether a row was showing.
    */
-  clearPendingCreationPresentation(): boolean {
-    const hadPresentation =
-      this.pendingInitialUserMessage !== null || this.pendingCreationInit !== null;
-    this.clearPendingInitialUserMessage();
-    this.clearPendingCreationInit();
-    return hadPresentation;
-  }
-
-  private clearPendingCreationInit(): void {
-    if (this.pendingCreationInit === null) {
-      return;
-    }
-    this.pendingCreationInit = null;
-    this.invalidateCache();
-  }
-
-  private clearPendingInitialUserMessage(): void {
+  clearPendingInitialUserMessage(): boolean {
     if (this.pendingInitialUserMessage === null) {
-      return;
+      return false;
     }
     this.pendingInitialUserMessage = null;
     this.invalidateCache();
+    return true;
   }
 
   private getActiveStreamEntry(): [string, StreamingContext] | undefined {
@@ -2097,7 +2084,7 @@ export class StreamingMessageAggregator {
               this.optimisticPendingStreamStartIdleCaughtUpCount,
           };
     // The creation rows outlive the replay reset: the replayed visible first message and
-    // init-start are what replace them (see clearPendingCreationPresentation).
+    // init-start are what replace them (see clearPendingInitialUserMessage).
     const pendingInitialUserMessage = this.pendingInitialUserMessage;
     const pendingCreationInit = this.pendingCreationInit;
 

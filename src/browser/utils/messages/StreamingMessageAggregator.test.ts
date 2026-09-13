@@ -3689,7 +3689,9 @@ describe("StreamingMessageAggregator", () => {
       });
     });
 
-    test("an explicit creation failure removes the pending row and a stand-in card no init replaced", () => {
+    test("a failed first send removes the pending row but keeps the stand-in card until init-start", () => {
+      // Init keeps running no matter how the send fared, so the card is the workspace's only
+      // provisioning status until the real init-start (live or replayed) takes over.
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
         workspaceName: null,
@@ -3701,25 +3703,22 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
 
       aggregator.clearPendingStreamStart();
-      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
-      expect(displayedTypes(aggregator)).toEqual([]);
-      expect(aggregator.clearPendingCreationPresentation()).toBe(false);
-    });
-
-    test("a failed initial /goal can drop its stand-in card without a pending stream", () => {
-      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
-      aggregator.markPendingCreationInit({
-        workspaceName: "dark-mode",
-        nameGenerated: true,
-        kind: undefined,
-        hookPath: "/project",
-        timestamp: Date.now(),
-      });
-      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(aggregator.clearPendingInitialUserMessage()).toBe(true);
       expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+      expect(aggregator.clearPendingInitialUserMessage()).toBe(false);
 
-      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
-      expect(displayedTypes(aggregator)).toEqual([]);
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+        completed: { exitCode: 0, endTime: 9 },
+      });
+      const initRows = aggregator
+        .getDisplayedMessages()
+        .filter((message) => message.type === "workspace-init");
+      expect(initRows).toHaveLength(1);
+      expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
     });
 
     test("carries a stand-in creation card without a pending stream until init-start", () => {

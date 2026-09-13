@@ -275,6 +275,12 @@ function transferDraftToWorkspace(
     updatePersistedState(getPendingDraftSkillDiscoveryKey(workspaceId), true);
   }
   updatePersistedState(getInputKey(workspaceId), text);
+  if (attachments.length === 0) {
+    // A text-only send never touches the attachments key: the mounted composer
+    // is unlocked during such a send, and a write here (even of "nothing") would
+    // replace attachments the user added there meanwhile.
+    return;
+  }
   // Base64-bearing attachments can exceed the persistence cap. Drop the
   // largest ones first so small retryable chips (e.g. a pending file whose
   // staging failed) survive the transfer.
@@ -698,7 +704,11 @@ export function useCreationWorkspace({
         // optimistic pending-send state is cleared below if staging fails.
         // Lock the mounted composer for that window so a user send cannot
         // leapfrog the initial message; the finally below unlocks on all paths.
-        if (pendingFilesToStage.length > 0) {
+        // Any attachment-bearing send locks, not only staged files: a failed
+        // send hands its attachments to that composer, and the write would
+        // replace attachments the user added there meanwhile (oversized ones
+        // live only in component state, so no persisted check can see them).
+        if (pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0) {
           lockInitialStaging(metadata.id);
         }
         onWorkspaceCreated(metadata, {
@@ -858,9 +868,9 @@ export function useCreationWorkspace({
           }
           // The workspace exists but holds no message, and the creation draft was already
           // cleared: hand the draft to the workspace composer (with any staged files) so the
-          // user can fix the model or provider and resend from the chat they landed in. The
-          // composer is only locked while files stage, so a text-only send that waited on init
-          // may already hold something the user typed there; never overwrite that.
+          // user can fix the model or provider and resend from the chat they landed in. Only
+          // attachment-bearing sends lock that composer, so a text-only send that waited on
+          // init may already hold something the user typed there; never overwrite that.
           if (isWorkspaceDraftEmpty(metadata.id)) {
             transferDraftToWorkspace(
               metadata.id,

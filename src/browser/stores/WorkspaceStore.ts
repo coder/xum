@@ -4026,8 +4026,8 @@ export class WorkspaceStore {
 
   /**
    * A creation send failed or was abandoned: drop the optimistic startup barrier and the
-   * presentation-only creation rows. The rows are cleared even without a pending stream so an
-   * initial /goal that fails before init-start arrives does not leave its stand-in card behind.
+   * presentation-only first-message row. The stand-in creation card stays: workspace init keeps
+   * running regardless of the send, and the real init-start (live or replayed) replaces it.
    */
   clearPendingInitialSendState(workspaceId: string): void {
     const aggregator = this.aggregators.get(workspaceId);
@@ -4039,8 +4039,8 @@ export class WorkspaceStore {
     if (hadPendingStream) {
       aggregator.clearPendingStreamStart();
     }
-    const clearedPresentation = aggregator.clearPendingCreationPresentation();
-    if (hadPendingStream || clearedPresentation) {
+    const clearedRow = aggregator.clearPendingInitialUserMessage();
+    if (hadPendingStream || clearedRow) {
       this.states.bump(workspaceId);
     }
   }
