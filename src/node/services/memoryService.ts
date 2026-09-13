@@ -50,6 +50,7 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
+  adoptionTargetPresence,
   adoptionTargetStamp,
   legacyAdoptionManifestPath,
   LegacyAdoptionManifestMalformedError,
@@ -632,48 +633,62 @@ class LocalMemoryStore implements MemoryStore {
         }
         return; // Self-healing: missing/unreadable dirs list as empty.
       }
+      // A filesystem may report DT_UNKNOWN: every type predicate is false
+      // and the entry would drop out of the walk — a strict caller
+      // (removal's legacy handover) would see a complete listing that omits
+      // a regular note or a whole subtree, and the bounded legacy
+      // fingerprint would never notice an edit under it. Such entries are
+      // classified by lstat instead (one extra stat per untyped entry; the
+      // bounded walk stays capped), BEFORE sorting: the order below keys
+      // directories as "name/", and an untyped directory sorted as a file
+      // would make the capped subset stop being a global prefix. Strict
+      // callers fail the listing on an unclassifiable entry like on an
+      // unreadable dir; bounded ones treat it as "other", as before.
+      const classified = await Promise.all(
+        entries.map(async (entry) => {
+          let kind: "dir" | "file" | "other";
+          if (entry.isDirectory()) {
+            kind = "dir";
+          } else if (entry.isFile()) {
+            kind = "file";
+          } else if (isDirentTypeUnknown(entry)) {
+            const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
+            const stat = await fsPromises.lstat(this.abs(childRel)).catch((error: unknown) => {
+              if (options?.strict === true) throw error;
+              return null;
+            });
+            kind =
+              stat === null
+                ? "other"
+                : stat.isDirectory()
+                  ? "dir"
+                  : stat.isFile()
+                    ? "file"
+                    : "other";
+          } else {
+            kind = "other";
+          }
+          return { name: entry.name, kind };
+        })
+      );
       // Iterate in path-string order — directories key as "name/" so the DFS
       // emits exact global lexicographic order ("a.md" < "a/...", `.` < `/`).
       // The capped subset is deterministic across platforms.
-      const sortKey = (entry: (typeof entries)[number]) =>
-        entry.isDirectory() ? `${entry.name}/` : entry.name;
-      entries.sort((a, b) => {
+      const sortKey = (entry: (typeof classified)[number]) =>
+        entry.kind === "dir" ? `${entry.name}/` : entry.name;
+      classified.sort((a, b) => {
         const ka = sortKey(a);
         const kb = sortKey(b);
         return ka < kb ? -1 : ka > kb ? 1 : 0;
       });
-      for (const entry of entries) {
+      for (const entry of classified) {
         // Per-entry cap: a single flat directory can exceed the cap on its own.
         if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
         if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
-        // A filesystem may report DT_UNKNOWN: every type predicate is false
-        // and the entry would drop out of the walk — a strict caller
-        // (removal's legacy handover) would see a complete listing that
-        // omits a regular note or a whole subtree, and the bounded legacy
-        // fingerprint would never notice an edit under it. Such entries are
-        // classified by lstat instead (one extra stat per untyped entry; the
-        // bounded walk stays capped). Strict callers fail the listing on an
-        // unclassifiable entry like on an unreadable dir; bounded ones treat
-        // it as "other", as before.
-        let kind: "dir" | "file" | "other";
-        if (entry.isDirectory()) {
-          kind = "dir";
-        } else if (entry.isFile()) {
-          kind = "file";
-        } else if (isDirentTypeUnknown(entry)) {
-          const stat = await fsPromises.lstat(this.abs(childRel)).catch((error: unknown) => {
-            if (options?.strict === true) throw error;
-            return null;
-          });
-          kind =
-            stat === null ? "other" : stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
-        } else {
-          kind = "other";
-        }
-        if (kind === "dir") {
+        if (entry.kind === "dir") {
           await walk(childRel);
-        } else if (kind === "file") {
+        } else if (entry.kind === "file") {
           results.push(childRel);
         }
       }
@@ -1497,6 +1512,18 @@ export class MemoryService extends EventEmitter {
             (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
         );
       };
+      // A sibling's settled reuse record may still name a copy of ours (the
+      // previous layers let identical notes share one). That sibling
+      // migrates to its own copy on its next pass (see the fast path below);
+      // until then the copy stays — its removal, for whatever reason, waits
+      // (transient) rather than pull a note out from under the sibling.
+      const siblingReliesOn = async (targetRelPath: string) => {
+        siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
+        return siblingRecords.some(
+          (record) =>
+            record.target === targetRelPath && record.created !== true && record.deleted !== true
+        );
+      };
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
       // combined notebook cannot exceed it — an over-full scope is silently
@@ -1594,21 +1621,10 @@ export class MemoryService extends EventEmitter {
             previous.pendingDeletion === true && targetContained && destination === "free";
           unchangedForTombstone = unchanged || removedByUs;
           if (unchanged) {
-            // A sibling's settled reuse record may still name this copy (the
-            // previous layers let identical notes share one). That sibling
-            // migrates to its own copy on its next pass (see the fast path
-            // above); until then the copy stays — the source's deletion
-            // waits (transient) rather than pull a note out from under the
-            // sibling. Strict sibling reads: unanswerable → wait as well.
+            // Strict sibling reads (siblingReliesOn): unanswerable → wait too.
             let reliedOn: boolean;
             try {
-              siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
-              reliedOn = siblingRecords.some(
-                (record) =>
-                  record.target === previous.target &&
-                  record.created !== true &&
-                  record.deleted !== true
-              );
+              reliedOn = await siblingReliesOn(previous.target);
             } catch (error) {
               log.warn(
                 "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
@@ -1715,13 +1731,53 @@ export class MemoryService extends EventEmitter {
           continue;
         }
         const current = destination === "free" ? null : destination.content;
-        const stamp = await adoptionTargetStamp(store.physicalPath(marker.target));
+        // The file is there: its generation decides. One that cannot be read
+        // right now is unanswered — the marker is kept for the next pass.
+        const presence =
+          current === null
+            ? "absent"
+            : await adoptionTargetPresence(store.physicalPath(marker.target));
+        if (presence === "unreadable") {
+          log.warn(
+            "[MemoryService] cannot read a superseded legacy note copy's generation; retrying later",
+            { childId, owner, relPath, target: marker.target }
+          );
+          skipped++;
+          transientSkips++;
+          continue;
+        }
         if (
           current !== null &&
-          stamp !== null &&
+          presence !== "absent" &&
           sha256Hex(current) === marker.content &&
-          stamp === marker.targetStamp
+          presence.stamp === marker.targetStamp
         ) {
+          // Same guard as the deletion loop: a sibling still standing on this
+          // generation keeps it (and the marker) until it has migrated.
+          let reliedOn: boolean;
+          try {
+            reliedOn = await siblingReliesOn(marker.target);
+          } catch (error) {
+            log.warn("[MemoryService] cannot read a sibling's adoption manifest; retrying later", {
+              childId,
+              owner,
+              relPath,
+              target: marker.target,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          if (reliedOn) {
+            log.info(
+              "[MemoryService] keeping a superseded legacy note copy a sibling still relies on",
+              { childId, owner, relPath, target: marker.target }
+            );
+            skipped++;
+            transientSkips++;
+            continue;
+          }
           await this.metaService.removeKeys(
             memoryLogicalKey("workspace", marker.target, {
               projectPath: ctx.projectPath,
@@ -1823,8 +1879,15 @@ export class MemoryService extends EventEmitter {
           let sharedReceipt = false;
           if (previous.created !== true) {
             try {
-              const liveStamp = await adoptionTargetStamp(store.physicalPath(previous.target));
-              sharedReceipt = liveStamp !== null && (await siblingOwns(previous.target, liveStamp));
+              // An absent target is settled as before (nothing to stand on
+              // either way); one whose generation cannot be read right now
+              // leaves the question open — the note waits, unmemoized.
+              const presence = await adoptionTargetPresence(store.physicalPath(previous.target));
+              if (presence === "unreadable") {
+                throw new Error(`cannot read the generation of adopted copy ${previous.target}`);
+              }
+              sharedReceipt =
+                presence !== "absent" && (await siblingOwns(previous.target, presence.stamp));
             } catch (error) {
               log.warn(
                 "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
