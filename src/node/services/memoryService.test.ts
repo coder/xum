@@ -3693,6 +3693,92 @@ describe("MemoryService", () => {
       ).get("note.md")!;
       expect(record).toMatchObject({ target: "note.md", created: false });
     });
+
+    it("migrates a settled shared receipt to the descendant's own copy before the creator's deletion can take it", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      // The grandchild's record as the previous layers wrote it: identical
+      // bytes, settled on the child's adoption-created copy (created: false).
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      const grandchildManifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
+      await fsPromises.writeFile(
+        grandchildManifest,
+        JSON.stringify({
+          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
+        })
+      );
+      // The child deletes its source first: its copy is what the grandchild
+      // still stands on, so it stays (the pass is left unmemoized) until the
+      // grandchild has its own.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "shared.md"));
+      const childPasses = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "same note"
+      );
+      // The grandchild's record is unchanged in every way the fast path
+      // checks — and still not settled: its next access gives it its own
+      // copy, the child's file untouched.
+      await fixture.service.listIndexEntries(grandchildCtx);
+      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "same note"
+      );
+      const migrated = (await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")!;
+      expect(migrated).toMatchObject({ target: "imported/ws-grandchild/shared.md", created: true });
+      expect(migrated.targetStamp).toBe((await adoptionTargetStamp(ownCopy)) ?? undefined);
+      // Now the child's deletion goes through, and only its copy follows.
+      await fixture.service.listIndexEntries(childCtx);
+      expect(childPasses.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(await pathExists(path.join(ownerRoot, "shared.md"))).toBe(false);
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+    });
+
+    it("removal's handover migrates a shared receipt to the descendant's own copy as well", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(path.dirname(grandchildRoot)),
+        JSON.stringify({
+          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
+        })
+      );
+      // Without its own copy the handover would be complete only on paper:
+      // the child's later edit or deletion would take the shared file.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner");
+      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "child's v2");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "child's v2"
+      );
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+    });
   });
 
   describe("memory index entries", () => {

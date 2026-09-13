@@ -1576,6 +1576,39 @@ export class MemoryService extends EventEmitter {
             previous.pendingDeletion === true && targetContained && destination === "free";
           unchangedForTombstone = unchanged || removedByUs;
           if (unchanged) {
+            // A sibling's settled reuse record may still name this copy (the
+            // previous layers let identical notes share one). That sibling
+            // migrates to its own copy on its next pass (see the fast path
+            // above); until then the copy stays — the source's deletion
+            // waits (transient) rather than pull a note out from under the
+            // sibling. Strict sibling reads: unanswerable → wait as well.
+            let reliedOn: boolean;
+            try {
+              siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
+              reliedOn = siblingRecords.some(
+                (record) =>
+                  record.target === previous.target &&
+                  record.created !== true &&
+                  record.deleted !== true
+              );
+            } catch (error) {
+              log.warn(
+                "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
+                { childId, owner, relPath, target: previous.target, error }
+              );
+              skipped++;
+              transientSkips++;
+              continue;
+            }
+            if (reliedOn) {
+              log.info(
+                "[MemoryService] keeping a deleted legacy note's copy a sibling still relies on",
+                { childId, owner, relPath, target: previous.target }
+              );
+              skipped++;
+              transientSkips++;
+              continue;
+            }
             // Deletion provenance first: a crash after the removal but before
             // the tombstone write must not make the retry read the missing
             // copy as owner-changed (and drop the child's rollback mapping).
@@ -1690,7 +1723,30 @@ export class MemoryService extends EventEmitter {
           // source reappearing with the same bytes must be adopted anew.
           previous.pendingDeletion !== true
         ) {
-          continue; // folded in earlier, nothing changed since
+          // Folded in earlier, nothing changed since — unless the settled
+          // reuse record (created: false) names another descendant's
+          // adoption-created copy: the previous layers let identical notes
+          // share one, but that copy follows ITS descendant's edits and
+          // deletions, so it is not this note's to stand on. Such a record
+          // is not settled; the note is placed as this descendant's own copy
+          // below (the sibling's file untouched). Sibling manifests read
+          // strictly: unanswerable → the note waits.
+          let sharedReceipt = false;
+          if (previous.created !== true) {
+            try {
+              const liveStamp = await adoptionTargetStamp(store.physicalPath(previous.target));
+              sharedReceipt = liveStamp !== null && (await siblingOwns(previous.target, liveStamp));
+            } catch (error) {
+              log.warn(
+                "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
+                { childId, owner, relPath, target: previous.target, error }
+              );
+              skipped++;
+              transientSkips++;
+              continue;
+            }
+          }
+          if (!sharedReceipt) continue;
         }
         // `generation`: the stamp of the copy an in-place replacement installs
         // over, re-checked right before the install.
