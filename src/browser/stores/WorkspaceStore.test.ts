@@ -43,6 +43,7 @@ import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   WorkspaceStore,
+  type WorkspaceStoreOptions,
 } from "./WorkspaceStore";
 import {
   createControllableAsyncIterable,
@@ -811,13 +812,16 @@ describe("WorkspaceStore", () => {
   const createResponseCompleteSpy = () => mock((_event: ResponseCompleteEvent) => undefined);
 
   /** Dispose the current store and replace it with a fresh instance (no client attached). */
-  const resetStore = () => {
+  const resetStore = (options?: WorkspaceStoreOptions) => {
     store.dispose();
-    store = new WorkspaceStore(mockOnModelUsed);
+    store = new WorkspaceStore(mockOnModelUsed, options);
   };
 
-  const recreateStore = (onResponseComplete?: ReturnType<typeof createResponseCompleteSpy>) => {
-    resetStore();
+  const recreateStore = (
+    onResponseComplete?: ReturnType<typeof createResponseCompleteSpy>,
+    options?: WorkspaceStoreOptions
+  ) => {
+    resetStore(options);
     if (onResponseComplete) {
       store.setOnResponseComplete(onResponseComplete);
     }
@@ -1887,14 +1891,137 @@ describe("WorkspaceStore", () => {
       expect(state().isTranscriptStale).toBe(false);
     });
 
-    it("releases the stale skeleton after the deadline when the replay never lands", async () => {
-      // Disposing the default store closes its activity feed; give the short-deadline
-      // store a fresh one before it subscribes.
-      store.dispose();
+    /** Swap in a store with a short stale-skeleton deadline and a fresh activity feed. */
+    async function useShortDeadlineStore(): Promise<void> {
+      // Disposing the default store closes its activity feed; give the replacement a fresh
+      // one before it subscribes.
       activityEvents = createControllableAsyncIterable<WorkspaceActivityEvent>();
-      store = new WorkspaceStore(mockOnModelUsed, { staleTranscriptSkeletonTimeoutMs: 150 });
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(undefined, { staleTranscriptSkeletonTimeoutMs: 150 });
+      await tick(0);
+    }
+
+    it("marks cached rows stale when activity moves before the onChat iterator is open", async () => {
+      await hydrateCachedRow();
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+
+      // Hold the next subscribe attempt in its startup await: the workspace is selected but
+      // no chat events can flow yet, so this stream is not covered by any replay in flight.
+      let releaseStartup: () => void = () => undefined;
+      mockGetStartupAutoRetryModel.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseStartup = () => resolve({ success: true, data: null });
+          })
+      );
+      store.setActiveWorkspaceId(workspaceId);
+      await tick(0);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(attemptsFor(workspaceId)).toHaveLength(1);
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      await tick(0);
+      expect(state().isTranscriptStale).toBe(true);
+
+      releaseStartup();
+      const attempt = await chatAttempt(workspaceId, 2);
+      expect(state().isTranscriptStale).toBe(true);
+      await finishSinceReplay(attempt);
+    });
+
+    it("treats the first activity snapshot as a baseline unless a stream is in flight", async () => {
+      // Round-trip the target through a full replay before any activity is known for it.
+      mockActivityList.mockResolvedValue({});
+      recreateStore();
+      activityEvents = createControllableAsyncIterable<WorkspaceActivityEvent>();
+      await hydrateCachedRow();
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+
+      // A late idle snapshot with no earlier value proves nothing arrived while unsubscribed.
+      pushActivity(workspaceId, { ...idleSnapshot });
+      await tick(0);
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+    });
+
+    it("marks cached rows stale on a first snapshot that reports an in-flight stream", async () => {
+      mockActivityList.mockResolvedValue({});
+      recreateStore();
+      activityEvents = createControllableAsyncIterable<WorkspaceActivityEvent>();
+      await hydrateCachedRow();
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+
+      // A detached aggregator cannot hold a stream that is running now.
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true });
+      await tick(0);
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(true);
+    });
+
+    it("keeps a cached init-only transcript painted on revisit but not during a cold full replay", async () => {
+      createAndAddWorkspace(store, workspaceId);
+      createAndAddWorkspace(store, otherWorkspaceId, {}, false);
+      const attempt = await chatAttempt(workspaceId, 1);
+      const initStart: WorkspaceChatMessage = {
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 1_000,
+        replay: true,
+      };
+      const initEnd: WorkspaceChatMessage = {
+        type: "init-end",
+        exitCode: 0,
+        timestamp: 1_001,
+        replay: true,
+      };
+
+      // Cold open (full replay): the replayed card lands before history and is applied
+      // immediately, but it is the only row of a transcript still being rebuilt.
+      attempt.push(initStart);
+      attempt.push(initEnd);
+      expect(await waitUntil(() => state().messages.some((m) => m.type === "workspace-init"))).toBe(
+        true
+      );
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().isTranscriptStale).toBe(true);
+      attempt.push(fullCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(state().isTranscriptStale).toBe(false);
+      expect(state().messages).toHaveLength(1);
+
+      // Revisit (since replay): the same cached card is authoritative and paints immediately.
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      const revisitAttempt = await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+      revisitAttempt.push(initStart);
+      revisitAttempt.push(initEnd);
+      await tick(0);
+      expect(state().isTranscriptStale).toBe(false);
+      revisitAttempt.push(sinceCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+    });
+
+    it("keeps the stale skeleton deadline running across quick subscribe retries", async () => {
+      await useShortDeadlineStore();
+      await hydrateCachedRow();
+
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      await tick(0);
+
+      const attempt = await revisit(2);
+      expect(state().isTranscriptStale).toBe(true);
+      // The attempt dies before the bound elapses; the retry must not restart the clock.
+      attempt.close();
+      expect(await waitUntil(() => !state().isTranscriptStale, 1_000)).toBe(true);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().messages).toHaveLength(1);
+    });
+
+    it("releases the stale skeleton after the deadline when the replay never lands", async () => {
+      await useShortDeadlineStore();
       await hydrateCachedRow();
 
       store.setActiveWorkspaceId(otherWorkspaceId);

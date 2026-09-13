@@ -12,12 +12,7 @@ import * as BackgroundBashStore from "@/browser/stores/BackgroundBashStore";
 import * as ProvidersConfigStore from "@/browser/stores/ProvidersConfigStore";
 import * as WorkspaceStore from "@/browser/stores/WorkspaceStore";
 import * as InstructionsStore from "@/browser/utils/additionalSystemContextStore";
-import type { DisplayedMessage } from "@/common/types/message";
-import {
-  computeChatViewReveal,
-  hasRenderableTranscriptRows,
-  useChatViewDataReady,
-} from "./useChatViewDataReady";
+import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
 
 describe("useChatViewDataReady", () => {
   let cleanupDom: () => void;
@@ -77,41 +72,6 @@ describe("useChatViewDataReady", () => {
       expect(result.current).toBe(true);
     }
   );
-});
-
-describe("hasRenderableTranscriptRows", () => {
-  const initCard = (status: "running" | "success"): DisplayedMessage => ({
-    type: "workspace-init",
-    id: "workspace-init",
-    historySequence: -1,
-    status,
-    hookPath: "/tmp/project/.xum/init",
-    lines: [{ line: "Creating workspace", isError: false, step: true }],
-    progress: null,
-    exitCode: status === "running" ? null : 0,
-    timestamp: 1,
-    durationMs: status === "running" ? null : 10,
-  });
-  const userRow: DisplayedMessage = {
-    type: "user",
-    id: "user-1",
-    historyId: "user-1",
-    historySequence: 1,
-    content: "hello",
-    timestamp: 2,
-  };
-
-  test("a finished creation card replayed before caught-up does not count as a transcript", () => {
-    // Init events are applied immediately during hydration, so on a cold open the finished
-    // card lands alone before history; painting it would release the skeleton and then jump.
-    expect(hasRenderableTranscriptRows([initCard("success")])).toBe(false);
-  });
-
-  test("a running creation card and real rows both keep the transcript painted", () => {
-    expect(hasRenderableTranscriptRows([initCard("running")])).toBe(true);
-    expect(hasRenderableTranscriptRows([userRow, initCard("success")])).toBe(true);
-    expect(hasRenderableTranscriptRows([])).toBe(false);
-  });
 });
 
 // These cover the reveal *decision* (the branching that makes the chat view

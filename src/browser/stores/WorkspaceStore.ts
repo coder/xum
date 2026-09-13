@@ -371,6 +371,12 @@ interface WorkspaceChatTransientState {
   isHydratingTranscript: boolean;
   /** Aggregator rows are missing transcript content that landed while unsubscribed from onChat. */
   cachedTranscriptStale: boolean;
+  /** The current attempt's onChat iterator is established, so chat events cover activity changes. */
+  onChatIteratorOpen: boolean;
+  /** A full replay is rebuilding the transcript; rows applied before caught-up are partial. */
+  fullReplayInFlight: boolean;
+  /** The stale-skeleton deadline elapsed for this hydration cycle: paint cached rows anyway. */
+  staleSkeletonExpired: boolean;
   historicalMessages: MuxMessage[];
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
@@ -494,6 +500,9 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     caughtUp: false,
     isHydratingTranscript: false,
     cachedTranscriptStale: false,
+    onChatIteratorOpen: false,
+    fullReplayInFlight: false,
+    staleSkeletonExpired: false,
     historicalMessages: [],
     pendingStreamEvents: [],
     replayingHistory: false,
@@ -1566,37 +1575,42 @@ export class WorkspaceStore {
     transient.replayingHistory = false;
     transient.historicalMessages.length = 0;
     transient.pendingStreamEvents.length = 0;
-    this.clearStaleSkeletonDeadline(workspaceId);
+    transient.onChatIteratorOpen = false;
+    transient.fullReplayInFlight = false;
     this.lastUserPromptStore.bump(workspaceId);
   }
 
   /**
-   * Bound the stale-cache skeleton for one subscribe attempt. Armed before the attempt
-   * awaits the backend, so a hang before the first replay event still releases the cached
-   * rows; caught-up and clearReplayBuffers (deactivation, retry) disarm it.
+   * Bound the stale-cache skeleton for the whole hydration cycle. Armed at the start of each
+   * subscribe attempt but never re-armed while running, so a hang before the first replay
+   * event and a run of short failing attempts both release the cached rows after one bound;
+   * only caught-up and deactivation disarm it.
    */
   private armStaleSkeletonDeadline(workspaceId: string): void {
-    this.clearStaleSkeletonDeadline(workspaceId);
-    if (!this.chatTransientState.get(workspaceId)?.cachedTranscriptStale) {
+    if (this.staleSkeletonDeadlines.has(workspaceId)) {
       return;
     }
     const handle = setTimeout(() => {
       this.staleSkeletonDeadlines.delete(workspaceId);
       const transient = this.chatTransientState.get(workspaceId);
-      if (!transient || transient.caughtUp || !transient.cachedTranscriptStale) {
+      if (!transient || transient.caughtUp || transient.staleSkeletonExpired) {
         return;
       }
-      transient.cachedTranscriptStale = false;
+      transient.staleSkeletonExpired = true;
       this.states.bump(workspaceId);
     }, this.staleSkeletonTimeoutMs);
     this.staleSkeletonDeadlines.set(workspaceId, handle);
   }
 
-  private clearStaleSkeletonDeadline(workspaceId: string): void {
+  private resetStaleSkeletonDeadline(workspaceId: string): void {
     const handle = this.staleSkeletonDeadlines.get(workspaceId);
     if (handle !== undefined) {
       clearTimeout(handle);
       this.staleSkeletonDeadlines.delete(workspaceId);
+    }
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      transient.staleSkeletonExpired = false;
     }
   }
 
@@ -1630,6 +1644,7 @@ export class WorkspaceStore {
         ) {
           previousTransient.cachedTranscriptStale = true;
         }
+        this.resetStaleSkeletonDeadline(previousActiveWorkspaceId);
       }
 
       // Clear replay buffers before aborting so a fast workspace switch/reopen
@@ -2337,10 +2352,18 @@ export class WorkspaceStore {
         transient.isHydratingTranscript &&
         !transient.caughtUp &&
         !hasRunningInitMessage;
-      // Only cached rows can be stale; an empty aggregator hydrates through the
-      // skeleton regardless (startup marks every idle workspace, harmlessly).
+      // Only painted rows can be stale; an empty transcript hydrates through the skeleton
+      // regardless. A full replay rebuilds the transcript from scratch, so the one row it
+      // can apply before caught-up (the replayed init card bypasses buffering) is partial
+      // too, whereas a since replay's cached init-only transcript is trustworthy.
+      const displayedOnlyReplayedInitCards =
+        transient.fullReplayInFlight &&
+        displayedMessages.every((message) => message.type === "workspace-init");
       const isTranscriptStale =
-        isHydratingTranscript && transient.cachedTranscriptStale && hasMessages;
+        isHydratingTranscript &&
+        displayedMessages.length > 0 &&
+        !transient.staleSkeletonExpired &&
+        (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
       const aggregatorTodos = aggregator.getCurrentTodos();
       // Sidebar status precedence, split into four tiers so each signal
       // wins exactly when it should. Active and inactive workspaces draw
@@ -3344,7 +3367,13 @@ export class WorkspaceStore {
       previous?.streaming !== snapshot?.streaming ||
       previous?.streamingGeneration !== snapshot?.streamingGeneration ||
       previous?.recency !== snapshot?.recency;
-    if (transcriptChanged && !this.isOnChatSubscriptionActive(workspaceId)) {
+    const transient = this.chatTransientState.get(workspaceId);
+    // Chat events cover this change only once the selected workspace's iterator is open;
+    // selection alone (awaiting subscribe, or backing off between attempts) delivers nothing,
+    // and the replay that follows lands after these rows were already painted.
+    const chatEventsCoverChange =
+      this.isOnChatSubscriptionActive(workspaceId) && transient?.onChatIteratorOpen === true;
+    if (transcriptChanged && transient && !chatEventsCoverChange) {
       // A stop for the generation that was already streaming when the user left is the
       // backend catching up on chat events the aggregator applied while subscribed
       // (stream-end reaches onChat first; streaming=false and the completion recency are
@@ -3355,8 +3384,11 @@ export class WorkspaceStore {
         previous?.streaming === true &&
         snapshot?.streaming === false &&
         previous.streamingGeneration === snapshot.streamingGeneration;
-      const transient = this.chatTransientState.get(workspaceId);
-      if (transient && !isLaggingStopForCompletedStream) {
+      // The first snapshot is a baseline, not movement: without an earlier value an idle
+      // snapshot proves nothing arrived while unsubscribed. An in-flight stream is the
+      // exception, because a detached aggregator cannot hold it.
+      const isIdleBaseline = previous === null && snapshot?.streaming !== true;
+      if (!isLaggingStopForCompletedStream && !isIdleBaseline) {
         transient.cachedTranscriptStale = true;
       }
     }
@@ -3978,7 +4010,13 @@ export class WorkspaceStore {
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
         if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        if (!mode || mode.type === "full") this.resetChatStateForReplay(workspaceId);
+        const isFullReplay = !mode || mode.type === "full";
+        if (isFullReplay) this.resetChatStateForReplay(workspaceId);
+        const established = this.chatTransientState.get(workspaceId);
+        if (established) {
+          established.onChatIteratorOpen = true;
+          established.fullReplayInFlight = isFullReplay;
+        }
         return { events: iterator, context: attemptContext };
       },
       onEvent: (data, attemptContext, attemptSignal) =>
@@ -4208,7 +4246,7 @@ export class WorkspaceStore {
     this.usageStore.delete(workspaceId);
     this.consumersStore.delete(workspaceId);
     this.aggregators.delete(workspaceId);
-    this.clearStaleSkeletonDeadline(workspaceId);
+    this.resetStaleSkeletonDeadline(workspaceId);
     this.chatTransientState.delete(workspaceId);
     this.workspaceMetadata.delete(workspaceId);
     this.derived.bump("workspaces");
@@ -4314,7 +4352,7 @@ export class WorkspaceStore {
     this.consumersStore.clear();
     this.aggregators.clear();
     for (const workspaceId of Array.from(this.staleSkeletonDeadlines.keys())) {
-      this.clearStaleSkeletonDeadline(workspaceId);
+      this.resetStaleSkeletonDeadline(workspaceId);
     }
     this.chatTransientState.clear();
     this.workspaceMetadata.clear();
@@ -4629,7 +4667,8 @@ export class WorkspaceStore {
       transient.caughtUp = true;
       transient.isHydratingTranscript = false;
       transient.cachedTranscriptStale = false;
-      this.clearStaleSkeletonDeadline(workspaceId);
+      transient.fullReplayInFlight = false;
+      this.resetStaleSkeletonDeadline(workspaceId);
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
