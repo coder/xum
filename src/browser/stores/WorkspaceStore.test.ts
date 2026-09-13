@@ -44,7 +44,10 @@ import {
   mergeTimelineEvents,
   WorkspaceStore,
 } from "./WorkspaceStore";
-import { createControllableAsyncIterable } from "@/browser/testUtils";
+import {
+  createControllableAsyncIterable,
+  type ControllableAsyncIterable,
+} from "@/browser/testUtils";
 import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
 
 interface LoadMoreResponse {
@@ -89,12 +92,14 @@ type WorkspaceActivityEvent =
     };
 
 // eslint-disable-next-line require-yield
-const mockActivitySubscribe = mock(async function* (
+async function* idleActivitySubscription(
   _input?: void,
   options?: { signal?: AbortSignal }
 ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
   await waitForAbortSignal(options?.signal);
-});
+}
+
+const mockActivitySubscribe = mock(idleActivitySubscription);
 
 type TerminalActivityEvent =
   | {
@@ -1715,6 +1720,196 @@ describe("WorkspaceStore", () => {
     store.setActiveWorkspaceId(null);
     expect(store.isOnChatSubscriptionActive("workspace-1")).toBe(false);
     expect(store.isOnChatSubscriptionActive("workspace-2")).toBe(false);
+  });
+
+  describe("stale cached transcript", () => {
+    const workspaceId = "stale-transcript-workspace";
+    const otherWorkspaceId = "stale-transcript-other";
+    const baseRecency = new Date("2024-02-01T00:00:00.000Z").getTime();
+    const idleSnapshot = createActivitySnapshot(baseRecency, {
+      streaming: false,
+      streamingGeneration: 1,
+    });
+
+    type ChatAttempt = ControllableAsyncIterable<WorkspaceChatMessage>;
+    let chatAttempts: Array<{ workspaceId: string; events: ChatAttempt }>;
+    let activityEvents: ControllableAsyncIterable<WorkspaceActivityEvent>;
+
+    const attemptsFor = (id: string) =>
+      chatAttempts.filter((attempt) => attempt.workspaceId === id);
+    /** Wait for the n-th (1-based) onChat attempt for a workspace and return its event sink. */
+    const chatAttempt = async (id: string, ordinal: number): Promise<ChatAttempt> => {
+      expect(await waitUntil(() => attemptsFor(id).length >= ordinal)).toBe(true);
+      return attemptsFor(id)[ordinal - 1].events;
+    };
+    const pushActivity = (id: string, activity: WorkspaceActivitySnapshot) =>
+      activityEvents.push({ type: "activity", workspaceId: id, activity });
+    const state = () => store.getWorkspaceState(workspaceId);
+
+    beforeEach(() => {
+      chatAttempts = [];
+      mockOnChat.mockImplementation(async function* (input, options) {
+        const events = createControllableAsyncIterable<WorkspaceChatMessage>();
+        chatAttempts.push({ workspaceId: input?.workspaceId ?? "", events });
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      activityEvents = createControllableAsyncIterable<WorkspaceActivityEvent>();
+      mockActivitySubscribe.mockImplementation(async function* (_input, options) {
+        const events = activityEvents;
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      mockActivityList.mockResolvedValue({ [workspaceId]: idleSnapshot });
+      recreateStore();
+    });
+
+    afterEach(() => {
+      mockChatScript([], { keepOpen: true });
+      mockActivitySubscribe.mockImplementation(idleActivitySubscription);
+    });
+
+    /** Register both workspaces and hydrate one cached row into the target via a full replay. */
+    async function hydrateCachedRow(): Promise<void> {
+      createAndAddWorkspace(store, workspaceId);
+      createAndAddWorkspace(store, otherWorkspaceId, {}, false);
+      const attempt = await chatAttempt(workspaceId, 1);
+      attempt.push(createHistoryMessageEvent("history-1", 1));
+      attempt.push(fullCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(state().messages).toHaveLength(1);
+      expect(state().isTranscriptStale).toBe(false);
+    }
+
+    /** Re-activate the target and assert the since replay is hydrating over the cached row. */
+    async function revisit(ordinal: number): Promise<ChatAttempt> {
+      store.setActiveWorkspaceId(workspaceId);
+      const attempt = await chatAttempt(workspaceId, ordinal);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().isTranscriptCaughtUp).toBe(false);
+      expect(state().messages.length).toBeGreaterThan(0);
+      return attempt;
+    }
+
+    async function finishSinceReplay(attempt: ChatAttempt): Promise<void> {
+      attempt.push(createHistoryMessageEvent("history-1", 1));
+      attempt.push(sinceCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(state().isHydratingTranscript).toBe(false);
+      expect(state().isTranscriptStale).toBe(false);
+      expect(state().messages).toHaveLength(1);
+    }
+
+    it.each([
+      ["streaming flips", { ...idleSnapshot, streaming: true }],
+      ["streamingGeneration advances", { ...idleSnapshot, streamingGeneration: 2 }],
+      ["recency advances", { ...idleSnapshot, recency: baseRecency + 1 }],
+    ])(
+      "hides cached rows behind hydration after background activity (%s) until since caught-up",
+      async (_change, snapshot) => {
+        await hydrateCachedRow();
+
+        store.setActiveWorkspaceId(otherWorkspaceId);
+        pushActivity(workspaceId, snapshot);
+        await tick(0);
+
+        const attempt = await revisit(2);
+        expect(state().isTranscriptStale).toBe(true);
+        await finishSinceReplay(attempt);
+      }
+    );
+
+    it("keeps unchanged cached rows trustworthy across a revisit", async () => {
+      await hydrateCachedRow();
+
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      // A re-delivered identical snapshot is not new transcript content.
+      pushActivity(workspaceId, { ...idleSnapshot });
+      await tick(0);
+
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+    });
+
+    it("ignores the active workspace's own activity updates", async () => {
+      await hydrateCachedRow();
+
+      // Live activity for the subscribed workspace arrives alongside onChat, which
+      // already carries the content; only unsubscribed deliveries are missing rows.
+      pushActivity(workspaceId, { ...idleSnapshot, recency: baseRecency + 5 });
+      await tick(0);
+      expect(state().isTranscriptStale).toBe(false);
+
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+    });
+
+    it.each([
+      [
+        "an interruptible aggregator stream",
+        async (attempt: ChatAttempt) => {
+          attempt.push(streamStartEvent(workspaceId, "live-stream", { historySequence: 2 }));
+          expect(await waitUntil(() => state().canInterrupt)).toBe(true);
+        },
+      ],
+      [
+        "activity reporting streaming",
+        async () => {
+          pushActivity(workspaceId, { ...idleSnapshot, streaming: true });
+          await tick(0);
+        },
+      ],
+    ])("marks cached rows stale when leaving during %s", async (_label, startStream) => {
+      await hydrateCachedRow();
+      await startStream(attemptsFor(workspaceId)[0].events);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // No activity event arrives while away; the switch itself must record the gap.
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(true);
+    });
+
+    it("marks cached rows stale when leaving before a replay catches up", async () => {
+      await hydrateCachedRow();
+
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // Leave mid-hydration: the pending since replay never lands in the aggregator.
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      const attempt = await revisit(3);
+      expect(state().isTranscriptStale).toBe(true);
+      await finishSinceReplay(attempt);
+    });
+
+    it("never reports an empty transcript as stale", async () => {
+      createAndAddWorkspace(store, otherWorkspaceId);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      await chatAttempt(otherWorkspaceId, 1);
+
+      // Startup-style activity for a workspace that has never hydrated.
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      await tick(0);
+
+      store.setActiveWorkspaceId(workspaceId);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().messages).toHaveLength(0);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // The full replay resets transient state; the skeleton path stays the empty-rows one.
+      const attempt = await chatAttempt(workspaceId, 1);
+      expect(state().isTranscriptStale).toBe(false);
+      attempt.push(createHistoryMessageEvent("history-1", 1));
+      attempt.push(fullCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(state().isTranscriptStale).toBe(false);
+    });
   });
 
   describe("live usage identity pinning", () => {

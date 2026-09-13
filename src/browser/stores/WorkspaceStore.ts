@@ -198,6 +198,10 @@ export interface WorkspaceState {
   loading: boolean;
   isTranscriptCaughtUp: boolean;
   isHydratingTranscript: boolean;
+  // Cached rows are known to be missing backend content that arrived while this
+  // workspace was not subscribed to onChat. Hydration must hide them behind the
+  // skeleton instead of painting them and jumping when caught-up lands.
+  isTranscriptStale: boolean;
   hasOlderHistory: boolean;
   loadingOlderHistory: boolean;
   muxMessages: MuxMessage[];
@@ -365,6 +369,8 @@ export interface WorkflowToolLiveRunState {
 interface WorkspaceChatTransientState {
   caughtUp: boolean;
   isHydratingTranscript: boolean;
+  /** Aggregator rows are missing transcript content that landed while unsubscribed from onChat. */
+  cachedTranscriptStale: boolean;
   historicalMessages: MuxMessage[];
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
@@ -476,6 +482,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
     isHydratingTranscript: false,
+    cachedTranscriptStale: false,
     historicalMessages: [],
     pendingStreamEvents: [],
     replayingHistory: false,
@@ -1562,6 +1569,18 @@ export class WorkspaceStore {
       const previousTransient = this.chatTransientState.get(previousActiveWorkspaceId);
       if (previousTransient) {
         previousTransient.isHydratingTranscript = false;
+        // Leaving mid-hydration or mid-stream leaves the cached rows incomplete: stream
+        // deltas are never delivered to an unsubscribed aggregator, and an activity
+        // snapshot carrying the same streamingGeneration cannot reveal that afterwards.
+        // Read caughtUp before clearReplayBuffers resets it below.
+        const previousAggregator = this.aggregators.get(previousActiveWorkspaceId);
+        if (
+          !previousTransient.caughtUp ||
+          this.workspaceActivity.get(previousActiveWorkspaceId)?.streaming === true ||
+          previousAggregator?.hasInterruptibleActiveStream() === true
+        ) {
+          previousTransient.cachedTranscriptStale = true;
+        }
       }
 
       // Clear replay buffers before aborting so a fast workspace switch/reopen
@@ -2269,6 +2288,10 @@ export class WorkspaceStore {
         transient.isHydratingTranscript &&
         !transient.caughtUp &&
         !hasRunningInitMessage;
+      // Only cached rows can be stale; an empty aggregator hydrates through the
+      // skeleton regardless (startup marks every idle workspace, harmlessly).
+      const isTranscriptStale =
+        isHydratingTranscript && transient.cachedTranscriptStale && hasMessages;
       const aggregatorTodos = aggregator.getCurrentTodos();
       // Sidebar status precedence, split into four tiers so each signal
       // wins exactly when it should. Active and inactive workspaces draw
@@ -2320,6 +2343,7 @@ export class WorkspaceStore {
         loading: !hasMessages && !hasRunningInitMessage && !transient.caughtUp,
         isTranscriptCaughtUp: transient.caughtUp,
         isHydratingTranscript,
+        isTranscriptStale,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
         muxMessages: messages,
@@ -3262,12 +3286,26 @@ export class WorkspaceStore {
 
     this.refreshActiveGoalCount();
 
-    const changed =
+    // Transcript content that lands while a workspace is not the active onChat
+    // subscription never reaches its aggregator, so any stream/recency movement
+    // means the cached rows are missing backend content (see isTranscriptStale).
+    // These fields answer "did data arrive" directly; a wall-clock "last refreshed"
+    // threshold would instead flash the skeleton on idle workspaces that did not change.
+    const transcriptChanged =
       previous?.streaming !== snapshot?.streaming ||
       previous?.streamingGeneration !== snapshot?.streamingGeneration ||
+      previous?.recency !== snapshot?.recency;
+    if (transcriptChanged && !this.isOnChatSubscriptionActive(workspaceId)) {
+      const transient = this.chatTransientState.get(workspaceId);
+      if (transient) {
+        transient.cachedTranscriptStale = true;
+      }
+    }
+
+    const changed =
+      transcriptChanged ||
       previous?.lastModel !== snapshot?.lastModel ||
       previous?.lastThinkingLevel !== snapshot?.lastThinkingLevel ||
-      previous?.recency !== snapshot?.recency ||
       previous?.hasTodos !== snapshot?.hasTodos ||
       !areStringArraysEqual(previous?.activeWorkflowRunIds, snapshot?.activeWorkflowRunIds) ||
       (previous?.activeWorkflowRunCount ?? 0) !== (snapshot?.activeWorkflowRunCount ?? 0) ||
@@ -4526,6 +4564,7 @@ export class WorkspaceStore {
       // Mark as caught up
       transient.caughtUp = true;
       transient.isHydratingTranscript = false;
+      transient.cachedTranscriptStale = false;
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency

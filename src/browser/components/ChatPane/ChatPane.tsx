@@ -1088,19 +1088,18 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
   // show its "waiting on monitor" state instead of the chat looking idle.
   const shouldMountStreamingBarrier = shouldShowStreamingBarrier || activeBashMonitorCount > 0;
-  // Keep rendering cached transcript rows during incremental catch-up so workspace switches
-  // feel stable, but active stream-start/interrupt states should keep their barrier visible
-  // instead of flashing full-height transcript placeholders. The skeleton additionally holds
-  // until decoration data sources are known so the transcript and all composer decorations
-  // reveal in ONE commit — see useChatViewDataReady for the contract.
+  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
+  // workspace switches feel stable; rows known to be missing backend content hide behind
+  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
+  // renders in the tail lane below the skeleton, so it never vetoes it. The skeleton
+  // additionally holds until decoration data sources are known so the transcript and all
+  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
   const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
     computeChatViewReveal({
       isHydratingTranscript,
       chatViewDataReady,
       hasRenderableMessages: deferredMessages.length > 0,
-      // Any mounted barrier (including waiting-on-monitor) counts: a cleared
-      // transcript with an armed monitor must not flash placeholders under it.
-      shouldShowStreamingBarrier: shouldMountStreamingBarrier,
+      isTranscriptStale: workspaceState.isTranscriptStale,
     });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&

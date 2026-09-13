@@ -1,6 +1,6 @@
 import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createMockORPCClient } from "./mocks/orpc";
@@ -115,19 +115,49 @@ async function finishReplayWithoutLayoutShift(
   await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
 }
 
-// Client swaps between stories must release the previous activity snapshot subscription.
-const keepActivitySubscriptionOpen: ReturnType<
+type ActivitySubscribe = ReturnType<
   typeof createMockORPCClient
->["workspace"]["activity"]["subscribe"] = (_input, options) => {
-  async function* iterate() {
-    yield* [];
-    await new Promise<void>((resolve) => {
-      if (options?.signal?.aborted) resolve();
-      else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
-    });
-  }
-  return Promise.resolve(wrapAsyncIterator(iterate(), {}));
-};
+>["workspace"]["activity"]["subscribe"];
+interface ActivityEvent {
+  type: "activity";
+  workspaceId: string;
+  activity: WorkspaceActivitySnapshot | null;
+}
+
+// Background activity snapshots (the always-on per-workspace subscription) queue through
+// `emit` and stay deliverable until the store aborts; client swaps between stories must
+// release the previous subscription, so the iterator also ends on abort.
+function createActivityFeed(): {
+  subscribe: ActivitySubscribe;
+  emit: (workspaceId: string, activity: WorkspaceActivitySnapshot) => void;
+} {
+  const queued: ActivityEvent[] = [];
+  let wake: (() => void) | null = null;
+  const subscribe: ActivitySubscribe = (_input, options) => {
+    async function* iterate() {
+      while (!options?.signal?.aborted) {
+        const next = queued.shift();
+        if (next) {
+          yield next;
+          continue;
+        }
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        wake = null;
+      }
+    }
+    return Promise.resolve(wrapAsyncIterator(iterate(), {}));
+  };
+  return {
+    subscribe,
+    emit: (workspaceId, activity) => {
+      queued.push({ type: "activity", workspaceId, activity });
+      wake?.();
+    },
+  };
+}
 
 function createHydrationStory(workspaceId: string): AppStory {
   const workspace = createWorkspace({
@@ -163,6 +193,7 @@ function createHydrationStory(workspaceId: string): AppStory {
   // A compact tail must remain clear of the dock without a permanent loading gutter.
   history.parts.push({ type: "reasoning", text: "Compact tail reasoning." });
   let emitChat: (event: WorkspaceChatMessage) => void;
+  let emitActivity: ReturnType<typeof createActivityFeed>["emit"];
   let subscriptions = 0;
   let transcriptSubscriptions = 0;
   let emitTranscript: (event: WorkspaceChatMessage) => void;
@@ -170,6 +201,8 @@ function createHydrationStory(workspaceId: string): AppStory {
   function setup() {
     subscriptions = 0;
     transcriptSubscriptions = 0;
+    const activityFeed = createActivityFeed();
+    emitActivity = activityFeed.emit;
     selectWorkspace(workspace);
     collapseLeftSidebar();
     collapseRightSidebar();
@@ -213,7 +246,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         }
       },
     });
-    client.workspace.activity.subscribe = keepActivitySubscriptionOpen;
+    client.workspace.activity.subscribe = activityFeed.subscribe;
     return client;
   }
   const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
@@ -234,9 +267,13 @@ function createHydrationStory(workspaceId: string): AppStory {
         phase: "preparing",
         hadAnyOutput: false,
       });
+      // An active turn does not mean history has loaded: the skeleton keeps holding the
+      // empty transcript while the barrier renders below it, and the dock shimmer only
+      // appears when the skeleton is absent.
       await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
       await checkTranscriptLayout(canvasElement);
-      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       emitChat({
         type: "stream-lifecycle",
         workspaceId: workspace.id,
@@ -375,13 +412,15 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier retains replay shimmer", async () => {
+    await step("A monitor barrier renders below the replay skeleton", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
       await checkTranscriptLayout(canvasElement);
-      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      // History rows are buffered until caught-up, so the transcript is still empty here.
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
     });
 
     await step("Read-only cached transcripts stay stable during replay", async () => {
@@ -412,6 +451,51 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
+      "Switching back to a workspace that streamed in the background shows the skeleton, not cached rows",
+      async () => {
+        await switchWorkspace(canvasElement, otherWorkspace.id);
+        await expect(
+          await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
+        ).toBeVisible();
+        // A new turn started while this workspace was unsubscribed from onChat: the cached
+        // rows are missing that content, so they must not paint and then jump on caught-up.
+        emitActivity(workspace.id, {
+          recency: STABLE_TIMESTAMP + 1,
+          streaming: true,
+          streamingGeneration: 2,
+          lastModel: DEFAULT_MODEL,
+          lastThinkingLevel: null,
+        });
+        await switchWorkspace(canvasElement, workspace.id);
+        await waitFor(() => expect(subscriptions).toBe(4));
+        await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+        await checkTranscriptLayout(canvasElement);
+        await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+        await expect(canvas.queryByText("Previously loaded response.")).toBeNull();
+        await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+        emitChat(history);
+        emitChat({
+          type: "caught-up",
+          replay: "since",
+          hasOlderHistory: false,
+          cursor: { history: { messageId: history.id, historySequence: 1 } },
+        });
+        await checkTranscriptLayout(canvasElement, false);
+        await expect(await canvas.findByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        // The background turn is over before the next step leaves this workspace, so its
+        // cached rows stay trustworthy there.
+        emitActivity(workspace.id, {
+          recency: STABLE_TIMESTAMP + 2,
+          streaming: false,
+          streamingGeneration: 2,
+          lastModel: DEFAULT_MODEL,
+          lastThinkingLevel: null,
+        });
+      }
+    );
+
+    await step(
       "A later replay remains busy without shifting or clearing previously cached messages",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
@@ -419,9 +503,10 @@ function createHydrationStory(workspaceId: string): AppStory {
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         await switchWorkspace(canvasElement, workspace.id);
-        await waitFor(() => expect(subscriptions).toBe(4));
+        await waitFor(() => expect(subscriptions).toBe(5));
         await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
         // Freeze active replay so desktop and phone snapshots cover the shimmer with turn controls.
         emitChat({
           type: "stream-lifecycle",
@@ -431,6 +516,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         });
         await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
         await checkTranscriptLayout(canvasElement);
+        // Trustworthy cached rows keep painting under an active turn; only the dock shimmer shows.
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       }
     );
   };
@@ -555,7 +642,7 @@ function createCreationPendingStory(): AppStory {
       await createGate;
       return originalCreate(input);
     };
-    client.workspace.activity.subscribe = keepActivitySubscriptionOpen;
+    client.workspace.activity.subscribe = createActivityFeed().subscribe;
     return client;
   }
 
