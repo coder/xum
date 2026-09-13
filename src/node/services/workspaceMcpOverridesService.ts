@@ -18,6 +18,7 @@ import { execBuffered, readFileString, writeFileString } from "@/node/utils/runt
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import {
   isCanonicalPluginServerKey,
   PLUGIN_SERVER_KEY_PREFIX,
@@ -4829,32 +4830,11 @@ const CANONICAL_PLUGIN_KEY_PATTERN = /plugin:[0-9a-f]{16}:/;
  * (shadowing) value. Returns the duplicated property name, if any.
  */
 function findDuplicateOverrideProperty(root: jsonc.Node | undefined): string | undefined {
-  const duplicateIn = (
-    node: jsonc.Node | undefined,
-    names?: ReadonlySet<string>
-  ): string | undefined => {
-    if (node?.type !== "object") {
-      return undefined;
-    }
-    const seen = new Set<string>();
-    for (const property of node.children ?? []) {
-      const name: unknown = property.children?.[0]?.value;
-      if (typeof name !== "string" || (names !== undefined && !names.has(name))) {
-        continue;
-      }
-      if (seen.has(name)) {
-        return name;
-      }
-      seen.add(name);
-    }
-    return undefined;
-  };
-
-  const rootDuplicate = duplicateIn(root, PRUNED_OVERRIDE_FIELDS);
+  const rootDuplicate = findDuplicateProperty(root, PRUNED_OVERRIDE_FIELDS);
   if (rootDuplicate !== undefined) {
     return rootDuplicate;
   }
-  return duplicateIn(
+  return findDuplicateProperty(
     root === undefined ? undefined : jsonc.findNodeAtLocation(root, ["toolAllowlist"])
   );
 }

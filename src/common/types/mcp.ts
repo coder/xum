@@ -67,6 +67,7 @@ export type MCPServerInfo = MCPStdioServerInfo | MCPHttpServerInfo;
 
 export interface MCPConfig {
   servers: Record<string, MCPServerInfo>;
+  enabledPluginServers: string[];
 }
 
 /**

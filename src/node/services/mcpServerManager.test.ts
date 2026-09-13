@@ -8192,6 +8192,152 @@ describe("MCPServerManager", () => {
     }
   });
 
+  for (const scenario of [
+    {
+      name: "workspace disable overrides a globally enabled plugin",
+      globallyEnabled: true,
+      overrides: { disabledServers: [PLUGIN_KEY] },
+      expectedServers: [],
+    },
+    {
+      name: "workspace enable overrides a globally disabled plugin",
+      globallyEnabled: false,
+      overrides: { enabledServers: [PLUGIN_KEY] },
+      expectedServers: [PLUGIN_KEY],
+    },
+    {
+      name: "globally enabled plugin starts without a workspace override",
+      globallyEnabled: true,
+      overrides: undefined,
+      expectedServers: [PLUGIN_KEY],
+    },
+  ]) {
+    test(scenario.name, async () => {
+      using tmp = new DisposableTempDir("mcp-plugin-global-overrides");
+      await fs.writeFile(
+        path.join(tmp.path, "mcp.jsonc"),
+        JSON.stringify({
+          servers: {},
+          enabledPluginServers: scenario.globallyEnabled ? [PLUGIN_KEY] : [],
+        })
+      );
+      const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+        agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+      });
+      manager.dispose();
+      manager = new MCPServerManager(pluginConfigService);
+      access = manager as unknown as MCPServerManagerTestAccess;
+      const startServers = spyOn(access, "startServers").mockImplementation(
+        (...args: unknown[]) => {
+          const servers = args[0] as Record<string, unknown>;
+          return Promise.resolve(
+            startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
+          );
+        }
+      );
+
+      // Establish the persisted default before testing workspace precedence.
+      expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(
+        !scenario.globallyEnabled
+      );
+      const result = await manager.getToolsForWorkspace(
+        workspaceRequest("ws-plugin-global-overrides", { overrides: scenario.overrides })
+      );
+      expect(result.stats.enabledServerCount).toBe(scenario.expectedServers.length);
+      expect(result.stats.startedServerCount).toBe(scenario.expectedServers.length);
+      expect(Object.values(result.toolServerNames)).toEqual(scenario.expectedServers);
+      expect(Object.keys(startServers.mock.calls.at(-1)?.[0] as Record<string, unknown>)).toEqual(
+        scenario.expectedServers
+      );
+    });
+  }
+
+  test("globally enabled plugins remain excluded on remote and devcontainer runtimes", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-off-host");
+    await fs.writeFile(
+      path.join(tmp.path, "mcp.jsonc"),
+      JSON.stringify({ servers: {}, enabledPluginServers: [PLUGIN_KEY] })
+    );
+    const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+    });
+    manager.dispose();
+    manager = new MCPServerManager(pluginConfigService);
+    access = manager as unknown as MCPServerManagerTestAccess;
+    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
+      );
+    });
+
+    expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(false);
+    const runtimes = [
+      Object.create(RemoteRuntime.prototype) as Runtime,
+      Object.create(DevcontainerRuntime.prototype) as Runtime,
+    ];
+    for (const [index, runtime] of runtimes.entries()) {
+      // Omit the discovery hint so this exercises the runtime's own host-path gate.
+      const result = await manager.getToolsForWorkspace(
+        workspaceRequest(`ws-plugin-global-off-host-${index}`, { runtime })
+      );
+      expect(result.stats.enabledServerCount).toBe(0);
+      expect(result.stats.startedServerCount).toBe(0);
+      expect(result.tools).toEqual({});
+      expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    }
+  });
+
+  test("global plugin toggles start and retire instances on the next warm-manager serve", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-toggle");
+    const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+    });
+    manager.dispose();
+    manager = new MCPServerManager(pluginConfigService);
+    access = manager as unknown as MCPServerManagerTestAccess;
+    const close = mock(() => Promise.resolve(undefined));
+    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        startResult(
+          Object.keys(servers).map((name) => [name, { tools: { echo: testTool() }, close }])
+        )
+      );
+    });
+    const request = workspaceRequest("ws-plugin-global-toggle");
+
+    const initiallyDisabled = await manager.getToolsForWorkspace(request);
+    expect(initiallyDisabled.stats.enabledServerCount).toBe(0);
+    expect(initiallyDisabled.tools).toEqual({});
+    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+
+    // Changing only the global default must invalidate a warmed startup signature;
+    // no workspace overrides or explicit stop/refresh calls should be necessary.
+    expect((await pluginConfigService.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    const enabled = await manager.getToolsForWorkspace(request);
+    expect(enabled.stats.enabledServerCount).toBe(1);
+    expect(enabled.stats.startedServerCount).toBe(1);
+    expect(Object.keys(enabled.tools)).toHaveLength(1);
+    expect(Object.values(enabled.toolServerNames)).toEqual([PLUGIN_KEY]);
+    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+
+    const cached = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(cached.tools)).toEqual(Object.keys(enabled.tools));
+    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+
+    expect((await pluginConfigService.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+    const disabled = await manager.getToolsForWorkspace(request);
+    expect(disabled.stats.enabledServerCount).toBe(0);
+    expect(disabled.stats.startedServerCount).toBe(0);
+    expect(disabled.tools).toEqual({});
+    expect(disabled.toolServerNames).toEqual({});
+    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   test("threads the agentPlugins context through to config listing", async () => {
     configService.listServers = mock(() => Promise.resolve({}));
     spyOn(access, "startServers").mockImplementation(() => Promise.resolve(startResult([])));

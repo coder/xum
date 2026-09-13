@@ -42,6 +42,7 @@ import {
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   ALL_WORKSPACES_TARGET,
@@ -450,6 +451,8 @@ export class AgentPluginInstallService {
       isEnabled: () => boolean;
       /** Recycles running MCP servers whose config key starts with the given prefix. */
       mcpServerManager?: MCPServerManager;
+      /** Revokes global plugin server enablement before uninstall commits. */
+      mcpConfigService?: Pick<MCPConfigService, "pruneEnabledPluginServers">;
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
       /** Test override for the staged-clone checkout quota. */
@@ -3026,6 +3029,19 @@ export class AgentPluginInstallService {
           }
         );
       };
+
+      // Stage out before the serialized prune: a toggle validated against the
+      // old tree finishes before pruning, while later toggles cannot discover it.
+      // Rollback never restores old consent: a successful write followed by a
+      // lock-release failure may already have revoked global enablement.
+      try {
+        await this.deps.mcpConfigService?.pruneEnabledPluginServers(serverKeyPrefix);
+      } catch (error) {
+        if (await restoreTree("failed global MCP enablement prune")) {
+          await consumeJournal();
+        }
+        throw new Error(`Failed to prune global MCP enablement: ${getErrorMessage(error)}`);
+      }
 
       const dataPath = getPluginDataPath(this.config.rootDir, instanceId);
       let stagedData = false;

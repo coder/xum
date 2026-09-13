@@ -351,6 +351,7 @@ export const MiscDesktopLive: Layer.Layer<
   | Experiments
   | Policy
   | Provider
+  | MCPConfig
   | MCPServerManagerTag
   | WorkspaceMcpOverrides
 > = Layer.effectContext(
@@ -376,6 +377,7 @@ export const MiscDesktopLive: Layer.Layer<
     const agentPluginInstallService = new AgentPluginInstallService(config, {
       isEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
       mcpServerManager: yield* MCPServerManagerTag,
+      mcpConfigService: yield* MCPConfig,
       workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
     });
     const projectService = new ProjectService(config, sshPromptService, yield* SecretsStoreTag);
