@@ -470,6 +470,11 @@ export const Phone: AppStory = {
 export const InitialLoadingPhone: AppStory = {
   ...Phone,
   ...createHydrationStory("ws-loading-initial-phone"),
+  globals: { ...Phone.globals, theme: "light" },
+  parameters: {
+    ...Phone.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
   play: async (context) => {
     await checkPhoneViewport(context);
     await checkTranscriptLayout(context.canvasElement);
