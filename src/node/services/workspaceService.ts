@@ -6704,9 +6704,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.enrichFrontendMetadata(metadata);
   }
 
-  async list(): Promise<FrontendWorkspaceMetadata[]> {
+  async list(
+    archived: "all" | "active" | "archived" = "all"
+  ): Promise<FrontendWorkspaceMetadata[]> {
     try {
-      const workspaces = await this.config.getAllWorkspaceMetadata();
+      const workspaces = await this.config.getAllWorkspaceMetadata({ archived });
       return this.filterVisibleWorkspaceMetadata(workspaces).map((workspace) =>
         this.enrichFrontendMetadata(workspace)
       );
@@ -6717,10 +6719,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   async listByArchivedStatus(archived: boolean): Promise<FrontendWorkspaceMetadata[]> {
-    const workspaces = await this.list();
-    return workspaces.filter(
-      (workspace) => isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) === archived
-    );
+    return this.list(archived ? "archived" : "active");
   }
 
   // Devcontainer Docker labels are keyed by the exact host worktree path from startup, so stop/status

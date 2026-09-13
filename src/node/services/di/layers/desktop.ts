@@ -247,9 +247,7 @@ export const BrowserLive: Layer.Layer<BrowserTags, never, ConfigTag> = Layer.eff
     const browserBridgeTokenManager = new BrowserBridgeTokenManager();
     const browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
       resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
-        const allWorkspaceMetadata = await config.getAllWorkspaceMetadata();
-        const workspaceMetadata =
-          allWorkspaceMetadata.find((candidate) => candidate.id === workspaceId) ?? null;
+        const workspaceMetadata = await config.getWorkspaceMetadataById(workspaceId);
         if (workspaceMetadata == null) {
           return [];
         }

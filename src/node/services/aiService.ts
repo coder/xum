@@ -539,10 +539,7 @@ export class AIService extends EventEmitter {
 
   async getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>> {
     try {
-      // Read from config.json (single source of truth)
-      // getAllWorkspaceMetadata() handles migration from legacy metadata.json files
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const metadata = allMetadata.find((m) => m.id === workspaceId);
+      const metadata = await this.config.getWorkspaceMetadataById(workspaceId);
 
       if (!metadata) {
         return Err(

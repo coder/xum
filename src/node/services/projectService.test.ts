@@ -231,7 +231,11 @@ describe("ProjectService", () => {
       expect(parentResult.success).toBe(true);
 
       const nestedPath = path.join(parentPath, "nested-new-repo");
+      const snapshot = config.loadConfigOrDefault();
+      const projects = snapshot.projects;
       const result = await service.create(nestedPath, { initGit: true });
+      expect(config.loadConfigOrDefault()).toBe(snapshot);
+      expect(snapshot.projects).toBe(projects);
 
       expect(result.success).toBe(false);
       expect(!result.success && result.error).toContain(

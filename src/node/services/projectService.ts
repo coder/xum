@@ -495,7 +495,8 @@ export class ProjectService {
         !projectPath.includes("\\") &&
         !projectPath.startsWith("~");
 
-      const config = this.config.loadConfigOrDefault();
+      // Hierarchy validation replaces projects without mutating the shared config snapshot.
+      const config = { ...this.config.loadConfigOrDefault() };
       let normalizedPath: string;
       if (isBareProjectName) {
         // Bare project name - put in default projects directory
