@@ -766,7 +766,7 @@ async function loadServices(): Promise<void> {
   services = new ServiceContainerClass(stores);
   // Desktop bootstrap owns interactive host-key trust policy
   setOpenSSHHostKeyPolicyMode("strict");
-  await services.initialize();
+  await services.initializeCore();
   // Keep the latest update status in main so close-to-tray can prompt for installs.
   services.updateService.onStatus((status) => {
     latestUpdateStatus = status;
@@ -1369,6 +1369,10 @@ async function startDesktopAfterStorage(): Promise<void> {
       await loadServices();
       initializeRemoteConnections();
       createWindow();
+      // Task recovery finishes during core init; housekeeping must not gate the window.
+      void services?.runStartupHousekeeping().catch((error: unknown) => {
+        log.error("[startup] Background startup housekeeping failed", { error });
+      });
       createTray();
       // Note: splash closes in ready-to-show event handler
 

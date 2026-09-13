@@ -536,6 +536,15 @@ export class ServiceContainer {
     } else {
       log.info("[startup] ServiceContainer.initialize completed", completedPayload);
     }
+
+    // Retention cleanup must not delay recovery or starting periodic services.
+    try {
+      await this.recordStartupStep("workspaceService.cleanupArchivedDevToolsLogs", () =>
+        this.workspaceService.cleanupArchivedDevToolsLogs({ signal })
+      );
+    } catch (error: unknown) {
+      log.warn("[startup] Archived DevTools cleanup failed", { error });
+    }
   }
 
   /**

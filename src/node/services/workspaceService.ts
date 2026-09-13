@@ -3478,12 +3478,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.cleanupOrphanScratchWorkdirs().catch((error: unknown) => {
         log.debug("Failed to clean orphaned scratch workdirs", { error });
       });
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
+      const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
       await this.cleanupOrphanSessionDirs(allMetadata).catch((error: unknown) => {
         log.debug("Failed to clean orphaned session directories", { error });
-      });
-      await this.cleanupArchivedDevToolsLogs(allMetadata).catch((error: unknown) => {
-        log.debug("Failed to clean archived workspace DevTools logs", { error });
       });
       let scheduledCount = 0;
       let skippedTaskCount = 0;
@@ -3772,6 +3769,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           continue;
         }
         return cached;
+      }
+
+      const workspace = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        workspaceId
+      )?.workspace;
+      // Archived stores are dormant until unarchive invalidates this cache. Live workflow
+      // events still update the shared Set without scanning archived session directories.
+      if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+        const activeRunIds = new Set<string>();
+        this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+        return activeRunIds;
       }
 
       // Install the shared Set before awaiting disk so parallel workflow status events
@@ -4934,39 +4943,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * handles new archives; this retroactively heals workspaces archived before that
    * cleanup existed (debug logs routinely dwarf all other session data).
    */
-  private async cleanupArchivedDevToolsLogs(
-    allMetadata: FrontendWorkspaceMetadata[]
-  ): Promise<void> {
-    if (!this.devToolsService) {
+  async cleanupArchivedDevToolsLogs(options?: { signal?: AbortSignal }): Promise<void> {
+    if (!this.devToolsService || options?.signal?.aborted) {
       return;
     }
 
     const devToolsService = this.devToolsService;
-    for (const metadata of allMetadata) {
-      if (!isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
-      try {
-        // archive() already removed the log for most archived workspaces, so gate the fresh config
-        // read below on there being something to delete: a per-workspace reload for every archived
-        // entry would scale this sweep with (archived workspaces x config size).
-        if (!(await devToolsService.hasWorkspaceData(metadata.id))) continue;
-        // This sweep can run while the server is serving clients. Unarchive runs under the same
-        // lock, so re-checking the live config inside it means a workspace unarchived since
-        // `allMetadata` was read keeps the logs it has produced since.
-        await this.withTaskTreeLifecycleLock(metadata.id, async () => {
-          const live = findWorkspaceEntry(
-            this.config.loadConfigOrDefault(),
-            metadata.id
-          )?.workspace;
-          if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) return;
-          await devToolsService.removeWorkspaceData(metadata.id);
-        });
-      } catch (error: unknown) {
-        log.debug("Failed to remove DevTools log for archived workspace", {
-          workspaceId: metadata.id,
-          error,
-        });
-      }
-    }
+    const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+    const archived = allMetadata.filter((metadata) =>
+      isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)
+    );
+    await this.effectRunner.runPromise(
+      Effect.forEach(
+        archived,
+        (metadata) =>
+          Effect.promise(async () => {
+            if (options?.signal?.aborted) return;
+            try {
+              if (!(await devToolsService.hasWorkspaceData(metadata.id))) return;
+              // Unarchive shares this lock, so a revived workspace keeps its new logs.
+              await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+                if (options?.signal?.aborted) return;
+                const live = findWorkspaceEntry(
+                  this.config.loadConfigOrDefault(),
+                  metadata.id
+                )?.workspace;
+                if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt))
+                  return;
+                await devToolsService.removeWorkspaceData(metadata.id);
+              });
+            } catch (error: unknown) {
+              log.debug("Failed to remove DevTools log for archived workspace", {
+                workspaceId: metadata.id,
+                error,
+              });
+            }
+          }),
+        { concurrency: 16, discard: true }
+      )
+    );
   }
 
   async createScratch(title?: string): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
@@ -9342,6 +9357,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Ok(undefined);
       }
 
+      this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
+      this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
@@ -13667,9 +13685,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>> {
     const legacyAliasIds = new Set<string>();
     const ids = new Set(
-      (await this.config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })).map(
-        (metadata) => metadata.id
-      )
+      (
+        await this.config.getAllWorkspaceMetadata({
+          throwOnError: true,
+          legacyAliasIds,
+          probeCheckouts: false,
+        })
+      ).map((metadata) => metadata.id)
     );
     for (const aliasId of legacyAliasIds) {
       ids.add(aliasId);
@@ -13701,8 +13723,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /**
    * Returns the config-known workspace ids captured during the prune so the
    * first activity bootstrap can reuse them for scoping —
-   * getAllWorkspaceMetadata walks every workspace with per-workspace disk
-   * probes, which large deployments should not pay twice in the
+   * getAllWorkspaceMetadata walks every workspace, so avoid repeating that work during
    * latency-sensitive bootstrap. `knownIds` is the FULL raw-plus-normalized
    * union the prune spared from deletion: scoping to anything narrower (the
    * normalized view alone) would drop raw-registered ids the normalized

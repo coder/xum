@@ -651,6 +651,16 @@ describe("ServiceContainer", () => {
       return Promise.resolve();
     });
 
+    const agentStatusStartSpy = spyOn(services.agentStatusService, "start");
+    const cleanupSpy = spyOn(
+      services.workspaceService,
+      "cleanupArchivedDevToolsLogs"
+    ).mockImplementation(() => {
+      expect(agentStatusStartSpy).toHaveBeenCalledTimes(1);
+      callOrder.push("devToolsCleanup");
+      return Promise.resolve();
+    });
+
     let coreSettled = false;
     const core = services.initializeCore().then(() => {
       coreSettled = true;
@@ -666,7 +676,8 @@ describe("ServiceContainer", () => {
     expect(taskHousekeepingSpy).not.toHaveBeenCalled();
 
     await services.runStartupHousekeeping();
-    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping", "devToolsCleanup"]);
+    expect(cleanupSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(workspaceInitializeSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
   });

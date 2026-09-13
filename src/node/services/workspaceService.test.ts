@@ -2544,6 +2544,75 @@ describe("WorkspaceService.setActiveTurnThinkingLevel", () => {
 });
 
 describe("WorkspaceService workflow activity", () => {
+  test("defers archived workflow stores until unarchive but retains live events", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      for (const id of ["active", "archived", "unarchived"]) {
+        await config.addWorkspace(projectPath, {
+          id,
+          name: id,
+          projectPath,
+          projectName: "project",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          archivedAt: id === "active" ? undefined : "2026-01-02T00:00:00.000Z",
+          unarchivedAt: id === "unarchived" ? "2026-01-03T00:00:00.000Z" : undefined,
+        });
+        const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, id) });
+        await runStore.createRun({
+          id: "wfr_" + id,
+          workspaceId: id,
+          workflow: { name: "demo", description: "Demo", scope: "global", executable: true },
+          source: "export default function workflow() { return {}; }",
+          args: {},
+          now: "2026-01-01T00:00:00.000Z",
+        });
+      }
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+      const activity = await workspaceService.getActivityList();
+      expect(activity?.active?.activeWorkflowRunIds).toEqual(["wfr_active"]);
+      expect(activity?.unarchived?.activeWorkflowRunIds).toEqual(["wfr_unarchived"]);
+      expect(activity?.archived).toBeUndefined();
+      expect(scanSpy).toHaveBeenCalledTimes(2);
+      expect(metadataSpy.mock.calls.every(([options]) => options?.probeCheckouts === false)).toBe(
+        true
+      );
+
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "running",
+      });
+      expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
+        "wfr_live",
+      ]);
+      expect(scanSpy).toHaveBeenCalledTimes(2);
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "completed",
+      });
+
+      expect(await workspaceService.unarchive("archived")).toEqual(Ok(undefined));
+      expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
+        "wfr_archived",
+      ]);
+      expect(scanSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("caches active workflow run counts and updates emitted activity from status events", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
@@ -10724,10 +10793,57 @@ describe("WorkspaceService initialize", () => {
     };
     spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
 
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
     await workspaceService.initialize();
+    expect(removeWorkspaceData).not.toHaveBeenCalled();
+    expect(metadataSpy).toHaveBeenCalledWith({ probeCheckouts: false });
+
+    await workspaceService.cleanupArchivedDevToolsLogs();
 
     expect(removeWorkspaceData).toHaveBeenCalledTimes(1);
     expect(removeWorkspaceData).toHaveBeenCalledWith("archived-ws");
+  });
+
+  test("bounds archived DevTools cleanup and stops admitting work on shutdown", async () => {
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(
+        Array.from({ length: 40 }, (_, i) =>
+          createFrontendWorkspaceMetadata({
+            id: "archived-" + i,
+            name: "Archived",
+            archivedAt: "2026-01-01T00:00:00.000Z",
+          })
+        )
+      )
+    );
+    const started = createDeferred<void>();
+    const release = createDeferred<void>();
+    const abort = new AbortController();
+    let active = 0;
+    let peak = 0;
+    const hasWorkspaceData = mock(async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      if (active === 16) started.resolve();
+      await release.promise;
+      active -= 1;
+      return false;
+    });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData,
+      removeWorkspaceData: mock(() => Promise.resolve()),
+    });
+    const cleanup = workspaceService.cleanupArchivedDevToolsLogs({ signal: abort.signal });
+    try {
+      await started.promise;
+      expect(peak).toBe(16);
+      expect(hasWorkspaceData).toHaveBeenCalledTimes(16);
+      abort.abort();
+    } finally {
+      release.resolve();
+      await cleanup;
+    }
+    expect(hasWorkspaceData).toHaveBeenCalledTimes(16);
   });
 
   test("initialize schedules no recovery once shutdown has aborted it", async () => {
@@ -12807,6 +12923,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     workspaceService = createWorkspaceServiceForTest({
@@ -13341,6 +13458,7 @@ describe("WorkspaceService streaming generation guard", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     workspaceService = createWorkspaceServiceForTest({
