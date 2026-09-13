@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { UpdateStatus } from "@/common/orpc/types";
 import { APIProvider } from "@/browser/contexts/API";
 import { AboutDialogProvider, useAboutDialog } from "@/browser/contexts/AboutDialogContext";
@@ -75,16 +75,15 @@ export const Downloading: Story = {
   },
 };
 
-export const Restarting: Story = {
+export const RestartingClosesDialog: Story = {
   args: { status: { type: "restarting", info: { version: "0.29.0" } } },
   play: async (context) => {
     await meta.play(context);
-    const dialog = await within(document.body).findByRole("dialog");
-    await expect(within(dialog).getByRole("button", { name: "Check for Updates" })).toBeDisabled();
-    await expect(
-      within(dialog).queryByRole("button", { name: "Install & restart" })
-    ).not.toBeInTheDocument();
-    await expect(within(dialog).getByRole("radio", { name: "Newest npm" })).toBeDisabled();
+    // The dialog hands the screen to the restart cover as soon as the restarting status lands,
+    // releasing its focus trap; the mock emits that status on subscribe, right after opening.
+    await waitFor(() =>
+      expect(within(document.body).queryByRole("dialog")).not.toBeInTheDocument()
+    );
   },
 };
 

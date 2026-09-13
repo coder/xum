@@ -623,6 +623,21 @@ describe("UpdaterService", () => {
       });
     });
 
+    it("should map updater errors reported while restarting to install phase", () => {
+      mockAutoUpdater.emit("update-available", { version: "2.0.0" });
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+      service.installUpdate();
+      expect(service.getStatus().type).toBe("restarting");
+
+      mockAutoUpdater.emit("error", new Error("Could not launch the installer"));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "install",
+        message: "Could not launch the installer",
+      });
+    });
+
     it("should preserve existing error phase on follow-up updater errors", () => {
       mockAutoUpdater.emit("update-available", { version: "2.0.0" });
       mockAutoUpdater.emit("download-progress", { percent: 30 });

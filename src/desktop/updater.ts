@@ -262,10 +262,12 @@ export class UpdaterService {
         return;
       }
 
+      // quitAndInstall() can also fail through this event (missing installer, native updater
+      // error); that is an install failure the user may retry, not a check failure.
       const phase =
         this.updateStatus.type === "downloading"
           ? "download"
-          : this.updateStatus.type === "downloaded"
+          : this.updateStatus.type === "downloaded" || this.updateStatus.type === "restarting"
             ? "install"
             : this.updateStatus.type === "error"
               ? this.updateStatus.phase

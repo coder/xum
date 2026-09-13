@@ -117,6 +117,12 @@ export function AboutDialog() {
           }
           setUpdateStatus(status);
           setPendingAction(null);
+          // The restart screen takes over; releasing this modal also releases its focus trap and
+          // the aria-hidden it put on the app, so the restarting status is what keyboard and
+          // assistive technology land on.
+          if (status.type === "restarting") {
+            close();
+          }
         }
       } catch (error) {
         if (!signal.aborted) {
@@ -128,7 +134,7 @@ export function AboutDialog() {
     return () => {
       controller.abort();
     };
-  }, [api, isOpen]);
+  }, [api, close, isOpen]);
 
   useEffect(() => {
     if (!isOpen || !api) {

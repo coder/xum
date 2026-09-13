@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { useAPI } from "@/browser/contexts/API";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 
@@ -47,15 +48,18 @@ export function UpdateRestartOverlay() {
     return null;
   }
 
-  // Stacked above dialogs, toasts, and menus so nothing from the old UI peeks through.
-  // pointer-events-auto: Radix's modal lock sets pointer-events: none on <body> while the About
-  // dialog (the usual install trigger) is open, which would let clicks fall through the cover.
-  return (
+  // Portaled to <body>, outside the app root: an open Radix modal (the About dialog is the usual
+  // install trigger) marks the app root aria-hidden and locks body pointer events, so rendering
+  // inside it would hide the status from assistive technology; pointer-events-auto keeps clicks
+  // from falling through the cover. Stacked above dialogs, toasts, and menus so nothing from the
+  // old UI peeks through.
+  return createPortal(
     <div
       className="bg-surface-primary pointer-events-auto fixed inset-0 z-[10002]"
       data-testid="update-restart-overlay"
     >
       <LoadingScreen statusText="Restarting Xum…" />
-    </div>
+    </div>,
+    document.body
   );
 }
