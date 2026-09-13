@@ -3374,21 +3374,21 @@ export class WorkspaceStore {
     const chatEventsCoverChange =
       this.isOnChatSubscriptionActive(workspaceId) && transient?.onChatIteratorOpen === true;
     if (transcriptChanged && transient && !chatEventsCoverChange) {
-      // A stop for the generation that was already streaming when the user left is the
-      // backend catching up on chat events the aggregator applied while subscribed
-      // (stream-end reaches onChat first; streaming=false and the completion recency are
-      // published afterwards). Leaving mid-stream already marked the cache stale on the
-      // switch itself, so a still-trustworthy cache means that stream ended in the
-      // aggregator and this snapshot carries no rows it is missing.
-      const isLaggingStopForCompletedStream =
+      // Completion bookkeeping for the generation that was already streaming when the user
+      // left: stream-end reaches onChat first, then the backend publishes the advanced
+      // completion recency (still streaming=true) and finally streaming=false. When the
+      // aggregator holds no active stream it already applied that stream's end, so neither
+      // snapshot carries rows the cache is missing. A stream still open in the aggregator
+      // means the user left mid-stream, which the switch itself marked stale.
+      const isCompletionOfStreamTheAggregatorFinished =
         previous?.streaming === true &&
-        snapshot?.streaming === false &&
-        previous.streamingGeneration === snapshot.streamingGeneration;
+        previous.streamingGeneration === snapshot?.streamingGeneration &&
+        this.aggregators.get(workspaceId)?.hasInterruptibleActiveStream() === false;
       // The first snapshot is a baseline, not movement: without an earlier value an idle
       // snapshot proves nothing arrived while unsubscribed. An in-flight stream is the
       // exception, because a detached aggregator cannot hold it.
       const isIdleBaseline = previous === null && snapshot?.streaming !== true;
-      if (!isLaggingStopForCompletedStream && !isIdleBaseline) {
+      if (!isCompletionOfStreamTheAggregatorFinished && !isIdleBaseline) {
         transient.cachedTranscriptStale = true;
       }
     }

@@ -1863,11 +1863,12 @@ describe("WorkspaceStore", () => {
       expect(state().isTranscriptStale).toBe(true);
     });
 
-    it("keeps cached rows trustworthy when the activity stop for a finished stream lags the switch", async () => {
+    it("keeps cached rows trustworthy when completion snapshots for a finished stream lag the switch", async () => {
       await hydrateCachedRow();
       const attempt = attemptsFor(workspaceId)[0].events;
       // The backend publishes streaming=true alongside stream-start, then the stream ends over
-      // onChat; the matching streaming=false update is published asynchronously afterwards.
+      // onChat; the completion recency (still streaming) and the streaming=false update are
+      // published asynchronously afterwards.
       pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
       attempt.push(streamStartEvent(workspaceId, "live-stream", { historySequence: 2 }));
       expect(await waitUntil(() => state().canInterrupt)).toBe(true);
@@ -1875,8 +1876,15 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => !state().canInterrupt)).toBe(true);
       expect(state().isTranscriptStale).toBe(false);
 
-      // Leave right after stream-end, before the lagging stop snapshot arrives.
+      // Leave right after stream-end, before either completion snapshot arrives.
       store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      pushActivity(workspaceId, {
+        ...idleSnapshot,
+        streaming: true,
+        streamingGeneration: 2,
+        recency: baseRecency + 1,
+      });
       await tick(0);
       pushActivity(workspaceId, {
         ...idleSnapshot,
