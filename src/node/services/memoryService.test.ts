@@ -3499,10 +3499,10 @@ describe("MemoryService", () => {
       );
       const realReadFile = fsPromises.readFile.bind(fsPromises);
       const denied = spyOn(fsPromises, "readFile").mockImplementation(((
-        target: Parameters<typeof fsPromises.readFile>[0],
+        target: string,
         ...rest: unknown[]
       ) =>
-        String(target) === childManifest
+        target === childManifest
           ? Promise.reject(
               Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
             )
@@ -4368,10 +4368,10 @@ describe("MemoryService", () => {
       // Unreadable (EACCES): the question stays open, the copy stays.
       const realReadFile = fsPromises.readFile.bind(fsPromises);
       const denied = spyOn(fsPromises, "readFile").mockImplementation(((
-        target: Parameters<typeof fsPromises.readFile>[0],
+        target: string,
         ...rest: unknown[]
       ) =>
-        String(target) === grandchildManifest
+        target === grandchildManifest
           ? Promise.reject(
               Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
             )

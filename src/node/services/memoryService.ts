@@ -665,9 +665,7 @@ class LocalMemoryStore implements MemoryStore {
       // Bounded concurrency: an externally over-cap directory on such a
       // filesystem would otherwise open one lstat per entry at once, on
       // every index or fingerprint read.
-      const classified: Array<{ name: string; kind: "dir" | "file" | "other" }> = new Array(
-        entries.length
-      );
+      const classified: Array<{ name: string; kind: "dir" | "file" | "other" }> = [];
       let nextEntry = 0;
       const classifyNext = async (): Promise<void> => {
         for (;;) {
