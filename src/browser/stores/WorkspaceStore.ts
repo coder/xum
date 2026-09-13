@@ -1430,6 +1430,15 @@ export class WorkspaceStore {
       return;
     }
 
+    for (const workspaceId of this.workspaceMetadata.keys()) {
+      if (
+        this.activeWorkspaceId === workspaceId ||
+        this.usageStore.hasKeySubscribers(workspaceId)
+      ) {
+        this.refreshSessionUsage(workspaceId);
+      }
+    }
+
     // Re-subscribe any workspaces that already have UI consumers.
     for (const workspaceId of this.statsListenerCounts.keys()) {
       this.subscribeToStats(workspaceId);
@@ -3033,7 +3042,11 @@ export class WorkspaceStore {
    * Subscribe to usage store changes for a specific workspace.
    */
   subscribeUsage(workspaceId: string, listener: () => void): () => void {
-    return this.usageStore.subscribeKey(workspaceId, listener);
+    const unsubscribe = this.usageStore.subscribeKey(workspaceId, listener);
+    if (!this.sessionUsageRequestVersion.has(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
+    }
+    return unsubscribe;
   }
 
   /**
@@ -3244,7 +3257,8 @@ export class WorkspaceStore {
 
   private applyWorkspaceActivitySnapshot(
     workspaceId: string,
-    snapshot: WorkspaceActivitySnapshot | null
+    snapshot: WorkspaceActivitySnapshot | null,
+    refreshGoalCount = true
   ): void {
     const previous = this.workspaceActivity.get(workspaceId) ?? null;
 
@@ -3260,7 +3274,9 @@ export class WorkspaceStore {
       this.workspaceActivity.delete(workspaceId);
     }
 
-    this.refreshActiveGoalCount();
+    if (refreshGoalCount) {
+      this.refreshActiveGoalCount();
+    }
 
     const changed =
       previous?.streaming !== snapshot?.streaming ||
@@ -3388,7 +3404,7 @@ export class WorkspaceStore {
       if (skipWorkspaceIds?.has(workspaceId)) {
         continue;
       }
-      this.applyWorkspaceActivitySnapshot(workspaceId, snapshot);
+      this.applyWorkspaceActivitySnapshot(workspaceId, snapshot, false);
     }
 
     // An empty list is a valid all-idle result (backend read failures arrive as null
@@ -3397,8 +3413,9 @@ export class WorkspaceStore {
       if (seenWorkspaceIds.has(workspaceId) || skipWorkspaceIds?.has(workspaceId)) {
         continue;
       }
-      this.applyWorkspaceActivitySnapshot(workspaceId, null);
+      this.applyWorkspaceActivitySnapshot(workspaceId, null, false);
     }
+    this.refreshActiveGoalCount();
   }
 
   private applyTerminalActivity(
@@ -3991,8 +4008,10 @@ export class WorkspaceStore {
     // Clear stale streaming state
     aggregator.clearActiveStreams();
 
-    // Fetch persisted session usage (fire-and-forget)
-    this.refreshSessionUsage(workspaceId);
+    // Registration must not fetch usage for every workspace in the sidebar.
+    if (this.activeWorkspaceId === workspaceId || this.usageStore.hasKeySubscribers(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
+    }
 
     // Stats snapshots are subscribed lazily via subscribeStats().
     this.subscribeToStats(workspaceId);

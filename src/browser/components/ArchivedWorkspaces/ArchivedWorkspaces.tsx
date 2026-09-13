@@ -43,7 +43,7 @@ type SessionUsageFile = z.infer<typeof SessionUsageFileSchema>;
 interface ArchivedWorkspacesProps {
   projectPath: string;
   projectName: string;
-  workspaces: FrontendWorkspaceMetadata[];
+  workspaces: FrontendWorkspaceMetadata[] | undefined;
   /** Called after a workspace is unarchived or deleted to refresh the list */
   onWorkspacesChanged?: () => void;
 }
@@ -302,13 +302,16 @@ const BulkProgressModal: React.FC<{
 export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   projectPath: _projectPath,
   projectName: _projectName,
-  workspaces,
+  workspaces: loadedWorkspaces,
   onWorkspacesChanged,
 }) => {
   const [isExpanded, setIsExpanded] = usePersistedState(
     getArchivedWorkspacesExpandedKey(_projectPath),
-    false
+    false,
+    { listener: true }
   );
+  // Collapsed sections must not scan metadata or fetch costs, even with a warm cache.
+  const workspaces = isExpanded ? (loadedWorkspaces ?? []) : [];
   const archivedRegionId = React.useId();
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
@@ -346,7 +349,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   // Cost data with optimistic caching - shows cached costs immediately, fetches fresh in background
-  const workspaceIds = React.useMemo(() => workspaces.map((w) => w.id), [workspaces]);
+  const workspaceIds = workspaces.map((w) => w.id);
 
   // Memoize fetchBatch so the hook doesn't refetch on every local state change.
   const fetchWorkspaceCosts = React.useCallback(
@@ -368,7 +371,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const { values: costsByWorkspace, status: costsStatus } = useOptimisticBatchLRU({
     keys: workspaceIds,
     cache: sessionCostCache,
-    skip: !api,
+    skip: !api || !isExpanded,
     fetchBatch: fetchWorkspaceCosts,
   });
   const costsLoading = costsStatus === "idle" || costsStatus === "loading";
@@ -387,18 +390,13 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
   // Calculate total cost and per-period costs from cached/fetched values
-  const totalCost = React.useMemo(() => {
-    let sum = 0;
-    let hasCost = false;
-    for (const ws of workspaces) {
-      const cost = costsByWorkspace[ws.id];
-      if (cost !== undefined) {
-        sum += cost;
-        hasCost = true;
-      }
+  let totalCost: number | undefined;
+  for (const ws of workspaces) {
+    const cost = costsByWorkspace[ws.id];
+    if (cost !== undefined) {
+      totalCost = (totalCost ?? 0) + cost;
     }
-    return hasCost ? sum : undefined;
-  }, [workspaces, costsByWorkspace]);
+  }
 
   const periodCosts = React.useMemo(() => {
     const costs = new Map<string, number | undefined>();
@@ -416,11 +414,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     }
     return costs;
   }, [groupedWorkspaces, costsByWorkspace]);
-
-  // workspaces prop should already be filtered to archived only
-  if (workspaces.length === 0) {
-    return null;
-  }
 
   // Handle checkbox click with shift-click range selection
   const handleCheckboxClick = (workspaceId: string, event: React.MouseEvent) => {
@@ -816,9 +809,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           </button>
           <ArchiveIcon className="text-muted h-4 w-4" />
           <span className="text-foreground font-medium">
-            Archived Workspaces ({workspaces.length})
+            Archived Workspaces{loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
           </span>
-          <CostBadge cost={totalCost} loading={costsLoading} size="lg" />
+          {isExpanded && <CostBadge cost={totalCost} loading={costsLoading} size="lg" />}
           <span className="flex-1" />
           {isExpanded && hasSelection && (
             <div className="flex items-center gap-2">

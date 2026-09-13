@@ -1292,14 +1292,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
           const meta = event.metadata;
 
-          // 1. ALWAYS normalize incoming metadata first - this is the critical data update.
-          if (meta !== null) {
+          const isNowArchived =
+            meta !== null && isWorkspaceArchived(meta.archivedAt, meta.unarchivedAt);
+
+          // Archived metadata never enters the active map or needs renderer settings.
+          if (meta !== null && !isNowArchived) {
             ensureCreatedAt(meta);
             seedWorkspaceLocalStorageFromBackend(meta, workspaceMetadataRef.current.get(meta.id));
           }
-
-          const isNowArchived =
-            meta !== null && isWorkspaceArchived(meta.archivedAt, meta.unarchivedAt);
 
           // If the currently-selected workspace is being archived, navigate away *before*
           // removing it from the active metadata map. Otherwise we can briefly render the

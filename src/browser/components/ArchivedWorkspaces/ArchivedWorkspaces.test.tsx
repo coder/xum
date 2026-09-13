@@ -15,6 +15,16 @@ import * as SkeletonModule from "@/browser/components/Skeleton/Skeleton";
 import * as OptimisticBatchLRUModule from "@/browser/hooks/useOptimisticBatchLRU";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 
+import * as AgentContextModule from "@/browser/contexts/AgentContext";
+import * as ThinkingContextModule from "@/browser/contexts/ThinkingContext";
+import * as ChatInputModule from "@/browser/features/ChatInput";
+import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ProjectMCPOverviewModule from "@/browser/components/ProjectMCPOverview/ProjectMCPOverview";
+import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
+import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
+import { getArchivedWorkspacesKey } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
 
 function installTestDoubles() {
@@ -124,6 +134,113 @@ describe("ArchivedWorkspaces", () => {
     cleanupDom?.();
     cleanupDom = null;
   });
+
+  test("fetches costs only while expanded, including when metadata is already cached", async () => {
+    spyOn(OptimisticBatchLRUModule, "useOptimisticBatchLRU").mockRestore();
+    const workspace = createWorkspace({ id: "lazy-cost" });
+    const readWorkspaceId = mock(() => "lazy-cost");
+    Object.defineProperty(workspace, "id", { get: readWorkspaceId });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+      />
+    );
+    expect(getSessionUsageBatchMock).not.toHaveBeenCalled();
+    expect(view.queryByRole("region", { name: "Archived workspaces" })).toBeNull();
+    expect(readWorkspaceId).not.toHaveBeenCalled();
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    await waitFor(() => expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1));
+    expect(getSessionUsageBatchMock).toHaveBeenCalledWith({ workspaceIds: [workspace.id] });
+    fireEvent.click(view.getByLabelText("Collapse archived workspaces"));
+    view.rerender(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace, createWorkspace({ id: "new-archive" })]}
+      />
+    );
+    expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["project", "cached-project", "scratch"])(
+    "defers archived metadata and usage on the %s page until expansion",
+    async (page) => {
+      spyOn(OptimisticBatchLRUModule, "useOptimisticBatchLRU").mockRestore();
+      spyOn(AgentContextModule, "AgentProvider").mockImplementation((props) => (
+        <>{props.children}</>
+      ));
+      spyOn(ThinkingContextModule, "ThinkingProvider").mockImplementation((props) => (
+        <>{props.children}</>
+      ));
+      spyOn(ChatInputModule, "ChatInput").mockImplementation(
+        (() => null) as unknown as typeof ChatInputModule.ChatInput
+      );
+      spyOn(ProjectMCPOverviewModule, "ProjectMCPOverview").mockImplementation(() => null);
+      spyOn(ProvidersConfigModule, "useProvidersConfig").mockImplementation(() => ({
+        config: null,
+        loading: true,
+        refresh: () => Promise.resolve(),
+        updateOptimistically: () => undefined,
+        updateModelsOptimistically: () => [],
+      }));
+      const workspace = createWorkspace({
+        id: "lazy-page-" + page,
+        ...(page === "scratch" ? { kind: "scratch" as const } : {}),
+      });
+      const allArchived = [
+        workspace,
+        ...Array.from({ length: 1254 }, (_, i) =>
+          createWorkspace({ id: "other-" + i, projectPath: "/other-project" })
+        ),
+      ];
+      const list = mock(() => Promise.resolve(allArchived));
+      const api = {
+        workspace: {
+          list,
+          getSessionUsageBatch: getSessionUsageBatchMock,
+          onMetadata: async function* () {
+            yield* await Promise.resolve([]);
+          },
+        },
+        projects: { listBranches: () => Promise.resolve({ branches: ["main"] }) },
+      } as unknown as APIClient;
+      spyOn(APIModule, "useAPI").mockImplementation(() => ({
+        api,
+        status: "connected",
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }));
+      if (page === "cached-project")
+        updatePersistedState(getArchivedWorkspacesKey(workspace.projectPath), []);
+      const sharedProps = {
+        leftSidebarCollapsed: false,
+        onToggleLeftSidebarCollapsed: () => undefined,
+        onWorkspaceCreated: () => undefined,
+      };
+      const view = render(
+        page === "scratch" ? (
+          <ScratchPage {...sharedProps} />
+        ) : (
+          <ProjectPage
+            {...sharedProps}
+            projectPath={workspace.projectPath}
+            projectName={workspace.projectName}
+          />
+        )
+      );
+      expect(list).not.toHaveBeenCalled();
+      expect(getSessionUsageBatchMock).not.toHaveBeenCalled();
+      fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+      await waitFor(() => expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1));
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledWith({ archived: true });
+      expect(getSessionUsageBatchMock).toHaveBeenCalledWith({ workspaceIds: [workspace.id] });
+      expect(view.getByLabelText("Restore workspace " + workspace.name)).toBeTruthy();
+    }
+  );
 
   test("shows an error when restoring an archived workspace fails", async () => {
     unarchiveWorkspaceMock.mockImplementationOnce(() =>

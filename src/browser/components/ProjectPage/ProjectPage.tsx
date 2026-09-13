@@ -25,6 +25,7 @@ import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
+  getArchivedWorkspacesExpandedKey,
   getDraftScopeId,
   getInputKey,
   getPendingScopeId,
@@ -76,8 +77,18 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
   // Initialize from localStorage cache to avoid flash when archived workspaces appear
-  const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>(() =>
-    readPersistedState<FrontendWorkspaceMetadata[]>(getArchivedWorkspacesKey(projectPath), [])
+  const [archivedWorkspaces, setArchivedWorkspaces] = useState<
+    FrontendWorkspaceMetadata[] | undefined
+  >(() =>
+    readPersistedState<FrontendWorkspaceMetadata[] | undefined>(
+      getArchivedWorkspacesKey(projectPath),
+      undefined
+    )
+  );
+  const [archivedExpanded] = usePersistedState(
+    getArchivedWorkspacesExpandedKey(projectPath),
+    false,
+    { listener: true }
   );
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
@@ -135,16 +146,16 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const syncArchivedState = useCallback(() => {
     const next = Array.from(archivedMapRef.current.values());
     setArchivedWorkspaces((prev) => {
-      if (archivedListsEqual(prev, next)) return prev;
+      if (prev && archivedListsEqual(prev, next)) return prev;
       // Persist to localStorage for optimistic cache on next load
       updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
       return next;
     });
   }, [projectPath]);
 
-  // Fetch archived workspaces for this project on mount
+  // Keep archived metadata off the project page startup path.
   useEffect(() => {
-    if (!api) return;
+    if (!api || !archivedExpanded) return;
     let cancelled = false;
 
     const loadArchived = async () => {
@@ -163,11 +174,11 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [api, projectPath, syncArchivedState]);
+  }, [api, projectPath, syncArchivedState, archivedExpanded]);
 
   // Subscribe to metadata events to reactively update archived list
   useEffect(() => {
-    if (!api) return;
+    if (!api || !archivedExpanded) return;
     const controller = new AbortController();
 
     (async () => {
@@ -200,7 +211,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     })();
 
     return () => controller.abort();
-  }, [api, projectPath, syncArchivedState]);
+  }, [api, projectPath, syncArchivedState, archivedExpanded]);
 
   const didAutoFocusRef = useRef(false);
 
@@ -338,24 +349,22 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
             </div>
 
             {/* Archived workspaces: separate section below centered area */}
-            {archivedWorkspaces.length > 0 && (
-              <div className="flex justify-center px-4 pb-4">
-                <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
-                  <ArchivedWorkspaces
-                    projectPath={projectPath}
-                    projectName={projectName}
-                    workspaces={archivedWorkspaces}
-                    onWorkspacesChanged={() => {
-                      // Refresh archived list after unarchive/delete
-                      if (!api) return;
-                      void api.workspace.list({ archived: true }).then((all) => {
-                        setArchivedWorkspaces(all.filter((w) => w.projectPath === projectPath));
-                      });
-                    }}
-                  />
-                </div>
+            <div className="flex justify-center px-4 pb-4">
+              <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
+                <ArchivedWorkspaces
+                  projectPath={projectPath}
+                  projectName={projectName}
+                  workspaces={archivedWorkspaces}
+                  onWorkspacesChanged={() => {
+                    // Refresh archived list after unarchive/delete
+                    if (!api) return;
+                    void api.workspace.list({ archived: true }).then((all) => {
+                      setArchivedWorkspaces(all.filter((w) => w.projectPath === projectPath));
+                    });
+                  }}
+                />
               </div>
-            )}
+            </div>
           </div>
         </div>
       </ThinkingProvider>

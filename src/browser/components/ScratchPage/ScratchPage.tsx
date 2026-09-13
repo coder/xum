@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Menu } from "lucide-react";
+import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { cn } from "@/common/lib/utils";
@@ -35,7 +37,12 @@ async function listArchivedScratchWorkspaces(api: APIClient | null) {
 
 export function ScratchPage(props: ScratchPageProps) {
   const { api } = useAPI();
-  const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>([]);
+  const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>();
+  const [archivedExpanded] = usePersistedState(
+    getArchivedWorkspacesExpandedKey(SCRATCH_PROJECT_CONFIG_KEY),
+    false,
+    { listener: true }
+  );
   const didAutoFocusRef = useRef(false);
   const { config: providersConfig, loading: providersLoading } = useProvidersConfig();
   const hasProviders = hasConfiguredProvider(providersConfig);
@@ -45,6 +52,7 @@ export function ScratchPage(props: ScratchPageProps) {
   }
 
   useEffect(() => {
+    if (!api || !archivedExpanded) return;
     let ignore = false;
     listArchivedScratchWorkspaces(api)
       .then((archived) => {
@@ -54,7 +62,7 @@ export function ScratchPage(props: ScratchPageProps) {
     return () => {
       ignore = true;
     };
-  }, [api]);
+  }, [api, archivedExpanded]);
 
   function handleChatReady(api: ChatInputAPI) {
     if (didAutoFocusRef.current) return;
@@ -118,20 +126,18 @@ export function ScratchPage(props: ScratchPageProps) {
                 )}
               </div>
             </div>
-            {archivedWorkspaces.length > 0 && (
-              <div className="flex justify-center px-4 pb-4">
-                <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
-                  <ArchivedWorkspaces
-                    projectPath={SCRATCH_PROJECT_CONFIG_KEY}
-                    projectName={SCRATCH_PROJECT_NAME}
-                    workspaces={archivedWorkspaces}
-                    onWorkspacesChanged={() => {
-                      refreshArchivedWorkspaces().catch(() => undefined);
-                    }}
-                  />
-                </div>
+            <div className="flex justify-center px-4 pb-4">
+              <div className={cn("w-full", CREATION_COLUMN_MAX_WIDTH_CLASS)}>
+                <ArchivedWorkspaces
+                  projectPath={SCRATCH_PROJECT_CONFIG_KEY}
+                  projectName={SCRATCH_PROJECT_NAME}
+                  workspaces={archivedWorkspaces}
+                  onWorkspacesChanged={() => {
+                    refreshArchivedWorkspaces().catch(() => undefined);
+                  }}
+                />
               </div>
-            )}
+            </div>
           </div>
         </div>
       </ThinkingProvider>

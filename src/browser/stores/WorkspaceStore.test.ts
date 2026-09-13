@@ -1761,6 +1761,45 @@ describe("WorkspaceStore", () => {
   });
 
   describe("session usage refresh on activation", () => {
+    it("hydrates usage only for selected workspaces or subscribed consumers", async () => {
+      const workspaces = Array.from({ length: 546 }, (_, i) => makeWorkspaceMetadata("lazy-" + i));
+      store.syncWorkspaces(new Map(workspaces.map((workspace) => [workspace.id, workspace])));
+      expect(mockGetSessionUsage).not.toHaveBeenCalled();
+
+      const unsubscribe = store.subscribeUsage("lazy-0", () => undefined);
+      const unsubscribeSecond = store.subscribeUsage("lazy-0", () => undefined);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "lazy-0" });
+      await tick(0);
+      expect(store.isSessionUsageKnown("lazy-0")).toBe(true);
+      expect(store.isSessionUsageKnown("lazy-1")).toBe(false);
+      unsubscribe();
+      unsubscribeSecond();
+      const unsubscribeCached = store.subscribeUsage("lazy-0", () => undefined);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+      unsubscribeCached();
+
+      store.setActiveWorkspaceId("lazy-1");
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(2);
+      expect(mockGetSessionUsage).toHaveBeenLastCalledWith({ workspaceId: "lazy-1" });
+    });
+
+    it("hydrates early usage subscribers when metadata and the client become available", () => {
+      store.setClient(null);
+      const unsubscribe = store.subscribeUsage("early-usage", () => undefined);
+      createAndAddWorkspace(store, "early-usage", {}, false);
+      createAndAddWorkspace(store, "hidden-usage", {}, false);
+      expect(mockGetSessionUsage).not.toHaveBeenCalled();
+      const client = mockClient as unknown as Parameters<WorkspaceStore["setClient"]>[0];
+      store.setClient(client);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "early-usage" });
+      store.setClient(null);
+      store.setClient(client);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(2);
+      unsubscribe();
+    });
+
     it("re-fetches persisted session usage when switching to an inactive workspace", async () => {
       const sessionUsageData = {
         byModel: {
@@ -1837,11 +1876,11 @@ describe("WorkspaceStore", () => {
       let callCount = 0;
       mockGetSessionUsage.mockImplementation(() => {
         callCount++;
-        if (callCount <= 2) {
-          // First two calls (addWorkspace + first activation) are slow responses.
+        if (callCount === 1) {
+          // The first activation is slow.
           return firstFetch;
         }
-        // Third call (second activation) resolves immediately with fresh data.
+        // The second activation resolves immediately with fresh data.
         return Promise.resolve(freshData);
       });
 
@@ -3649,6 +3688,61 @@ describe("WorkspaceStore", () => {
   });
 
   describe("activity fallbacks", () => {
+    it("recounts active goals once per bulk list, including removals and preserved live goals", () => {
+      resetStore();
+      const internal = getInternal<{
+        applyWorkspaceActivityList: (
+          snapshots: Record<string, WorkspaceActivitySnapshot>,
+          skipWorkspaceIds?: ReadonlySet<string>
+        ) => void;
+        refreshActiveGoalCount: () => void;
+      }>(store);
+      const recount = spyOn(internal, "refreshActiveGoalCount");
+      const snapshot = (
+        status: "active" | "paused",
+        pendingPersistence = false
+      ): WorkspaceActivitySnapshot => ({
+        recency: 1_000,
+        streaming: false,
+        lastModel: null,
+        lastThinkingLevel: null,
+        goal: {
+          goalId: "00000000-0000-4000-8000-000000000001",
+          status,
+          objective: "Finish the task",
+          budgetCents: null,
+          costCents: 0,
+          turnsUsed: 0,
+          turnCap: null,
+          startedAtMs: 1_000,
+          ...(pendingPersistence ? { pendingPersistence: true } : {}),
+        },
+      });
+      internal.applyWorkspaceActivityList({
+        ...Object.fromEntries(
+          Array.from({ length: 500 }, (_, i) => ["goal-" + i, snapshot("active")])
+        ),
+        paused: snapshot("paused"),
+        pending: snapshot("active", true),
+      });
+      expect(store.getActiveGoalCount()).toBe(500);
+      expect(recount).toHaveBeenCalledTimes(1);
+
+      recount.mockClear();
+      internal.applyWorkspaceActivityList(
+        { "goal-0": snapshot("paused"), added: snapshot("active") },
+        new Set(["goal-0", "goal-1"])
+      );
+      expect(store.getActiveGoalCount()).toBe(3);
+      expect(recount).toHaveBeenCalledTimes(1);
+
+      recount.mockClear();
+      internal.applyWorkspaceActivityList({});
+      expect(store.getActiveGoalCount()).toBe(0);
+      expect(recount).toHaveBeenCalledTimes(1);
+      recount.mockRestore();
+    });
+
     it("tracks active goals across workspace activity snapshots", async () => {
       const makeSnapshot = (
         workspaceId: string,
