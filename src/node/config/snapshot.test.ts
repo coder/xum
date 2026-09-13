@@ -104,6 +104,21 @@ describe("Config snapshots", () => {
     expect(config.loadConfigOrDefault()).toEqual(new Config(root).loadConfigOrDefault());
   });
 
+  it("warms the saved runtime projection with normalized keys and hierarchy", async () => {
+    await config.editConfig((snapshot) => {
+      snapshot.projects.set(projectPath + "/child/", { workspaces: [workspace("child")] });
+      return snapshot;
+    });
+    const snapshot = config.loadConfigOrDefault();
+    expect(snapshot).toEqual(new Config(root).loadConfigOrDefault());
+    expect(snapshot.projects.has(projectPath + "/child/")).toBe(false);
+    expect(snapshot.projects.get(projectPath + "/child")?.workspaces).toEqual([]);
+    expect(
+      snapshot.projects.get(projectPath)?.workspaces.find((entry) => entry.id === "child")
+        ?.subProjectPath
+    ).toBe(projectPath + "/child");
+  });
+
   it("does not reuse a lenient structurally invalid load for a strict read", () => {
     fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({ projects: {} }));
     expect(config.loadConfigOrDefault().projects.size).toBe(0);
@@ -170,15 +185,19 @@ describe("Config snapshots", () => {
       workspace("rearchived", { archivedAt: newer, unarchivedAt: older }),
     ]);
     const stored = config.loadConfigOrDefault().projects.get(projectPath)!.workspaces;
-    const clone = spyOn(globalThis, "structuredClone");
+    Object.defineProperty(stored[0], "title", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        throw new Error("Archived metadata must not be constructed");
+      },
+    });
     const access = spyOn(fs.promises, "access").mockResolvedValue(undefined);
     try {
       const active = await config.getAllWorkspaceMetadata({ archived: "active" });
       expect(active.map((metadata) => metadata.id)).toEqual(["active", "restored", "equal"]);
       expect(active[0].rootWorkspaceId).toBe("root");
-      expect(clone.mock.calls.some(([value]) => value === stored[0] || value === stored[4])).toBe(
-        false
-      );
+      delete stored[0].title;
       expect(access.mock.calls.map(([file]) => file)).toEqual(
         active.map((metadata) => metadata.namedWorkspacePath)
       );
@@ -191,7 +210,7 @@ describe("Config snapshots", () => {
       expect(access).not.toHaveBeenCalled();
     } finally {
       access.mockRestore();
-      clone.mockRestore();
+      delete stored[0].title;
     }
   });
 
@@ -227,7 +246,7 @@ describe("Config snapshots", () => {
     expect(await config.getAllWorkspaceMetadata()).toEqual([metadata!]);
   });
 
-  it("keeps returned metadata independently mutable", async () => {
+  it("keeps returned metadata tags independently mutable", async () => {
     await saveWorkspaces([workspace("tagged", { tags: { original: "value" } })]);
     const metadata = await config.getWorkspaceMetadataById("tagged");
     expect(metadata?.tags).toBeDefined();

@@ -1540,9 +1540,47 @@ export class Config {
     }
   }
 
+  private normalizeConfigProjects(
+    projects: AppConfigOnDisk["projects"] | undefined
+  ): Map<string, ProjectConfig> {
+    const rawPairs = Array.isArray(projects) ? projects : [];
+    // Migrate: normalize project paths by stripping trailing slashes
+    // This fixes configs created with paths like "/home/user/project/"
+    // Also filter out any malformed entries (null/undefined paths)
+    // Rebuild config-backed entries from the current on-disk snapshot. Metadata-only entries
+    // survive until the legacy metadata migration writes them into config.json below.
+    for (const workspaceId of this.legacyTaskVariantGroups.keys()) {
+      if (!this.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
+        this.legacyTaskVariantGroups.delete(workspaceId);
+      }
+    }
+    const normalizedPairs = rawPairs
+      .filter(([projectPath]) => {
+        if (!projectPath || typeof projectPath !== "string") {
+          log.warn("Filtering out project with invalid path", { projectPath });
+          return false;
+        }
+        return true;
+      })
+      .map(([projectPath, projectConfig]) => {
+        if (Array.isArray(projectConfig?.workspaces)) {
+          for (const workspace of projectConfig.workspaces) {
+            this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
+          }
+        }
+        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
+        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
+          string,
+          ProjectConfig,
+        ];
+      });
+    return new Map(normalizedPairs);
+  }
+
   private normalizeParsedConfig(
     parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
-    persistMigrations = true
+    persistMigrations = true,
+    normalizedProjects?: Map<string, ProjectConfig>
   ): ProjectsConfig {
     let configModified = false;
     let shouldInvalidateSessionUsageCaches = false;
@@ -1680,38 +1718,9 @@ export class Config {
       shouldInvalidateSessionUsageCaches = true;
     }
 
-    const rawPairs = Array.isArray(parsed.projects) ? parsed.projects : [];
-    // Migrate: normalize project paths by stripping trailing slashes
-    // This fixes configs created with paths like "/home/user/project/"
-    // Also filter out any malformed entries (null/undefined paths)
-    // Rebuild config-backed entries from the current on-disk snapshot. Metadata-only entries
-    // survive until the legacy metadata migration writes them into config.json below.
-    for (const workspaceId of this.legacyTaskVariantGroups.keys()) {
-      if (!this.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
-        this.legacyTaskVariantGroups.delete(workspaceId);
-      }
-    }
-    const normalizedPairs = rawPairs
-      .filter(([projectPath]) => {
-        if (!projectPath || typeof projectPath !== "string") {
-          log.warn("Filtering out project with invalid path", { projectPath });
-          return false;
-        }
-        return true;
-      })
-      .map(([projectPath, projectConfig]) => {
-        if (Array.isArray(projectConfig?.workspaces)) {
-          for (const workspace of projectConfig.workspaces) {
-            this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
-          }
-        }
-        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
-          string,
-          ProjectConfig,
-        ];
-      });
-    const projectsMap = deriveProjectHierarchy(new Map<string, ProjectConfig>(normalizedPairs));
+    const projectsMap = deriveProjectHierarchy(
+      normalizedProjects ?? this.normalizeConfigProjects(parsed.projects)
+    );
 
     // Run before the subproject merge below so a hierarchy edge case
     // cannot relocate a legacy workspace into a parent project first.
@@ -2026,6 +2035,8 @@ export class Config {
         ensurePrivateDirSync(self.rootDir);
       }
 
+      // Keep the runtime projection separate from downgrade-only fields written to disk.
+      const normalizedProjects = new Map<string, ProjectConfig>();
       const data: Partial<Record<keyof AppConfigOnDisk, unknown>> & {
         projects: Array<[string, ProjectConfig]>;
       } = {
@@ -2033,6 +2044,7 @@ export class Config {
         writeId: crypto.randomUUID(),
         projects: Array.from(config.projects.entries()).map(([projectPath, projectConfig]) => {
           const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
+          normalizedProjects.set(stripTrailingSlashes(projectPath), normalizedProjectConfig);
           const persistedProjectConfig = {
             ...normalizedProjectConfig,
             workspaces: normalizedProjectConfig.workspaces.map((workspace) => ({ ...workspace })),
@@ -2315,7 +2327,7 @@ export class Config {
           self.validateConfigStructure(data);
           self.configSnapshot = {
             key,
-            config: self.normalizeParsedConfig(structuredClone(data), false),
+            config: self.normalizeParsedConfig(data, false, normalizedProjects),
             writeId: typeof data.writeId === "string" ? data.writeId : "-",
           };
         } catch (error) {
@@ -3025,12 +3037,10 @@ export class Config {
    * Add paths to WorkspaceMetadata to create FrontendWorkspaceMetadata.
    * Helper to avoid duplicating path computation logic.
    */
-  private async addPathsToMetadata(
+  private addPathsToMetadata(
     metadata: WorkspaceMetadata,
-    workspacePath: string,
-    _projectPath: string,
-    probeCheckout = true
-  ): Promise<FrontendWorkspaceMetadata> {
+    workspacePath: string
+  ): FrontendWorkspaceMetadata {
     const result: FrontendWorkspaceMetadata = {
       ...metadata,
       namedWorkspacePath: workspacePath,
@@ -3043,6 +3053,12 @@ export class Config {
         `Please upgrade ${XUM_PRODUCT_NAME} to use this workspace.`;
     }
 
+    return result;
+  }
+
+  private async probeWorkspaceCheckout(
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<FrontendWorkspaceMetadata> {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
@@ -3050,22 +3066,20 @@ export class Config {
     // blocks it indefinitely); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
     // transcriptOnly classification.
-    const workspacePathExists = probeCheckout
-      ? await fs.promises
-          .access(workspacePath)
-          .then(() => true)
-          .catch(() => false)
-      : true;
+    const workspacePathExists = await fs.promises
+      .access(metadata.namedWorkspacePath)
+      .then(() => true)
+      .catch(() => false);
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
       metadata.taskStatus !== "starting" &&
       !workspacePathExists
     ) {
-      result.transcriptOnly = true;
+      metadata.transcriptOnly = true;
     }
 
-    return result;
+    return metadata;
   }
 
   private ensureWorkspaceIndex(config: ProjectsConfig): void {
@@ -3354,7 +3368,10 @@ export class Config {
         )
           continue;
         // Read-time identity migrations must not mutate the shared config snapshot.
-        const workspace = structuredClone(storedWorkspace);
+        const workspace = {
+          ...storedWorkspace,
+          tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
+        };
         // Extract workspace basename from path (could be stable ID or legacy name)
         const workspaceBasename =
           workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
@@ -3477,7 +3494,7 @@ export class Config {
               };
             }
 
-            workspaceMetadata.push({ ...metadata, namedWorkspacePath: workspace.path });
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
             continue; // Skip metadata file lookup
           }
 
@@ -3682,7 +3699,7 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push({ ...metadata, namedWorkspacePath: workspace.path });
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
             metadataFound = true;
           }
 
@@ -3752,7 +3769,7 @@ export class Config {
               entry.runtimeConfig ??= metadata.runtimeConfig;
             });
 
-            workspaceMetadata.push({ ...metadata, namedWorkspacePath: workspace.path });
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
           }
         } catch (error) {
           // Strict callers make destructive "id is not known" decisions (the
@@ -3812,7 +3829,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
-          workspaceMetadata.push({ ...metadata, namedWorkspacePath: workspace.path });
+          workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }
     }
@@ -3859,24 +3876,18 @@ export class Config {
       const cycle = chain.indexOf(root);
       metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
     }
+    const filtered = workspaceMetadata.filter((metadata) => {
+      if (options?.archived == null || options.archived === "all") return true;
+      return (
+        isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt) ===
+        (options.archived === "archived")
+      );
+    });
+    if (!probeCheckouts) return filtered;
     return Effect.runPromise(
       Effect.forEach(
-        workspaceMetadata.filter((metadata) => {
-          if (options?.archived == null || options.archived === "all") return true;
-          return (
-            isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt) ===
-            (options.archived === "archived")
-          );
-        }),
-        (metadata) =>
-          Effect.promise(() =>
-            this.addPathsToMetadata(
-              metadata,
-              metadata.namedWorkspacePath,
-              metadata.projectPath,
-              probeCheckouts
-            )
-          ),
+        filtered,
+        (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata)),
         { concurrency: 32 }
       )
     );
