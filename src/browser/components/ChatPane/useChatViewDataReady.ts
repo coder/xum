@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { DisplayedMessage } from "@/common/types/message";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundBashStateKnown } from "@/browser/stores/BackgroundBashStore";
 import { useSessionUsageKnown } from "@/browser/stores/WorkspaceStore";
@@ -86,12 +87,28 @@ export function useChatViewDataReady(workspaceId: string): boolean {
 // degrades to "decorations pop in late" instead of "chat looks broken".
 const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
 
+/**
+ * Rows that justify painting the transcript instead of the skeleton.
+ *
+ * Replayed init events are applied before caught-up (WorkspaceStore applies them
+ * immediately so a running init can be the only content of a brand-new workspace),
+ * so on a cold open the finished creation card lands alone a few hundred ms before
+ * the history rows. Counting it released the skeleton, and the rest of the
+ * transcript then jumped in under the dock shimmer. A running init card still
+ * counts: live init output bypasses hydration by design.
+ */
+export function hasRenderableTranscriptRows(messages: readonly DisplayedMessage[]): boolean {
+  return messages.some(
+    (message) => message.type !== "workspace-init" || message.status === "running"
+  );
+}
+
 export interface ChatViewRevealInputs {
   /** Transcript history replay still in flight for the active workspace. */
   isHydratingTranscript: boolean;
   /** All registered decoration data sources are known (useChatViewDataReady). */
   chatViewDataReady: boolean;
-  /** Cached/replayed rows already renderable (revisits skip the skeleton). */
+  /** Cached/replayed rows already renderable (revisits skip the skeleton); see hasRenderableTranscriptRows. */
   hasRenderableMessages: boolean;
   /** Cached rows are known to be missing backend content (WorkspaceState.isTranscriptStale). */
   isTranscriptStale: boolean;

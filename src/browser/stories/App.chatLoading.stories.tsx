@@ -281,6 +281,21 @@ function createHydrationStory(workspaceId: string): AppStory {
         hadAnyOutput: false,
       });
       await expect(await canvas.findByTestId("transcript-hydration-placeholder")).toBeVisible();
+      // Cold open of an existing workspace: replayed init events land before history. A
+      // running init card is the transcript (live init bypasses hydration), but once it
+      // finishes the lone card must not release the skeleton ahead of the history rows.
+      emitChat({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: STABLE_TIMESTAMP,
+        replay: true,
+      });
+      await expect((await canvas.findAllByText(/Creating workspace/))[0]).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      emitChat({ type: "init-end", exitCode: 0, timestamp: STABLE_TIMESTAMP, replay: true });
+      await expect(await canvas.findByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.queryByText(/Workspace created/)).toBeNull();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       emitChat(history);
       emitChat({
         type: "caught-up",
@@ -291,6 +306,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       await expect(
         await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
       ).toBeVisible();
+      await expect(await canvas.findByText(/Workspace created/)).toBeVisible();
       await expect(exposedStatuses()).toHaveLength(0);
     });
 

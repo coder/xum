@@ -25,7 +25,11 @@ import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/Stream
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
-import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
+import {
+  computeChatViewReveal,
+  hasRenderableTranscriptRows,
+  useChatViewDataReady,
+} from "./useChatViewDataReady";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
 import {
   createChatInputDecorationStackItem,
@@ -1098,7 +1102,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     computeChatViewReveal({
       isHydratingTranscript,
       chatViewDataReady,
-      hasRenderableMessages: deferredMessages.length > 0,
+      hasRenderableMessages: hasRenderableTranscriptRows(deferredMessages),
       isTranscriptStale: workspaceState.isTranscriptStale,
     });
   const showEmptyTranscriptPlaceholder =
