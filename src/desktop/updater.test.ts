@@ -178,6 +178,20 @@ describe("UpdaterService", () => {
       expect(() => channelService.setChannel("nightly")).toThrow("ready to install");
     });
 
+    it("setChannel throws while an install is restarting", () => {
+      mockAutoUpdater.setFeedURL.mockClear();
+      const channelService = new UpdaterService();
+      const statuses: string[] = [];
+      channelService.subscribe((status) => statuses.push(status.type));
+
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+      channelService.installUpdate();
+
+      expect(() => channelService.setChannel("nightly")).toThrow("installing");
+      expect(channelService.getStatus().type).toBe("restarting");
+      expect(statuses).not.toContain("idle");
+    });
+
     it("setChannel notifies subscribers on switch", () => {
       mockAutoUpdater.setFeedURL.mockClear();
       const channelService = new UpdaterService();

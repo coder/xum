@@ -48,9 +48,11 @@ export function UpdateRestartOverlay() {
   }
 
   // Stacked above dialogs, toasts, and menus so nothing from the old UI peeks through.
+  // pointer-events-auto: Radix's modal lock sets pointer-events: none on <body> while the About
+  // dialog (the usual install trigger) is open, which would let clicks fall through the cover.
   return (
     <div
-      className="bg-surface-primary fixed inset-0 z-[10002]"
+      className="bg-surface-primary pointer-events-auto fixed inset-0 z-[10002]"
       data-testid="update-restart-overlay"
     >
       <LoadingScreen statusText="Restarting Xum…" />

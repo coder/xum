@@ -547,10 +547,12 @@ export class UpdaterService {
       return;
     }
 
-    const blockedStates = ["checking", "downloading", "downloaded"] as const;
+    // "restarting" is blocked too: resetting to idle here would drop the renderer's restart
+    // screen while quitAndInstall() is still in flight.
+    const blockedStates = ["checking", "downloading", "downloaded", "restarting"] as const;
     if ((blockedStates as readonly string[]).includes(this.updateStatus.type)) {
       throw new Error(
-        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : "an update is ready to install"}`
+        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : this.updateStatus.type === "restarting" ? "an update is installing" : "an update is ready to install"}`
       );
     }
 
