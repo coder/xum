@@ -2126,6 +2126,11 @@ async function restoreMcpFile(
       localServerMerge.objectTrailingText
     );
   }
+  // Plugin enablement is local consent, not backup content. Even rehydrating
+  // local keys could resurrect consent revoked by a concurrent uninstall.
+  restoredText = applyJsoncEdits(restoredText, [
+    { path: ["enabledPluginServers"], value: undefined },
+  ]);
   parseJsoncObjectWithTree(restoredText, "restored mcp.jsonc");
   return Buffer.from(restoredText, "utf-8");
 }

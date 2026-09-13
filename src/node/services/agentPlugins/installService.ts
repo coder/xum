@@ -3645,8 +3645,8 @@ export class AgentPluginInstallService {
    * Fresh-install hygiene for consent state left by a PREVIOUS occupant of
    * this plugin's path. The instance ID derives from the lexical target
    * path, so an UNMANAGED plugin the user enabled and then deleted by hand
-   * (never uninstalled — no tombstone exists) leaves workspace overrides,
-   * and possibly cached server instances, that a same-name managed install
+   * (never uninstalled — no tombstone exists) leaves global enablement,
+   * workspace overrides and cached instances that a same-name managed install
    * would silently inherit: its default-disabled servers would start
    * without fresh enablement. Sweep the prefix across live workspaces and
    * retire cached instances BEFORE anything is promoted; failures block the
@@ -3656,6 +3656,7 @@ export class AgentPluginInstallService {
   private async assertNoResidualInstanceState(name: string): Promise<void> {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
     await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+    await this.deps.mcpConfigService?.pruneEnabledPluginServers(serverKeyPrefix);
     const { enumerated, failed } = await this.retryPrune({
       prefix: serverKeyPrefix,
       workspaceIds: [],

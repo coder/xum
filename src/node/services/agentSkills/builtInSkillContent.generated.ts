@@ -3913,6 +3913,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- **Disabled by default** — globally installed plugins can be enabled for all eligible local workspaces in **Settings → MCP**, which saves their keys in `enabledPluginServers` in `~/.xum/mcp.jsonc`. Repo plugins are enabled per workspace via the Workspace MCP dialog. Workspace enable/disable overrides take precedence over the global default",
       "- **Read-only definitions** — commands and tool allowlists cannot be edited globally, and servers cannot be removed individually. Definitions are never written into `mcp.jsonc`; only enabled server keys appear in `enabledPluginServers`, which a managed uninstall clears for that plugin",
+      "- **Machine-local enablement** — restoring `mcp.jsonc` from a settings backup clears global plugin enablement; enable the servers again in **Settings → MCP**",
       "- **Trust-gated** — servers from a repo's `.xum/plugins` / `.agents/plugins` only appear once the project is trusted",
       "- **Host-only** — plugin servers are skipped for SSH and devcontainer workspaces",
       "- **Branch-following** — in a workspace, repo plugin servers load from the workspace's own checkout (matching skill discovery), while server identities stay stable across worktrees of the same project",

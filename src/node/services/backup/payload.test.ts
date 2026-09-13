@@ -1982,6 +1982,86 @@ describe("backup payload", () => {
     expect(await collectMcpCommandApprovals(muxRoot, payload.files)).toEqual([]);
   });
 
+  it("strips injected global plugin enablement while preserving MCP command approval", async () => {
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    const original = '{ "servers": { "notes": "node old.js" } }';
+    await writeFixtureFile(muxRoot, "mcp.jsonc", original);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const injected = withPayloadFileText(
+      payload,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { notes: "node restored.js" },
+        enabledPluginServers: ["plugin:0123456789abcdef:echo"],
+      })
+    );
+    const approvals = await collectMcpCommandApprovals(muxRoot, injected.files);
+    expect(approvals.map((approval) => approval.command)).toEqual(["node restored.js"]);
+    expect(
+      await captureRejection(restoreBackupPayload({ muxRoot, payload: injected }))
+    ).toBeInstanceOf(BackupCommandApprovalRequiredError);
+    expect(await fs.readFile(configPath, "utf8")).toBe(original);
+
+    await restoreBackupPayload({
+      muxRoot,
+      payload: injected,
+      approvedCommandTokens: approvals.map((approval) => approval.token),
+    });
+    expect(jsonc.parse(await fs.readFile(configPath, "utf8"))).toEqual({
+      servers: { notes: "node restored.js" },
+    });
+  });
+
+  it("does not rehydrate global plugin consent from a redacted backup", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { notes: "node notes.js" },
+        enabledPluginServers: ["plugin:0123456789abcdef:echo"],
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.manifest.mcpRedactions).toContainEqual(["enabledPluginServers"]);
+    expect(await collectMcpCommandApprovals(muxRoot, payload.files)).toEqual([]);
+
+    await restoreBackupPayload({ muxRoot, payload });
+
+    expect(jsonc.parse(await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8"))).toEqual({
+      servers: { notes: "node notes.js" },
+    });
+  });
+
+  it("rejects duplicate plugin enablement fields before restoring any settings", async () => {
+    const original = '{ "servers": {} }';
+    await writeFixtureFile(muxRoot, "mcp.jsonc", original);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const duplicate = withPayloadFileText(
+      payload,
+      "mcp.jsonc",
+      '{ "enabledPluginServers": [], "enabledPluginServers": ["plugin:0123456789abcdef:echo"] }'
+    );
+
+    const error = await captureRejection(restoreBackupPayload({ muxRoot, payload: duplicate }));
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("duplicate key 'enabledPluginServers'");
+    expect(await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8")).toBe(original);
+  });
+
   const commandApprovalCases: Array<{
     name: string;
     destinationName: string;

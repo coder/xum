@@ -3200,6 +3200,62 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(stagingDir(), "update-demo-plugin.json"))).toBe(false);
   });
 
+  test("a fresh install revokes global MCP consent left by a manually removed plugin", async () => {
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await writePluginFixture(targetPath);
+    const mcpConfigService = new MCPConfigService(config, {
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+        xumHome: muxRoot,
+        isEnabled: () => true,
+      }),
+    });
+    const key = buildPluginServerKey(computePluginInstanceId(targetPath), "echo");
+    expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+      success: true,
+      data: undefined,
+    });
+    const siblingKey = "plugin:0123456789abcdef:other";
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    await fsPromises.writeFile(
+      configPath,
+      JSON.stringify({ enabledPluginServers: [key, siblingKey] })
+    );
+    await fsPromises.rm(targetPath, { recursive: true });
+
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
+    expect(jsonc.parse(await fsPromises.readFile(configPath, "utf8"))).toEqual({
+      enabledPluginServers: [siblingKey],
+    });
+  });
+
+  test("a fresh install aborts before promotion when global MCP consent cannot be pruned", async () => {
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    const malformed = '{ "enabledPluginServers": "invalid" }';
+    await fsPromises.writeFile(configPath, malformed);
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService: new MCPConfigService(config),
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+
+    await expect(
+      serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/enabledPluginServers must be an array/);
+
+    expect(await pathExists(preview.targetPath)).toBe(false);
+    expect(await registry()).toEqual([]);
+    expect(await stagingLeftovers()).toEqual([]);
+    expect(await fsPromises.readFile(configPath, "utf8")).toBe(malformed);
+  });
+
   test("a fresh install sweeps stale overrides left by a manually removed unmanaged plugin", async () => {
     // An unmanaged plugin the user enabled and then deleted BY HAND was
     // never uninstalled, so no tombstone exists — yet a same-name managed
