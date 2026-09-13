@@ -187,7 +187,11 @@ export function TitleBar(props: TitleBarProps) {
       return <RefreshCw className="size-3.5" />;
     }
 
-    if (updateStatus.type === "downloading" || updateStatus.type === "checking") {
+    if (
+      updateStatus.type === "downloading" ||
+      updateStatus.type === "checking" ||
+      updateStatus.type === "restarting"
+    ) {
       return <Loader2 className="size-3.5 animate-spin" />;
     }
 

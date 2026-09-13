@@ -75,6 +75,19 @@ export const Downloading: Story = {
   },
 };
 
+export const Restarting: Story = {
+  args: { status: { type: "restarting", info: { version: "0.29.0" } } },
+  play: async (context) => {
+    await meta.play(context);
+    const dialog = await within(document.body).findByRole("dialog");
+    await expect(within(dialog).getByRole("button", { name: "Check for Updates" })).toBeDisabled();
+    await expect(
+      within(dialog).queryByRole("button", { name: "Install & restart" })
+    ).not.toBeInTheDocument();
+    await expect(within(dialog).getByRole("radio", { name: "Newest npm" })).toBeDisabled();
+  },
+};
+
 export const BlockedPhone: Story = {
   args: {
     status: {

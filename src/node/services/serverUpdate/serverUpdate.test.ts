@@ -763,18 +763,26 @@ describe("server updater", () => {
     });
     await updater.checkForUpdates();
     await updater.downloadUpdate();
+    const restarting: UpdateStatus[] = [];
+    updater.subscribe((status) => {
+      events.push(`status:${status.type}`);
+      if (status.type === "restarting") restarting.push(status);
+    });
+    events.length = 0;
     await updater.installUpdate();
     expect(updater.getStatus()).toMatchObject({ type: "install-blocked", blockers });
-    expect(events).toEqual(["refresh", "snapshot"]);
+    expect(events).toEqual(["refresh", "snapshot", "status:install-blocked"]);
     blockers = [];
     events.length = 0;
     await updater.installUpdate();
     expect(updater.getStatus()).toMatchObject({ type: "error", phase: "install" });
-    expect(events).toEqual(["refresh", "snapshot"]);
+    // The client drops its restart screen on the install error that follows.
+    expect(events).toEqual(["refresh", "snapshot", "status:restarting", "status:error"]);
     activationFails = false;
     events.length = 0;
     await Promise.all([updater.installUpdate(), updater.installUpdate()]);
-    expect(events).toEqual(["refresh", "snapshot", "activate", "restart"]);
+    expect(events).toEqual(["refresh", "snapshot", "status:restarting", "activate", "restart"]);
+    expect(restarting.at(-1)).toEqual({ type: "restarting", info: { version: "2.0.0" } });
   });
   test("a forced install restarts despite blockers without consulting them", async () => {
     const { layout } = await fixture();
@@ -806,9 +814,10 @@ describe("server updater", () => {
     const updater = await stagedUpdater();
     await updater.installUpdate();
     expect(updater.getStatus().type).toBe("install-blocked");
+    updater.subscribe((status) => events.push(`status:${status.type}`));
     events.length = 0;
     await updater.installUpdate({ force: true });
-    expect(events).toEqual(["activate", "restart"]);
+    expect(events).toEqual(["status:restarting", "activate", "restart"]);
 
     // An unrelated teardown already under way still wins over a forced install.
     const shuttingDown = await stagedUpdater();

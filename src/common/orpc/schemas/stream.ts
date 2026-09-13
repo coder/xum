@@ -780,6 +780,8 @@ export const UpdateStatusSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("downloading"), percent: z.number().nullable() }),
   z.object({ type: z.literal("downloaded"), info: z.object({ version: z.string() }) }),
+  // Emitted synchronously once an install is going ahead, before the process restarts.
+  z.object({ type: z.literal("restarting"), info: z.object({ version: z.string() }) }),
   z.object({
     type: z.literal("error"),
     phase: z.enum(["check", "download", "install"]),

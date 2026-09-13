@@ -160,6 +160,7 @@ export function AboutDialog() {
     (updateStatus.type === "checking" ||
       updateStatus.type === "downloading" ||
       pendingAction === "check");
+  const isRestarting = updateStatus.type === "restarting";
 
   const handleChannelChange = (next: UpdateChannel) => {
     if (!api || next === channel || channelLoading) {
@@ -260,7 +261,9 @@ export function AboutDialog() {
                           handleChannelChange(next);
                         }
                       }}
-                      disabled={channelLoading || isChecking || pendingAction !== null}
+                      disabled={
+                        channelLoading || isChecking || isRestarting || pendingAction !== null
+                      }
                       aria-label="Update channel"
                       size="sm"
                     >
@@ -278,7 +281,7 @@ export function AboutDialog() {
               <Button
                 variant="outline"
                 size="sm"
-                disabled={isChecking}
+                disabled={isChecking || isRestarting}
                 onClick={handleCheckForUpdates}
               >
                 {isChecking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
@@ -319,6 +322,16 @@ export function AboutDialog() {
                   ) : (
                     <>Downloading update: {updateStatus.percent}%</>
                   )}
+                </div>
+              )}
+
+              {updateStatus.type === "restarting" && (
+                <div className="text-muted text-xs">
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Restarting to install{" "}
+                    <span className="font-mono">{updateStatus.info.version}</span>…
+                  </span>
                 </div>
               )}
 
