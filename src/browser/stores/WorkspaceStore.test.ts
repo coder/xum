@@ -1845,24 +1845,11 @@ describe("WorkspaceStore", () => {
       expect(state().isTranscriptStale).toBe(false);
     });
 
-    it.each([
-      [
-        "an interruptible aggregator stream",
-        async (attempt: ChatAttempt) => {
-          attempt.push(streamStartEvent(workspaceId, "live-stream", { historySequence: 2 }));
-          expect(await waitUntil(() => state().canInterrupt)).toBe(true);
-        },
-      ],
-      [
-        "activity reporting streaming",
-        async () => {
-          pushActivity(workspaceId, { ...idleSnapshot, streaming: true });
-          await tick(0);
-        },
-      ],
-    ])("marks cached rows stale when leaving during %s", async (_label, startStream) => {
+    it("marks cached rows stale when leaving during an interruptible aggregator stream", async () => {
       await hydrateCachedRow();
-      await startStream(attemptsFor(workspaceId)[0].events);
+      const attempt = attemptsFor(workspaceId)[0].events;
+      attempt.push(streamStartEvent(workspaceId, "live-stream", { historySequence: 2 }));
+      expect(await waitUntil(() => state().canInterrupt)).toBe(true);
       expect(state().isTranscriptStale).toBe(false);
 
       // No activity event arrives while away; the switch itself must record the gap.
@@ -1870,6 +1857,59 @@ describe("WorkspaceStore", () => {
       await tick(0);
       await revisit(2);
       expect(state().isTranscriptStale).toBe(true);
+    });
+
+    it("keeps cached rows trustworthy when the activity stop for a finished stream lags the switch", async () => {
+      await hydrateCachedRow();
+      const attempt = attemptsFor(workspaceId)[0].events;
+      // The backend publishes streaming=true alongside stream-start, then the stream ends over
+      // onChat; the matching streaming=false update is published asynchronously afterwards.
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      attempt.push(streamStartEvent(workspaceId, "live-stream", { historySequence: 2 }));
+      expect(await waitUntil(() => state().canInterrupt)).toBe(true);
+      attempt.push(streamEndEvent(workspaceId, "live-stream"));
+      expect(await waitUntil(() => !state().canInterrupt)).toBe(true);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // Leave right after stream-end, before the lagging stop snapshot arrives.
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      pushActivity(workspaceId, {
+        ...idleSnapshot,
+        streaming: false,
+        streamingGeneration: 2,
+        recency: baseRecency + 1,
+      });
+      await tick(0);
+
+      // The aggregator already holds that stream's end; nothing is missing from the cache.
+      await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+    });
+
+    it("releases the stale skeleton after the deadline when the replay never lands", async () => {
+      // Disposing the default store closes its activity feed; give the short-deadline
+      // store a fresh one before it subscribes.
+      store.dispose();
+      activityEvents = createControllableAsyncIterable<WorkspaceActivityEvent>();
+      store = new WorkspaceStore(mockOnModelUsed, { staleTranscriptSkeletonTimeoutMs: 150 });
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient(mockClient as any);
+      await hydrateCachedRow();
+
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      await tick(0);
+
+      // The since replay hangs: the skeleton must give way to the cached rows plus the
+      // dock shimmer instead of hiding a readable conversation forever.
+      const attempt = await revisit(2);
+      expect(state().isTranscriptStale).toBe(true);
+      expect(await waitUntil(() => !state().isTranscriptStale)).toBe(true);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().messages).toHaveLength(1);
+
+      await finishSinceReplay(attempt);
     });
 
     it("marks cached rows stale when leaving before a replay catches up", async () => {
