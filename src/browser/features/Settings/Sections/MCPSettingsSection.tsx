@@ -1192,8 +1192,8 @@ export const MCPSettingsSection: React.FC = () => {
                   const isEditing = editing?.name === name;
                   const isEnabled = !entry.disabled;
                   const remoteEntry = entry.transport === "stdio" ? null : entry;
-                  // Agent Plugin servers are read-only config entries: no
-                  // global enable/edit/remove; enable them per workspace.
+                  // Plugin definitions remain read-only (no edit/remove/allowlist).
+                  // Global enablement persists only their keys in enabledPluginServers.
                   const isPluginEntry = entry.plugin !== undefined;
                   const isDesignEntry = remoteEntry?.managed === "claude-design";
                   const displayName = entry.plugin
@@ -1210,7 +1210,6 @@ export const MCPSettingsSection: React.FC = () => {
                             <div className="mt-0.5 shrink-0">
                               <Switch
                                 checked={isEnabled}
-                                disabled={isPluginEntry}
                                 onCheckedChange={(checked) =>
                                   void handleToggleEnabled(name, checked)
                                 }
@@ -1219,11 +1218,7 @@ export const MCPSettingsSection: React.FC = () => {
                             </div>
                           </TooltipTrigger>
                           <TooltipContent side="top">
-                            {isPluginEntry
-                              ? "Agent Plugin servers are enabled per workspace (Workspace MCP)"
-                              : isEnabled
-                                ? "Disable server"
-                                : "Enable server"}
+                            {isEnabled ? "Disable server" : "Enable server"}
                           </TooltipContent>
                         </Tooltip>
                         <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
