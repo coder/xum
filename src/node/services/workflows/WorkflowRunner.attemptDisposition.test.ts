@@ -1,4 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type { WorkflowRunEvent } from "@/common/types/workflow";
@@ -81,6 +83,24 @@ function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
     if (signal.aborted) return resolve();
     signal.addEventListener("abort", () => resolve(), { once: true });
   });
+}
+
+/**
+ * A lease renewal tick that fired just before a run ended can still hold the lease mutation lock
+ * for a few ms after release; acquireLease deliberately does not wait through that lock. Wait for
+ * it to clear so a back-to-back run in the same test cannot see a spurious "already active".
+ */
+async function waitForLeaseLockRelease(sessionDir: string): Promise<void> {
+  const lockDir = path.join(sessionDir, "workflows", RUN_ID, "lease.json.lock");
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await fs.stat(lockDir);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`lease mutation lock still held: ${lockDir}`);
 }
 
 const report = (taskId: string): WorkflowAgentResult => ({
@@ -260,6 +280,7 @@ describe("WorkflowRunner attempt disposition", () => {
       { stepId: "ok", taskId: "task_ok_1", status: "completed" },
     ]);
 
+    await waitForLeaseLockRelease(tmp.path);
     const retried = await runner.run(RUN_ID, { allowRetryFromFailedCheckpoint: true });
     expect(retried).toEqual({ reportMarkdown: "report from task_fail_2|report from task_ok_1" });
     // Only the failed step reran; the settled sibling was reused.
