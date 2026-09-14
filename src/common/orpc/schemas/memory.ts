@@ -38,6 +38,13 @@ export const MemoryFileChangeEventSchema = z.object({
   workspaceId: z.string(),
   /** Stable project identity of the emitting scope context. */
   projectPath: z.string(),
+  /**
+   * Why the event fired. Absent or "mutation": the file's bytes changed (an
+   * edit the UI may attribute to the actor). "access": a read-side
+   * re-ranking only (view/recall moved the shared hot set) — the file is
+   * unchanged and must not be labeled as edited.
+   */
+  reason: z.enum(["mutation", "access"]).optional(),
 });
 
 /** Sidecar-only consolidation coverage changed; subscribers should refetch status. */
