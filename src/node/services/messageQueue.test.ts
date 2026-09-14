@@ -1103,6 +1103,21 @@ describe("MessageQueue", () => {
       expect((candidate?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
     });
 
+    it("dispatch returns the cut candidate's entry identity and the entry leaves the queue", () => {
+      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+      queue.add("Manual user message");
+      const candidate = queue.getNextQueueCutCandidate();
+      expect(candidate).toBeDefined();
+      expect(queue.hasEntry(candidate!.entryId)).toBe(true);
+
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.entryId).toBe(candidate!.entryId);
+      expect(queue.hasEntry(candidate!.entryId)).toBe(false);
+      // The remaining entry keeps its own identity.
+      expect(queue.getNextQueueCutCandidate()?.entryId).not.toBe(candidate!.entryId);
+      expect(queue.hasEntry(queue.getNextQueueCutCandidate()!.entryId)).toBe(true);
+    });
+
     it("never batches a user message into a sealed workspace-turn entry", () => {
       // Cut attribution reads the head entry's muxMetadata; the sealing
       // invariant guarantees a manual user message queued after a

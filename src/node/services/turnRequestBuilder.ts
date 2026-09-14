@@ -320,6 +320,7 @@ export interface StreamMessageOptions {
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  selectContextBudgetContinuationEntryId?: () => string | undefined;
   onStepSettled?: OnStepSettled;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
@@ -873,6 +874,7 @@ export class TurnRequestBuilder {
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
+      selectContextBudgetContinuationEntryId,
       onStepSettled,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
@@ -3217,6 +3219,7 @@ export class TurnRequestBuilder {
         providedStreamToken: streamToken,
         hasQueuedMessages,
         getQueuedInputStopCause,
+        selectContextBudgetContinuationEntryId,
         onStepSettled,
         workspaceName: metadata.name,
         thinkingLevel: streamThinkingLevel,

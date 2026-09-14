@@ -73,7 +73,7 @@ import {
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
-import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import type { QueueCutReceipt, TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import {
   CompactionCancellation,
   matchesCompactionCancellation,
@@ -945,6 +945,8 @@ export class AgentSession {
     [];
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
+      // The admitted successor now owns completion through its own stream end.
+      this.settleAdmittedQueueCutReceipts(this.coordinator.turnId, "streaming");
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
@@ -957,7 +959,15 @@ export class AgentSession {
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
-    phaseChanged: (phase, isCurrent) => this.publishTurnPhase(phase, isCurrent),
+    phaseChanged: (phase, isCurrent) => {
+      // An admitted turn that reaches idle without ever registering a stream failed before
+      // streaming (withdrawn send, rejected admission, startup abort). Record it before idle
+      // publication so the cut stream's owner never observes idle with an unsettled successor.
+      if (phase === "idle") {
+        this.settleAdmittedQueueCutReceipts(this.coordinator.turnId, "prestream-failed");
+      }
+      this.publishTurnPhase(phase, isCurrent);
+    },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
@@ -993,6 +1003,12 @@ export class AgentSession {
   private readonly activeToolCallIds = new Set<string>();
 
   private readonly messageQueue = new MessageQueue();
+  /**
+   * Receipts for queue entries this session selected to cut a live turn (queued-input stop or
+   * context-budget hand-over), keyed by entry id. See QueueCutReceipt for the lifecycle; only
+   * cuts register, so entries that never cut a turn retain nothing here.
+   */
+  private readonly queueCutReceipts = new Map<string, QueueCutReceipt>();
   private readonly compactionHandler: CompactionHandler;
   private readonly compactionMonitor: CompactionMonitor;
   private readonly continuousCompactor: ContinuousCompactor;
@@ -1458,6 +1474,7 @@ export class AgentSession {
     };
     // Latch admission without publishing idle before stopStream captures the old attempt.
     this.coordinator.beginShutdown();
+    this.queueCutReceipts.clear();
     const stopped = cleanup("stopStream", () =>
       this.streamManager.stopStream(this.workspaceId, {
         abandonPartial: true,
@@ -5362,6 +5379,9 @@ export class AgentSession {
     this.contextBudgetHistoryAvailable = false;
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY);
+    // This removal does not publish the queue on its own; a cut continuation dropped here must
+    // still reach its deferred owner.
+    if (this.settleWithdrawnQueueCutReceipts()) this.emitQueuedMessageChanged();
   }
 
   /** Shared with manual reset, but only context-scoped state: tasks, costs and goal consent survive. */
@@ -5921,6 +5941,8 @@ export class AgentSession {
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
+        selectContextBudgetContinuationEntryId:
+          this.selectContextBudgetContinuationEntryId.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
@@ -8271,6 +8293,8 @@ export class AgentSession {
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
+        selectContextBudgetContinuationEntryId:
+          this.selectContextBudgetContinuationEntryId.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
@@ -10191,6 +10215,7 @@ export class AgentSession {
   getQueuedInputStopCause(): QueuedInputStopCause | undefined {
     const candidate = this.messageQueue.getNextQueueCutCandidate();
     if (candidate?.dispatchMode !== "tool-end") return undefined;
+    this.registerQueueCutReceipt(candidate.entryId);
     return {
       kind: "queued-input",
       entryId: candidate.entryId,
@@ -10201,6 +10226,91 @@ export class AgentSession {
           : candidate.muxMetadata
       ),
     };
+  }
+
+  /**
+   * Continuation of a context-budget stop: the next dispatchable entry (the "Continue"/flush
+   * just enqueued, or whatever was already queued when the budget stop became authoritative).
+   * Called by StreamManager when the stop is selected, so the identity is captured at the cut.
+   */
+  selectContextBudgetContinuationEntryId(): string | undefined {
+    const candidate = this.messageQueue.getNextQueueCutCandidate();
+    if (candidate == null) return undefined;
+    this.registerQueueCutReceipt(candidate.entryId);
+    return candidate.entryId;
+  }
+
+  getQueueCutReceipt(entryId: string): QueueCutReceipt | undefined {
+    return this.queueCutReceipts.get(entryId);
+  }
+
+  markQueueCutSourceHandled(entryId: string): void {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt == null) return;
+    receipt.sourceHandled = true;
+    this.releaseQueueCutReceiptIfSettled(entryId);
+  }
+
+  /** Consume-once: true only for the caller that flipped `disposed` (see QueueCutReceipt). */
+  disposeQueueCut(entryId: string): boolean {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt == null || receipt.disposed) return false;
+    receipt.disposed = true;
+    this.releaseQueueCutReceiptIfSettled(entryId);
+    return true;
+  }
+
+  /** Idempotent for the same entry: a repeated selection keeps the original source turn. */
+  private registerQueueCutReceipt(entryId: string): void {
+    if (this.queueCutReceipts.has(entryId)) return;
+    this.queueCutReceipts.set(entryId, {
+      sourceTurnGeneration: this.coordinator.turnId,
+      successor: "pending",
+      sourceHandled: false,
+      disposed: false,
+    });
+  }
+
+  /**
+   * Deleting on `disposed` alone would let a source handler arriving after the failure
+   * notification miss the consumed marker and recover a second time; deleting on `streaming`
+   * alone would hide the transfer from a late source handler the same way.
+   */
+  private releaseQueueCutReceiptIfSettled(entryId: string): void {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt?.sourceHandled && (receipt.disposed || receipt.successor === "streaming")) {
+      this.queueCutReceipts.delete(entryId);
+    }
+  }
+
+  /** Pending successors whose entry left the queue without being dispatched were withdrawn. */
+  private settleWithdrawnQueueCutReceipts(): boolean {
+    let changed = false;
+    for (const [entryId, receipt] of this.queueCutReceipts) {
+      if (receipt.successor !== "pending" || this.messageQueue.hasEntry(entryId)) continue;
+      receipt.successor = "canceled";
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** Successors admitted under `turnGeneration` reach `streaming` or fail before it. */
+  private settleAdmittedQueueCutReceipts(
+    turnGeneration: TurnId,
+    outcome: "streaming" | "prestream-failed"
+  ): void {
+    let changed = false;
+    for (const [entryId, receipt] of this.queueCutReceipts) {
+      if (
+        typeof receipt.successor !== "object" ||
+        receipt.successor.turnGeneration !== turnGeneration
+      )
+        continue;
+      receipt.successor = outcome;
+      changed = true;
+      this.releaseQueueCutReceiptIfSettled(entryId);
+    }
+    if (changed) this.emitQueuedMessageChanged();
   }
 
   /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
@@ -10486,6 +10596,9 @@ export class AgentSession {
   }
 
   private emitQueuedMessageChanged(): void {
+    // Every queue mutation publishes here, so successor withdrawal is recorded before observers
+    // (TaskService deferral reconciliation) read the receipt for this notification.
+    this.settleWithdrawnQueueCutReceipts();
     this.emitChatEvent({
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
@@ -10578,7 +10691,12 @@ export class AgentSession {
       // consume a replacement entry or notify callbacks already handled by queue removal.
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
-      const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      // Admission transfers the cut to this turn; streamStarted/idle settle it (see receipts).
+      const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;
+      if (receipt?.successor === "pending") {
+        receipt.successor = { kind: "admitted", turnGeneration: preparedTurn };
+      }
       this.preparingQueuedInput = { attempt, read: candidate.inputForRestore };
       attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
       attempt.onFailure = internal?.onAcceptedPreStreamFailure;

@@ -34,7 +34,12 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
-import { PEER_MESSAGE_RATE_LIMIT_MAX } from "@/constants/agentMessaging";
+import {
+  PEER_MESSAGE_RATE_LIMIT_MAX,
+  agentReportProgressDedupePrefix,
+  taskRecoveryPromptDedupeKey,
+  taskRecoveryPromptDedupePrefix,
+} from "@/constants/agentMessaging";
 import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
@@ -79,8 +84,19 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import type {
+  QueueCutReceipt,
+  QueueCutSuccessorState,
+  SendMessageInternalOptions,
+  WorkspaceHost,
+} from "@/node/services/taskWorkspaceSeam";
+import type { SendMessageOptions } from "@/common/orpc/types";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { AgentSessionAIService } from "@/node/services/agentSession";
+import {
+  createTurnCompletionController,
+  type SettledStepBudget,
+} from "@/node/services/streamManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
@@ -19956,10 +19972,16 @@ describe("TaskService", () => {
     // terminal status commit, before the report's slower follow-up work (artifacts, patch
     // generation), and only once the supersession probe would already refuse a dequeued update.
     const order: string[] = [];
-    const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => {
-      order.push(`remove:${findWorkspaceInConfig(config, childId)?.taskStatus ?? "missing"}`);
-      return Ok(1);
-    });
+    const removeQueuedMessagesByDedupeKeyPrefix = mock(
+      (_workspaceId: string, prefix: string): Result<number> => {
+        // The same terminal commit also drops the child's own queued recovery prompts; only the
+        // parent-queue progress removal is under test here.
+        if (prefix === agentReportProgressDedupePrefix(childId)) {
+          order.push(`remove:${findWorkspaceInConfig(config, childId)?.taskStatus ?? "missing"}`);
+        }
+        return Ok(1);
+      }
+    );
     const { workspaceService } = createWorkspaceServiceMocks({
       removeQueuedMessagesByDedupeKeyPrefix,
     });
@@ -30985,5 +31007,729 @@ describe("TaskService", () => {
     if (!historyResult.success) throw new Error("workspace-turn history read failed");
     const preservedReport = historyResult.data.find((message) => message.id === reportMessage.id);
     expect(preservedReport?.metadata?.muxMetadata).toEqual(previousCorrelation);
+  });
+
+  describe("continuation-aware stream end", () => {
+    const model = "openai:gpt-5.5-pro";
+
+    /** In-memory stand-in for AgentSession's cut receipts, wired through the seam. */
+    function createQueueCutReceiptFake() {
+      const receipts = new Map<string, QueueCutReceipt>();
+      const listeners = new Set<(workspaceId: string) => void>();
+      const release = (entryId: string) => {
+        const receipt = receipts.get(entryId);
+        if (receipt?.sourceHandled && (receipt.disposed || receipt.successor === "streaming")) {
+          receipts.delete(entryId);
+        }
+      };
+      return {
+        receipts,
+        register(entryId: string, successor: QueueCutSuccessorState = "pending", disposed = false) {
+          receipts.set(entryId, {
+            sourceTurnGeneration: Symbol("source-turn"),
+            successor,
+            sourceHandled: false,
+            disposed,
+          });
+        },
+        record(entryId: string, successor: QueueCutSuccessorState) {
+          const receipt = receipts.get(entryId);
+          assert(receipt, `no receipt for ${entryId}`);
+          receipt.successor = successor;
+          release(entryId);
+        },
+        notify(workspaceId: string) {
+          for (const listener of listeners) listener(workspaceId);
+        },
+        overrides: {
+          getQueueCutReceipt: mock((_workspaceId: string, entryId: string) =>
+            receipts.get(entryId)
+          ),
+          markQueueCutSourceHandled: mock((_workspaceId: string, entryId: string) => {
+            const receipt = receipts.get(entryId);
+            if (receipt) receipt.sourceHandled = true;
+            release(entryId);
+          }),
+          disposeQueueCut: mock((_workspaceId: string, entryId: string) => {
+            const receipt = receipts.get(entryId);
+            if (!receipt || receipt.disposed) return false;
+            receipt.disposed = true;
+            release(entryId);
+            return true;
+          }),
+          onQueuedMessageChanged: mock((listener: (workspaceId: string) => void) => {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          }),
+        },
+      };
+    }
+
+    async function setupChildTask(
+      overrides: Partial<WorkspaceConfigEntry> = {},
+      hostOverrides: Parameters<typeof createWorkspaceServiceMocks>[0] = {}
+    ) {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-cut";
+      const childId = "child-cut";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: model,
+            ...overrides,
+          }),
+        ],
+        testTaskSettings(1, 3)
+      );
+      const receiptFake = createQueueCutReceiptFake();
+      const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(0));
+      const mocks = createWorkspaceServiceMocks({
+        ...receiptFake.overrides,
+        removeQueuedMessagesByDedupeKeyPrefix,
+        ...hostOverrides,
+      });
+      const harness = createTaskServiceHarness(config, {
+        workspaceService: mocks.workspaceService,
+      });
+      const child = () => findWorkspaceInConfig(config, childId);
+      /** Settles behind any reconcile the notification listener queued under the event lock. */
+      const settleEventLock = () =>
+        (
+          harness.taskService as unknown as { workspaceEventLocks: MutexMap<string> }
+        ).workspaceEventLocks.withLock(childId, () => Promise.resolve());
+      return {
+        config,
+        parentId,
+        childId,
+        receiptFake,
+        child,
+        settleEventLock,
+        removeQueuedMessagesByDedupeKeyPrefix,
+        ...mocks,
+        ...harness,
+      };
+    }
+
+    function cutEvent(
+      childId: string,
+      stopCause: StreamEndEvent["metadata"]["stopCause"],
+      messageId = "assistant-cut"
+    ): StreamEndEvent {
+      return {
+        type: "stream-end",
+        workspaceId: childId,
+        messageId,
+        metadata: { model, finishReason: "tool-calls", ...(stopCause ? { stopCause } : {}) },
+        parts: [],
+      };
+    }
+
+    function recoverySendOptions(sendMessage: ReturnType<typeof mock>, index = 0) {
+      const call = sendMessage.mock.calls[index] as unknown[] | undefined;
+      return {
+        message: call?.[1] as string | undefined,
+        options: call?.[2] as SendMessageOptions | undefined,
+        internal: call?.[3] as SendMessageInternalOptions | undefined,
+      };
+    }
+
+    test.each([
+      ["pending", "pending" as const],
+      ["admitted", { kind: "admitted" as const, turnGeneration: Symbol("successor") }],
+    ])(
+      "a queued-input cut whose successor is %s defers instead of prompting",
+      async (_label, successor) => {
+        const t = await setupChildTask();
+        t.receiptFake.register("entry-1", successor);
+
+        await handleTaskServiceStreamEndForTest(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+
+        expect(t.sendMessage).not.toHaveBeenCalled();
+        expect(t.child()?.taskStatus).toBe("running");
+        expect(t.child()?.taskRecoveryAttempts).toBeUndefined();
+        // Source handled, but the receipt survives until the successor settles.
+        expect(t.receiptFake.receipts.get("entry-1")).toMatchObject({
+          sourceHandled: true,
+          disposed: false,
+        });
+        // Repeated notifications with an unsettled successor never become ordinary recovery.
+        t.receiptFake.notify(t.childId);
+        t.receiptFake.notify(t.childId);
+        await t.settleEventLock();
+        expect(t.sendMessage).not.toHaveBeenCalled();
+        expect(t.child()?.taskStatus).toBe("running");
+      }
+    );
+
+    test("a streaming successor owns completion: deferral dropped, receipt released", async () => {
+      const t = await setupChildTask();
+      t.receiptFake.register("entry-1", "streaming");
+
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("running");
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+      t.receiptFake.notify(t.childId);
+      await t.settleEventLock();
+      expect(t.sendMessage).not.toHaveBeenCalled();
+    });
+
+    test.each(["canceled", "prestream-failed"] as const)(
+      "a %s successor at classification recovers exactly once with a turn-end deduped prompt",
+      async (successor) => {
+        const t = await setupChildTask();
+        t.receiptFake.register("entry-1", successor);
+
+        await handleTaskServiceStreamEndForTest(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+
+        expect(t.sendMessage).toHaveBeenCalledTimes(1);
+        const { options, internal } = recoverySendOptions(t.sendMessage);
+        expect(options?.queueDispatchMode).toBe("turn-end");
+        expect(internal).toMatchObject({
+          queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "completion"),
+          removableQueueDedupeKey: true,
+        });
+        expect(t.child()?.taskStatus).toBe("awaiting_report");
+        expect(t.child()?.taskRecoveryAttempts).toBe(1);
+        // Consumed and, with the source handled, released.
+        expect(t.receiptFake.overrides.disposeQueueCut).toHaveBeenCalledTimes(1);
+        expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+        // A late duplicate notification after release is a no-op.
+        t.receiptFake.notify(t.childId);
+        await t.settleEventLock();
+        expect(t.sendMessage).toHaveBeenCalledTimes(1);
+        expect(t.child()?.taskRecoveryAttempts).toBe(1);
+      }
+    );
+
+    test("an already disposed receipt at classification is acknowledged without recovery", async () => {
+      const t = await setupChildTask();
+      // The failure notification recovered first (disposed); the source handler runs last.
+      t.receiptFake.register("entry-1", "prestream-failed", true);
+
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("running");
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+    });
+
+    test.each([
+      ["still queued", "pending" as const],
+      ["already dequeued", { kind: "admitted" as const, turnGeneration: Symbol("continue") }],
+    ])(
+      "a context-budget warning whose continuation is %s defers instead of prompting",
+      async (_label, successor) => {
+        const t = await setupChildTask();
+        t.receiptFake.register("continue-entry", successor);
+
+        await handleTaskServiceStreamEndForTest(
+          t.taskService,
+          cutEvent(t.childId, {
+            kind: "context-budget",
+            decision: "warn",
+            continuationEntryId: "continue-entry",
+          })
+        );
+
+        expect(t.sendMessage).not.toHaveBeenCalled();
+        expect(t.child()?.taskStatus).toBe("running");
+        expect(t.receiptFake.receipts.get("continue-entry")?.sourceHandled).toBe(true);
+      }
+    );
+
+    test.each([
+      ["context-budget block", { kind: "context-budget" as const, decision: "block" as const }],
+      ["a cut without a receipt", { kind: "queued-input" as const, entryId: "unknown-entry" }],
+      ["no stop cause", undefined],
+    ])("%s keeps the existing recovery path", async (_label, stopCause) => {
+      const t = await setupChildTask();
+
+      await handleTaskServiceStreamEndForTest(t.taskService, cutEvent(t.childId, stopCause));
+
+      expect(t.sendMessage).toHaveBeenCalledTimes(1);
+      expect(t.child()?.taskStatus).toBe("awaiting_report");
+      expect(t.child()?.taskRecoveryAttempts).toBe(1);
+      expect(t.receiptFake.overrides.disposeQueueCut).not.toHaveBeenCalled();
+    });
+
+    test.each(["canceled", "prestream-failed"] as const)(
+      "a deferred stream end recovers once when its successor later settles %s",
+      async (successor) => {
+        const t = await setupChildTask();
+        t.receiptFake.register("entry-1");
+        await handleTaskServiceStreamEndForTest(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+        expect(t.sendMessage).not.toHaveBeenCalled();
+
+        // Admission is a transfer, not success: the deferral survives it.
+        t.receiptFake.record("entry-1", { kind: "admitted", turnGeneration: Symbol("successor") });
+        t.receiptFake.notify(t.childId);
+        await t.settleEventLock();
+        expect(t.sendMessage).not.toHaveBeenCalled();
+        expect(t.child()?.taskStatus).toBe("running");
+
+        t.receiptFake.record("entry-1", successor);
+        t.receiptFake.notify(t.childId);
+        t.receiptFake.notify(t.childId);
+        await t.settleEventLock();
+
+        expect(t.sendMessage).toHaveBeenCalledTimes(1);
+        expect(recoverySendOptions(t.sendMessage).options?.queueDispatchMode).toBe("turn-end");
+        expect(t.child()?.taskStatus).toBe("awaiting_report");
+        expect(t.child()?.taskRecoveryAttempts).toBe(1);
+        expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+
+        // Late duplicate after release: never a fallback into ordinary recovery.
+        t.receiptFake.notify(t.childId);
+        await t.settleEventLock();
+        expect(t.sendMessage).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    test("a deferred stream end settles when the successor streams, and its own end classifies normally", async () => {
+      const t = await setupChildTask();
+      t.receiptFake.register("entry-1");
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      t.receiptFake.record("entry-1", "streaming");
+      t.receiptFake.notify(t.childId);
+      await t.settleEventLock();
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+
+      // The successor's genuine incomplete end (no cut) still recovers.
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, undefined, "assistant-successor")
+      );
+      expect(t.sendMessage).toHaveBeenCalledTimes(1);
+      expect(t.child()?.taskStatus).toBe("awaiting_report");
+    });
+
+    test("a terminal interruption clears the deferral, disposes the cut, and removes queued prompts", async () => {
+      const t = await setupChildTask();
+      t.receiptFake.register("entry-1");
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      await t.taskService.failAgentTaskForHardTimeout(t.childId, {
+        workflowRunId: "wfr_cut",
+        stepId: "explore",
+        inputHash: "hash",
+        reason: "Task exceeded its hard timeout.",
+      });
+      expect(t.child()?.taskStatus).toBe("interrupted");
+      expect(t.removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
+        t.childId,
+        taskRecoveryPromptDedupePrefix(t.childId),
+        expect.anything()
+      );
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+
+      // A withdrawn continuation after Stop never recovers.
+      t.receiptFake.register("entry-1", "canceled");
+      t.receiptFake.notify(t.childId);
+      await t.settleEventLock();
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("interrupted");
+    });
+
+    test("a genuine completion clears the deferral so a withdrawn continuation never recovers", async () => {
+      const t = await setupChildTask();
+      t.receiptFake.register("entry-1");
+      await handleTaskServiceStreamEndForTest(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      await handleTaskServiceStreamEndForTest(t.taskService, {
+        type: "stream-end",
+        workspaceId: t.childId,
+        messageId: "assistant-final",
+        metadata: { model, finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "agent-report-1",
+            toolName: "agent_report",
+            input: { reportMarkdown: "Done", title: "Result" },
+            state: "output-available",
+            output: { success: true },
+          },
+          { type: "text", text: "Done" },
+        ],
+      });
+      await flushTerminalAttentionDrains(t.taskService);
+      expect(t.child()?.taskStatus).toBe("reported");
+      expect(t.removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
+        t.childId,
+        taskRecoveryPromptDedupePrefix(t.childId),
+        expect.anything()
+      );
+
+      t.receiptFake.record("entry-1", "canceled");
+      t.receiptFake.notify(t.childId);
+      await t.settleEventLock();
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("reported");
+    });
+
+    test("the timeout finalization prompt also queues turn-end under the task recovery prefix", async () => {
+      const t = await setupChildTask({
+        workflowTask: { runId: "wfr_finalize", stepId: "explore" },
+      });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(t.config.sessionsDir, t.parentId),
+      });
+      await runStore.createRun({
+        id: "wfr_finalize",
+        workspaceId: t.parentId,
+        workflow: {
+          name: "finalize",
+          description: "Finalize",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return {}; }\n",
+        args: {},
+        now: "2026-06-04T00:00:00.000Z",
+      });
+      await runStore.appendStatus("wfr_finalize", "running", "2026-06-04T00:00:01.000Z");
+
+      await t.taskService.requestAgentFinalReportForTimeout(t.childId, {
+        workflowRunId: "wfr_finalize",
+        stepId: "explore",
+        inputHash: "hash",
+        finalInstructions: "Summarize what you have.",
+        finalizationToken: "token-1",
+      });
+
+      expect(t.sendMessage).toHaveBeenCalledTimes(1);
+      const { options, internal } = recoverySendOptions(t.sendMessage);
+      expect(options?.queueDispatchMode).toBe("turn-end");
+      expect(internal).toMatchObject({
+        queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "timeout-finalization"),
+        removableQueueDedupeKey: true,
+      });
+    });
+
+    test("the error recovery prompt carries the structured-output diagnostic and nothing else", async () => {
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      const internal = t.taskService as unknown as {
+        promptTaskForRequiredCompletionTool: (
+          workspaceId: string,
+          options?: {
+            reason?: "startup" | "stream_end" | "error";
+            error?: { error: string; errorType?: string };
+            structuredOutputDiagnostic?: string;
+          }
+        ) => Promise<boolean>;
+      };
+      const diagnostic = `agent_report structuredOutput failed schema validation: ${"x".repeat(600)}\nsecond line`;
+
+      await internal.promptTaskForRequiredCompletionTool(t.childId, {
+        reason: "error",
+        error: { error: "provider said: SECRET-PROVIDER-DETAIL", errorType: "unknown" },
+        structuredOutputDiagnostic: diagnostic,
+      });
+      await internal.promptTaskForRequiredCompletionTool(t.childId, {
+        reason: "error",
+        error: { error: "provider said: SECRET-PROVIDER-DETAIL", errorType: "unknown" },
+      });
+
+      expect(t.sendMessage).toHaveBeenCalledTimes(2);
+      const withDiagnostic = recoverySendOptions(t.sendMessage, 0).message ?? "";
+      const withoutDiagnostic = recoverySendOptions(t.sendMessage, 1).message ?? "";
+      expect(withDiagnostic).toContain("agent_report structuredOutput failed schema validation");
+      expect(withDiagnostic).not.toContain("second line");
+      expect(withDiagnostic).not.toContain("SECRET-PROVIDER-DETAIL");
+      expect(withDiagnostic.split("\n").length).toBe(1);
+      expect(withDiagnostic.length - withoutDiagnostic.length).toBeLessThanOrEqual(400 + 4);
+      expect(withoutDiagnostic).not.toContain("SECRET-PROVIDER-DETAIL");
+    });
+
+    test("regression: budget warning, queued Continue, agent_report cut by queued input, then a final stop yields one report and zero recovery prompts", async () => {
+      // Replays the observed child trace through a real AgentSession/MessageQueue/HistoryService
+      // with a controlled provider; TaskService classifies each stream end as production would.
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-regression";
+      const childId = "child-regression";
+      const runId = "wfr_regression";
+      const childModel = "openai:gpt-4o";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_exec_child",
+            parentWorkspaceId: parentId,
+            agentType: "exec",
+            taskStatus: "running",
+            taskModelString: childModel,
+            workflowTask: { runId, stepId: "research", outputSchema: { type: "object" } },
+          }),
+        ],
+        testTaskSettings(1, 3)
+      );
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, parentId),
+      });
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "regression",
+          description: "Regression",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return {}; }\n",
+        args: {},
+        now: "2026-06-04T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-04T00:00:01.000Z");
+
+      // Controlled provider (agentSession.tokenBudget.test.ts style).
+      type Request = Parameters<AgentSessionAIService["streamMessage"]>[0];
+      const requests: Request[] = [];
+      const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
+      const requestWaiters = new Map<number, ReturnType<typeof Promise.withResolvers<Request>>>();
+      const waitForRequest = (count: number) => {
+        let waiter = requestWaiters.get(count);
+        if (!waiter) {
+          waiter = Promise.withResolvers<Request>();
+          requestWaiters.set(count, waiter);
+          if (requests.length >= count) waiter.resolve(requests[count - 1]);
+        }
+        return waiter.promise;
+      };
+      const historyService = new HistoryService(config);
+      const sessionHarness = await createAgentSessionHarness({
+        workspaceId: childId,
+        config,
+        historyService,
+        aiServiceOverrides: {
+          streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
+            requests.push(request);
+            sessionHarness.aiEmitter.emit("stream-start", {
+              type: "stream-start",
+              workspaceId: childId,
+              messageId: `assistant-${requests.length}`,
+              model: request.modelString,
+              startTime: Date.now(),
+            });
+            const completion = createTurnCompletionController();
+            completions.push(completion);
+            requestWaiters.get(requests.length)?.resolve(request);
+            const close = () => completion.settle({ status: "aborted", abortReason: "system" });
+            const signal = sessionHarness.session.closingSignal;
+            if (signal.aborted) close();
+            else signal.addEventListener("abort", close, { once: true });
+            return Promise.resolve(
+              Ok({
+                messageId: `assistant-${requests.length}`,
+                completion: completion.promise.finally(() =>
+                  signal.removeEventListener("abort", close)
+                ),
+              })
+            );
+          }),
+          buildMemorySessionContext: mock(() => Promise.resolve(null)),
+        },
+      });
+      const { session } = sessionHarness;
+      spyOn(sessionHarness.aiService, "getWorkspaceMetadata").mockResolvedValue(
+        Ok({
+          id: childId,
+          name: "child",
+          projectName: "repo",
+          projectPath: config.rootDir,
+          namedWorkspacePath: config.rootDir,
+          runtimeConfig: { type: "local" },
+        } as WorkspaceMetadata)
+      );
+      session.setAutoCompactionThreshold(0.7);
+
+      // TaskService sees the child through the seam, backed by the real session.
+      const listeners = new Set<(workspaceId: string) => void>();
+      session.onChatEvent(({ message }) => {
+        if (message.type !== "queued-message-changed") return;
+        for (const listener of listeners) listener(childId);
+      });
+      const mocks = createWorkspaceServiceMocks({
+        getQueueCutReceipt: mock((_workspaceId: string, entryId: string) =>
+          session.getQueueCutReceipt(entryId)
+        ),
+        markQueueCutSourceHandled: mock((_workspaceId: string, entryId: string) =>
+          session.markQueueCutSourceHandled(entryId)
+        ),
+        disposeQueueCut: mock((_workspaceId: string, entryId: string) =>
+          session.disposeQueueCut(entryId)
+        ),
+        onQueuedMessageChanged: mock((listener: (workspaceId: string) => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        }),
+        hasPendingQueuedOrPreparingTurn: mock(
+          () => session.hasQueuedMessages() || session.isPreparingTurn()
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService: mocks.workspaceService,
+      });
+      const settleEventLock = () =>
+        (
+          taskService as unknown as { workspaceEventLocks: MutexMap<string> }
+        ).workspaceEventLocks.withLock(childId, () => Promise.resolve());
+
+      try {
+        // Turn 1: the child works until the settled step crosses the budget warning.
+        expect(
+          (
+            await session.sendMessage("Research the topic and report.", {
+              model: childModel,
+              agentId: "exec",
+              experiments: { tokenBudget: true },
+            })
+          ).success
+        ).toBe(true);
+        await waitForRequest(1);
+        const budgetStep: SettledStepBudget = {
+          model: childModel,
+          usage: { inputTokens: 85_000, outputTokens: 10, totalTokens: 85_010 },
+          toolResultChars: 0,
+          imageParts: 0,
+          sessionHistoryAvailable: true,
+          memoryWritable: true,
+        };
+        expect(await requests[0].onStepSettled?.(budgetStep)).toBe("warn");
+        const continuationEntryId = requests[0].selectContextBudgetContinuationEntryId?.();
+        expect(continuationEntryId).toBeDefined();
+        const budgetCut: StreamEndEvent = {
+          type: "stream-end",
+          workspaceId: childId,
+          messageId: "assistant-1",
+          metadata: {
+            model: childModel,
+            agentId: "exec",
+            finishReason: "tool-calls",
+            stopCause: { kind: "context-budget", decision: "warn", continuationEntryId },
+          },
+          parts: [],
+        };
+        await handleTaskServiceStreamEndForTest(taskService, budgetCut);
+        expect(mocks.sendMessage).not.toHaveBeenCalled();
+        completions[0].settle({ status: "completed", streamEnd: budgetCut });
+
+        // Turn 2 (queued "Continue"): a schema-shaped agent_report succeeds, then a message
+        // queued for the child (task_send_message) cuts the turn at the step boundary.
+        await waitForRequest(2);
+        const agentReportPart = {
+          type: "dynamic-tool" as const,
+          toolCallId: "agent-report-1",
+          toolName: "agent_report",
+          input: { verdict: "supported", confidence: 0.9 },
+          state: "output-available" as const,
+          output: { success: true },
+        };
+        expect(
+          (
+            await historyService.appendToHistory(
+              childId,
+              createMuxMessage("assistant-2", "assistant", "", { model: childModel }, [
+                agentReportPart,
+              ])
+            )
+          ).success
+        ).toBe(true);
+        expect(
+          session.queueMessage("Parent guidance: include the source list.", {
+            model: childModel,
+            agentId: "exec",
+          })
+        ).toBe("tool-end");
+        const queuedInputCause = requests[1].getQueuedInputStopCause?.();
+        expect(queuedInputCause?.kind).toBe("queued-input");
+        const queuedInputCut: StreamEndEvent = {
+          type: "stream-end",
+          workspaceId: childId,
+          messageId: "assistant-2",
+          metadata: {
+            model: childModel,
+            agentId: "exec",
+            finishReason: "tool-calls",
+            stopCause: queuedInputCause,
+          },
+          parts: [agentReportPart],
+        };
+        await handleTaskServiceStreamEndForTest(taskService, queuedInputCut);
+        expect(mocks.sendMessage).not.toHaveBeenCalled();
+        completions[1].settle({ status: "completed", streamEnd: queuedInputCut });
+
+        // Turn 3 (the queued message): the child answers with its final text.
+        await waitForRequest(3);
+        await settleEventLock();
+        const finalTurn: StreamEndEvent = {
+          type: "stream-end",
+          workspaceId: childId,
+          messageId: "assistant-3",
+          metadata: { model: childModel, agentId: "exec", finishReason: "stop" },
+          parts: [{ type: "text", text: "Sources listed; verdict stands." }],
+        };
+        await handleTaskServiceStreamEndForTest(taskService, finalTurn);
+        completions[2].settle({ status: "completed", streamEnd: finalTurn });
+        await flushTerminalAttentionDrains(taskService);
+
+        // Exactly one finalized report, zero recovery prompts, no recovery budget consumed.
+        expect(mocks.sendMessage).not.toHaveBeenCalled();
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskStatus).toBe("reported");
+        expect(child?.taskRecoveryAttempts).toBeUndefined();
+        const report = await readSubagentReportArtifact(
+          path.join(config.sessionsDir, parentId),
+          childId
+        );
+        expect(report?.structuredOutput).toEqual({ verdict: "supported", confidence: 0.9 });
+        expect(report?.reportMarkdown).toBe("Sources listed; verdict stands.");
+        expect(requests).toHaveLength(3);
+        // Every cut receipt settled: nothing retained in the session.
+        expect(session.getQueueCutReceipt(continuationEntryId!)).toBeUndefined();
+        expect(session.getQueueCutReceipt(queuedInputCause!.entryId)).toBeUndefined();
+      } finally {
+        await session.dispose();
+        await sessionHarness.cleanup();
+      }
+    });
   });
 });

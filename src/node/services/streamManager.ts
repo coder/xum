@@ -284,6 +284,8 @@ interface StreamRequestOptions {
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  /** Identity of the entry a budget stop hands the turn to, captured when the stop is selected. */
+  selectContextBudgetContinuationEntryId?: () => string | undefined;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -344,6 +346,7 @@ interface StreamRequestConfig {
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  selectContextBudgetContinuationEntryId?: () => string | undefined;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2302,6 +2305,7 @@ export class StreamManager {
       toolPolicy,
       hasQueuedMessages,
       getQueuedInputStopCause,
+      selectContextBudgetContinuationEntryId,
       headers,
       onChunk,
       onStepMessages,
@@ -2359,6 +2363,7 @@ export class StreamManager {
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
       getQueuedInputStopCause,
+      selectContextBudgetContinuationEntryId,
       onChunk,
       onStepMessages,
       onStepSettled,
@@ -2378,6 +2383,7 @@ export class StreamManager {
       StreamRequestConfig,
       | "hasQueuedMessages"
       | "getQueuedInputStopCause"
+      | "selectContextBudgetContinuationEntryId"
       | "stopCause"
       | "toolPolicy"
       | "onStepSettled"
@@ -2464,7 +2470,14 @@ export class StreamManager {
           });
           // All siblings have settled: stop before another provider step without discarding results.
           if (decision !== "continue") {
-            request.stopCause ??= { kind: "context-budget", decision };
+            // Bind the successor at the cut: a blocked stop has no continuation to hand over to.
+            const continuationEntryId =
+              decision === "block" ? undefined : request.selectContextBudgetContinuationEntryId?.();
+            request.stopCause ??= {
+              kind: "context-budget",
+              decision,
+              ...(continuationEntryId != null ? { continuationEntryId } : {}),
+            };
           }
           if (decision === "block")
             throw new ContextBudgetBlockedError(
@@ -3624,6 +3637,8 @@ export class StreamManager {
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
+      selectContextBudgetContinuationEntryId:
+        streamInfo.request.selectContextBudgetContinuationEntryId,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
