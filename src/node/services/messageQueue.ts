@@ -579,6 +579,11 @@ export class MessageQueue {
     return this.entries.some((entry) => entry.entryId === entryId);
   }
 
+  /** Identity of the queued entry holding this addOnce key, for the enqueuer's own bookkeeping. */
+  getEntryIdByDedupeKey(dedupeKey: string): string | undefined {
+    return this.entries.find((entry) => entry.dedupeKeys.has(dedupeKey))?.entryId;
+  }
+
   /**
    * Whether the queue's only content is the single message queued under this dedupe key.
    * Used to supersede low-value scheduled entries (heartbeats): a later real message must

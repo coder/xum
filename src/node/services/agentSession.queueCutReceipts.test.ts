@@ -2,17 +2,36 @@ import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { StreamEndEvent } from "@/common/types/stream";
 import { Err, Ok } from "@/common/types/result";
 import { taskRecoveryPromptDedupeKey } from "@/constants/agentMessaging";
+import {
+  CONTEXT_CONTINUE_DEDUPE_KEY,
+  CONTEXT_WARNING_DEDUPE_KEY,
+} from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 import type { MessageQueue } from "./messageQueue";
-import { createTurnCompletionController } from "./streamManager";
+import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
+/** Known 128k context limit; threshold 0.7 warns at 85k and rolls over at 110k. */
+const BUDGET_MODEL = "openai:gpt-4o";
 const workspaceId = "queue-cut-receipts";
 
 type Request = Parameters<AgentSessionAIService["streamMessage"]>[0];
+
+function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): SettledStepBudget {
+  return {
+    model: BUDGET_MODEL,
+    usage: { inputTokens, outputTokens: 10, totalTokens: inputTokens + 10 },
+    toolResultChars: 0,
+    imageParts: 0,
+    sessionHistoryAvailable: true,
+    memoryWritable: true,
+    ...overrides,
+  };
+}
 
 function queueOf(h: AgentSessionHarness): MessageQueue {
   return (h.session as unknown as { messageQueue: MessageQueue }).messageQueue;
@@ -21,10 +40,13 @@ function queueOf(h: AgentSessionHarness): MessageQueue {
 /** Controlled provider in the token-budget test style: stream-start is emitted on delivery. */
 async function setup(args?: { failure?: boolean }) {
   const requests: Request[] = [];
+  const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
   const firstRequest = Promise.withResolvers<Request>();
+  const secondRequest = Promise.withResolvers<Request>();
   const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
     requests.push(request);
     firstRequest.resolve(request);
+    if (requests.length === 2) secondRequest.resolve(request);
     if (args?.failure) {
       return Promise.resolve(Err({ type: "unknown" as const, raw: "provider unavailable" }));
     }
@@ -36,6 +58,7 @@ async function setup(args?: { failure?: boolean }) {
       startTime: Date.now(),
     });
     const completion = createTurnCompletionController();
+    completions.push(completion);
     const close = () => completion.settle({ status: "aborted", abortReason: "system" });
     const signal = h.session.closingSignal;
     if (signal.aborted) close();
@@ -50,7 +73,10 @@ async function setup(args?: { failure?: boolean }) {
   const h = await createAgentSessionHarness({
     workspaceId,
     captureEvents: true,
-    aiServiceOverrides: { streamMessage },
+    aiServiceOverrides: {
+      streamMessage,
+      buildMemorySessionContext: mock(() => Promise.resolve(null)),
+    },
   });
   spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
     Ok({
@@ -62,7 +88,37 @@ async function setup(args?: { failure?: boolean }) {
       runtimeConfig: { type: "local" },
     } as FrontendWorkspaceMetadata)
   );
-  return { ...h, requests, firstRequest: firstRequest.promise, streamMessage };
+  h.session.setAutoCompactionThreshold(0.7);
+  /** Start a token-budget turn so requests[0].onStepSettled evaluates the real budget policy. */
+  const startBudgetTurn = async () => {
+    const sent = await h.session.sendMessage("Work through the task", {
+      model: BUDGET_MODEL,
+      agentId: "exec",
+      experiments: { tokenBudget: true },
+    });
+    expect(sent.success).toBe(true);
+    return firstRequest.promise;
+  };
+  const settleStream = (index: number, finishReason = "tool-calls") => {
+    const streamEnd: StreamEndEvent = {
+      type: "stream-end",
+      workspaceId,
+      messageId: `assistant-${index + 1}`,
+      metadata: { model: BUDGET_MODEL, agentId: "exec", finishReason },
+      parts: [],
+    };
+    completions[index].settle({ status: "completed", streamEnd });
+  };
+  return {
+    ...h,
+    requests,
+    completions,
+    firstRequest: firstRequest.promise,
+    secondRequest: secondRequest.promise,
+    streamMessage,
+    startBudgetTurn,
+    settleStream,
+  };
 }
 
 async function teardown(h: AgentSessionHarness) {
@@ -117,22 +173,94 @@ describe("AgentSession queue-cut receipts", () => {
       expect(candidate?.dispatchMode).toBe("turn-end");
       expect(h.session.getQueuedInputStopCause()).toBeUndefined();
       expect(h.session.getQueueCutReceipt(candidate!.entryId)).toBeUndefined();
-      // A budget stop with nothing queued has no continuation to hand over to either.
-      h.session.clearQueue();
-      expect(h.session.selectContextBudgetContinuationEntryId()).toBeUndefined();
     } finally {
       await teardown(h);
     }
   });
 
-  test("a budget stop selects the queue head as its continuation and registers a receipt", async () => {
+  test("a budget stop designates exactly the entry it enqueued: the flush first, the paired rollover only once the flush turn ends for it", async () => {
     const h = await setup();
     try {
-      h.session.queueMessage("Continue", { model: TEST_MODEL, agentId: "exec" });
+      await h.startBudgetTurn();
+      const first = await h.requests[0].onStepSettled!(step(110_000));
+      const flushEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
+      const rolloverEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY);
+      expect(flushEntryId).toBeDefined();
+      expect(rolloverEntryId).toBeDefined();
+      expect(first).toEqual({ decision: "rollover", continuationEntryId: flushEntryId });
+      expect(h.session.getQueueCutReceipt(flushEntryId!)?.successor).toBe("pending");
+      // B has cut nothing yet: no receipt is invented for it.
+      expect(h.session.getQueueCutReceipt(rolloverEntryId!)).toBeUndefined();
+
+      // The flush turn (A) dispatches and ends after one step for B.
+      h.settleStream(0);
+      await h.secondRequest;
+      expect(h.session.getQueueCutReceipt(flushEntryId!)?.successor).toBe("streaming");
+      const second = await h.requests[1].onStepSettled!(step(5_000));
+      expect(second).toEqual({ decision: "rollover", continuationEntryId: rolloverEntryId });
+      expect(h.session.getQueueCutReceipt(rolloverEntryId!)?.successor).toBe("pending");
+    } finally {
+      await teardown(h);
+    }
+  });
+
+  test("the captured successor survives a head reorder or removal after the decision", async () => {
+    const h = await setup();
+    try {
+      await h.startBudgetTurn();
+      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const continueEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
+      expect(outcome).toEqual({ decision: "warn", continuationEntryId: continueEntryId });
+
+      // A user "Send now" moves a manual entry ahead before StreamManager consumes the decision.
+      h.session.queueMessage("Actually, do this first", { model: TEST_MODEL, agentId: "exec" });
+      expect(queueOf(h).prioritizeNextUserEntry()).toBe(true);
       const head = queueOf(h).getNextQueueCutCandidate();
-      const selected = h.session.selectContextBudgetContinuationEntryId();
-      expect(selected).toBe(head!.entryId);
-      expect(h.session.getQueueCutReceipt(selected!)?.successor).toBe("pending");
+      expect(head?.entryId).not.toBe(continueEntryId);
+      expect(h.session.getQueueCutReceipt(head!.entryId)).toBeUndefined();
+      expect(h.session.getQueueCutReceipt(continueEntryId!)?.successor).toBe("pending");
+
+      // Removal of the designated entry is recorded against it, not re-attributed to the head.
+      h.session.clearQueue();
+      expect(h.session.getQueueCutReceipt(continueEntryId!)?.successor).toBe("canceled");
+      expect(h.session.getQueueCutReceipt(head!.entryId)).toBeUndefined();
+    } finally {
+      await teardown(h);
+    }
+  });
+
+  test("a budget stop with unrelated input already queued designates no successor", async () => {
+    const h = await setup();
+    try {
+      await h.startBudgetTurn();
+      h.session.queueMessage("Unrelated follow-up", { model: TEST_MODEL, agentId: "exec" });
+      const unrelatedEntryId = queueOf(h).getNextQueueCutCandidate()!.entryId;
+      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      expect(outcome).toEqual({ decision: "warn" });
+      expect(h.session.getQueueCutReceipt(unrelatedEntryId)).toBeUndefined();
+    } finally {
+      await teardown(h);
+    }
+  });
+
+  test("the enqueuer's pre-stream failure callback already observes prestream-failed", async () => {
+    const h = await setup({ failure: true });
+    try {
+      let observedInCallback: unknown = "callback did not run";
+      h.session.queueMessage(
+        "continue",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          onAcceptedPreStreamFailure: () => {
+            observedInCallback = h.session.getQueueCutReceipt(entryId)?.successor;
+          },
+        }
+      );
+      const entryId = h.session.getQueuedInputStopCause()!.entryId;
+      h.session.sendQueuedMessages();
+      await h.firstRequest;
+      await h.session.waitForIdle();
+      expect(observedInCallback).toBe("prestream-failed");
     } finally {
       await teardown(h);
     }

@@ -268,9 +268,19 @@ export interface SettledStepBudget {
   newContextRequested?: boolean;
 }
 
-export type OnStepSettled = (
-  step: SettledStepBudget
-) => Promise<"continue" | "warn" | "rollover" | "block">;
+export type ContextBudgetStepDecision = "continue" | "warn" | "rollover" | "block";
+
+/**
+ * Budget verdict for a settled step. `continuationEntryId` is the exact queue entry the session
+ * designated to continue the turn when it decided to stop (its enqueued "Continue"/flush, or the
+ * paired rollover behind a flush turn); absent when the stop hands over to nothing in particular.
+ */
+export interface SettledStepOutcome {
+  decision: ContextBudgetStepDecision;
+  continuationEntryId?: string;
+}
+
+export type OnStepSettled = (step: SettledStepBudget) => Promise<SettledStepOutcome>;
 
 interface StreamRequestOptions {
   model: LanguageModel;
@@ -284,8 +294,6 @@ interface StreamRequestOptions {
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-  /** Identity of the entry a budget stop hands the turn to, captured when the stop is selected. */
-  selectContextBudgetContinuationEntryId?: () => string | undefined;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -346,7 +354,6 @@ interface StreamRequestConfig {
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-  selectContextBudgetContinuationEntryId?: () => string | undefined;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2305,7 +2312,6 @@ export class StreamManager {
       toolPolicy,
       hasQueuedMessages,
       getQueuedInputStopCause,
-      selectContextBudgetContinuationEntryId,
       headers,
       onChunk,
       onStepMessages,
@@ -2363,7 +2369,6 @@ export class StreamManager {
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
       getQueuedInputStopCause,
-      selectContextBudgetContinuationEntryId,
       onChunk,
       onStepMessages,
       onStepSettled,
@@ -2383,7 +2388,6 @@ export class StreamManager {
       StreamRequestConfig,
       | "hasQueuedMessages"
       | "getQueuedInputStopCause"
-      | "selectContextBudgetContinuationEntryId"
       | "stopCause"
       | "toolPolicy"
       | "onStepSettled"
@@ -2456,7 +2460,7 @@ export class StreamManager {
             model: request.modelString,
             metadataModel: request.budgetMetadataModel,
           });
-          const decision = await request.onStepSettled({
+          const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
@@ -2470,13 +2474,14 @@ export class StreamManager {
           });
           // All siblings have settled: stop before another provider step without discarding results.
           if (decision !== "continue") {
-            // Bind the successor at the cut: a blocked stop has no continuation to hand over to.
-            const continuationEntryId =
-              decision === "block" ? undefined : request.selectContextBudgetContinuationEntryId?.();
+            // The session captured its designated successor when it decided; a blocked stop hands
+            // over to nothing.
             request.stopCause ??= {
               kind: "context-budget",
               decision,
-              ...(continuationEntryId != null ? { continuationEntryId } : {}),
+              ...(decision !== "block" && continuationEntryId != null
+                ? { continuationEntryId }
+                : {}),
             };
           }
           if (decision === "block")
@@ -3637,8 +3642,6 @@ export class StreamManager {
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
-      selectContextBudgetContinuationEntryId:
-        streamInfo.request.selectContextBudgetContinuationEntryId,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,

@@ -40,7 +40,7 @@ import {
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 import { resolveAgentForStream, type AgentResolutionResult } from "./agentResolution";
-import type { SettledStepBudget } from "./streamManager";
+import type { SettledStepBudget, SettledStepOutcome } from "./streamManager";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
@@ -917,6 +917,8 @@ interface PreparationAttempt {
   failureAttempts?: number;
   failure?: SendMessageError;
   onFailure?: (error: SendMessageError) => Promise<void> | void;
+  /** Queue entry this attempt dispatched when a cut receipt names it (see QueueCutReceipt). */
+  queueCutEntryId?: string;
 }
 
 export class AgentSession {
@@ -959,15 +961,7 @@ export class AgentSession {
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
-    phaseChanged: (phase, isCurrent) => {
-      // An admitted turn that reaches idle without ever registering a stream failed before
-      // streaming (withdrawn send, rejected admission, startup abort). Record it before idle
-      // publication so the cut stream's owner never observes idle with an unsettled successor.
-      if (phase === "idle") {
-        this.settleAdmittedQueueCutReceipts(this.coordinator.turnId, "prestream-failed");
-      }
-      this.publishTurnPhase(phase, isCurrent);
-    },
+    phaseChanged: (phase, isCurrent) => this.publishTurnPhase(phase, isCurrent),
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
@@ -3464,6 +3458,11 @@ export class AgentSession {
       );
       throw error;
     } finally {
+      // A dispatched cut entry whose attempt resolved without a stream or a failure settlement
+      // (withdrawn send, pre-admission early return) also never runs; settle it before idle.
+      if (attempt.outcome !== "delivered" && attempt.outcome !== "background") {
+        this.recordQueueCutSuccessorPreStreamFailure(attempt);
+      }
       try {
         if (this.preparingQueuedInput?.attempt === attempt) {
           // A dequeued manual send can fail even after Send Now refreshes its Stop admission.
@@ -3510,6 +3509,9 @@ export class AgentSession {
   ): Promise<void> {
     if (attempt.failureNotified || (!attempt.queued && attempt.durability !== "accepted")) return;
     attempt.failure ??= error;
+    // Evidence for the cut stream's owner precedes the enqueuer's own callback and the idle
+    // publication that follows in completePreparation.
+    this.recordQueueCutSuccessorPreStreamFailure(attempt);
     while ((attempt.failureAttempts ?? 0) < 2) {
       attempt.failureAttempts = (attempt.failureAttempts ?? 0) + 1;
       try {
@@ -5941,8 +5943,6 @@ export class AgentSession {
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
-        selectContextBudgetContinuationEntryId:
-          this.selectContextBudgetContinuationEntryId.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
@@ -6333,8 +6333,8 @@ export class AgentSession {
     muxMetadata: MuxMessageMetadata;
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
-  }): void {
-    this.messageQueue.addOnce(
+  }): string | undefined {
+    const queued = this.messageQueue.addOnce(
       args.text,
       {
         ...args.options,
@@ -6360,11 +6360,11 @@ export class AgentSession {
         goalId: args.goalId,
       }
     );
+    // addOnce keys are unique in the queue, so this resolves the exact entry just added.
+    return queued ? this.messageQueue.getEntryIdByDedupeKey(args.dedupeKey) : undefined;
   }
 
-  private async onContextBudgetStepSettled(
-    step: SettledStepBudget
-  ): Promise<"continue" | "warn" | "rollover" | "block"> {
+  private async onContextBudgetStepSettled(step: SettledStepBudget): Promise<SettledStepOutcome> {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
     if (!context?.options || !this.isTokenBudgetActive(context.options)) {
@@ -6376,9 +6376,9 @@ export class AgentSession {
       // outcome (WorkspaceTurnManager defers while a same-turn continuation is pending).
       if (context?.contextBudgetFlushTurn === true) {
         this.dropContextBudgetIntent();
-        return "rollover";
+        return this.flushTurnRolloverOutcome();
       }
-      return "continue";
+      return { decision: "continue" };
     }
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
@@ -6411,7 +6411,7 @@ export class AgentSession {
     if (!knownLimit) {
       log.warn("Token budget has no known model context limit", { model: step.model });
       // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
-      if (!modelRequested) return "continue";
+      if (!modelRequested) return { decision: "continue" };
     }
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({
@@ -6434,7 +6434,7 @@ export class AgentSession {
     // recorded as the observed usage so the row stays valid for display and downgrade parsing.
     const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
     // "block" only exists at threshold 100%, where requests are not offered and never honored.
-    if (decision.decision === "block") return "block";
+    if (decision.decision === "block") return { decision: "block" };
     if (context.contextBudgetFlushTurn === true) {
       if (this.compactionMonitor.getThreshold() >= 1) {
         // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
@@ -6443,23 +6443,23 @@ export class AgentSession {
         // delegated turn must not record the notes-only flush finish as the task's outcome
         // (WorkspaceTurnManager defers finalization while a same-turn continuation is pending).
         this.dropContextBudgetIntent();
-        return "rollover";
+        return this.flushTurnRolloverOutcome();
       }
       // A flush turn is bounded to one provider step even when the step no longer crosses the
       // threshold (larger model after a restart): stopping here lets the queued rollover
       // continuation seal the window.
-      if (decision.decision === "continue") return "rollover";
+      if (decision.decision === "continue") return this.flushTurnRolloverOutcome();
     }
     // A model request is honored like a budget rollover (continuation queued after every sibling
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
-    if (decision.decision === "continue" && !modelRequested) return "continue";
+    if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
     let offerFlush = false;
     if (decision.decision === "rollover" || modelRequested) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
-        return "continue";
+        return { decision: "continue" };
       // Offer one final notes flush before sealing when a writing step still fits and the
       // reset that follows can actually be admitted (session_history available). A model that
       // asked for the reset itself has already had its chance to write notes.
@@ -6498,7 +6498,7 @@ export class AgentSession {
     // transcript that may already contain injected tool output. The request builder derives
     // its memory-only tool ceiling, pinned notes path, and disabled hooks/PTC from the
     // `contextBudgetFlush` flag, independent of these send options.
-    const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
+    const enqueue = (text: string, dedupeKey: string, flush: boolean): string | undefined =>
       this.enqueueContextBudgetContinuation({
         admissionCapture: context.admissionCapture,
         text,
@@ -6513,6 +6513,9 @@ export class AgentSession {
         goalKind: context.goalKind,
         goalId: context.goalId,
       });
+    // The exact entry this stop hands the turn to. Captured here, before the queue is published
+    // or this decision yields, so a later head reorder or removal cannot change the attribution.
+    let continuationEntryId: string | undefined;
     if (offerFlush) {
       assert(
         !this.messageQueue.hasDedupeKey(CONTEXT_WARNING_DEDUPE_KEY) &&
@@ -6522,19 +6525,42 @@ export class AgentSession {
       this.contextBudgetFlushClaimed = true;
       // Entry 1 is the flush turn (hidden trigger text; the visible prefix carries the prompt).
       // Entry 2 is the unconditional rollover; its tool-end dispatch also bounds the flush
-      // turn to a single provider step.
-      enqueue("Flush context notes now.", CONTEXT_WARNING_DEDUPE_KEY, true);
+      // turn to a single provider step. Only entry 1 continues THIS turn; entry 2 earns its
+      // receipt when it cuts the flush turn (flushTurnRolloverOutcome).
+      continuationEntryId = enqueue("Flush context notes now.", CONTEXT_WARNING_DEDUPE_KEY, true);
       enqueue("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false);
+      this.registerQueueCutReceipt(continuationEntryId);
       this.emitQueuedMessageChanged();
     } else if (this.messageQueue.isEmpty()) {
-      enqueue(
+      continuationEntryId = enqueue(
         "Continue",
         decision.decision === "warn" ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
         false
       );
+      this.registerQueueCutReceipt(continuationEntryId);
       this.emitQueuedMessageChanged();
     }
-    return modelRequested ? "rollover" : decision.decision;
+    // Nothing enqueued (unrelated input already queued): the stop designates no successor.
+    return {
+      decision: modelRequested ? "rollover" : decision.decision,
+      ...(continuationEntryId != null ? { continuationEntryId } : {}),
+    };
+  }
+
+  /**
+   * A flush turn ends after one step for the rollover entry enqueued alongside it. That paired
+   * entry (not whatever else may lead the queue) is the successor; if it was already dropped
+   * (degraded flush, cleared queue) the stop designates none.
+   */
+  private flushTurnRolloverOutcome(): SettledStepOutcome {
+    const continuationEntryId = this.messageQueue.getEntryIdByDedupeKey(
+      CONTEXT_CONTINUE_DEDUPE_KEY
+    );
+    this.registerQueueCutReceipt(continuationEntryId);
+    return {
+      decision: "rollover",
+      ...(continuationEntryId != null ? { continuationEntryId } : {}),
+    };
   }
 
   /**
@@ -8293,8 +8319,6 @@ export class AgentSession {
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
-        selectContextBudgetContinuationEntryId:
-          this.selectContextBudgetContinuationEntryId.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
@@ -9134,6 +9158,8 @@ export class AgentSession {
     operation = this.coordinator.operationId
   ): Promise<void> {
     const turn = this.coordinator.turnId;
+    // A delivered handle that aborted before its stream registered never streams either.
+    this.settleAdmittedQueueCutReceipts(turn, "prestream-failed");
     log.debug("Forwarding stream-abort without phase transition (not in STREAMING)", {
       workspaceId: this.workspaceId,
       turnPhase: this.coordinator.phase,
@@ -10228,20 +10254,18 @@ export class AgentSession {
     };
   }
 
-  /**
-   * Continuation of a context-budget stop: the next dispatchable entry (the "Continue"/flush
-   * just enqueued, or whatever was already queued when the budget stop became authoritative).
-   * Called by StreamManager when the stop is selected, so the identity is captured at the cut.
-   */
-  selectContextBudgetContinuationEntryId(): string | undefined {
-    const candidate = this.messageQueue.getNextQueueCutCandidate();
-    if (candidate == null) return undefined;
-    this.registerQueueCutReceipt(candidate.entryId);
-    return candidate.entryId;
-  }
-
   getQueueCutReceipt(entryId: string): QueueCutReceipt | undefined {
     return this.queueCutReceipts.get(entryId);
+  }
+
+  /** The coordinator turn (TurnId) currently owning this session; receipts key successors by it. */
+  getTurnGeneration(): symbol {
+    return this.coordinator.turnId;
+  }
+
+  /** Termination releases every receipt regardless of its release rule. */
+  clearQueueCutReceipts(): void {
+    this.queueCutReceipts.clear();
   }
 
   markQueueCutSourceHandled(entryId: string): void {
@@ -10261,8 +10285,8 @@ export class AgentSession {
   }
 
   /** Idempotent for the same entry: a repeated selection keeps the original source turn. */
-  private registerQueueCutReceipt(entryId: string): void {
-    if (this.queueCutReceipts.has(entryId)) return;
+  private registerQueueCutReceipt(entryId: string | undefined): void {
+    if (entryId == null || this.queueCutReceipts.has(entryId)) return;
     this.queueCutReceipts.set(entryId, {
       sourceTurnGeneration: this.coordinator.turnId,
       successor: "pending",
@@ -10292,6 +10316,17 @@ export class AgentSession {
       changed = true;
     }
     return changed;
+  }
+
+  /** The attempt's dispatched cut entry was admitted but will never stream. */
+  private recordQueueCutSuccessorPreStreamFailure(attempt: PreparationAttempt): void {
+    const entryId = attempt.queueCutEntryId;
+    if (entryId == null) return;
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (typeof receipt?.successor !== "object") return;
+    receipt.successor = "prestream-failed";
+    this.releaseQueueCutReceiptIfSettled(entryId);
+    this.emitQueuedMessageChanged();
   }
 
   /** Successors admitted under `turnGeneration` reach `streaming` or fail before it. */
@@ -10692,10 +10727,12 @@ export class AgentSession {
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
       const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
-      // Admission transfers the cut to this turn; streamStarted/idle settle it (see receipts).
+      // Admission transfers the cut to this turn; streamStarted or this attempt's failure
+      // settlement records the outcome (see QueueCutReceipt).
       const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;
       if (receipt?.successor === "pending") {
         receipt.successor = { kind: "admitted", turnGeneration: preparedTurn };
+        attempt.queueCutEntryId = entryId;
       }
       this.preparingQueuedInput = { attempt, read: candidate.inputForRestore };
       attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
