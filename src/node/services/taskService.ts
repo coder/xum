@@ -652,6 +652,13 @@ interface WorkspaceStopRecord {
   /** Live execution mirror at capture (reawakened child); undefined when none. */
   capturedExecutionId: string | undefined;
   executionSettled: boolean;
+  /**
+   * The cascade recorded a durable stop marker (terminal task status, or the workspace is gone).
+   * A failed persistence keeps the latch (fail closed) until a later cascade or settlement
+   * records one — ownership evidence alone would otherwise free a child whose status still
+   * reads running to peer messaging right after the failed stop.
+   */
+  stopPersisted: boolean;
   /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
   capturedStreamMessageId: string | undefined;
 }
@@ -1715,7 +1722,12 @@ export class TaskService implements AgentTaskIntegration {
       capturedTurn,
       turnSettled: capturedTurn == null,
       capturedExecutionId,
-      executionSettled: capturedExecutionId == null,
+      // A registration whose mirror already persisted terminally is settled (its settlement
+      // callback ran before this capture and will not run again).
+      executionSettled:
+        capturedExecutionId == null ||
+        this.isExecutionMirrorSettled(workspaceId, capturedExecutionId),
+      stopPersisted: false,
       capturedStreamMessageId:
         this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(workspaceId).activeStream
           ?.messageId,
@@ -1808,7 +1820,9 @@ export class TaskService implements AgentTaskIntegration {
     if (record == null) return;
     const removed = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null;
     if (record.cleanupInFlight > 0) return;
-    if (!removed && !(record.turnSettled && record.executionSettled)) return;
+    if (!removed && !(record.stopPersisted && record.turnSettled && record.executionSettled)) {
+      return;
+    }
     this.workspaceStopRecords.delete(workspaceId);
     for (const release of record.releases) {
       release();
@@ -1825,10 +1839,29 @@ export class TaskService implements AgentTaskIntegration {
     if (record == null) return;
     const liveHandleId =
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
-    if (record.capturedExecutionId != null && liveHandleId !== record.capturedExecutionId) {
+    if (
+      record.capturedExecutionId != null &&
+      (liveHandleId !== record.capturedExecutionId ||
+        this.isExecutionMirrorSettled(workspaceId, record.capturedExecutionId))
+    ) {
       record.executionSettled = true;
     }
     this.recheckWorkspaceStopRelease(workspaceId);
+  }
+
+  /** The persisted execution mirror for this handle is terminal (settled by its owner). */
+  private isExecutionMirrorSettled(workspaceId: string, handleId: string): boolean {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return (
+      workspace?.taskExecutionId === handleId &&
+      !isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus)
+    );
+  }
+
+  /** Phase A recorded a durable stop marker for this workspace (see WorkspaceStopRecord). */
+  private markWorkspaceStopPersisted(workspaceId: string): void {
+    const record = this.workspaceStopRecords.get(workspaceId);
+    if (record != null) record.stopPersisted = true;
   }
 
   /** Owner settlement: the captured turn generation ended for good (see onWorkspaceTurnSettled). */
@@ -5840,6 +5873,8 @@ export class TaskService implements AgentTaskIntegration {
         const executionActive =
           ACTIVE_AGENT_TASK_STATUSES.has(status) || this.aiService.isStreaming(id);
         if (!executionActive && activeHandles.length === 0) {
+          // Already terminal with nothing live: the persisted status is the stop marker.
+          this.markWorkspaceStopPersisted(id);
           continue;
         }
         activeHandlesById.set(
@@ -5870,6 +5905,7 @@ export class TaskService implements AgentTaskIntegration {
           },
           { allowMissing: true }
         );
+        this.markWorkspaceStopPersisted(id);
         if (parentWorkspaceId != null) {
           await this.suppressTerminalAttention({
             ownerWorkspaceId: parentWorkspaceId,
@@ -5978,6 +6014,16 @@ export class TaskService implements AgentTaskIntegration {
         this.beginWorkspaceStop(id);
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
+        // Durable stop marker before removal: a workspace whose removal later fails or times out
+        // must not read as a live running task once its latch settles.
+        const persisted = await this.editWorkspaceEntry(
+          id,
+          (ws) => {
+            this.applyInterruptedTaskStatus(ws);
+          },
+          { allowMissing: true }
+        );
+        if (persisted) this.markWorkspaceStopPersisted(id);
       }
     }
 
@@ -6374,6 +6420,7 @@ export class TaskService implements AgentTaskIntegration {
             });
             continue;
           }
+          this.markWorkspaceStopPersisted(id);
 
           if (preservedCompletedDescendant) {
             // A reawakened completed child executes under a live workspace-turn handle while its
