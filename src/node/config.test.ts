@@ -647,6 +647,55 @@ describe("Config", () => {
     });
   });
 
+  describe("read-only workspace metadata", () => {
+    it("getWorkspaceMetadataById with persistMigrations: false fills defaults without writing", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      fs.mkdirSync(projectPath, { recursive: true });
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [
+                  // Legacy entry: no runtimeConfig, so a default build records a migration.
+                  { id: "ws-legacy", name: "legacy", path: path.join(projectPath, "legacy") },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      // Flush load-time (non-workspace) migrations so only the metadata build can write below.
+      await flushConfigEdits();
+      const editSpy = spyOn(config, "editConfig");
+
+      const readOnly = await config.getWorkspaceMetadataById("ws-legacy", {
+        persistMigrations: false,
+      });
+      expect(readOnly?.runtimeConfig).toBeDefined();
+      expect(editSpy).not.toHaveBeenCalled();
+      const persistedAfterReadOnly = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ runtimeConfig?: unknown }> }]>;
+      };
+      expect(persistedAfterReadOnly.projects[0]?.[1].workspaces[0]?.runtimeConfig).toBeUndefined();
+
+      // Default behavior is unchanged: the migration is persisted.
+      const migrating = await config.getWorkspaceMetadataById("ws-legacy");
+      expect(migrating?.runtimeConfig).toEqual(readOnly?.runtimeConfig);
+      expect(editSpy).toHaveBeenCalled();
+      await flushConfigEdits();
+      const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ runtimeConfig?: unknown }> }]>;
+      };
+      expect(persisted.projects[0]?.[1].workspaces[0]?.runtimeConfig).toEqual(
+        readOnly?.runtimeConfig
+      );
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write

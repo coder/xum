@@ -35,7 +35,12 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
+import {
+  ProvidersConfigStore,
+  SecretsStore,
+  type Config,
+  type WorkspaceMetadataOptions,
+} from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -537,9 +542,12 @@ export class AIService extends EventEmitter {
     this.streamManager.setMockStreamLifecycle(this.mockAiStreamPlayer);
   }
 
-  async getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>> {
+  async getWorkspaceMetadata(
+    workspaceId: string,
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+  ): Promise<Result<WorkspaceMetadata>> {
     try {
-      const metadata = await this.config.getWorkspaceMetadataById(workspaceId);
+      const metadata = await this.config.getWorkspaceMetadataById(workspaceId, options);
 
       if (!metadata) {
         return Err(

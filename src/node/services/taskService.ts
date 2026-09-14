@@ -441,6 +441,12 @@ export interface AgentTaskReport {
 interface OwnedTaskAttempt {
   readonly generation: number;
   readonly source: string;
+  /**
+   * Reservation cancellation of THIS attempt (createMany abortSignal). Rides with the identity so
+   * a plan the scheduler rebuilds from config (capacity-queued, or requeued by the stop barrier)
+   * still observes it; a reawakening starts a new identity and never inherits it.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 interface TaskLaunchPlan {
@@ -579,6 +585,7 @@ interface PreparedTaskReservation {
   effectiveThinkingLevel: ThinkingLevel;
   effectiveReasoningMode: OpenAIReasoningMode | undefined;
   inputs: string;
+  /** pinParentMetaForReservation(parentMeta) at preparation time. */
   parentMetaJson: string;
 }
 
@@ -2077,11 +2084,16 @@ export class TaskService implements AgentTaskIntegration {
    * Replaces the owned identity and drops any settlement of the previous attempt SYNCHRONOUSLY,
    * before the admission that follows — current ownership always wins over a stale settlement.
    */
-  private beginOwnedTaskAttempt(taskId: string, source: string): OwnedTaskAttempt {
+  private beginOwnedTaskAttempt(
+    taskId: string,
+    source: string,
+    abortSignal?: AbortSignal
+  ): OwnedTaskAttempt {
     assert(taskId.length > 0, "beginOwnedTaskAttempt: taskId must be non-empty");
     const attempt: OwnedTaskAttempt = {
       generation: (this.ownedAttemptByTaskId.get(taskId)?.generation ?? 0) + 1,
       source,
+      ...(abortSignal != null ? { abortSignal } : {}),
     };
     this.ownedAttemptByTaskId.set(taskId, attempt);
     this.attemptSettlementByTaskId.delete(taskId);
@@ -2238,10 +2250,65 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * Take the task's event lock for a short read while the caller's bound (deadline/abort) keeps
+   * applying to the WAIT for the lock: a publication holding it must not pin a bounded caller.
+   * Abandoned before entry → the late acquisition is a no-op that releases at once (nothing read,
+   * no subscription installed). Once entered, the operation runs to completion (never detached).
+   */
+  private async runUnderEventLockBounded<T>(
+    taskId: string,
+    operation: () => Promise<T>,
+    bound: { signal?: AbortSignal; deadline: number }
+  ): Promise<{ kind: "ok"; value: T } | { kind: "timeout" } | { kind: "aborted" }> {
+    let entered = false;
+    let abandoned = false;
+    const run = this.workspaceEventLocks.withLock(taskId, async (): Promise<T | undefined> => {
+      if (abandoned) return undefined;
+      entered = true;
+      return await operation();
+    });
+    return await new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timer != null) clearTimeout(timer);
+        bound.signal?.removeEventListener("abort", onAbort);
+      };
+      const abandon = (result: { kind: "timeout" } | { kind: "aborted" }) => {
+        if (entered || abandoned) return;
+        abandoned = true;
+        cleanup();
+        resolve(result);
+      };
+      const onAbort = () => abandon({ kind: "aborted" });
+      bound.signal?.addEventListener("abort", onAbort, { once: true });
+      const remainingMs = bound.deadline - Date.now();
+      if (bound.signal?.aborted) {
+        abandon({ kind: "aborted" });
+      } else if (remainingMs <= 0) {
+        abandon({ kind: "timeout" });
+      } else {
+        timer = setTimeout(() => abandon({ kind: "timeout" }), remainingMs);
+        timer.unref?.();
+      }
+      run.then(
+        (value) => {
+          cleanup();
+          if (!abandoned) resolve({ kind: "ok", value: value as T });
+        },
+        (error: unknown) => {
+          cleanup();
+          if (!abandoned) reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      );
+    });
+  }
+
+  /**
    * Bounded wait for the current attempt to settle: subscribe THEN re-read under the task's
    * event lock (a settlement landing between the two is observed by the re-read), release the
-   * lock before awaiting, and re-read on every notification. `indeterminate` returns at once —
-   * an unknown owner never pins the caller. Timeout is a bounded outcome, abort rejects.
+   * lock before awaiting, and re-read on every notification. The bound also covers waiting for
+   * the lock itself (runUnderEventLockBounded). `indeterminate` returns at once — an unknown
+   * owner never pins the caller. Timeout is a bounded outcome, abort rejects.
    */
   async waitForAttemptSettlement(
     taskId: string,
@@ -2253,15 +2320,23 @@ export class TaskService implements AgentTaskIntegration {
       "waitForAttemptSettlement: timeoutMs invalid"
     );
     const deadline = Date.now() + options.timeoutMs;
+    const bound = { signal: options.abortSignal, deadline };
     let notified = Promise.withResolvers<void>();
     const listener = () => notified.resolve();
     try {
-      let outcome = await this.workspaceEventLocks.withLock(taskId, async () => {
-        const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
-        listeners.add(listener);
-        this.attemptSettlementListenersByTaskId.set(taskId, listeners);
-        return await this.inspectAttemptOutcome(taskId, options);
-      });
+      const first = await this.runUnderEventLockBounded(
+        taskId,
+        async () => {
+          const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
+          listeners.add(listener);
+          this.attemptSettlementListenersByTaskId.set(taskId, listeners);
+          return await this.inspectAttemptOutcome(taskId, options);
+        },
+        bound
+      );
+      if (first.kind === "aborted") throw new Error("Interrupted");
+      if (first.kind === "timeout") return { kind: "timeout" };
+      let outcome = first.value;
       while (outcome.kind === "live" || outcome.kind === "cleanup-pending") {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) return { kind: "timeout" };
@@ -2273,9 +2348,14 @@ export class TaskService implements AgentTaskIntegration {
         if (raced.kind === "timeout") return { kind: "timeout" };
         // Re-arm before re-reading so a notification during the read is never lost.
         notified = Promise.withResolvers<void>();
-        outcome = await this.workspaceEventLocks.withLock(taskId, () =>
-          this.inspectAttemptOutcome(taskId, options)
+        const reread = await this.runUnderEventLockBounded(
+          taskId,
+          () => this.inspectAttemptOutcome(taskId, options),
+          bound
         );
+        if (reread.kind === "aborted") throw new Error("Interrupted");
+        if (reread.kind === "timeout") return { kind: "timeout" };
+        outcome = reread.value;
       }
       return outcome;
     } finally {
@@ -3578,10 +3658,46 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  /** Read-only preparation of one plan (no locks held); see PreparedTaskReservation. */
+  /**
+   * The parent metadata fields a reservation consumes (identity, checkout naming, runtime,
+   * projects). Pinned as JSON for revalidation; derived defaults a read-only build fills anew on
+   * every call (createdAt for a legacy entry) are deliberately not part of it.
+   */
+  private pinParentMetaForReservation(parentMeta: WorkspaceMetadata): string {
+    return JSON.stringify({
+      id: parentMeta.id,
+      kind: parentMeta.kind,
+      name: parentMeta.name,
+      projectPath: parentMeta.projectPath,
+      projectName: parentMeta.projectName,
+      runtimeConfig: parentMeta.runtimeConfig,
+      projects: parentMeta.projects,
+    });
+  }
+
+  /**
+   * Await a pure read while it stays cancellable: an abort resolves at once and the late result is
+   * discarded. Only for reads with no owned side effect (metadata built with
+   * persistMigrations: false, definition files, AI-settings resolution) — never for config writes.
+   */
+  private async readCancellable<T>(
+    read: Promise<T>,
+    signal: AbortSignal | undefined
+  ): Promise<{ kind: "ok"; value: T } | { kind: "aborted" }> {
+    const raced = await raceWithAbortAndTimeout(read, { signal });
+    return raced.kind === "ok" ? raced : { kind: "aborted" };
+  }
+
+  /**
+   * Read-only preparation of one plan (no locks held, cancellable at every read); see
+   * PreparedTaskReservation. Metadata is built without persisting read-time migrations so a
+   * discarded late result never leaves a detached config write behind.
+   */
   private async prepareTaskReservation(
     args: TaskCreateArgs,
-    cfg: ProjectsConfig
+    cfg: ProjectsConfig,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
   ): Promise<Result<PreparedTaskReservation, string>> {
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentWorkspaceId = coerceNonEmptyString(args.parentWorkspaceId);
@@ -3627,7 +3743,12 @@ export class TaskService implements AgentTaskIntegration {
       };
     }
 
-    const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    const parentMetaRead = await this.readCancellable(
+      this.aiService.getWorkspaceMetadata(parentWorkspaceId, { persistMigrations: false }),
+      signal
+    );
+    if (parentMetaRead.kind !== "ok") return Err(progress.interruptedError());
+    const parentMetaResult = parentMetaRead.value;
     if (!parentMetaResult.success) {
       return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
     }
@@ -3759,7 +3880,12 @@ export class TaskService implements AgentTaskIntegration {
     let definitionSource: string | undefined;
     let frontmatterJson: string;
     try {
-      const definition = await resolveAgentDefinition(runtime, parentWorkspacePath, agentId);
+      const definitionRead = await this.readCancellable(
+        resolveAgentDefinition(runtime, parentWorkspacePath, agentId),
+        signal
+      );
+      if (definitionRead.kind !== "ok") return Err(progress.interruptedError());
+      const definition = definitionRead.value;
       const frontmatter = definition.frontmatter;
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await getRunnableHint();
@@ -3782,8 +3908,8 @@ export class TaskService implements AgentTaskIntegration {
     let effectiveThinkingLevel: ThinkingLevel;
     let effectiveReasoningMode: OpenAIReasoningMode | undefined;
     try {
-      ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-        await this.resolveTaskAISettings({
+      const aiSettingsRead = await this.readCancellable(
+        this.resolveTaskAISettings({
           cfg,
           parentWorkspaceId,
           parentMeta,
@@ -3796,7 +3922,12 @@ export class TaskService implements AgentTaskIntegration {
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
           },
-        }));
+        }),
+        signal
+      );
+      if (aiSettingsRead.kind !== "ok") return Err(progress.interruptedError());
+      ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+        aiSettingsRead.value);
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createMany: ${error.message}`);
@@ -3835,7 +3966,7 @@ export class TaskService implements AgentTaskIntegration {
         configProjectPath,
         agentId
       ),
-      parentMetaJson: JSON.stringify(parentMeta),
+      parentMetaJson: this.pinParentMetaForReservation(parentMeta),
     });
   }
 
@@ -3854,7 +3985,9 @@ export class TaskService implements AgentTaskIntegration {
     for (const args of argsList) {
       const preparation = await this.prepareTaskReservation(
         args,
-        this.config.loadConfigOrDefault()
+        this.config.loadConfigOrDefault(),
+        progress,
+        signal
       );
       if (signal?.aborted) return interrupted();
       if (!preparation.success) return preparation;
@@ -3902,8 +4035,18 @@ export class TaskService implements AgentTaskIntegration {
         );
       }
       // Parent identity as the metadata service resolves it (runtime config, name, projects).
-      const parentMetaNow = await this.aiService.getWorkspaceMetadata(plan.parentWorkspaceId);
-      if (!parentMetaNow.success || JSON.stringify(parentMetaNow.data) !== plan.parentMetaJson) {
+      // Read-only and cancellable under the mutex: no config-queue wait, and a held read releases
+      // the mutex on abort instead of stalling every other reservation.
+      const parentMetaNowRead = await this.readCancellable(
+        this.aiService.getWorkspaceMetadata(plan.parentWorkspaceId, { persistMigrations: false }),
+        signal
+      );
+      if (parentMetaNowRead.kind !== "ok") return interrupted();
+      const parentMetaNow = parentMetaNowRead.value;
+      if (
+        !parentMetaNow.success ||
+        this.pinParentMetaForReservation(parentMetaNow.data) !== plan.parentMetaJson
+      ) {
         return Err(
           "Task.createMany: parent workspace changed during preparation (runtime, name or projects); retry"
         );
@@ -3911,11 +4054,12 @@ export class TaskService implements AgentTaskIntegration {
       // The definition resolved before the mutex must still be the one that would run.
       let definitionNow: { source?: string; frontmatter: unknown };
       try {
-        definitionNow = await resolveAgentDefinition(
-          plan.runtime,
-          plan.parentWorkspacePath,
-          plan.agentId
+        const definitionNowRead = await this.readCancellable(
+          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId),
+          signal
         );
+        if (definitionNowRead.kind !== "ok") return interrupted();
+        definitionNow = definitionNowRead.value;
       } catch (error) {
         return Err(
           `Task.createMany: agent definition changed during preparation (${plan.agentId}): ${getErrorMessage(error)}; retry`
@@ -4074,9 +4218,9 @@ export class TaskService implements AgentTaskIntegration {
         }
         return config;
       });
-      // Records exist: this process owns these attempts from here on.
+      // Records exist: this process owns these attempts from here on (with their cancellation).
       for (const plan of plans) {
-        this.beginOwnedTaskAttempt(plan.taskId, "reservation");
+        this.beginOwnedTaskAttempt(plan.taskId, "reservation", signal);
       }
       return null;
     };
@@ -4107,8 +4251,14 @@ export class TaskService implements AgentTaskIntegration {
     }
     if (commitOutcome != null) return commitOutcome;
 
-    // Post-commit fence, immediately before scheduling: an abort that landed after the mutator
-    // ran reconciles the live reservations to interrupted with an OWNED write (never detached).
+    progress.enter("launch");
+    for (const result of results) {
+      await this.emitWorkspaceMetadata(result.taskId);
+    }
+
+    // Post-commit fence, after the last await and immediately before scheduling: an abort that
+    // landed after the mutator ran reconciles the live reservations to interrupted with an OWNED
+    // write (never detached).
     if (canceledInsideCommit || signal?.aborted) {
       for (const plan of plans) {
         const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
@@ -4133,10 +4283,6 @@ export class TaskService implements AgentTaskIntegration {
       return interrupted();
     }
 
-    progress.enter("launch");
-    for (const result of results) {
-      await this.emitWorkspaceMetadata(result.taskId);
-    }
     for (const plan of plans) {
       if (plan.status === "starting") {
         this.scheduleReservedTaskLaunch(plan);
@@ -11556,6 +11702,11 @@ export class TaskService implements AgentTaskIntegration {
           workflowTask: task.workflowTask,
           bestOf: this.getEffectiveTaskGroup(taskId, task),
           experiments: task.taskExperiments,
+          // A reservation this process owns keeps its cancellation across the queue.
+          ...(() => {
+            const abortSignal = this.ownedAttemptByTaskId.get(taskId)?.abortSignal;
+            return abortSignal != null ? { abortSignal } : {};
+          })(),
         });
       }
     }
