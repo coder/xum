@@ -31999,7 +31999,10 @@ describe("TaskService", () => {
     parent: string;
     overrides?: Parameters<typeof projectWorkspace>[3];
   }
-  async function setupTree(descendants: Array<string | TreeDescendant>) {
+  async function setupTree(
+    descendants: Array<string | TreeDescendant>,
+    taskSettings = testTaskSettings(4, 3)
+  ) {
     const descendantEntries: TreeDescendant[] = descendants.map((descendant) =>
       typeof descendant === "string" ? { id: descendant, parent: rootId } : descendant
     );
@@ -32027,7 +32030,7 @@ describe("TaskService", () => {
           })
         ),
       ],
-      testTaskSettings(4, 3)
+      taskSettings
     );
     return { config, projectPath };
   }
@@ -32036,6 +32039,25 @@ describe("TaskService", () => {
     const deadline = Date.now() + 2_000;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+
+  /** The owned settlement follows the status write asynchronously; poll the authoritative read. */
+  async function waitForOutcomeKind(
+    taskService: TaskService,
+    taskId: string,
+    kind: string
+  ): Promise<void> {
+    const deadline = Date.now() + 2_000;
+    for (;;) {
+      const outcome = await taskService.readAttemptOutcome(taskId, {
+        requestingWorkspaceId: rootId,
+      });
+      if (outcome.kind === kind) return;
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for ${kind}; last ${JSON.stringify(outcome)}`);
+      }
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
   }
@@ -32770,9 +32792,7 @@ describe("TaskService", () => {
         "the failed launch to persist"
       );
       expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe("fork failed");
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
-        kind: "terminal-no-report",
-      });
+      await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
     });
 
     test("waitForAttemptSettlement subscribes before re-reading, releases the lock while waiting, and observes a settlement landing mid-read", async () => {
@@ -32814,6 +32834,52 @@ describe("TaskService", () => {
       } finally {
         restoreTimers();
       }
+    });
+
+    test("waitForAttemptSettlement stays bounded while the task's event lock is held", async () => {
+      const taskId = "task-settle-locked";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = taskService as unknown as {
+        inspectAttemptOutcome: (taskId: string, options: unknown) => Promise<unknown>;
+        workspaceEventLocks: { withLock: <T>(key: string, op: () => Promise<T>) => Promise<T> };
+        attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+      };
+      const inspect = spyOn(internals, "inspectAttemptOutcome");
+      const gate = Promise.withResolvers<void>();
+      // A publication (or any handler) holds the lock for longer than the caller's bound.
+      const holding = internals.workspaceEventLocks.withLock(taskId, () => gate.promise);
+      const timedOut = await taskService.waitForAttemptSettlement(taskId, {
+        timeoutMs: 20,
+        ...requesting,
+      });
+      expect(timedOut).toEqual({ kind: "timeout" });
+      const controller = new AbortController();
+      const aborted = taskService.waitForAttemptSettlement(taskId, {
+        timeoutMs: 5_000,
+        abortSignal: controller.signal,
+        ...requesting,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      controller.abort();
+      expect(
+        await aborted.then(
+          () => null,
+          (error: unknown) => error
+        )
+      ).toBeInstanceOf(Error);
+      // Nothing ran under the lock for the abandoned waits.
+      expect(inspect).not.toHaveBeenCalled();
+      gate.resolve();
+      await holding;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // Late acquisitions are no-ops: no read, no leaked subscription.
+      expect(inspect).not.toHaveBeenCalled();
+      expect(internals.attemptSettlementListenersByTaskId.get(taskId)?.size ?? 0).toBe(0);
+      // The lock is usable again and a normal read works.
+      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
 
     test("waitForAttemptSettlement returns timeout for pending cleanup, rejects on abort, and returns indeterminate immediately", async () => {
@@ -32892,24 +32958,7 @@ describe("TaskService", () => {
       [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
         project.workspaces.filter((ws) => ws.parentWorkspaceId != null)
       ).length;
-    /** The owned settlement follows the status write asynchronously; poll the authoritative read. */
-    async function waitForOutcomeKind(
-      taskService: TaskService,
-      taskId: string,
-      kind: string
-    ): Promise<void> {
-      const deadline = Date.now() + 2_000;
-      for (;;) {
-        const outcome = await taskService.readAttemptOutcome(taskId, {
-          requestingWorkspaceId: rootId,
-        });
-        if (outcome.kind === kind) return;
-        if (Date.now() > deadline) {
-          throw new Error(`Timed out waiting for ${kind}; last ${JSON.stringify(outcome)}`);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-    }
+
     /** The harness default metadata lookup with a hook run before/after the real read. */
     const metadataMock = (
       config: Config,
@@ -32922,6 +32971,23 @@ describe("TaskService", () => {
         await hooks.after?.();
         return found ? Ok(found) : Err("not found");
       });
+    /** Metadata reads where exactly the Nth call (1-based) blocks on a gate, like a stalled SSH read. */
+    const heldMetadataMock = (config: Config, holdCall: number) => {
+      const gate = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<void>();
+      let calls = 0;
+      const read = mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
+        calls += 1;
+        if (calls === holdCall) {
+          held.resolve();
+          await gate.promise;
+        }
+        const all = await config.getAllWorkspaceMetadata();
+        const found = all.find((m) => m.id === workspaceId);
+        return found ? Ok(found) : Err("not found");
+      });
+      return { read, gate, held: held.promise, calls: () => calls };
+    };
     interface Internals {
       startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
       materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
@@ -33168,6 +33234,205 @@ describe("TaskService", () => {
       );
       await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
     });
+
+    test("a held preparation read is cancellable: abort returns before the read releases and no late reservation follows", async () => {
+      const { config } = await setupTree([]);
+      const metadata = heldMetadataMock(config, 1);
+      const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata.read });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const onTaskReserved = mock(() => undefined);
+      const recordsBefore = taskRecordCount(config);
+      const controller = new AbortController();
+      const creating = taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+        onTaskReserved,
+      });
+      await metadata.held;
+      controller.abort();
+      const result = await creating;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("prepare");
+      // The read is still blocked: cancellation did not wait for it.
+      metadata.gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(onTaskReserved).not.toHaveBeenCalled();
+      expect(taskRecordCount(config)).toBe(recordsBefore);
+    });
+
+    test("a held revalidation read under the mutex is cancellable: abort frees the mutex for unrelated creation", async () => {
+      const { config } = await setupTree([]);
+      // First read (preparation) resolves; the second (revalidation, under the mutex) blocks.
+      const metadata = heldMetadataMock(config, 2);
+      const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata.read });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const internals = taskService as unknown as Internals;
+      spyOn(internals, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
+      stubStableIds(config, ["unrelatedchild9"]);
+      const recordsBefore = taskRecordCount(config);
+      const controller = new AbortController();
+      const creating = taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      await metadata.held;
+      controller.abort();
+      const result = await creating;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("revalidate");
+      // Mutex released while the revalidation read is still held: an unrelated tree creates.
+      const unrelated = await taskService.createMany([spawnArgs(unrelatedParentId)]);
+      expect(unrelated.success).toBe(true);
+      metadata.gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Only the unrelated reservation exists; the canceled one never committed.
+      expect(taskRecordCount(config)).toBe(recordsBefore + 1);
+      expect(findWorkspaceInConfig(config, "unrelatedchild9")?.parentWorkspaceId).toBe(
+        unrelatedParentId
+      );
+    });
+
+    test("reservation reads never persist metadata migrations (owned config writes stay explicit)", async () => {
+      const spawnedId = "readonlychild1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      // Real reader, forwarding the caller's read-only option.
+      const { aiService } = createAIServiceMocks(config, {
+        getWorkspaceMetadata: mock(
+          async (
+            workspaceId: string,
+            options?: { persistMigrations?: boolean }
+          ): Promise<Result<WorkspaceMetadata>> => {
+            const found = await config.getWorkspaceMetadataById(workspaceId, options);
+            return found ? Ok(found) : Err("not found");
+          }
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const internals = taskService as unknown as Internals;
+      spyOn(internals, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
+      // The fixture parent has no runtimeConfig: a default (migrating) read would write it.
+      expect(findWorkspaceInConfig(config, rootId)?.runtimeConfig).toBeUndefined();
+      const editSpy = spyOn(config, "editConfig");
+      let writesBeforeCommit = -1;
+      let parentRuntimeConfigAtCheckpoint: unknown = "unset";
+      const created = await taskService.createMany([spawnArgs(rootId)], {
+        onTaskReserved: () => {
+          // Preparation + revalidation (both reads) are done; the commit has not run yet.
+          writesBeforeCommit = editSpy.mock.calls.length;
+          parentRuntimeConfigAtCheckpoint = findWorkspaceInConfig(config, rootId)?.runtimeConfig;
+        },
+      });
+      if (!created.success) throw new Error(`createMany failed: ${created.error}`);
+      expect(writesBeforeCommit).toBe(0);
+      expect(parentRuntimeConfigAtCheckpoint).toBeUndefined();
+      // The child was still created with the parent's (default-filled) runtime.
+      expect(findWorkspaceInConfig(config, spawnedId)?.runtimeConfig).toBeDefined();
+    });
+
+    test("abort during the post-commit metadata emit still reconciles the reservation and never schedules", async () => {
+      const spawnedId = "emitcanceled1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = taskService as unknown as Internals & {
+        emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+      };
+      const launch = spyOn(internals, "startReservedAgentTask").mockImplementation(() =>
+        Promise.resolve()
+      );
+      const controller = new AbortController();
+      const realEmit = internals.emitWorkspaceMetadata.bind(taskService);
+      spyOn(internals, "emitWorkspaceMetadata").mockImplementation(async (workspaceId: string) => {
+        await realEmit(workspaceId);
+        if (workspaceId === spawnedId) controller.abort();
+      });
+      const result = await taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/^Interrupted/);
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("interrupted");
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe(
+        "Reservation canceled"
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(launch).not.toHaveBeenCalled();
+    });
+
+    test.each(["capacity-queued", "barrier-requeued"] as const)(
+      "a %s plan canceled after createMany returned is never launched when the scheduler rebuilds it",
+      async (kind) => {
+        const spawnedId = "requeuedchild1";
+        const blockerId = "task-capacity-blocker";
+        const { config } = await setupTree(
+          kind === "capacity-queued" ? [blockerId] : [],
+          testTaskSettings(1, 3)
+        );
+        stubStableIds(config, [spawnedId]);
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        const internals = taskService as unknown as Internals;
+        spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(() =>
+          Promise.resolve({
+            workspacePath: config.loadConfigOrDefault().projects.keys().next().value ?? "/tmp",
+            trunkBranch: "main",
+            forkedRuntimeConfig: { type: "local" },
+            runtimeForTaskWorkspace: {
+              deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+              getWorkspacePath: () => "/tmp/requeued",
+            },
+            inheritedProjects: undefined,
+          })
+        );
+        spyOn(internals, "cleanupMaterializedTaskWorkspace").mockImplementation(() =>
+          Promise.resolve()
+        );
+        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+          Promise.resolve(undefined)
+        );
+        const controller = new AbortController();
+        const releaseBarrier =
+          kind === "barrier-requeued"
+            ? taskService.latchWorkspaceStopsInProgress([rootId])
+            : undefined;
+        const created = await taskService.createMany([spawnArgs(rootId)], {
+          abortSignal: controller.signal,
+        });
+        expect(created).toMatchObject({
+          success: true,
+          data: [{ status: kind === "capacity-queued" ? "queued" : "starting" }],
+        });
+        await waitUntil(
+          () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "queued",
+          "the plan to wait in the queue"
+        );
+        // Canceled while queued — after createMany already returned Ok.
+        controller.abort();
+        // Release capacity / the barrier: the scheduler rebuilds the plan from config.
+        if (kind === "capacity-queued") {
+          expect((await taskService.stopDescendantAgentTask(rootId, blockerId)).success).toBe(true);
+        } else {
+          releaseBarrier?.();
+        }
+        await taskService.maybeStartQueuedTasks();
+        await waitUntil(
+          () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "interrupted",
+          "the rebuilt launch to observe the cancellation"
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe(
+          "Reservation canceled"
+        );
+        await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
+        // A reawakening is a NEW attempt and must not inherit the canceled signal.
+        expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
+        const owned = (
+          taskService as unknown as {
+            ownedAttemptByTaskId: Map<string, { abortSignal?: AbortSignal }>;
+          }
+        ).ownedAttemptByTaskId.get(spawnedId);
+        expect(owned?.abortSignal).toBeUndefined();
+      }
+    );
 
     test("abort after send admission cannot un-launch: the execution exists and is stopped through the Layer 2 path", async () => {
       const spawnedId = "admittedchild1";

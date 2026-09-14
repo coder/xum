@@ -935,7 +935,7 @@ class ProjectRegistrationLockContended extends Error {
   }
 }
 
-interface WorkspaceMetadataOptions {
+export interface WorkspaceMetadataOptions {
   /**
    * Throw on config read/parse failure instead of silently resolving with
    * the empty default. Callers that make destructive decisions based on
@@ -968,6 +968,14 @@ interface WorkspaceMetadataOptions {
   probeCheckouts?: boolean;
 
   archived?: "all" | "active" | "archived";
+  /**
+   * Persist read-time workspace migrations (missing id/name/createdAt/runtimeConfig) through the
+   * editConfig queue. Default true. Callers that must stay read-only — e.g. a cancellable
+   * preparation whose result may be discarded, or a read under a lock that must not wait on the
+   * config queue — pass false: defaults are still filled in the returned metadata, nothing is
+   * written, and the next default build persists them.
+   */
+  persistMigrations?: boolean;
 }
 
 export class Config {
@@ -3305,7 +3313,10 @@ export class Config {
     return this.buildWorkspaceMetadata(config, config.projects, options);
   }
 
-  async getWorkspaceMetadataById(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
+  async getWorkspaceMetadataById(
+    workspaceId: string,
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+  ): Promise<FrontendWorkspaceMetadata | null> {
     const config = this.loadConfigOrDefault();
     this.ensureWorkspaceIndex(config);
     let entry = this.workspaceIndex.get(workspaceId);
@@ -3319,9 +3330,11 @@ export class Config {
     }
     if (!entry) return null;
     const { projectPath, project, workspace } = entry;
-    const metadata = await this.buildWorkspaceMetadata(config, [
-      [projectPath, { ...project, workspaces: [workspace] }],
-    ]);
+    const metadata = await this.buildWorkspaceMetadata(
+      config,
+      [[projectPath, { ...project, workspaces: [workspace] }]],
+      options
+    );
     return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
@@ -3841,7 +3854,7 @@ export class Config {
     // an id must match by id, and only id-less legacy entries may match by path — a
     // path match with a different id is a replacement workspace that must not inherit
     // the removed workspace's migrated settings.
-    if (pendingWorkspaceMigrations.length > 0) {
+    if (pendingWorkspaceMigrations.length > 0 && options?.persistMigrations !== false) {
       await this.editConfig((freshConfig) => {
         for (const migration of pendingWorkspaceMigrations) {
           const project = freshConfig.projects.get(migration.projectPath);
