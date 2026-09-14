@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as fsPromises from "fs/promises";
 import type { z } from "zod";
 import {
+  TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
@@ -638,6 +639,22 @@ const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
  * that never call their completion tool.
  */
 const MAX_TASK_RECOVERY_ATTEMPTS = 5;
+
+/** See TaskService.workspaceStopRecords. */
+interface WorkspaceStopRecord {
+  /** Latch releases (one per overlapping cascade) run together once release conditions hold. */
+  releases: Array<() => void>;
+  /** Phase B cleanups whose ORIGINAL promise has not settled; timeouts never decrement this. */
+  cleanupInFlight: number;
+  /** Turn generation admitted at capture; undefined when the session was idle (nothing to wait for). */
+  capturedTurn: symbol | undefined;
+  turnSettled: boolean;
+  /** Live execution mirror at capture (reawakened child); undefined when none. */
+  capturedExecutionId: string | undefined;
+  executionSettled: boolean;
+  /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
+  capturedStreamMessageId: string | undefined;
+}
 function truncateSingleLine(text: string, maxChars: number): string {
   const singleLine = text.split(/[\r\n\u2028\u2029]/u, 1)[0].trim();
   return singleLine.length <= maxChars ? singleLine : `${singleLine.slice(0, maxChars - 1)}…`;
@@ -1330,7 +1347,14 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopsInProgress = new Map<string, number>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
-  private readonly retainedStopLatchReleasesByWorkspaceId = new Map<string, Array<() => void>>();
+  /**
+   * Ownership of every in-progress stop, keyed by workspace (see beginWorkspaceStop). The latch
+   * a record guards drops only when BOTH hold: the captured owner settled authoritatively
+   * (admitted turn generation ended; matching execution mirror settled) AND no cleanup issued
+   * by the cascade is still in flight. Persisted statuses, stop results, and missing
+   * registrations are not evidence — an accepted-but-preparing turn can still start.
+   */
+  private readonly workspaceStopRecords = new Map<string, WorkspaceStopRecord>();
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
 
@@ -1638,7 +1662,7 @@ export class TaskService implements AgentTaskIntegration {
     this.workspaceStopEpochs.set(workspaceId, (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1);
   }
 
-  private getWorkspaceStopEpoch(workspaceId: string): number {
+  getWorkspaceStopEpoch(workspaceId: string): number {
     return this.workspaceStopEpochs.get(workspaceId) ?? 0;
   }
 
@@ -1663,63 +1687,156 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
-  private isWorkspaceStopInProgress(workspaceId: string): boolean {
+  isWorkspaceStopInProgress(workspaceId: string): boolean {
     return this.workspaceStopsInProgress.has(workspaceId);
   }
 
   /**
-   * Park a stop latch whose owning cascade could not confirm the workspace's stop (failed
-   * stream cancellation or failed status persistence). The latch keeps refusing peer-message
-   * admission, but unlike an unconditionally discarded release it stays releasable: authoritative
-   * terminal settlement (releaseRetainedStopLatches) frees the workspace again instead of locking
-   * it out of peer messaging until restart.
+   * Phase A of a stop cascade (synchronous, under the global mutex): bump the epoch, latch the
+   * workspace and record what must settle before the latch may drop — the admitted turn
+   * generation (owner of any preparing/streaming work) and the live execution mirror. Nothing
+   * admitted after this point exists (admission barrier), so these captures are complete.
+   * Overlapping cascades add their release to the same record instead of resetting ownership.
    */
-  private retainStopLatchUntilSettlement(workspaceId: string, release: () => void): void {
-    const releases = this.retainedStopLatchReleasesByWorkspaceId.get(workspaceId) ?? [];
-    releases.push(release);
-    this.retainedStopLatchReleasesByWorkspaceId.set(workspaceId, releases);
+  private beginWorkspaceStop(workspaceId: string): WorkspaceStopRecord {
+    this.bumpWorkspaceStopEpoch(workspaceId);
+    const release = this.latchWorkspaceStopsInProgress([workspaceId]);
+    const existing = this.workspaceStopRecords.get(workspaceId);
+    if (existing != null) {
+      existing.releases.push(release);
+      return existing;
+    }
+    const capturedTurn = this.workspaceService.getActiveTurnGeneration(workspaceId);
+    const capturedExecutionId =
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
+    const record: WorkspaceStopRecord = {
+      releases: [release],
+      cleanupInFlight: 0,
+      capturedTurn,
+      turnSettled: capturedTurn == null,
+      capturedExecutionId,
+      executionSettled: capturedExecutionId == null,
+      capturedStreamMessageId:
+        this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(workspaceId).activeStream
+          ?.messageId,
+    };
+    this.workspaceStopRecords.set(workspaceId, record);
+    return record;
   }
 
   /**
-   * Release latches parked by retainStopLatchUntilSettlement. Call ONLY on admission-visible
-   * settlement evidence for the workspace: a persisted terminal (or cleared) execution mirror,
-   * or a persisted interrupted task status — either refuses peer sends on its own, so the latch
-   * is no longer the last line of defense. Each closure is removed before invocation because the
-   * underlying releases are plain refcount decrements, not idempotent.
+   * Phase B (outside the global mutex): every descendant's clearQueue + stopStream, issued
+   * exactly once while its latch is held and targeted at the execution captured in Phase A, raced
+   * concurrently under a per-child and one aggregate deadline. A timeout abandons the WAIT only:
+   * the original promise keeps its cleanup ownership and its later settlement rechecks release.
    */
-  releaseRetainedStopLatches(workspaceId: string): void {
-    const releases = this.retainedStopLatchReleasesByWorkspaceId.get(workspaceId);
-    if (releases == null) return;
-    this.retainedStopLatchReleasesByWorkspaceId.delete(workspaceId);
-    for (const release of releases) {
+  private async runWorkspaceStopCleanup(
+    targets: readonly string[],
+    options: {
+      label: string;
+      abandonPartial: boolean;
+      clearQueue: boolean;
+      onTimeout?: (workspaceId: string) => void;
+    }
+  ): Promise<void> {
+    const waits = targets.map(async (id) => {
+      const record = this.workspaceStopRecords.get(id);
+      if (record != null) record.cleanupInFlight += 1;
+      const expectedMessageId = record?.capturedStreamMessageId;
+      const cleanup = (async () => {
+        if (options.clearQueue) {
+          // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
+          // descendant must not keep pending input; issued once, never re-issued later.
+          try {
+            const clearQueueResult = this.workspaceService.clearQueue(id);
+            if (!clearQueueResult.success) {
+              log.debug(`${options.label}: clearQueue failed`, {
+                taskId: id,
+                error: clearQueueResult.error,
+              });
+            }
+          } catch (error: unknown) {
+            log.debug(`${options.label}: clearQueue threw`, { taskId: id, error });
+          }
+        }
+        // Success is NOT stop confirmation (an accepted-but-PREPARING turn has no registered
+        // stream yet); only the owner's settlement recorded on the stop record confirms.
+        const stopResult = await this.aiService.stopStream(id, {
+          abandonPartial: options.abandonPartial,
+          ...(expectedMessageId != null ? { expectedMessageId } : {}),
+        });
+        if (!stopResult.success) {
+          log.debug(`${options.label}: stopStream failed`, { taskId: id });
+        }
+      })();
+      // Ownership stays with the original promise: only ITS settlement (however late) counts
+      // the cleanup as finished, and even then it merely triggers a recheck.
+      void cleanup
+        .catch((error: unknown) => {
+          log.debug(`${options.label}: cleanup threw`, { taskId: id, error });
+        })
+        .finally(() => {
+          if (record != null) record.cleanupInFlight -= 1;
+          this.recheckWorkspaceStopRelease(id);
+        });
+      const outcome = await raceWithAbortAndTimeout(cleanup, {
+        timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+      });
+      if (outcome.kind !== "ok") {
+        log.warn(`${options.label}: stopStream timed out; retaining stop latch`, { taskId: id });
+        options.onTimeout?.(id);
+      }
+    });
+    const aggregate = await raceWithAbortAndTimeout(Promise.allSettled(waits), {
+      timeoutMs: TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
+    });
+    if (aggregate.kind !== "ok") {
+      log.warn(`${options.label}: cleanup exceeded the aggregate deadline`, {
+        taskIds: targets,
+      });
+    }
+  }
+
+  /**
+   * Phase C: drop the latch iff the captured owner settled and no cleanup is in flight. Called
+   * from every settlement path; a late cleanup completion or a persisted-status caller only
+   * triggers this recheck and never supplies evidence by itself. A removed workspace has no
+   * session left to start anything, so it counts as settled.
+   */
+  private recheckWorkspaceStopRelease(workspaceId: string): void {
+    const record = this.workspaceStopRecords.get(workspaceId);
+    if (record == null) return;
+    const removed = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null;
+    if (record.cleanupInFlight > 0) return;
+    if (!removed && !(record.turnSettled && record.executionSettled)) return;
+    this.workspaceStopRecords.delete(workspaceId);
+    for (const release of record.releases) {
       release();
     }
   }
 
   /**
-   * True when persisted evidence alone already refuses this workspace's peer sends, making a
-   * retained stop latch redundant: the workspace is missing, or its stable status is terminal
-   * with no live accepted running execution to rescue it. Active stable statuses return false —
-   * for a running child only the latch refuses, so it must be retained. Used to close the
-   * park-after-settlement race: settlement persists its terminal mirror BEFORE releasing
-   * retained latches, so a recheck that still sees a live execution is ordered before the
-   * settlement's release, which will then find the freshly parked latch.
+   * Authoritative execution settlement (WorkspaceTurnManager settled the MATCHING execution
+   * mirror and removed its live registration). Records the evidence for the captured execution
+   * and rechecks; persisted interrupted statuses from other callers reach only the recheck.
    */
-  private isStopSettledForAdmission(workspaceId: string): boolean {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (entry == null) return true;
-    const workspace = entry.workspace;
-    if (ACTIVE_AGENT_TASK_STATUSES.has(workspace.taskStatus ?? "running")) return false;
-    // Mirror of the peer relation leg's hasLiveRunningExecution: terminal-status senders are
-    // admitted only through a running mirror backed by a matching ACCEPTED live registration.
-    const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
-    const liveRunningExecution =
-      workspace.taskExecutionStatus === "running" &&
-      workspace.taskExecutionId != null &&
-      live != null &&
-      live.handleId === workspace.taskExecutionId &&
-      live.accepted;
-    return !liveRunningExecution;
+  releaseRetainedStopLatches(workspaceId: string): void {
+    const record = this.workspaceStopRecords.get(workspaceId);
+    if (record == null) return;
+    const liveHandleId =
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
+    if (record.capturedExecutionId != null && liveHandleId !== record.capturedExecutionId) {
+      record.executionSettled = true;
+    }
+    this.recheckWorkspaceStopRelease(workspaceId);
+  }
+
+  /** Owner settlement: the captured turn generation ended for good (see onWorkspaceTurnSettled). */
+  private recordWorkspaceTurnSettled(workspaceId: string, turnGeneration: symbol): void {
+    const record = this.workspaceStopRecords.get(workspaceId);
+    if (record?.capturedTurn !== turnGeneration) return;
+    record.turnSettled = true;
+    this.recheckWorkspaceStopRelease(workspaceId);
   }
 
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
@@ -1927,6 +2044,11 @@ export class TaskService implements AgentTaskIntegration {
         .catch((error: unknown) => {
           log.error("TaskService.handleTaskStreamError failed", { error });
         });
+    });
+
+    // Stop cascades wait on the admitted turn they captured; its owner reports settlement here.
+    this.workspaceService.onWorkspaceTurnSettled((workspaceId, turnGeneration) => {
+      this.recordWorkspaceTurnSettled(workspaceId, turnGeneration);
     });
 
     // Successor outcomes (withdrawn, admitted, streaming) are published as queue changes.
@@ -3531,6 +3653,15 @@ export class TaskService implements AgentTaskIntegration {
 
     const entryAtStart = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
     if (entryAtStart?.workspace.taskStatus !== "starting") {
+      return;
+    }
+    // Stop-cascade barrier: a queued launch stays queued while its own or its parent's stop
+    // latch is held; the next scheduler pass (after release) launches it.
+    if (
+      this.isWorkspaceStopInProgress(plan.taskId) ||
+      this.isWorkspaceStopInProgress(plan.parentWorkspaceId)
+    ) {
+      log.debug("startReservedAgentTask deferred: a stop is in progress", { taskId: plan.taskId });
       return;
     }
 
@@ -5660,7 +5791,13 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
     const stoppedTaskIds: string[] = [];
     const metadataToEmit = new Set<string>();
+    const activeHandlesById = new Map<
+      string,
+      Array<{ ownerWorkspaceId: string; handleId: string }>
+    >();
+    let taskIds: string[] = [];
 
+    // Phase A (global mutex, no stream/network awaits): see terminateAllDescendantAgentTasks.
     {
       await using _lock = await this.mutex.acquire();
       const cfg = this.config.loadConfigOrDefault();
@@ -5675,7 +5812,7 @@ export class TaskService implements AgentTaskIntegration {
         return Err("Task is not a descendant of this workspace");
       }
 
-      const taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
+      taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
       taskIds.sort(
         (left, right) =>
           this.getTaskDepthFromParentById(index.parentById, right) -
@@ -5684,104 +5821,104 @@ export class TaskService implements AgentTaskIntegration {
       // Latch the stop for the whole subtree BEFORE any await below: stopStream waits for
       // in-flight tool calls to settle, and one of those tool calls may be the very peer send
       // this stop must invalidate — a bump deferred to the status transition would deadlock
-      // behind it and let every admission probe pass in the meantime.
+      // behind it and let every admission probe pass in the meantime. The level latch also
+      // covers sends ENTERING during the cascade (they would treat the bumped generation as
+      // clean while statuses still read running); each latch drops once its owner settled and
+      // cleanup finished.
       for (const id of taskIds) {
-        this.bumpWorkspaceStopEpoch(id);
+        this.beginWorkspaceStop(id);
       }
-      // Level latch alongside the bump: the epoch only invalidates sends that captured a
-      // BASELINE before it — a send ENTERING during the awaits below would treat the bumped
-      // generation as clean while the subtree's statuses still read running, letting a
-      // prompt-influenced agent in the stopped subtree wake workspaces outside it. Held until
-      // every id's terminal status persists (the loop below), then the persisted statuses
-      // take over refusal.
-      const releaseStopLatch = this.latchWorkspaceStopsInProgress(taskIds);
-      try {
-        const activeWorkspaceTurns = await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
-          statuses: ["queued", "starting", "running"],
-        });
+      const activeWorkspaceTurns = await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
+        statuses: ["queued", "starting", "running"],
+      });
 
-        for (const id of taskIds) {
-          const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), id);
-          if (!current) continue;
-          const status = current.workspace.taskStatus ?? "running";
-          const activeHandles = activeWorkspaceTurns.filter((turn) => turn.workspaceId === id);
-          const executionActive =
-            ACTIVE_AGENT_TASK_STATUSES.has(status) || this.aiService.isStreaming(id);
-          if (!executionActive && activeHandles.length === 0) {
-            continue;
-          }
-
-          // Stop cancels the durable queue too, but never guidance authored after this snapshot.
-          const canceledGuidance = new Set(
-            current.workspace.taskPendingGuidance?.map((entry) => entry.id)
-          );
-          for (const handle of activeHandles) {
-            const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
-              handle.ownerWorkspaceId,
-              handle.handleId,
-              { scheduleQueueDrain: false }
-            );
-            if (!interrupted.success) {
-              return Err(interrupted.error);
-            }
-            await this.suppressTerminalAttention({
-              ownerWorkspaceId: handle.ownerWorkspaceId,
-              sourceKind: "workspace_turn",
-              sourceId: handle.handleId,
-            });
-          }
-
-          const clearQueueResult = this.workspaceService.clearQueue(id);
-          if (!clearQueueResult.success) {
-            log.debug("stopDescendantAgentTask: clearQueue failed", {
-              taskId: id,
-              error: clearQueueResult.error,
-            });
-          }
-          if (this.aiService.isStreaming(id)) {
-            try {
-              await this.aiService.stopStream(id, { abandonPartial: false });
-            } catch (error: unknown) {
-              log.debug("stopDescendantAgentTask: stopStream threw", { taskId: id, error });
-            }
-          }
-
-          let transitioned = false;
-          let parentWorkspaceId: string | undefined;
-          await this.editWorkspaceEntry(
-            id,
-            (workspace) => {
-              const previousStatus = workspace.taskStatus;
-              parentWorkspaceId = workspace.parentWorkspaceId;
-              workspace.taskPendingGuidance = workspace.taskPendingGuidance?.filter(
-                (entry) => !canceledGuidance.has(entry.id)
-              );
-              if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
-              const mutation = this.applyInterruptedTaskStatus(workspace);
-              transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
-            },
-            { allowMissing: true }
-          );
-          if (parentWorkspaceId != null) {
-            await this.suppressTerminalAttention({
-              ownerWorkspaceId: parentWorkspaceId,
-              sourceKind: "agent_task",
-              sourceId: id,
-            });
-          }
-          if (transitioned) {
-            this.recordTaskInterrupted(id, parentWorkspaceId);
-            // Authoritative settlement for latches parked by earlier failed cascades: the
-            // persisted interrupted status refuses peer sends on its own now.
-            this.releaseRetainedStopLatches(id);
-            this.rejectWaiters(id, new Error("Task stopped"));
-            metadataToEmit.add(id);
-          }
-          stoppedTaskIds.push(id);
+      for (const id of taskIds) {
+        const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), id);
+        if (!current) continue;
+        const status = current.workspace.taskStatus ?? "running";
+        const activeHandles = activeWorkspaceTurns.filter((turn) => turn.workspaceId === id);
+        const executionActive =
+          ACTIVE_AGENT_TASK_STATUSES.has(status) || this.aiService.isStreaming(id);
+        if (!executionActive && activeHandles.length === 0) {
+          continue;
         }
-      } finally {
-        releaseStopLatch();
+        activeHandlesById.set(
+          id,
+          activeHandles.map((handle) => ({
+            ownerWorkspaceId: handle.ownerWorkspaceId,
+            handleId: handle.handleId,
+          }))
+        );
+
+        // Stop cancels the durable queue too, but never guidance authored after this snapshot.
+        const canceledGuidance = new Set(
+          current.workspace.taskPendingGuidance?.map((entry) => entry.id)
+        );
+        let transitioned = false;
+        let parentWorkspaceId: string | undefined;
+        await this.editWorkspaceEntry(
+          id,
+          (workspace) => {
+            const previousStatus = workspace.taskStatus;
+            parentWorkspaceId = workspace.parentWorkspaceId;
+            workspace.taskPendingGuidance = workspace.taskPendingGuidance?.filter(
+              (entry) => !canceledGuidance.has(entry.id)
+            );
+            if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
+            const mutation = this.applyInterruptedTaskStatus(workspace);
+            transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
+          },
+          { allowMissing: true }
+        );
+        if (parentWorkspaceId != null) {
+          await this.suppressTerminalAttention({
+            ownerWorkspaceId: parentWorkspaceId,
+            sourceKind: "agent_task",
+            sourceId: id,
+          });
+        }
+        if (transitioned) {
+          this.recordTaskInterrupted(id, parentWorkspaceId);
+          this.rejectWaiters(id, new Error("Task stopped"));
+          metadataToEmit.add(id);
+        }
+        stoppedTaskIds.push(id);
       }
+    }
+
+    // Phase B (unlocked): workspace-turn handles are interrupted first — interruptWorkspaceTurn
+    // awaits its own stopStream, which must not run under the global mutex either — then each
+    // descendant's queue clear and stop, once, bounded and concurrent.
+    for (const [id, handles] of activeHandlesById) {
+      for (const handle of handles) {
+        const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
+          handle.ownerWorkspaceId,
+          handle.handleId,
+          { scheduleQueueDrain: false }
+        );
+        if (!interrupted.success) {
+          log.warn("stopDescendantAgentTask: interruptWorkspaceTurn failed", {
+            taskId: id,
+            handleId: handle.handleId,
+            error: interrupted.error,
+          });
+          continue;
+        }
+        await this.suppressTerminalAttention({
+          ownerWorkspaceId: handle.ownerWorkspaceId,
+          sourceKind: "workspace_turn",
+          sourceId: handle.handleId,
+        });
+      }
+    }
+    await this.runWorkspaceStopCleanup(stoppedTaskIds, {
+      label: "stopDescendantAgentTask",
+      abandonPartial: false,
+      clearQueue: true,
+    });
+    // Descendants skipped as inactive still hold a latch from Phase A; recheck the whole subtree.
+    for (const id of taskIds) {
+      this.recheckWorkspaceStopRelease(id);
     }
 
     for (const id of metadataToEmit) {
@@ -5803,7 +5940,11 @@ export class TaskService implements AgentTaskIntegration {
 
     const terminatedTaskIds: string[] = [];
     const terminationErrors: string[] = [];
+    let toTerminate: string[] = [];
+    let parentById = new Map<string, string>();
 
+    // Phase A (global mutex, no stream/network awaits): snapshot the subtree, latch it with its
+    // captured owners and settle waiters. Stops and removals run unlocked below.
     {
       await using _lock = await this.mutex.acquire();
 
@@ -5822,10 +5963,10 @@ export class TaskService implements AgentTaskIntegration {
 
       // Terminate the entire subtree to avoid orphaned descendant tasks.
       const descendants = this.listDescendantAgentTaskIdsFromIndex(index, taskId);
-      const toTerminate = Array.from(new Set([taskId, ...descendants]));
+      toTerminate = Array.from(new Set([taskId, ...descendants]));
 
       // Delete leaves first to avoid leaving children with missing parents.
-      const parentById = index.parentById;
+      parentById = index.parentById;
       const depthById = new Map<string, number>();
       for (const id of toTerminate) {
         depthById.set(id, this.getTaskDepthFromParentById(parentById, id));
@@ -5833,54 +5974,54 @@ export class TaskService implements AgentTaskIntegration {
       toTerminate.sort((a, b) => (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0));
 
       const terminationError = new Error("Task terminated");
-
-      // When a descendant workspace could not be removed, keep every ancestor of it
-      // so the surviving child never points at removed parent metadata.
-      const ancestorsBlockedByFailedChild = new Set<string>();
-      const blockAncestorsOf = (id: string) => {
-        for (
-          let cur = parentById.get(id);
-          cur != null && !ancestorsBlockedByFailedChild.has(cur);
-          cur = parentById.get(cur)
-        ) {
-          ancestorsBlockedByFailedChild.add(cur);
-        }
-      };
-
       for (const id of toTerminate) {
-        // Best-effort: stop any active stream immediately to avoid further token usage.
-        try {
-          const stopPromise = this.aiService.stopStream(id, { abandonPartial: true });
-          const stopOutcome = await raceWithAbortAndTimeout(stopPromise, {
-            timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
-          });
-          if (stopOutcome.kind !== "ok") {
-            void stopPromise.catch((error: unknown) => {
-              log.debug("terminateDescendantAgentTask: timed-out stopStream later threw", {
-                taskId: id,
-                error,
-              });
-            });
-            terminationErrors.push(`Timed out stopping task stream (${id})`);
-            blockAncestorsOf(id);
-            continue;
-          }
-          if (!stopOutcome.value.success) {
-            log.debug("terminateDescendantAgentTask: stopStream failed", { taskId: id });
-          }
-        } catch (error: unknown) {
-          log.debug("terminateDescendantAgentTask: stopStream threw", { taskId: id, error });
-        }
+        this.beginWorkspaceStop(id);
+        this.completedReportsByTaskId.delete(id);
+        this.rejectWaiters(id, terminationError);
+      }
+    }
 
+    // When a descendant workspace could not be removed, keep every ancestor of it
+    // so the surviving child never points at removed parent metadata.
+    const ancestorsBlockedByFailedChild = new Set<string>();
+    const blockAncestorsOf = (id: string) => {
+      for (
+        let cur = parentById.get(id);
+        cur != null && !ancestorsBlockedByFailedChild.has(cur);
+        cur = parentById.get(cur)
+      ) {
+        ancestorsBlockedByFailedChild.add(cur);
+      }
+    };
+
+    // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
+    // its workspace (and its ancestors) in place because the removal below would race a stream
+    // that may still be running.
+    const stopTimedOut = new Set<string>();
+    await this.runWorkspaceStopCleanup(toTerminate, {
+      label: "terminateDescendantAgentTask",
+      abandonPartial: true,
+      clearQueue: false,
+      onTimeout: (id) => stopTimedOut.add(id),
+    });
+    for (const id of toTerminate) {
+      if (stopTimedOut.has(id)) {
+        terminationErrors.push(`Timed out stopping task stream (${id})`);
+        blockAncestorsOf(id);
+      }
+    }
+
+    {
+      for (const id of toTerminate) {
+        if (stopTimedOut.has(id)) {
+          continue;
+        }
         if (ancestorsBlockedByFailedChild.has(id)) {
           terminationErrors.push(
             `Skipped removing task workspace (${id}): a descendant task workspace was not removed`
           );
           continue;
         }
-
-        this.completedReportsByTaskId.delete(id);
-        this.rejectWaiters(id, terminationError);
 
         try {
           let removePromise = this.pendingTaskWorkspaceRemovals.get(id);
@@ -5935,6 +6076,10 @@ export class TaskService implements AgentTaskIntegration {
 
         terminatedTaskIds.push(id);
       }
+    }
+    // Removed workspaces have no owner left; surviving (timed-out) ones keep their latch.
+    for (const id of toTerminate) {
+      this.recheckWorkspaceStopRelease(id);
     }
 
     // Free slots and start any queued tasks (best-effort).
@@ -6165,13 +6310,17 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     const interruptedTaskIds: string[] = [];
+    let descendants: string[] = [];
 
+    // Phase A (global mutex, config writes only — no stream or network awaits): snapshot the
+    // subtree, latch every descendant with its captured owner, persist terminal statuses and
+    // settle waiters. A hung child stream must never block unrelated task creation.
     {
       await using _lock = await this.mutex.acquire();
 
       const cfg = this.config.loadConfigOrDefault();
       const index = this.buildAgentTaskIndex(cfg);
-      const descendants = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).filter(
+      descendants = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).filter(
         (taskId) =>
           options?.workflowRunId == null ||
           this.isWorkflowRunDescendant(index, taskId, options.workflowRunId)
@@ -6190,163 +6339,78 @@ export class TaskService implements AgentTaskIntegration {
 
       const interruptionError = new Error("Parent workspace interrupted");
 
-      // Same protection as stopDescendantAgentTask: bump + latch the WHOLE descendant set
-      // before any await below. The hard-interrupted ancestor's suppression entry is
-      // level-triggered and cleared by the user's next real send (resetAutoResumeCount), which
-      // can happen while a descendant is still blocked in stopStream with taskStatus "running" —
-      // a peer send entering then would capture the already-bumped ancestor epoch as its clean
-      // baseline and could wake a cousin or the root after Stop. The latch holds until every
-      // descendant's terminal status persists — and is RETAINED (fail closed) for descendants
-      // whose interrupt processing throws: interruptStream's outer catch suppresses the error
-      // and reports success, so without an admission-visible stop marker a still-running
-      // descendant would resume peer sends right after the failed cascade. The retained latch
-      // refuses admission until the process restarts (which also kills the descendant's
-      // stream) or a later cascade completes.
+      // Bump + latch the WHOLE descendant set before any await below. The hard-interrupted
+      // ancestor's suppression entry is level-triggered and cleared by the user's next real send
+      // (resetAutoResumeCount), which can happen while a descendant's stop is still pending — a
+      // peer send entering then would capture the already-bumped ancestor epoch as its clean
+      // baseline and could wake a cousin or the root after Stop. Each latch holds until the
+      // captured owner settles and the descendant's cleanup finishes (recheckWorkspaceStopRelease).
       for (const id of descendants) {
-        this.bumpWorkspaceStopEpoch(id);
+        this.beginWorkspaceStop(id);
       }
-      const releaseById = new Map(
-        descendants.map((id) => [id, this.latchWorkspaceStopsInProgress([id])] as const)
-      );
-      try {
-        for (const id of descendants) {
-          try {
-            // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
-            // queued messages, so descendants must not keep pending input after a hard interrupt.
-            try {
-              const clearQueueResult = this.workspaceService.clearQueue(id);
-              if (!clearQueueResult.success) {
-                log.debug("terminateAllDescendantAgentTasks: clearQueue failed", {
-                  taskId: id,
-                  error: clearQueueResult.error,
-                });
-              }
-            } catch (error: unknown) {
-              log.debug("terminateAllDescendantAgentTasks: clearQueue threw", {
-                taskId: id,
-                error,
-              });
-            }
-
-            // Best-effort: stop any active stream immediately to avoid further token usage
-            // while preserving commit-worthy partial progress for inspection/resume. Success is
-            // NOT stop confirmation for latch purposes: an accepted-but-PREPARING turn has no
-            // registered stream yet, so stopStream no-ops with success while the turn can still
-            // start afterward — only terminal execution settlement confirms.
-            try {
-              const stopResult = await this.aiService.stopStream(id, { abandonPartial: false });
-              if (!stopResult.success) {
-                log.debug("terminateAllDescendantAgentTasks: stopStream failed", { taskId: id });
-              }
-            } catch (error: unknown) {
-              log.debug("terminateAllDescendantAgentTasks: stopStream threw", {
-                taskId: id,
-                error,
-              });
-            }
-
-            let preservedCompletedDescendant = false;
-            let transitionedToInterrupted = false;
-            let parentWorkspaceId: string | undefined;
-            const updated = await this.editWorkspaceEntry(
-              id,
-              (ws) => {
-                const previousStatus = ws.taskStatus;
-                parentWorkspaceId = ws.parentWorkspaceId;
-                preservedCompletedDescendant =
-                  this.applyInterruptedTaskStatus(ws) === "preserved-completed-report";
-                transitionedToInterrupted =
-                  !preservedCompletedDescendant && previousStatus !== "interrupted";
-              },
-              { allowMissing: true }
-            );
-            if (!updated) {
-              // Missing descendants should still reject prompt waiters promptly so task_await does
-              // not hang until timeout after a parent hard interrupt races with external cleanup.
-              this.rejectWaiters(id, interruptionError);
-              log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
-                taskId: id,
-              });
-              continue;
-            }
-
-            if (preservedCompletedDescendant) {
-              // A reawakened completed child executes under a live workspace-turn handle while
-              // its STABLE status stays terminal, so this branch persists neither an interrupted
-              // status nor a terminal execution mirror. Until that execution settles terminally,
-              // nothing admission-visible marks the stop once the latch drops — a still-running
-              // child (failed stream cancellation) or an accepted-but-PREPARING turn (stopStream
-              // no-ops with success before a stream registers, and the turn starts afterward)
-              // could message a root or cousin right after Stop. Retain the latch (fail closed,
-              // same contract as the catch below) whenever a live registration remains;
-              // settlement releases it via releaseRetainedStopLatches so the child is not
-              // barred until restart.
-              const release = releaseById.get(id);
-              if (
-                release != null &&
-                this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null
-              ) {
-                releaseById.delete(id);
-                this.retainStopLatchUntilSettlement(id, release);
-                // Park-then-recheck: a settlement racing this cascade may have persisted the
-                // terminal mirror and run ITS release before the park above. If persisted
-                // evidence now refuses on its own, free the latch immediately — no later
-                // settlement callback will.
-                if (this.isStopSettledForAdmission(id)) {
-                  this.releaseRetainedStopLatches(id);
-                } else {
-                  log.error(
-                    "terminateAllDescendantAgentTasks: unsettled live execution for completed descendant; retaining stop latch",
-                    { taskId: id }
-                  );
-                }
-              }
-              log.debug(
-                "terminateAllDescendantAgentTasks: preserving completed descendant report",
-                {
-                  taskId: id,
-                }
-              );
-              continue;
-            }
-
-            if (transitionedToInterrupted) {
-              this.recordTaskInterrupted(id, parentWorkspaceId);
-            }
-            // The persisted interrupted status is authoritative settlement for any latch a
-            // PREVIOUS failed cascade parked for this id — refusal now rides the status itself.
-            this.releaseRetainedStopLatches(id);
-
-            // Report monotonicity: descendants that did not complete a report must reject waiters
-            // once the interrupt status transition is persisted.
+      for (const id of descendants) {
+        try {
+          let preservedCompletedDescendant = false;
+          let transitionedToInterrupted = false;
+          let parentWorkspaceId: string | undefined;
+          const updated = await this.editWorkspaceEntry(
+            id,
+            (ws) => {
+              const previousStatus = ws.taskStatus;
+              parentWorkspaceId = ws.parentWorkspaceId;
+              preservedCompletedDescendant =
+                this.applyInterruptedTaskStatus(ws) === "preserved-completed-report";
+              transitionedToInterrupted =
+                !preservedCompletedDescendant && previousStatus !== "interrupted";
+            },
+            { allowMissing: true }
+          );
+          if (!updated) {
+            // Missing descendants should still reject prompt waiters promptly so task_await does
+            // not hang until timeout after a parent hard interrupt races with external cleanup.
             this.rejectWaiters(id, interruptionError);
-            interruptedTaskIds.push(id);
-          } catch (error: unknown) {
-            // Retain this descendant's latch as the stop marker (see comment above) and keep
-            // processing the remaining descendants instead of aborting the whole cascade;
-            // authoritative settlement (releaseRetainedStopLatches) frees it later. The same
-            // park-then-recheck as the preserved-completed branch closes the race with a
-            // settlement whose release ran before this park (running children recheck false and
-            // stay latched).
-            const release = releaseById.get(id);
-            if (release != null) {
-              releaseById.delete(id);
-              this.retainStopLatchUntilSettlement(id, release);
-              if (this.isStopSettledForAdmission(id)) {
-                this.releaseRetainedStopLatches(id);
-              }
-            }
-            log.error(
-              "terminateAllDescendantAgentTasks: interrupt processing failed; retaining stop latch",
-              { taskId: id, error }
-            );
+            log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
+              taskId: id,
+            });
+            continue;
           }
-        }
-      } finally {
-        for (const release of releaseById.values()) {
-          release();
+
+          if (preservedCompletedDescendant) {
+            // A reawakened completed child executes under a live workspace-turn handle while its
+            // STABLE status stays terminal: its stop record waits for that execution's mirror
+            // settlement (releaseRetainedStopLatches) instead of the interrupted status.
+            log.debug("terminateAllDescendantAgentTasks: preserving completed descendant report", {
+              taskId: id,
+            });
+            continue;
+          }
+
+          if (transitionedToInterrupted) {
+            this.recordTaskInterrupted(id, parentWorkspaceId);
+          }
+          // Report monotonicity: descendants that did not complete a report must reject waiters
+          // once the interrupt status transition is persisted.
+          this.rejectWaiters(id, interruptionError);
+          interruptedTaskIds.push(id);
+        } catch (error: unknown) {
+          // Keep processing the remaining descendants; this one's latch stays held (fail closed)
+          // until its owner settles and cleanup finishes.
+          log.error(
+            "terminateAllDescendantAgentTasks: interrupt processing failed; retaining stop latch",
+            { taskId: id, error }
+          );
         }
       }
+    }
+
+    // Phase B (unlocked, bounded, concurrent) then Phase C via recheckWorkspaceStopRelease.
+    await this.runWorkspaceStopCleanup(descendants, {
+      label: "terminateAllDescendantAgentTasks",
+      abandonPartial: false,
+      clearQueue: true,
+    });
+    for (const id of descendants) {
+      this.recheckWorkspaceStopRelease(id);
     }
 
     for (const taskId of interruptedTaskIds) {
@@ -10772,6 +10836,11 @@ export class TaskService implements AgentTaskIntegration {
    */
   async markInterruptedTaskRunning(workspaceId: string): Promise<boolean> {
     assert(workspaceId.length > 0, "markInterruptedTaskRunning: workspaceId must be non-empty");
+    // Stop-cascade barrier: a resume must not resurrect a task whose stop is still settling.
+    if (this.isWorkspaceStopInProgress(workspaceId)) {
+      log.debug("markInterruptedTaskRunning refused: a stop is in progress", { workspaceId });
+      return false;
+    }
 
     const configAtStart = this.config.loadConfigOrDefault();
     const entryAtStart = findWorkspaceEntry(configAtStart, workspaceId);

@@ -74,6 +74,7 @@ export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
 import type { QueueCutReceipt, TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import {
   CompactionCancellation,
   matchesCompactionCancellation,
@@ -779,6 +780,15 @@ interface AgentSessionOptions {
    */
   hasExternalSendPreflight?: () => boolean;
   onContextWindowRollover?: () => void;
+  /**
+   * Stop-cascade admission barrier and generation for this workspace (TaskService via
+   * WorkspaceService). Consulted at every turn admission and by the provider-start fence; an
+   * accepted turn captures the epoch at admission and must not start once it moved.
+   */
+  isStopInProgress?: () => boolean;
+  getStopEpoch?: () => number;
+  /** Authoritative turn settlement for stop cascades: the admitted generation ended for good. */
+  onTurnSettled?: (turnGeneration: symbol) => void;
 }
 
 interface CachedMemoryContext {
@@ -919,6 +929,12 @@ interface PreparationAttempt {
   onFailure?: (error: SendMessageError) => Promise<void> | void;
   /** Queue entry this attempt dispatched when a cut receipt names it (see QueueCutReceipt). */
   queueCutEntryId?: string;
+  /**
+   * Workspace stop epoch captured when the coordinator admitted this turn. The provider-start
+   * fence refuses to start once a stop bumped it (a stop's single stopStream cannot capture a
+   * turn that had no registered start yet); prepared candidates never refresh it at startup.
+   */
+  admissionStopEpoch?: number;
 }
 
 export class AgentSession {
@@ -940,6 +956,9 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly isStopInProgress: () => boolean;
+  private readonly getStopEpoch: () => number;
+  private readonly onTurnSettled?: (turnGeneration: symbol) => void;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -961,7 +980,13 @@ export class AgentSession {
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
-    phaseChanged: (phase, isCurrent) => this.publishTurnPhase(phase, isCurrent),
+    phaseChanged: (phase, isCurrent) => {
+      this.publishTurnPhase(phase, isCurrent);
+      // The coordinator transitions a generation to idle only from its owner's completion paths
+      // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
+      // settlement — a stop cascade waiting on the captured generation may release its latch.
+      if (phase === "idle") this.onTurnSettled?.(this.coordinator.turnId);
+    },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
@@ -1253,6 +1278,9 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      isStopInProgress,
+      getStopEpoch,
+      onTurnSettled,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1284,6 +1312,9 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.isStopInProgress = isStopInProgress ?? (() => false);
+    this.getStopEpoch = getStopEpoch ?? (() => 0);
+    this.onTurnSettled = onTurnSettled;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -4037,6 +4068,11 @@ export class AgentSession {
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
         );
       }
+      if (this.isStopInProgress()) {
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
+        );
+      }
       if (this.coordinator.closing) {
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
@@ -4443,6 +4479,13 @@ export class AgentSession {
     if (this.coordinator.admissionBlocked || isAdmissionStale()) {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    }
+    // Stop-cascade barrier: a send that passed WorkspaceService's entry check during preflight
+    // must still not become an admitted turn while the workspace's stop latch is held.
+    if (this.isStopInProgress()) {
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
       );
     }
     // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
@@ -4923,8 +4966,12 @@ export class AgentSession {
     // normally impossible since mutations refuse while sends are in
     // preflight (r42), but kept for paths that bypass WorkspaceService
     // entry accounting.
-    if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-      const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+    if (this.coordinator.admissionBlocked || isAdmissionStale() || this.isStopInProgress()) {
+      const error = createUnknownSendMessageError(
+        this.isStopInProgress()
+          ? WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE
+          : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+      );
       // The turn was already accepted (rows durable, onAccepted ran):
       // internal callers like the terminal-attention outbox mark state
       // delivered in onAccepted and rely on the accepted pre-stream failure
@@ -4972,6 +5019,7 @@ export class AgentSession {
       );
     }
     const preparedTurn = admission.turnId;
+    attempt.admissionStopEpoch ??= this.getStopEpoch();
 
     internal?.onTurnAdmissionCommitted?.();
 
@@ -5138,6 +5186,10 @@ export class AgentSession {
     ) {
       return Ok({ started: false });
     }
+    // Stop-cascade barrier: a resume is a stream-starting entry point like a send.
+    if (this.isStopInProgress()) {
+      return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
+    }
 
     const attempt: PreparationAttempt = {
       intent: "resume",
@@ -5164,6 +5216,7 @@ export class AgentSession {
       );
       if (admission.status !== "admitted") return Ok({ started: false });
       const preparedTurn = admission.turnId;
+      attempt.admissionStopEpoch = this.getStopEpoch();
       this.setAutoRetryResumeState(
         optionsForStream,
         internal?.agentInitiated,
@@ -8273,9 +8326,15 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(getErrorMessage(error)));
       }
       if (isStreamStartAborted()) return Ok(undefined);
+      // Provider-start fence closes over the epoch captured at this turn's admission (never
+      // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
+      const admissionStopEpoch = preparation?.admissionStopEpoch ?? this.getStopEpoch();
+      const stopFence = () =>
+        !this.isStopInProgress() && this.getStopEpoch() === admissionStopEpoch;
       const streamResult = await startRequest({
         assertAdmissionCurrent,
         withAdmissionCurrent,
+        stopFence,
         messages: requestMessages,
         workspaceId: this.workspaceId,
         modelString,
@@ -10263,6 +10322,11 @@ export class AgentSession {
     return this.coordinator.turnId;
   }
 
+  /** The admitted generation while a turn is preparing/streaming/completing; undefined when idle. */
+  getActiveTurnGeneration(): symbol | undefined {
+    return this.coordinator.phase === "idle" ? undefined : this.coordinator.turnId;
+  }
+
   /** Termination releases every receipt regardless of its release rule. */
   clearQueueCutReceipts(): void {
     this.queueCutReceipts.clear();
@@ -10692,6 +10756,9 @@ export class AgentSession {
       this.midStreamCompactionPending
     )
       return;
+    // Stop-cascade barrier: hold queued entries (do not dequeue or consume them) while the
+    // workspace's stop latch is held; the cascade's single clearQueue owns their removal.
+    if (this.isStopInProgress()) return;
     using _dispatch = this.coordinator.enterExecution();
     const candidate = this.messageQueue.peekNext();
     if (candidate == null) {
@@ -10722,6 +10789,7 @@ export class AgentSession {
       );
       if (admission.status !== "admitted") return Ok(undefined);
       const preparedTurn = admission.turnId;
+      attempt.admissionStopEpoch = this.getStopEpoch();
       // PREPARING observers can clear/reorder the head without retiring its owner. Never
       // consume a replacement entry or notify callbacks already handled by queue removal.
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
