@@ -1380,6 +1380,7 @@ export type DisplayedMessage =
       type: "compaction-boundary";
       id: string; // Display ID for UI/React keys
       historySequence: number; // Sequence of the compaction summary this boundary belongs to
+      timestamp?: number;
       boundaryKind?: ContextBoundaryKind;
       /** Distinguishes automatic rollover from a manual reset without changing boundary semantics. */
       contextWindowRollover?: true;

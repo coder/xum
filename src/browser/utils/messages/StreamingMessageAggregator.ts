@@ -330,6 +330,28 @@ function markRowsBeforeLatestContextBoundary(messages: DisplayedMessage[]): Disp
   return changed ? marked : messages;
 }
 
+/**
+ * The creation card belongs to the first user turn of the whole transcript. When the loaded
+ * rows start at a context boundary, that turn lives in older history the user has not loaded,
+ * so the card stays hidden with it. A fork copies compacted history and runs its own init
+ * afterwards; that init happened inside the loaded window, so its card stays visible.
+ */
+function findInitMessageInsertionIndex(
+  messages: DisplayedMessage[],
+  initStartTime: number
+): number | null {
+  const firstUserIndex = messages.findIndex((message) => message.type === "user");
+  const rowsBeforeFirstUser = firstUserIndex === -1 ? messages : messages.slice(0, firstUserIndex);
+  const boundary = rowsBeforeFirstUser.find(
+    (message): message is Extract<DisplayedMessage, { type: "compaction-boundary" }> =>
+      message.type === "compaction-boundary"
+  );
+  const initInsideLoadedWindow =
+    boundary === undefined ||
+    (boundary.timestamp !== undefined && initStartTime > boundary.timestamp);
+  return initInsideLoadedWindow ? firstUserIndex + 1 : null;
+}
+
 function extractAgentSkillSnapshotBody(snapshotText: string): string | null {
   assert(typeof snapshotText === "string", "extractAgentSkillSnapshotBody requires snapshotText");
 
@@ -3965,9 +3987,11 @@ export class StreamingMessageAggregator {
         : this.pendingCreationInit
           ? createPendingCreationInitMessage(this.pendingCreationInit)
           : null;
-      if (initMessage) {
-        // Creation belongs to the first user turn, even though init starts before it is persisted.
-        const insertionIndex = resultMessages.findIndex((message) => message.type === "user") + 1;
+      // Creation belongs to the first user turn, even though init starts before it is persisted.
+      const insertionIndex = initMessage
+        ? findInitMessageInsertionIndex(resultMessages, initMessage.timestamp)
+        : null;
+      if (initMessage && insertionIndex !== null) {
         resultMessages = resultMessages.slice();
         resultMessages.splice(insertionIndex, 0, initMessage);
       }
