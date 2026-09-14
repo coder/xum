@@ -71,10 +71,12 @@ const PLUGIN_ENABLEMENT_FIELDS = new Set(["enabledPluginServers"]);
 /** Ambiguous or malformed consent must never grant enablement or survive a prune. */
 function parsePluginEnablement(raw: string): unknown[] {
   const errors: jsonc.ParseError[] = [];
-  const root = jsonc.parseTree(raw, errors);
-  if (errors.length > 0 || root?.type !== "object") {
+  const root = jsonc.parseTree(raw, errors, { allowEmptyContent: true });
+  if (errors.length > 0 || (root !== undefined && root.type !== "object")) {
     throw new Error("Invalid MCP config document");
   }
+  // Empty/comment-only configuration contains no consent to preserve or revoke.
+  if (root === undefined) return [];
   if (findDuplicateProperty(root, PLUGIN_ENABLEMENT_FIELDS)) {
     throw new Error("Duplicate enabledPluginServers in MCP config");
   }

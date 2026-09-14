@@ -672,6 +672,27 @@ describe("MCP server disable filtering", () => {
       }
     });
 
+    test.each([
+      ["empty", ""],
+      ["whitespace-only", " \n\t\r\n"],
+      ["line-comment-only", "// Local MCP preferences\n"],
+      ["block-comment-only", "/* Keep this local note. */\n"],
+    ])("%s MCP documents allow toggles and consent pruning", async (_name, raw) => {
+      await fs.writeFile(configPath, raw);
+      expect((await service.listServers())[key]?.disabled).toBe(true);
+      await service.pruneEnabledPluginServers(prefix);
+      expect((await service.setServerEnabled(key, false)).success).toBe(true);
+      expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
+      expect((await service.setServerEnabled(key, true)).success).toBe(true);
+      expect((await service.listServers())[key]?.disabled).toBe(false);
+      expect(await readDocument()).toEqual({ enabledPluginServers: [key] });
+      if (raw.trim()) expect(await fs.readFile(configPath, "utf-8")).toContain(raw.trim());
+      await service.pruneEnabledPluginServers(prefix);
+      expect((await service.listServers())[key]?.disabled).toBe(true);
+      expect(await readDocument()).toEqual({});
+      if (raw.trim()) expect(await fs.readFile(configPath, "utf-8")).toContain(raw.trim());
+    });
+
     test("toggle and prune preserve comments, unknown fields, and raw server definitions", async () => {
       const untouched = `  // Server definitions belong to their owner.\n  "servers": {"ordinary": {"command":"echo original", "future":42}},\n  "unknown": {"enabledPluginServers": ["nested"], "keep": true}`;
       await fs.writeFile(configPath, `// user's config\n{\n${untouched}\n}\n`);
@@ -692,6 +713,8 @@ describe("MCP server disable filtering", () => {
     });
 
     const invalidDocuments = [
+      ["unterminated comment", "/* not a complete comment"],
+      ["invalid content after comments", "// valid comment\nnot-json"],
       ["invalid syntax", `{"enabledPluginServers":["${key}"], "broken": }`],
       ["duplicate property", `{"enabledPluginServers":[], "enabledPluginServers":["${key}"]}`],
       [

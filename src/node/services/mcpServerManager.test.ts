@@ -8262,6 +8262,153 @@ describe("MCPServerManager", () => {
     });
   }
 
+  for (const transport of ["stdio", "http", "sse", "auto"] as const) {
+    for (const workspaceConsent of [false, true]) {
+      for (const trackOverrides of [false, true]) {
+        test(`cold ${transport} startup gates sibling revocation (workspace consent: ${workspaceConsent}, override fence: ${trackOverrides})`, async () => {
+          using tmp = new DisposableTempDir("mcp-plugin-global-startup-revocation");
+          const plugin = pluginStdioConfig()[PLUGIN_KEY].plugin;
+          const definition: MCPServerInfo =
+            transport === "stdio"
+              ? {
+                  ...pluginStdioConfig()[PLUGIN_KEY],
+                  env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+                  cwd: tmp.path,
+                }
+              : { transport, url: "http://127.0.0.1:1", disabled: true, plugin };
+          const deps = {
+            agentPluginsMcpProvider: () => Promise.resolve({ [PLUGIN_KEY]: definition }),
+          };
+          const writer = new MCPConfigService(new Config(tmp.path), deps);
+          const reader = new MCPConfigService(new Config(tmp.path), deps);
+          expect((await writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+          const list = reader.listServers.bind(reader);
+          const discovery = spyOn(reader, "listServers").mockImplementationOnce(async (...args) => {
+            const snapshot = await list(...args);
+            expect(snapshot[PLUGIN_KEY]?.disabled).toBe(false);
+            expect((await writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+            return snapshot;
+          });
+          const exec = mock(() => Promise.reject(new Error("Reached exec")));
+          const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+            Promise.reject(new Error("Reached connection"))
+          );
+          const overrides = workspaceConsent ? { enabledServers: [PLUGIN_KEY] } : {};
+          manager.dispose();
+          manager = new MCPServerManager(reader, {
+            ...(trackOverrides
+              ? {
+                  pluginInvalidation: {
+                    keyPrefix: "plugin:",
+                    readToken: () => Promise.resolve("stable"),
+                    readOverridesEpoch: () => Promise.resolve("stable"),
+                    readWorkspaceOverrides: () => Promise.resolve(overrides),
+                    acquireOverridesLock: () => Promise.resolve(() => Promise.resolve()),
+                  },
+                }
+              : {}),
+          });
+          try {
+            await manager.getToolsForWorkspace(
+              workspaceRequest("global-startup", {
+                runtime: { exec } as unknown as Runtime,
+                overrides,
+              })
+            );
+            expect(transport === "stdio" ? exec : client).toHaveBeenCalledTimes(
+              workspaceConsent ? 1 : 0
+            );
+          } finally {
+            discovery.mockRestore();
+            client.mockRestore();
+          }
+        });
+      }
+    }
+  }
+
+  test("auto startup rechecks global consent before its SSE fallback", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-fallback-revocation");
+    const deps = {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve({
+          [PLUGIN_KEY]: {
+            transport: "auto" as const,
+            url: "http://127.0.0.1:1",
+            disabled: true,
+            plugin: pluginStdioConfig()[PLUGIN_KEY].plugin,
+          },
+        }),
+    };
+    const writer = new MCPConfigService(new Config(tmp.path), deps);
+    const reader = new MCPConfigService(new Config(tmp.path), deps);
+    expect((await writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    const acquire = reader.acquireGlobalPluginEnablementFence.bind(reader);
+    let admissions = 0;
+    const admission = spyOn(reader, "acquireGlobalPluginEnablementFence").mockImplementation(
+      async (...args) => {
+        if (++admissions === 2) {
+          expect((await writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+        }
+        return acquire(...args);
+      }
+    );
+    const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("HTTP not supported"), { status: 404 }))
+    );
+    manager.dispose();
+    manager = new MCPServerManager(reader);
+    try {
+      await manager.getToolsForWorkspace(workspaceRequest("global-fallback"));
+      expect(admissions).toBe(2);
+      expect(client).toHaveBeenCalledTimes(1);
+    } finally {
+      admission.mockRestore();
+      client.mockRestore();
+    }
+  });
+
+  test("global consent stays locked through exec and releases on startup failure", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-exec-lock");
+    const deps = {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve(
+          pluginStdioConfig({
+            env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+            cwd: tmp.path,
+          })
+        ),
+    };
+    const config = new MCPConfigService(new Config(tmp.path), deps);
+    expect((await config.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    let writerBlocked = false;
+    const exec = mock(async () => {
+      // Probe the real writer lock at the execution boundary, rather than
+      // assuming a prior discovery read still authorizes process creation.
+      const release = await crossProcessLock
+        .acquireCrossProcessLock({
+          lockPath: path.join(tmp.path, "mcp-config.lock"),
+          acquireTimeoutMs: 0,
+          staleMs: 5 * 60_000,
+          timeoutMessage: "writer blocked by startup",
+        })
+        .catch((error: unknown) => {
+          writerBlocked = error instanceof Error && error.message === "writer blocked by startup";
+          return undefined;
+        });
+      await release?.();
+      throw new Error("Startup failed at exec");
+    });
+    manager.dispose();
+    manager = new MCPServerManager(config);
+    await manager.getToolsForWorkspace(
+      workspaceRequest("global-exec-lock", { runtime: { exec } as unknown as Runtime })
+    );
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(writerBlocked).toBe(true);
+    expect((await config.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+  });
+
   async function globalPluginInvocationFixture(
     rootDir: string,
     overrides?: MCPWorkspaceRequestOptions["overrides"],
