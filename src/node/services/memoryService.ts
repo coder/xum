@@ -1540,15 +1540,26 @@ export class MemoryService extends EventEmitter {
       // case-insensitive filesystem a sibling's `a.md` and this note's `A.md`
       // are one file with one live stamp, and a spelling comparison would let
       // this note reuse — and the sibling later replace or delete — the copy.
-      // (siblingReliesOn additionally tells aliases from hard links; below.)
+      // Identity alone, though, conflates two aliases of one file with two
+      // HARD LINKS to it (`sameEntry`, shared by both predicates): an
+      // owner's independent link to a sibling's copy is the owner's entry,
+      // not the sibling's — treating it as sibling-owned would give an
+      // identical note a redundant import copy (and, at capacity, a
+      // permanently skipped handover). One directory entry (nlink 1) proves
+      // both spellings are aliases of it; with several links only a spelling
+      // equal under case folding (and Unicode normalization) is taken as an
+      // alias — the safe side where the two cannot be told apart.
+      const sameEntry = (recordTarget: string, targetRelPath: string, nlink: bigint) =>
+        nlink === 1n || foldedSpelling(recordTarget) === foldedSpelling(targetRelPath);
       let siblingRecords: LegacyAdoptionRecord[] | null = null;
-      const siblingOwns = async (_targetRelPath: string, liveStamp: string) => {
+      const siblingOwns = async (targetRelPath: string, live: { stamp: string; nlink: bigint }) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
         return siblingRecords.some(
           (record) =>
             record.created === true &&
             record.deleted !== true &&
-            (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
+            (record.targetStamp === live.stamp || record.replacementStamp === live.stamp) &&
+            sameEntry(record.target, targetRelPath, live.nlink)
         );
       };
       // A sibling's settled reuse record may still name a copy of ours (the
@@ -1569,15 +1580,10 @@ export class MemoryService extends EventEmitter {
       // receipts times under the owner-store lock). A path this pass itself
       // installs or removes is dropped from the cache (`forgetIdentity`) so a
       // stale identity never grants or withholds deletion authority.
-      // Identity alone conflates two aliases of one file with two HARD LINKS
-      // to it: removing one link leaves the sibling's link intact, so a
-      // receipt naming the other link does not rely on this one (a copy
+      // Removing one hard link leaves the sibling's link intact, so a receipt
+      // naming the other link does not rely on this one (`sameEntry`; a copy
       // wrongly held would block the creator's non-forced removal until the
-      // sibling's next pass). One directory entry (nlink 1) proves both
-      // spellings are aliases of it; with several links only a spelling
-      // equal under case folding (and Unicode normalization) is taken as an
-      // alias — the safe side for a removal where the two cannot be told
-      // apart.
+      // sibling's next pass).
       const receiptIdentities = new Map<
         string,
         Awaited<ReturnType<typeof adoptionTargetPresence>>
@@ -1607,12 +1613,7 @@ export class MemoryService extends EventEmitter {
           if (receipt === "absent") continue;
           if (receipt === "unreadable" || identity === "unreadable") return true;
           if (receipt.stamp !== identity.stamp) continue;
-          if (
-            identity.nlink === 1n ||
-            foldedSpelling(record.target) === foldedSpelling(targetRelPath)
-          ) {
-            return true;
-          }
+          if (sameEntry(record.target, targetRelPath, identity.nlink)) return true;
         }
         return false;
       };
@@ -2015,7 +2016,7 @@ export class MemoryService extends EventEmitter {
                 throw new Error(`cannot read the generation of adopted copy ${previous.target}`);
               }
               sharedReceipt =
-                presence !== "absent" && (await siblingOwns(previous.target, presence.stamp));
+                presence !== "absent" && (await siblingOwns(previous.target, presence));
             } catch (error) {
               log.warn(
                 "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
@@ -2100,8 +2101,9 @@ export class MemoryService extends EventEmitter {
           // it at the planned target. `pending` alone is never provenance: a
           // stamp-less pending record (an older build's) is ambiguous and
           // claims nothing.
+          const currentPresence = await adoptionTargetPresence(store.physicalPath(previous.target));
           const currentStamp =
-            (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+            typeof currentPresence === "string" ? undefined : currentPresence.stamp;
           const ours =
             previous.created === true &&
             currentStamp !== undefined &&
@@ -2113,10 +2115,10 @@ export class MemoryService extends EventEmitter {
           let siblings = false;
           if (!ours && priorContent === content) {
             try {
-              if (currentStamp === undefined) {
+              if (typeof currentPresence === "string") {
                 throw new Error(`cannot read the generation of adopted copy ${previous.target}`);
               }
-              siblings = await siblingOwns(previous.target, currentStamp);
+              siblings = await siblingOwns(previous.target, currentPresence);
             } catch (error) {
               log.warn(
                 "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
@@ -2498,7 +2500,7 @@ export class MemoryService extends EventEmitter {
     childId: string,
     relPath: string,
     content: string,
-    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>
+    siblingOwns: (targetRelPath: string, live: { stamp: string; nlink: bigint }) => Promise<boolean>
   ): Promise<{ relPath: string; write: boolean } | null> {
     for (const candidate of [
       relPath,
@@ -2519,11 +2521,11 @@ export class MemoryService extends EventEmitter {
       // (the lstat failed after the read succeeded) is unanswered, not
       // "nobody's" — the note waits (the caller skips it transiently).
       if (destination.content === content) {
-        const liveStamp = await adoptionTargetStamp(store.physicalPath(candidate));
-        if (liveStamp === null) {
+        const live = await adoptionTargetPresence(store.physicalPath(candidate));
+        if (typeof live === "string") {
           throw new Error(`cannot read the generation of adoption destination ${candidate}`);
         }
-        if (!(await siblingOwns(candidate, liveStamp))) return { relPath: candidate, write: false };
+        if (!(await siblingOwns(candidate, live))) return { relPath: candidate, write: false };
       }
     }
     return null;

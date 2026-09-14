@@ -4609,16 +4609,15 @@ describe("MemoryService", () => {
       expect(manifest.get("a/b")).toMatchObject({ target: "a/b", created: true });
     });
 
-    it("recognizes a sibling's copy by file identity, not by the spelling of its path", async () => {
-      // A real case-insensitive alias needs such a filesystem; here a second
-      // name is made to resolve to the SAME file with a hard link, which
-      // shares the identity stamp (ino:size:mtimeNs) exactly like an alias
-      // does. The alias name is deliberately not a case variant (on a
-      // case-insensitive filesystem `alias-of-a.md` would already exist and the link
-      // would fail before the predicates ran): they compare identity, not
-      // spelling, so any distinct name proves the same thing on every
-      // platform. The sibling's record names `a.md`; the candidate is
-      // `alias-of-a.md`.
+    it("recognizes a sibling's copy by file identity and directory entry, not by the spelling of its path", async () => {
+      // A real case-insensitive alias needs such a filesystem. Here `A.md` is
+      // hard-linked to the child's copy `a.md` (EEXIST on a case-insensitive
+      // filesystem, where the name already resolves to the one entry) and
+      // `alias-of-a.md` is an INDEPENDENT hard link to it. Both share the
+      // identity stamp (ino:size:mtimeNs); the predicates tell them apart by
+      // directory entry: one entry (nlink 1) or a case-folded-equal spelling
+      // is the sibling's copy under another name, a differently named link
+      // is the owner's own entry.
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const childCtx = { ...fixture.ctx };
@@ -4631,16 +4630,32 @@ describe("MemoryService", () => {
       await fsPromises.writeFile(path.join(childRoot, "a.md"), "same note");
       await fixture.service.listIndexEntries(childCtx);
       await fsPromises.link(path.join(ownerRoot, "a.md"), path.join(ownerRoot, "alias-of-a.md"));
-      // The grandchild's identical `alias-of-a.md` finds an identical file
-      // at its primary candidate — the child's copy under another name. Not
-      // reused: the grandchild gets its own copy.
+      await fsPromises
+        .link(path.join(ownerRoot, "a.md"), path.join(ownerRoot, "A.md"))
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "EEXIST") throw error;
+        });
+      // The grandchild's identical `A.md` finds the child's copy at its
+      // primary candidate (a case alias of it): not reused, the grandchild
+      // gets its own copy. Its identical `alias-of-a.md` finds the owner's
+      // independent link: reused like any identical owner note, no copy.
+      await fsPromises.writeFile(path.join(grandchildRoot, "A.md"), "same note");
       await fsPromises.writeFile(path.join(grandchildRoot, "alias-of-a.md"), "same note");
       await fixture.service.listIndexEntries(grandchildCtx);
+      const grandchildManifest = await readLegacyAdoptionManifest(
+        legacyAdoptionManifestPath(path.dirname(grandchildRoot))
+      );
+      expect(grandchildManifest.get("A.md")).toMatchObject({
+        target: "imported/ws-grandchild/A.md",
+        created: true,
+      });
+      expect(grandchildManifest.get("alias-of-a.md")).toMatchObject({
+        target: "alias-of-a.md",
+        created: false,
+      });
       expect(
-        (
-          await readLegacyAdoptionManifest(legacyAdoptionManifestPath(path.dirname(grandchildRoot)))
-        ).get("alias-of-a.md")
-      ).toMatchObject({ target: "imported/ws-grandchild/alias-of-a.md", created: true });
+        await pathExists(path.join(ownerRoot, "imported", "ws-grandchild", "alias-of-a.md"))
+      ).toBe(false);
       // A receipt spelled as a CASE variant of the child's copy relies on
       // it: on a case-insensitive filesystem `A.md` IS `a.md` (the link
       // below fails with EEXIST and the name resolves to the one entry);
