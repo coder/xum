@@ -566,6 +566,38 @@ describe("WorkflowRunner attempt disposition", () => {
     ]);
   });
 
+  test("a Stop after the reservation returned still reaches a child whose launch is pending", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-pending-launch-abort");
+    const store = await createStore(tmp.path);
+    const abortController = new AbortController();
+    let reservationSignal: AbortSignal | undefined;
+    const runner = createRunner(store, {
+      async runAgent() {
+        throw new Error("must reserve through createAgentTasks");
+      },
+      async createAgentTasks(_specs, lifecycle) {
+        reservationSignal = lifecycle?.abortSignal;
+        await lifecycle?.onTaskCreated?.(0, "task_queued");
+        // createMany returns before the queued child launches; the task service re-checks the
+        // reservation signal at launch admission, so it must stay linked to the run.
+        return [{ taskId: "task_queued", status: "queued" }];
+      },
+      async waitForAgentTask(_taskId, _spec, waitOptions) {
+        expect(reservationSignal?.aborted).toBe(false);
+        abortController.abort();
+        await waitForAbort(waitOptions?.abortSignal);
+        throw new Error("Task interrupted");
+      },
+      readSettledAgentResult: async () => ({ kind: "cleanup-pending" }),
+    });
+
+    await expect(runner.run(RUN_ID, { abortSignal: abortController.signal })).rejects.toThrow();
+    expect(reservationSignal?.aborted).toBe(true);
+    expect((await store.getRun(RUN_ID)).steps).toMatchObject([
+      { taskId: "task_queued", status: "started" },
+    ]);
+  });
+
   test("a stalled reservation fails with a distinct timeout error and a breadcrumb", async () => {
     using tmp = new DisposableTempDir("workflow-runner-reservation-timeout");
     const store = await createStore(tmp.path);
