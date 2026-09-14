@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 
 import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 
@@ -881,12 +881,14 @@ describe("MemoryService", () => {
           scope: "global",
           relPath: "described.md",
           description: "a useful note",
+          carriesProjectSkillContent: false,
         },
         {
           path: "/memories/project/plain.md",
           scope: "project",
           relPath: "plain.md",
           description: "",
+          carriesProjectSkillContent: false,
         },
       ]);
     });
@@ -1164,6 +1166,212 @@ describe("MemoryService", () => {
       expect(entries.get("workspace:ws-stats:scratch.md")?.accessCount).toBe(1);
       for (const key of entries.keys()) {
         expect(key).not.toContain(fixture.checkout);
+      }
+    });
+
+    it("reads index provenance and descriptions under the store lock, so a tainted rewrite cannot pair new content with the old clean marker", async () => {
+      using fixture = await createFixture("ws-index-race");
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/racy.md",
+        "---\ndescription: clean facts\n---\nclean",
+        "agent"
+      );
+      const realGetEntries = fixture.metaService.getEntries.bind(fixture.metaService);
+      let releaseSnapshot!: () => void;
+      const snapshotHeld = new Promise<void>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+      let snapshotTaken!: () => void;
+      const snapshotReached = new Promise<void>((resolve) => {
+        snapshotTaken = resolve;
+      });
+      const spy = spyOn(fixture.metaService, "getEntries").mockImplementationOnce(async () => {
+        const snapshot = await realGetEntries();
+        snapshotTaken();
+        await snapshotHeld;
+        return snapshot;
+      });
+      try {
+        const listing = fixture.service.listIndexEntries(fixture.ctx);
+        await snapshotReached;
+        // Requested while the listing holds the lock: the rewrite (stamp, then
+        // content) lands only after the descriptions were read.
+        const tainted = {
+          ...fixture.ctx,
+          writeProvenance: { carriesProjectSkillContent: true as const },
+        };
+        const rewrite = fixture.service.strReplace(
+          tainted,
+          "/memories/global/racy.md",
+          "clean facts",
+          "from a skill",
+          "agent"
+        );
+        releaseSnapshot();
+        const entries = await listing;
+        expect(entries.find((entry) => entry.path === "/memories/global/racy.md")).toMatchObject({
+          description: "clean facts",
+          carriesProjectSkillContent: false,
+        });
+        expect((await rewrite).success).toBe(true);
+        expect(
+          (await fixture.service.listIndexEntries(fixture.ctx)).find(
+            (entry) => entry.path === "/memories/global/racy.md"
+          )
+        ).toMatchObject({ description: "from a skill", carriesProjectSkillContent: true });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("re-checks a preloaded file's provenance at its read, so a file that turned tainted after the index snapshot is withheld or flagged", async () => {
+      using fixture = await createFixture("ws-hot-race");
+      for (const name of ["a.md", "b.md"]) {
+        await fixture.service.create(
+          fixture.ctx,
+          `/memories/global/${name}`,
+          "clean facts",
+          "agent"
+        );
+        await fixture.metaService.setPinned(`global:${name}`, true);
+      }
+      const taintAfterSnapshot = ["a.md", "b.md"];
+      const realList = fixture.service.listIndexEntries.bind(fixture.service);
+      const spy = spyOn(fixture.service, "listIndexEntries").mockImplementation(async (ctx) => {
+        const entries = await realList(ctx);
+        // Another writer stamps and replaces a file between the index snapshot
+        // and the preload reads.
+        const name = taintAfterSnapshot.shift();
+        if (name !== undefined) {
+          await fixture.metaService.markCarriesProjectSkillContent(`global:${name}`);
+          await fsPromises.writeFile(
+            path.join(fixture.xumHome, "memory", "global", name),
+            "quotes a skill"
+          );
+        }
+        return entries;
+      });
+      try {
+        const countTokens = () => Promise.resolve(1);
+        // a.md turns tainted after the excluding turn's snapshot: withheld at its read.
+        const excluding = await fixture.service.listHotMemories(fixture.ctx, {
+          countTokens,
+          excludeProjectSkillContent: true,
+        });
+        expect(excluding.map((item) => item.path)).toEqual(["/memories/global/b.md"]);
+        // b.md turns tainted after the trusted turn's snapshot: preloaded, flagged.
+        const trusted = await fixture.service.listHotMemories(fixture.ctx, { countTokens });
+        expect(trusted.find((item) => item.path === "/memories/global/b.md")).toMatchObject({
+          content: "quotes a skill",
+          carriesProjectSkillContent: true,
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("records project skill provenance for tainted writes and exposes it to the index and hot set", async () => {
+      // Provenance rides the scope context of the writer (harvest of a trusted
+      // project-skill epoch, sweep over such an inbox, tainted chat turn): the
+      // sidecar marks the file, the index and hot set report it, and a routed
+      // request without trust can leave such files out.
+      using fixture = await createFixture("ws-provenance");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "clean", "agent");
+      // A later clean read or write does not launder the provenance.
+      await fixture.service.view(fixture.ctx, "/memories/global/from-skill.md");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "quotes",
+        "still quotes",
+        "agent"
+      );
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(meta.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
+
+      const entries = await fixture.service.listIndexEntries(fixture.ctx);
+      const byPath = (virtualPath: string) => entries.find((entry) => entry.path === virtualPath);
+      expect(byPath("/memories/global/from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(byPath("/memories/global/clean.md")?.carriesProjectSkillContent).toBe(false);
+      expect(await fixture.service.scopeCarriesProjectSkillContent(fixture.ctx)).toBe(true);
+
+      await fixture.metaService.setPinned("global:from-skill.md", true);
+      const countTokens = (text: string) => Promise.resolve(Math.ceil(text.length / 4));
+      const hot = await fixture.service.listHotMemories(fixture.ctx, { countTokens });
+      expect(
+        hot.find((item) => item.path === "/memories/global/from-skill.md")
+          ?.carriesProjectSkillContent
+      ).toBe(true);
+      const withheld = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens,
+        excludeProjectSkillContent: true,
+      });
+      expect(withheld.some((item) => item.path === "/memories/global/from-skill.md")).toBe(false);
+    });
+
+    it("reports a file's provenance with its content when a read asks for it", async () => {
+      // Read together under the store lock: the marker describes the bytes
+      // returned. A plain UI read keeps its exact shape.
+      using fixture = await createFixture("ws-read-provenance");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "clean", "agent");
+      const carrying = await fixture.service.readFileWithSha(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        { withProvenance: true }
+      );
+      expect(carrying.success && carrying.data.carriesProjectSkillContent).toBe(true);
+      const clean = await fixture.service.readFileWithSha(
+        fixture.ctx,
+        "/memories/global/clean.md",
+        {
+          withProvenance: true,
+        }
+      );
+      expect(clean.success && clean.data.carriesProjectSkillContent).toBe(false);
+      const plain = await fixture.service.readFileWithSha(fixture.ctx, "/memories/global/clean.md");
+      expect(plain.success && plain.data).toEqual({
+        content: "clean",
+        sha256: createHash("sha256").update("clean").digest("hex"),
+      });
+    });
+
+    it("leaves tainted files out of directory views for a turn that excludes project content", async () => {
+      // A directory view lists file names — repository-influenced for a file
+      // harvested from project skill content — so the exclusion applies to the
+      // virtual root, the scope root and subdirectories alike.
+      using fixture = await createFixture("ws-listing");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "x", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "y", "agent");
+      await fixture.service.create(tainted, "/memories/global/notes/from-skill-2.md", "x", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/notes/clean-2.md", "y", "agent");
+      const excluded = { excludeProjectSkillContent: true };
+      // The virtual root lists one level per scope; deeper views list files.
+      for (const [virtualPath, taintedName, cleanName] of [
+        ["/memories", "from-skill.md", "clean.md"],
+        ["/memories/global", "from-skill.md", "clean.md"],
+        ["/memories/global/notes", "from-skill-2.md", "clean-2.md"],
+      ] as const) {
+        const full = await fixture.service.view(fixture.ctx, virtualPath);
+        expect(full.success && full.output).toContain(taintedName);
+        const filtered = await fixture.service.view(fixture.ctx, virtualPath, excluded);
+        expect(filtered.success && filtered.output).toContain(cleanName);
+        expect(filtered.success && filtered.output).not.toContain(taintedName);
       }
     });
 
@@ -1665,5 +1873,125 @@ describe("MemoryService refinement journal", () => {
     expect(
       await fsPromises.readFile(path.join(fixture.xumHome, "memory", "global", "notes.md"), "utf-8")
     ).toBe("hello");
+  });
+});
+
+describe("MemoryService write provenance persistence", () => {
+  it("fails a tainted write whose provenance marker cannot persist, keeping content and marker paired", async () => {
+    // The post-write stats update is best-effort; the taint marker is not.
+    // A marker that cannot be written must fail the write, or a verified-clean
+    // file would hold tainted content for a later untrusted routed turn.
+    using fixture = await createFixture("ws-provenance-persist");
+    const tainted = {
+      ...fixture.ctx,
+      writeProvenance: { carriesProjectSkillContent: true as const },
+    };
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "clean", "agent");
+    const marker = spyOn(
+      fixture.metaService,
+      "markCarriesProjectSkillContent"
+    ).mockRejectedValueOnce(new Error("sidecar is read-only"));
+    try {
+      const failed = await fixture.service.strReplace(
+        tainted,
+        "/memories/global/notes.md",
+        "clean",
+        "quotes the skill",
+        "agent"
+      );
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("provenance");
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:notes.md")?.carriesProjectSkillContent).toBe(false);
+      // The content is untouched: the same edit applies once the marker persists.
+      const retried = await fixture.service.strReplace(
+        tainted,
+        "/memories/global/notes.md",
+        "clean",
+        "quotes the skill",
+        "agent"
+      );
+      expect(retried.success).toBe(true);
+      expect(
+        (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+      ).toBe(true);
+    } finally {
+      marker.mockRestore();
+    }
+  });
+});
+
+describe("MemoryService rename provenance", () => {
+  it("fails a rename whose provenance move cannot persist and leaves the file in place", async () => {
+    // A sidecar failure after the physical move would leave the destination's
+    // stale marker beside content of another provenance; the move persists
+    // first or the rename is refused.
+    using fixture = await createFixture("ws-rename-provenance");
+    const tainted = {
+      ...fixture.ctx,
+      writeProvenance: { carriesProjectSkillContent: true as const },
+    };
+    await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+    const move = spyOn(fixture.metaService, "renameKeys").mockRejectedValueOnce(
+      new Error("sidecar is read-only")
+    );
+    try {
+      const failed = await fixture.service.rename(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "/memories/global/renamed.md",
+        "agent"
+      );
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("provenance");
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(meta.has("global:renamed.md")).toBe(false);
+      // The file never moved: the same rename applies once the sidecar writes again.
+      const retried = await fixture.service.rename(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "/memories/global/renamed.md",
+        "agent"
+      );
+      expect(retried.success).toBe(true);
+      expect(
+        (await fixture.metaService.getEntries()).get("global:renamed.md")
+          ?.carriesProjectSkillContent
+      ).toBe(true);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
+  it("does not let a stale verified-clean destination marker survive a rename of unknown provenance", async () => {
+    // A marker left behind by an external deletion must not vouch for whatever
+    // is renamed onto that path later.
+    using fixture = await createFixture("ws-rename-stale-marker");
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "clean", "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/global/notes.md", "agent");
+    // Plant the stale marker a crashed deletion could leave.
+    await fixture.metaService.recordAccess("global:notes.md", {
+      write: true,
+      replacesContent: true,
+    });
+    expect(
+      (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+    ).toBe(false);
+    // A legacy file written straight to disk has no sidecar entry (unknown provenance).
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory", "global", "legacy.md"),
+      "legacy contents\n"
+    );
+    const renamed = await fixture.service.rename(
+      fixture.ctx,
+      "/memories/global/legacy.md",
+      "/memories/global/notes.md",
+      "agent"
+    );
+    expect(renamed.success).toBe(true);
+    expect(
+      (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+    ).toBeUndefined();
   });
 });

@@ -178,6 +178,9 @@ export class AttachmentService {
         id: entry.childTaskId,
         kind: "task",
         ...(typeof entry.title === "string" ? { title: entry.title } : {}),
+        // Same fail-closed reading as TaskService's report delivery: an
+        // artifact persisted before the verdict existed is of unknown provenance.
+        ...(entry.carriesProjectSkillContent !== false ? { carriesProjectSkillContent: true } : {}),
         completedAtMs: entry.updatedAtMs,
         ...(Number.isFinite(entry.reportTokenEstimate)
           ? { reportTokenEstimate: entry.reportTokenEstimate }

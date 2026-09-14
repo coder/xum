@@ -9,7 +9,10 @@ import type {
   TaskService,
 } from "@/node/services/taskService";
 
-import { createTaskSendMessageTool } from "./task_send_message";
+import {
+  TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR,
+  createTaskSendMessageTool,
+} from "./task_send_message";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 
 type TreeSendResult = Result<
@@ -157,5 +160,52 @@ describe("task_send_message tool", () => {
       taskId: "busy",
       retryAfterMs: 1501,
     });
+  });
+});
+
+describe("task_send_message project skill content sink", () => {
+  it("refuses to forward from a turn whose context carries excluded project skill content", async () => {
+    using tempDir = new TestTempDir("task-send-message-project-content");
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> => Promise.resolve(Ok({ delivery: "accepted", relation: "peer" }))
+    );
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
+      taskService: { sendAgentTreeMessage } as unknown as TaskService,
+      excludeProjectSkillContent: true,
+      projectSkillContentInContext: () => true,
+    });
+    await Promise.resolve(
+      expect(
+        Promise.resolve(
+          tool.execute!({ task_id: "child", message: "the skill says ..." }, toolCallOptions)
+        )
+      ).rejects.toThrow(TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR)
+    );
+    expect(sendAgentTreeMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("task_send_message provenance", () => {
+  it("forwards the sender context's project skill provenance under trust", async () => {
+    using tempDir = new TestTempDir("task-send-message-provenance");
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> =>
+        Promise.resolve(Ok({ delivery: "accepted", relation: "target_descendant" }))
+    );
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
+      taskService: { sendAgentTreeMessage } as unknown as TaskService,
+      projectSkillContentInContext: () => true,
+      projectSkillContentStillReadable: () => Promise.resolve(true),
+    });
+    await tool.execute!({ task_id: "child", message: "the skill says ..." }, toolCallOptions);
+    expect(sendAgentTreeMessage).toHaveBeenCalledWith(
+      "parent",
+      "child",
+      "the skill says ...",
+      undefined,
+      { carriesProjectSkillContent: true }
+    );
   });
 });

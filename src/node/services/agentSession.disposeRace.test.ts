@@ -209,6 +209,7 @@ describe("AgentSession disposal race conditions", () => {
       // Large enough to clear the tiny-segment threshold (chars/4 heuristic).
       const filler = "investigated the dispose race and traced the write path ".repeat(200);
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: gatedAiService,
         workspaceId,

@@ -46,7 +46,11 @@ import {
   memoryMutationLockKey,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
-import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import {
+  memoryLogicalKey,
+  type MemoryMetaService,
+  memoryEntryCarriesProjectSkillContent,
+} from "@/node/services/memoryMeta";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -79,13 +83,34 @@ export interface MemoryScopeContext {
    * and sidecar logical keys; empty when no project identity is available.
    */
   projectPath: string;
+  /**
+   * Provenance of the WRITES made through this context: set when the writer's
+   * own context carried repository-controlled project skill content (a
+   * harvest of a trusted project-skill epoch, a sweep over such an inbox, a
+   * chat turn whose request carried it), so the sidecar marks every file
+   * written as carrying it (MemoryMetaEntry.carriesProjectSkillContent).
+   */
+  writeProvenance?: { carriesProjectSkillContent: true };
 }
 
 export type MemoryActor = "agent" | "user";
 
 export type MemoryCommandResult =
-  | { success: true; output: string }
+  | {
+      success: true;
+      output: string;
+      /**
+       * The viewed file carries project skill provenance (or none is recorded
+       * for it): a routed turn's per-step consent gate arms on this result and
+       * an untrusted routed request redacts it like a project skill read.
+       */
+      carriesProjectSkillContent?: true;
+    }
   | { success: false; error: string };
+
+/** A `view` refused because the turn must not read project skill content (routed, untrusted). */
+export const MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
+  "Memory withheld: it carries project skill content and Project Trust is not granted for this workspace.";
 
 export interface MemoryChangeEvent {
   scope: MemoryScope;
@@ -109,10 +134,27 @@ export interface MemoryIndexEntry {
   relPath: string;
   /** Sanitized single-line description from frontmatter (may be empty). */
   description: string;
+  /** Sidecar provenance (MemoryMetaEntry.carriesProjectSkillContent); absent on test doubles. */
+  carriesProjectSkillContent?: boolean;
 }
 
 export type MemoryReadFileResult =
-  | { success: true; data: { content: string; sha256: string } }
+  | {
+      success: true;
+      data: {
+        content: string;
+        sha256: string;
+        /**
+         * Present when the read asked for provenance (readFileWithSha's
+         * withProvenance): the file's marker at the moment of THIS read, taken
+         * under the store lock together with the content, so a caller holding
+         * an index snapshot re-checks a file that can have been replaced with
+         * project-derived content after the snapshot. Unknown provenance reads
+         * as carrying.
+         */
+        carriesProjectSkillContent?: boolean;
+      };
+    }
   | { success: false; error: string };
 
 /**
@@ -621,15 +663,66 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     scope: MemoryScope,
     relPath: string,
-    options: { write: boolean }
+    options: { write: boolean; replacesContent?: boolean }
   ): Promise<void> {
     try {
       const key = this.logicalKeyFor(ctx, scope, relPath);
       if (key === null) return;
-      await this.metaService.recordAccess(key, options);
+      await this.metaService.recordAccess(key, {
+        write: options.write,
+        // Provenance rides the context: a write made with project skill
+        // content in the writer's context marks the file (sticky); a clean
+        // write replacing the whole content verifies it clean.
+        carriesProjectSkillContent:
+          options.write && ctx.writeProvenance?.carriesProjectSkillContent === true,
+        replacesContent: options.replacesContent,
+      });
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
     }
+  }
+
+  /**
+   * A write from a context carrying project skill content commits its
+   * provenance marker BEFORE the content lands: recordUsage above is
+   * best-effort, and a marker that failed to persist would leave a
+   * verified-clean file holding tainted content for a later untrusted routed
+   * turn to read. A marker that cannot be written fails the write instead.
+   */
+  private async commitWriteProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    relPath: string
+  ): Promise<void> {
+    if (ctx.writeProvenance?.carriesProjectSkillContent !== true) return;
+    const key = this.logicalKeyFor(ctx, scope, relPath);
+    if (key === null) return;
+    try {
+      await this.metaService.markCarriesProjectSkillContent(key);
+    } catch (error) {
+      throw new MemoryCommandError(
+        `Could not record the provenance of ${toVirtualPath(scope, relPath)}; the write was not applied (${getErrorMessage(error)})`
+      );
+    }
+  }
+
+  /**
+   * Directory listings for a turn that must not read project skill content:
+   * files carrying (or of unknown) provenance are left out, so their
+   * repository-influenced names never reach the provider either.
+   */
+  private async filterFilesByProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    files: string[],
+    excludeProjectSkillContent: boolean
+  ): Promise<string[]> {
+    if (!excludeProjectSkillContent) return files;
+    const meta = await this.metaService.getEntries();
+    return files.filter((relPath) => {
+      const key = this.logicalKeyFor(ctx, scope, relPath);
+      return !memoryEntryCarriesProjectSkillContent(key === null ? undefined : meta.get(key));
+    });
   }
 
   /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
@@ -639,6 +732,58 @@ export class MemoryService extends EventEmitter {
     await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
   }
 
+  /**
+   * Sidecar entries (pins, stats, provenance) move BEFORE the content on a
+   * rename: a sidecar failure after the physical move would leave the
+   * destination's stale marker — a verified-clean one from an earlier external
+   * deletion, say — beside content of another provenance, which a later
+   * untrusted routed read would trust. A move that cannot persist fails the
+   * rename instead.
+   */
+  private async commitRenameProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    oldRelPath: string,
+    newRelPath: string
+  ): Promise<void> {
+    const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
+    const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
+    if (oldKey === null || newKey === null) return;
+    try {
+      await this.metaService.renameKeys(oldKey, newKey);
+    } catch (error) {
+      throw new MemoryCommandError(
+        `Could not move the provenance of ${toVirtualPath(scope, oldRelPath)}; the rename was not applied (${getErrorMessage(error)})`
+      );
+    }
+  }
+
+  /**
+   * Best-effort inverse of commitRenameProvenance for a physical rename that
+   * failed after the sidecar moved; a failure here leaves both paths without
+   * an entry — unknown provenance, the conservative state.
+   */
+  private async revertRenameProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    oldRelPath: string,
+    newRelPath: string
+  ): Promise<void> {
+    const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
+    const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
+    if (oldKey === null || newKey === null) return;
+    try {
+      await this.metaService.renameKeys(newKey, oldKey);
+    } catch (error) {
+      log.debug("[MemoryService] failed to move memory provenance back after a failed rename", {
+        scope,
+        oldRelPath,
+        newRelPath,
+        error,
+      });
+    }
+  }
+
   private async recordRename(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -646,11 +791,10 @@ export class MemoryService extends EventEmitter {
     newRelPath: string
   ): Promise<void> {
     try {
-      const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
       const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
-      if (oldKey === null || newKey === null) return;
-      // Pins and stats follow the file; the rename itself counts as a use.
-      await this.metaService.renameKeys(oldKey, newKey);
+      if (newKey === null) return;
+      // Pins, stats and provenance already moved (commitRenameProvenance);
+      // the rename itself counts as a use — best-effort, like every stat.
       await this.metaService.recordAccess(newKey, { write: true });
     } catch (error) {
       log.debug("[MemoryService] failed to move memory usage stats on rename", {
@@ -956,7 +1100,12 @@ export class MemoryService extends EventEmitter {
   async view(
     ctx: MemoryScopeContext,
     virtualPath: string,
-    options?: { offset?: number; limit?: number }
+    options?: {
+      offset?: number;
+      limit?: number;
+      /** Routed turn without Project Trust: refuse files carrying (or of unknown) provenance. */
+      excludeProjectSkillContent?: boolean;
+    }
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -969,7 +1118,12 @@ export class MemoryService extends EventEmitter {
             const store = this.getStore(ctx, scope);
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
-            const files = await store.listFiles();
+            const files = await this.filterFilesByProvenance(
+              ctx,
+              scope,
+              await store.listFiles(),
+              options?.excludeProjectSkillContent === true
+            );
             sections.push(...renderTree(files, MEMORY_VIEW_MAX_DEPTH - 1, "  "));
           } catch (error) {
             // Self-healing: an unavailable scope must not break the whole view.
@@ -985,7 +1139,12 @@ export class MemoryService extends EventEmitter {
       // create roots, so clean checkouts have no physical dir until the first
       // write — but the scope itself always exists in the protocol.
       if (kind === "dir" || (kind === null && parsed.relPath === "")) {
-        const files = await store.listFiles();
+        const files = await this.filterFilesByProvenance(
+          ctx,
+          parsed.scope,
+          await store.listFiles(),
+          options?.excludeProjectSkillContent === true
+        );
         const prefix = parsed.relPath === "" ? "" : `${parsed.relPath}/`;
         const scopedFiles = files
           .filter((file) => file.startsWith(prefix))
@@ -1000,10 +1159,40 @@ export class MemoryService extends EventEmitter {
         throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
       }
 
-      const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
+      // Provenance gate BEFORE the read: the index and preload already hide
+      // tainted files from an untrusted routed turn, and an exact-path view
+      // must not be the way around them. A stamped result lets the per-step
+      // consent scan and request redaction classify the output. Check and read
+      // run under the target's mutation lock: writers replace the file and
+      // record its provenance inside that lock, so a view can never pair a
+      // stale "clean" marker with freshly tainted content.
+      const fileScope = this.requireFilePath(parsed, virtualPath);
+      const { content, carriesProjectSkillContent } = await withTargetMutationLock(
+        this.config.rootDir,
+        this.storeLockKey(store),
+        async () => {
+          const provenanceKey = this.logicalKeyFor(ctx, fileScope, parsed.relPath);
+          const carries = memoryEntryCarriesProjectSkillContent(
+            provenanceKey === null
+              ? undefined
+              : (await this.metaService.getEntries()).get(provenanceKey)
+          );
+          if (carries && options?.excludeProjectSkillContent === true) {
+            throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+          }
+          return {
+            content: await this.readBoundedTextFile(store, parsed.relPath, virtualPath),
+            carriesProjectSkillContent: carries,
+          };
+        }
+      );
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
-      return { success: true, output };
+      return {
+        success: true,
+        output,
+        ...(carriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
+      };
     });
   }
 
@@ -1040,6 +1229,7 @@ export class MemoryService extends EventEmitter {
           );
         }
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1050,7 +1240,7 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: store.physicalPath(parsed.relPath), content: fileText }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true, replacesContent: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1081,6 +1271,7 @@ export class MemoryService extends EventEmitter {
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1134,6 +1325,7 @@ export class MemoryService extends EventEmitter {
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1229,6 +1421,7 @@ export class MemoryService extends EventEmitter {
                 ).updated;
         assertWithinFileSizeCap(updated, maxFileBytes);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         const physicalPath = store.physicalPath(parsed.relPath);
         // Row is written before the write is acknowledged (mutation → row → ack).
@@ -1242,7 +1435,10 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: physicalPath, content: updated }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        await this.recordUsage(ctx, scope, parsed.relPath, {
+          write: true,
+          replacesContent: mutation.command === "create",
+        });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1464,7 +1660,13 @@ export class MemoryService extends EventEmitter {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, oldVirtualPath);
-        await store.rename(oldParsed.relPath, newParsed.relPath);
+        await this.commitRenameProvenance(ctx, scope, oldParsed.relPath, newParsed.relPath);
+        try {
+          await store.rename(oldParsed.relPath, newParsed.relPath);
+        } catch (error) {
+          await this.revertRenameProvenance(ctx, scope, oldParsed.relPath, newParsed.relPath);
+          throw error;
+        }
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
@@ -1539,18 +1741,50 @@ export class MemoryService extends EventEmitter {
 
   async readFileWithSha(
     ctx: MemoryScopeContext,
-    virtualPath: string
+    virtualPath: string,
+    options?: {
+      /**
+       * Also report the file's provenance, read under the store's mutation
+       * lock together with the content (writers stamp the sidecar and replace
+       * the file inside it), so the marker describes the content returned —
+       * never a clean marker beside freshly project-derived bytes. Intuition
+       * gates its provider reads on this verdict rather than on its earlier
+       * index snapshot.
+       */
+      withProvenance?: boolean;
+    }
   ): Promise<MemoryReadFileResult> {
     try {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      const read = async () => this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      const { content, carriesProjectSkillContent } =
+        options?.withProvenance === true
+          ? await withTargetMutationLock(
+              this.config.rootDir,
+              this.storeLockKey(store),
+              async () => {
+                const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+                const carries = memoryEntryCarriesProjectSkillContent(
+                  key === null ? undefined : (await this.metaService.getEntries()).get(key)
+                );
+                return { content: await read(), carriesProjectSkillContent: carries };
+              }
+            )
+          : { content: await read(), carriesProjectSkillContent: undefined };
       // Deliberately NOT recorded as a use: this is a human browsing the
       // Memory tab/settings, and usage stats must reflect agent reads only so
       // UI browsing never inflates hot-set ranking. (UI saves still count —
       // an edit is an explicit signal the file matters, like pinning.)
-      return { success: true, data: { content, sha256: sha256Hex(content) } };
+      return {
+        success: true,
+        data: {
+          content,
+          sha256: sha256Hex(content),
+          ...(carriesProjectSkillContent !== undefined ? { carriesProjectSkillContent } : {}),
+        },
+      };
     } catch (error) {
       if (error instanceof MemoryCommandError) {
         return { success: false, error: error.message };
@@ -1615,8 +1849,12 @@ export class MemoryService extends EventEmitter {
             }
           }
           await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+          await this.commitWriteProvenance(ctx, scope, parsed.relPath);
           await store.writeFile(parsed.relPath, content);
-          await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+          await this.recordUsage(ctx, scope, parsed.relPath, {
+            write: true,
+            replacesContent: true,
+          });
           this.emitChange(ctx, scope, parsed.relPath, actor);
           return { success: true as const, data: { sha256: sha256Hex(content) } };
         }
@@ -1647,57 +1885,98 @@ export class MemoryService extends EventEmitter {
         // Read-only enumeration (stream startup, Memory tab) must not create
         // scope roots unnecessarily. Missing roots list as empty.
         await store.assertRootSafe();
-        const files = await store.listFiles();
-        if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
-          // Files can be edited outside MemoryService; honor the cap at
-          // enumeration so a degenerate directory cannot force thousands of
-          // per-file reads on stream startup. The context-notes slot is exempt
-          // from the cap on write (writePinnedFile), so it must survive the cut
-          // too or the flush handoff would vanish from the next window's index.
-          log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          // The bounded walk may have stopped before reaching the notes: probe them
-          // directly. lstat (not store.kind, which follows symlinks) so the probe
-          // admits exactly what the walk's dirent filter would: a regular file. A
-          // symlinked notes slot must not smuggle an out-of-root file into the index.
-          const keepNotes =
-            scope === CONTEXT_NOTES.scope &&
-            (await fsPromises
-              .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
-              .then((stat) => stat.isFile())
-              .catch(() => false));
-          files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
-          if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
-            files.push(CONTEXT_NOTES.relPath);
-        }
-        for (const relPath of files) {
-          // Filenames are attacker-controlled: only index paths the memory tool
-          // itself would accept (rejects control chars, traversal,
-          // etc.), so a hostile name can never break out of its index line.
-          try {
-            parseMemoryPath(toVirtualPath(scope, relPath));
-          } catch {
-            log.debug("[MemoryService] skipping unaddressable file in memory index", {
-              scope,
-            });
-            continue;
-          }
-          let description = "";
-          try {
-            // Bounded prefix read: files can bypass service write caps when
-            // edited outside Xum, and this runs on every memory-enabled stream startup.
-            description = extractMemoryDescription(
-              await store.readFilePrefix(relPath, MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES)
-            );
-          } catch {
-            // Unreadable file: list it without a description.
-          }
-          entries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
-        }
+        // Enumeration, descriptions and the sidecar snapshot are read under the
+        // store's mutation lock: writers stamp the sidecar and replace the file
+        // inside it, so an index line can never pair the description of freshly
+        // tainted content with the verified-clean marker of the content it
+        // replaced (a routed turn without trust would preload it).
+        entries.push(
+          ...(await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), () =>
+            this.listScopeIndexEntries(ctx, scope, store)
+          ))
+        );
       } catch (error) {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
     }
     return entries;
+  }
+
+  /** One scope's index lines; the caller holds the store's mutation lock. */
+  private async listScopeIndexEntries(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    store: MemoryStore
+  ): Promise<MemoryIndexEntry[]> {
+    const entries: MemoryIndexEntry[] = [];
+    // Sidecar provenance rides the index so prompt injection and hot-set
+    // selection can withhold tainted files without a second enumeration.
+    const meta = await this.metaService.getEntries();
+    const files = await store.listFiles();
+    if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
+      // Files can be edited outside MemoryService; honor the cap at
+      // enumeration so a degenerate directory cannot force thousands of
+      // per-file reads on stream startup. The context-notes slot is exempt
+      // from the cap on write (writePinnedFile), so it must survive the cut
+      // too or the flush handoff would vanish from the next window's index.
+      log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
+      // The bounded walk may have stopped before reaching the notes: probe them
+      // directly. lstat (not store.kind, which follows symlinks) so the probe
+      // admits exactly what the walk's dirent filter would: a regular file. A
+      // symlinked notes slot must not smuggle an out-of-root file into the index.
+      const keepNotes =
+        scope === CONTEXT_NOTES.scope &&
+        (await fsPromises
+          .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
+          .then((stat) => stat.isFile())
+          .catch(() => false));
+      files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
+      if (keepNotes && !files.includes(CONTEXT_NOTES.relPath)) files.push(CONTEXT_NOTES.relPath);
+    }
+    for (const relPath of files) {
+      // Filenames are attacker-controlled: only index paths the memory tool
+      // itself would accept (rejects control chars, traversal,
+      // etc.), so a hostile name can never break out of its index line.
+      try {
+        parseMemoryPath(toVirtualPath(scope, relPath));
+      } catch {
+        log.debug("[MemoryService] skipping unaddressable file in memory index", {
+          scope,
+        });
+        continue;
+      }
+      let description = "";
+      try {
+        // Bounded prefix read: files can bypass service write caps when
+        // edited outside Xum, and this runs on every memory-enabled stream startup.
+        description = extractMemoryDescription(
+          await store.readFilePrefix(relPath, MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES)
+        );
+      } catch {
+        // Unreadable file: list it without a description.
+      }
+      const key = this.logicalKeyFor(ctx, scope, relPath);
+      entries.push({
+        path: toVirtualPath(scope, relPath),
+        scope,
+        relPath,
+        description,
+        // Unknown provenance (legacy entry, never-classified file) is tainted.
+        carriesProjectSkillContent: memoryEntryCarriesProjectSkillContent(
+          key === null ? undefined : meta.get(key)
+        ),
+      });
+    }
+    return entries;
+  }
+
+  /**
+   * Whether any memory file of the scope carries project skill provenance —
+   * a consolidation sweep reads freely across the scope, so its writes
+   * inherit the provenance of everything it could have read.
+   */
+  async scopeCarriesProjectSkillContent(ctx: MemoryScopeContext): Promise<boolean> {
+    return (await this.listIndexEntries(ctx)).some((entry) => entry.carriesProjectSkillContent);
   }
 
   /**
@@ -1712,9 +1991,13 @@ export class MemoryService extends EventEmitter {
       countTokens: (text: string) => Promise<number>;
       tokenBudgetActive?: boolean;
       onlyContextNotes?: boolean;
+      /** Leave files carrying project skill provenance out of the selection. */
+      excludeProjectSkillContent?: boolean;
     }
   ): Promise<MemoryHotSetItem[]> {
-    const entries = await this.listIndexEntries(ctx);
+    const entries = (await this.listIndexEntries(ctx)).filter(
+      (entry) => options.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+    );
     const meta = await this.metaService.getEntries();
     const candidates = entries.map((entry) => {
       const key = this.logicalKeyFor(ctx, entry.scope, entry.relPath);
@@ -1724,9 +2007,11 @@ export class MemoryService extends EventEmitter {
         pinned: stats?.pinned ?? false,
         accessCount: stats?.accessCount ?? 0,
         lastAccessedAt: stats?.lastAccessedAt ?? null,
+        carriesProjectSkillContent: entry.carriesProjectSkillContent,
       };
     });
-    return selectHotMemories({
+    const taintedPaths = new Set<string>();
+    const items = await selectHotMemories({
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
@@ -1734,16 +2019,37 @@ export class MemoryService extends EventEmitter {
       readFile: (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);
-        // Paths come from listIndexEntries (already enumerated under the scope
-        // roots), so no extra containment walk is needed for these reads.
-        // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
-        // anyway; +1 byte preserves its over-budget (truncation marker) check.
-        return this.getStore(ctx, scope).readFilePrefix(
-          parsed.relPath,
-          MEMORY_HOT_SET_MAX_ITEM_BYTES + 1
-        );
+        const store = this.getStore(ctx, scope);
+        // The index snapshot above is stale by the time a candidate is read: a
+        // tainted write landing in between would preload the new content under
+        // the old verified-clean classification. Marker check and read run
+        // under the store's mutation lock (writers stamp and replace inside
+        // it): a turn that excludes project skill content skips a file that
+        // turned tainted, a trusted turn flags the item. Paths come from
+        // listIndexEntries (already enumerated under the scope roots), so no
+        // extra containment walk is needed for these reads.
+        return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+          const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+          const carries = memoryEntryCarriesProjectSkillContent(
+            key === null ? undefined : (await this.metaService.getEntries()).get(key)
+          );
+          if (carries) {
+            if (options.excludeProjectSkillContent === true) {
+              throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+            }
+            taintedPaths.add(virtualPath);
+          }
+          // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
+          // anyway; +1 byte preserves its over-budget (truncation marker) check.
+          return store.readFilePrefix(parsed.relPath, MEMORY_HOT_SET_MAX_ITEM_BYTES + 1);
+        });
       },
     });
+    return items.map((item) =>
+      taintedPaths.has(item.path) && item.carriesProjectSkillContent !== true
+        ? { ...item, carriesProjectSkillContent: true }
+        : item
+    );
   }
 }
 
@@ -1762,6 +2068,13 @@ export interface MemorySessionContext {
    * sub-experiment is off or nothing qualifies.
    */
   hotMemoriesBlock: string | null;
+  /**
+   * An included memory (index entry or preloaded file) carries project skill
+   * provenance: a routed turn arms its consent gate on it, and writes made
+   * with this context in the prompt inherit the provenance. Absent on
+   * contexts built by test doubles (treated as clean).
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 /**

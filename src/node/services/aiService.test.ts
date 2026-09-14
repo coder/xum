@@ -41,6 +41,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type {
   ErrorEvent,
@@ -319,6 +320,8 @@ function stubCommonStreamMessageDependencies(args: {
   onPrepareMessagesForProvider?: (
     args: Parameters<typeof messagePipeline.prepareMessagesForProvider>[0]
   ) => void;
+  /** Skills the stubbed system context advertises to the turn (agent_skill_read's description). */
+  availableSkills?: AgentSkillDescriptor[];
 }): ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">> {
   spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(
     resolvedAgentResultFor(args.metadata)
@@ -338,7 +341,7 @@ function stubCommonStreamMessageDependencies(args: {
       systemMessage: "test-system-message",
       systemMessageTokens: 1,
       agentDefinitions: undefined,
-      availableSkills: undefined,
+      availableSkills: args.availableSkills,
       ancestorPlanFilePaths: [],
     });
   });
@@ -1098,6 +1101,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId?: string;
       useRequestedModelString?: boolean;
       experimentsService?: ExperimentsService;
+      availableSkills?: AgentSkillDescriptor[];
     }
   ): StreamMessageHarness {
     const { config, historyService, initStateManager, service } = createBasicAIService(
@@ -1130,6 +1134,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalProviderName: options?.canonicalProviderName,
       canonicalModelId: options?.canonicalModelId,
       useRequestedModelString: options?.useRequestedModelString,
+      availableSkills: options?.availableSkills,
       onPlanPayloadMessageIds: (messageIds) => planPayloadMessageIds.push(messageIds),
       onBuildStreamSystemContext: (contextArgs) => {
         if (!contextArgs.xumScope) {
@@ -2653,6 +2658,85 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ownerWorkspaceId: "owner-workspace",
       turnId: "turn-id",
     });
+  });
+
+  const projectSkillDescriptor: AgentSkillDescriptor = {
+    name: "repo-conventions",
+    description: "Repository conventions",
+    scope: "project",
+    advertise: true,
+    userInvocable: true,
+  };
+  const globalSkillDescriptor: AgentSkillDescriptor = {
+    ...projectSkillDescriptor,
+    name: "team-style",
+    scope: "global",
+  };
+
+  async function initialMetadataWithAdvertisedSkills(
+    xumHomePath: string,
+    availableSkills: AgentSkillDescriptor[],
+    options?: { excludeProjectSkillContent?: boolean }
+  ): Promise<Record<string, unknown>> {
+    const projectPath = path.join(xumHomePath, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-description-provenance";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHomePath, metadata, { availableSkills });
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "medium",
+      ...(options?.excludeProjectSkillContent === true ? { excludeProjectSkillContent: true } : {}),
+    });
+    expect(result.success).toBe(true);
+    const startStreamCall = harness.startStreamCalls[0];
+    if (!startStreamCall) {
+      throw new Error("Expected streamManager.startStream call arguments");
+    }
+    return initialMetadataFromStartStreamCall(startStreamCall);
+  }
+
+  it("stamps the assistant row when the request advertises a project skill's description", async () => {
+    // agent_skill_read's description carries each advertised project skill's
+    // repository-controlled description into the provider context; the reply
+    // can quote it and no history row records that channel, so the turn's own
+    // row is stamped for later routed requests to withhold.
+    using xumHome = new DisposableTempDir("ai-service-description-provenance");
+    const initialMetadata = await initialMetadataWithAdvertisedSkills(xumHome.path, [
+      globalSkillDescriptor,
+      projectSkillDescriptor,
+    ]);
+    expect(initialMetadata.carriesProjectSkillContent).toBe(true);
+  });
+
+  it("leaves the assistant row unstamped when no project skill description is advertised", async () => {
+    // Global skills are not project content; a project skill that opted out of
+    // advertising never enters the description; and a turn that excludes
+    // project skill content filters the descriptions instead of carrying them.
+    using xumHome = new DisposableTempDir("ai-service-description-provenance-clean");
+    expect(
+      await initialMetadataWithAdvertisedSkills(xumHome.path, [globalSkillDescriptor])
+    ).not.toHaveProperty("carriesProjectSkillContent");
+  });
+
+  it("leaves the assistant row unstamped for an opted-out project skill", async () => {
+    using xumHome = new DisposableTempDir("ai-service-description-provenance-optout");
+    expect(
+      await initialMetadataWithAdvertisedSkills(xumHome.path, [
+        { ...projectSkillDescriptor, advertise: false },
+      ])
+    ).not.toHaveProperty("carriesProjectSkillContent");
+  });
+
+  it("leaves the assistant row unstamped when the turn excludes project skill content", async () => {
+    using xumHome = new DisposableTempDir("ai-service-description-provenance-excluded");
+    expect(
+      await initialMetadataWithAdvertisedSkills(xumHome.path, [projectSkillDescriptor], {
+        excludeProjectSkillContent: true,
+      })
+    ).not.toHaveProperty("carriesProjectSkillContent");
   });
 
   it("omits routeProvider from initial stream metadata when unresolved", async () => {

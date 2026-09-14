@@ -1,3 +1,5 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { createHash } from "node:crypto";
 import { tool } from "ai";
 import type { z } from "zod";
@@ -184,6 +186,24 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // One cooperative deadline covers caller authorization, target discovery and delivery.
       const deadline = performance.now() + SESSION_HISTORY_SCAN_DEADLINE_MS;
       const args = TOOL_DEFINITIONS.session_history.schema.parse(input);
+      // Rows behind a rollover can carry project skill content the request's
+      // own filter never saw (an earlier trusted agent_skill_read): a routed
+      // turn without trust leaves such rows out, and any returned row carrying
+      // it stamps the result for the per-step consent scan.
+      const excludeProjectSkillContent = await toolExcludesProjectSkillContent(config);
+      // Taint is tracked per context window in scan order (a source row precedes the replies
+      // that can quote it); recent_first would surface those replies first. A routed turn
+      // (trust re-read wired) or an excluding turn cannot classify such a page: refuse it.
+      if (
+        args.recent_first === true &&
+        (excludeProjectSkillContent || config.projectSkillContentStillReadable !== undefined)
+      )
+        return {
+          success: false,
+          error: "recent_first_unavailable",
+          exhausted: false,
+          skipped_oversized_rows: 0,
+        };
       if (args.action === "search" && !args.query)
         return {
           success: false,
@@ -295,6 +315,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
         const cursor = args.cursor != null ? history.cursors.load(args.cursor, binding) : undefined;
+        // Windows already known to carry project skill content (this page or earlier pages).
+        const taintedWindows = new Set<string>(cursor?.taintedWindows ?? []);
         // One page budget is shared by the authorization scan and the target scan.
         const budget = {
           maxBytes: SESSION_HISTORY_TOOL_MAX_SCAN_BYTES,
@@ -336,6 +358,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                 result.exhausted = false;
                 result.nextCursor = history.cursors.save({
                   ...binding,
+                  taintedWindows: [...taintedWindows],
                   scan: cursor?.scan ?? null,
                   authorization,
                 });
@@ -350,6 +373,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               // Keep any target progress made while the in-flight receipt still authorized.
               result.nextCursor = history.cursors.save({
                 ...binding,
+                taintedWindows: [...taintedWindows],
                 scan: cursor?.scan ?? null,
                 authorization,
               });
@@ -375,6 +399,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             result.exhausted = false;
             result.nextCursor = history.cursors.save({
               ...binding,
+              taintedWindows: [...taintedWindows],
               scan: cursor?.scan ?? null,
               authorization,
             });
@@ -388,6 +413,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           deadline,
           requireExistingHistory: foreign,
           budget,
+          // A row skipped as oversized (a near-cap agent_skill_read result, say) is never
+          // classified: its window is tainted conservatively so the rows after it are
+          // withheld or stamped like the rows after a classified source.
+          onOversizedRow: ({ windowId }) => {
+            taintedWindows.add(windowId);
+          },
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
@@ -402,6 +433,16 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               return true;
             }
             if (foundItem) return false;
+            // Classified BEFORE every filter so the source row is seen even when the page
+            // returns only later rows: once a row of this window carries project skill
+            // content, every later row of the window can quote it — withheld for a turn that
+            // excludes project content, otherwise the result is stamped for the consent scan.
+            if (messagesCarryProjectSkillContent([message])) taintedWindows.add(windowId);
+            const rowTainted = taintedWindows.has(windowId);
+            if (rowTainted && excludeProjectSkillContent) {
+              result.withheldProjectSkillRows = (result.withheldProjectSkillRows ?? 0) + 1;
+              return true;
+            }
             if (args.window_id != null && args.window_id !== windowId) return true;
             const legacyItemId = getHistoryItemId(message);
             // Keep sequence and m:id inputs working, but return the exact row ID
@@ -450,6 +491,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               text: text.slice(start, end),
               nextCharOffset: undefined as number | undefined,
             };
+            if (rowTainted) result.carriesProjectSkillContent = true;
             items.push(item);
             if (byteLength() > payloadBudget && items.length > 1) {
               items.pop();
@@ -478,6 +520,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         if (scan.cursor && !foundItem)
           result.nextCursor = history.cursors.save({
             ...binding,
+            taintedWindows: [...taintedWindows],
             scan: scan.cursor,
             authorization,
           });

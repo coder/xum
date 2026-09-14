@@ -11,7 +11,7 @@ import type { ModelMessage } from "@/common/types/message";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AdvisorToolCallSnapshot, ToolModelUsageEvent } from "@/common/utils/tools/tools";
 import { log } from "@/node/services/log";
-import { createAdvisorTool } from "./advisor";
+import { ADVISOR_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE, createAdvisorTool } from "./advisor";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
 const ADVISOR_MODEL = "anthropic:claude-sonnet-4-20250514";
@@ -733,5 +733,66 @@ describe("advisor tool", () => {
       "advisor: failed to report model usage",
       expect.objectContaining({ error: "report callback failed" })
     );
+  });
+});
+
+describe("advisor project skill content gate", () => {
+  it("refuses instead of sending a transcript that carries excluded project skill content", async () => {
+    // The advisor runs on its own provider: a live read this stream taints
+    // the context, and an untrusted routed turn must not forward it.
+    using tempDir = new TestTempDir("advisor-project-content-excluded");
+    const { config, createModel } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "unused",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+    try {
+      const tool = createAdvisorTool({
+        ...config,
+        excludeProjectSkillContent: true,
+        projectSkillContentInContext: () => true,
+      });
+      const result: unknown = await tool.execute!({}, mockToolCallOptions);
+      expect(result).toMatchObject({
+        type: "error",
+        isError: true,
+        message: ADVISOR_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+      });
+      expect(createModel).not.toHaveBeenCalled();
+      expect(streamTextSpy).not.toHaveBeenCalled();
+    } finally {
+      streamTextSpy.mockRestore();
+    }
+  });
+
+  it("re-reads trust after model creation and refuses a revocation before dispatch", async () => {
+    using tempDir = new TestTempDir("advisor-project-content-revoked");
+    let trusted = true;
+    const { config, createModel } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "unused",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+    try {
+      const tool = createAdvisorTool({
+        ...config,
+        memoryWriteCarriesProjectSkillContent: true,
+        projectSkillContentStillReadable: () => Promise.resolve(trusted),
+        advisorRuntime: {
+          ...config.advisorRuntime,
+          // Revoked while the advisor model is being created.
+          createModel: () => {
+            trusted = false;
+            return createModel();
+          },
+        },
+      });
+      const result: unknown = await tool.execute!({}, mockToolCallOptions);
+      expect(result).toMatchObject({ type: "error", isError: true });
+      expect(createModel).toHaveBeenCalledTimes(1);
+      expect(streamTextSpy).not.toHaveBeenCalled();
+    } finally {
+      streamTextSpy.mockRestore();
+    }
   });
 });

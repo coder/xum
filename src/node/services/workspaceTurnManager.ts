@@ -278,6 +278,12 @@ export interface WorkspaceTurnCreateArgs {
   /** Internal-only: allow a persistent descendant agent workspace as an existing target. */
   allowAgentWorkspace?: boolean;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * The launching turn's context carried project skill content: stamped on the
+   * target's opening row so its provenance tracking inherits it (see
+   * TaskCreateArgs.carriesProjectSkillContent).
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 export interface WorkspaceTurnCreateResult {
@@ -1562,6 +1568,9 @@ export class WorkspaceTurnManager {
         acceptanceOrigin: "automatic",
         startStreamInBackground: true,
         requireIdle: !queuedForExistingWorkspace,
+        ...(args.carriesProjectSkillContent === true
+          ? { userRowCarriesProjectSkillContent: true }
+          : {}),
         onCanceled: async (reason) => {
           const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
           if (

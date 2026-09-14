@@ -1,3 +1,4 @@
+import type { AgentSkillScope } from "@/common/types/agentSkill";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -20,7 +21,11 @@ interface PreparationInputs {
     materializedTokens: string[];
     fileStates: [];
   }>;
-  materializeAgentSkillSnapshots(): Promise<MuxMessage[]>;
+  materializeAgentSkillSnapshots(): Promise<{
+    messages: MuxMessage[];
+    carriesProjectSkillContent: boolean;
+    resolvedScopes: Map<string, AgentSkillScope>;
+  }>;
   materializeMcpPromptSnapshots(metadata: unknown, invokingId: string): Promise<MuxMessage[]>;
   compactionMonitor: CompactionMonitor;
 }
@@ -42,7 +47,11 @@ async function fixture() {
     materializedTokens: ["@input.ts"],
     fileStates: [],
   });
-  const skills = spyOn(inputs, "materializeAgentSkillSnapshots").mockResolvedValue([skill]);
+  const skills = spyOn(inputs, "materializeAgentSkillSnapshots").mockResolvedValue({
+    messages: [skill],
+    carriesProjectSkillContent: false,
+    resolvedScopes: new Map(),
+  });
   const prompts = spyOn(inputs, "materializeMcpPromptSnapshots").mockImplementation(
     (_metadata, invokingId) =>
       Promise.resolve([

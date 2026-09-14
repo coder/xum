@@ -78,6 +78,96 @@ async function createFixture(options?: {
 }
 
 describe("memory tool sub-project workspaces", () => {
+  it("carries the tool configuration's write provenance into the scope context", async () => {
+    // A turn whose request carries project skill content marks every memory
+    // file it writes (MemoryService records it from ctx.writeProvenance).
+    using fixture = await createFixture();
+    expect(memoryScopeContextFromToolConfig(fixture.config).writeProvenance).toBeUndefined();
+    fixture.config.memoryWriteCarriesProjectSkillContent = true;
+    expect(memoryScopeContextFromToolConfig(fixture.config).writeProvenance).toEqual({
+      carriesProjectSkillContent: true,
+    });
+  });
+
+  it("stamps views of tainted memories, refuses them when the turn excludes project content, and taints later writes", async () => {
+    // Index and preload already hide tainted files from an untrusted routed
+    // turn; an exact-path `view` must not be the way around them, and under
+    // trust the stamped result lets the per-step consent scan classify it. A
+    // view also puts the content in the model's context, so the tool's later
+    // writes inherit the provenance.
+    using fixture = await createFixture();
+    fixture.config.memoryWriteCarriesProjectSkillContent = true;
+    const taintedWriter = createMemoryTool(fixture.config);
+    expect(
+      (
+        await run(taintedWriter, {
+          command: "create",
+          path: "/memories/global/from-skill.md",
+          file_text: "quotes the skill",
+        })
+      ).success
+    ).toBe(true);
+    fixture.config.memoryWriteCarriesProjectSkillContent = false;
+    const cleanTool = createMemoryTool(fixture.config);
+    expect(
+      (
+        await run(cleanTool, {
+          command: "create",
+          path: "/memories/global/clean.md",
+          file_text: "clean",
+        })
+      ).success
+    ).toBe(true);
+
+    const viewed = await run(cleanTool, {
+      command: "view",
+      path: "/memories/global/from-skill.md",
+    });
+    expect(viewed.success && viewed.carriesProjectSkillContent).toBe(true);
+    const cleanView = await run(cleanTool, { command: "view", path: "/memories/global/clean.md" });
+    expect(cleanView.success && cleanView.carriesProjectSkillContent).toBeUndefined();
+    // The view put project content in context: the tool's later writes carry it.
+    expect(
+      (
+        await run(cleanTool, {
+          command: "create",
+          path: "/memories/global/derived.md",
+          file_text: "derived",
+        })
+      ).success
+    ).toBe(true);
+    const meta = await new MemoryMetaService(fixture.xumHome).getEntries();
+    expect(meta.get("global:derived.md")?.carriesProjectSkillContent).toBe(true);
+    expect(meta.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
+
+    fixture.config.excludeProjectSkillContent = true;
+    const excludingTool = createMemoryTool(fixture.config);
+    const refused = await run(excludingTool, {
+      command: "view",
+      path: "/memories/global/from-skill.md",
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("withheld");
+    expect(
+      (await run(excludingTool, { command: "view", path: "/memories/global/clean.md" })).success
+    ).toBe(true);
+  });
+
+  it("records provenance for writes made after the stream's context turned tainted", async () => {
+    // Pre-stream rows were clean; a project skill read by an earlier step of
+    // the same stream taints later writes through the live accessor.
+    using fixture = await createFixture();
+    let carries = false;
+    fixture.config.projectSkillContentInContext = () => carries;
+    const tool = createMemoryTool(fixture.config);
+    await run(tool, { command: "create", path: "/memories/global/before.md", file_text: "a" });
+    carries = true;
+    await run(tool, { command: "create", path: "/memories/global/after.md", file_text: "b" });
+    const meta = await new MemoryMetaService(fixture.xumHome).getEntries();
+    expect(meta.get("global:before.md")?.carriesProjectSkillContent).toBe(false);
+    expect(meta.get("global:after.md")?.carriesProjectSkillContent).toBe(true);
+  });
+
   it("resolves project memory from the project identity, not the execution cwd", async () => {
     using fixture = await createFixture();
     // Simulate a sub-project workspace: tools execute in <checkout>/packages/app.

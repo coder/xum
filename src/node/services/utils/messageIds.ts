@@ -58,8 +58,10 @@ export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;
 
 /** Task report message IDs: task-report-{timestamp}-{random} */
+/** Id prefix of a child task's report row; a report persisted without provenance is unknown (see loadedSkillSnapshots). */
+export const TASK_REPORT_MESSAGE_ID_PREFIX = "task-report-";
 export const createTaskReportMessageId = (): string =>
-  `task-report-${Date.now()}-${randomSuffix(9)}`;
+  `${TASK_REPORT_MESSAGE_ID_PREFIX}${Date.now()}-${randomSuffix(9)}`;
 
 /** Task terminal-failure message IDs: task-failure-{timestamp}-{random} */
 export const createTaskFailureMessageId = (): string =>

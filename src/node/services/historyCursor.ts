@@ -104,6 +104,9 @@ export interface HistoryCursor {
   scan: HistoryScanState | null;
   // Keep the finished caller scan to revalidate its privacy floor on later target pages.
   authorization: { branchRoot: string; scan: HistoryScanState; proven: boolean } | null;
+  // Context windows in which a row carrying project skill content was already seen: the
+  // next page keeps withholding/stamping their later rows without re-seeing the source.
+  taintedWindows?: string[];
 }
 
 /** Backend-owned continuations avoid asking models to copy serialized scan state.
@@ -131,7 +134,7 @@ export class HistoryCursorStore {
   load(
     token: string,
     binding: Pick<HistoryCursor, "workspaceId" | "action" | "query">
-  ): Pick<HistoryCursor, "scan" | "authorization"> {
+  ): Pick<HistoryCursor, "scan" | "authorization" | "taintedWindows"> {
     const cursor = this.entries.get(token);
     if (
       !cursor ||
@@ -141,6 +144,10 @@ export class HistoryCursorStore {
     )
       throw new Error("invalid_cursor");
     // Retries (including concurrent calls) must start at the same immutable position.
-    return structuredClone({ scan: cursor.scan, authorization: cursor.authorization });
+    return structuredClone({
+      scan: cursor.scan,
+      authorization: cursor.authorization,
+      taintedWindows: cursor.taintedWindows,
+    });
   }
 }
