@@ -1394,20 +1394,53 @@ export class MCPServerManager {
     return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
   }
 
-  private async withComponentPolicyFence<T>(
+  private async withPluginAdmissionFence<T>(
     name: string,
     info: MCPServerInfo | undefined,
     dispatch: () => T,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string } = {}
   ): Promise<{ pending: T }> {
-    const release = await this.acquireComponentPolicyFence(name, info, options);
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+    const workspaceId = options.workspaceId;
+    const plugin =
+      info?.plugin ??
+      (workspaceId !== undefined
+        ? this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin
+        : undefined);
+    // Explicit workspace consent still wins over the global default. Named
+    // connection tests have no workspace and remain an explicit user action.
+    const requiresGlobalConsent =
+      workspaceId !== undefined &&
+      plugin?.sourceScope === "global" &&
+      !this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides?.enabledServers?.includes(name);
+    const releaseGlobal = requiresGlobalConsent
+      ? await this.configService.acquireGlobalPluginEnablementFence(name, {
+          signal: options.signal,
+          timeoutMs: remainingMs(),
+        })
+      : undefined;
     try {
-      const pending = dispatch();
-      // Observe early rejection while admission locks are being released.
-      Promise.resolve(pending).catch(() => undefined);
-      return { pending };
+      // Global consent is locked before the component try-lock. Uninstall can
+      // hold the component writer lock while pruning global consent, so this
+      // inner acquisition must remain non-blocking to avoid an inverted wait.
+      const release = await this.acquireComponentPolicyFence(name, info, {
+        signal: options.signal,
+        timeoutMs: remainingMs(),
+      });
+      try {
+        if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+        if (remainingMs() === 0)
+          throw new Error(`MCP server '${name}' is unavailable: admission timed out`);
+        const pending = dispatch();
+        // Observe early rejection while admission locks are being released.
+        Promise.resolve(pending).catch(() => undefined);
+        return { pending };
+      } finally {
+        await release();
+      }
     } finally {
-      await release();
+      await releaseGlobal?.();
     }
   }
 
@@ -4043,12 +4076,10 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            ({ pending } = await this.withComponentPolicyFence(
-              serverName,
-              undefined,
-              dispatch,
-              options
-            ));
+            ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+              ...options,
+              workspaceId,
+            }));
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
             // abort race cannot stop this callback, so a stalled home filesystem
@@ -4078,7 +4109,8 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
-              ({ pending } = await this.withComponentPolicyFence(serverName, undefined, dispatch, {
+              ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+                workspaceId,
                 signal: options?.signal,
                 timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
               }));
@@ -4492,7 +4524,7 @@ export class MCPServerManager {
         // Admit the named test after disk/OAuth preparation, before its connection
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
         try {
-          const { pending } = await this.withComponentPolicyFence(trimmedName, server, () =>
+          const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
             runServerTest(launch, projectPath, `server "${trimmedName}"`)
           );
           return await pending;
@@ -4985,11 +5017,11 @@ export class MCPServerManager {
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            const { pending } = await this.withComponentPolicyFence(
+            const { pending } = await this.withPluginAdmissionFence(
               serverName,
               servedInfo,
               dispatch,
-              { signal: abortSignal, timeoutMs: remainingMs() }
+              { workspaceId, signal: abortSignal, timeoutMs: remainingMs() }
             );
             if (pending === "retry") continue;
             return await pending;
@@ -5034,7 +5066,8 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
-            ({ pending } = await this.withComponentPolicyFence(serverName, servedInfo, dispatch, {
+            ({ pending } = await this.withPluginAdmissionFence(serverName, servedInfo, dispatch, {
+              workspaceId,
               signal: abortSignal,
               timeoutMs: remainingMs(),
             }));

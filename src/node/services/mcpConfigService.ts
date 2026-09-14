@@ -5,6 +5,7 @@ import * as path from "path";
 import * as jsonc from "jsonc-parser";
 import { isDeepStrictEqual } from "node:util";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import writeFileAtomic from "write-file-atomic";
@@ -515,16 +516,23 @@ export class MCPConfigService {
    */
   private writeQueue: Promise<unknown> = Promise.resolve();
 
+  private async acquireGlobalConfigLock(
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<() => Promise<void>> {
+    await this.ensureMuxRootDir();
+    return acquireCrossProcessLock({
+      lockPath: path.join(this.config.rootDir, "mcp-config.lock"),
+      acquireTimeoutMs: options.timeoutMs ?? 60_000,
+      staleMs: 5 * 60_000,
+      timeoutMessage:
+        "Another Mux process is currently updating MCP settings. Wait for it to finish and try again.",
+      signal: options.signal,
+    });
+  }
+
   private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const locked = async (): Promise<T> => {
-      await this.ensureMuxRootDir();
-      const release = await acquireCrossProcessLock({
-        lockPath: path.join(this.config.rootDir, "mcp-config.lock"),
-        acquireTimeoutMs: 60_000,
-        staleMs: 5 * 60_000,
-        timeoutMessage:
-          "Another Mux process is currently updating MCP settings. Wait for it to finish and try again.",
-      });
+      const release = await this.acquireGlobalConfigLock();
       try {
         return await fn();
       } finally {
@@ -534,6 +542,58 @@ export class MCPConfigService {
     const next = this.writeQueue.then(locked, locked);
     this.writeQueue = next.catch(() => undefined);
     return next;
+  }
+
+  /** Hold the writer's lock from a fresh consent read until invocation starts, not until it finishes. */
+  async acquireGlobalPluginEnablementFence(
+    name: string,
+    options: { signal?: AbortSignal; timeoutMs: number }
+  ): Promise<() => Promise<void>> {
+    assert(isCanonicalPluginServerKey(name), "Plugin server must have a canonical key");
+    const deadlineAt = Date.now() + options.timeoutMs;
+    const checkActive = () => {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt)
+        throw new Error(
+          `MCP server '${name}' is unavailable: global consent could not be read in time`
+        );
+    };
+    const bounded = async <T>(work: Promise<T>): Promise<T> => {
+      work.catch(() => undefined);
+      const result = await raceWithAbortAndTimeout(work, {
+        timeoutMs: Math.max(0, deadlineAt - Date.now()),
+        signal: options.signal,
+      });
+      checkActive();
+      if (result.kind !== "ok")
+        throw new Error(`MCP server '${name}' is unavailable: global consent could not be read`);
+      return result.value;
+    };
+    checkActive();
+    const acquisition = this.acquireGlobalConfigLock(options);
+    let release: () => Promise<void>;
+    try {
+      release = await bounded(acquisition);
+    } catch (error) {
+      acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+      throw error;
+    }
+    try {
+      // A process-local generation cannot revoke another backend's held tool.
+      // Open the document only AFTER acquisition; an older open inode is stale.
+      const raw = await bounded(
+        fs.promises.readFile(this.getGlobalConfigPath(), "utf-8").catch((error: unknown) => {
+          if (hasErrorCode(error, "ENOENT")) return "{}";
+          throw error;
+        })
+      );
+      if (!canonicalPluginKeys(parsePluginEnablement(raw)).includes(name))
+        throw new Error(`MCP server '${name}' is disabled globally`);
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
+    }
   }
 
   /** Caller must hold runExclusive; never acquires the lock itself. */
