@@ -33434,6 +33434,140 @@ describe("TaskService", () => {
       }
     );
 
+    test.each([
+      "abort-observed-by-second-checkpoint",
+      "checkpoint-throws",
+      "config-commit-throws",
+      "config-commit-throws-after-write",
+    ] as const)(
+      "a checkpointed reservation whose commit fails (%s) is authoritatively settled, never launchable",
+      async (failure) => {
+        const firstId = "checkpointed01";
+        const secondId = "checkpointed02";
+        const { config } = await setupTree([]);
+        stubStableIds(config, [firstId, secondId]);
+        const { taskService } = createTaskServiceHarness(config);
+        const internals = taskService as unknown as Internals;
+        const launch = spyOn(internals, "startReservedAgentTask").mockImplementation(() =>
+          Promise.resolve()
+        );
+        const controller = new AbortController();
+        const checkpointed: string[] = [];
+        const originalEdit = config.editConfig.bind(config);
+        // Only the reservation COMMIT (the first write after the checkpoint) fails; the fence
+        // that follows is an ordinary owned write.
+        let commitAttempted = false;
+        const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator) => {
+          if (checkpointed.length === 0 || commitAttempted) return await originalEdit(mutator);
+          commitAttempted = true;
+          if (failure === "config-commit-throws") throw new Error("config write failed");
+          const result = await originalEdit(mutator);
+          if (failure === "config-commit-throws-after-write") {
+            throw new Error("config write acknowledged late");
+          }
+          return result;
+        });
+        try {
+          const result = await taskService.createMany([spawnArgs(rootId), spawnArgs(rootId)], {
+            abortSignal: controller.signal,
+            // Runner semantics: the FIRST callback durably checkpoints its task id; the second
+            // observes Stop (or its own store failure) and throws before checkpointing.
+            onTaskReserved: (index, created) => {
+              if (index === 0) {
+                checkpointed.push(created.taskId);
+                return;
+              }
+              if (failure === "abort-observed-by-second-checkpoint") {
+                controller.abort();
+                throw new Error("Interrupted");
+              }
+              if (failure === "checkpoint-throws") throw new Error("store write failed");
+              checkpointed.push(created.taskId);
+            },
+          });
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).not.toBe("Task interrupted");
+        } finally {
+          editSpy.mockRestore();
+        }
+        expect(checkpointed[0]).toBe(firstId);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(launch).not.toHaveBeenCalled();
+        const persisted = findWorkspaceInConfig(config, firstId);
+        if (failure === "config-commit-throws-after-write") {
+          // The write landed after all: the record must be fenced, never left launchable.
+          expect(persisted?.taskStatus).toBe("interrupted");
+          expect(persisted?.taskLaunchError).toBeDefined();
+        } else {
+          expect(persisted).toBeUndefined();
+        }
+        // The checkpointed attempt belongs to this process: its failure before launch is an
+        // authoritative outcome the runner can dispose (failed → one replacement), not a
+        // "missing task" it has to keep waiting on.
+        expect(
+          await taskService.readAttemptOutcome(firstId, { requestingWorkspaceId: rootId })
+        ).toEqual({ kind: "terminal-no-report" });
+        expect(
+          await taskService.waitForAttemptSettlement(firstId, {
+            timeoutMs: 200,
+            requestingWorkspaceId: rootId,
+          })
+        ).toEqual({ kind: "terminal-no-report" });
+        // The scheduler cannot pick a fenced record up later.
+        await taskService.maybeStartQueuedTasks();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(launch).not.toHaveBeenCalled();
+        // Control: the same persisted state seen by a fresh process stays indeterminate (no owner).
+        const { taskService: legacyService } = createTaskServiceHarness(config);
+        expect(
+          (await legacyService.readAttemptOutcome(firstId, { requestingWorkspaceId: rootId })).kind
+        ).toBe("indeterminate");
+      }
+    );
+
+    test("a Stop landing during send admission is never overwritten by the launch's running transition", async () => {
+      const spawnedId = "stoppedduring1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const serviceRef: { current?: TaskService } = {};
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        sendMessage: mock(async (): Promise<Result<void>> => {
+          // The runner's interruptRun (Layer 2 cascade) lands while the send is being admitted.
+          await serviceRef.current!.terminateAllDescendantAgentTasks(rootId);
+          return Ok(undefined);
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      serviceRef.current = taskService;
+      const internals = taskService as unknown as Internals;
+      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve({
+          workspacePath: config.loadConfigOrDefault().projects.keys().next().value ?? "/tmp",
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          runtimeForTaskWorkspace: {
+            deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+            getWorkspacePath: () => "/tmp/stopped-during",
+          },
+          inheritedProjects: undefined,
+        })
+      );
+      spyOn(internals, "cleanupMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve()
+      );
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve(undefined)
+      );
+      const created = await taskService.createMany([spawnArgs(rootId)]);
+      expect(created.success).toBe(true);
+      await waitUntil(() => sendMessage.mock.calls.length === 1, "the send to be admitted");
+      // Let the launch's tail run after the cascade persisted "interrupted".
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("interrupted");
+      // Coherent readback: the stopped attempt is settled, not a stale "running" live child.
+      await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
+    });
+
     test("abort after send admission cannot un-launch: the execution exists and is stopped through the Layer 2 path", async () => {
       const spawnedId = "admittedchild1";
       const { config } = await setupTree([]);
