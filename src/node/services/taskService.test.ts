@@ -32255,5 +32255,80 @@ describe("TaskService", () => {
         restoreTimers();
       }
     });
+
+    test("an owner settling while Phase A still holds config writes keeps the latch until the planned cleanup ran", async () => {
+      const earlyId = "task-early";
+      const lateId = "task-late";
+      // Leaves interrupt first: the deeper descendant's status persists before its parent's.
+      const { config } = await setupTree([lateId, { id: earlyId, parent: lateId }]);
+      const { stopStream, pending } = controlledStopStream(new Set([earlyId, lateId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const turnByWorkspace = new Map([
+        [earlyId, Symbol("early-turn")],
+        [lateId, Symbol("late-turn")],
+      ]);
+      const turnSettledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
+      const clearQueue = mock((_workspaceId: string): Result<void> => Ok(undefined));
+      const { workspaceService } = createWorkspaceServiceMocks({
+        clearQueue,
+        getActiveTurnGeneration: mock((workspaceId: string) => turnByWorkspace.get(workspaceId)),
+        onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+          turnSettledListeners.add(listener);
+          return () => turnSettledListeners.delete(listener);
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      // Hold the SECOND descendant's status write open: the first descendant's status is already
+      // persisted while Phase A is still inside the mutex, and its owner settles meanwhile.
+      const gate = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<void>();
+      const originalEdit = config.editConfig.bind(config);
+      let heldOnce = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator) => {
+        // Hold the first config write that follows the early descendant's persisted status.
+        if (!heldOnce && findWorkspaceInConfig(config, earlyId)?.taskStatus === "interrupted") {
+          heldOnce = true;
+          held.resolve();
+          await gate.promise;
+        }
+        return await originalEdit(mutator);
+      });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        const teardown = taskService.terminateAllDescendantAgentTasks(rootId);
+        await Promise.race([
+          held.promise,
+          teardown.then(() => {
+            throw new Error("no config write was held after the early descendant persisted");
+          }),
+        ]);
+        expect(findWorkspaceInConfig(config, earlyId)?.taskStatus).toBe("interrupted");
+        expect(taskService.isWorkspaceStopInProgress(earlyId)).toBe(true);
+        // Owner settled before the cascade ever issued its cleanup: the planned (not yet
+        // started) cleanup still owns the latch, so new input cannot slip in ahead of the
+        // unscoped clearQueue/stopStream.
+        for (const listener of turnSettledListeners)
+          listener(earlyId, turnByWorkspace.get(earlyId)!);
+        expect(taskService.isWorkspaceStopInProgress(earlyId)).toBe(true);
+        expect(clearQueue).not.toHaveBeenCalled();
+        gate.resolve();
+        editSpy.mockRestore();
+        await teardown;
+        expect(clearQueue.mock.calls.filter((call) => call[0] === earlyId)).toHaveLength(1);
+        // Cleanup issued (pending stop) — still latched until its ORIGINAL promise settles.
+        expect(pending.has(earlyId)).toBe(true);
+        expect(taskService.isWorkspaceStopInProgress(earlyId)).toBe(true);
+        pending.get(earlyId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(earlyId)).toBe(false);
+        // The late descendant's owner never settled: cleanup done or not, it stays latched.
+        pending.get(lateId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(lateId)).toBe(true);
+      } finally {
+        editSpy.mockRestore();
+        restoreTimers();
+      }
+    });
   });
 });
