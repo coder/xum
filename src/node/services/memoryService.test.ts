@@ -4346,7 +4346,7 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerRoot, "shared.md"))).toBe(false);
     }, 30_000);
 
-    it("claims a migration copy installed before the receipt flipped instead of writing a second one", async () => {
+    it("reuses, without claiming, a migration copy installed before the receipt flipped", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const childCtx = { ...fixture.ctx };
@@ -4368,26 +4368,81 @@ describe("MemoryService", () => {
       );
       // The state a crash between install and flip leaves: the own copy sits
       // at the descendant's import slot, the receipt still names the shared
-      // copy.
+      // copy. No receipt was recorded before that install, so the file is
+      // indistinguishable from one the owner wrote there.
       const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
       await fsPromises.mkdir(path.dirname(ownCopy), { recursive: true });
       await fsPromises.writeFile(ownCopy, "same note");
-      const installed = (await adoptionTargetStamp(ownCopy))!;
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
       await fixture.service.listIndexEntries(grandchildCtx);
+      // Converges in one pass: the identical file is reused like any other
+      // identical occupied candidate (a plain receipt, no provenance), no
+      // second copy, and the pass is settled.
       const record = (await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")!;
-      expect(record).toMatchObject({ target: "imported/ws-grandchild/shared.md", created: true });
-      expect(record.targetStamp).toBe(installed);
+      expect(record).toMatchObject({ target: "imported/ws-grandchild/shared.md", created: false });
+      expect(record.targetStamp).toBeUndefined();
       expect(await fsPromises.readdir(path.join(ownerRoot, "imported", "ws-grandchild"))).toEqual([
         "shared.md",
       ]);
-      // With provenance, the claimed copy follows the grandchild's source out.
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(passes).toHaveBeenCalledTimes(1);
+      // Without provenance the file is not adoption's to delete: the bounded
+      // outcome is one redundant copy that stays.
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.rm(path.join(grandchildRoot, "shared.md"));
       await fixture.service.listIndexEntries(grandchildCtx);
-      expect(await pathExists(ownCopy)).toBe(false);
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
       expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
         "same note"
       );
+    });
+
+    it("never deletes an owner-authored file at the import slot that a migration retry merely reused", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(path.dirname(grandchildRoot)),
+        JSON.stringify({
+          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
+        })
+      );
+      // The owner has a note of its own at exactly the grandchild's import
+      // slot, with the same bytes, pinned — the slot is inside the writable
+      // notebook, so nothing forbids it. (Written directly: an owner command
+      // would first sweep the descendants and run the migration itself.)
+      const ownerKey = memoryLogicalKey("workspace", "imported/ws-grandchild/shared.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      const ownerFile = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      await fsPromises.mkdir(path.dirname(ownerFile), { recursive: true });
+      await fsPromises.writeFile(ownerFile, "same note");
+      await fixture.metaService.setPinned(ownerKey, true);
+      // The grandchild's migration finds it identical and reuses it; then
+      // its legacy source is deleted and reconciled.
+      await fixture.service.listIndexEntries(grandchildCtx);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(grandchildRoot, "shared.md"));
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await fsPromises.readFile(ownerFile, "utf-8")).toBe("same note");
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      const tombstone = (
+        await readLegacyAdoptionManifest(legacyAdoptionManifestPath(path.dirname(grandchildRoot)))
+      ).get("shared.md")!;
+      expect(tombstone).toMatchObject({ deleted: true, created: false });
     });
 
     it("treats an unreadable config as an unanswered sibling scan: nothing is deleted, the pass retries", async () => {
