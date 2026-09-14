@@ -4174,10 +4174,8 @@ describe("TaskService", () => {
         spyOn(manager, "interruptWorkspaceTurn").mockImplementationOnce(async (...args) => {
           // A concurrent writer after stop's capture horizon must not lose its fresh GUID.
           await config.editConfig((cfg) => {
-            cfg.projects
-              .get(projectPath)!
-              .workspaces.find((ws) => ws.id === childId)!
-              .taskPendingGuidance!.push(newGuidance);
+            const ws = cfg.projects.get(projectPath)!.workspaces.find((ws) => ws.id === childId)!;
+            (ws.taskPendingGuidance ??= []).push(newGuidance);
             return cfg;
           });
           return interrupt(...args);
@@ -11822,11 +11820,14 @@ describe("TaskService", () => {
     const stopping = taskService.stopDescendantAgentTask("tree-root", "sib-b");
     await stopStarted;
 
+    // The cascade persists the terminal status before its (still pending) stream stop, so the
+    // entering send is refused on the persisted status; the latch still covers the window.
+    expect(taskService.isWorkspaceStopInProgress("sib-b")).toBe(true);
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "beat the stop")).toEqual(
       Err({
-        code: "refused",
-        reason:
-          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+        code: "not_active",
+        message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+        taskStatus: "interrupted",
       })
     );
 
