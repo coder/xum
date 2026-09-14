@@ -3,7 +3,6 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
 import {
   validatePlanModeAccess,
-  validatePathInCwd,
   validateFileSize,
   validateNoRedundantPrefix,
   resolvePathWithinCwd,
@@ -77,130 +76,6 @@ describe("fileCommon", () => {
     });
   });
 
-  describe("validatePathInCwd", () => {
-    const cwd = "/workspace/project";
-    const runtime = createRuntime({ type: "local", srcBaseDir: cwd });
-
-    it("should allow relative paths within cwd", () => {
-      expect(validatePathInCwd("src/file.ts", cwd, runtime)).toBeNull();
-      expect(validatePathInCwd("./src/file.ts", cwd, runtime)).toBeNull();
-      expect(validatePathInCwd("file.ts", cwd, runtime)).toBeNull();
-    });
-
-    it("should allow absolute paths within extraAllowedDirs", () => {
-      expect(validatePathInCwd("/tmp/test.txt", cwd, runtime, ["/tmp"])).toBeNull();
-    });
-
-    it("should reject absolute paths outside cwd and extraAllowedDirs", () => {
-      const result = validatePathInCwd("/etc/passwd", cwd, runtime, ["/tmp"]);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should allow absolute paths within cwd", () => {
-      expect(validatePathInCwd("/workspace/project/src/file.ts", cwd, runtime)).toBeNull();
-      expect(validatePathInCwd("/workspace/project/file.ts", cwd, runtime)).toBeNull();
-    });
-
-    it("should reject paths that go up and outside cwd with ..", () => {
-      const result = validatePathInCwd("../outside.ts", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-      expect(result?.error).toContain("/workspace/project");
-    });
-
-    it("should reject paths that go multiple levels up", () => {
-      const result = validatePathInCwd("../../outside.ts", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should reject paths that go down then up outside cwd", () => {
-      const result = validatePathInCwd("src/../../outside.ts", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should reject absolute paths outside cwd", () => {
-      const result = validatePathInCwd("/etc/passwd", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should reject absolute paths in different directory tree", () => {
-      const result = validatePathInCwd("/home/user/file.ts", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should handle paths with trailing slashes", () => {
-      expect(validatePathInCwd("src/", cwd, runtime)).toBeNull();
-    });
-
-    it("should handle nested paths correctly", () => {
-      expect(validatePathInCwd("src/components/Button/index.ts", cwd, runtime)).toBeNull();
-      expect(validatePathInCwd("./src/components/Button/index.ts", cwd, runtime)).toBeNull();
-    });
-
-    it("should provide helpful error message mentioning to ask user", () => {
-      const result = validatePathInCwd("../outside.ts", cwd, runtime);
-      expect(result?.error).toContain("ask the user for permission");
-    });
-
-    it("should work with cwd that has trailing slash", () => {
-      const cwdWithSlash = "/workspace/project/";
-      expect(validatePathInCwd("src/file.ts", cwdWithSlash, runtime)).toBeNull();
-
-      const result = validatePathInCwd("../outside.ts", cwdWithSlash, runtime);
-      expect(result).not.toBeNull();
-    });
-
-    it("should reject tilde paths outside cwd", () => {
-      // Tilde paths expand to home directory, which is outside /workspace/project
-      const result = validatePathInCwd("~/other-project/file.ts", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should reject tilde paths to sensitive files", () => {
-      const result = validatePathInCwd("~/.ssh/id_rsa", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-
-    it("should reject bare tilde path", () => {
-      const result = validatePathInCwd("~", cwd, runtime);
-      expect(result).not.toBeNull();
-      expect(result?.error).toContain("restricted to the workspace directory");
-    });
-  });
-
-  it("should reject traversal outside cwd for SSH runtimes", () => {
-    const sshRuntime = createRuntime({
-      type: "ssh",
-      host: "user@localhost",
-      srcBaseDir: "/home/user/mux",
-      identityFile: "/tmp/fake-key",
-    });
-
-    const result = validatePathInCwd("../outside.ts", "/home/user/mux/project", sshRuntime);
-    expect(result).not.toBeNull();
-    expect(result?.error).toContain("restricted to the workspace directory");
-  });
-
-  it("should allow absolute paths within cwd for SSH runtimes", () => {
-    const sshRuntime = createRuntime({
-      type: "ssh",
-      host: "user@localhost",
-      srcBaseDir: "/home/user/mux",
-      identityFile: "/tmp/fake-key",
-    });
-
-    expect(
-      validatePathInCwd("/home/user/mux/project/src/file.ts", "/home/user/mux/project", sshRuntime)
-    ).toBeNull();
-  });
-
   describe("resolvePathWithinCwd", () => {
     const cwd = "/workspace/project";
     const runtime = createRuntime({ type: "local", srcBaseDir: cwd });
@@ -255,7 +130,7 @@ describe("fileCommon", () => {
       expect(result?.warning).toContain("auto-corrected");
     });
 
-    it("should allow absolute paths outside cwd (they will be caught by validatePathInCwd)", () => {
+    it("should allow absolute paths outside cwd", () => {
       // This validation only catches redundant prefixes, not paths outside cwd
       expect(validateNoRedundantPrefix("/etc/passwd", cwd, runtime)).toBeNull();
       expect(validateNoRedundantPrefix("/home/user/file.ts", cwd, runtime)).toBeNull();

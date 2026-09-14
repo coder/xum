@@ -33,7 +33,7 @@ import {
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { RuntimeError } from "@/node/runtime/Runtime";
-import { computeBaseRepoPath, SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import {
   buildLegacyRemoteProjectLayout,
   buildRemoteProjectLayout,
@@ -1110,12 +1110,6 @@ describeIntegration("Runtime integration tests", () => {
     const createSSHRuntime = (): SSHRuntime =>
       createTestRuntime("ssh", srcBaseDir, sshConfig) as SSHRuntime;
     const getLayout = (projectPath: string) => buildRemoteProjectLayout(srcBaseDir, projectPath);
-
-    test("computeBaseRepoPath returns correct path", async () => {
-      const layout = getLayout("/some/path/my-project");
-      const result = computeBaseRepoPath(srcBaseDir, "/some/path/my-project");
-      expect(result).toBe(layout.baseRepoPath);
-    }, 10000);
 
     test("forkWorkspace uses worktree when base repo exists", async () => {
       const runtime = createSSHRuntime();

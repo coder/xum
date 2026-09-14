@@ -258,34 +258,6 @@ describe("SSHConnectionPool", () => {
       expect(backoffMs).toBeGreaterThan(7_500); // 10 * 0.8 - some tolerance
       expect(backoffMs).toBeLessThanOrEqual(12_500); // 10 * 1.2 + some tolerance
     });
-
-    test("resetBackoff clears backoff state after failed probe", async () => {
-      const pool = new SSHConnectionPool();
-      const config: SSHRuntimeConfig = {
-        host: "nonexistent.invalid.host.test",
-        srcBaseDir: "/work",
-      };
-
-      // Trigger a failure via acquireConnection (will fail to connect)
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        pool.acquireConnection(config, { timeoutMs: 1000, maxWaitMs: 0 })
-      ).rejects.toThrow();
-
-      // Verify we're now in backoff
-      const healthBefore = pool.getConnectionHealth(config);
-      expect(healthBefore?.status).toBe("unhealthy");
-      expect(healthBefore?.backoffUntil).toBeDefined();
-
-      // Reset backoff
-      pool.resetBackoff(config);
-      const healthAfter = pool.getConnectionHealth(config);
-
-      expect(healthAfter).toBeDefined();
-      expect(healthAfter!.status).toBe("unknown");
-      expect(healthAfter!.consecutiveFailures).toBe(0);
-      expect(healthAfter!.backoffUntil).toBeUndefined();
-    });
   });
 
   describe("acquireConnection", () => {

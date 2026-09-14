@@ -340,13 +340,6 @@ export class DockerRuntime extends RemoteRuntime {
     return this.containerName;
   }
 
-  /**
-   * Get Docker image name
-   */
-  public getImage(): string {
-    return this.config.image;
-  }
-
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix = "Docker";

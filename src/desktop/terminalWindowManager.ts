@@ -159,18 +159,4 @@ export class TerminalWindowManager {
       this.windows.delete(workspaceId);
     }
   }
-
-  /**
-   * Close all terminal windows for all workspaces
-   */
-  closeAll(): void {
-    for (const [workspaceId, windowSet] of this.windows.entries()) {
-      for (const window of windowSet) {
-        if (!window.isDestroyed()) {
-          window.close();
-        }
-      }
-      this.windows.delete(workspaceId);
-    }
-  }
 }

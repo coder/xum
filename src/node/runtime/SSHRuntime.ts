@@ -354,17 +354,6 @@ function isGitPushTransportFailure(exitCode: number | null, errorMsg: string): b
 export type { SSHRuntimeConfig } from "./sshConnectionPool";
 
 /**
- * Compute the path to the shared bare base repo for a project on the remote.
- * Convention: <srcBaseDir>/<projectId>/.mux-base.git
- *
- * Exported for unit testing; runtime code should use the private
- * `SSHRuntime.getBaseRepoPath()` method instead.
- */
-export function computeBaseRepoPath(srcBaseDir: string, projectPath: string): string {
-  return buildRemoteProjectLayout(srcBaseDir, projectPath).baseRepoPath;
-}
-
-/**
  * Run `git show-ref --heads` against a local project and return the raw stdout
  * (newline-separated `<oid> <refname>` lines).
  *

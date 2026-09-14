@@ -375,21 +375,6 @@ export class SSHConnectionPool {
   }
 
   /**
-   * Reset backoff for a connection (e.g., after user intervention)
-   */
-  resetBackoff(config: SSHConnectionConfig): void {
-    const key = makeConnectionKey(config);
-    const health = this.health.get(key);
-    if (health) {
-      health.backoffUntil = undefined;
-      health.consecutiveFailures = 0;
-      health.status = "unknown";
-      this.clearReadyControlPaths(key);
-      log.info(`Reset backoff for SSH connection to ${config.host}`);
-    }
-  }
-
-  /**
    * Mark connection as healthy.
    * Call after successful SSH operations to maintain health state.
    */

@@ -47,18 +47,6 @@ def env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in {"1", "true"}
 
 
-def extract_thinking_from_config(config: dict) -> str | None:
-    """Extract thinking_level from config.json."""
-    return config.get("agent", {}).get("thinking_level")
-
-
-def extract_model_from_config(config: dict) -> str | None:
-    """Extract model_name from config.json."""
-    return config.get("agent", {}).get("model_name")
-
-
-
-
 def extract_trial_score(trial_result: dict) -> float | None:
     """Extract score from trial result, supporting multiple Harbor formats."""
     score = trial_result.get("score")

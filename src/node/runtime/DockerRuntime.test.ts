@@ -113,24 +113,10 @@ function getGhSetupCall(runtime: CredentialTestDockerRuntime): ExecCall | undefi
 }
 
 describe("DockerRuntime constructor", () => {
-  it("should return image via getImage()", () => {
-    const runtime = new DockerRuntime({ image: "node:20" });
-    expect(runtime.getImage()).toBe("node:20");
-  });
 
   it("should return /src for workspace path", () => {
     const runtime = new DockerRuntime({ image: "ubuntu:22.04" });
     expect(runtime.getWorkspacePath("/any/project", "any-branch")).toBe("/src");
-  });
-
-  it("should accept containerName for existing workspaces", () => {
-    // When recreating runtime for existing workspace, containerName is passed in config
-    const runtime = new DockerRuntime({
-      image: "ubuntu:22.04",
-      containerName: "mux-myproject-my-feature",
-    });
-    expect(runtime.getImage()).toBe("ubuntu:22.04");
-    // Runtime should be ready for exec operations without calling createWorkspace
   });
 });
 
