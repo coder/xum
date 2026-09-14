@@ -4292,9 +4292,11 @@ describe("MemoryService", () => {
           sidecar: "",
           target: "shared.md",
         });
-        await expect(
-          fixture.service.adoptLegacyPrivateStoreForRemoval(id, "ws-owner")
-        ).rejects.toThrow(/could not be folded/);
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval(id, "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/could not be folded/);
       }
       expect(await mdFiles()).toBe(MEMORY_MAX_FILES_PER_SCOPE);
       // The creator deletes its note: the copy two receipts stand on stays.
@@ -4966,9 +4968,11 @@ describe("MemoryService", () => {
         sidecar: "",
         target: "other.md",
       });
-      await expect(
-        fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner")
-      ).rejects.toThrow(/could not be folded/);
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/could not be folded/);
     });
   });
 
