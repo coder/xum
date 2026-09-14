@@ -246,6 +246,8 @@ export function resolveTaskAgentIdForResume(workspace: {
  * attribution to the state observed at the ended stream's own event.
  */
 export interface QueueCutAttributionSnapshot {
+  /** Session turn observed at emission, not after the task event lock is acquired. */
+  turnGeneration?: symbol;
   activeStream: { messageId: string; muxMetadata: unknown } | undefined;
   cutter: QueueCutCutter | undefined;
   hasPendingQueuedOrPreparingTurn: boolean;
@@ -461,6 +463,9 @@ export interface TurnAdmissionHost {
   ): Result<number>;
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
   countQueuedAgentPeerMessages(workspaceId: string): number;
+  getTurnGeneration(workspaceId: string): symbol | undefined;
+  /** Terminal task settlement releases receipts even if their source event has not arrived. */
+  clearQueueCutReceipts(workspaceId: string): void;
   /** Receipt of a host-selected queue cut (see QueueCutReceipt); undefined once released. */
   getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined;
   /** The cut stream's own stream-end has been classified; the receipt may now release. */
