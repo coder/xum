@@ -6135,11 +6135,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // workspace's metadata can still be built (the phantom-cleanup path
       // below removes the config entry all the same, and a child left with a
       // dangling parent and no pin would silently fall back to a private
-      // notebook). Failing to pin aborts the removal unless forced.
+      // notebook). Failing to pin aborts the removal unless forced. The
+      // owner is resolved from a STRICT config read: a lenient read of an
+      // unreadable or malformed config.json yields an empty topology, which
+      // would name this workspace its own owner and silently skip both the
+      // pinning and the shared-memory handover below — a destructive
+      // decision taken from fallback state. Strict, the failure lands in
+      // this catch: a non-forced removal aborts (retryable), a forced one
+      // proceeds with the loss logged.
       let sharedMemoryOwnerId = workspaceId;
       try {
         sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
-          this.config.loadConfigOrDefault(),
+          this.config.loadConfigOrDefault({ throwOnError: true }),
           workspaceId
         );
         verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
