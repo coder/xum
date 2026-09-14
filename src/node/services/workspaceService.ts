@@ -6136,13 +6136,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // below removes the config entry all the same, and a child left with a
       // dangling parent and no pin would silently fall back to a private
       // notebook). Failing to pin aborts the removal unless forced.
-      const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
-        this.config.loadConfigOrDefault(),
-        workspaceId
-      );
-      verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
-      if (sharedMemoryOwnerId !== workspaceId) {
-        try {
+      let sharedMemoryOwnerId = workspaceId;
+      try {
+        sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.config.loadConfigOrDefault(),
+          workspaceId
+        );
+        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+        if (sharedMemoryOwnerId !== workspaceId) {
           let pinnedOwners = new Map<string, string>();
           await this.config.editConfig((cfg) => {
             pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
@@ -6155,18 +6156,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               throw new Error(`memory owner pin for descendant ${id} did not persist`);
             }
           }
-        } catch (error) {
-          if (!force) {
-            return Err(
-              `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal, or force it`
-            );
-          }
-          log.warn("Forced removal: could not pin the shared memory owner on descendants", {
-            workspaceId,
-            sharedMemoryOwnerId,
-            error: getErrorMessage(error),
-          });
         }
+      } catch (error) {
+        if (!force) {
+          return Err(
+            `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal, or force it`
+          );
+        }
+        log.warn("Forced removal: could not pin the shared memory owner on descendants", {
+          workspaceId,
+          sharedMemoryOwnerId,
+          error: getErrorMessage(error),
+        });
       }
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);

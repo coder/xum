@@ -16336,6 +16336,11 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      // The descendant pin pass edits whatever topology a test installed.
+      editConfig: mock((edit: (cfg: unknown) => unknown) => {
+        edit(mockConfig.loadConfigOrDefault!());
+        return Promise.resolve();
+      }) as unknown as MockWorkspaceConfig["editConfig"],
     };
 
     workspaceService = createWorkspaceServiceForTest({
