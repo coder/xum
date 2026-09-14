@@ -4,6 +4,20 @@ import assert from "@/common/utils/assert";
 
 export { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
 
+/**
+ * An attempt is replaceable only after its owner has settled and its report is positively absent.
+ * Missing config or an interrupted status alone cannot distinguish a dead owner from preparation.
+ */
+export type TaskAttemptOutcome<Report> =
+  | { kind: "reported"; report: Report }
+  | { kind: "live"; executionId: string }
+  | { kind: "cleanup-pending" }
+  | { kind: "indeterminate"; reason: string }
+  | { kind: "terminal-no-report" };
+
+/** A bounded settlement wait never turns unresolved cleanup into permission to replace a child. */
+export type TaskAttemptSettlement<Report> = TaskAttemptOutcome<Report> | { kind: "timeout" };
+
 // Normalized runtime settings always include numeric task limits.
 export type TaskSettings = Required<
   Pick<TaskSettingsOnDisk, "maxParallelAgentTasks" | "maxTaskNestingDepth">
