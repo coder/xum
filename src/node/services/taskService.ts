@@ -644,7 +644,12 @@ const MAX_TASK_RECOVERY_ATTEMPTS = 5;
 interface WorkspaceStopRecord {
   /** Latch releases (one per overlapping cascade) run together once release conditions hold. */
   releases: Array<() => void>;
-  /** Phase B cleanups whose ORIGINAL promise has not settled; timeouts never decrement this. */
+  /**
+   * Cleanups this record still owes: one is planned per cascade at latch time (before any await,
+   * so an owner settling during Phase A cannot release ahead of the unscoped clearQueue/stopStream),
+   * consumed when Phase B issues it and paid back only when that ORIGINAL promise settles —
+   * never by a timeout.
+   */
   cleanupInFlight: number;
   /** Turn generation admitted at capture; undefined when the session was idle (nothing to wait for). */
   capturedTurn: symbol | undefined;
@@ -1710,7 +1715,10 @@ export class TaskService implements AgentTaskIntegration {
     const release = this.latchWorkspaceStopsInProgress([workspaceId]);
     const existing = this.workspaceStopRecords.get(workspaceId);
     if (existing != null) {
+      // An overlapping cascade adds its release and plans its own cleanup; ownership of the
+      // earlier cascade's counts is untouched.
       existing.releases.push(release);
+      existing.cleanupInFlight += 1;
       return existing;
     }
     const capturedTurn = this.workspaceService.getActiveTurnGeneration(workspaceId);
@@ -1718,7 +1726,7 @@ export class TaskService implements AgentTaskIntegration {
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
     const record: WorkspaceStopRecord = {
       releases: [release],
-      cleanupInFlight: 0,
+      cleanupInFlight: 1,
       capturedTurn,
       turnSettled: capturedTurn == null,
       capturedExecutionId,
@@ -1741,6 +1749,8 @@ export class TaskService implements AgentTaskIntegration {
    * exactly once while its latch is held and targeted at the execution captured in Phase A, raced
    * concurrently under a per-child and one aggregate deadline. A timeout abandons the WAIT only:
    * the original promise keeps its cleanup ownership and its later settlement rechecks release.
+   * Must run for EVERY id latched in Phase A (each planned one cleanup), so callers pass the
+   * full latched set even when Phase A failed midway.
    */
   private async runWorkspaceStopCleanup(
     targets: readonly string[],
@@ -1752,8 +1762,8 @@ export class TaskService implements AgentTaskIntegration {
     }
   ): Promise<void> {
     const waits = targets.map(async (id) => {
+      // Consumes the unit planned by beginWorkspaceStop; the finally below pays it back.
       const record = this.workspaceStopRecords.get(id);
-      if (record != null) record.cleanupInFlight += 1;
       const expectedMessageId = record?.capturedStreamMessageId;
       const cleanup = (async () => {
         if (options.clearQueue) {
@@ -1810,19 +1820,17 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Phase C: drop the latch iff the captured owner settled and no cleanup is in flight. Called
-   * from every settlement path; a late cleanup completion or a persisted-status caller only
-   * triggers this recheck and never supplies evidence by itself. A removed workspace has no
-   * session left to start anything, so it counts as settled.
+   * Phase C: drop the latch iff the captured owner settled, a durable stop marker exists and no
+   * cleanup is owed. Called from every settlement path; a late cleanup completion or a
+   * persisted-status caller only triggers this recheck and never supplies evidence by itself.
+   * A missing config entry is NOT evidence: a still-preparing session settles through its own
+   * disposal (the coordinator publishes the captured generation's idle transition).
    */
   private recheckWorkspaceStopRelease(workspaceId: string): void {
     const record = this.workspaceStopRecords.get(workspaceId);
     if (record == null) return;
-    const removed = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null;
     if (record.cleanupInFlight > 0) return;
-    if (!removed && !(record.stopPersisted && record.turnSettled && record.executionSettled)) {
-      return;
-    }
+    if (!(record.stopPersisted && record.turnSettled && record.executionSettled)) return;
     this.workspaceStopRecords.delete(workspaceId);
     for (const release of record.releases) {
       release();
@@ -5828,10 +5836,10 @@ export class TaskService implements AgentTaskIntegration {
       string,
       Array<{ ownerWorkspaceId: string; handleId: string }>
     >();
-    let taskIds: string[] = [];
+    const latched: string[] = [];
 
     // Phase A (global mutex, no stream/network awaits): see terminateAllDescendantAgentTasks.
-    {
+    try {
       await using _lock = await this.mutex.acquire();
       const cfg = this.config.loadConfigOrDefault();
       const entry = findWorkspaceEntry(cfg, taskId);
@@ -5845,7 +5853,7 @@ export class TaskService implements AgentTaskIntegration {
         return Err("Task is not a descendant of this workspace");
       }
 
-      taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
+      const taskIds = [taskId, ...this.listDescendantAgentTaskIdsFromIndex(index, taskId)];
       taskIds.sort(
         (left, right) =>
           this.getTaskDepthFromParentById(index.parentById, right) -
@@ -5860,6 +5868,7 @@ export class TaskService implements AgentTaskIntegration {
       // cleanup finished.
       for (const id of taskIds) {
         this.beginWorkspaceStop(id);
+        latched.push(id);
       }
       const activeWorkspaceTurns = await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
         statuses: ["queued", "starting", "running"],
@@ -5920,11 +5929,28 @@ export class TaskService implements AgentTaskIntegration {
         }
         stoppedTaskIds.push(id);
       }
+    } finally {
+      if (latched.length > 0) {
+        await this.finishSubtreeStopCleanup(latched, activeHandlesById);
+      }
     }
 
-    // Phase B (unlocked): workspace-turn handles are interrupted first — interruptWorkspaceTurn
-    // awaits its own stopStream, which must not run under the global mutex either — then each
-    // descendant's queue clear and stop, once, bounded and concurrent.
+    for (const id of metadataToEmit) {
+      await this.emitWorkspaceMetadata(id);
+    }
+    if (drainQueue) await this.maybeStartQueuedTasks();
+    return Ok({ stoppedTaskIds });
+  }
+
+  /**
+   * Phase B of a subtree stop (unlocked): workspace-turn handles are interrupted first —
+   * interruptWorkspaceTurn awaits its own stopStream, which must not run under the global mutex
+   * either — then every latched descendant's queue clear and stop, once, bounded and concurrent.
+   */
+  private async finishSubtreeStopCleanup(
+    latched: readonly string[],
+    activeHandlesById: ReadonlyMap<string, Array<{ ownerWorkspaceId: string; handleId: string }>>
+  ): Promise<void> {
     for (const [id, handles] of activeHandlesById) {
       for (const handle of handles) {
         const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
@@ -5947,21 +5973,11 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
-    await this.runWorkspaceStopCleanup(stoppedTaskIds, {
+    await this.runWorkspaceStopCleanup(latched, {
       label: "stopDescendantAgentTask",
       abandonPartial: false,
       clearQueue: true,
     });
-    // Descendants skipped as inactive still hold a latch from Phase A; recheck the whole subtree.
-    for (const id of taskIds) {
-      this.recheckWorkspaceStopRelease(id);
-    }
-
-    for (const id of metadataToEmit) {
-      await this.emitWorkspaceMetadata(id);
-    }
-    if (drainQueue) await this.maybeStartQueuedTasks();
-    return Ok({ stoppedTaskIds });
   }
 
   async terminateDescendantAgentTask(
@@ -5978,10 +5994,12 @@ export class TaskService implements AgentTaskIntegration {
     const terminationErrors: string[] = [];
     let toTerminate: string[] = [];
     let parentById = new Map<string, string>();
+    const latched: string[] = [];
+    const stopTimedOut = new Set<string>();
 
     // Phase A (global mutex, no stream/network awaits): snapshot the subtree, latch it with its
     // captured owners and settle waiters. Stops and removals run unlocked below.
-    {
+    try {
       await using _lock = await this.mutex.acquire();
 
       const cfg = this.config.loadConfigOrDefault();
@@ -6012,6 +6030,7 @@ export class TaskService implements AgentTaskIntegration {
       const terminationError = new Error("Task terminated");
       for (const id of toTerminate) {
         this.beginWorkspaceStop(id);
+        latched.push(id);
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
         // Durable stop marker before removal: a workspace whose removal later fails or times out
@@ -6024,6 +6043,18 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
         if (persisted) this.markWorkspaceStopPersisted(id);
+      }
+    } finally {
+      // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
+      // its workspace (and its ancestors) in place because the removal below would race a stream
+      // that may still be running.
+      if (latched.length > 0) {
+        await this.runWorkspaceStopCleanup(latched, {
+          label: "terminateDescendantAgentTask",
+          abandonPartial: true,
+          clearQueue: false,
+          onTimeout: (id) => stopTimedOut.add(id),
+        });
       }
     }
 
@@ -6040,16 +6071,6 @@ export class TaskService implements AgentTaskIntegration {
       }
     };
 
-    // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
-    // its workspace (and its ancestors) in place because the removal below would race a stream
-    // that may still be running.
-    const stopTimedOut = new Set<string>();
-    await this.runWorkspaceStopCleanup(toTerminate, {
-      label: "terminateDescendantAgentTask",
-      abandonPartial: true,
-      clearQueue: false,
-      onTimeout: (id) => stopTimedOut.add(id),
-    });
     for (const id of toTerminate) {
       if (stopTimedOut.has(id)) {
         terminationErrors.push(`Timed out stopping task stream (${id})`);
@@ -6123,11 +6144,6 @@ export class TaskService implements AgentTaskIntegration {
         terminatedTaskIds.push(id);
       }
     }
-    // Removed workspaces have no owner left; surviving (timed-out) ones keep their latch.
-    for (const id of toTerminate) {
-      this.recheckWorkspaceStopRelease(id);
-    }
-
     // Free slots and start any queued tasks (best-effort).
     await this.maybeStartQueuedTasks();
 
@@ -6356,17 +6372,18 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     const interruptedTaskIds: string[] = [];
-    let descendants: string[] = [];
+    const latched: string[] = [];
 
     // Phase A (global mutex, config writes only — no stream or network awaits): snapshot the
     // subtree, latch every descendant with its captured owner, persist terminal statuses and
-    // settle waiters. A hung child stream must never block unrelated task creation.
-    {
+    // settle waiters. A hung child stream must never block unrelated task creation. Phase B runs
+    // in the finally for every latched id even if Phase A throws midway.
+    try {
       await using _lock = await this.mutex.acquire();
 
       const cfg = this.config.loadConfigOrDefault();
       const index = this.buildAgentTaskIndex(cfg);
-      descendants = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).filter(
+      const descendants = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).filter(
         (taskId) =>
           options?.workflowRunId == null ||
           this.isWorkflowRunDescendant(index, taskId, options.workflowRunId)
@@ -6393,6 +6410,7 @@ export class TaskService implements AgentTaskIntegration {
       // captured owner settles and the descendant's cleanup finishes (recheckWorkspaceStopRelease).
       for (const id of descendants) {
         this.beginWorkspaceStop(id);
+        latched.push(id);
       }
       for (const id of descendants) {
         try {
@@ -6414,6 +6432,8 @@ export class TaskService implements AgentTaskIntegration {
           if (!updated) {
             // Missing descendants should still reject prompt waiters promptly so task_await does
             // not hang until timeout after a parent hard interrupt races with external cleanup.
+            // There is no status left to persist; the owner conditions still apply.
+            this.markWorkspaceStopPersisted(id);
             this.rejectWaiters(id, interruptionError);
             log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
               taskId: id,
@@ -6448,16 +6468,15 @@ export class TaskService implements AgentTaskIntegration {
           );
         }
       }
-    }
-
-    // Phase B (unlocked, bounded, concurrent) then Phase C via recheckWorkspaceStopRelease.
-    await this.runWorkspaceStopCleanup(descendants, {
-      label: "terminateAllDescendantAgentTasks",
-      abandonPartial: false,
-      clearQueue: true,
-    });
-    for (const id of descendants) {
-      this.recheckWorkspaceStopRelease(id);
+    } finally {
+      // Phase B (unlocked, bounded, concurrent) then Phase C via recheckWorkspaceStopRelease.
+      if (latched.length > 0) {
+        await this.runWorkspaceStopCleanup(latched, {
+          label: "terminateAllDescendantAgentTasks",
+          abandonPartial: false,
+          clearQueue: true,
+        });
+      }
     }
 
     for (const taskId of interruptedTaskIds) {
