@@ -116,6 +116,11 @@ interface OwnedWorkflowAgentAttempt {
   title?: string;
   resultSpec: WorkflowAgentSpec;
   startedAt: string;
+  /**
+   * Releases this attempt's share of its reservation's upstream abort link (see
+   * reserveAgentTasks). Called when the attempt settles, is superseded, or the run ends.
+   */
+  releaseLaunchSignal?: () => void;
 }
 
 function getOwnedAttemptKey(attempt: { stepId: string; inputHash: string }): string {
@@ -884,7 +889,7 @@ export class WorkflowRunner {
     } finally {
       removeAbortListener();
       clearInterval(leaseRenewal);
-      this.ownedAttemptsByRun.delete(runId);
+      this.releaseOwnedAttempts(runId);
       await this.runStore.releaseLease(runId, this.runnerId);
     }
   }
@@ -2517,9 +2522,20 @@ export class WorkflowRunner {
 
   private trackAttempt(runId: string, attempt: OwnedWorkflowAgentAttempt): void {
     assert(attempt.taskId.length > 0, "WorkflowRunner: owned attempt taskId is required");
-    // A replacement attempt for the same step identity supersedes the obsolete one; the store's
-    // attempt fence already rejects the old task id, so only the current one is worth draining.
-    this.ownedAttemptsByRun.get(runId)?.set(getOwnedAttemptKey(attempt), attempt);
+    const owned = this.ownedAttemptsByRun.get(runId);
+    if (owned == null) {
+      attempt.releaseLaunchSignal?.();
+      return;
+    }
+    const key = getOwnedAttemptKey(attempt);
+    const superseded = owned.get(key);
+    if (superseded != null && superseded.taskId !== attempt.taskId) {
+      // A replacement attempt for the same step identity supersedes the obsolete one; the
+      // store's attempt fence already rejects the old task id, so only the current one is worth
+      // draining and only its launch can still be pending.
+      superseded.releaseLaunchSignal?.();
+    }
+    owned.set(key, attempt);
   }
 
   private untrackAttempt(
@@ -2528,9 +2544,22 @@ export class WorkflowRunner {
   ) {
     const owned = this.ownedAttemptsByRun.get(runId);
     const key = getOwnedAttemptKey(attempt);
-    if (owned?.get(key)?.taskId === attempt.taskId) {
+    const current = owned?.get(key);
+    if (owned != null && current?.taskId === attempt.taskId) {
+      current.releaseLaunchSignal?.();
       owned.delete(key);
     }
+  }
+
+  private releaseOwnedAttempts(runId: string): void {
+    const owned = this.ownedAttemptsByRun.get(runId);
+    if (owned == null) {
+      return;
+    }
+    for (const attempt of owned.values()) {
+      attempt.releaseLaunchSignal?.();
+    }
+    this.ownedAttemptsByRun.delete(runId);
   }
 
   /**
@@ -2750,6 +2779,11 @@ export class WorkflowRunner {
    * the signal BEFORE entering recordStepStarted (the last cancellation point); once the
    * checkpoint write has entered the store lock it is owned to completion. Steps checkpointed by
    * a reservation that then fails or completes after an abort are disposed report-first.
+   *
+   * Lifetime: the deadline is cleared when the reservation call returns, but the upstream abort
+   * link is NOT. createMany returns before the children launch (queued children may wait for
+   * capacity) and the task service re-checks this signal at launch admission, so the link stays
+   * connected until every attempt it reserved has settled, been superseded, or the run ends.
    */
   private async reserveAgentTasks(
     runId: string,
@@ -2786,11 +2820,34 @@ export class WorkflowRunner {
     let deadlineFired = false;
     const abortReservation = () => reservation.abort();
     const upstream = input.abortSignal;
-    if (upstream?.aborted) {
-      abortReservation();
-    } else {
-      upstream?.addEventListener("abort", abortReservation, { once: true });
+    // Link the batch signal AND the run signal: a batch controller is unlinked from the run
+    // when its loop ends, but a child reserved by that batch may still be waiting to launch.
+    const upstreamSignals = Array.from(
+      new Set([input.abortSignal, input.runAbortSignal].filter((signal) => signal != null))
+    );
+    const linkedSignals = new Set<AbortSignal>();
+    for (const signal of upstreamSignals) {
+      if (signal.aborted) {
+        abortReservation();
+      } else {
+        signal.addEventListener("abort", abortReservation, { once: true });
+        linkedSignals.add(signal);
+      }
     }
+    const releaseUpstreamLink = (): void => {
+      for (const signal of linkedSignals) {
+        signal.removeEventListener("abort", abortReservation);
+      }
+      linkedSignals.clear();
+    };
+    // Every checkpointed attempt holds one share of the link; the last release disconnects it.
+    let linkedAttempts = 0;
+    const releaseAttemptLink = (): void => {
+      linkedAttempts -= 1;
+      if (linkedAttempts <= 0) {
+        releaseUpstreamLink();
+      }
+    };
     const deadline = setTimeout(() => {
       deadlineFired = true;
       abortReservation();
@@ -2806,6 +2863,7 @@ export class WorkflowRunner {
       assert(taskId.length > 0, "WorkflowRunner.reserveAgentTasks: created taskId is required");
       assert(!checkpointed.has(index), "WorkflowRunner.reserveAgentTasks: duplicate checkpoint");
       input.leaseGuard.throwIfLost();
+      linkedAttempts += 1;
       const attempt: OwnedWorkflowAgentAttempt = {
         stepId: step.spec.id,
         inputHash: step.inputHash,
@@ -2813,6 +2871,7 @@ export class WorkflowRunner {
         title: step.title,
         resultSpec: step.spec,
         startedAt: step.startedAt,
+        releaseLaunchSignal: releaseAttemptLink,
       };
       await this.recordStepStarted(runId, {
         stepId: step.spec.id,
@@ -2876,10 +2935,12 @@ export class WorkflowRunner {
       // A checkpoint whose reservation then failed is still disposed by its authoritative
       // outcome: the child may have launched and reported before the failure surfaced.
       await disposeCheckpointed();
+      // No launch can still be pending once the reservation call itself failed.
+      releaseUpstreamLink();
       throw failure;
     } finally {
+      // Only the deadline ends here: it bounds admission stages, never a pending launch.
       clearTimeout(deadline);
-      upstream?.removeEventListener("abort", abortReservation);
     }
 
     if (createdTasks.length !== input.steps.length) {
