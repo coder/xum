@@ -4905,7 +4905,7 @@ describe("MemoryService", () => {
       expect(receiptProbes).toBeLessThanOrEqual(count);
     });
 
-    it("recovers an edit made after a crash between a migration's install and its receipt flip by writing over the byte-redundant copy", async () => {
+    it("leaves an edit made after a crash between a migration's install and its receipt flip unfolded (documented limitation: fail closed, nothing overwritten)", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const childCtx = { ...fixture.ctx };
@@ -4919,60 +4919,48 @@ describe("MemoryService", () => {
       await fixture.service.listIndexEntries(childCtx);
       await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
       const manifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
-      await fsPromises.writeFile(
-        manifest,
-        JSON.stringify({
-          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
-        })
-      );
+      const receipt = { content: sha256Hex("same note"), sidecar: "", target: "shared.md" };
+      await fsPromises.writeFile(manifest, JSON.stringify({ "shared.md": receipt }));
       // The crash left this descendant's copy installed at its import slot
       // with the plain receipt still naming the shared copy; then the legacy
-      // note is edited on the downgraded build. Both candidates hold other
-      // bytes — but the slot's are a byte-for-byte duplicate of the shared
-      // copy's, so the edit is written over it and the record flips to a
-      // copy of this adoption's own generation.
-      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
-      await fsPromises.mkdir(path.dirname(ownCopy), { recursive: true });
-      await fsPromises.writeFile(ownCopy, "same note");
+      // note is edited on the downgraded build. Both candidates now hold
+      // other bytes. The slot's happen to equal the shared copy's, but bytes
+      // are not provenance (the owner may have written that file): nothing
+      // is written over, the edit stays in the legacy store, the receipt
+      // keeps protecting the shared copy, and the handover fails closed
+      // (the forced removal path discards the edit with the session dir).
+      const ownSlot = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      await fsPromises.mkdir(path.dirname(ownSlot), { recursive: true });
+      await fsPromises.writeFile(ownSlot, "same note");
       await new Promise((r) => setTimeout(r, 5));
       await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "edited");
       await fixture.service.listIndexEntries(grandchildCtx);
-      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("edited");
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await fsPromises.readFile(ownSlot, "utf-8")).toBe("same note");
       expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
         "same note"
       );
-      expect((await readLegacyAdoptionManifest(manifest)).get("shared.md")).toMatchObject({
-        target: "imported/ws-grandchild/shared.md",
-        created: true,
-        targetStamp: (await adoptionTargetStamp(ownCopy)) ?? undefined,
-      });
-      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner");
-      // A slot file that is NOT such a duplicate is somebody's content: never
-      // written over; the edit waits and the handover fails closed.
-      await fsPromises.writeFile(path.join(childRoot, "other.md"), "other");
-      await fixture.service.listIndexEntries(childCtx);
-      await fsPromises.writeFile(path.join(grandchildRoot, "other.md"), "other edited");
-      await fsPromises.writeFile(
-        manifest,
-        JSON.stringify({
-          "other.md": { content: sha256Hex("other"), sidecar: "", target: "other.md" },
-        })
+      expect(await fsPromises.readFile(path.join(grandchildRoot, "shared.md"), "utf-8")).toBe(
+        "edited"
       );
-      const otherSlot = path.join(ownerRoot, "imported", "ws-grandchild", "other.md");
-      await fsPromises.writeFile(otherSlot, "unrelated");
-      await fixture.service.listIndexEntries(grandchildCtx);
-      expect(await fsPromises.readFile(otherSlot, "utf-8")).toBe("unrelated");
-      expect(await fsPromises.readFile(path.join(ownerRoot, "other.md"), "utf-8")).toBe("other");
-      expect((await readLegacyAdoptionManifest(manifest)).get("other.md")).toEqual({
-        content: sha256Hex("other"),
-        sidecar: "",
-        target: "other.md",
-      });
+      expect((await readLegacyAdoptionManifest(manifest)).get("shared.md")).toEqual(receipt);
       expect(
         await fixture.service
           .adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner")
           .then(() => null, getErrorMessage)
-      ).toMatch(/could not be folded/);
+      ).toMatch(/1 legacy workspace memory note\(s\) .* could not be folded/);
+      // The shared copy the receipt names is still relied on: the creator's
+      // deletion of its note waits too.
+      await fsPromises.rm(path.join(childRoot, "shared.md"));
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "same note"
+      );
+      // Manual recovery: clearing the slot lets the next unmemoized pass (a
+      // restart, a legacy-store change, or removal's own pass) place the edit.
+      await fsPromises.rm(ownSlot);
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner");
+      expect(await fsPromises.readFile(ownSlot, "utf-8")).toBe("edited");
     });
   });
 

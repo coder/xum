@@ -2037,8 +2037,6 @@ export class MemoryService extends EventEmitter {
           replaces?: boolean;
           generation?: string;
           supersedes?: string;
-          /** Writes over a byte-redundant duplicate at the import slot (see legacyImportTarget). */
-          replacesRedundant?: boolean;
         } | null = null;
         // Migrating off another descendant's copy this note's settled receipt
         // (created: false) stands on: the receipt is the sibling's reason to
@@ -2055,9 +2053,9 @@ export class MemoryService extends EventEmitter {
         // recorded before the install (targetStamp), never from a byte
         // match. The bounded outcome of a crash there (and of a downgrade in
         // the window, which sees the receipt as before) is one redundant copy
-        // adoption never deletes (or, once the legacy note is edited, writes
-        // over — see legacyImportTarget). At capacity the migration waits (a
-        // transient skip) instead of overflowing the cap.
+        // adoption never deletes (see legacyImportTarget for the limitation
+        // this leaves once the legacy note is edited). At capacity the
+        // migration waits (a transient skip) instead of overflowing the cap.
         let migration = false;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
@@ -2159,14 +2157,7 @@ export class MemoryService extends EventEmitter {
           // its lstat or read) is neither free nor different: the note waits
           // for the next pass with no copy made and no record written.
           try {
-            target = await this.legacyImportTarget(
-              store,
-              childId,
-              relPath,
-              content,
-              siblingOwns,
-              previous !== undefined && previous.created !== true ? previous.target : undefined
-            );
+            target = await this.legacyImportTarget(store, childId, relPath, content, siblingOwns);
           } catch (error) {
             log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
               childId,
@@ -2184,11 +2175,7 @@ export class MemoryService extends EventEmitter {
           }
         }
         if (target.write) {
-          if (
-            target.replaces !== true &&
-            target.replacesRedundant !== true &&
-            remainingCapacity <= 0
-          ) {
+          if (target.replaces !== true && remainingCapacity <= 0) {
             // A migration off a shared copy waits for a slot rather than
             // overflowing the cap (which the index would silently truncate):
             // the note keeps standing on the shared copy — its receipt keeps
@@ -2295,10 +2282,7 @@ export class MemoryService extends EventEmitter {
             target.replaces === true
               ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
                 target.generation
-              : target.replacesRedundant === true
-                ? previous !== undefined &&
-                  (await this.isRedundantCopy(store, target.relPath, previous.target))
-                : (await store.kind(target.relPath, { strict: true })) === null;
+              : (await store.kind(target.relPath, { strict: true })) === null;
           const restoreRecord = async () => {
             await fsPromises.rm(stagingPath, { force: true });
             if (migration) return; // the manifest was never touched
@@ -2341,7 +2325,7 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          if (target.replaces !== true && target.replacesRedundant !== true) remainingCapacity--;
+          if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
           // The generation of the file just installed (see targetStamp): the
@@ -2491,26 +2475,31 @@ export class MemoryService extends EventEmitter {
    * per-child import directory when the owner has different content there
    * or the identical file is another descendant's adoption-created copy;
    * null when even that slot is taken by different content (the file stays
-   * only in the legacy directory) — unless that slot holds a byte-for-byte
-   * duplicate of the copy this note's receipt stands on (`redundantWith`):
-   * a migration installed before its receipt flipped, now stale because the
-   * legacy note was edited since. Nothing is lost by writing over it (the
-   * same bytes remain at the shared copy, and no sibling receipt can name
-   * this child's slot — receipts name a note's own path or the sibling's
-   * own slot), so it is replaced (`replacesRedundant`, no generation: the
-   * install re-checks the duplicate is still one). Only the import slot is
-   * ever written over this way; the shared copy itself never is.
-   * Throws when a sibling manifest the decision needs cannot be read
-   * (callers skip the note transiently).
+   * only in the legacy directory). Throws when a sibling manifest the
+   * decision needs cannot be read (callers skip the note transiently).
+   *
+   * Bounded limitation, deliberately not recovered here: a migration off a
+   * shared copy that crashed between its install and its receipt flip
+   * leaves this child's slot occupied by the (then identical) copy with no
+   * receipt naming it. If the legacy note is then edited on a downgraded
+   * build, both candidates hold other bytes and the edit is never folded:
+   * the edited bytes stay in the legacy session store, the receipt keeps
+   * naming the shared copy, and the non-forced handover fails closed until
+   * the slot is cleared by hand and an unmemoized pass (a restart, a
+   * legacy-store change, removal's own pass) places the edit; a forced
+   * removal discards the edit with the session directory. Matching bytes
+   * are not provenance — the slot is in
+   * the model-writable notebook and the owner may have written that file —
+   * so an occupied slot is never written over without a receipt recorded
+   * before the install, which this path deliberately has none of.
    */
   private async legacyImportTarget(
     store: MemoryStore,
     childId: string,
     relPath: string,
     content: string,
-    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>,
-    redundantWith?: string
-  ): Promise<{ relPath: string; write: boolean; replacesRedundant?: boolean } | null> {
+    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>
+  ): Promise<{ relPath: string; write: boolean } | null> {
     for (const candidate of [
       relPath,
       `${LEGACY_IMPORT_DIR}/${legacyImportSegment(childId)}/${relPath}`,
@@ -2535,43 +2524,9 @@ export class MemoryService extends EventEmitter {
           throw new Error(`cannot read the generation of adoption destination ${candidate}`);
         }
         if (!(await siblingOwns(candidate, liveStamp))) return { relPath: candidate, write: false };
-      } else if (
-        redundantWith !== undefined &&
-        candidate !== redundantWith &&
-        candidate !== relPath &&
-        destination.content !== null &&
-        (await this.isRedundantCopy(store, candidate, redundantWith))
-      ) {
-        return { relPath: candidate, write: true, replacesRedundant: true };
       }
     }
     return null;
-  }
-
-  /**
-   * Whether the file at `candidate` holds exactly the bytes of the file at
-   * `original` (both regular, in-cap, UTF-8): a duplicate whose removal loses
-   * nothing. Unreadable pieces read as "not redundant".
-   */
-  private async isRedundantCopy(
-    store: MemoryStore,
-    candidate: string,
-    original: string
-  ): Promise<boolean> {
-    try {
-      const [copy, source] = await Promise.all([
-        this.inspectAdoptionDestination(store, candidate),
-        this.inspectAdoptionDestination(store, original),
-      ]);
-      return (
-        copy !== "free" &&
-        source !== "free" &&
-        copy.content !== null &&
-        copy.content === source.content
-      );
-    } catch {
-      return false;
-    }
   }
 
   /**
