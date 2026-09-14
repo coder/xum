@@ -31993,8 +31993,13 @@ describe("TaskService", () => {
       return () => spy.mockRestore();
     }
 
-    async function setupTree(descendants: Array<string | { id: string; parent: string }>) {
-      const descendantEntries = descendants.map((descendant) =>
+    interface TreeDescendant {
+      id: string;
+      parent: string;
+      overrides?: Parameters<typeof projectWorkspace>[3];
+    }
+    async function setupTree(descendants: Array<string | TreeDescendant>) {
+      const descendantEntries: TreeDescendant[] = descendants.map((descendant) =>
         typeof descendant === "string" ? { id: descendant, parent: rootId } : descendant
       );
       const config = await createTestConfig(rootDir);
@@ -32012,11 +32017,12 @@ describe("TaskService", () => {
             aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
           },
           projectWorkspace(projectPath, "root", rootId),
-          ...descendantEntries.map(({ id, parent }) =>
+          ...descendantEntries.map(({ id, parent, overrides }) =>
             projectWorkspace(projectPath, id, id, {
               parentWorkspaceId: parent,
               agentType: "explore",
               taskStatus: "running",
+              ...overrides,
             })
           ),
         ],
@@ -32327,6 +32333,181 @@ describe("TaskService", () => {
         expect(taskService.isWorkspaceStopInProgress(lateId)).toBe(true);
       } finally {
         editSpy.mockRestore();
+        restoreTimers();
+      }
+    });
+    /** Remove a workspace entry from config on the cascade's FIRST config write (leaves first). */
+    function removeEntryOnFirstConfigWrite(config: Config, workspaceId: string): () => void {
+      const originalEdit = config.editConfig.bind(config);
+      let removed = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator) => {
+        if (!removed) {
+          removed = true;
+          await originalEdit((cfg) => {
+            for (const project of cfg.projects.values()) {
+              project.workspaces = project.workspaces.filter((ws) => ws.id !== workspaceId);
+            }
+            return cfg;
+          });
+        }
+        return await originalEdit(mutator);
+      });
+      return () => editSpy.mockRestore();
+    }
+
+    test.each(["stop", "terminate"] as const)(
+      "a descendant removed between the subtree snapshot and its status write (%s) still releases only when its owner settled and cleanup finished",
+      async (cascade) => {
+        const childId = "task-vanished";
+        const grandchildId = "task-vanished-leaf";
+        const { config } = await setupTree([childId, { id: grandchildId, parent: childId }]);
+        const { stopStream, pending } = controlledStopStream(new Set([childId]));
+        const { aiService } = createAIServiceMocks(config, { stopStream });
+        const childTurn = Symbol("child-turn");
+        const turnSettledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
+        const { workspaceService } = createWorkspaceServiceMocks({
+          getActiveTurnGeneration: mock((workspaceId: string) =>
+            workspaceId === childId ? childTurn : undefined
+          ),
+          onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+            turnSettledListeners.add(listener);
+            return () => turnSettledListeners.delete(listener);
+          }),
+        });
+        const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+        // The grandchild's status write is the cascade's first config write; the child vanishes
+        // right before it, after the subtree (and its latches) were captured.
+        const restoreEdit = removeEntryOnFirstConfigWrite(config, childId);
+        const restoreTimers = shortenTerminationTimers();
+        try {
+          if (cascade === "stop") {
+            const stopped = await taskService.stopDescendantAgentTask(rootId, childId);
+            expect(stopped).toEqual({ success: true, data: { stoppedTaskIds: [grandchildId] } });
+          } else {
+            // The hung child stop is reported as a timeout (its workspace is kept in place).
+            const terminated = await taskService.terminateDescendantAgentTask(rootId, childId);
+            expect(terminated.success).toBe(false);
+            if (!terminated.success) {
+              expect(terminated.error).toContain(`Timed out stopping task stream (${childId})`);
+            }
+          }
+          restoreEdit();
+          expect(findWorkspaceInConfig(config, childId)).toBeUndefined();
+          // No status was left to persist for the vanished child, yet its captured owner is
+          // still live and its cleanup is pending: the latch must hold (no absent-config bypass).
+          expect(stopStream.mock.calls.filter((call) => call[0] === childId)).toHaveLength(1);
+          expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+          for (const listener of turnSettledListeners) listener(childId, childTurn);
+          expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+          // ...and release once the owner settled AND the planned cleanup finished.
+          pending.get(childId)!.resolve(Ok(undefined));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+        } finally {
+          restoreEdit();
+          restoreTimers();
+        }
+      }
+    );
+
+    test("a queued task is not reserved while its parent's stop latch is held and is picked up after release", async () => {
+      const parentTaskId = "task-latched-parent";
+      const queuedId = "task-queued-under-latched";
+      const { config } = await setupTree([
+        parentTaskId,
+        {
+          id: queuedId,
+          parent: parentTaskId,
+          overrides: {
+            taskStatus: "queued",
+            taskPrompt: "queued work",
+            runtimeConfig: { type: "local" },
+          },
+        },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const launched: string[] = [];
+      const internals = taskService as unknown as {
+        startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+      };
+      spyOn(internals, "startReservedAgentTask").mockImplementation((plan) => {
+        launched.push(plan.taskId);
+        return Promise.resolve();
+      });
+      const release = taskService.latchWorkspaceStopsInProgress([parentTaskId]);
+      try {
+        await taskService.maybeStartQueuedTasks();
+        // Not even reserved: the record stays "queued" (a "starting" record would be stranded,
+        // because the scheduler only ever selects queued ones).
+        expect(findWorkspaceInConfig(config, queuedId)?.taskStatus).toBe("queued");
+        expect(launched).toEqual([]);
+      } finally {
+        release();
+      }
+      await taskService.maybeStartQueuedTasks();
+      expect(launched).toEqual([queuedId]);
+      expect(findWorkspaceInConfig(config, queuedId)?.taskStatus).toBe("starting");
+    });
+
+    test("a launch deferred by a stop in progress hands its record back to queued and is re-picked when the latch releases", async () => {
+      const parentTaskId = "task-spawning-parent";
+      const spawnedId = "spawnedchild1";
+      // The parent runs under a live execution mirror: createMany still admits its spawns after
+      // Stop persisted "interrupted", until that execution settles — the realistic window for a
+      // launch to meet the parent's held latch.
+      const { config } = await setupTree([
+        {
+          id: parentTaskId,
+          parent: rootId,
+          overrides: { taskExecutionId: "exec-parent", taskExecutionStatus: "running" },
+        },
+      ]);
+      stubStableIds(config, [spawnedId]);
+      const { stopStream, pending } = controlledStopStream(new Set([parentTaskId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        const teardown = taskService.terminateAllDescendantAgentTasks(rootId);
+        await waitUntil(() => pending.has(parentTaskId), "the hung parent stop to be issued");
+        expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(true);
+        const spawned = await taskService.createMany([
+          {
+            parentWorkspaceId: parentTaskId,
+            kind: "agent" as const,
+            agentId: "explore",
+            prompt: "spawned during stop",
+            title: "Spawned",
+          },
+        ]);
+        expect(spawned).toMatchObject({
+          success: true,
+          data: [{ taskId: spawnedId, status: "starting" }],
+        });
+        // The reserved launch met the barrier: its record goes back to "queued" instead of
+        // staying a stranded "starting" nobody re-selects.
+        await waitUntil(
+          () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "queued",
+          "the deferred launch to hand its record back"
+        );
+        const launched: string[] = [];
+        const internals = taskService as unknown as {
+          startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+        };
+        spyOn(internals, "startReservedAgentTask").mockImplementation((plan) => {
+          launched.push(plan.taskId);
+          return Promise.resolve();
+        });
+        await teardown;
+        // The cascade's own queue drain ran with the latch still held: still queued, untouched.
+        expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("queued");
+        expect(launched).toEqual([]);
+        // Latch release re-picks the queued record without waiting for an unrelated trigger.
+        pending.get(parentTaskId)!.resolve(Ok(undefined));
+        await waitUntil(() => launched.includes(spawnedId), "the released launch to be re-picked");
+        expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(false);
+        expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("starting");
+      } finally {
         restoreTimers();
       }
     });
