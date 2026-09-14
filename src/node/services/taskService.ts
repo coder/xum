@@ -3746,6 +3746,11 @@ export class TaskService implements AgentTaskIntegration {
         return;
       }
       await this.emitWorkspaceMetadata(plan.taskId);
+      // The release-time drain may have seen "starting" while this rollback was awaiting disk.
+      // Complete the handoff after publishing "queued", or leave the next release owning it.
+      if (!this.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
+        this.scheduleMaybeStartQueuedTasks();
+      }
       return;
     }
 

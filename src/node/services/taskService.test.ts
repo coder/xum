@@ -32449,67 +32449,98 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, queuedId)?.taskStatus).toBe("starting");
     });
 
-    test("a launch deferred by a stop in progress hands its record back to queued and is re-picked when the latch releases", async () => {
-      const parentTaskId = "task-spawning-parent";
-      const spawnedId = "spawnedchild1";
-      // The parent runs under a live execution mirror: createMany still admits its spawns after
-      // Stop persisted "interrupted", until that execution settles — the realistic window for a
-      // launch to meet the parent's held latch.
-      const { config } = await setupTree([
-        {
-          id: parentTaskId,
-          parent: rootId,
-          overrides: { taskExecutionId: "exec-parent", taskExecutionStatus: "running" },
-        },
-      ]);
-      stubStableIds(config, [spawnedId]);
-      const { stopStream, pending } = controlledStopStream(new Set([parentTaskId]));
-      const { aiService } = createAIServiceMocks(config, { stopStream });
-      const { taskService } = createTaskServiceHarness(config, { aiService });
-      const restoreTimers = shortenTerminationTimers();
-      try {
-        const teardown = taskService.terminateAllDescendantAgentTasks(rootId);
-        await waitUntil(() => pending.has(parentTaskId), "the hung parent stop to be issued");
-        expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(true);
-        const spawned = await taskService.createMany([
+    test.each(["before rollback", "after rollback"] as const)(
+      "a deferred launch is re-picked when its stop latch releases %s",
+      async (releaseAt) => {
+        const parentTaskId = "task-spawning-parent";
+        const spawnedId = "spawnedchild1";
+        // The parent runs under a live execution mirror: createMany still admits its spawns after
+        // Stop persisted "interrupted", until that execution settles — the realistic window for a
+        // launch to meet the parent's held latch.
+        const { config } = await setupTree([
           {
-            parentWorkspaceId: parentTaskId,
-            kind: "agent" as const,
-            agentId: "explore",
-            prompt: "spawned during stop",
-            title: "Spawned",
+            id: parentTaskId,
+            parent: rootId,
+            overrides: { taskExecutionId: "exec-parent", taskExecutionStatus: "running" },
           },
         ]);
-        expect(spawned).toMatchObject({
-          success: true,
-          data: [{ taskId: spawnedId, status: "starting" }],
+        stubStableIds(config, [spawnedId]);
+        const { stopStream, pending } = controlledStopStream(new Set([parentTaskId]));
+        const { aiService } = createAIServiceMocks(config, { stopStream });
+        const { taskService } = createTaskServiceHarness(config, { aiService });
+        const rollbackEntered = Promise.withResolvers<void>();
+        const releaseRollback = Promise.withResolvers<void>();
+        let holdRollback = releaseAt === "before rollback";
+        const originalEditConfig = config.editConfig.bind(config);
+        const editSpy = spyOn(config, "editConfig").mockImplementation(async (updater) => {
+          if (holdRollback && findWorkspaceInConfig(config, spawnedId)?.taskStatus === "starting") {
+            holdRollback = false;
+            rollbackEntered.resolve();
+            await releaseRollback.promise;
+          }
+          return originalEditConfig(updater);
         });
-        // The reserved launch met the barrier: its record goes back to "queued" instead of
-        // staying a stranded "starting" nobody re-selects.
-        await waitUntil(
-          () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "queued",
-          "the deferred launch to hand its record back"
-        );
-        const launched: string[] = [];
-        const internals = taskService as unknown as {
-          startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
-        };
-        spyOn(internals, "startReservedAgentTask").mockImplementation((plan) => {
-          launched.push(plan.taskId);
-          return Promise.resolve();
-        });
-        await teardown;
-        // The cascade's own queue drain ran with the latch still held: still queued, untouched.
-        expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("queued");
-        expect(launched).toEqual([]);
-        // Latch release re-picks the queued record without waiting for an unrelated trigger.
-        pending.get(parentTaskId)!.resolve(Ok(undefined));
-        await waitUntil(() => launched.includes(spawnedId), "the released launch to be re-picked");
-        expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(false);
-        expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("starting");
-      } finally {
-        restoreTimers();
+        const restoreTimers = shortenTerminationTimers();
+        try {
+          const teardown = taskService.terminateAllDescendantAgentTasks(rootId);
+          await waitUntil(() => pending.has(parentTaskId), "the hung parent stop to be issued");
+          expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(true);
+          const spawned = await taskService.createMany([
+            {
+              parentWorkspaceId: parentTaskId,
+              kind: "agent" as const,
+              agentId: "explore",
+              prompt: "spawned during stop",
+              title: "Spawned",
+            },
+          ]);
+          expect(spawned).toMatchObject({
+            success: true,
+            data: [{ taskId: spawnedId, status: "starting" }],
+          });
+          if (releaseAt === "before rollback") {
+            await rollbackEntered.promise;
+          } else {
+            await waitUntil(
+              () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "queued",
+              "the deferred launch to hand its record back"
+            );
+          }
+          const launched: string[] = [];
+          const internals = taskService as unknown as {
+            startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+          };
+          spyOn(internals, "startReservedAgentTask").mockImplementation((plan) => {
+            launched.push(plan.taskId);
+            return Promise.resolve();
+          });
+          await teardown;
+          expect(launched).toEqual([]);
+          pending.get(parentTaskId)!.resolve(Ok(undefined));
+          if (releaseAt === "before rollback") {
+            await waitUntil(
+              () => !taskService.isWorkspaceStopInProgress(parentTaskId),
+              "the parent latch to release while rollback is blocked"
+            );
+            // The release-time drain sees only "starting" and cannot reserve it. Publishing the
+            // later rollback must finish the handoff without needing another scheduler trigger.
+            await taskService.maybeStartQueuedTasks();
+            expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("starting");
+            expect(launched).toEqual([]);
+            releaseRollback.resolve();
+          }
+          await waitUntil(
+            () => launched.includes(spawnedId),
+            "the released launch to be re-picked"
+          );
+          expect(taskService.isWorkspaceStopInProgress(parentTaskId)).toBe(false);
+          expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("starting");
+        } finally {
+          releaseRollback.resolve();
+          editSpy.mockRestore();
+          restoreTimers();
+        }
       }
-    });
+    );
   });
 });
