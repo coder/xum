@@ -4145,210 +4145,6 @@ describe("MemoryService", () => {
       }
     }, 30_000);
 
-    it("takes a shared copy over by rename when its creator's source is gone and the store is full", async () => {
-      using fixture = await createFixture("ws-child");
-      await registerTaskTree(fixture);
-      const childCtx = { ...fixture.ctx };
-      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
-      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
-      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
-      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
-      await fsPromises.mkdir(ownerRoot, { recursive: true });
-      await fsPromises.mkdir(childRoot, { recursive: true });
-      await fsPromises.mkdir(grandchildRoot, { recursive: true });
-      // The child's adoption takes the owner store's last slot.
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
-          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
-        )
-      );
-      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
-      await fixture.service.listIndexEntries(childCtx);
-      const sharedCopy = path.join(ownerRoot, "shared.md");
-      const generation = (await adoptionTargetStamp(sharedCopy))!;
-      // The grandchild's receipt (previous layers) stands on that copy.
-      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
-      const grandchildManifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
-      await fsPromises.writeFile(
-        grandchildManifest,
-        JSON.stringify({
-          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
-        })
-      );
-      const passes = spyOn(
-        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
-        "readOrQuarantineAdoptionManifest"
-      );
-      // No slot for its own copy while the child keeps its source: the
-      // grandchild stays on the shared copy — unmemoized, not a permanent
-      // "full" skip, so the next access looks again.
-      await fixture.service.listIndexEntries(grandchildCtx);
-      expect(await pathExists(path.join(ownerRoot, "imported"))).toBe(false);
-      await fixture.service.listIndexEntries(grandchildCtx);
-      expect(passes).toHaveBeenCalledTimes(2);
-      // The child deletes its source: its copy is kept for the grandchild;
-      // the grandchild's next pass takes the file over by rename (no slot
-      // needed, same generation) instead of the two waiting on each other.
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      await fsPromises.rm(path.join(childRoot, "shared.md"));
-      await fixture.service.listIndexEntries(childCtx);
-      expect(await pathExists(sharedCopy)).toBe(true);
-      await fixture.service.listIndexEntries(grandchildCtx);
-      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
-      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
-      expect(await pathExists(sharedCopy)).toBe(false);
-      expect(await adoptionTargetStamp(ownCopy)).toBe(generation);
-      const migrated = (await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")!;
-      expect(migrated).toMatchObject({
-        target: "imported/ws-grandchild/shared.md",
-        created: true,
-        targetStamp: generation,
-      });
-      expect(
-        (await fixture.service.listIndexEntries(grandchildCtx)).filter(
-          (e) => e.scope === "workspace"
-        )
-      ).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
-      // Both handovers complete now.
-      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
-      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner");
-    }, 30_000);
-
-    it("types untyped dirents with bounded concurrency", async () => {
-      using fixture = await createFixture("ws-child");
-      await registerTaskTree(fixture);
-      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
-      await fsPromises.mkdir(legacyRoot, { recursive: true });
-      await Promise.all(
-        Array.from({ length: 200 }, (_, i) =>
-          fsPromises.writeFile(path.join(legacyRoot, `n${String(i).padStart(3, "0")}.md`), "x")
-        )
-      );
-      const realReaddir = fsPromises.readdir.bind(fsPromises);
-      const untyped = spyOn(fsPromises, "readdir").mockImplementation((async (
-        target: string,
-        options: unknown
-      ) => {
-        const entries = (await realReaddir(
-          target,
-          options as { withFileTypes: true }
-        )) as unknown as Array<Record<string, unknown>>;
-        if (!String(target).startsWith(legacyRoot)) return entries;
-        const no = () => false;
-        return entries.map((entry) => ({
-          ...entry,
-          name: entry.name,
-          isFile: no,
-          isDirectory: no,
-          isSymbolicLink: no,
-          isFIFO: no,
-          isSocket: no,
-          isBlockDevice: no,
-          isCharacterDevice: no,
-        }));
-      }) as unknown as typeof fsPromises.readdir);
-      // The typing lstats are the plain ones (the generation probes pass
-      // `bigint`): count how many are in flight at once.
-      let inFlight = 0;
-      let peak = 0;
-      const realLstat = fsPromises.lstat.bind(fsPromises);
-      const counting = spyOn(fsPromises, "lstat").mockImplementation(((
-        p: Parameters<typeof fsPromises.lstat>[0],
-        options?: { bigint?: boolean }
-      ) => {
-        if (options?.bigint === true) {
-          return (realLstat as (...args: unknown[]) => unknown)(p, options);
-        }
-        inFlight++;
-        peak = Math.max(peak, inFlight);
-        return (realLstat as (...args: unknown[]) => Promise<unknown>)(p).finally(() => {
-          inFlight--;
-        });
-      }) as never);
-      try {
-        await fixture.service.listIndexEntries({ ...fixture.ctx });
-      } finally {
-        counting.mockRestore();
-        untyped.mockRestore();
-      }
-      expect(peak).toBeGreaterThan(0);
-      expect(peak).toBeLessThanOrEqual(16);
-    });
-
-    it("keeps the shared receipt visible while a migration's copy is not yet installed", async () => {
-      using fixture = await createFixture("ws-child");
-      await registerTaskTree(fixture);
-      const childCtx = { ...fixture.ctx };
-      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
-      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
-      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
-      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
-      const stagingDir = path.join(path.dirname(ownerRoot), "memory-adoption-staging");
-      await fsPromises.mkdir(childRoot, { recursive: true });
-      await fsPromises.mkdir(grandchildRoot, { recursive: true });
-      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
-      await fixture.service.listIndexEntries(childCtx);
-      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
-      const grandchildManifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
-      await fsPromises.writeFile(
-        grandchildManifest,
-        JSON.stringify({
-          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
-        })
-      );
-      // The grandchild's migration dies after its pending manifest write,
-      // before the new copy is installed (install and record restore fail).
-      const crash = () => Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }));
-      const realRename = fsPromises.rename.bind(fsPromises);
-      const realRm = fsPromises.rm.bind(fsPromises);
-      const renameSpy = spyOn(fsPromises, "rename").mockImplementation(((
-        from: string,
-        to: string
-      ) => (String(from).startsWith(stagingDir) ? crash() : realRename(from, to))) as never);
-      const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
-        target: string,
-        options?: unknown
-      ) =>
-        String(target).startsWith(stagingDir) && String(target) !== stagingDir
-          ? crash()
-          : (realRm as (...args: unknown[]) => unknown)(target, options)) as never);
-      try {
-        await fixture.service.listIndexEntries(grandchildCtx);
-      } finally {
-        renameSpy.mockRestore();
-        rmSpy.mockRestore();
-      }
-      const pendingState = (await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")!;
-      expect(pendingState).toMatchObject({
-        target: "imported/ws-grandchild/shared.md",
-        pending: true,
-      });
-      expect(await pathExists(path.join(ownerRoot, "imported", "ws-grandchild", "shared.md"))).toBe(
-        false
-      );
-      // In that window the child deletes its source: the shared copy is
-      // still all the grandchild has, and must stay.
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      await fsPromises.rm(path.join(childRoot, "shared.md"));
-      await fixture.service.listIndexEntries(childCtx);
-      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
-        "same note"
-      );
-      // The grandchild's retry finishes the migration; then the copy may go.
-      await fixture.service.listIndexEntries(grandchildCtx);
-      expect(
-        await fsPromises.readFile(
-          path.join(ownerRoot, "imported", "ws-grandchild", "shared.md"),
-          "utf-8"
-        )
-      ).toBe("same note");
-      expect(
-        Object.keys(Object.fromEntries(await readLegacyAdoptionManifest(grandchildManifest)))
-      ).toEqual(["shared.md"]);
-      await fixture.service.listIndexEntries(childCtx);
-      expect(await pathExists(path.join(ownerRoot, "shared.md"))).toBe(false);
-    });
-
     it("quarantines a malformed sibling manifest during a reliance check, but waits on an unreadable one", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -4394,6 +4190,264 @@ describe("MemoryService", () => {
         )
       ).toBe(true);
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+    });
+
+    it("migrates every descendant off a shared copy in a full store, then the creator's deletion clears it and its metadata", async () => {
+      using fixture = await createFixture("ws-child");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.set(FIXTURE_PROJECT_PATH, {
+          workspaces: [
+            { id: "ws-owner", name: "owner", path: "/checkouts/owner" },
+            {
+              id: "ws-child",
+              name: "child",
+              path: "/checkouts/child",
+              parentWorkspaceId: "ws-owner",
+            },
+            { id: "ws-grandchild", name: "g", path: "/checkouts/g", parentWorkspaceId: "ws-child" },
+            { id: "ws-cousin", name: "c", path: "/checkouts/c", parentWorkspaceId: "ws-owner" },
+          ],
+        });
+        return cfg;
+      });
+      const childCtx = { ...fixture.ctx };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      // The child's adoption takes the owner store's last slot.
+      await Promise.all(
+        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
+          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
+        )
+      );
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      const sharedCopy = path.join(ownerRoot, "shared.md");
+      const sharedKey = memoryLogicalKey("workspace", "shared.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      await fixture.metaService.setPinned(sharedKey, true);
+      // Two more descendants stand on that copy with receipts the previous
+      // layers wrote.
+      for (const id of ["ws-grandchild", "ws-cousin"]) {
+        const root = path.join(fixture.config.sessionsDir, id, "memory");
+        await fsPromises.mkdir(root, { recursive: true });
+        await fsPromises.writeFile(path.join(root, "shared.md"), "same note");
+        await fsPromises.writeFile(
+          legacyAdoptionManifestPath(path.dirname(root)),
+          JSON.stringify({
+            "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
+          })
+        );
+      }
+      // Each gets its own copy although the store is full (a bounded
+      // overflow: one file per outstanding receipt); the creator's file is
+      // never renamed, so no receipt is left pointing at nothing.
+      for (const id of ["ws-grandchild", "ws-cousin"]) {
+        await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: id });
+        const ownCopy = path.join(ownerRoot, "imported", id, "shared.md");
+        expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+        const record = (
+          await readLegacyAdoptionManifest(
+            legacyAdoptionManifestPath(path.join(fixture.config.sessionsDir, id))
+          )
+        ).get("shared.md")!;
+        expect(record).toMatchObject({ target: `imported/${id}/shared.md`, created: true });
+        expect(record.targetStamp).toBe((await adoptionTargetStamp(ownCopy)) ?? undefined);
+        expect(await fsPromises.readFile(sharedCopy, "utf-8")).toBe("same note");
+      }
+      // Nobody relies on the creator's copy any more: its deletion runs the
+      // normal removal, metadata included, and returns the slot.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "shared.md"));
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await pathExists(sharedCopy)).toBe(false);
+      expect((await fixture.metaService.getPinnedKeys()).has(sharedKey)).toBe(false);
+      // Back to the two own copies over the owner's notes: cap + 1 on disk.
+      expect(
+        (await fsPromises.readdir(ownerRoot, { recursive: true })).filter((entry) =>
+          String(entry).endsWith(".md")
+        )
+      ).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE + 1);
+      for (const id of ["ws-child", "ws-grandchild", "ws-cousin"]) {
+        await fixture.service.adoptLegacyPrivateStoreForRemoval(id, "ws-owner");
+      }
+    }, 30_000);
+
+    it("keeps the plain receipt until a migration's copy is installed, so a crash in between leaves the shared copy protected", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      const stagingDir = path.join(path.dirname(ownerRoot), "memory-adoption-staging");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      const grandchildManifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
+      const receipt = { content: sha256Hex("same note"), sidecar: "", target: "shared.md" };
+      await fsPromises.writeFile(grandchildManifest, JSON.stringify({ "shared.md": receipt }));
+      // The migration dies between staging and install.
+      const crash = () => Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }));
+      const realRename = fsPromises.rename.bind(fsPromises);
+      const realRm = fsPromises.rm.bind(fsPromises);
+      const renameSpy = spyOn(fsPromises, "rename").mockImplementation(((
+        from: string,
+        to: string
+      ) => (String(from).startsWith(stagingDir) ? crash() : realRename(from, to))) as never);
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
+        target: string,
+        options?: unknown
+      ) =>
+        String(target).startsWith(stagingDir) && String(target) !== stagingDir
+          ? crash()
+          : (realRm as (...args: unknown[]) => unknown)(target, options)) as never);
+      try {
+        await fixture.service.listIndexEntries(grandchildCtx);
+      } finally {
+        renameSpy.mockRestore();
+        rmSpy.mockRestore();
+      }
+      // Nothing but the plain receipt, exactly as written — the form every
+      // build reads (no pending record, no control key), still naming the
+      // shared copy.
+      expect(JSON.parse(await fsPromises.readFile(grandchildManifest, "utf-8"))).toEqual({
+        "shared.md": receipt,
+      });
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-grandchild", "shared.md"))).toBe(
+        false
+      );
+      // In that window the child deletes its source: the copy stays.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "shared.md"));
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "same note"
+      );
+      // The grandchild's forced handover completes the migration; the copy
+      // may go afterwards.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-grandchild", "ws-owner");
+      expect(
+        await fsPromises.readFile(
+          path.join(ownerRoot, "imported", "ws-grandchild", "shared.md"),
+          "utf-8"
+        )
+      ).toBe("same note");
+      expect((await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")).toMatchObject(
+        { target: "imported/ws-grandchild/shared.md", created: true }
+      );
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await pathExists(path.join(ownerRoot, "shared.md"))).toBe(false);
+    }, 30_000);
+
+    it("claims a migration copy installed before the receipt flipped instead of writing a second one", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      const grandchildManifest = legacyAdoptionManifestPath(path.dirname(grandchildRoot));
+      await fsPromises.writeFile(
+        grandchildManifest,
+        JSON.stringify({
+          "shared.md": { content: sha256Hex("same note"), sidecar: "", target: "shared.md" },
+        })
+      );
+      // The state a crash between install and flip leaves: the own copy sits
+      // at the descendant's import slot, the receipt still names the shared
+      // copy.
+      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      await fsPromises.mkdir(path.dirname(ownCopy), { recursive: true });
+      await fsPromises.writeFile(ownCopy, "same note");
+      const installed = (await adoptionTargetStamp(ownCopy))!;
+      await fixture.service.listIndexEntries(grandchildCtx);
+      const record = (await readLegacyAdoptionManifest(grandchildManifest)).get("shared.md")!;
+      expect(record).toMatchObject({ target: "imported/ws-grandchild/shared.md", created: true });
+      expect(record.targetStamp).toBe(installed);
+      expect(await fsPromises.readdir(path.join(ownerRoot, "imported", "ws-grandchild"))).toEqual([
+        "shared.md",
+      ]);
+      // With provenance, the claimed copy follows the grandchild's source out.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(grandchildRoot, "shared.md"));
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await pathExists(ownCopy)).toBe(false);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "same note"
+      );
+    });
+
+    it("treats an unreadable config as an unanswered sibling scan: nothing is deleted, the pass retries", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // A sibling relies on the copy — which a scan over an empty config
+      // would never see.
+      await fsPromises.writeFile(path.join(grandchildRoot, "note.md"), "v1");
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(path.dirname(grandchildRoot)),
+        JSON.stringify({ "note.md": { content: sha256Hex("v1"), sidecar: "", target: "note.md" } })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "note.md"));
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      // While the config is unreadable, a strict read throws and a tolerant
+      // one yields a default view that lacks the sibling — the view that
+      // would answer "no other descendants".
+      const realLoad = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        ((options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError === true) {
+            throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+          }
+          const cfg = realLoad();
+          return {
+            ...cfg,
+            projects: new Map(
+              [...cfg.projects].map(([key, project]) => [
+                key,
+                {
+                  ...project,
+                  workspaces: project.workspaces.filter((w) => w.id !== "ws-grandchild"),
+                },
+              ])
+            ),
+          };
+        }) as typeof fixture.config.loadConfigOrDefault
+      );
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        unreadable.mockRestore();
+      }
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      // Readable again: the scan finds the sibling and still keeps the copy;
+      // the pass was not memoized in between.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(2);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
     });
   });
 

@@ -479,23 +479,8 @@ const LEGACY_ADOPTION_STAGING_DIR_NAME = "memory-adoption-staging";
  * finds the marker, sees the note's record moved elsewhere, and removes the
  * superseded original while it is still that generation. Dropped when the
  * replacement settles here.
- *
- * The same key also retains a RELIANCE receipt while a note migrates off a
- * shared copy (`created: false`, `target` the copy it stood on): the pending
- * record must already name the new target, but until the new copy is
- * installed the old one is all the note has, and the sibling that created it
- * must keep seeing a receipt naming it (siblingReliesOn) — otherwise a crash
- * in that window would let the sibling's source deletion remove the only
- * copy. Dropped when the migration settles or its record is restored.
  */
 const LEGACY_SUPERSEDED_MARKER_PREFIX = "\u0001superseded\u0001";
-
-/** A sibling descendant's manifest record with where it came from. */
-interface DescendantAdoptionRecord {
-  workspaceId: string;
-  relPath: string;
-  record: LegacyAdoptionRecord;
-}
 
 function legacyAdoptionStagingDir(store: MemoryStore): string {
   return path.join(path.dirname(store.physicalRoot), LEGACY_ADOPTION_STAGING_DIR_NAME);
@@ -1530,35 +1515,16 @@ export class MemoryService extends EventEmitter {
       // malformed one cannot answer, and the note waits (transient skip)
       // rather than reuse — or clear the pins of — a copy that may be a
       // sibling's.
-      let siblingRecords: DescendantAdoptionRecord[] | null = null;
-      const siblingOwner = async (targetRelPath: string, liveStamp: string) => {
+      let siblingRecords: LegacyAdoptionRecord[] | null = null;
+      const siblingOwns = async (targetRelPath: string, liveStamp: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
-        return (
-          siblingRecords.find(
-            ({ record }) =>
-              record.target === targetRelPath &&
-              record.created === true &&
-              record.deleted !== true &&
-              (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
-          ) ?? null
+        return siblingRecords.some(
+          (record) =>
+            record.target === targetRelPath &&
+            record.created === true &&
+            record.deleted !== true &&
+            (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
         );
-      };
-      const siblingOwns = async (targetRelPath: string, liveStamp: string) =>
-        (await siblingOwner(targetRelPath, liveStamp)) !== null;
-      // Whether the descendant whose adoption created a copy has since lost
-      // (deleted, renamed away) the legacy source behind it — that copy is
-      // about to follow the source out, so a note migrating off it may take
-      // the file over instead of writing a second one. An existing or
-      // unreadable source keeps the copy the creator's.
-      const siblingSourceGone = async (targetRelPath: string, liveStamp: string) => {
-        const creator = await siblingOwner(targetRelPath, liveStamp);
-        if (creator === null) return false;
-        return fsPromises
-          .lstat(path.join(this.config.sessionsDir, creator.workspaceId, "memory", creator.relPath))
-          .then(
-            () => false,
-            (error: unknown) => isMissingPathError(error)
-          );
       };
       // A sibling's settled reuse record may still name a copy of ours (the
       // previous layers let identical notes share one). That sibling
@@ -1568,7 +1534,7 @@ export class MemoryService extends EventEmitter {
       const siblingReliesOn = async (targetRelPath: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
         return siblingRecords.some(
-          ({ record }) =>
+          (record) =>
             record.target === targetRelPath && record.created !== true && record.deleted !== true
         );
       };
@@ -1958,11 +1924,21 @@ export class MemoryService extends EventEmitter {
           replaces?: boolean;
           generation?: string;
           supersedes?: string;
-          /** A migration that takes the shared copy over by rename (its creator's source is gone). */
-          takeOver?: { target: string; stamp: string };
         } | null = null;
-        // The shared copy (and its generation) this note is migrating off.
-        let migratingFrom: { target: string; stamp: string } | null = null;
+        // Migrating off another descendant's copy this note's settled receipt
+        // (created: false) stands on: the receipt is the sibling's reason to
+        // keep that copy (siblingReliesOn) and stays in the manifest,
+        // unchanged and in the form every build reads, until this note's own
+        // copy is installed — then the record flips to it in one write. No
+        // pending record precedes the install (it would replace the receipt),
+        // so a retry recognizes an installed-but-unflipped copy by its
+        // identical bytes at this descendant's own import slot; a downgrade
+        // in that window sees the receipt as before plus, at worst, one
+        // redundant copy this build claims on return. The install is exempt
+        // from the capacity check: at most one extra file per outstanding
+        // shared receipt (prior state, bounded), and the creator's normal
+        // deletion returns the slot once nobody relies on its copy.
+        let migration = false;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
         // note it was folded into at first adoption; a copy the owner
@@ -2033,9 +2009,7 @@ export class MemoryService extends EventEmitter {
               continue;
             }
           }
-          if (siblings && currentStamp !== undefined) {
-            migratingFrom = { target: previous.target, stamp: currentStamp };
-          }
+          migration = siblings;
           if (priorContent === content && !siblings) {
             target = { relPath: previous.target, write: false };
             record.created = ours;
@@ -2081,39 +2055,26 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
+          // A migration interrupted between its install and its receipt flip
+          // left this note's own copy at its import slot with no record: the
+          // identical file found there is that copy (this descendant's slot;
+          // see `migration`) and is claimed rather than reused as the owner's.
+          if (migration && !target.write && target.relPath !== previous?.target) {
+            const stamp = await adoptionTargetStamp(store.physicalPath(target.relPath));
+            if (stamp === null) {
+              skipped++;
+              transientSkips++;
+              continue;
+            }
+            record.created = true;
+            record.targetStamp = stamp;
+          }
         }
         if (target.write) {
-          if (target.replaces !== true && remainingCapacity <= 0) {
-            // A migration off a shared copy needs no slot once the copy's
-            // creator has lost its source (the copy would follow that source
-            // out — but cannot while this note still relies on it): the file
-            // is taken over by rename. Otherwise the note keeps relying on
-            // the shared copy for now, unmemoized, so freed space or the
-            // creator's deletion is picked up on the next access rather than
-            // the two waiting on each other until a restart.
-            if (migratingFrom === null) {
-              capacityExhausted = true;
-              skipped++;
-              continue;
-            }
-            let sourceGone: boolean;
-            try {
-              sourceGone = await siblingSourceGone(migratingFrom.target, migratingFrom.stamp);
-            } catch (error) {
-              log.warn(
-                "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
-                { childId, owner, relPath, target: migratingFrom.target, error }
-              );
-              skipped++;
-              transientSkips++;
-              continue;
-            }
-            if (!sourceGone) {
-              skipped++;
-              transientSkips++;
-              continue;
-            }
-            target.takeOver = migratingFrom;
+          if (target.replaces !== true && !migration && remainingCapacity <= 0) {
+            capacityExhausted = true;
+            skipped++;
+            continue;
           }
           // Destination containment immediately before the write (the
           // same check a memory create runs): a symlinked component under
@@ -2143,73 +2104,58 @@ export class MemoryService extends EventEmitter {
           // follow it out of the shared store. A replacement keeps the PRIOR
           // record (old hash and stamp, same target) while pending: on either
           // side of the install the retry recognizes the file by its stamp.
-          // A take-over's "staged bytes" are the shared copy itself (identical
-          // to this note; its generation is the receipt).
-          let stagingPath: string;
-          let stagedStamp: string;
-          if (target.takeOver !== undefined) {
-            stagingPath = store.physicalPath(target.takeOver.target);
-            stagedStamp = target.takeOver.stamp;
-          } else {
-            stagingPath = path.join(stagingDir, randomUUID());
-            try {
-              await fsPromises.mkdir(stagingDir, { recursive: true });
-              await writeFileAtomic(stagingPath, content, { encoding: "utf-8" });
-            } catch (error) {
-              log.warn("[MemoryService] cannot stage a legacy note for adoption; retrying later", {
-                childId,
-                relPath,
-                error,
+          // A migration installs first and flips its receipt afterwards (see
+          // `migration`): no pending record.
+          const stagingPath = path.join(stagingDir, randomUUID());
+          try {
+            await fsPromises.mkdir(stagingDir, { recursive: true });
+            await writeFileAtomic(stagingPath, content, { encoding: "utf-8" });
+          } catch (error) {
+            log.warn("[MemoryService] cannot stage a legacy note for adoption; retrying later", {
+              childId,
+              relPath,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          const stagedStamp = await adoptionTargetStamp(stagingPath);
+          if (stagedStamp === null) {
+            await fsPromises.rm(stagingPath, { force: true });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          if (!migration) {
+            adopted.set(
+              relPath,
+              target.replaces === true && previous !== undefined
+                ? {
+                    ...previous,
+                    pending: true,
+                    replacementContent: record.content,
+                    replacementStamp: stagedStamp,
+                  }
+                : {
+                    ...record,
+                    target: target.relPath,
+                    created: true,
+                    pending: true,
+                    targetStamp: stagedStamp,
+                  }
+            );
+            if (target.replaces === true) {
+              adopted.set(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`, {
+                content: target.supersedes ?? "",
+                sidecar: "",
+                target: target.relPath,
+                created: true,
+                targetStamp: target.generation,
               });
-              skipped++;
-              transientSkips++;
-              continue;
             }
-            const staged = await adoptionTargetStamp(stagingPath);
-            if (staged === null) {
-              await fsPromises.rm(stagingPath, { force: true });
-              skipped++;
-              transientSkips++;
-              continue;
-            }
-            stagedStamp = staged;
+            await writeManifest();
           }
-          adopted.set(
-            relPath,
-            target.replaces === true && previous !== undefined
-              ? {
-                  ...previous,
-                  pending: true,
-                  replacementContent: record.content,
-                  replacementStamp: stagedStamp,
-                }
-              : {
-                  ...record,
-                  target: target.relPath,
-                  created: true,
-                  pending: true,
-                  targetStamp: stagedStamp,
-                }
-          );
-          if (target.replaces === true) {
-            adopted.set(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`, {
-              content: target.supersedes ?? "",
-              sidecar: "",
-              target: target.relPath,
-              created: true,
-              targetStamp: target.generation,
-            });
-          } else if (previous !== undefined && previous.created !== true) {
-            // Migrating off a reused copy: the receipt naming it is retained
-            // until the new copy is installed (see the marker prefix).
-            adopted.set(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`, {
-              content: previous.content,
-              sidecar: "",
-              target: previous.target,
-              created: false,
-            });
-          }
-          await writeManifest();
           // The destination as decided above, re-checked under the lock right
           // before the install: a fresh placement must still be free, a
           // replacement must still be the generation it was decided against.
@@ -2220,11 +2166,10 @@ export class MemoryService extends EventEmitter {
             target.replaces === true
               ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
                 target.generation
-              : (await store.kind(target.relPath, { strict: true })) === null &&
-                (target.takeOver === undefined ||
-                  (await adoptionTargetStamp(stagingPath)) === stagedStamp);
+              : (await store.kind(target.relPath, { strict: true })) === null;
           const restoreRecord = async () => {
-            if (target.takeOver === undefined) await fsPromises.rm(stagingPath, { force: true });
+            await fsPromises.rm(stagingPath, { force: true });
+            if (migration) return; // the manifest was never touched
             if (previous === undefined) adopted.delete(relPath);
             else adopted.set(relPath, previous);
             adopted.delete(`${LEGACY_SUPERSEDED_MARKER_PREFIX}${relPath}`);
@@ -2263,7 +2208,7 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          if (target.replaces !== true && target.takeOver === undefined) remainingCapacity--;
+          if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
           // The generation of the file just installed (see targetStamp): the
@@ -2453,20 +2398,25 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * The adoption records of the owner's OTHER descendants (with the
-   * descendant and legacy relPath each belongs to), read strictly: the pass
-   * decides on their authority whether an identical owner file may be
-   * reused or a copy removed, so an unreadable sibling manifest fails the
-   * question (callers skip the note transiently) instead of answering "not a
-   * sibling's"; a malformed one is quarantined (see below).
+   * The adoption records of the owner's OTHER descendants, read strictly:
+   * the pass decides on their authority whether an identical owner file may
+   * be reused or a copy removed, so an unreadable config or sibling manifest
+   * fails the question (callers skip the note transiently) instead of
+   * answering "not a sibling's"; a malformed manifest is quarantined (see
+   * below).
    */
   private async descendantAdoptionRecords(
     owner: string,
     childId: string
-  ): Promise<DescendantAdoptionRecord[]> {
-    const cfg = this.config.loadConfigOrDefault();
+  ): Promise<LegacyAdoptionRecord[]> {
+    // Strict: a config that is merely unreadable or malformed right now must
+    // not read as "no other descendants" — that answer lets the deletion and
+    // superseded-copy paths remove a generation a sibling still names.
+    // Callers treat the throw as transient. Only a MISSING config is the
+    // genuine empty case.
+    const cfg = this.config.loadConfigOrDefault({ throwOnError: true });
     const resolve = workspaceMemoryOwnerResolver(cfg);
-    const records: DescendantAdoptionRecord[] = [];
+    const records: LegacyAdoptionRecord[] = [];
     for (const project of cfg.projects.values()) {
       for (const workspace of project.workspaces) {
         const id = workspace.id;
@@ -2486,8 +2436,7 @@ export class MemoryService extends EventEmitter {
           await this.quarantineAdoptionManifest(manifestPath, id, error);
           continue;
         }
-        for (const [relPath, record] of manifest)
-          records.push({ workspaceId: id, relPath, record });
+        records.push(...manifest.values());
       }
     }
     return records;
