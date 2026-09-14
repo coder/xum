@@ -147,6 +147,23 @@ describe("Init display after cleanup changes", () => {
       aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 301 });
       expect(displayedTypes(aggregator)).toContain("workspace-init");
     });
+
+    it("only hides the card on positive evidence that the init predates the boundary", () => {
+      // A boundary without a timestamp cannot prove the init belongs to unloaded history,
+      // so a running fork init keeps its card rather than losing its progress and failure output.
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      const undatedSummary = compactionSummary("summary-undated", 5, 200);
+      delete undatedSummary.metadata?.timestamp;
+      aggregator.loadHistoricalMessages([undatedSummary, ...epoch2.slice(1)], false);
+      aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 300 });
+      expect(displayedTypes(aggregator)).toEqual([
+        "compaction-boundary",
+        "assistant",
+        "user",
+        "workspace-init",
+        "assistant",
+      ]);
+    });
   });
 
   it("propagates steps and throttles progress until another step or completion clears it", () => {

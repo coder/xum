@@ -334,7 +334,9 @@ function markRowsBeforeLatestContextBoundary(messages: DisplayedMessage[]): Disp
  * The creation card belongs to the first user turn of the whole transcript. When the loaded
  * rows start at a context boundary, that turn lives in older history the user has not loaded,
  * so the card stays hidden with it. A fork copies compacted history and runs its own init
- * afterwards; that init happened inside the loaded window, so its card stays visible.
+ * afterwards; that init happened inside the loaded window, so its card stays visible. Hiding
+ * needs positive evidence: an undated boundary cannot prove the init predates it, and a hidden
+ * running init would lose its progress and failure output.
  */
 function findInitMessageInsertionIndex(
   messages: DisplayedMessage[],
@@ -346,10 +348,9 @@ function findInitMessageInsertionIndex(
     (message): message is Extract<DisplayedMessage, { type: "compaction-boundary" }> =>
       message.type === "compaction-boundary"
   );
-  const initInsideLoadedWindow =
-    boundary === undefined ||
-    (boundary.timestamp !== undefined && initStartTime > boundary.timestamp);
-  return initInsideLoadedWindow ? firstUserIndex + 1 : null;
+  const initPredatesBoundary =
+    boundary?.timestamp !== undefined && initStartTime <= boundary.timestamp;
+  return initPredatesBoundary ? null : firstUserIndex + 1;
 }
 
 function extractAgentSkillSnapshotBody(snapshotText: string): string | null {
