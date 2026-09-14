@@ -74,6 +74,8 @@ export type WorkflowAgentResult = StructuredTaskOutput & { taskId: string };
 interface WorkflowAgentRunResult {
   rawResult: WorkflowAgentResult;
   resultSpec: WorkflowAgentSpec;
+  /** The checkpointed attempt this result settles; every terminal write is fenced to it. */
+  taskId: string;
 }
 
 interface StartedWorkflowAgentHandle {
@@ -322,16 +324,6 @@ function getTaskTerminalStatusForError(
 
 function isRetryableAgentOutputError(error: unknown): boolean {
   return error instanceof WorkflowAgentOutputValidationError;
-}
-
-function getTaskIdFromUnknownAgentResult(result: unknown): string | undefined {
-  if (result != null && typeof result === "object") {
-    const taskId = (result as Record<string, unknown>).taskId;
-    if (typeof taskId === "string" && taskId.length > 0) {
-      return taskId;
-    }
-  }
-  return undefined;
 }
 
 function buildRetryAgentSpec(
@@ -1370,10 +1362,12 @@ export class WorkflowRunner {
 
     let result: StructuredTaskOutput;
     try {
+      assert(settled.state.taskId != null, "pipeline agent result requires a started taskId");
       result = await this.recordAgentResult(runId, sequence, {
         spec: settled.state.resultSpec,
         inputHash: settled.state.inputHash,
         startedAt: settled.state.startedAt,
+        taskId: settled.state.taskId,
         leaseGuard: options.leaseGuard,
         rawResult: settled.rawResult,
       });
@@ -1706,6 +1700,7 @@ export class WorkflowRunner {
               spec: settled.runResult.resultSpec,
               inputHash: settled.step.inputHash,
               startedAt: settled.step.startedAt,
+              taskId: settled.runResult.taskId,
               leaseGuard: options.leaseGuard,
               rawResult: settled.runResult.rawResult,
             });
@@ -1777,6 +1772,7 @@ export class WorkflowRunner {
           spec: runResult.resultSpec,
           inputHash: step.inputHash,
           startedAt,
+          taskId: runResult.taskId,
           leaseGuard: step.leaseGuard,
           rawResult: runResult.rawResult,
         });
@@ -2212,7 +2208,7 @@ export class WorkflowRunner {
           waitOptions: step.waitOptions,
           leaseGuard: step.leaseGuard,
         });
-        return { rawResult, resultSpec };
+        return { rawResult, resultSpec, taskId };
       } catch (error) {
         if (!isForegroundWaitBackgroundedError(error) && !isWorkflowAgentHardTimeoutError(error)) {
           step.leaseGuard.throwIfLost();
@@ -2249,7 +2245,7 @@ export class WorkflowRunner {
           resultSpec,
           step.waitOptions
         );
-        return { rawResult, resultSpec };
+        return { rawResult, resultSpec, taskId: step.taskId };
       } catch (error) {
         if (!isForegroundWaitBackgroundedError(error)) {
           step.leaseGuard.throwIfLost();
@@ -2340,7 +2336,7 @@ export class WorkflowRunner {
           resultSpec,
           step.waitOptions
         );
-        return { rawResult, resultSpec };
+        return { rawResult, resultSpec, taskId: recordedTaskId };
       } catch (error) {
         if (!isForegroundWaitBackgroundedError(error)) {
           step.leaseGuard.throwIfLost();
@@ -2394,19 +2390,20 @@ export class WorkflowRunner {
     }
     step.leaseGuard.throwIfLost();
     if (recordedTaskId == null) {
+      recordedTaskId = rawResult.taskId;
       await this.recordStepStarted(runId, {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId: rawResult.taskId,
+        taskId: recordedTaskId,
         startedAt: step.startedAt,
       });
       await this.recordTaskStartedEventIfMissing(runId, sequence, {
         stepId: step.spec.id,
-        taskId: rawResult.taskId,
+        taskId: recordedTaskId,
         title: step.spec.title,
       });
     }
-    return { rawResult, resultSpec };
+    return { rawResult, resultSpec, taskId: recordedTaskId };
   }
 
   private async recordAgentReservationEventIfMissing(
@@ -2614,10 +2611,15 @@ export class WorkflowRunner {
       spec: WorkflowAgentSpec;
       inputHash: string;
       startedAt: string;
+      taskId: string;
       leaseGuard: WorkflowRunnerLeaseGuard;
       rawResult: WorkflowAgentResult;
     }
   ): Promise<StructuredTaskOutput> {
+    assert(
+      step.rawResult.taskId === step.taskId,
+      `agent ${step.spec.id} result task ${step.rawResult.taskId} does not match attempt ${step.taskId}`
+    );
     let result: StructuredTaskOutput;
     try {
       result = StructuredTaskOutputSchema.parse(step.rawResult);
@@ -2641,7 +2643,6 @@ export class WorkflowRunner {
       }
     }
     step.leaseGuard.throwIfLost();
-    const taskId = this.getTaskIdFromAgentResult(step.rawResult, step.spec.id);
     const completedAt = this.clock.nowIso();
     sequence.next();
     await this.runStore.recordStepCompletedAndAppendTaskEvent(
@@ -2649,7 +2650,7 @@ export class WorkflowRunner {
       {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId,
+        taskId: step.taskId,
         title: step.spec.title,
         result,
         startedAt: step.startedAt,
@@ -2667,24 +2668,21 @@ export class WorkflowRunner {
       spec: WorkflowAgentSpec;
       inputHash: string;
       startedAt: string;
+      taskId: string;
       leaseGuard: WorkflowRunnerLeaseGuard;
-      rawResult: WorkflowAgentResult;
     },
     message: string
   ): Promise<void> {
     step.leaseGuard.throwIfLost();
-    const taskId = getTaskIdFromUnknownAgentResult(step.rawResult);
     const failedAt = this.clock.nowIso();
     sequence.next();
-    if (taskId != null) {
-      sequence.next();
-    }
+    sequence.next();
     await this.runStore.recordStepFailedAndAppendTaskEvent(
       runId,
       {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId,
+        taskId: step.taskId,
         title: step.spec.title,
         error: message,
         startedAt: step.startedAt,
@@ -2694,15 +2692,6 @@ export class WorkflowRunner {
       },
       { expectedLeaseOwnerId: this.runnerId }
     );
-  }
-
-  private getTaskIdFromAgentResult(result: WorkflowAgentResult, stepId: string): string {
-    const maybeTaskId = result.taskId;
-    assert(
-      typeof maybeTaskId === "string" && maybeTaskId.length > 0,
-      `agent ${stepId} returned no taskId`
-    );
-    return maybeTaskId;
   }
 }
 
