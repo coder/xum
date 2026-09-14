@@ -58,6 +58,9 @@ import {
 } from "@/node/services/taskHandleStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { WorkflowRunner } from "@/node/services/workflows/WorkflowRunner";
+import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { log } from "@/node/services/log";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
@@ -33612,6 +33615,156 @@ describe("TaskService", () => {
       // Linearization point passed: only Stop ends it.
       expect(await taskService.terminateAllDescendantAgentTasks(rootId)).toEqual([spawnedId]);
       expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("interrupted");
+    });
+  });
+
+  describe("workflow runner integration (real TaskService + adapter)", () => {
+    const RUN_ID = "wfr_bulk_checkpoint_stop";
+    const FANOUT_SOURCE = `export default function workflow({ agent, parallel }) {
+  const results = parallel([
+    () => agent("Fan out A", { id: "fanout-0" }),
+    () => agent("Fan out B", { id: "fanout-1" }),
+  ]);
+  return { reportMarkdown: results.join(" | ") };
+}
+`;
+
+    test("a Stop between bulk checkpoints fails the checkpointed attempt, frees the lease, and the same-run resume replaces each failed step exactly once", async () => {
+      const firstIds = ["fanout0first", "fanout1first"];
+      const replacementIds = ["fanout0second", "fanout1second"];
+      const { config } = await setupTree([]);
+      stubStableIds(config, [...firstIds, ...replacementIds]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = taskService as unknown as {
+        startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+        setTaskStatus: (
+          taskId: string,
+          status: string,
+          options?: { onlyFromStatus?: string }
+        ) => Promise<boolean>;
+        handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+      };
+      // Every admitted launch completes immediately through the real publication path.
+      const launched: string[] = [];
+      spyOn(internals, "startReservedAgentTask").mockImplementation(async (plan) => {
+        launched.push(plan.taskId);
+        await internals.setTaskStatus(plan.taskId, "running", { onlyFromStatus: "starting" });
+        await internals.handleStreamEnd({
+          type: "stream-end",
+          workspaceId: plan.taskId,
+          messageId: `${plan.taskId}-final`,
+          metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolCallId: `${plan.taskId}-report`,
+              toolName: "agent_report",
+              input: { reportMarkdown: `report ${plan.taskId}` },
+              state: "output-available",
+              output: { success: true, report: { reportMarkdown: `report ${plan.taskId}` } },
+            },
+            // The terminal report is the final assistant response of the turn.
+            { type: "text", text: `report ${plan.taskId}` },
+          ],
+        });
+      });
+
+      // Production keeps the run under the parent workspace's session dir; TaskService reads it
+      // there to decide whether a workflow-owned child still has a live owner.
+      const store = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, rootId),
+        staleLeaseMs: 100,
+      });
+      await store.createRun({
+        id: RUN_ID,
+        workspaceId: rootId,
+        workflow: {
+          name: "fanout",
+          description: "Fan out",
+          scope: "built-in" as const,
+          executable: true,
+        },
+        source: FANOUT_SOURCE,
+        args: {},
+        now: "2026-05-29T00:00:00.000Z",
+      });
+      const adapter = new WorkflowTaskServiceAdapter({
+        taskService,
+        parentWorkspaceId: rootId,
+        workflowRunId: RUN_ID,
+        defaultAgentId: "explore",
+        getProjectTrusted: () => true,
+      });
+      const createRunner = (runnerId: string) =>
+        new WorkflowRunner({
+          runStore: store,
+          runtimeFactory: new QuickJSRuntimeFactory(),
+          taskAdapter: adapter,
+          runnerId,
+          clock: { nowIso: () => new Date().toISOString(), nowMs: () => Date.now() },
+        });
+
+      // The user's Stop lands right after the FIRST bulk checkpoint was durably recorded: the
+      // second checkpoint observes the abort and throws before the config commit (the exact
+      // UAT sequence).
+      const stop = new AbortController();
+      const realRecordStepStarted = store.recordStepStarted.bind(store);
+      let checkpoints = 0;
+      spyOn(store, "recordStepStarted").mockImplementation(async (...args) => {
+        const result = await realRecordStepStarted(...args);
+        checkpoints += 1;
+        if (checkpoints === 1) stop.abort();
+        return result;
+      });
+      const firstRun = createRunner("runner-a").run(RUN_ID, { abortSignal: stop.signal });
+      expect(
+        await firstRun.then(
+          () => null,
+          (error: unknown) => error
+        )
+      ).toBeInstanceOf(Error);
+
+      const afterStop = await store.getRun(RUN_ID);
+      // The checkpointed attempt is authoritatively failed (its reservation never committed),
+      // not left `started` behind an indeterminate "no attempt owned" read.
+      expect(afterStop.steps).toMatchObject([
+        { stepId: "fanout-0", taskId: firstIds[0], status: "failed" },
+      ]);
+      // WorkflowService.interruptRun persists the run's interrupted status around the abort.
+      await store.appendStatus(RUN_ID, "interrupted", new Date().toISOString());
+      expect(launched).toEqual([]);
+      for (const id of firstIds) expect(findWorkspaceInConfig(config, id)).toBeUndefined();
+      expect(
+        await taskService.readAttemptOutcome(firstIds[0], { requestingWorkspaceId: rootId })
+      ).toEqual({ kind: "terminal-no-report" });
+
+      // Same run, new runner (the lease was released): exactly one replacement per failed step,
+      // and the canceled ids are never admitted.
+      await waitUntil(() => checkpoints >= 1, "checkpoint");
+      const resumed = await createRunner("runner-b").run(RUN_ID, {
+        allowResumeFromInterrupted: true,
+      });
+      expect(resumed).toEqual({
+        reportMarkdown: `report ${replacementIds[0]} | report ${replacementIds[1]}`,
+      });
+      expect(launched.sort()).toEqual([...replacementIds].sort());
+      const finalRun = await store.getRun(RUN_ID);
+      expect(finalRun.status).toBe("completed");
+      expect(finalRun.steps.map((step) => [step.stepId, step.taskId, step.status]).sort()).toEqual([
+        ["fanout-0", replacementIds[0], "completed"],
+        ["fanout-1", replacementIds[1], "completed"],
+      ]);
+      const taskEvents = finalRun.events
+        .filter((event) => event.type === "task")
+        .map((event) => (event.type === "task" ? `${event.taskId}:${event.status}` : ""));
+      expect(taskEvents.filter((entry) => entry.startsWith(firstIds[0]))).toEqual([
+        `${firstIds[0]}:started`,
+        `${firstIds[0]}:failed`,
+      ]);
+      expect(taskEvents.filter((entry) => entry.startsWith(firstIds[1]))).toEqual([]);
+      for (const id of replacementIds) {
+        expect(findWorkspaceInConfig(config, id)?.taskStatus).toBe("reported");
+      }
     });
   });
 });
