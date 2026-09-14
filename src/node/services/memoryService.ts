@@ -335,6 +335,16 @@ export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
 }
 
 /**
+ * A store-relative path with the differences a case- and
+ * normalization-insensitive filesystem (APFS, NTFS, HFS+) ignores removed:
+ * two spellings folding to the same string MAY name one directory entry
+ * there. Never a proof of identity on its own (compare stamps too).
+ */
+function foldedSpelling(relPath: string): string {
+  return relPath.normalize("NFC").toLowerCase();
+}
+
+/**
  * The uniqueness suffix of a project memory directory name. A pure string hash of the
  * project path, so it is host-independent: the settings backup's project bundle validates
  * recorded memory directory names against this same function, which must therefore never
@@ -1530,6 +1540,7 @@ export class MemoryService extends EventEmitter {
       // case-insensitive filesystem a sibling's `a.md` and this note's `A.md`
       // are one file with one live stamp, and a spelling comparison would let
       // this note reuse — and the sibling later replace or delete — the copy.
+      // (siblingReliesOn additionally tells aliases from hard links; below.)
       let siblingRecords: LegacyAdoptionRecord[] | null = null;
       const siblingOwns = async (_targetRelPath: string, liveStamp: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
@@ -1558,6 +1569,15 @@ export class MemoryService extends EventEmitter {
       // receipts times under the owner-store lock). A path this pass itself
       // installs or removes is dropped from the cache (`forgetIdentity`) so a
       // stale identity never grants or withholds deletion authority.
+      // Identity alone conflates two aliases of one file with two HARD LINKS
+      // to it: removing one link leaves the sibling's link intact, so a
+      // receipt naming the other link does not rely on this one (a copy
+      // wrongly held would block the creator's non-forced removal until the
+      // sibling's next pass). One directory entry (nlink 1) proves both
+      // spellings are aliases of it; with several links only a spelling
+      // equal under case folding (and Unicode normalization) is taken as an
+      // alias — the safe side for a removal where the two cannot be told
+      // apart.
       const receiptIdentities = new Map<
         string,
         Awaited<ReturnType<typeof adoptionTargetPresence>>
@@ -1585,10 +1605,11 @@ export class MemoryService extends EventEmitter {
           if (identity === "absent") continue;
           const receipt = await receiptIdentity(record.target);
           if (receipt === "absent") continue;
+          if (receipt === "unreadable" || identity === "unreadable") return true;
+          if (receipt.stamp !== identity.stamp) continue;
           if (
-            receipt === "unreadable" ||
-            identity === "unreadable" ||
-            receipt.stamp === identity.stamp
+            identity.nlink === 1n ||
+            foldedSpelling(record.target) === foldedSpelling(targetRelPath)
           ) {
             return true;
           }
@@ -2016,6 +2037,8 @@ export class MemoryService extends EventEmitter {
           replaces?: boolean;
           generation?: string;
           supersedes?: string;
+          /** Writes over a byte-redundant duplicate at the import slot (see legacyImportTarget). */
+          replacesRedundant?: boolean;
         } | null = null;
         // Migrating off another descendant's copy this note's settled receipt
         // (created: false) stands on: the receipt is the sibling's reason to
@@ -2032,10 +2055,9 @@ export class MemoryService extends EventEmitter {
         // recorded before the install (targetStamp), never from a byte
         // match. The bounded outcome of a crash there (and of a downgrade in
         // the window, which sees the receipt as before) is one redundant copy
-        // adoption never deletes. The install is exempt from the capacity
-        // check: at most one extra file per outstanding shared receipt (prior
-        // state, bounded), and the creator's normal deletion returns the slot
-        // once nobody relies on its copy.
+        // adoption never deletes (or, once the legacy note is edited, writes
+        // over — see legacyImportTarget). At capacity the migration waits (a
+        // transient skip) instead of overflowing the cap.
         let migration = false;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
@@ -2137,7 +2159,14 @@ export class MemoryService extends EventEmitter {
           // its lstat or read) is neither free nor different: the note waits
           // for the next pass with no copy made and no record written.
           try {
-            target = await this.legacyImportTarget(store, childId, relPath, content, siblingOwns);
+            target = await this.legacyImportTarget(
+              store,
+              childId,
+              relPath,
+              content,
+              siblingOwns,
+              previous !== undefined && previous.created !== true ? previous.target : undefined
+            );
           } catch (error) {
             log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
               childId,
@@ -2155,7 +2184,23 @@ export class MemoryService extends EventEmitter {
           }
         }
         if (target.write) {
-          if (target.replaces !== true && !migration && remainingCapacity <= 0) {
+          if (
+            target.replaces !== true &&
+            target.replacesRedundant !== true &&
+            remainingCapacity <= 0
+          ) {
+            // A migration off a shared copy waits for a slot rather than
+            // overflowing the cap (which the index would silently truncate):
+            // the note keeps standing on the shared copy — its receipt keeps
+            // that copy in place — and the skip is transient, so freed space
+            // is picked up on the next access. Removal: the creator's
+            // non-forced handover waits on the reliance; forced handovers
+            // proceed (the note stays represented by the shared copy).
+            if (migration) {
+              skipped++;
+              transientSkips++;
+              continue;
+            }
             capacityExhausted = true;
             skipped++;
             continue;
@@ -2250,7 +2295,10 @@ export class MemoryService extends EventEmitter {
             target.replaces === true
               ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
                 target.generation
-              : (await store.kind(target.relPath, { strict: true })) === null;
+              : target.replacesRedundant === true
+                ? previous !== undefined &&
+                  (await this.isRedundantCopy(store, target.relPath, previous.target))
+                : (await store.kind(target.relPath, { strict: true })) === null;
           const restoreRecord = async () => {
             await fsPromises.rm(stagingPath, { force: true });
             if (migration) return; // the manifest was never touched
@@ -2293,7 +2341,7 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          if (target.replaces !== true) remainingCapacity--;
+          if (target.replaces !== true && target.replacesRedundant !== true) remainingCapacity--;
           imported++;
           record.created = true;
           // The generation of the file just installed (see targetStamp): the
@@ -2443,16 +2491,26 @@ export class MemoryService extends EventEmitter {
    * per-child import directory when the owner has different content there
    * or the identical file is another descendant's adoption-created copy;
    * null when even that slot is taken by different content (the file stays
-   * only in the legacy directory). Throws when a sibling manifest the
-   * decision needs cannot be read (callers skip the note transiently).
+   * only in the legacy directory) — unless that slot holds a byte-for-byte
+   * duplicate of the copy this note's receipt stands on (`redundantWith`):
+   * a migration installed before its receipt flipped, now stale because the
+   * legacy note was edited since. Nothing is lost by writing over it (the
+   * same bytes remain at the shared copy, and no sibling receipt can name
+   * this child's slot — receipts name a note's own path or the sibling's
+   * own slot), so it is replaced (`replacesRedundant`, no generation: the
+   * install re-checks the duplicate is still one). Only the import slot is
+   * ever written over this way; the shared copy itself never is.
+   * Throws when a sibling manifest the decision needs cannot be read
+   * (callers skip the note transiently).
    */
   private async legacyImportTarget(
     store: MemoryStore,
     childId: string,
     relPath: string,
     content: string,
-    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>
-  ): Promise<{ relPath: string; write: boolean } | null> {
+    siblingOwns: (targetRelPath: string, liveStamp: string) => Promise<boolean>,
+    redundantWith?: string
+  ): Promise<{ relPath: string; write: boolean; replacesRedundant?: boolean } | null> {
     for (const candidate of [
       relPath,
       `${LEGACY_IMPORT_DIR}/${legacyImportSegment(childId)}/${relPath}`,
@@ -2477,9 +2535,43 @@ export class MemoryService extends EventEmitter {
           throw new Error(`cannot read the generation of adoption destination ${candidate}`);
         }
         if (!(await siblingOwns(candidate, liveStamp))) return { relPath: candidate, write: false };
+      } else if (
+        redundantWith !== undefined &&
+        candidate !== redundantWith &&
+        candidate !== relPath &&
+        destination.content !== null &&
+        (await this.isRedundantCopy(store, candidate, redundantWith))
+      ) {
+        return { relPath: candidate, write: true, replacesRedundant: true };
       }
     }
     return null;
+  }
+
+  /**
+   * Whether the file at `candidate` holds exactly the bytes of the file at
+   * `original` (both regular, in-cap, UTF-8): a duplicate whose removal loses
+   * nothing. Unreadable pieces read as "not redundant".
+   */
+  private async isRedundantCopy(
+    store: MemoryStore,
+    candidate: string,
+    original: string
+  ): Promise<boolean> {
+    try {
+      const [copy, source] = await Promise.all([
+        this.inspectAdoptionDestination(store, candidate),
+        this.inspectAdoptionDestination(store, original),
+      ]);
+      return (
+        copy !== "free" &&
+        source !== "free" &&
+        copy.content !== null &&
+        copy.content === source.content
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**

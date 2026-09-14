@@ -218,10 +218,12 @@ export async function readLegacyAdoptionManifest(
  */
 export async function adoptionTargetPresence(
   absPath: string
-): Promise<{ stamp: string } | "absent" | "unreadable"> {
+): Promise<{ stamp: string; nlink: bigint } | "absent" | "unreadable"> {
   try {
     const stat = await fsPromises.lstat(absPath, { bigint: true });
-    return { stamp: `${stat.ino}:${stat.size}:${stat.mtimeNs}` };
+    // nlink lets a caller tell two spellings of ONE directory entry (a
+    // case or normalization alias: nlink 1) from independent hard links.
+    return { stamp: `${stat.ino}:${stat.size}:${stat.mtimeNs}`, nlink: stat.nlink };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | null)?.code;
     return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unreadable";
