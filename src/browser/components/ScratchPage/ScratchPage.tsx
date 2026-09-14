@@ -5,6 +5,7 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { cn } from "@/common/lib/utils";
+import { getErrorMessage } from "@/common/utils/errors";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
@@ -38,6 +39,7 @@ async function listArchivedScratchWorkspaces(api: APIClient | null) {
 export function ScratchPage(props: ScratchPageProps) {
   const { api } = useAPI();
   const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>();
+  const [archivedLoadError, setArchivedLoadError] = useState<string>();
   const [archivedExpanded] = usePersistedState(
     getArchivedWorkspacesExpandedKey(SCRATCH_PROJECT_CONFIG_KEY),
     false,
@@ -56,9 +58,13 @@ export function ScratchPage(props: ScratchPageProps) {
     let ignore = false;
     listArchivedScratchWorkspaces(api)
       .then((archived) => {
-        if (!ignore) setArchivedWorkspaces(archived);
+        if (ignore) return;
+        setArchivedLoadError(undefined);
+        setArchivedWorkspaces(archived);
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!ignore) setArchivedLoadError(getErrorMessage(error));
+      });
     return () => {
       ignore = true;
     };
@@ -132,6 +138,7 @@ export function ScratchPage(props: ScratchPageProps) {
                   projectPath={SCRATCH_PROJECT_CONFIG_KEY}
                   projectName={SCRATCH_PROJECT_NAME}
                   workspaces={archivedWorkspaces}
+                  loadError={archivedLoadError}
                   onWorkspacesChanged={() => {
                     refreshArchivedWorkspaces().catch(() => undefined);
                   }}

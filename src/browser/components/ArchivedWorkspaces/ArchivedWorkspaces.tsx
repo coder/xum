@@ -44,6 +44,8 @@ interface ArchivedWorkspacesProps {
   projectPath: string;
   projectName: string;
   workspaces: FrontendWorkspaceMetadata[] | undefined;
+  /** Message from a failed archived list request; shown while expanded instead of an empty list */
+  loadError?: string;
   /** Called after a workspace is unarchived or deleted to refresh the list */
   onWorkspacesChanged?: () => void;
 }
@@ -303,6 +305,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   projectPath: _projectPath,
   projectName: _projectName,
   workspaces: loadedWorkspaces,
+  loadError,
   onWorkspacesChanged,
 }) => {
   const [isExpanded, setIsExpanded] = usePersistedState(
@@ -923,8 +926,19 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             {/* Timeline grouped list */}
             <div>
               {filteredWorkspaces.length === 0 ? (
-                <div className="text-muted px-4 py-6 text-center text-sm">
-                  No workspaces match {`"${searchQuery}"`}
+                <div
+                  className={cn(
+                    "px-4 py-6 text-center text-sm",
+                    loadError !== undefined ? "text-error" : "text-muted"
+                  )}
+                >
+                  {loadError !== undefined
+                    ? `Failed to load archived workspaces: ${loadError}`
+                    : loadedWorkspaces === undefined
+                      ? "Loading archived workspaces…"
+                      : searchQuery.trim()
+                        ? `No workspaces match "${searchQuery}"`
+                        : "No archived workspaces"}
                 </div>
               ) : (
                 Array.from(groupedWorkspaces.entries()).map(([period, periodWorkspaces]) => (
