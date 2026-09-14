@@ -1875,6 +1875,7 @@ describe("StreamManager - stopWhen configuration", () => {
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
     toolPolicy?: ToolPolicy;
     onStepSettled?: TurnExecutionOptions["onStepSettled"];
+    selectContextBudgetContinuationEntryId?: () => string | undefined;
     modelString?: string;
     tools?: Record<string, Tool>;
     contextBudgetMemoryWritable?: boolean;
@@ -2069,6 +2070,40 @@ describe("StreamManager - stopWhen configuration", () => {
       });
       expect(settled.toolResultChars).toBeGreaterThan(40_000);
       expect(settled.newContextRequested).toBe(false);
+    }
+  );
+
+  test.each([
+    ["warn", "continue-entry"],
+    ["rollover", "continue-entry"],
+    ["block", undefined],
+  ] as const)(
+    "budget %s binds the selected continuation entry into the stop cause",
+    async (decision, expectedEntryId) => {
+      const request: Parameters<BuildStopWhenCondition>[0] = {
+        hasQueuedMessages: () => false,
+        onStepSettled: () => Promise.resolve(decision),
+        selectContextBudgetContinuationEntryId: () => "continue-entry",
+        modelString: "anthropic:claude-sonnet-4-5",
+      };
+      const [, stop] = buildStopWhenForTests()(request);
+      const step = { steps: [{ usage: undefined, toolResults: [] }] };
+      if (decision === "block") {
+        let thrown: unknown;
+        try {
+          await stop(step);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(Error);
+      } else {
+        expect(await stop(step)).toBe(true);
+      }
+      expect(request.stopCause).toEqual({
+        kind: "context-budget",
+        decision,
+        ...(expectedEntryId != null ? { continuationEntryId: expectedEntryId } : {}),
+      });
     }
   );
 

@@ -60,6 +60,8 @@ import {
   AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
   agentReportProgressDedupePrefix,
+  taskRecoveryPromptDedupeKey,
+  taskRecoveryPromptDedupePrefix,
 } from "@/constants/agentMessaging";
 import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
@@ -144,6 +146,7 @@ import {
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
+import type { StreamStopCause } from "@/common/types/streamStopCause";
 import {
   isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
@@ -313,6 +316,17 @@ function formatStructuredOutputValidationMessage(params: {
     : "";
   const errorSummary = formatJsonSchemaValidationErrors(params.errors, { maxErrors: 5 });
   return `agent_report structuredOutput failed schema validation${stepLabel}: ${errorSummary}`;
+}
+
+/** Entry selected to continue a host-cut turn; undefined for genuine or blocked stops. */
+function continuationEntryIdOfStopCause(
+  stopCause: StreamStopCause | undefined
+): string | undefined {
+  if (stopCause?.kind === "queued-input") return stopCause.entryId;
+  if (stopCause?.kind === "context-budget" && stopCause.decision !== "block") {
+    return stopCause.continuationEntryId;
+  }
+  return undefined;
 }
 
 function normalizeWorkflowAgentReportArgsForWorkflowTask(
@@ -623,6 +637,13 @@ const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
  * that never call their completion tool.
  */
 const MAX_TASK_RECOVERY_ATTEMPTS = 5;
+/** Longest structured-output diagnostic excerpt echoed into an error recovery prompt. */
+const TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS = 400;
+
+function truncateSingleLine(text: string, maxChars: number): string {
+  const singleLine = text.replace(/\s*\n[\s\S]*$/u, "").trim();
+  return singleLine.length <= maxChars ? singleLine : `${singleLine.slice(0, maxChars - 1)}…`;
+}
 
 /**
  * Reason persisted when other queued input (a manual user message, /compact)
@@ -1284,6 +1305,23 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopEpochs = new Map<string, number>();
   /**
+   * Child stream ends cut by a host-selected continuation (queued input or context-budget
+   * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
+   * from the recorded successor outcome (QueueCutReceipt), never from an idle probe, and cleared
+   * on terminal transitions. In-memory only: after a restart a running task with no stream is
+   * handled by startup recovery.
+   */
+  private readonly deferredTaskStreamEnds = new Map<
+    string,
+    {
+      sourceMessageId: string;
+      sourceTurnGeneration: symbol;
+      continuationEntryId: string;
+      executionId: string | undefined;
+      stopEpoch: number;
+    }
+  >();
+  /**
    * Level-triggered stop latches: workspace IDs whose stop cascade is currently between its
    * synchronous epoch bump and terminal status persistence. The epoch map alone cannot refuse
    * a send that ENTERS during that window — the post-bump generation becomes the send's clean
@@ -1689,6 +1727,7 @@ export class TaskService implements AgentTaskIntegration {
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
     // Latch the stop for in-flight peer-send admission even when there is no parent to notify.
     this.bumpWorkspaceStopEpoch(taskId);
+    this.settleTaskRecoveryAtTerminalTransition(taskId);
     if (!parentWorkspaceId) {
       return;
     }
@@ -1714,6 +1753,28 @@ export class TaskService implements AgentTaskIntegration {
       status: "interrupted",
       anchor: { taskId, childWorkspaceId: taskId },
     });
+  }
+
+  /**
+   * A terminal outcome (interrupted, failed, reported) ends recovery for the task: drop its
+   * deferred cut (consuming the receipt so a late successor notification never recovers) and
+   * remove recovery prompts still queued in the child's own queue, mirroring the queued
+   * incremental-report removal in recordTaskInterrupted.
+   */
+  private settleTaskRecoveryAtTerminalTransition(taskId: string): void {
+    const deferral = this.deferredTaskStreamEnds.get(taskId);
+    if (deferral != null) {
+      this.deferredTaskStreamEnds.delete(taskId);
+      this.workspaceService.disposeQueueCut(taskId, deferral.continuationEntryId);
+    }
+    const removal = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+      taskId,
+      taskRecoveryPromptDedupePrefix(taskId),
+      { cancelReason: "Task recovery prompt superseded by the task's terminal outcome." }
+    );
+    if (!removal.success) {
+      log.warn("Failed to remove queued task recovery prompts", { taskId, error: removal.error });
+    }
   }
 
   private applyInterruptedTaskStatus(
@@ -1867,6 +1928,18 @@ export class TaskService implements AgentTaskIntegration {
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleTaskStreamError failed", { error });
+        });
+    });
+
+    // Successor outcomes (withdrawn, admitted, streaming) are published as queue changes.
+    this.workspaceService.onQueuedMessageChanged((workspaceId) => {
+      if (!this.deferredTaskStreamEnds.has(workspaceId)) return;
+      void this.workspaceEventLocks
+        .withLock(workspaceId, async () => {
+          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+        })
+        .catch((error: unknown) => {
+          log.error("TaskService.reconcileDeferredTaskStreamEnd failed", { error });
         });
     });
   }
@@ -8520,12 +8593,16 @@ export class TaskService implements AgentTaskIntegration {
         ...(completionKind === "propose_plan"
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
+        // Never cut the child's live turn (the soft stop above already ends it at a boundary).
+        queueDispatchMode: "turn-end",
       },
       {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
         startStreamInBackground: true,
+        queueDedupeKey: taskRecoveryPromptDedupeKey(taskId, "timeout-finalization"),
+        removableQueueDedupeKey: true,
         onAccepted: persistFinalizationToken,
         onCanceled: (reason) => {
           log.debug("Workflow timeout finalization prompt was canceled", {
@@ -10793,6 +10870,7 @@ export class TaskService implements AgentTaskIntegration {
     options?: {
       reason?: "startup" | "stream_end" | "error";
       error?: Pick<ErrorEvent, "error" | "errorType">;
+      structuredOutputDiagnostic?: string;
     }
   ): string {
     const completionLabel =
@@ -10815,7 +10893,13 @@ export class TaskService implements AgentTaskIntegration {
         const errorType = options.error?.errorType
           ? ` (last error: ${options.error.errorType})`
           : "";
-        return `The previous ${completionLabel} attempt failed${errorType}. ${noExtraWorkInstruction} ${completionInstruction}`;
+        // Only the schema validator's own diagnostic is echoed to the model, bounded to one
+        // line; arbitrary provider error text never enters the prompt.
+        const diagnostic =
+          options.structuredOutputDiagnostic != null
+            ? ` ${truncateSingleLine(options.structuredOutputDiagnostic, TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS)}`
+            : "";
+        return `The previous ${completionLabel} attempt failed${errorType}.${diagnostic} ${noExtraWorkInstruction} ${completionInstruction}`;
       }
       case "stream_end":
       default:
@@ -10828,6 +10912,8 @@ export class TaskService implements AgentTaskIntegration {
     options?: {
       reason?: "startup" | "stream_end" | "error";
       error?: Pick<ErrorEvent, "error" | "errorType">;
+      /** formatStructuredOutputValidationMessage output for an invalid agent_report. */
+      structuredOutputDiagnostic?: string;
     }
   ): Promise<boolean> {
     assert(
@@ -10917,11 +11003,16 @@ export class TaskService implements AgentTaskIntegration {
         ...(completionKind === "propose_plan"
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
+        // A tool-end prompt would cut the child's next turn after one step and re-enter this
+        // path (observed recovery loop); wait for the turn to end instead.
+        queueDispatchMode: "turn-end",
       },
       {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
+        removableQueueDedupeKey: true,
       }
     );
     const durationMs = Date.now() - startedAt;
@@ -11330,6 +11421,10 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // A later stream end of the same task supersedes any deferral recorded for an earlier cut:
+    // this event is either the successor's own end or a newer turn that classifies on its own.
+    this.deferredTaskStreamEnds.delete(workspaceId);
+
     const status = entry.workspace.taskStatus;
     const workflowOutputSchema = entry.workspace.workflowTask?.outputSchema;
     const acceptsSchemaShapedWorkflowReport =
@@ -11462,6 +11557,46 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // Host-initiated cuts (queued input, context-budget hand-over) are not incomplete responses:
+    // the selected continuation owns the turn unless it is withdrawn or fails before streaming.
+    const continuationEntryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
+    if (continuationEntryId != null) {
+      const receipt = this.workspaceService.getQueueCutReceipt(workspaceId, continuationEntryId);
+      if (receipt != null) {
+        this.workspaceService.markQueueCutSourceHandled(workspaceId, continuationEntryId);
+        if (receipt.successor === "streaming") {
+          return;
+        }
+        if (receipt.successor === "canceled" || receipt.successor === "prestream-failed") {
+          // Consume-once: the failure notification may already have recovered.
+          if (!this.workspaceService.disposeQueueCut(workspaceId, continuationEntryId)) {
+            return;
+          }
+        } else {
+          if (status === "awaiting_report") {
+            await this.setTaskStatus(workspaceId, "running");
+          }
+          this.deferredTaskStreamEnds.set(workspaceId, {
+            sourceMessageId: event.messageId,
+            sourceTurnGeneration: receipt.sourceTurnGeneration,
+            continuationEntryId,
+            executionId: entry.workspace.taskExecutionId,
+            stopEpoch: this.getWorkspaceStopEpoch(workspaceId),
+          });
+          // The successor may have been withdrawn between the cut and this classification.
+          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+          return;
+        }
+      }
+    }
+
+    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status);
+  }
+
+  private async recoverTaskFromIncompleteStreamEnd(
+    workspaceId: string,
+    status: WorkspaceConfigEntry["taskStatus"]
+  ): Promise<void> {
     if (status !== "awaiting_report") {
       await this.setTaskStatus(workspaceId, "awaiting_report");
     }
@@ -11469,7 +11604,52 @@ export class TaskService implements AgentTaskIntegration {
     await this.promptTaskForRequiredCompletionTool(workspaceId, { reason: "stream_end" });
   }
 
+  /**
+   * Settle a deferred cut from the recorded successor outcome. Runs under the task's
+   * workspaceEventLock (from handleStreamEnd, the queue-change listener, stream-abort and error
+   * handlers). Only `canceled`/`prestream-failed` (recover once) and `streaming` (transfer) settle
+   * it; `pending`/`admitted` keep waiting. A task whose execution or stop epoch moved on, or that
+   * left `running`, drops the deferral without recovery.
+   */
+  private async reconcileDeferredTaskStreamEnd(workspaceId: string): Promise<void> {
+    const deferral = this.deferredTaskStreamEnds.get(workspaceId);
+    if (deferral == null) return;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      entry?.workspace.parentWorkspaceId == null ||
+      entry.workspace.taskStatus !== "running" ||
+      entry.workspace.taskExecutionId !== deferral.executionId ||
+      this.getWorkspaceStopEpoch(workspaceId) !== deferral.stopEpoch
+    ) {
+      this.deferredTaskStreamEnds.delete(workspaceId);
+      return;
+    }
+    const receipt = this.workspaceService.getQueueCutReceipt(
+      workspaceId,
+      deferral.continuationEntryId
+    );
+    if (receipt == null || receipt.successor === "streaming") {
+      this.deferredTaskStreamEnds.delete(workspaceId);
+      return;
+    }
+    if (receipt.successor !== "canceled" && receipt.successor !== "prestream-failed") {
+      return;
+    }
+    this.deferredTaskStreamEnds.delete(workspaceId);
+    if (!this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId)) {
+      return;
+    }
+    log.debug("Deferred task stream end recovering: continuation withdrawn", {
+      workspaceId,
+      sourceMessageId: deferral.sourceMessageId,
+      continuationEntryId: deferral.continuationEntryId,
+      successor: receipt.successor,
+    });
+    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, entry.workspace.taskStatus);
+  }
+
   private async handleStreamAbort(event: StreamAbortEvent): Promise<void> {
+    await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
     // Settles a continuation handle (execution mirror) first. A reawakened child is ALSO
     // `running` in its stable status (markInterruptedTaskRunning), and the desktop ledger treats
     // either active source as control, so the stable status must be released independently.
@@ -11527,6 +11707,7 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async handleTaskStreamError(event: ErrorEvent): Promise<void> {
+    await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
     if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamError(event)) {
       return;
     }
@@ -12655,6 +12836,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.promptTaskForRequiredCompletionTool(childWorkspaceId, {
         reason: "error",
         error: { error: validationMessage, errorType: "unknown" },
+        structuredOutputDiagnostic: validationMessage,
       });
       return {
         finalized: false,
@@ -12838,6 +13020,7 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    this.settleTaskRecoveryAtTerminalTransition(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
     // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.

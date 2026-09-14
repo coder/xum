@@ -461,6 +461,42 @@ export interface TurnAdmissionHost {
   ): Result<number>;
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
   countQueuedAgentPeerMessages(workspaceId: string): number;
+  /** Receipt of a host-selected queue cut (see QueueCutReceipt); undefined once released. */
+  getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined;
+  /** The cut stream's own stream-end has been classified; the receipt may now release. */
+  markQueueCutSourceHandled(workspaceId: string, entryId: string): void;
+  /**
+   * Consume-once disposition for a successor that will never run. Returns true only for the
+   * call that flipped `disposed`; a later caller must not run recovery again.
+   */
+  disposeQueueCut(workspaceId: string, entryId: string): boolean;
+  /** Observe `queued-message-changed` for every session (successor outcomes are recorded there). */
+  onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void;
+}
+
+/**
+ * Outcome of the queue entry selected to continue a turn the host cut at a step boundary
+ * (queued-input or context-budget stop). Recorded by AgentSession at the lifecycle points the
+ * entry actually passes — withdrawal, turn admission, stream registration — never inferred from
+ * an idle probe. `admitted` is a transfer that can still fail before streaming, so only
+ * `streaming` hands completion to the successor; `canceled`/`prestream-failed` return it to the
+ * cut stream's owner (TaskService recovery).
+ */
+export type QueueCutSuccessorState =
+  | "pending"
+  | "canceled"
+  | "prestream-failed"
+  | "streaming"
+  | { kind: "admitted"; turnGeneration: symbol };
+
+export interface QueueCutReceipt {
+  /** TurnCoordinator turn of the stream the cut ended. */
+  sourceTurnGeneration: symbol;
+  successor: QueueCutSuccessorState;
+  /** Set by the source stream-end classifier (markQueueCutSourceHandled). */
+  sourceHandled: boolean;
+  /** Set by the first disposeQueueCut caller; later callers perform no recovery. */
+  disposed: boolean;
 }
 
 export interface WorkspaceLifecycleHost {

@@ -7,7 +7,13 @@ export const StreamStopCauseSchema = z.discriminatedUnion("kind", [
     entryId: z.string().min(1),
     muxMetadata: z.unknown().optional(),
   }),
-  z.object({ kind: z.literal("context-budget"), decision: z.enum(["warn", "rollover", "block"]) }),
+  z.object({
+    kind: z.literal("context-budget"),
+    decision: z.enum(["warn", "rollover", "block"]),
+    // Queue entry selected to continue the cut turn (budget "Continue"/flush, or the queue
+    // head a budget stop hands over to). Optional so older rows stay parseable.
+    continuationEntryId: z.string().min(1).optional(),
+  }),
   z.object({ kind: z.literal("required-tool") }),
   z.object({ kind: z.literal("step-limit") }),
 ]);

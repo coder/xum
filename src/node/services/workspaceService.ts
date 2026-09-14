@@ -356,6 +356,7 @@ import {
   normalizeArchiveUntrackedPaths,
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
+  type QueueCutReceipt,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type WorkspaceHost,
@@ -13096,6 +13097,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
     const session = this.sessions.get(workspaceId.trim());
     return session?.getQueueCutCutter();
+  }
+
+  /** See AgentSession queue-cut receipts (QueueCutReceipt). */
+  getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined {
+    return this.sessions.get(workspaceId.trim())?.getQueueCutReceipt(entryId);
+  }
+
+  markQueueCutSourceHandled(workspaceId: string, entryId: string): void {
+    this.sessions.get(workspaceId.trim())?.markQueueCutSourceHandled(entryId);
+  }
+
+  disposeQueueCut(workspaceId: string, entryId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.disposeQueueCut(entryId) ?? false;
+  }
+
+  onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void {
+    const handler = (payload: { workspaceId: string; message: WorkspaceChatMessage }) => {
+      if (payload.message.type === "queued-message-changed") listener(payload.workspaceId);
+    };
+    this.on("chat", handler);
+    return () => {
+      this.off("chat", handler);
+    };
   }
 
   /** See AgentSession.getStoppablePreparingWorkspaceTurn. */

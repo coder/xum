@@ -51,6 +51,26 @@ export const AGENT_REPORT_PROGRESS_SUPERSEDED_REASON =
   "Incremental sub-agent update superseded by the terminal report.";
 
 /**
+ * Queue dedupe-key prefix for synthetic prompts that ask a child task to finish
+ * (`task-recovery-prompt:<taskId>:<kind>`). Prompts queue with turn-end dispatch so they never
+ * cut the child's live turn, and a terminal transition removes them by the task prefix so a
+ * queued prompt cannot outlive the task it was meant to recover.
+ */
+export const TASK_RECOVERY_PROMPT_DEDUPE_PREFIX = "task-recovery-prompt:";
+
+export type TaskRecoveryPromptKind = "completion" | "timeout-finalization";
+
+/** Prefix matching every queued recovery prompt for one child task. */
+export function taskRecoveryPromptDedupePrefix(taskId: string): string {
+  return `${TASK_RECOVERY_PROMPT_DEDUPE_PREFIX}${taskId}:`;
+}
+
+/** One queued prompt per kind per task; a duplicate send coalesces onto the queued one. */
+export function taskRecoveryPromptDedupeKey(taskId: string, kind: TaskRecoveryPromptKind): string {
+  return `${taskRecoveryPromptDedupePrefix(taskId)}${kind}`;
+}
+
+/**
  * Max peer messages admitted for a target without any user-authored input or parent guidance in
  * between; at the cap the target is deemed to need user attention. Charged when a send is
  * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.
