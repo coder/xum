@@ -7967,7 +7967,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     });
 
     const candidates: NameGenerationCandidate[] = [];
-    if (resolved.sources.model.tier !== "default") {
+    if (
+      resolved.sources.model.tier !== "default" ||
+      resolved.sources.thinkingLevel.tier !== "default"
+    ) {
+      // Thinking-only overrides are still explicit settings when the model inherits.
       // Selected (not effective) thinking: the generator clamps against the
       // creation-time route/config receipt rather than this resolver's view.
       candidates.push({
@@ -7984,9 +7988,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       pushFallback(preferred);
     }
     if (metadata) {
-      pushFallback(metadata.aiSettings?.model);
-      for (const settings of Object.values(metadata.aiSettingsByAgent ?? {})) {
-        pushFallback(settings.model);
+      // Legacy settings can be stale once the selected agent has its own model.
+      for (const model of deriveSideChannelModelCandidates(metadata)) {
+        pushFallback(model);
       }
     }
     for (const model of extraFallbackModels) {
