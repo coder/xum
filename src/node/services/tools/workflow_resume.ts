@@ -9,6 +9,7 @@ import {
   WorkflowResumeToolResultSchema,
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
+import { isWorkflowRunAlreadyActiveError } from "@/node/services/workflows/WorkflowRunner";
 import { isWorkflowRunTaskId } from "./taskId";
 import {
   emitWorkflowRunAttachedEvent,
@@ -89,10 +90,6 @@ async function getWorkflowRunForWorkspace(
 
 function getLatestWorkflowResult(run: WorkflowRunRecord): unknown {
   return run.events.findLast((event) => event.type === "result")?.result ?? null;
-}
-
-function isWorkflowRunAlreadyActiveError(error: unknown, runId: string): boolean {
-  return getErrorMessage(error) === `Workflow run is already active: ${runId}`;
 }
 
 /**
@@ -227,8 +224,9 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
         }
       } catch (error: unknown) {
         if (isWorkflowRunAlreadyActiveError(error, runId)) {
+          // Keep the lease diagnostics (owner, freshness) the runner put in the message.
           throw new Error(
-            `Workflow run is already active: ${runId}. It does not need resuming — await it with task_await.`
+            `${getErrorMessage(error)}. It does not need resuming — await it with task_await.`
           );
         }
         throw error;
