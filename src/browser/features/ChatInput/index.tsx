@@ -2437,13 +2437,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     // Tip carousel: rotates the placeholder through a curated list of
-    // slash-command tricks on a wall-clock bucket so switching workspaces
-    // mid-bucket doesn't reroll the visible tip. See placeholderTips.ts.
+    // slash-command and capability tips on a wall-clock bucket so switching
+    // workspaces mid-bucket doesn't reroll the visible tip. See placeholderTips.ts.
     //
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
     }
-    return getPlaceholderTip();
+    return getPlaceholderTip(undefined, { dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
   })();
 
   const activeToast = toast ?? (variant === "creation" ? creationState.toast : null);
