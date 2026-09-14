@@ -660,4 +660,154 @@ describe("WorkflowTaskServiceAdapter", () => {
     );
     expect(waitForAgentReport).not.toHaveBeenCalled();
   });
+
+  test("forwards the reservation abort signal and maps cancellation to a non-restart error", async () => {
+    const create = mock(async () => ({ success: false as const, error: "unexpected create" }));
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "should not wait" }));
+    const abortController = new AbortController();
+    const createMany = mock(
+      async (
+        _args: unknown[],
+        options?: {
+          onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
+          abortSignal?: AbortSignal;
+        }
+      ) => {
+        assert(options?.abortSignal != null, "createMany must receive the abort signal");
+        expect(options.abortSignal.aborted).toBe(false);
+        abortController.abort();
+        expect(options.abortSignal.aborted).toBe(true);
+        return { success: false as const, error: "Interrupted (stage: mutex)" };
+      }
+    );
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, createMany, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+
+    let caught: unknown;
+    try {
+      await adapter.createAgentTasks([{ id: "claims", prompt: "Extract claims" }], {
+        abortSignal: abortController.signal,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert(caught instanceof Error, "createAgentTasks must reject when creation is canceled");
+    expect(caught.message).toContain("Interrupted (stage: mutex)");
+    // The runner restarts started attempts on these exact sentinels; a canceled reservation
+    // must never be mistaken for one.
+    expect(caught.message).not.toBe("Task interrupted");
+    expect(caught.message).not.toBe("Task not found");
+    expect(create).not.toHaveBeenCalled();
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  test("refuses to create a legacy runAgent child once the wait signal is aborted", async () => {
+    const create = mock(async () =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "should not wait" }));
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    const abortController = new AbortController();
+    abortController.abort();
+
+    await expect(
+      adapter.runAgent({ id: "claims", prompt: "Extract claims" }, undefined, {
+        abortSignal: abortController.signal,
+      })
+    ).rejects.toThrow(/canceled/);
+    expect(create).not.toHaveBeenCalled();
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  test("exposes attempt outcome reads only when the task service can answer them", async () => {
+    const create = mock(async () => ({ success: false as const, error: "unused" }));
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
+    const legacyAdapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    // Missing capability is unavailable authority, not a fabricated outcome.
+    expect(legacyAdapter.readSettledAgentResult).toBeUndefined();
+    expect(legacyAdapter.waitForAttemptSettlement).toBeUndefined();
+
+    const readAttemptOutcome = mock(
+      async (taskId: string, _options?: { requestingWorkspaceId?: string }) =>
+        taskId === "task_reported"
+          ? {
+              kind: "reported" as const,
+              report: {
+                reportMarkdown: "persisted report",
+                title: "Claims",
+                structuredOutput: { claims: ["durable"] },
+              },
+            }
+          : { kind: "indeterminate" as const, reason: "no settlement record" }
+    );
+    const waitForAttemptSettlement = mock(
+      async (
+        taskId: string,
+        _options: { abortSignal?: AbortSignal; timeoutMs: number; requestingWorkspaceId?: string }
+      ) =>
+        taskId === "task_reported"
+          ? { kind: "reported" as const, report: { reportMarkdown: "settled report" } }
+          : { kind: "timeout" as const }
+    );
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport, readAttemptOutcome, waitForAttemptSettlement },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    assert(adapter.readSettledAgentResult != null && adapter.waitForAttemptSettlement != null);
+
+    await expect(adapter.readSettledAgentResult("task_reported")).resolves.toEqual({
+      kind: "reported",
+      report: {
+        taskId: "task_reported",
+        reportMarkdown: "persisted report",
+        title: "Claims",
+        structuredOutput: { claims: ["durable"] },
+      },
+    });
+    await expect(adapter.readSettledAgentResult("task_unknown")).resolves.toEqual({
+      kind: "indeterminate",
+      reason: "no settlement record",
+    });
+    // Reports are looked up on behalf of the workflow parent so they stay readable after the
+    // child's config entry is cleaned up.
+    expect(readAttemptOutcome).toHaveBeenCalledWith("task_reported", {
+      requestingWorkspaceId: "parent_1",
+    });
+
+    const abortSignal = new AbortController().signal;
+    await expect(
+      adapter.waitForAttemptSettlement("task_reported", { abortSignal, timeoutMs: 1234 })
+    ).resolves.toEqual({
+      kind: "reported",
+      report: { taskId: "task_reported", reportMarkdown: "settled report" },
+    });
+    await expect(
+      adapter.waitForAttemptSettlement("task_pending", { timeoutMs: 1234 })
+    ).resolves.toEqual({ kind: "timeout" });
+    expect(waitForAttemptSettlement).toHaveBeenCalledWith("task_reported", {
+      abortSignal,
+      timeoutMs: 1234,
+      requestingWorkspaceId: "parent_1",
+    });
+    expect(waitForAttemptSettlement).toHaveBeenCalledWith("task_pending", {
+      timeoutMs: 1234,
+      requestingWorkspaceId: "parent_1",
+    });
+  });
 });
