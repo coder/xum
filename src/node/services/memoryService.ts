@@ -1547,7 +1547,11 @@ export class MemoryService extends EventEmitter {
       // (transient) rather than pull a note out from under the sibling.
       // Receipts carry no stamp, so each candidate's target is probed once
       // and compared to the copy's identity (an unreadable probe counts as
-      // relying — the safe side for a removal).
+      // relying — the safe side for a removal). A receipt naming a path
+      // outside the owner store (a corrupted or hostile manifest) is never
+      // probed — like every other persisted target, it is checked for
+      // containment first — and cannot name a copy in the store, so it does
+      // not rely on anything.
       const siblingReliesOn = async (targetRelPath: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
         const identity = await adoptionTargetPresence(store.physicalPath(targetRelPath));
@@ -1555,6 +1559,11 @@ export class MemoryService extends EventEmitter {
           if (record.created === true || record.deleted === true) continue;
           if (record.target === targetRelPath) return true;
           if (identity === "absent") continue;
+          const contained = await store.assertContained(record.target).then(
+            () => true,
+            () => false
+          );
+          if (!contained) continue;
           const receiptIdentity = await adoptionTargetPresence(store.physicalPath(record.target));
           if (receiptIdentity === "absent") continue;
           if (
@@ -3667,7 +3676,10 @@ export class MemoryService extends EventEmitter {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
     }
-    return entries;
+    // The scopes are enumerated in order: a tombstone landing after an
+    // earlier scope's gate passed only skipped the later ones. Final check
+    // over the whole accumulated index.
+    return this.withholdAfterTombstone(ctx, entries, (entry) => entry.scope);
   }
 
   /**
@@ -3719,18 +3731,38 @@ export class MemoryService extends EventEmitter {
     });
     // Selection keeps awaiting (token counting, repeatedly) after the last
     // per-file gate: a tombstone published meanwhile must still withhold the
-    // buffered owner notes. Final check once selection is done; the workspace
-    // items are dropped (the scope reads as unavailable, like in the index).
-    const isWorkspaceItem = (item: MemoryHotSetItem): boolean =>
-      parseMemoryPath(item.path).scope === "workspace";
-    if (selected.some(isWorkspaceItem)) {
+    // buffered notes. Final check once selection is done, unconditionally:
+    // the acting (or guarded) workspace removed means nothing goes out,
+    // whatever the scope; the owner removed drops the workspace items (that
+    // scope reads as unavailable, like in the index).
+    return this.withholdAfterTombstone(ctx, selected, (item) => parseMemoryPath(item.path).scope);
+  }
+
+  /**
+   * Post-selection gate shared by the index and the hot set (see
+   * assertWorkspaceStoreReadable): a removal tombstone published while the
+   * result was still being assembled. The acting/guarded check uses a
+   * non-session store, whose guarded ids are exactly those two; the owner
+   * check runs only when workspace-scope items are among the results.
+   */
+  private async withholdAfterTombstone<T>(
+    ctx: MemoryScopeContext,
+    items: T[],
+    scopeOf: (item: T) => MemoryScope | null
+  ): Promise<T[]> {
+    try {
+      await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "global"));
+    } catch {
+      return [];
+    }
+    if (items.some((item) => scopeOf(item) === "workspace")) {
       try {
         await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "workspace"));
       } catch {
-        return selected.filter((item) => !isWorkspaceItem(item));
+        return items.filter((item) => scopeOf(item) !== "workspace");
       }
     }
-    return selected;
+    return items;
   }
 }
 

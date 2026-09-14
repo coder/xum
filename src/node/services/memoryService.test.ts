@@ -1437,8 +1437,11 @@ describe("MemoryService", () => {
       await untombstone();
 
       tombstoneAfterOpen();
+      // Global was enumerated before the tombstone landed: the final check
+      // over the accumulated index withholds it too — nothing is served to
+      // the removed workspace.
       const entries = await fixture.service.listIndexEntries(fixture.ctx);
-      expect(entries.map((entry) => entry.scope)).toEqual(["global"]);
+      expect(entries).toEqual([]);
       await untombstone();
 
       tombstoneAfterOpen();
@@ -4575,10 +4578,14 @@ describe("MemoryService", () => {
 
     it("recognizes a sibling's copy by file identity, not by the spelling of its path", async () => {
       // A real case-insensitive alias needs such a filesystem; here a second
-      // spelling is made to resolve to the SAME file with a hard link, which
+      // name is made to resolve to the SAME file with a hard link, which
       // shares the identity stamp (ino:size:mtimeNs) exactly like an alias
-      // does. This proves the predicates match on identity: the sibling's
-      // record names `a.md`, the candidate is spelled `A.md`.
+      // does. The alias name is deliberately not a case variant (on a
+      // case-insensitive filesystem `alias-of-a.md` would already exist and the link
+      // would fail before the predicates ran): they compare identity, not
+      // spelling, so any distinct name proves the same thing on every
+      // platform. The sibling's record names `a.md`; the candidate is
+      // `alias-of-a.md`.
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const childCtx = { ...fixture.ctx };
@@ -4590,22 +4597,28 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(grandchildRoot, { recursive: true });
       await fsPromises.writeFile(path.join(childRoot, "a.md"), "same note");
       await fixture.service.listIndexEntries(childCtx);
-      await fsPromises.link(path.join(ownerRoot, "a.md"), path.join(ownerRoot, "A.md"));
-      // The grandchild's identical `A.md` finds an identical file at its
-      // primary candidate — the child's copy under another spelling. Not
+      await fsPromises.link(path.join(ownerRoot, "a.md"), path.join(ownerRoot, "alias-of-a.md"));
+      // The grandchild's identical `alias-of-a.md` finds an identical file
+      // at its primary candidate — the child's copy under another name. Not
       // reused: the grandchild gets its own copy.
-      await fsPromises.writeFile(path.join(grandchildRoot, "A.md"), "same note");
+      await fsPromises.writeFile(path.join(grandchildRoot, "alias-of-a.md"), "same note");
       await fixture.service.listIndexEntries(grandchildCtx);
       expect(
         (
           await readLegacyAdoptionManifest(legacyAdoptionManifestPath(path.dirname(grandchildRoot)))
-        ).get("A.md")
-      ).toMatchObject({ target: "imported/ws-grandchild/A.md", created: true });
+        ).get("alias-of-a.md")
+      ).toMatchObject({ target: "imported/ws-grandchild/alias-of-a.md", created: true });
       // And a receipt spelled differently still counts as relying on the
       // child's copy: with the receipt in place the child's deletion waits.
       await fsPromises.writeFile(
         legacyAdoptionManifestPath(path.dirname(grandchildRoot)),
-        JSON.stringify({ "A.md": { content: sha256Hex("same note"), sidecar: "", target: "A.md" } })
+        JSON.stringify({
+          "alias-of-a.md": {
+            content: sha256Hex("same note"),
+            sidecar: "",
+            target: "alias-of-a.md",
+          },
+        })
       );
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.rm(path.join(childRoot, "a.md"));
@@ -4663,6 +4676,69 @@ describe("MemoryService", () => {
         untyped.mockRestore();
       }
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+    });
+
+    it("withholds an already selected global hot item when the tombstone lands during token counting", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // Only a global note: no workspace item is ever selected, so a guard
+      // conditioned on workspace items would never run.
+      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "global", "agent");
+      await fixture.service.setPinned(fixture.ctx, "/memories/global/g.md", true);
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      const hot = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens: async (text) => {
+          await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+          await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          return text.length;
+        },
+      });
+      expect(hot).toEqual([]);
+    });
+
+    it("never probes a sibling receipt that names a path outside the owner store", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // A syntactically valid sibling manifest whose receipt target escapes
+      // the owner store; the escaped path exists but cannot be stat'ed. Read
+      // as relying, it would block the child's deletion (and removal) for
+      // good; probed, it would lstat outside the store.
+      const grandchildSession = path.join(fixture.config.sessionsDir, "ws-grandchild");
+      await fsPromises.mkdir(grandchildSession, { recursive: true });
+      const outside = path.join(fixture.config.sessionsDir, "locked.md");
+      await fsPromises.writeFile(outside, "outside");
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(grandchildSession),
+        JSON.stringify({
+          "note.md": { content: sha256Hex("v1"), sidecar: "", target: "../../locked.md" },
+        })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "note.md"));
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      let outsideProbes = 0;
+      const guard = spyOn(fsPromises, "lstat").mockImplementation(((
+        p: Parameters<typeof fsPromises.lstat>[0],
+        options?: unknown
+      ) => {
+        if (path.resolve(String(p)) === outside) {
+          outsideProbes++;
+          return Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }));
+        }
+        return (realLstat as (...args: unknown[]) => unknown)(p, options);
+      }) as never);
+      try {
+        await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      } finally {
+        guard.mockRestore();
+      }
+      expect(outsideProbes).toBe(0);
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
     });
   });
 
