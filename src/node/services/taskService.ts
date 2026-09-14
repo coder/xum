@@ -1358,6 +1358,13 @@ export class TaskService implements AgentTaskIntegration {
    * must not clear each other's latch.
    */
   private readonly workspaceStopsInProgress = new Map<string, number>();
+  /**
+   * Latched workspace IDs whose held latch deferred a queued-task launch (own or parent latch;
+   * see startReservedAgentTask). The launch record was handed back to "queued", and the queue is
+   * rechecked exactly when that latch clears — not on every release (startup normalizes stopped
+   * trees before any drain) and not on an unrelated scheduler trigger.
+   */
+  private readonly queueRechecksOwedByStopLatch = new Set<string>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
   /**
    * Ownership of every in-progress stop, keyed by workspace (see beginWorkspaceStop). The latch
@@ -1692,6 +1699,9 @@ export class TaskService implements AgentTaskIntegration {
         const count = this.workspaceStopsInProgress.get(id) ?? 0;
         if (count <= 1) {
           this.workspaceStopsInProgress.delete(id);
+          if (this.queueRechecksOwedByStopLatch.delete(id)) {
+            this.scheduleMaybeStartQueuedTasks();
+          }
         } else {
           this.workspaceStopsInProgress.set(id, count - 1);
         }
@@ -1701,6 +1711,25 @@ export class TaskService implements AgentTaskIntegration {
 
   isWorkspaceStopInProgress(workspaceId: string): boolean {
     return this.workspaceStopsInProgress.has(workspaceId);
+  }
+
+  /**
+   * Stop-cascade launch barrier: true (and the queue recheck owed to the held latch recorded)
+   * while the task's own or its parent's stop latch is held. The record stays/returns to
+   * "queued"; the latch release rechecks the queue (see queueRechecksOwedByStopLatch).
+   */
+  private deferLaunchWhileStopInProgress(
+    taskId: string,
+    parentWorkspaceId: string | undefined
+  ): boolean {
+    let deferred = false;
+    for (const id of [taskId, parentWorkspaceId]) {
+      if (id != null && this.isWorkspaceStopInProgress(id)) {
+        this.queueRechecksOwedByStopLatch.add(id);
+        deferred = true;
+      }
+    }
+    return deferred;
   }
 
   /**
@@ -3696,13 +3725,27 @@ export class TaskService implements AgentTaskIntegration {
     if (entryAtStart?.workspace.taskStatus !== "starting") {
       return;
     }
-    // Stop-cascade barrier: a queued launch stays queued while its own or its parent's stop
-    // latch is held; the next scheduler pass (after release) launches it.
-    if (
-      this.isWorkspaceStopInProgress(plan.taskId) ||
-      this.isWorkspaceStopInProgress(plan.parentWorkspaceId)
-    ) {
+    // Stop-cascade barrier: no launch while its own or its parent's stop latch is held. The
+    // reservation already flipped the record to "starting" and the scheduler selects only
+    // "queued", so a deferred launch hands its record back or it is stranded; the latch release
+    // rechecks the queue. Only a still-reserved record is reverted — a status written meanwhile
+    // (an explicit Stop's "interrupted") stays as is and is never relaunched.
+    if (this.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
       log.debug("startReservedAgentTask deferred: a stop is in progress", { taskId: plan.taskId });
+      try {
+        await this.editActiveWorkspaceEntry(
+          plan.taskId,
+          (workspace) => {
+            if (workspace.taskStatus !== "starting") return;
+            workspace.taskStatus = "queued";
+          },
+          { allowMissing: true }
+        );
+      } catch (error) {
+        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
+        return;
+      }
+      await this.emitWorkspaceMetadata(plan.taskId);
       return;
     }
 
@@ -5876,7 +5919,12 @@ export class TaskService implements AgentTaskIntegration {
 
       for (const id of taskIds) {
         const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), id);
-        if (!current) continue;
+        if (!current) {
+          // Removed since the subtree snapshot: no status is left to persist, but the latch
+          // still waits for the captured owner and the planned cleanup (no absent-config bypass).
+          this.markWorkspaceStopPersisted(id);
+          continue;
+        }
         const status = current.workspace.taskStatus ?? "running";
         const activeHandles = activeWorkspaceTurns.filter((turn) => turn.workspaceId === id);
         const executionActive =
@@ -6034,15 +6082,16 @@ export class TaskService implements AgentTaskIntegration {
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
         // Durable stop marker before removal: a workspace whose removal later fails or times out
-        // must not read as a live running task once its latch settles.
-        const persisted = await this.editWorkspaceEntry(
+        // must not read as a live running task once its latch settles. An entry already gone has
+        // no status left to persist; its captured owner and cleanup still gate the release.
+        await this.editWorkspaceEntry(
           id,
           (ws) => {
             this.applyInterruptedTaskStatus(ws);
           },
           { allowMissing: true }
         );
-        if (persisted) this.markWorkspaceStopPersisted(id);
+        this.markWorkspaceStopPersisted(id);
       }
     } finally {
       // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
@@ -10631,6 +10680,14 @@ export class TaskService implements AgentTaskIntegration {
             taskIndex,
             { scheduleQueueDrain: false }
           )
+        ) {
+          continue;
+        }
+
+        // Stop-cascade barrier (see startReservedAgentTask): a task whose own or parent's stop
+        // latch is held is not even reserved; the latch release rechecks the queue.
+        if (
+          this.deferLaunchWhileStopInProgress(taskId, coerceNonEmptyString(task.parentWorkspaceId))
         ) {
           continue;
         }
