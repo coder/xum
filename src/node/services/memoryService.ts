@@ -1552,6 +1552,30 @@ export class MemoryService extends EventEmitter {
       // probed — like every other persisted target, it is checked for
       // containment first — and cannot name a copy in the store, so it does
       // not rely on anything.
+      // Receipt identities are probed once per pass, not once per deletion
+      // candidate (a child deleting many notes against a sibling with many
+      // receipts would otherwise stat the sibling's targets candidates ×
+      // receipts times under the owner-store lock). A path this pass itself
+      // installs or removes is dropped from the cache (`forgetIdentity`) so a
+      // stale identity never grants or withholds deletion authority.
+      const receiptIdentities = new Map<
+        string,
+        Awaited<ReturnType<typeof adoptionTargetPresence>>
+      >();
+      const forgetIdentity = (relPath: string) => receiptIdentities.delete(relPath);
+      const receiptIdentity = async (relPath: string) => {
+        const cached = receiptIdentities.get(relPath);
+        if (cached !== undefined) return cached;
+        const contained = await store.assertContained(relPath).then(
+          () => true,
+          () => false
+        );
+        const probed = contained
+          ? await adoptionTargetPresence(store.physicalPath(relPath))
+          : ("absent" as const);
+        receiptIdentities.set(relPath, probed);
+        return probed;
+      };
       const siblingReliesOn = async (targetRelPath: string) => {
         siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
         const identity = await adoptionTargetPresence(store.physicalPath(targetRelPath));
@@ -1559,17 +1583,12 @@ export class MemoryService extends EventEmitter {
           if (record.created === true || record.deleted === true) continue;
           if (record.target === targetRelPath) return true;
           if (identity === "absent") continue;
-          const contained = await store.assertContained(record.target).then(
-            () => true,
-            () => false
-          );
-          if (!contained) continue;
-          const receiptIdentity = await adoptionTargetPresence(store.physicalPath(record.target));
-          if (receiptIdentity === "absent") continue;
+          const receipt = await receiptIdentity(record.target);
+          if (receipt === "absent") continue;
           if (
-            receiptIdentity === "unreadable" ||
+            receipt === "unreadable" ||
             identity === "unreadable" ||
-            receiptIdentity.stamp === identity.stamp
+            receipt.stamp === identity.stamp
           ) {
             return true;
           }
@@ -1613,6 +1632,27 @@ export class MemoryService extends EventEmitter {
       for (const [relPath, previous] of adopted) {
         if (relPath.startsWith(LEGACY_SUPERSEDED_MARKER_PREFIX)) continue; // handled below
         if (listed.has(relPath) || previous.deleted === true) continue;
+        // A persisted key is not trusted as a legacy memory path: one the
+        // grammar rejects (`../../outside`, control characters, a spelling
+        // the parser would normalize) could never have been listed or
+        // adopted by this pass, so the probe below must not run on it — an
+        // escaping key would lstat outside the legacy root and a directory
+        // there would read as "source deleted", authorizing removal of the
+        // record's owner-store target. Such a record is left inert.
+        let addressable = false;
+        try {
+          addressable = parseMemoryPath(toVirtualPath("workspace", relPath)).relPath === relPath;
+        } catch {
+          // rejected below
+        }
+        if (!addressable) {
+          log.warn("[MemoryService] ignoring an adoption record whose key is not a memory path", {
+            childId,
+            owner,
+            relPath,
+          });
+          continue;
+        }
         // Absence from the listing is not proof enough on its own: only a
         // provable ENOENT on the source itself counts; any other failure
         // keeps the entry (and the copy) for a later pass. ENOTDIR is proof
@@ -1714,6 +1754,7 @@ export class MemoryService extends EventEmitter {
               })
             );
             await store.remove(previous.target);
+            forgetIdentity(previous.target);
             remainingCapacity++;
             adoptedCount++;
             log.info("[MemoryService] removed an adopted legacy note deleted on the old build", {
@@ -1841,6 +1882,7 @@ export class MemoryService extends EventEmitter {
             })
           );
           await store.remove(marker.target);
+          forgetIdentity(marker.target);
           remainingCapacity++;
           adoptedCount++;
           log.info(
@@ -2238,6 +2280,7 @@ export class MemoryService extends EventEmitter {
             const destination = store.physicalPath(target.relPath);
             await fsPromises.mkdir(path.dirname(destination), { recursive: true });
             await fsPromises.rename(stagingPath, destination);
+            forgetIdentity(target.relPath);
           } catch (error) {
             await restoreRecord();
             log.warn("[MemoryService] cannot install a staged legacy note; retrying later", {
@@ -2929,6 +2972,14 @@ export class MemoryService extends EventEmitter {
             // Self-healing: an unavailable scope must not break the whole view.
             sections.push(`  (unavailable: ${getErrorMessage(error)})`);
           }
+        }
+        // Same final gate as the index and the hot set: a tombstone landing
+        // while a later scope was enumerated withholds the filenames the
+        // earlier scopes already contributed.
+        if ((await this.withholdAfterTombstone(ctx, [sections], () => null)).length === 0) {
+          throw new MemoryCommandError(
+            `Workspace ${ctx.workspaceId} was removed; its memory is no longer available`
+          );
         }
         return { success: true, output: sections.join("\n") };
       }
@@ -3750,15 +3801,20 @@ export class MemoryService extends EventEmitter {
     items: T[],
     scopeOf: (item: T) => MemoryScope | null
   ): Promise<T[]> {
-    try {
-      await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "global"));
-    } catch {
-      return [];
-    }
+    const actingRevoked = () =>
+      this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "global")).then(
+        () => false,
+        () => true
+      );
+    if (await actingRevoked()) return [];
     if (items.some((item) => scopeOf(item) === "workspace")) {
       try {
         await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "workspace"));
       } catch {
+        // The owner check covers the acting/guarded ids as well: a tombstone
+        // for THOSE first observed here revokes every scope, not just the
+        // owner's — reclassify before keeping the other scopes' items.
+        if (await actingRevoked()) return [];
         return items.filter((item) => scopeOf(item) !== "workspace");
       }
     }

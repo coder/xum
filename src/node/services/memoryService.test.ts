@@ -1428,12 +1428,13 @@ describe("MemoryService", () => {
       await untombstone();
 
       tombstoneAfterOpen();
+      // The root listing had already gathered the global filenames before the
+      // tombstone landed during the workspace scope: the final gate withholds
+      // the whole listing (g.md included), like the index and the hot set.
       const root = await fixture.service.view(fixture.ctx, "/memories");
-      expect(root.success).toBe(true);
-      if (root.success) {
-        expect(root.output).toContain("unavailable");
-        expect(root.output).not.toContain("n.md");
-      }
+      expect(root.success).toBe(false);
+      if (!root.success) expect(root.error).toContain("was removed");
+      expect(JSON.stringify(root)).not.toContain("g.md");
       await untombstone();
 
       tombstoneAfterOpen();
@@ -4739,6 +4740,118 @@ describe("MemoryService", () => {
       }
       expect(outsideProbes).toBe(0);
       expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
+    });
+
+    it("drops every scope when the acting tombstone is first observed by the final gate's owner check", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      // The shared post-selection gate checks the acting/guarded ids first
+      // (passes), then — workspace items present — the owner store, whose
+      // check covers the acting id too. The acting tombstone lands right
+      // between the two: its failure must not be read as "owner only".
+      const service = fixture.service as unknown as {
+        assertWorkspaceStoreReadable: (
+          ctx: MemoryScopeContext,
+          store: { physicalRoot: string }
+        ) => Promise<void>;
+        withholdAfterTombstone: <T>(
+          ctx: MemoryScopeContext,
+          items: T[],
+          scopeOf: (item: T) => string | null
+        ) => Promise<T[]>;
+      };
+      const original = service.assertWorkspaceStoreReadable.bind(service);
+      const gate = spyOn(service, "assertWorkspaceStoreReadable").mockImplementation(
+        async (ctx, store) => {
+          if (store.physicalRoot === ownerRoot) {
+            await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+            await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          }
+          return original(ctx, store);
+        }
+      );
+      try {
+        const kept = await service.withholdAfterTombstone(
+          fixture.ctx,
+          [
+            { path: "/memories/global/g.md", scope: "global" },
+            { path: "/memories/workspace/n.md", scope: "workspace" },
+          ],
+          (item) => item.scope
+        );
+        expect(kept).toEqual([]);
+      } finally {
+        gate.mockRestore();
+      }
+    });
+
+    it("never probes an adoption record whose key is not a memory path, so it cannot authorize a deletion", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
+      const settled = (await readLegacyAdoptionManifest(manifestPath)).get("note.md")!;
+      // A corrupted record under an escaping key claims the same owner
+      // target with the same receipt; `<legacy>/../../outside` exists and is
+      // a directory, so a probe there would read as "source deleted".
+      await fsPromises.mkdir(path.join(legacyRoot, "..", "..", "outside"), { recursive: true });
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": settled, "../../outside": settled })
+      );
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      // The legitimate source still exists: its copy stays.
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+    });
+
+    it("probes each sibling receipt once per pass, not once per deletion candidate", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildSession = path.join(fixture.config.sessionsDir, "ws-grandchild");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildSession, { recursive: true });
+      const count = 20;
+      for (let i = 0; i < count; i++) {
+        await fsPromises.writeFile(path.join(childRoot, `n${i}.md`), `note ${i}`);
+      }
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // A sibling with `count` unsettled receipts naming other targets.
+      const receipts: Record<string, unknown> = {};
+      for (let i = 0; i < count; i++) {
+        receipts[`r${i}.md`] = { content: sha256Hex(`r${i}`), sidecar: "", target: `r${i}.md` };
+      }
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(grandchildSession),
+        JSON.stringify(receipts)
+      );
+      // The child deletes every note: `count` deletion candidates.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      for (let i = 0; i < count; i++) await fsPromises.rm(path.join(childRoot, `n${i}.md`));
+      let receiptProbes = 0;
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const counting = spyOn(fsPromises, "lstat").mockImplementation(((
+        p: Parameters<typeof fsPromises.lstat>[0],
+        options?: { bigint?: boolean }
+      ) => {
+        if (options?.bigint === true && /[\\/]r\d+\.md$/.test(String(p))) receiptProbes++;
+        return (realLstat as (...args: unknown[]) => unknown)(p, options);
+      }) as never);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        counting.mockRestore();
+      }
+      expect(await fsPromises.readdir(ownerRoot)).toEqual([]);
+      // Once per receipt, not receipts × candidates.
+      expect(receiptProbes).toBeLessThanOrEqual(count);
     });
   });
 
