@@ -13099,6 +13099,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return session?.getQueueCutCutter();
   }
 
+  getTurnGeneration(workspaceId: string): symbol | undefined {
+    return this.sessions.get(workspaceId.trim())?.getTurnGeneration();
+  }
+
+  clearQueueCutReceipts(workspaceId: string): void {
+    this.sessions.get(workspaceId.trim())?.clearQueueCutReceipts();
+  }
+
   /** See AgentSession queue-cut receipts (QueueCutReceipt). */
   getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined {
     return this.sessions.get(workspaceId.trim())?.getQueueCutReceipt(entryId);

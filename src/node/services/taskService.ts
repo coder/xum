@@ -62,6 +62,7 @@ import {
   agentReportProgressDedupePrefix,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
+  TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS,
 } from "@/constants/agentMessaging";
 import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
@@ -637,11 +638,8 @@ const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
  * that never call their completion tool.
  */
 const MAX_TASK_RECOVERY_ATTEMPTS = 5;
-/** Longest structured-output diagnostic excerpt echoed into an error recovery prompt. */
-const TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS = 400;
-
 function truncateSingleLine(text: string, maxChars: number): string {
-  const singleLine = text.replace(/\s*\n[\s\S]*$/u, "").trim();
+  const singleLine = text.split(/[\r\n\u2028\u2029]/u, 1)[0].trim();
   return singleLine.length <= maxChars ? singleLine : `${singleLine.slice(0, maxChars - 1)}…`;
 }
 
@@ -1727,7 +1725,7 @@ export class TaskService implements AgentTaskIntegration {
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
     // Latch the stop for in-flight peer-send admission even when there is no parent to notify.
     this.bumpWorkspaceStopEpoch(taskId);
-    this.settleTaskRecoveryAtTerminalTransition(taskId);
+    this.clearTaskRecovery(taskId);
     if (!parentWorkspaceId) {
       return;
     }
@@ -1756,17 +1754,13 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * A terminal outcome (interrupted, failed, reported) ends recovery for the task: drop its
-   * deferred cut (consuming the receipt so a late successor notification never recovers) and
-   * remove recovery prompts still queued in the child's own queue, mirroring the queued
-   * incremental-report removal in recordTaskInterrupted.
+   * A terminal outcome or explicit Stop ends recovery: release every cut receipt, including
+   * sources still waiting for the event lock, and remove prompts from the child's own queue.
+   * Delayed source events are separately fenced by their execution identity and Stop epoch.
    */
-  private settleTaskRecoveryAtTerminalTransition(taskId: string): void {
-    const deferral = this.deferredTaskStreamEnds.get(taskId);
-    if (deferral != null) {
-      this.deferredTaskStreamEnds.delete(taskId);
-      this.workspaceService.disposeQueueCut(taskId, deferral.continuationEntryId);
-    }
+  private clearTaskRecovery(taskId: string): void {
+    this.deferredTaskStreamEnds.delete(taskId);
+    this.workspaceService.clearQueueCutReceipts(taskId);
     const removal = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
       taskId,
       taskRecoveryPromptDedupePrefix(taskId),
@@ -1898,9 +1892,13 @@ export class TaskService implements AgentTaskIntegration {
       const queueCutSnapshot = this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(
         payload.workspaceId
       );
+      const taskOrigin = {
+        executionId: this.getAgentTaskExecutionId(payload.workspaceId),
+        stopEpoch: this.getWorkspaceStopEpoch(payload.workspaceId),
+      };
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleStreamEnd(payload, queueCutSnapshot);
+          await this.handleStreamEnd(payload, queueCutSnapshot, taskOrigin);
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamEnd failed", { error });
@@ -1934,7 +1932,7 @@ export class TaskService implements AgentTaskIntegration {
     // Successor outcomes (withdrawn, admitted, streaming) are published as queue changes.
     this.workspaceService.onQueuedMessageChanged((workspaceId) => {
       if (!this.deferredTaskStreamEnds.has(workspaceId)) return;
-      void this.workspaceEventLocks
+      this.workspaceEventLocks
         .withLock(workspaceId, async () => {
           await this.reconcileDeferredTaskStreamEnd(workspaceId);
         })
@@ -11100,7 +11098,8 @@ export class TaskService implements AgentTaskIntegration {
     // The production stream-end listener captures this synchronously at event
     // time, before waiting on the workspace event lock; the entry-time capture
     // below is a fallback for direct callers (tests) only.
-    eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot
+    eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot,
+    eventTimeTaskOrigin?: { executionId: string | null; stopEpoch: number }
   ): Promise<void> {
     // Cut attribution must reflect the state at the ended stream's own event,
     // not whatever input engaged while the lock wait or the awaits below ran
@@ -11108,6 +11107,19 @@ export class TaskService implements AgentTaskIntegration {
     const queueCutSnapshot =
       eventTimeQueueCutSnapshot ??
       this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(event.workspaceId);
+    const taskOrigin = eventTimeTaskOrigin ?? {
+      executionId: this.getAgentTaskExecutionId(event.workspaceId),
+      stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
+    };
+    const cutSourceIsObsolete = () =>
+      taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
+      taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(event.workspaceId);
+    const discardObsoleteCut = () => {
+      const entryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
+      if (entryId == null) return;
+      this.workspaceService.disposeQueueCut(event.workspaceId, entryId);
+      this.workspaceService.markQueueCutSourceHandled(event.workspaceId, entryId);
+    };
     const isCompaction = event.metadata.agentId === "compact" || event.metadata.mode === "compact";
     // AgentSession resolves true only after a durable compaction follow-up is accepted. Bare,
     // rejected, and failed-to-dispatch compactions remain on the normal child recovery path.
@@ -11421,9 +11433,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // A later stream end of the same task supersedes any deferral recorded for an earlier cut:
-    // this event is either the successor's own end or a newer turn that classifies on its own.
-    this.deferredTaskStreamEnds.delete(workspaceId);
+    // Stop and reactivation can pass this handler while it waits for the event lock. Its
+    // original execution, not the task's current status, owns this stream-end disposition.
+    if (cutSourceIsObsolete()) {
+      discardObsoleteCut();
+      return;
+    }
 
     const status = entry.workspace.taskStatus;
     const workflowOutputSchema = entry.workspace.workflowTask?.outputSchema;
@@ -11557,6 +11572,18 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    if (cutSourceIsObsolete()) {
+      discardObsoleteCut();
+      return;
+    }
+    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    const pendingCut = this.deferredTaskStreamEnds.get(workspaceId);
+    // A different turn can be admitted ahead of the designated continuation. Its incomplete
+    // end does not withdraw that continuation or transfer the old cut's recovery obligation.
+    if (pendingCut != null && pendingCut.sourceTurnGeneration !== queueCutSnapshot.turnGeneration) {
+      return;
+    }
+
     // Host-initiated cuts (queued input, context-budget hand-over) are not incomplete responses:
     // the selected continuation owns the turn unless it is withdrawn or fails before streaming.
     const continuationEntryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
@@ -11580,8 +11607,8 @@ export class TaskService implements AgentTaskIntegration {
             sourceMessageId: event.messageId,
             sourceTurnGeneration: receipt.sourceTurnGeneration,
             continuationEntryId,
-            executionId: entry.workspace.taskExecutionId,
-            stopEpoch: this.getWorkspaceStopEpoch(workspaceId),
+            executionId: taskOrigin.executionId ?? undefined,
+            stopEpoch: taskOrigin.stopEpoch,
           });
           // The successor may have been withdrawn between the cut and this classification.
           await this.reconcileDeferredTaskStreamEnd(workspaceId);
@@ -11611,9 +11638,9 @@ export class TaskService implements AgentTaskIntegration {
    * it; `pending`/`admitted` keep waiting. A task whose execution or stop epoch moved on, or that
    * left `running`, drops the deferral without recovery.
    */
-  private async reconcileDeferredTaskStreamEnd(workspaceId: string): Promise<void> {
+  private async reconcileDeferredTaskStreamEnd(workspaceId: string): Promise<boolean> {
     const deferral = this.deferredTaskStreamEnds.get(workspaceId);
-    if (deferral == null) return;
+    if (deferral == null) return false;
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (
       entry?.workspace.parentWorkspaceId == null ||
@@ -11622,7 +11649,8 @@ export class TaskService implements AgentTaskIntegration {
       this.getWorkspaceStopEpoch(workspaceId) !== deferral.stopEpoch
     ) {
       this.deferredTaskStreamEnds.delete(workspaceId);
-      return;
+      this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId);
+      return false;
     }
     const receipt = this.workspaceService.getQueueCutReceipt(
       workspaceId,
@@ -11630,14 +11658,14 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (receipt == null || receipt.successor === "streaming") {
       this.deferredTaskStreamEnds.delete(workspaceId);
-      return;
+      return false;
     }
     if (receipt.successor !== "canceled" && receipt.successor !== "prestream-failed") {
-      return;
+      return false;
     }
     this.deferredTaskStreamEnds.delete(workspaceId);
     if (!this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId)) {
-      return;
+      return true;
     }
     log.debug("Deferred task stream end recovering: continuation withdrawn", {
       workspaceId,
@@ -11646,10 +11674,18 @@ export class TaskService implements AgentTaskIntegration {
       successor: receipt.successor,
     });
     await this.recoverTaskFromIncompleteStreamEnd(workspaceId, entry.workspace.taskStatus);
+    return true;
   }
 
   private async handleStreamAbort(event: StreamAbortEvent): Promise<void> {
-    await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
+    if (event.abortReason === "user") {
+      // Explicit Stop withdraws the execution, not just its continuation. A later queue
+      // notification or delayed source event must not turn that Stop into automatic recovery.
+      this.bumpWorkspaceStopEpoch(event.workspaceId);
+      this.clearTaskRecovery(event.workspaceId);
+    } else {
+      await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
+    }
     // Settles a continuation handle (execution mirror) first. A reawakened child is ALSO
     // `running` in its stable status (markInterruptedTaskRunning), and the desktop ledger treats
     // either active source as control, so the stable status must be released independently.
@@ -11707,7 +11743,6 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async handleTaskStreamError(event: ErrorEvent): Promise<void> {
-    await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
     if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamError(event)) {
       return;
     }
@@ -11809,6 +11844,10 @@ export class TaskService implements AgentTaskIntegration {
       });
       return;
     }
+
+    // A startup error can wait behind the source handler until its continuation failure is
+    // recorded. That disposition already requested recovery; do not spend the budget twice.
+    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
 
     if (status !== "awaiting_report") {
       // Retryable errors during `running` are handled by the agent session's
@@ -13020,7 +13059,7 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
-    this.settleTaskRecoveryAtTerminalTransition(childWorkspaceId);
+    this.clearTaskRecovery(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
     // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.
