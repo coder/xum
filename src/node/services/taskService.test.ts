@@ -8,6 +8,7 @@ import { existsSync } from "fs";
 import * as os from "os";
 import { execSync } from "node:child_process";
 import {
+  TASK_CREATE_WAIT_WARNING_MS,
   TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
@@ -22,6 +23,7 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import {
+  getSubagentReportArtifactPath,
   readSubagentReportArtifact,
   upsertSubagentReportArtifact,
 } from "@/node/services/subagentReportArtifacts";
@@ -31971,86 +31973,86 @@ describe("TaskService", () => {
     });
   });
 
-  describe("teardown ownership and lock isolation", () => {
-    const rootId = "root-teardown";
-    const unrelatedParentId = "1111111111";
+  const rootId = "root-teardown";
+  const unrelatedParentId = "1111111111";
 
-    /** Fire only the termination timers immediately; every other timer keeps its delay. */
-    function shortenTerminationTimers(): () => void {
-      const originalSetTimeout = globalThis.setTimeout;
-      const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
-        handler: () => void,
-        timeout?: number
-      ) => {
-        if (
-          timeout === TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS ||
-          timeout === TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
-        ) {
-          return originalSetTimeout(handler, 0);
-        }
-        return originalSetTimeout(handler, timeout);
-      }) as typeof setTimeout);
-      return () => spy.mockRestore();
-    }
-
-    interface TreeDescendant {
-      id: string;
-      parent: string;
-      overrides?: Parameters<typeof projectWorkspace>[3];
-    }
-    async function setupTree(descendants: Array<string | TreeDescendant>) {
-      const descendantEntries: TreeDescendant[] = descendants.map((descendant) =>
-        typeof descendant === "string" ? { id: descendant, parent: rootId } : descendant
-      );
-      const config = await createTestConfig(rootDir);
-      const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
-      await saveWorkspaces(
-        config,
-        projectPath,
-        [
-          {
-            path: projectPath,
-            id: unrelatedParentId,
-            name: "unrelated-parent",
-            createdAt: new Date().toISOString(),
-            runtimeConfig: { type: "local" },
-            aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
-          },
-          projectWorkspace(projectPath, "root", rootId),
-          ...descendantEntries.map(({ id, parent, overrides }) =>
-            projectWorkspace(projectPath, id, id, {
-              parentWorkspaceId: parent,
-              agentType: "explore",
-              taskStatus: "running",
-              ...overrides,
-            })
-          ),
-        ],
-        testTaskSettings(4, 3)
-      );
-      return { config, projectPath };
-    }
-
-    async function waitUntil(condition: () => boolean, label: string): Promise<void> {
-      const deadline = Date.now() + 2_000;
-      while (!condition()) {
-        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-        await new Promise((resolve) => setTimeout(resolve, 1));
+  /** Fire only the termination timers immediately; every other timer keeps its delay. */
+  function shortenTerminationTimers(): () => void {
+    const originalSetTimeout = globalThis.setTimeout;
+    const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: () => void,
+      timeout?: number
+    ) => {
+      if (
+        timeout === TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS ||
+        timeout === TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+      ) {
+        return originalSetTimeout(handler, 0);
       }
-    }
+      return originalSetTimeout(handler, timeout);
+    }) as typeof setTimeout);
+    return () => spy.mockRestore();
+  }
 
-    /** Controlled stopStream: hung ids never settle until the test resolves them. */
-    function controlledStopStream(hungIds: Set<string>) {
-      const pending = new Map<string, ReturnType<typeof Promise.withResolvers<Result<void>>>>();
-      const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
-        if (!hungIds.has(workspaceId)) return Promise.resolve(Ok(undefined));
-        const gate = Promise.withResolvers<Result<void>>();
-        pending.set(workspaceId, gate);
-        return gate.promise;
-      });
-      return { stopStream, pending };
-    }
+  interface TreeDescendant {
+    id: string;
+    parent: string;
+    overrides?: Parameters<typeof projectWorkspace>[3];
+  }
+  async function setupTree(descendants: Array<string | TreeDescendant>) {
+    const descendantEntries: TreeDescendant[] = descendants.map((descendant) =>
+      typeof descendant === "string" ? { id: descendant, parent: rootId } : descendant
+    );
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: unrelatedParentId,
+          name: "unrelated-parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+        },
+        projectWorkspace(projectPath, "root", rootId),
+        ...descendantEntries.map(({ id, parent, overrides }) =>
+          projectWorkspace(projectPath, id, id, {
+            parentWorkspaceId: parent,
+            agentType: "explore",
+            taskStatus: "running",
+            ...overrides,
+          })
+        ),
+      ],
+      testTaskSettings(4, 3)
+    );
+    return { config, projectPath };
+  }
 
+  async function waitUntil(condition: () => boolean, label: string): Promise<void> {
+    const deadline = Date.now() + 2_000;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+
+  /** Controlled stopStream: hung ids never settle until the test resolves them. */
+  function controlledStopStream(hungIds: Set<string>) {
+    const pending = new Map<string, ReturnType<typeof Promise.withResolvers<Result<void>>>>();
+    const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+      if (!hungIds.has(workspaceId)) return Promise.resolve(Ok(undefined));
+      const gate = Promise.withResolvers<Result<void>>();
+      pending.set(workspaceId, gate);
+      return gate.promise;
+    });
+    return { stopStream, pending };
+  }
+
+  describe("teardown ownership and lock isolation", () => {
     test("a hung descendant stop neither holds the global mutex nor unbounds teardown; its latch is retained", async () => {
       const stuckId = "task-stuck";
       const siblingId = "task-sibling";
@@ -32542,5 +32544,675 @@ describe("TaskService", () => {
         }
       }
     );
+  });
+
+  describe("attempt outcome and settlement", () => {
+    const requesting = { requestingWorkspaceId: rootId };
+
+    async function persistReport(
+      config: Config,
+      ownerId: string,
+      taskId: string,
+      markdown: string
+    ) {
+      await upsertSubagentReportArtifact({
+        workspaceId: ownerId,
+        workspaceSessionDir: path.join(config.sessionsDir, ownerId),
+        childTaskId: taskId,
+        parentWorkspaceId: ownerId,
+        ancestorWorkspaceIds: [ownerId],
+        reportMarkdown: markdown,
+        nowMs: Date.now(),
+      });
+    }
+
+    test("a persisted report wins regardless of config status or a held latch", async () => {
+      const taskId = "task-outcome-reported";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      await persistReport(config, rootId, taskId, "final answer");
+      const { taskService } = createTaskServiceHarness(config);
+      // Legacy interrupted config, no owner — the report still decides.
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "reported",
+        report: { reportMarkdown: "final answer" },
+      });
+      // The requesting workspace scopes the artifact read (no scan over all parents): a fresh
+      // process asked by an unrelated requester learns nothing.
+      const { taskService: unrelatedService } = createTaskServiceHarness(config);
+      expect(
+        await unrelatedService.readAttemptOutcome(taskId, {
+          requestingWorkspaceId: unrelatedParentId,
+        })
+      ).toMatchObject({ kind: "indeterminate" });
+    });
+
+    test("an unreadable report artifact is indeterminate, never positive absence", async () => {
+      const taskId = "task-outcome-corrupt";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const reportPath = getSubagentReportArtifactPath(
+        path.join(config.sessionsDir, rootId),
+        taskId
+      );
+      await fsPromises.mkdir(path.dirname(reportPath), { recursive: true });
+      await fsPromises.writeFile(reportPath, "{ corrupt");
+      const { taskService } = createTaskServiceHarness(config);
+      const outcome = await taskService.readAttemptOutcome(taskId, requesting);
+      expect(outcome.kind).toBe("indeterminate");
+      if (outcome.kind === "indeterminate") expect(outcome.reason).toContain("unreadable");
+    });
+
+    test("a current-generation preparing turn is live even with interrupted config and no registered stream", async () => {
+      const taskId = "task-outcome-preparing";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { workspaceService } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock((workspaceId: string) =>
+          workspaceId === taskId ? Symbol("preparing") : undefined
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "live",
+        executionId: taskId,
+      });
+    });
+
+    test("paired: an owned reservation is live while the identical config loaded as legacy is indeterminate", async () => {
+      const spawnedId = "ownedchild01";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = taskService as unknown as {
+        startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+      };
+      // Hold the launch so the reservation stays "starting" without any stream or turn.
+      const launchGate = Promise.withResolvers<void>();
+      spyOn(internals, "startReservedAgentTask").mockImplementation(() => launchGate.promise);
+      const created = await taskService.createMany([
+        {
+          parentWorkspaceId: rootId,
+          kind: "agent" as const,
+          agentId: "explore",
+          prompt: "owned work",
+          title: "Owned",
+        },
+      ]);
+      expect(created).toMatchObject({
+        success: true,
+        data: [{ taskId: spawnedId, status: "starting" }],
+      });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "live",
+        executionId: spawnedId,
+      });
+      launchGate.resolve();
+
+      // Same persisted record, fresh process: nobody in this process owns the attempt.
+      const { taskService: legacyService } = createTaskServiceHarness(config);
+      const legacy = await legacyService.readAttemptOutcome(spawnedId, requesting);
+      expect(legacy.kind).toBe("indeterminate");
+      if (legacy.kind === "indeterminate") expect(legacy.reason).toContain("starting");
+    });
+
+    test("stopping an owned attempt is cleanup-pending until its latch settles, then terminal-no-report", async () => {
+      const taskId = "task-outcome-owned-stop";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { stopStream, pending } = controlledStopStream(new Set([taskId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        // Reawakening in this process makes the attempt owned (status running, no stream yet).
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "live",
+          executionId: taskId,
+        });
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "cleanup-pending",
+        });
+        pending.get(taskId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("paired: stopping an unknown legacy attempt settles its latch but never proves retirement", async () => {
+      const taskId = "task-outcome-legacy-stop";
+      const { config } = await setupTree([taskId]);
+      const { stopStream, pending } = controlledStopStream(new Set([taskId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        // Legacy "running" config with no proven admission in this process.
+        const before = await taskService.readAttemptOutcome(taskId, requesting);
+        expect(before.kind).toBe("indeterminate");
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "cleanup-pending",
+        });
+        pending.get(taskId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+        const after = await taskService.readAttemptOutcome(taskId, requesting);
+        expect(after.kind).toBe("indeterminate");
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("a settlement is bound to its attempt: reawakening invalidates it before new admission", async () => {
+      const taskId = "task-outcome-rebound";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+      // A new attempt starts: the old settlement must not leak into it...
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "live",
+        executionId: taskId,
+      });
+      // ...so a status write without any owner settlement is indeterminate, not retired.
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((entry) => entry.id === taskId);
+          if (ws) ws.taskStatus = "interrupted";
+        }
+        return cfg;
+      });
+      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
+    });
+
+    test("a launch that fails in this process settles its owned attempt", async () => {
+      const spawnedId = "failedchild01";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = taskService as unknown as {
+        startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+      };
+      spyOn(internals, "startReservedAgentTask").mockImplementation(() =>
+        Promise.reject(new Error("fork failed"))
+      );
+      const created = await taskService.createMany([
+        {
+          parentWorkspaceId: rootId,
+          kind: "agent" as const,
+          agentId: "explore",
+          prompt: "doomed",
+          title: "Doomed",
+        },
+      ]);
+      expect(created.success).toBe(true);
+      await waitUntil(
+        () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "interrupted",
+        "the failed launch to persist"
+      );
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe("fork failed");
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+    });
+
+    test("waitForAttemptSettlement subscribes before re-reading, releases the lock while waiting, and observes a settlement landing mid-read", async () => {
+      const taskId = "task-settle-race";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { stopStream, pending } = controlledStopStream(new Set([taskId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        const internals = taskService as unknown as {
+          inspectAttemptOutcome: (taskId: string, options: unknown) => Promise<unknown>;
+          workspaceEventLocks: { withLock: <T>(key: string, op: () => Promise<T>) => Promise<T> };
+        };
+        const realInspect = internals.inspectAttemptOutcome.bind(taskService);
+        // The first (locked) read is stale: the settlement lands while it runs, after the
+        // subscription was installed.
+        spyOn(internals, "inspectAttemptOutcome").mockImplementationOnce(async () => {
+          pending.get(taskId)!.resolve(Ok(undefined));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+          return { kind: "cleanup-pending" };
+        });
+        const settled = await taskService.waitForAttemptSettlement(taskId, {
+          timeoutMs: 5_000,
+          ...requesting,
+        });
+        expect(settled).toEqual({ kind: "terminal-no-report" });
+        expect(await realInspect(taskId, requesting)).toEqual({ kind: "terminal-no-report" });
+        // The lock is free while a waiter is pending (the wait below is bounded by its timeout).
+        const lockProbe = await internals.workspaceEventLocks.withLock(taskId, () =>
+          Promise.resolve("acquired")
+        );
+        expect(lockProbe).toBe("acquired");
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("waitForAttemptSettlement returns timeout for pending cleanup, rejects on abort, and returns indeterminate immediately", async () => {
+      const taskId = "task-settle-bounds";
+      const legacyId = "task-settle-legacy";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        { id: legacyId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { stopStream, pending } = controlledStopStream(new Set([taskId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        await taskService.stopDescendantAgentTask(rootId, taskId);
+        expect(pending.has(taskId)).toBe(true);
+        expect(
+          await taskService.waitForAttemptSettlement(taskId, { timeoutMs: 20, ...requesting })
+        ).toEqual({ kind: "timeout" });
+        const controller = new AbortController();
+        const aborted = taskService.waitForAttemptSettlement(taskId, {
+          timeoutMs: 5_000,
+          abortSignal: controller.signal,
+          ...requesting,
+        });
+        controller.abort();
+        expect(
+          await aborted.then(
+            () => null,
+            (error: unknown) => error
+          )
+        ).toBeInstanceOf(Error);
+        // Unknown owner: no wait at all, the caller must not pin a lease on it.
+        const started = Date.now();
+        expect(
+          (
+            await taskService.waitForAttemptSettlement(legacyId, {
+              timeoutMs: 5_000,
+              ...requesting,
+            })
+          ).kind
+        ).toBe("indeterminate");
+        expect(Date.now() - started).toBeLessThan(1_000);
+        // Settlement while a waiter is pending resolves it with the settled outcome.
+        const waiting = taskService.waitForAttemptSettlement(taskId, {
+          timeoutMs: 5_000,
+          ...requesting,
+        });
+        pending.get(taskId)!.resolve(Ok(undefined));
+        expect(await waiting).toEqual({ kind: "terminal-no-report" });
+        // Subscriptions do not leak past the wait.
+        const listeners = (
+          taskService as unknown as {
+            attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+          }
+        ).attemptSettlementListenersByTaskId;
+        expect(listeners.get(taskId)?.size ?? 0).toBe(0);
+        expect(listeners.get(legacyId)?.size ?? 0).toBe(0);
+      } finally {
+        restoreTimers();
+      }
+    });
+  });
+
+  describe("cancellable reservation", () => {
+    const spawnArgs = (parentWorkspaceId: string) => ({
+      parentWorkspaceId,
+      kind: "agent" as const,
+      agentId: "explore",
+      prompt: "cancellable work",
+      title: "Cancellable",
+    });
+    const configSnapshot = (config: Config) => JSON.stringify(config.loadConfigOrDefault());
+    const taskRecordCount = (config: Config) =>
+      [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
+        project.workspaces.filter((ws) => ws.parentWorkspaceId != null)
+      ).length;
+    /** The owned settlement follows the status write asynchronously; poll the authoritative read. */
+    async function waitForOutcomeKind(
+      taskService: TaskService,
+      taskId: string,
+      kind: string
+    ): Promise<void> {
+      const deadline = Date.now() + 2_000;
+      for (;;) {
+        const outcome = await taskService.readAttemptOutcome(taskId, {
+          requestingWorkspaceId: rootId,
+        });
+        if (outcome.kind === kind) return;
+        if (Date.now() > deadline) {
+          throw new Error(`Timed out waiting for ${kind}; last ${JSON.stringify(outcome)}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    }
+    /** The harness default metadata lookup with a hook run before/after the real read. */
+    const metadataMock = (
+      config: Config,
+      hooks: { before?: () => void; after?: () => Promise<void> | void }
+    ) =>
+      mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
+        hooks.before?.();
+        const all = await config.getAllWorkspaceMetadata();
+        const found = all.find((m) => m.id === workspaceId);
+        await hooks.after?.();
+        return found ? Ok(found) : Err("not found");
+      });
+    interface Internals {
+      startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+      materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
+      cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
+    }
+
+    test("abort while blocked on the global mutex returns promptly, leaves config untouched and releases the late acquisition", async () => {
+      const { config } = await setupTree([]);
+      const { taskService } = createTaskServiceHarness(config);
+      const before = configSnapshot(config);
+      const warned: unknown[][] = [];
+      const warnSpy = spyOn(log, "warn").mockImplementation((...args: unknown[]) => {
+        warned.push(args);
+      });
+      const originalSetTimeout = globalThis.setTimeout;
+      // Capture the stall warning instead of waiting 30 s; fired by hand once the mutex blocks.
+      let warningHandler: (() => void) | undefined;
+      const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        timeout?: number
+      ) => {
+        if (timeout === TASK_CREATE_WAIT_WARNING_MS) {
+          warningHandler = handler;
+          return originalSetTimeout(() => undefined, 0);
+        }
+        return originalSetTimeout(handler, timeout);
+      }) as typeof setTimeout);
+      const mutexQueue = (taskService as unknown as { mutex: { queue: unknown[] } }).mutex.queue;
+      const held = await taskService.acquireTaskCreationLock();
+      try {
+        const controller = new AbortController();
+        const creating = taskService.createMany([spawnArgs(rootId)], {
+          abortSignal: controller.signal,
+        });
+        await waitUntil(() => mutexQueue.length > 0, "the reservation to block on the mutex");
+        warningHandler?.();
+        expect(
+          warned.some(
+            (args) =>
+              String(args[0]).includes("[task-create]") &&
+              (args[1] as { stage?: string } | undefined)?.stage === "mutex"
+          )
+        ).toBe(true);
+        controller.abort();
+        const result = await creating;
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toMatch(/^Interrupted/);
+          expect(result.error).toContain("mutex");
+          expect(result.error).not.toBe("Task interrupted");
+        }
+      } finally {
+        await held[Symbol.asyncDispose]();
+        timerSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+      // The late acquisition released the mutex without doing work.
+      const reacquired = await taskService.acquireTaskCreationLock();
+      await reacquired[Symbol.asyncDispose]();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(configSnapshot(config)).toBe(before);
+    });
+
+    test("abort while blocked on the tree lifecycle lock returns promptly and the late callback is a no-op", async () => {
+      const { config } = await setupTree([]);
+      const { taskService } = createTaskServiceHarness(config);
+      const before = configSnapshot(config);
+      const gate = Promise.withResolvers<void>();
+      const holding = taskService.withTaskTreeLifecycleLock(rootId, () => gate.promise);
+      const controller = new AbortController();
+      const creating = taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      controller.abort();
+      const result = await creating;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("tree-lock");
+      gate.resolve();
+      await holding;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(configSnapshot(config)).toBe(before);
+    });
+
+    test("abort during read-only preparation discards the late result without touching config or locks", async () => {
+      const { config } = await setupTree([]);
+      const controller = new AbortController();
+      const { aiService } = createAIServiceMocks(config, {
+        getWorkspaceMetadata: metadataMock(config, { before: () => controller.abort() }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const recordsBefore = taskRecordCount(config);
+      const result = await taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("prepare");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // No reservation record (metadata normalization writes are not reservation writes).
+      expect(taskRecordCount(config)).toBe(recordsBefore);
+    });
+
+    test("preparation inputs that drift before the mutex fail closed with a retryable error and no commit", async () => {
+      const { config } = await setupTree([]);
+      let drifted = false;
+      const { aiService } = createAIServiceMocks(config, {
+        getWorkspaceMetadata: metadataMock(config, {
+          after: async () => {
+            if (drifted) return;
+            drifted = true;
+            // The parent moves to another checkout while preparation is in flight.
+            await config.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                const ws = project.workspaces.find((entry) => entry.id === rootId);
+                if (ws) ws.path = `${ws.path}-moved`;
+              }
+              return cfg;
+            });
+          },
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const result = await taskService.createMany([spawnArgs(rootId)]);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/changed|retry/i);
+      expect(config.loadConfigOrDefault().projects.values().next().value?.workspaces.length).toBe(
+        2
+      );
+    });
+
+    test("abort before the checkpoint callback is entered: no callback, no commit", async () => {
+      const { config } = await setupTree([]);
+      const { taskService } = createTaskServiceHarness(config);
+      const controller = new AbortController();
+      const coordinator = (
+        taskService as unknown as {
+          desktopInputCoordinator: { withReservations: (...args: unknown[]) => Promise<unknown> };
+        }
+      ).desktopInputCoordinator;
+      const realWithReservations = coordinator.withReservations.bind(coordinator);
+      spyOn(coordinator, "withReservations").mockImplementation((...args: unknown[]) => {
+        controller.abort();
+        return realWithReservations(...args);
+      });
+      const onTaskReserved = mock(() => undefined);
+      const before = configSnapshot(config);
+      const result = await taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+        onTaskReserved,
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/desktop-gate|checkpoint/);
+      expect(onTaskReserved).not.toHaveBeenCalled();
+      expect(configSnapshot(config)).toBe(before);
+    });
+
+    test.each(["inside-checkpoint", "config-lock-wait", "after-commit"] as const)(
+      "abort %s: the owned reservation is persisted interrupted, never scheduled, and settled",
+      async (moment) => {
+        const spawnedId = "canceledchild";
+        const { config } = await setupTree([]);
+        stubStableIds(config, [spawnedId]);
+        const { taskService } = createTaskServiceHarness(config);
+        const internals = taskService as unknown as Internals;
+        const launch = spyOn(internals, "startReservedAgentTask").mockImplementation(() =>
+          Promise.resolve()
+        );
+        const controller = new AbortController();
+        // Target the reservation commit itself (the write that follows the checkpoint), not
+        // normalization writes made by earlier reads.
+        let checkpointed = false;
+        const originalEdit = config.editConfig.bind(config);
+        const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator) => {
+          if (moment === "config-lock-wait" && checkpointed) controller.abort();
+          const result = await originalEdit(mutator);
+          if (moment === "after-commit" && checkpointed) controller.abort();
+          return result;
+        });
+        const waiter = taskService.waitForAgentReport(spawnedId, { timeoutMs: 5_000 }).then(
+          () => "resolved" as const,
+          (error: unknown) => (error instanceof Error ? error.message : "rejected")
+        );
+        try {
+          const result = await taskService.createMany([spawnArgs(rootId)], {
+            abortSignal: controller.signal,
+            onTaskReserved: () => {
+              checkpointed = true;
+              if (moment === "inside-checkpoint") controller.abort();
+            },
+          });
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toMatch(/^Interrupted/);
+        } finally {
+          editSpy.mockRestore();
+        }
+        const persisted = findWorkspaceInConfig(config, spawnedId);
+        expect(persisted?.taskStatus).toBe("interrupted");
+        expect(persisted?.taskLaunchError).toBe("Reservation canceled");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(launch).not.toHaveBeenCalled();
+        expect(
+          await taskService.readAttemptOutcome(spawnedId, { requestingWorkspaceId: rootId })
+        ).toEqual({ kind: "terminal-no-report" });
+        // Waiters are rejected by the owned reconcile, not left hanging.
+        expect(await waiter).not.toBe("resolved");
+      }
+    );
+
+    test("abort during materialization cleans the materialized workspace and never sends", async () => {
+      const spawnedId = "materializedchild";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const internals = taskService as unknown as Internals;
+      const controller = new AbortController();
+      const fakeRuntime = { deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))) };
+      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(() => {
+        controller.abort();
+        return Promise.resolve({
+          workspacePath: "/tmp/materialized",
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          runtimeForTaskWorkspace: fakeRuntime,
+          inheritedProjects: undefined,
+        });
+      });
+      const cleanup = spyOn(internals, "cleanupMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve()
+      );
+      const created = await taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      expect(created.success).toBe(true);
+      await waitUntil(
+        () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "interrupted",
+        "the canceled launch to persist"
+      );
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup.mock.calls[0]?.[3]).toBe(spawnedId);
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe(
+        "Reservation canceled"
+      );
+      await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
+    });
+
+    test("abort after send admission cannot un-launch: the execution exists and is stopped through the Layer 2 path", async () => {
+      const spawnedId = "admittedchild1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const controller = new AbortController();
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        sendMessage: mock((): Promise<Result<void>> => {
+          controller.abort();
+          return Promise.resolve(Ok(undefined));
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const internals = taskService as unknown as Internals;
+      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve({
+          workspacePath: config.loadConfigOrDefault().projects.keys().next().value ?? "/tmp",
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          runtimeForTaskWorkspace: {
+            deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+            getWorkspacePath: () => "/tmp/admitted",
+          },
+          inheritedProjects: undefined,
+        })
+      );
+      const cleanup = spyOn(internals, "cleanupMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve()
+      );
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve(undefined)
+      );
+      const created = await taskService.createMany([spawnArgs(rootId)], {
+        abortSignal: controller.signal,
+      });
+      expect(created.success).toBe(true);
+      await waitUntil(
+        () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "running",
+        "the admitted launch to run"
+      );
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(cleanup).not.toHaveBeenCalled();
+      // Linearization point passed: only Stop ends it.
+      expect(await taskService.terminateAllDescendantAgentTasks(rootId)).toEqual([spawnedId]);
+      expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("interrupted");
+    });
   });
 });
