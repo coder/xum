@@ -2333,7 +2333,11 @@ export const nameGeneration = {
   generate: {
     input: z.object({
       message: z.string(),
-      /** Ordered list of model candidates to try (backend resolves gateway routing in createModel) */
+      /**
+       * Caller fallback models (e.g. the model selected for the new workspace). The backend
+       * tries the configured `name_workspace` model and its built-in small-model fallbacks
+       * first, then these; gateway routing is resolved in createModel.
+       */
       candidates: z.array(z.string()),
     }),
     output: ResultSchema(

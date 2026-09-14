@@ -374,7 +374,7 @@ export function useCreationWorkspace({
   const projectScopeId = getProjectScopeId(projectPath);
 
   // Workspace name generation with debounce
-  // Backend tries cheap models first, then user's model, then any available
+  // Backend tries the configured naming model first, then cheap models, then user's model
   const workspaceNameState = useWorkspaceName({
     message,
     debounceMs: 500,

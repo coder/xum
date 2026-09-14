@@ -7,8 +7,9 @@ import {
   mapModelCreationError,
   mapNameGenerationError,
 } from "./workspaceTitleGenerator";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { AIService } from "./aiService";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 
 afterEach(() => {
@@ -67,22 +68,179 @@ const createApiCallError = (
     responseBody: overrides?.responseBody,
   });
 
+function createTitleModel(modelId = "title-model"): LanguageModel {
+  return {
+    specificationVersion: "v3",
+    provider: "test",
+    modelId,
+    supportedUrls: {},
+    doGenerate: () => Promise.reject(new Error("doGenerate is unused in cleanup tests")),
+    doStream: () => Promise.reject(new Error("doStream is unused in cleanup tests")),
+  };
+}
+
+/** Pinned-options receipt for a direct (non-gateway) route, as ProviderModelFactory returns it. */
+function pinnedOptionsFor(
+  modelString: string,
+  model: LanguageModel,
+  _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }
+) {
+  return Ok({
+    model,
+    effectiveModelString: modelString,
+    wireProviderName: modelString.split(":")[0],
+    metadataModel: modelString,
+    optionsModelString: modelString,
+    optionsProvidersConfig: {},
+    optionsMuxProviderOptions: {},
+  });
+}
+
+function createTitleAIService(model: LanguageModel): AIService {
+  return {
+    createModelWithPinnedOptions: (modelString: string) =>
+      Promise.resolve(pinnedOptionsFor(modelString, model)),
+  } as unknown as AIService;
+}
+
+const proposeNameStream = {
+  toolResults: Promise.resolve([
+    {
+      dynamic: false,
+      toolName: "propose_name",
+      output: { name: "settings", title: "Add setting" },
+    },
+  ]),
+} as unknown as ReturnType<typeof aiSdk.streamText>;
+
+describe("generateWorkspaceIdentity candidate settings", () => {
+  test("uses the configured candidate's thinking level and stops after it succeeds", async () => {
+    const createModelWithPinnedOptions = mock(
+      (modelString: string, opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }) =>
+        Promise.resolve(pinnedOptionsFor(modelString, createTitleModel(modelString), opts))
+    );
+    const aiService = { createModelWithPinnedOptions } as unknown as AIService;
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [
+        { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+        { model: "anthropic:claude-haiku-4-5" },
+      ],
+      aiService
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.modelUsed).toBe("google:gemini-3.8-flash");
+    }
+    // Configured model is created with its thinking level (xAI variant mapping etc.)
+    // and the hardcoded fallback is never touched once it succeeds.
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(1);
+    expect(createModelWithPinnedOptions.mock.calls[0]?.[0]).toBe("google:gemini-3.8-flash");
+    expect(createModelWithPinnedOptions.mock.calls[0]?.[1]).toMatchObject({
+      thinkingLevel: "medium",
+      agentInitiated: true,
+    });
+    // The request itself carries the configured thinking level.
+    expect(streamTextSpy).toHaveBeenCalledTimes(1);
+    expect(streamTextSpy.mock.calls[0]?.[0].providerOptions).toMatchObject({
+      google: { thinkingConfig: { thinkingLevel: "medium" } },
+    });
+  });
+
+  test("clamps the configured thinking level to the model's policy", async () => {
+    const aiService = createTitleAIService(createTitleModel());
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      // Gemini 3.8 Flash has no true "off"; policy floors it to "low" instead of
+      // sending a value the provider rejects.
+      [{ model: "google:gemini-3.8-flash", thinkingLevel: "off" }],
+      aiService
+    );
+
+    expect(result.success).toBe(true);
+    expect(streamTextSpy.mock.calls[0]?.[0].providerOptions).toMatchObject({
+      google: { thinkingConfig: { thinkingLevel: "low" } },
+    });
+  });
+
+  test("falls through to the next candidate when the configured model fails", async () => {
+    const createModelWithPinnedOptions = mock(
+      (modelString: string, opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }) =>
+        Promise.resolve(pinnedOptionsFor(modelString, createTitleModel(modelString), opts))
+    );
+    const aiService = { createModelWithPinnedOptions } as unknown as AIService;
+    let streamTextCalls = 0;
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockImplementation((() => {
+      streamTextCalls += 1;
+      if (streamTextCalls === 1) {
+        throw createApiCallError(500, "configured model unavailable");
+      }
+      return proposeNameStream;
+    }) as unknown as typeof aiSdk.streamText);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [
+        { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+        { model: "openai:gpt-5.6-luna" },
+      ],
+      aiService
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.modelUsed).toBe("openai:gpt-5.6-luna");
+    }
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
+    // Fallbacks carry no configured thinking: they run with thinking off.
+    expect(createModelWithPinnedOptions.mock.calls[1]?.[1]).toMatchObject({
+      thinkingLevel: undefined,
+      agentInitiated: true,
+    });
+    expect(streamTextSpy.mock.calls[1]?.[0].providerOptions).toMatchObject({
+      openai: { reasoningEffort: "none" },
+    });
+  });
+
+  test("skips a candidate whose model cannot be created and reports the last failure", async () => {
+    const createModelWithPinnedOptions = mock((modelString: string) =>
+      Promise.resolve(
+        modelString.startsWith("google:")
+          ? Err({ type: "api_key_not_found" as const, provider: "google" })
+          : pinnedOptionsFor(modelString, createTitleModel(modelString))
+      )
+    );
+    const aiService = { createModelWithPinnedOptions } as unknown as AIService;
+    spyOn(aiSdk, "streamText").mockReturnValue({
+      toolResults: Promise.resolve([]),
+    } as unknown as ReturnType<typeof aiSdk.streamText>);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [
+        { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+        { model: "openai:gpt-5.6-luna" },
+      ],
+      aiService
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toEqual({
+        type: "unknown",
+        raw: "Model did not call propose_name tool",
+      });
+    }
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("generateWorkspaceIdentity cleanup", () => {
-  function createTitleModel(modelId = "title-model"): LanguageModel {
-    return {
-      specificationVersion: "v3",
-      provider: "test",
-      modelId,
-      supportedUrls: {},
-      doGenerate: () => Promise.reject(new Error("doGenerate is unused in cleanup tests")),
-      doStream: () => Promise.reject(new Error("doStream is unused in cleanup tests")),
-    };
-  }
-
-  function createTitleAIService(model: LanguageModel): AIService {
-    return { createModel: () => Promise.resolve(Ok(model)) } as unknown as AIService;
-  }
-
   test("cleans up the model after a successful title stream", async () => {
     let cleanupCalls = 0;
     const model = createTitleModel();
@@ -103,7 +261,7 @@ describe("generateWorkspaceIdentity cleanup", () => {
 
     const result = await generateWorkspaceIdentity(
       "Add setting",
-      ["openai:gpt-4.1-mini"],
+      [{ model: "openai:gpt-4.1-mini" }],
       titleAiService
     );
 
@@ -125,7 +283,7 @@ describe("generateWorkspaceIdentity cleanup", () => {
 
     const result = await generateWorkspaceIdentity(
       "Add setting",
-      ["openai:gpt-4.1-mini"],
+      [{ model: "openai:gpt-4.1-mini" }],
       aiService
     );
 
@@ -145,8 +303,10 @@ describe("generateWorkspaceIdentity cleanup", () => {
       secondCleanupCalls += 1;
     });
     const aiService = {
-      createModel: mock((modelString: string) =>
-        Promise.resolve(Ok(modelString.includes("first") ? firstModel : secondModel))
+      createModelWithPinnedOptions: mock((modelString: string) =>
+        Promise.resolve(
+          pinnedOptionsFor(modelString, modelString.includes("first") ? firstModel : secondModel)
+        )
       ),
     } as unknown as AIService;
     let streamTextCalls = 0;
@@ -168,7 +328,7 @@ describe("generateWorkspaceIdentity cleanup", () => {
 
     const result = await generateWorkspaceIdentity(
       "Add setting",
-      ["openai:first", "openai:second"],
+      [{ model: "openai:first" }, { model: "openai:second" }],
       aiService
     );
 
@@ -191,7 +351,7 @@ describe("generateWorkspaceIdentity cleanup", () => {
 
     const result = await generateWorkspaceIdentity(
       "Add setting",
-      ["openai:gpt-4.1-mini"],
+      [{ model: "openai:gpt-4.1-mini" }],
       aiService
     );
 

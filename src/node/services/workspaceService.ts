@@ -156,7 +156,10 @@ import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
   ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
 } from "@/node/services/additionalSystemContext";
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
+import {
+  generateWorkspaceIdentity,
+  type NameGenerationCandidate,
+} from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import type { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
@@ -7929,20 +7932,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Candidate list for "small model" callers (title + AI sidebar status).
-   * Global preferences first, then any workspace-configured model so a
-   * custom-model workspace still works when global preferences are
-   * unavailable. Public so AgentStatusService can share the precedence.
+   * Ordered naming candidates shared by every naming path (pre-creation,
+   * fork auto-title, regenerate title). The user's configured `name_workspace`
+   * settings (workspace bucket, then agent defaults) lead with their thinking
+   * level; the hardcoded small-model fallbacks come next, then any
+   * workspace-configured models and caller-supplied fallbacks (e.g. the model
+   * selected for a workspace that does not exist yet) so a custom-model setup
+   * still works when the preferred providers are unavailable.
    */
-  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
-    const candidates: string[] = [];
-    const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
-    const metadata = metadataResult.success ? metadataResult.data : undefined;
+  public async getWorkspaceNamingCandidates(
+    workspaceId: string | undefined,
+    extraFallbackModels: string[] = []
+  ): Promise<NameGenerationCandidate[]> {
+    const metadataResult = workspaceId
+      ? await this.aiService.getWorkspaceMetadata(workspaceId)
+      : undefined;
+    const metadata = metadataResult?.success ? metadataResult.data : undefined;
 
-    // A configured name_workspace model (workspace bucket, then agent
-    // defaults) leads the candidate list. Model-only: this runtime ignores
-    // thinking and reasoning parameters. Defensive config read: tests
-    // construct the service with partial Config mocks.
+    // Defensive config read: tests construct the service with partial Config mocks.
     let agentAiDefaults: AgentAiDefaults | undefined;
     try {
       agentAiDefaults = this.config.loadConfigOrDefault().agentAiDefaults;
@@ -7954,31 +7961,49 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       targetAgentId: "name_workspace",
       profile: "interactive",
       agentAiDefaults,
-      targetWorkspaceSettings: nameBucket ? { model: nameBucket.model } : undefined,
+      targetWorkspaceSettings: nameBucket
+        ? { model: nameBucket.model, thinkingLevel: nameBucket.thinkingLevel }
+        : undefined,
     });
-    if (resolved.sources.model.tier !== "default") {
-      candidates.push(resolved.selected.model);
-    }
-    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
-      if (!candidates.includes(preferred)) {
-        candidates.push(preferred);
-      }
-    }
-    if (!metadata) {
-      return candidates;
-    }
 
-    const fallbackModels = [
-      metadata.aiSettings?.model,
-      ...Object.values(metadata.aiSettingsByAgent ?? {}).map((settings) => settings.model),
-    ];
-    for (const model of fallbackModels) {
-      if (model && !candidates.includes(model)) {
-        candidates.push(model);
+    const candidates: NameGenerationCandidate[] = [];
+    if (resolved.sources.model.tier !== "default") {
+      // Selected (not effective) thinking: the generator clamps against the
+      // creation-time route/config receipt rather than this resolver's view.
+      candidates.push({
+        model: resolved.selected.model,
+        thinkingLevel: resolved.selected.thinkingLevel,
+      });
+    }
+    const pushFallback = (model: string | undefined) => {
+      if (model && !candidates.some((candidate) => candidate.model === model)) {
+        candidates.push({ model });
       }
+    };
+    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
+      pushFallback(preferred);
+    }
+    if (metadata) {
+      pushFallback(metadata.aiSettings?.model);
+      for (const settings of Object.values(metadata.aiSettingsByAgent ?? {})) {
+        pushFallback(settings.model);
+      }
+    }
+    for (const model of extraFallbackModels) {
+      pushFallback(model);
     }
 
     return candidates;
+  }
+
+  /**
+   * Model-only view of getWorkspaceNamingCandidates for "small model" callers
+   * whose runtime ignores thinking (AI sidebar status). Public so
+   * AgentStatusService can share the precedence.
+   */
+  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
+    return candidates.map((candidate) => candidate.model);
   }
 
   private async maybeRunPendingAutoTitleFromMessage(
@@ -7991,7 +8016,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     try {
-      const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+      const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
       const result = await generateWorkspaceIdentity(trimmedMessage, candidates, this.aiService);
       if (result.success) {
         const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
@@ -8350,7 +8375,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const { conversationContext, latestUserText } =
       buildWorkspaceTitleConversationContext(contextTurns);
 
-    const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
 
     const result = await generateWorkspaceIdentity(
       firstUserText,

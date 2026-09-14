@@ -10,6 +10,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
+import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
@@ -12821,6 +12822,13 @@ describe("WorkspaceService pending auto-title", () => {
   });
 
   test("completing a pending auto-title replaces the fallback title and clears the state", async () => {
+    // Fork auto-titles honor the configured naming agent (model + thinking) first.
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: {
+        name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+      },
+    }));
     const generateIdentitySpy = spyOn(
       workspaceTitleGenerator,
       "generateWorkspaceIdentity"
@@ -12848,6 +12856,10 @@ describe("WorkspaceService pending auto-title", () => {
       expect(metadata?.title).toBe("Harden auth flow");
       expect(metadata?.pendingAutoTitle).toBeUndefined();
       expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+      expect(generateIdentitySpy.mock.calls[0]?.[1][0]).toEqual({
+        model: "google:gemini-3.8-flash",
+        thinkingLevel: "medium",
+      });
     } finally {
       generateIdentitySpy.mockRestore();
     }
@@ -20974,6 +20986,104 @@ describe("WorkspaceService init cancellation", () => {
   });
 });
 
+describe("WorkspaceService naming model candidates", () => {
+  const NAMING_DEFAULTS = {
+    name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" as const },
+  };
+
+  function createNamingService(options: {
+    agentAiDefaults?: typeof NAMING_DEFAULTS;
+    metadata?: Partial<FrontendWorkspaceMetadata>;
+  }): WorkspaceService {
+    const metadata = options.metadata
+      ? Ok({
+          id: "ws-naming",
+          name: "ws-naming",
+          projectName: "proj",
+          projectPath: "/tmp/proj",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" as const },
+          ...options.metadata,
+        })
+      : { success: false as const, error: "workspace metadata unavailable" };
+    return createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/test",
+        sessionsDir: "/tmp/test/sessions",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map(),
+          agentAiDefaults: options.agentAiDefaults,
+        })),
+      },
+      aiService: createMockAIService({
+        getWorkspaceMetadata: mock(() => Promise.resolve(metadata)),
+      }),
+    });
+  }
+
+  test("configured naming model + thinking leads, hardcoded small models follow", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates[0]).toEqual({ model: "google:gemini-3.8-flash", thinkingLevel: "medium" });
+    expect(candidates.slice(1)).toEqual(NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })));
+  });
+
+  test("unset naming config keeps the hardcoded small models first, thinking off", async () => {
+    const service = createNamingService({});
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual(NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })));
+    expect(candidates.every((candidate) => candidate.thinkingLevel === undefined)).toBe(true);
+  });
+
+  test("workspace-configured models trail the built-in fallbacks without duplicates", async () => {
+    const service = createNamingService({
+      agentAiDefaults: NAMING_DEFAULTS,
+      metadata: {
+        aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+        aiSettingsByAgent: {
+          exec: { model: NAME_GEN_PREFERRED_MODELS[0], thinkingLevel: "off" },
+        },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual([
+      "google:gemini-3.8-flash",
+      ...NAME_GEN_PREFERRED_MODELS,
+      "openai:gpt-5.6-sol",
+    ]);
+  });
+
+  test("pre-creation naming (no workspace) puts caller fallbacks after the configured and built-in models", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined, [
+      "openai:gpt-5.6-sol",
+      NAME_GEN_PREFERRED_MODELS[0],
+    ]);
+
+    expect(candidates).toEqual([
+      { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+      { model: "openai:gpt-5.6-sol" },
+    ]);
+  });
+
+  test("small-model string candidates share the same precedence", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    expect(await service.getWorkspaceTitleModelCandidates("ws-naming")).toEqual([
+      "google:gemini-3.8-flash",
+      ...NAME_GEN_PREFERRED_MODELS,
+    ]);
+  });
+});
+
 describe("WorkspaceService regenerateTitle", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
@@ -20999,6 +21109,15 @@ describe("WorkspaceService regenerateTitle", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map(),
+        agentAiDefaults: {
+          name_workspace: {
+            modelString: "google:gemini-3.8-flash",
+            thinkingLevel: "medium" as const,
+          },
+        },
+      })),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
       on: mock(() => undefined as unknown as InitStateManager),
@@ -21045,6 +21164,8 @@ describe("WorkspaceService regenerateTitle", () => {
       }
       expect(generateIdentitySpy).toHaveBeenCalledTimes(1);
       const call = generateIdentitySpy.mock.calls[0];
+      // Regeneration honors the configured naming agent (model + thinking) first.
+      expect(call?.[1][0]).toEqual({ model: "google:gemini-3.8-flash", thinkingLevel: "medium" });
       expect(call?.[3]).toBeUndefined();
       expect(call?.[4]).toBe("Fix CI");
       expect(updateTitleSpy).toHaveBeenCalledWith(workspaceId, "Fix CI");

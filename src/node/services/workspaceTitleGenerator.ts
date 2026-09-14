@@ -4,8 +4,11 @@ import { log } from "./log";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { NameGenerationError, SendMessageError } from "@/common/types/errors";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { TOOL_DEFINITIONS, ProposeNameToolArgsSchema } from "@/common/utils/tools/toolDefinitions";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import crypto from "crypto";
@@ -15,6 +18,16 @@ export interface WorkspaceIdentity {
   name: string;
   /** Human-readable title (e.g., "Fix plan mode over SSH") */
   title: string;
+}
+
+/** One model to try for naming, in precedence order. */
+export interface NameGenerationCandidate {
+  model: string;
+  /**
+   * Thinking level from the user's `name_workspace` agent settings. Hardcoded
+   * fallbacks omit it and run with thinking off; the policy floor still applies.
+   */
+  thinkingLevel?: ThinkingLevel;
 }
 
 // Crockford Base32 alphabet (excludes I, L, O, U to avoid confusion)
@@ -138,7 +151,8 @@ export function mapModelCreationError(
 
 /**
  * Generate workspace identity (name + title) using AI.
- * Tries candidates in order, retrying on API errors (invalid keys, quota, etc.).
+ * Tries candidates in order (configured `name_workspace` settings first, then
+ * hardcoded fallbacks), retrying on API errors (invalid keys, quota, etc.).
  *
  * - name: Codebase area with 4-char suffix (e.g., "sidebar-a1b2")
  * - title: Human-readable description (e.g., "Fix plan mode over SSH")
@@ -180,7 +194,7 @@ export function buildWorkspaceIdentityPrompt(
 
 export async function generateWorkspaceIdentity(
   message: string,
-  candidates: string[],
+  candidates: NameGenerationCandidate[],
   aiService: AIService,
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
@@ -198,9 +212,13 @@ export async function generateWorkspaceIdentity(
   let lastError: NameGenerationError | null = null;
 
   for (let i = 0; i < maxAttempts; i++) {
-    const modelString = candidates[i];
+    const { model: modelString, thinkingLevel: configuredThinking } = candidates[i];
 
-    const modelResult = await aiService.createModel(modelString, undefined, {
+    // Pinned options: the same creation-time route/config receipt every other
+    // headless streamText caller uses, so the configured thinking level is
+    // serialized for the wire the model was actually created on.
+    const modelResult = await aiService.createModelWithPinnedOptions(modelString, {
+      thinkingLevel: configuredThinking,
       agentInitiated: true,
     });
     if (!modelResult.success) {
@@ -208,6 +226,13 @@ export async function generateWorkspaceIdentity(
       log.debug(`Name generation: skipping ${modelString} (${modelResult.error.type})`);
       continue;
     }
+    const pinned = modelResult.data;
+    const thinkingLevel = enforceThinkingPolicy(
+      pinned.optionsModelString,
+      configuredThinking ?? "off",
+      undefined,
+      pinned.optionsProvidersConfig
+    );
 
     try {
       // Use streamText with a propose_name tool instead of Output.object().
@@ -226,8 +251,21 @@ export async function generateWorkspaceIdentity(
       // For this direct streamText path, the candidate retry loop handles the
       // (rare) case where the model ignores the instruction.
       const currentStream = streamText({
-        model: modelResult.data,
+        model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
+        // Same route/wire receipt as model creation; also pins thinking off
+        // explicitly for fallbacks (some providers default to medium otherwise).
+        providerOptions: buildProviderOptions(
+          pinned.optionsModelString,
+          thinkingLevel,
+          undefined,
+          undefined,
+          pinned.optionsMuxProviderOptions,
+          undefined,
+          undefined,
+          pinned.optionsProvidersConfig,
+          pinned.optionsRouteProvider
+        ) as Parameters<typeof streamText>[0]["providerOptions"],
         tools: {
           // Defined inline so TypeScript preserves full schema inference on
           // toolResult.output (the propose_name tool is only used here).
@@ -274,7 +312,7 @@ export async function generateWorkspaceIdentity(
       log.warn("Name generation failed, trying next candidate", { modelString, error: lastError });
       continue;
     } finally {
-      runLanguageModelCleanup(modelResult.data);
+      runLanguageModelCleanup(pinned.model);
     }
   }
 

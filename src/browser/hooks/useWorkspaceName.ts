@@ -3,7 +3,6 @@ import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getWorkspaceNameStateKey } from "@/common/constants/storage";
-import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -17,16 +16,12 @@ export type WorkspaceNameUIError =
   | { kind: "transport"; message: string };
 
 /**
- * Build ordered candidate list for name generation.
- * Gateway routing is resolved automatically by createModel on the backend,
- * so candidates are sent as canonical model IDs.
+ * Caller fallbacks for name generation. The backend owns the precedence
+ * (configured name_workspace model + thinking first, then its built-in small
+ * models); the user's selected model is only a last resort after those.
  */
 function buildNameGenCandidates(userModel: string | undefined): string[] {
-  const candidates: string[] = [...NAME_GEN_PREFERRED_MODELS];
-  if (userModel && !candidates.includes(userModel)) {
-    candidates.push(userModel);
-  }
-  return candidates;
+  return userModel ? [userModel] : [];
 }
 
 function buildFallbackWorkspaceIdentity(message: string): WorkspaceIdentity {
@@ -47,7 +42,7 @@ export interface UseWorkspaceNameOptions {
   message: string;
   /** Debounce delay in milliseconds (default: 500) */
   debounceMs?: number;
-  /** User's selected model to try after preferred models */
+  /** User's selected model to try after the configured and built-in naming models */
   userModel?: string;
   /**
    * Optional storage scope for persisting draft name-generation state.
@@ -229,8 +224,8 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
 
       try {
-        // Frontend sends canonical candidates; backend createModel resolves gateway routing.
-        // Backend tries candidates in order with retry on API errors.
+        // Backend prepends the configured naming model and built-in fallbacks, then
+        // tries candidates in order with retry on API errors (createModel resolves routing).
         const result = await api.nameGeneration.generate({
           message: forMessage,
           candidates,
