@@ -207,6 +207,47 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     });
   });
 
+  test.each([true, false])(
+    "keeps the selected chat model reachable within a bounded chain (succeeds=%s)",
+    async (selectedModelSucceeds) => {
+      const selectedModel = "openai:gpt-5.4";
+      const createModelWithPinnedOptions = mock((modelString: string) =>
+        Promise.resolve(pinnedOptionsFor(modelString, createTitleModel(modelString)))
+      );
+      const aiService = { createModelWithPinnedOptions } as unknown as AIService;
+      let attempts = 0;
+      spyOn(aiSdk, "streamText").mockImplementation((() => {
+        attempts += 1;
+        if (attempts === 4 && selectedModelSucceeds) {
+          return proposeNameStream;
+        }
+        throw createApiCallError(500, "candidate unavailable");
+      }) as unknown as typeof aiSdk.streamText);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [
+          { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+          { model: "anthropic:claude-haiku-4-5" },
+          { model: "openai:gpt-5.6-luna" },
+          { model: selectedModel },
+          { model: "openai:gpt-5.6" },
+        ],
+        aiService
+      );
+
+      expect(result.success).toBe(selectedModelSucceeds);
+      if (result.success) {
+        expect(result.data.modelUsed).toBe(selectedModel);
+      }
+      // A configured naming model must not displace the previously reachable
+      // chat-model fallback, but extra candidates must not extend the retry bound.
+      expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(4);
+      expect(createModelWithPinnedOptions.mock.calls[3]?.[0]).toBe(selectedModel);
+      expect(attempts).toBe(4);
+    }
+  );
+
   test("skips a candidate whose model cannot be created and reports the last failure", async () => {
     const createModelWithPinnedOptions = mock((modelString: string) =>
       Promise.resolve(

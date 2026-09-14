@@ -205,8 +205,9 @@ export async function generateWorkspaceIdentity(
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
   }
 
-  // Try up to 3 candidates
-  const maxAttempts = Math.min(candidates.length, 3);
+  // Leave room for the configured naming model, both defaults, and the selected
+  // chat model so honoring naming settings does not displace the last fallback.
+  const maxAttempts = Math.min(candidates.length, 4);
 
   // Track the last classified error to return if all candidates fail
   let lastError: NameGenerationError | null = null;
