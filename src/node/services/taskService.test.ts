@@ -31193,6 +31193,49 @@ describe("TaskService", () => {
       }
     );
 
+    test.each<QueueCutSuccessorState>([
+      "pending",
+      { kind: "admitted", turnGeneration: Symbol("successor") },
+      "streaming",
+      "canceled",
+      "prestream-failed",
+    ])(
+      "parent stream-end releases its exact cut receipt regardless of successor outcome: %j",
+      async (successor) => {
+        const t = await setupChildTask({ taskStatus: "reported" });
+        for (const stopCause of [
+          { kind: "queued-input" as const, entryId: "parent-entry" },
+          {
+            kind: "context-budget" as const,
+            decision: "warn" as const,
+            continuationEntryId: "parent-entry",
+          },
+        ]) {
+          t.receiptFake.register("parent-entry", successor);
+          t.receiptFake.register("unrelated-entry");
+          await handleTaskServiceStreamEndForTest(t.taskService, cutEvent(t.parentId, stopCause));
+          expect(t.receiptFake.receipts.has("parent-entry")).toBe(false);
+          expect(t.receiptFake.receipts.has("unrelated-entry")).toBe(true);
+        }
+        expect(t.sendMessage).not.toHaveBeenCalled();
+      }
+    );
+
+    test("an owned compaction continuation releases its source receipt", async () => {
+      const t = await setupChildTask(
+        {},
+        {
+          waitForPendingCompactionCompletionDecision: mock(() => Promise.resolve(true)),
+        }
+      );
+      t.receiptFake.register("compact-entry");
+      const event = cutEvent(t.childId, { kind: "queued-input", entryId: "compact-entry" });
+      event.metadata.agentId = "compact";
+      await handleTaskServiceStreamEndForTest(t.taskService, event);
+      expect(t.receiptFake.receipts.size).toBe(0);
+      expect(t.sendMessage).not.toHaveBeenCalled();
+    });
+
     test("a streaming successor owns completion: deferral dropped, receipt released", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1", "streaming");
@@ -31546,6 +31589,35 @@ describe("TaskService", () => {
       expect(t.sendMessage).not.toHaveBeenCalled();
       expect(t.child()?.taskRecoveryAttempts).toBeUndefined();
       expect(t.receiptFake.receipts.size).toBe(0);
+    });
+
+    test("persisted report adoption clears superseded recovery state", async () => {
+      const t = await setupChildTask();
+      t.receiptFake.register("late-source-entry", "prestream-failed");
+      await upsertSubagentReportArtifact({
+        workspaceId: t.parentId,
+        workspaceSessionDir: path.join(t.config.sessionsDir, t.parentId),
+        childTaskId: t.childId,
+        parentWorkspaceId: t.parentId,
+        ancestorWorkspaceIds: [t.parentId],
+        reportMarkdown: "Recovered completed work",
+        nowMs: Date.now(),
+      });
+      const report = await t.taskService.waitForAgentReport(t.childId, {
+        requestingWorkspaceId: t.parentId,
+        timeoutMs: 10,
+      });
+      expect(report.reportMarkdown).toBe("Recovered completed work");
+      expect(t.child()?.taskStatus).toBe("reported");
+      expect(t.receiptFake.receipts.size).toBe(0);
+      expect(t.removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
+        t.childId,
+        taskRecoveryPromptDedupePrefix(t.childId),
+        expect.any(Object)
+      );
+      t.receiptFake.notify(t.childId);
+      await t.settleEventLock();
+      expect(t.sendMessage).not.toHaveBeenCalled();
     });
 
     test("terminal settlement releases a receipt whose source event has not been handled", async () => {

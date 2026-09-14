@@ -8752,6 +8752,8 @@ export class TaskService implements AgentTaskIntegration {
           },
           { allowMissing: true }
         );
+        // Adopting an already-persisted report owns the same terminal cleanup as publication.
+        this.clearTaskRecovery(taskId);
         eventSpine.emit("task.reported", { workspaceId: taskId, taskId });
         await this.maybeStartPatchGenerationForReportedTask(taskId);
         await this.emitWorkspaceMetadata(taskId);
@@ -11114,7 +11116,7 @@ export class TaskService implements AgentTaskIntegration {
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
       taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(event.workspaceId);
-    const discardObsoleteCut = () => {
+    const discardCutReceipt = () => {
       const entryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
       if (entryId == null) return;
       this.workspaceService.disposeQueueCut(event.workspaceId, entryId);
@@ -11130,6 +11132,8 @@ export class TaskService implements AgentTaskIntegration {
         event.messageId
       )) === true
     ) {
+      // Compaction already transferred completion to its durable follow-up.
+      discardCutReceipt();
       return;
     }
 
@@ -11152,6 +11156,9 @@ export class TaskService implements AgentTaskIntegration {
 
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, workspaceId);
+    // Only child recovery consumes receipts. Parent/workspace-turn settlement uses its own
+    // attribution snapshot; retaining its receipts would grow the session map on every cut.
+    if (!entry?.workspace.parentWorkspaceId) discardCutReceipt();
     if (!entry) return;
     const taskIndex = this.buildAgentTaskIndex(cfg);
 
@@ -11436,7 +11443,7 @@ export class TaskService implements AgentTaskIntegration {
     // Stop and reactivation can pass this handler while it waits for the event lock. Its
     // original execution, not the task's current status, owns this stream-end disposition.
     if (cutSourceIsObsolete()) {
-      discardObsoleteCut();
+      discardCutReceipt();
       return;
     }
 
@@ -11573,7 +11580,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (cutSourceIsObsolete()) {
-      discardObsoleteCut();
+      discardCutReceipt();
       return;
     }
     if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
