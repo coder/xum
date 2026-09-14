@@ -6127,6 +6127,48 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let childTaskModelString: string | undefined;
       let childTaskThinkingLevel: ThinkingLevel | undefined;
 
+      // Shared workspace memory (sub-agents write into their task-tree
+      // owner's store): pin the owner on surviving descendants FIRST — their
+      // parent chain is about to lose this node — verified by reading the
+      // config back because Config swallows write failures. A topology-only
+      // edit from the persisted config, so it runs whether or not this
+      // workspace's metadata can still be built (the phantom-cleanup path
+      // below removes the config entry all the same, and a child left with a
+      // dangling parent and no pin would silently fall back to a private
+      // notebook). Failing to pin aborts the removal unless forced.
+      const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
+        this.config.loadConfigOrDefault(),
+        workspaceId
+      );
+      verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+      if (sharedMemoryOwnerId !== workspaceId) {
+        try {
+          let pinnedOwners = new Map<string, string>();
+          await this.config.editConfig((cfg) => {
+            pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
+            return cfg;
+          });
+          const persisted = this.config.loadConfigOrDefault();
+          for (const [id, owner] of pinnedOwners) {
+            const entry = findWorkspaceEntry(persisted, id);
+            if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
+              throw new Error(`memory owner pin for descendant ${id} did not persist`);
+            }
+          }
+        } catch (error) {
+          if (!force) {
+            return Err(
+              `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal, or force it`
+            );
+          }
+          log.warn("Forced removal: could not pin the shared memory owner on descendants", {
+            workspaceId,
+            sharedMemoryOwnerId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (metadataResult.success) {
         const metadata = metadataResult.data;
@@ -6193,36 +6235,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
-        // Shared workspace memory (sub-agents write into their task-tree
-        // owner's store). BEFORE any destructive step — so a failure leaves a
-        // fully intact, retryable workspace:
-        //  - pin the owner on surviving descendants (their parent chain is
-        //    about to lose this node), verified by reading the config back
-        //    because Config swallows write failures;
-        //  - fold this workspace's pre-sharing private notebook into the
-        //    owner's store. A second, delta pass runs under the removal locks
-        //    below so a note that lands in between is captured too; that late
-        //    pass only has the few notes written since this one, keeping the
-        //    fallible work at the point of no return minimal.
-        const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
-          this.config.loadConfigOrDefault(),
-          workspaceId
-        );
-        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+        // Shared workspace memory, BEFORE any destructive step — so a failure
+        // leaves a fully intact, retryable workspace: fold this workspace's
+        // pre-sharing private notebook into the owner's store (the owner pin
+        // on surviving descendants was applied above). A second, delta pass
+        // runs under the removal locks below so a note that lands in between
+        // is captured too; that late pass only has the few notes written
+        // since this one, keeping the fallible work at the point of no return
+        // minimal.
         if (sharedMemoryOwnerId !== workspaceId) {
           try {
-            let pinnedOwners = new Map<string, string>();
-            await this.config.editConfig((cfg) => {
-              pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
-              return cfg;
-            });
-            const persisted = this.config.loadConfigOrDefault();
-            for (const [id, owner] of pinnedOwners) {
-              const entry = findWorkspaceEntry(persisted, id);
-              if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
-                throw new Error(`memory owner pin for descendant ${id} did not persist`);
-              }
-            }
             // A pre-sharing build kept this child's notebook in its OWN
             // session dir (<sessionsDir>/<child>/memory); access-time adoption
             // may never have run for a child removed right after the upgrade,

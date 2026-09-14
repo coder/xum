@@ -16266,6 +16266,40 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       createRuntimeSpy.mockRestore();
     }
   });
+
+  test("pins surviving descendants even when the removed node's metadata cannot be built", async () => {
+    // The phantom-cleanup path: no metadata, yet the config entry is removed
+    // all the same — the pin is a config-only edit and must still land, or a
+    // surviving child silently falls back to a private notebook.
+    class PhantomAiService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({ success: false as const, error: "metadata unavailable" })
+      );
+    }
+    const { config, topology } = buildConfig({ persistPins: true });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const result = await workspaceService.remove("ws-mid");
+    expect(result.success).toBe(true);
+    expect(config.removeWorkspace).toHaveBeenCalledTimes(1);
+    const grand = topology.projects.get(projectPath)!.workspaces.find((ws) => ws.id === "ws-grand");
+    expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+
+    // ...and a pin that does not persist still aborts the non-forced removal
+    // on that path, before the config entry is dropped.
+    const unpersisted = buildConfig({ persistPins: false });
+    const refusing = createWorkspaceServiceForTest({
+      config: unpersisted.config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const refused = await refusing.remove("ws-mid");
+    expect(refused.success).toBe(false);
+    expect(unpersisted.config.removeWorkspace).not.toHaveBeenCalled();
+  });
 });
 
 describe("WorkspaceService remove desktop session cleanup", () => {
