@@ -1570,7 +1570,11 @@ export class WorkspaceStore {
 
     // Replay buffers are only valid for the in-flight subscription attempt that
     // populated them. Clear eagerly when deactivating/retrying so stale buffered
-    // events cannot leak into a later caught-up cycle.
+    // events cannot leak into a later caught-up cycle. Non-empty buffers are backend
+    // content this attempt saw but never applied, so the cached rows are behind it.
+    if (transient.historicalMessages.length > 0 || transient.pendingStreamEvents.length > 0) {
+      transient.cachedTranscriptStale = true;
+    }
     transient.caughtUp = false;
     transient.replayingHistory = false;
     transient.historicalMessages.length = 0;
@@ -1583,10 +1587,11 @@ export class WorkspaceStore {
   }
 
   /**
-   * Bound the stale-cache skeleton for the whole hydration cycle. Armed at the start of each
-   * subscribe attempt but never re-armed while running, so a hang before the first replay
-   * event and a run of short failing attempts both release the cached rows after one bound;
-   * only caught-up and deactivation disarm it.
+   * Bound the stale-cache skeleton for the whole hydration cycle. Armed when the skeleton
+   * first has something to hide (a stale cache, or a full replay's partial rows) and never
+   * re-armed while running, so a hang before the first replay event and a run of short
+   * failing attempts both release the cached rows after one bound counted from the moment
+   * the skeleton appeared; only caught-up and deactivation disarm it.
    */
   private armStaleSkeletonDeadline(workspaceId: string): void {
     if (this.staleSkeletonDeadlines.has(workspaceId)) {
@@ -3392,6 +3397,11 @@ export class WorkspaceStore {
       const isIdleBaseline = previous === null && snapshot?.streaming !== true;
       if (!isCompletionOfStreamTheAggregatorFinished && !isIdleBaseline) {
         transient.cachedTranscriptStale = true;
+        // The selected workspace is hydrating with rows that just became stale: start its
+        // bound now rather than at the next attempt.
+        if (this.isOnChatSubscriptionActive(workspaceId)) {
+          this.armStaleSkeletonDeadline(workspaceId);
+        }
       }
     }
 
@@ -3984,7 +3994,9 @@ export class WorkspaceStore {
             transient.isHydratingTranscript = true;
             this.states.bump(workspaceId);
           }
-          this.armStaleSkeletonDeadline(workspaceId);
+          if (transient.cachedTranscriptStale) {
+            this.armStaleSkeletonDeadline(workspaceId);
+          }
         }
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
@@ -4018,6 +4030,9 @@ export class WorkspaceStore {
         if (established) {
           established.onChatIteratorOpen = true;
           established.fullReplayInFlight = isFullReplay;
+          if (isFullReplay) {
+            this.armStaleSkeletonDeadline(workspaceId);
+          }
         }
         return { events: iterator, context: attemptContext };
       },

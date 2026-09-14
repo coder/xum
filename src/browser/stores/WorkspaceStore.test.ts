@@ -2062,6 +2062,69 @@ describe("WorkspaceStore", () => {
       expect(state().messages).toHaveLength(1);
     });
 
+    it("counts the stale skeleton bound from when the cache becomes stale, not from subscribe", async () => {
+      await useShortDeadlineStore();
+      await hydrateCachedRow();
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+
+      // Trustworthy cache, hung startup: no bound should be running yet.
+      let releaseStartup: () => void = () => undefined;
+      mockGetStartupAutoRetryModel.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseStartup = () => resolve({ success: true, data: null });
+          })
+      );
+      store.setActiveWorkspaceId(workspaceId);
+      await tick(200);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // Content arrives while the attempt hangs: the skeleton must appear and stay for a
+      // full bound instead of being suppressed by an already-expired timer.
+      pushActivity(workspaceId, { ...idleSnapshot, streaming: true, streamingGeneration: 2 });
+      await tick(0);
+      expect(state().isTranscriptStale).toBe(true);
+      await tick(60);
+      expect(state().isTranscriptStale).toBe(true);
+      expect(await waitUntil(() => !state().isTranscriptStale)).toBe(true);
+      expect(state().isHydratingTranscript).toBe(true);
+      releaseStartup();
+    });
+
+    it("marks the cache stale when a since replay is dropped after buffering rows", async () => {
+      await hydrateCachedRow();
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      await tick(0);
+      const attempt = await revisit(2);
+      expect(state().isTranscriptStale).toBe(false);
+
+      // The attempt sees a new row but dies before caught-up: the cache is now known to be
+      // behind, so the retry must hydrate behind the skeleton.
+      attempt.push(createHistoryMessageEvent("history-2", 2));
+      await tick(0);
+      let releaseStartup: () => void = () => undefined;
+      mockGetStartupAutoRetryModel.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseStartup = () => resolve({ success: true, data: null });
+          })
+      );
+      const startupCallsBeforeRetry = mockGetStartupAutoRetryModel.mock.calls.length;
+      attempt.close();
+      expect(
+        await waitUntil(
+          () => mockGetStartupAutoRetryModel.mock.calls.length > startupCallsBeforeRetry,
+          3_000
+        )
+      ).toBe(true);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().messages).toHaveLength(1);
+      expect(state().isTranscriptStale).toBe(true);
+      releaseStartup();
+    });
+
     it("releases the stale skeleton after the deadline when the replay never lands", async () => {
       await useShortDeadlineStore();
       await hydrateCachedRow();
