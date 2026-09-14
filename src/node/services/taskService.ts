@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as fsPromises from "fs/promises";
 import type { z } from "zod";
 import {
+  TASK_CREATE_WAIT_WARNING_MS,
   TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
@@ -73,6 +74,7 @@ import {
   discoverAgentDefinitions,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
+  resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
@@ -95,7 +97,12 @@ import { validateWorkspaceName } from "@/common/utils/validation/workspaceValida
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
-import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
+import {
+  DEFAULT_TASK_SETTINGS,
+  type TaskAttemptOutcome,
+  type TaskAttemptSettlement,
+  type TaskSettings,
+} from "@/common/types/tasks";
 import {
   resolveBackgroundWorkAttentionPolicy,
   type BackgroundWorkAttentionPolicy,
@@ -118,6 +125,7 @@ import type {
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentId } from "@/common/types/agentDefinition";
 import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
   normalizeAgentId,
@@ -182,6 +190,7 @@ import {
 } from "@/node/services/subagentGitPatchArtifacts";
 import {
   readSubagentReportArtifact,
+  readSubagentReportArtifactStrict,
   readSubagentReportArtifactsFile,
   upsertSubagentReportArtifact,
 } from "@/node/services/subagentReportArtifacts";
@@ -413,6 +422,27 @@ export interface TaskCreateResult {
 
 type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
 
+/** The report a settled child delivers (waitForAgentReport, readAttemptOutcome). */
+export interface AgentTaskReport {
+  reportMarkdown: string;
+  title?: string;
+  structuredOutput?: unknown;
+  planFilePath?: string;
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+/**
+ * An execution attempt this process owns: reserved, launched, reawakened or reactivated HERE.
+ * Identity (not a counter compared by value) so a settlement captured before an awaited write
+ * can be matched exactly against the attempt it belongs to. Persisted status, a stop cascade or
+ * startup reconciliation never mint one: a prior backend's attempt has no owner in this process.
+ */
+interface OwnedTaskAttempt {
+  readonly generation: number;
+  readonly source: string;
+}
+
 interface TaskLaunchPlan {
   taskId: string;
   parentWorkspaceId: string;
@@ -439,10 +469,117 @@ interface TaskLaunchPlan {
   onRefusal?: TaskCreateArgs["onRefusal"];
   attentionPolicy?: TaskCreateArgs["attentionPolicy"];
   taskDesktopOwnerWorkspaceId?: string;
+  /**
+   * Reservation cancellation (createMany abortSignal), re-checked after every await of the launch
+   * up to the physical send admission. Plans rebuilt by the scheduler or after a restart carry
+   * none and follow the existing path.
+   */
+  abortSignal?: AbortSignal;
 }
 
 interface TaskCreateManyOptions {
   onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
+  /**
+   * Cancels the cancellable admission stages of createMany (tree locks, global mutex, read-only
+   * preparation, desktop gate, checkpoint entry) promptly, and fences the owned commit/launch:
+   * a canceled plan is persisted `interrupted` with taskLaunchError "Reservation canceled" and is
+   * never launched. Config writes and the checkpoint callback already entered are owned to
+   * completion, never detached. The Result error is NOT the "Task interrupted" restart sentinel.
+   */
+  abortSignal?: AbortSignal;
+}
+
+/** Last stage a reservation entered; carried into abort/timeout diagnostics and the stall warning. */
+type TaskReservationStage =
+  | "tree-lock"
+  | "mutex"
+  | "prepare"
+  | "revalidate"
+  | "desktop-gate"
+  | "checkpoint"
+  | "config-commit"
+  | "launch";
+
+/** Prefix of every cancellation error createMany returns (never the restart sentinel). */
+export const TASK_RESERVATION_INTERRUPTED_PREFIX = "Interrupted";
+/** taskLaunchError persisted for a reservation canceled before its launch was admitted. */
+export const TASK_RESERVATION_CANCELED_MESSAGE = "Reservation canceled";
+
+export function isTaskReservationInterruptedError(message: string): boolean {
+  return message.startsWith(TASK_RESERVATION_INTERRUPTED_PREFIX);
+}
+
+/**
+ * Stage tracking for one createMany call: the last entered stage is included in cancellation
+ * errors, and a single warning names it if the reservation is still waiting after
+ * TASK_CREATE_WAIT_WARNING_MS (cleared on completion; no polling).
+ */
+class TaskReservationProgress {
+  stage: TaskReservationStage = "tree-lock";
+  private readonly startedAt = Date.now();
+  private warning: ReturnType<typeof setTimeout> | undefined;
+
+  constructor() {
+    this.warning = setTimeout(() => {
+      this.warning = undefined;
+      log.warn("[task-create] Task reservation still waiting", {
+        stage: this.stage,
+        elapsedMs: this.elapsedMs(),
+      });
+    }, TASK_CREATE_WAIT_WARNING_MS);
+    this.warning.unref?.();
+  }
+
+  enter(stage: TaskReservationStage): void {
+    this.stage = stage;
+  }
+
+  elapsedMs(): number {
+    return Date.now() - this.startedAt;
+  }
+
+  interruptedError(): string {
+    return `${TASK_RESERVATION_INTERRUPTED_PREFIX} (task reservation canceled at stage ${this.stage} after ${this.elapsedMs()} ms)`;
+  }
+
+  dispose(): void {
+    if (this.warning != null) clearTimeout(this.warning);
+    this.warning = undefined;
+  }
+}
+
+/**
+ * Read-only preparation of one createMany plan, computed BEFORE the global mutex (cancellable).
+ * `inputs` is the JSON of every config-derived value the preparation consumed; under the mutex
+ * the same snapshot is recomputed from a fresh config and must match byte for byte (drift fails
+ * closed with a retryable error). `definitionSource`/`frontmatter` pin the agent definition.
+ */
+interface PreparedTaskReservation {
+  args: TaskCreateArgs;
+  parentWorkspaceId: string;
+  prompt: string;
+  agentId: AgentId;
+  parentMeta: WorkspaceMetadata;
+  configProjectPath: string;
+  parentIsScratch: boolean;
+  taskDesktopOwnerWorkspaceId: string | undefined;
+  normalizedBestOf: TaskCreateArgs["bestOf"];
+  runtime: Runtime;
+  parentWorkspacePath: string;
+  taskRuntimeConfig: RuntimeConfig;
+  parentRuntimeConfig: RuntimeConfig;
+  sharedWorkspacePath: string | undefined;
+  parentIsSharedTask: boolean;
+  parentBranchName: string | undefined;
+  skipInitHook: boolean;
+  definitionSource: string | undefined;
+  frontmatter: string;
+  taskModelString: string;
+  canonicalModel: string;
+  effectiveThinkingLevel: ThinkingLevel;
+  effectiveReasoningMode: OpenAIReasoningMode | undefined;
+  inputs: string;
+  parentMetaJson: string;
 }
 
 interface MaterializedTaskLaunch {
@@ -664,9 +801,22 @@ interface WorkspaceStopRecord {
    * reads running to peer messaging right after the failed stop.
    */
   stopPersisted: boolean;
+  /** Attempt owned by this process at capture; only its settlement may be minted on release. */
+  ownedAttempt: OwnedTaskAttempt | undefined;
   /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
   capturedStreamMessageId: string | undefined;
 }
+function toAgentTaskReport(source: AgentTaskReport): AgentTaskReport {
+  return {
+    reportMarkdown: source.reportMarkdown,
+    title: source.title,
+    planFilePath: source.planFilePath,
+    structuredOutput: source.structuredOutput,
+    model: source.model,
+    thinkingLevel: source.thinkingLevel,
+  };
+}
+
 function truncateSingleLine(text: string, maxChars: number): string {
   const singleLine = text.split(/[\r\n\u2028\u2029]/u, 1)[0].trim();
   return singleLine.length <= maxChars ? singleLine : `${singleLine.slice(0, maxChars - 1)}…`;
@@ -1365,6 +1515,14 @@ export class TaskService implements AgentTaskIntegration {
    * trees before any drain) and not on an unrelated scheduler trigger.
    */
   private readonly queueRechecksOwedByStopLatch = new Set<string>();
+  /** Attempt ownership ledger (see OwnedTaskAttempt); replaced before any new admission. */
+  private readonly ownedAttemptByTaskId = new Map<string, OwnedTaskAttempt>();
+  /** Authoritative settlement of exactly the owned attempt it names; dropped with that attempt. */
+  private readonly attemptSettlementByTaskId = new Map<
+    string,
+    { attempt: OwnedTaskAttempt; source: string }
+  >();
+  private readonly attemptSettlementListenersByTaskId = new Map<string, Set<() => void>>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
   /**
    * Ownership of every in-progress stop, keyed by workspace (see beginWorkspaceStop). The latch
@@ -1702,6 +1860,7 @@ export class TaskService implements AgentTaskIntegration {
           if (this.queueRechecksOwedByStopLatch.delete(id)) {
             this.scheduleMaybeStartQueuedTasks();
           }
+          this.notifyAttemptSettlementListeners(id);
         } else {
           this.workspaceStopsInProgress.set(id, count - 1);
         }
@@ -1765,6 +1924,7 @@ export class TaskService implements AgentTaskIntegration {
         capturedExecutionId == null ||
         this.isExecutionMirrorSettled(workspaceId, capturedExecutionId),
       stopPersisted: false,
+      ownedAttempt: this.ownedAttemptByTaskId.get(workspaceId),
       capturedStreamMessageId:
         this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(workspaceId).activeStream
           ?.messageId,
@@ -1864,6 +2024,9 @@ export class TaskService implements AgentTaskIntegration {
     for (const release of record.releases) {
       release();
     }
+    // Owner settled + cleanup finished + marker persisted: authoritative for the attempt captured
+    // in Phase A. An unknown (legacy) attempt has none to settle — stopping it proves nothing.
+    this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
   }
 
   /**
@@ -1909,10 +2072,222 @@ export class TaskService implements AgentTaskIntegration {
     this.recheckWorkspaceStopRelease(workspaceId);
   }
 
+  /**
+   * A new attempt begins in this process (reservation commit, launch, reawakening, reactivation).
+   * Replaces the owned identity and drops any settlement of the previous attempt SYNCHRONOUSLY,
+   * before the admission that follows — current ownership always wins over a stale settlement.
+   */
+  private beginOwnedTaskAttempt(taskId: string, source: string): OwnedTaskAttempt {
+    assert(taskId.length > 0, "beginOwnedTaskAttempt: taskId must be non-empty");
+    const attempt: OwnedTaskAttempt = {
+      generation: (this.ownedAttemptByTaskId.get(taskId)?.generation ?? 0) + 1,
+      source,
+    };
+    this.ownedAttemptByTaskId.set(taskId, attempt);
+    this.attemptSettlementByTaskId.delete(taskId);
+    return attempt;
+  }
+
+  /**
+   * Authoritative settlement by the attempt's owner (stop record released, launch failed,
+   * terminal stream failure). `attempt` is the identity captured BEFORE the owner's awaited
+   * write; a settlement for an attempt that is no longer current, or for no owned attempt at
+   * all (legacy/prior-process execution), is never recorded — only announced.
+   */
+  private settleOwnedTaskAttempt(
+    taskId: string,
+    attempt: OwnedTaskAttempt | undefined,
+    source: string
+  ): void {
+    if (attempt != null && this.ownedAttemptByTaskId.get(taskId) === attempt) {
+      this.attemptSettlementByTaskId.set(taskId, { attempt, source });
+    } else {
+      log.debug("Task attempt settlement without a current owned attempt", {
+        taskId,
+        source,
+        owned: attempt?.generation,
+      });
+    }
+    this.notifyAttemptSettlementListeners(taskId);
+  }
+
+  private notifyAttemptSettlementListeners(taskId: string): void {
+    const listeners = this.attemptSettlementListenersByTaskId.get(taskId);
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      listener();
+    }
+  }
+
+  private removeAttemptSettlementListener(taskId: string, listener: () => void): void {
+    const listeners = this.attemptSettlementListenersByTaskId.get(taskId);
+    if (!listeners) return;
+    listeners.delete(listener);
+    if (listeners.size === 0) this.attemptSettlementListenersByTaskId.delete(taskId);
+  }
+
+  /**
+   * Authoritative outcome of a child's current attempt, read under the task's event lock — the
+   * serialization report publication (handleStreamEnd → publishAgentTaskReport) runs under — so
+   * report and termination evidence are one observation. Positive evidence only: a persisted
+   * status, a missing entry or a settled latch of an attempt nobody in this process owns is
+   * `indeterminate`, never "no report". `requestingWorkspaceId` names the ancestor session dir
+   * holding the persisted report after config cleanup (no scan over all parents).
+   */
+  async readAttemptOutcome(
+    taskId: string,
+    options?: { requestingWorkspaceId?: string }
+  ): Promise<TaskAttemptOutcome<AgentTaskReport>> {
+    assert(taskId.length > 0, "readAttemptOutcome: taskId must be non-empty");
+    return await this.workspaceEventLocks.withLock(taskId, () =>
+      this.inspectAttemptOutcome(taskId, options)
+    );
+  }
+
+  private async inspectAttemptOutcome(
+    taskId: string,
+    options?: { requestingWorkspaceId?: string }
+  ): Promise<TaskAttemptOutcome<AgentTaskReport>> {
+    const indeterminate = (reason: string): TaskAttemptOutcome<AgentTaskReport> => ({
+      kind: "indeterminate",
+      reason,
+    });
+    const cached = this.completedReportsByTaskId.get(taskId);
+    if (cached) {
+      return { kind: "reported", report: toAgentTaskReport(cached) };
+    }
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (entry != null && !entry.workspace.parentWorkspaceId) {
+      return indeterminate("workspace is not an agent task");
+    }
+    const reportOwnerWorkspaceId =
+      coerceNonEmptyString(options?.requestingWorkspaceId) ??
+      coerceNonEmptyString(entry?.workspace.parentWorkspaceId);
+    let reportPositivelyAbsent = false;
+    if (reportOwnerWorkspaceId != null) {
+      const read = await readSubagentReportArtifactStrict(
+        path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
+        taskId
+      );
+      if (read.kind === "found") {
+        this.completedReportsByTaskId.set(taskId, {
+          reportMarkdown: read.artifact.reportMarkdown,
+          title: read.artifact.title,
+          planFilePath: read.artifact.planFilePath,
+          structuredOutput: read.artifact.structuredOutput,
+          model: read.artifact.model,
+          thinkingLevel: read.artifact.thinkingLevel,
+          workflowOwnedAncestorWorkspaceIds: read.artifact.workflowOwnedAncestorWorkspaceIds,
+          ancestorWorkspaceIds: read.artifact.ancestorWorkspaceIds,
+        });
+        this.enforceCompletedReportCacheLimit();
+        return { kind: "reported", report: toAgentTaskReport(read.artifact) };
+      }
+      if (read.kind === "unreadable") {
+        return indeterminate(
+          `report artifact unreadable in ${reportOwnerWorkspaceId}: ${read.error}`
+        );
+      }
+      reportPositivelyAbsent = true;
+    }
+
+    // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
+    if (this.isWorkspaceStopInProgress(taskId)) {
+      return { kind: "cleanup-pending" };
+    }
+    const liveRegistration =
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId);
+    if (liveRegistration != null) {
+      return { kind: "live", executionId: liveRegistration.handleId };
+    }
+    const executionId = coerceNonEmptyString(entry?.workspace.taskExecutionId) ?? taskId;
+    // Admitted in this process: a registered stream, or a turn admitted but still preparing
+    // (no stream yet; Layer 2 may already have persisted "interrupted" ahead of its settlement).
+    if (
+      this.aiService.isStreaming(taskId) ||
+      this.workspaceService.getActiveTurnGeneration(taskId) != null
+    ) {
+      return { kind: "live", executionId };
+    }
+
+    const status = entry?.workspace.taskStatus ?? (entry != null ? "running" : undefined);
+    const owned = this.ownedAttemptByTaskId.get(taskId);
+    if (owned == null) {
+      return indeterminate(
+        entry == null
+          ? "no task record and no attempt owned by this process"
+          : `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
+      );
+    }
+    const settlement = this.attemptSettlementByTaskId.get(taskId);
+    if (settlement?.attempt === owned) {
+      if (!reportPositivelyAbsent) {
+        return indeterminate(
+          "attempt settled but no session directory names where its report would be"
+        );
+      }
+      return { kind: "terminal-no-report" };
+    }
+    if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {
+      // Reserved/queued/launching/running under this process's ownership; no stream yet.
+      return { kind: "live", executionId };
+    }
+    return indeterminate(
+      `owned attempt (${owned.source}) has status ${status ?? "missing"} without settlement evidence`
+    );
+  }
+
+  /**
+   * Bounded wait for the current attempt to settle: subscribe THEN re-read under the task's
+   * event lock (a settlement landing between the two is observed by the re-read), release the
+   * lock before awaiting, and re-read on every notification. `indeterminate` returns at once —
+   * an unknown owner never pins the caller. Timeout is a bounded outcome, abort rejects.
+   */
+  async waitForAttemptSettlement(
+    taskId: string,
+    options: { abortSignal?: AbortSignal; timeoutMs: number; requestingWorkspaceId?: string }
+  ): Promise<TaskAttemptSettlement<AgentTaskReport>> {
+    assert(taskId.length > 0, "waitForAttemptSettlement: taskId must be non-empty");
+    assert(
+      Number.isFinite(options.timeoutMs) && options.timeoutMs > 0,
+      "waitForAttemptSettlement: timeoutMs invalid"
+    );
+    const deadline = Date.now() + options.timeoutMs;
+    let notified = Promise.withResolvers<void>();
+    const listener = () => notified.resolve();
+    try {
+      let outcome = await this.workspaceEventLocks.withLock(taskId, async () => {
+        const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
+        listeners.add(listener);
+        this.attemptSettlementListenersByTaskId.set(taskId, listeners);
+        return await this.inspectAttemptOutcome(taskId, options);
+      });
+      while (outcome.kind === "live" || outcome.kind === "cleanup-pending") {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return { kind: "timeout" };
+        const raced = await raceWithAbortAndTimeout(notified.promise, {
+          signal: options.abortSignal,
+          timeoutMs: remainingMs,
+        });
+        if (raced.kind === "aborted") throw new Error("Interrupted");
+        if (raced.kind === "timeout") return { kind: "timeout" };
+        // Re-arm before re-reading so a notification during the read is never lost.
+        notified = Promise.withResolvers<void>();
+        outcome = await this.workspaceEventLocks.withLock(taskId, () =>
+          this.inspectAttemptOutcome(taskId, options)
+        );
+      }
+      return outcome;
+    } finally {
+      this.removeAttemptSettlementListener(taskId, listener);
+    }
+  }
+
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
     // Latch the stop for in-flight peer-send admission even when there is no parent to notify.
     this.bumpWorkspaceStopEpoch(taskId);
     this.clearTaskRecovery(taskId);
+    this.notifyAttemptSettlementListeners(taskId);
     if (!parentWorkspaceId) {
       return;
     }
@@ -3103,16 +3478,409 @@ export class TaskService implements AgentTaskIntegration {
     if (parentWorkspaceIds.some((workspaceId) => workspaceId == null)) {
       return Err("Task.createMany: parentWorkspaceId is required");
     }
-    return await this.withTaskTreeLifecycleLocks(
-      parentWorkspaceIds.filter((workspaceId): workspaceId is string => workspaceId != null),
-      () => this.createManyUnderTaskTreeLifecycleLocks(argsList, options)
-    );
+    const progress = new TaskReservationProgress();
+    try {
+      progress.enter("tree-lock");
+      return await this.runCancellableAcquisition(
+        (callback) =>
+          this.withTaskTreeLifecycleLocks(
+            parentWorkspaceIds.filter((workspaceId): workspaceId is string => workspaceId != null),
+            callback
+          ),
+        options.abortSignal,
+        () => this.createManyUnderTaskTreeLifecycleLocks(argsList, options, progress),
+        () => Err(progress.interruptedError())
+      );
+    } finally {
+      progress.dispose();
+    }
+  }
+
+  /**
+   * Race a lock/gate acquisition against `signal`. An abort BEFORE the callback enters resolves
+   * `onAborted()` at once, and the late-acquired callback observes the signal as its first
+   * statement and returns the same result without doing work — the lock is released immediately
+   * and nothing runs detached. An abort AFTER entry is not observed here: the operation handles it
+   * at its own cancellation points and stays owned by this caller to completion.
+   */
+  private async runCancellableAcquisition<T>(
+    acquire: (callback: () => Promise<T>) => Promise<T>,
+    signal: AbortSignal | undefined,
+    operation: () => Promise<T>,
+    onAborted: () => T
+  ): Promise<T> {
+    if (signal == null) return await acquire(operation);
+    if (signal.aborted) return onAborted();
+    let entered = false;
+    const acquisition = acquire(async () => {
+      entered = true;
+      if (signal.aborted) return onAborted();
+      return await operation();
+    });
+    return await new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        if (!entered) resolve(onAborted());
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      acquisition.then(resolve, reject).finally(() => {
+        signal.removeEventListener("abort", onAbort);
+      });
+    });
+  }
+
+  /**
+   * Every config-derived input one plan's preparation read from the config entry itself, as JSON
+   * (parent identity resolved through the metadata service is pinned separately as
+   * parentMetaJson). Recomputed from a fresh config under the mutex; a mismatch means the
+   * preparation is stale (parent moved, trust or AI defaults changed, depth changed) and the
+   * reservation must fail closed for a retry.
+   */
+  private snapshotReservationInputs(
+    cfg: ProjectsConfig,
+    args: TaskCreateArgs,
+    parentWorkspaceId: string,
+    configProjectPath: string,
+    agentId: string
+  ): string {
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    const parent = parentEntry?.workspace;
+    let desktopOwner: string | undefined | { error: string };
+    try {
+      desktopOwner = this.resolveTaskDesktopOwner(args, agentId);
+    } catch (error) {
+      desktopOwner = { error: getErrorMessage(error) };
+    }
+    return JSON.stringify({
+      parent:
+        parentEntry == null || parent == null
+          ? null
+          : {
+              projectPath: parentEntry.projectPath,
+              path: parent.path,
+              kind: parent.kind,
+              archivedAt: parent.archivedAt,
+              unarchivedAt: parent.unarchivedAt,
+              taskStatus: parent.taskStatus,
+              taskExecutionStatus: parent.taskExecutionStatus,
+              taskIsolation: parent.taskIsolation,
+              taskTrunkBranch: parent.taskTrunkBranch,
+              aiSettings: parent.aiSettings,
+              aiSettingsByAgent: parent.aiSettingsByAgent,
+              agentId: parent.agentId,
+              agentType: parent.agentType,
+            },
+      trusted: cfg.projects.get(configProjectPath)?.trusted ?? false,
+      depth: this.getTaskDepth(cfg, parentWorkspaceId),
+      maxTaskNestingDepth: (cfg.taskSettings ?? DEFAULT_TASK_SETTINGS).maxTaskNestingDepth,
+      agentAiDefaults: cfg.agentAiDefaults,
+      minThinkingLevelByModel: cfg.minThinkingLevelByModel,
+      desktopOwner,
+    });
+  }
+
+  /** Read-only preparation of one plan (no locks held); see PreparedTaskReservation. */
+  private async prepareTaskReservation(
+    args: TaskCreateArgs,
+    cfg: ProjectsConfig
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
+    const parentWorkspaceId = coerceNonEmptyString(args.parentWorkspaceId);
+    if (!parentWorkspaceId) return Err("Task.createMany: parentWorkspaceId is required");
+    if (args.kind !== "agent") return Err("Task.createMany: unsupported kind");
+
+    const prompt = coerceNonEmptyString(args.prompt);
+    if (!prompt) return Err("Task.createMany: prompt is required");
+
+    const normalizedAgentId = normalizeAgentId(args.agentId ?? args.agentType, "");
+    if (!normalizedAgentId) return Err("Task.createMany: agentId is required");
+    const parsedAgentId = AgentIdSchema.safeParse(normalizedAgentId);
+    if (!parsedAgentId.success) {
+      return Err(`Task.createMany: invalid agentId (${normalizedAgentId})`);
+    }
+    const agentId = parsedAgentId.data;
+    let taskDesktopOwnerWorkspaceId: string | undefined;
+    try {
+      taskDesktopOwnerWorkspaceId = this.resolveTaskDesktopOwner(args, agentId);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    let normalizedBestOf: TaskCreateArgs["bestOf"];
+    const bestOf = args.bestOf;
+    if (bestOf) {
+      const groupId = coerceNonEmptyString(bestOf.groupId);
+      if (!groupId)
+        return Err("Task.createMany: bestOf.groupId is required when bestOf is provided");
+      if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
+        return Err("Task.createMany: bestOf.index must be a non-negative integer");
+      }
+      if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
+        return Err("Task.createMany: bestOf.total must be an integer >= 2");
+      }
+      if (bestOf.index >= bestOf.total) {
+        return Err("Task.createMany: bestOf.index must be less than bestOf.total");
+      }
+      normalizedBestOf = {
+        groupId,
+        index: bestOf.index,
+        total: bestOf.total,
+      };
+    }
+
+    const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    if (!parentMetaResult.success) {
+      return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
+    }
+    const parentMeta = parentMetaResult.data;
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    if (
+      parentEntry != null &&
+      isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
+    ) {
+      return Err("Task.createMany: parent workspace is archived");
+    }
+    const parentIsScratch = parentEntry?.workspace.kind === "scratch";
+    const configProjectPath = parentIsScratch
+      ? SCRATCH_PROJECT_CONFIG_KEY
+      : stripTrailingSlashes(parentMeta.projectPath);
+    const taskProjectConfig = cfg.projects.get(configProjectPath);
+    if (!taskProjectConfig?.trusted) {
+      return Err(
+        "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+      );
+    }
+
+    if (
+      parentEntry?.workspace.taskStatus === "interrupted" &&
+      !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+    ) {
+      return Err("Task.createMany: cannot spawn new tasks after task_stop");
+    }
+
+    if (
+      parentEntry?.workspace.taskStatus === "reported" &&
+      !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+    ) {
+      return Err("Task.createMany: cannot spawn new tasks after agent_report");
+    }
+
+    const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
+    if (requestedDepth > taskSettings.maxTaskNestingDepth) {
+      return Err(
+        `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
+      );
+    }
+
+    const parentRuntimeConfig = parentMeta.runtimeConfig;
+    const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
+    // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
+    // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
+    const runtime = createRuntimeForWorkspace({
+      runtimeConfig: taskRuntimeConfig,
+      projectPath: parentMeta.projectPath,
+      name: parentMeta.name,
+      namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
+    });
+    // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
+    // itself an isolation: "none" task, its name is synthetic and the derived path does not
+    // exist — its real checkout is the persisted (shared) path.
+    const isInPlace = parentMeta.projectPath === parentMeta.name;
+    const parentWorkspacePath = isInPlace
+      ? parentMeta.projectPath
+      : (coerceNonEmptyString(parentEntry?.workspace.path) ??
+        runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
+
+    // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
+    // share the parent checkout; everything else falls back to the normal fork path.
+    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
+    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    const useSharedWorkspace =
+      parentIsScratch ||
+      (args.isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject);
+    const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
+    // Branch actually checked out in the parent's checkout (see create() for rationale).
+    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
+    const parentBranchName = parentIsSharedTask
+      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
+        coerceNonEmptyString(parentMeta.name))
+      : coerceNonEmptyString(parentMeta.name);
+    if (args.isolation === "none" && !useSharedWorkspace) {
+      log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
+        parentWorkspaceId,
+        runtimeMode: taskRuntimeMode,
+        parentIsMultiProject,
+      });
+    }
+
+    const getRunnableHint = async (): Promise<string> => {
+      try {
+        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
+        const runnableIds = (
+          await Promise.all(
+            allAgents.map(async (agent) => {
+              try {
+                const frontmatter = await resolveAgentFrontmatter(
+                  runtime,
+                  parentWorkspacePath,
+                  agent.id,
+                  { skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope) }
+                );
+                if (
+                  !isAgentRunnableAsChild(frontmatter, {
+                    workflowOwned: args.workflowTask != null,
+                  })
+                ) {
+                  return null;
+                }
+                return isAgentEffectivelyDisabled({
+                  cfg,
+                  agentId: agent.id,
+                  resolvedFrontmatter: frontmatter,
+                })
+                  ? null
+                  : agent.id;
+              } catch {
+                return null;
+              }
+            })
+          )
+        ).filter((id): id is string => typeof id === "string");
+        return runnableIds.length > 0
+          ? `Runnable agentIds: ${runnableIds.join(", ")}`
+          : "No runnable agents available";
+      } catch {
+        return "Could not discover available agents";
+      }
+    };
+
+    let skipInitHook = false;
+    let definitionSource: string | undefined;
+    let frontmatterJson: string;
+    try {
+      const definition = await resolveAgentDefinition(runtime, parentWorkspacePath, agentId);
+      const frontmatter = definition.frontmatter;
+      if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
+        const hint = await getRunnableHint();
+        return Err(`Task.createMany: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
+      }
+      if (isAgentEffectivelyDisabled({ cfg, agentId, resolvedFrontmatter: frontmatter })) {
+        const hint = await getRunnableHint();
+        return Err(`Task.createMany: agentId is disabled (${agentId}). ${hint}`);
+      }
+      skipInitHook = frontmatter.subagent?.skip_init_hook === true;
+      definitionSource = definition.source;
+      frontmatterJson = JSON.stringify(frontmatter);
+    } catch {
+      const hint = await getRunnableHint();
+      return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
+    }
+
+    let taskModelString: string;
+    let canonicalModel: string;
+    let effectiveThinkingLevel: ThinkingLevel;
+    let effectiveReasoningMode: OpenAIReasoningMode | undefined;
+    try {
+      ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+        await this.resolveTaskAISettings({
+          cfg,
+          parentWorkspaceId,
+          parentMeta,
+          agentId,
+          modelString: args.modelString,
+          thinkingLevel: args.thinkingLevel,
+          parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+          definitionContext: {
+            runtime,
+            workspacePath: parentWorkspacePath,
+            workspaceId: parentWorkspaceId,
+          },
+        }));
+    } catch (error) {
+      if (error instanceof InvalidExplicitAiSettingError) {
+        return Err(`Task.createMany: ${error.message}`);
+      }
+      throw error;
+    }
+
+    return Ok({
+      args,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      parentMeta,
+      configProjectPath,
+      parentIsScratch,
+      taskDesktopOwnerWorkspaceId,
+      normalizedBestOf,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeConfig,
+      parentRuntimeConfig,
+      sharedWorkspacePath,
+      parentIsSharedTask,
+      parentBranchName,
+      skipInitHook,
+      definitionSource,
+      frontmatter: frontmatterJson,
+      taskModelString,
+      canonicalModel,
+      effectiveThinkingLevel,
+      effectiveReasoningMode,
+      inputs: this.snapshotReservationInputs(
+        cfg,
+        args,
+        parentWorkspaceId,
+        configProjectPath,
+        agentId
+      ),
+      parentMetaJson: JSON.stringify(parentMeta),
+    });
   }
 
   private async createManyUnderTaskTreeLifecycleLocks(
     argsList: TaskCreateArgs[],
-    options: TaskCreateManyOptions
+    options: TaskCreateManyOptions,
+    progress: TaskReservationProgress
   ): Promise<Result<TaskCreateResult[], string>> {
+    const signal = options.abortSignal;
+    const interrupted = (): Result<TaskCreateResult[], string> => Err(progress.interruptedError());
+
+    // Stage: read-only preparation, before the global mutex. Cancellable between plans; a result
+    // computed after the abort is discarded.
+    progress.enter("prepare");
+    const prepared: PreparedTaskReservation[] = [];
+    for (const args of argsList) {
+      const preparation = await this.prepareTaskReservation(
+        args,
+        this.config.loadConfigOrDefault()
+      );
+      if (signal?.aborted) return interrupted();
+      if (!preparation.success) return preparation;
+      prepared.push(preparation.data);
+    }
+
+    // Stage: global mutex (cancellable acquisition; a late lock is released untouched).
+    progress.enter("mutex");
+    const acquisition = this.mutex.acquire();
+    const lockRace = await raceWithAbortAndTimeout(acquisition, { signal });
+    if (lockRace.kind !== "ok") {
+      void acquisition.then((lock) => lock[Symbol.asyncDispose]());
+      return interrupted();
+    }
+    await using _lock = lockRace.value;
+    if (signal?.aborted) return interrupted();
+
+    // Stage: revalidate every prepared input against a fresh config, then decide capacity.
+    progress.enter("revalidate");
+    const cfg = this.config.loadConfigOrDefault();
+    const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
+    let reservedActiveCount =
+      this.countActiveAgentTasks(cfg) +
+      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
+    if (signal?.aborted) return interrupted();
+
     // sharedWorkspacePath is set for honored isolation: "none" plans; the entry is persisted
     // pointing at the parent's checkout and startReservedAgentTask reuses it without fork/init.
     const plans: Array<
@@ -3120,240 +3888,56 @@ export class TaskService implements AgentTaskIntegration {
     > = [];
     const results: TaskCreateResult[] = [];
 
-    await using _lock = await this.mutex.acquire();
-
-    const cfg = this.config.loadConfigOrDefault();
-    const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
-    let reservedActiveCount =
-      this.countActiveAgentTasks(cfg) +
-      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
-
-    for (const args of argsList) {
-      const parentWorkspaceId = coerceNonEmptyString(args.parentWorkspaceId);
-      if (!parentWorkspaceId) return Err("Task.createMany: parentWorkspaceId is required");
-      if (args.kind !== "agent") return Err("Task.createMany: unsupported kind");
-
-      const prompt = coerceNonEmptyString(args.prompt);
-      if (!prompt) return Err("Task.createMany: prompt is required");
-
-      const normalizedAgentId = normalizeAgentId(args.agentId ?? args.agentType, "");
-      if (!normalizedAgentId) return Err("Task.createMany: agentId is required");
-      const parsedAgentId = AgentIdSchema.safeParse(normalizedAgentId);
-      if (!parsedAgentId.success) {
-        return Err(`Task.createMany: invalid agentId (${normalizedAgentId})`);
+    for (const plan of prepared) {
+      const inputsNow = this.snapshotReservationInputs(
+        cfg,
+        plan.args,
+        plan.parentWorkspaceId,
+        plan.configProjectPath,
+        plan.agentId
+      );
+      if (inputsNow !== plan.inputs) {
+        return Err(
+          "Task.createMany: reservation inputs changed during preparation (parent, trust or AI defaults); retry"
+        );
       }
-      const agentId = parsedAgentId.data;
-      const agentType = agentId;
-      let taskDesktopOwnerWorkspaceId: string | undefined;
+      // Parent identity as the metadata service resolves it (runtime config, name, projects).
+      const parentMetaNow = await this.aiService.getWorkspaceMetadata(plan.parentWorkspaceId);
+      if (!parentMetaNow.success || JSON.stringify(parentMetaNow.data) !== plan.parentMetaJson) {
+        return Err(
+          "Task.createMany: parent workspace changed during preparation (runtime, name or projects); retry"
+        );
+      }
+      // The definition resolved before the mutex must still be the one that would run.
+      let definitionNow: { source?: string; frontmatter: unknown };
       try {
-        taskDesktopOwnerWorkspaceId = this.resolveTaskDesktopOwner(args, agentId);
+        definitionNow = await resolveAgentDefinition(
+          plan.runtime,
+          plan.parentWorkspacePath,
+          plan.agentId
+        );
       } catch (error) {
-        return Err(getErrorMessage(error));
-      }
-
-      let normalizedBestOf: TaskCreateArgs["bestOf"];
-      const bestOf = args.bestOf;
-      if (bestOf) {
-        const groupId = coerceNonEmptyString(bestOf.groupId);
-        if (!groupId)
-          return Err("Task.createMany: bestOf.groupId is required when bestOf is provided");
-        if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
-          return Err("Task.createMany: bestOf.index must be a non-negative integer");
-        }
-        if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
-          return Err("Task.createMany: bestOf.total must be an integer >= 2");
-        }
-        if (bestOf.index >= bestOf.total) {
-          return Err("Task.createMany: bestOf.index must be less than bestOf.total");
-        }
-        normalizedBestOf = {
-          groupId,
-          index: bestOf.index,
-          total: bestOf.total,
-        };
-      }
-
-      const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
-      if (!parentMetaResult.success) {
-        return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
-      }
-      const parentMeta = parentMetaResult.data;
-      const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
-      if (
-        parentEntry != null &&
-        isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
-      ) {
-        return Err("Task.createMany: parent workspace is archived");
-      }
-      const parentIsScratch = parentEntry?.workspace.kind === "scratch";
-      const configProjectPath = parentIsScratch
-        ? SCRATCH_PROJECT_CONFIG_KEY
-        : stripTrailingSlashes(parentMeta.projectPath);
-      const taskProjectConfig = cfg.projects.get(configProjectPath);
-      if (!taskProjectConfig?.trusted) {
         return Err(
-          "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+          `Task.createMany: agent definition changed during preparation (${plan.agentId}): ${getErrorMessage(error)}; retry`
         );
       }
-
       if (
-        parentEntry?.workspace.taskStatus === "interrupted" &&
-        !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
+        definitionNow.source !== plan.definitionSource ||
+        JSON.stringify(definitionNow.frontmatter) !== plan.frontmatter
       ) {
-        return Err("Task.createMany: cannot spawn new tasks after task_stop");
-      }
-
-      if (
-        parentEntry?.workspace.taskStatus === "reported" &&
-        !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
-      ) {
-        return Err("Task.createMany: cannot spawn new tasks after agent_report");
-      }
-
-      const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
-      if (requestedDepth > taskSettings.maxTaskNestingDepth) {
         return Err(
-          `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
+          `Task.createMany: agent definition changed during preparation (${plan.agentId}); retry`
         );
       }
+      if (signal?.aborted) return interrupted();
 
       const taskId = this.config.generateStableId();
-      const workspaceName = buildAgentWorkspaceName(agentId, taskId);
+      const workspaceName = buildAgentWorkspaceName(plan.agentId, taskId);
       const nameValidation = validateWorkspaceName(workspaceName);
       if (!nameValidation.valid) {
         return Err(
           `Task.createMany: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
         );
-      }
-
-      const parentRuntimeConfig = parentMeta.runtimeConfig;
-      const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
-      // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
-      // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
-      const runtime = createRuntimeForWorkspace({
-        runtimeConfig: taskRuntimeConfig,
-        projectPath: parentMeta.projectPath,
-        name: parentMeta.name,
-        namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
-      });
-      // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
-      // itself an isolation: "none" task, its name is synthetic and the derived path does not
-      // exist — its real checkout is the persisted (shared) path.
-      const isInPlace = parentMeta.projectPath === parentMeta.name;
-      const parentWorkspacePath = isInPlace
-        ? parentMeta.projectPath
-        : (coerceNonEmptyString(parentEntry?.workspace.path) ??
-          runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
-
-      // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
-      // share the parent checkout; everything else falls back to the normal fork path.
-      const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
-      const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
-      const useSharedWorkspace =
-        parentIsScratch ||
-        (args.isolation === "none" &&
-          runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-          !parentIsMultiProject);
-      const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
-      // Branch actually checked out in the parent's checkout (see create() for rationale).
-      const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
-      const parentBranchName = parentIsSharedTask
-        ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
-          coerceNonEmptyString(parentMeta.name))
-        : coerceNonEmptyString(parentMeta.name);
-      if (args.isolation === "none" && !useSharedWorkspace) {
-        log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
-          taskId,
-          runtimeMode: taskRuntimeMode,
-          parentIsMultiProject,
-        });
-      }
-
-      const getRunnableHint = async (): Promise<string> => {
-        try {
-          const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
-          const runnableIds = (
-            await Promise.all(
-              allAgents.map(async (agent) => {
-                try {
-                  const frontmatter = await resolveAgentFrontmatter(
-                    runtime,
-                    parentWorkspacePath,
-                    agent.id,
-                    { skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope) }
-                  );
-                  if (
-                    !isAgentRunnableAsChild(frontmatter, {
-                      workflowOwned: args.workflowTask != null,
-                    })
-                  ) {
-                    return null;
-                  }
-                  return isAgentEffectivelyDisabled({
-                    cfg,
-                    agentId: agent.id,
-                    resolvedFrontmatter: frontmatter,
-                  })
-                    ? null
-                    : agent.id;
-                } catch {
-                  return null;
-                }
-              })
-            )
-          ).filter((id): id is string => typeof id === "string");
-          return runnableIds.length > 0
-            ? `Runnable agentIds: ${runnableIds.join(", ")}`
-            : "No runnable agents available";
-        } catch {
-          return "Could not discover available agents";
-        }
-      };
-
-      let skipInitHook = false;
-      try {
-        const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId);
-        if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
-          const hint = await getRunnableHint();
-          return Err(
-            `Task.createMany: agentId is not runnable as a sub-agent (${agentId}). ${hint}`
-          );
-        }
-        if (isAgentEffectivelyDisabled({ cfg, agentId, resolvedFrontmatter: frontmatter })) {
-          const hint = await getRunnableHint();
-          return Err(`Task.createMany: agentId is disabled (${agentId}). ${hint}`);
-        }
-        skipInitHook = frontmatter.subagent?.skip_init_hook === true;
-      } catch {
-        const hint = await getRunnableHint();
-        return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
-      }
-
-      let taskModelString: string;
-      let canonicalModel: string;
-      let effectiveThinkingLevel: ThinkingLevel;
-      let effectiveReasoningMode: OpenAIReasoningMode | undefined;
-      try {
-        ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-          await this.resolveTaskAISettings({
-            cfg,
-            parentWorkspaceId,
-            parentMeta,
-            agentId,
-            modelString: args.modelString,
-            thinkingLevel: args.thinkingLevel,
-            parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-            definitionContext: {
-              runtime,
-              workspacePath: parentWorkspacePath,
-              workspaceId: parentWorkspaceId,
-            },
-          }));
-      } catch (error) {
-        if (error instanceof InvalidExplicitAiSettingError) {
-          return Err(`Task.createMany: ${error.message}`);
-        }
-        throw error;
       }
 
       const status: "queued" | "starting" =
@@ -3363,135 +3947,193 @@ export class TaskService implements AgentTaskIntegration {
       const createdAt = getIsoNow();
       plans.push({
         taskId,
-        parentWorkspaceId,
-        parentMeta,
-        agentId,
-        agentType,
-        start: { kind: "sendMessage", prompt },
-        title: args.title,
+        parentWorkspaceId: plan.parentWorkspaceId,
+        parentMeta: plan.parentMeta,
+        agentId: plan.agentId,
+        agentType: plan.agentId,
+        start: { kind: "sendMessage", prompt: plan.prompt },
+        title: plan.args.title,
         workspaceName,
         createdAt,
-        taskRuntimeConfig,
-        parentRuntimeConfig,
-        configProjectPath,
-        workspaceKind: parentIsScratch ? "scratch" : undefined,
-        taskModelString,
-        canonicalModel,
-        effectiveThinkingLevel,
-        effectiveReasoningMode,
-        skipInitHook,
-        workflowTask: args.workflowTask,
-        bestOf: normalizedBestOf,
-        experiments: args.experiments,
-        onRefusal: args.onRefusal,
-        attentionPolicy: args.attentionPolicy,
-        taskDesktopOwnerWorkspaceId,
+        taskRuntimeConfig: plan.taskRuntimeConfig,
+        parentRuntimeConfig: plan.parentRuntimeConfig,
+        configProjectPath: plan.configProjectPath,
+        workspaceKind: plan.parentIsScratch ? "scratch" : undefined,
+        taskModelString: plan.taskModelString,
+        canonicalModel: plan.canonicalModel,
+        effectiveThinkingLevel: plan.effectiveThinkingLevel,
+        effectiveReasoningMode: plan.effectiveReasoningMode,
+        skipInitHook: plan.skipInitHook,
+        workflowTask: plan.args.workflowTask,
+        bestOf: plan.normalizedBestOf,
+        experiments: plan.args.experiments,
+        onRefusal: plan.args.onRefusal,
+        attentionPolicy: plan.args.attentionPolicy,
+        taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
         status,
-        ...(sharedWorkspacePath != null ? { sharedWorkspacePath } : {}),
+        ...(signal != null ? { abortSignal: signal } : {}),
+        ...(plan.sharedWorkspacePath != null
+          ? { sharedWorkspacePath: plan.sharedWorkspacePath }
+          : {}),
         // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
         // by orchestrateFork's create-fallback when the fork cannot detect a source branch
         // (a shared parent's synthetic name never names a real branch). Gated to shared parents
         // to keep the existing branch-discovery fallback otherwise.
-        ...(parentIsSharedTask && parentBranchName != null
-          ? { preferredTrunkBranch: parentBranchName }
+        ...(plan.parentIsSharedTask && plan.parentBranchName != null
+          ? { preferredTrunkBranch: plan.parentBranchName }
           : {}),
       });
       results.push({
         taskId,
         kind: "agent",
         status,
-        modelString: taskModelString,
-        thinkingLevel: effectiveThinkingLevel,
-        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
+        modelString: plan.taskModelString,
+        thinkingLevel: plan.effectiveThinkingLevel,
+        desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
       });
     }
 
-    try {
-      await this.desktopInputCoordinator.withReservations(
-        plans.flatMap((plan) =>
-          plan.taskDesktopOwnerWorkspaceId == null
-            ? []
-            : [
-                {
-                  ownerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
-                  borrowerWorkspaceId: plan.taskId,
-                },
-              ]
-        ),
-        async () => {
-          for (const [index, result] of results.entries()) {
-            // Workflow callers durably checkpoint returned task IDs before task records are persisted.
-            // If config persistence fails afterward, replay sees a started step whose task is not found
-            // and restarts it instead of duplicating an already-launched child after a crash.
-            await options.onTaskReserved?.(index, result);
-          }
+    // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
+    progress.enter("desktop-gate");
+    let canceledInsideCommit = false;
+    const commit = async (): Promise<Result<TaskCreateResult[], string> | null> => {
+      // Checkpoint entry is the LAST cancellation point: an abort observed here leaves nothing
+      // durable. Once a callback is entered it is owned to completion (the runner checks the
+      // signal itself before its store write).
+      progress.enter("checkpoint");
+      if (signal?.aborted) return interrupted();
+      for (const [index, result] of results.entries()) {
+        // Workflow callers durably checkpoint returned task IDs before task records are persisted.
+        // If config persistence fails afterward, replay sees a started step whose task is not found
+        // and restarts it instead of duplicating an already-launched child after a crash.
+        await options.onTaskReserved?.(index, result);
+      }
 
-          await this.config.editConfig((config) => {
-            for (const plan of plans) {
-              const runtime = createRuntimeForWorkspace({
-                runtimeConfig: plan.taskRuntimeConfig,
-                projectPath: plan.parentMeta.projectPath,
-                name: plan.parentMeta.name,
-              });
-              const workspacePath =
-                plan.sharedWorkspacePath ??
-                runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
-              const trunkBranch =
-                coerceNonEmptyString(plan.preferredTrunkBranch) ??
-                coerceNonEmptyString(plan.parentMeta.name);
-              if (!trunkBranch) {
-                throw new Error("Task.createMany: parent workspace name missing");
-              }
-              let projectConfig = config.projects.get(plan.configProjectPath);
-              if (!projectConfig) {
-                projectConfig = { workspaces: [] };
-                config.projects.set(plan.configProjectPath, projectConfig);
-              }
-              projectConfig.workspaces.push({
-                kind: plan.workspaceKind,
-                path: workspacePath,
-                id: plan.taskId,
-                name: plan.workspaceName,
-                title: plan.title,
-                createdAt: plan.createdAt,
-                runtimeConfig: plan.taskRuntimeConfig,
-                aiSettings:
-                  plan.effectiveThinkingLevel !== undefined
-                    ? {
-                        model: plan.canonicalModel,
-                        thinkingLevel: plan.effectiveThinkingLevel,
-                        ...(plan.effectiveReasoningMode != null
-                          ? { reasoningMode: plan.effectiveReasoningMode }
-                          : {}),
-                      }
-                    : undefined,
-                parentWorkspaceId: plan.parentWorkspaceId,
-                agentId: plan.agentId,
-                agentType: plan.agentType,
-                workflowTask: plan.workflowTask,
-                bestOf: plan.bestOf,
-                taskStatus: plan.status,
-                taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
-                taskTrunkBranch: trunkBranch,
-                taskModelString: plan.taskModelString,
-                taskThinkingLevel: plan.effectiveThinkingLevel,
-                taskOnRefusal: plan.onRefusal,
-                taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
-                taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
-                taskAttentionPolicy: plan.attentionPolicy,
-                taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
-                projects: plan.parentMeta.projects,
-              });
-              this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
-            }
-            return config;
+      progress.enter("config-commit");
+      await this.config.editConfig((config) => {
+        // Fence inside the mutator: an abort that landed while waiting for the config lock (or
+        // during the checkpoint) persists the plans interrupted instead of live reservations.
+        canceledInsideCommit = signal?.aborted === true;
+        for (const plan of plans) {
+          const runtime = createRuntimeForWorkspace({
+            runtimeConfig: plan.taskRuntimeConfig,
+            projectPath: plan.parentMeta.projectPath,
+            name: plan.parentMeta.name,
           });
+          const workspacePath =
+            plan.sharedWorkspacePath ??
+            runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
+          const trunkBranch =
+            coerceNonEmptyString(plan.preferredTrunkBranch) ??
+            coerceNonEmptyString(plan.parentMeta.name);
+          if (!trunkBranch) {
+            throw new Error("Task.createMany: parent workspace name missing");
+          }
+          let projectConfig = config.projects.get(plan.configProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(plan.configProjectPath, projectConfig);
+          }
+          projectConfig.workspaces.push({
+            kind: plan.workspaceKind,
+            path: workspacePath,
+            id: plan.taskId,
+            name: plan.workspaceName,
+            title: plan.title,
+            createdAt: plan.createdAt,
+            runtimeConfig: plan.taskRuntimeConfig,
+            aiSettings:
+              plan.effectiveThinkingLevel !== undefined
+                ? {
+                    model: plan.canonicalModel,
+                    thinkingLevel: plan.effectiveThinkingLevel,
+                    ...(plan.effectiveReasoningMode != null
+                      ? { reasoningMode: plan.effectiveReasoningMode }
+                      : {}),
+                  }
+                : undefined,
+            parentWorkspaceId: plan.parentWorkspaceId,
+            agentId: plan.agentId,
+            agentType: plan.agentType,
+            workflowTask: plan.workflowTask,
+            bestOf: plan.bestOf,
+            taskStatus: canceledInsideCommit ? "interrupted" : plan.status,
+            taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
+            taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+            taskTrunkBranch: trunkBranch,
+            taskModelString: plan.taskModelString,
+            taskThinkingLevel: plan.effectiveThinkingLevel,
+            taskOnRefusal: plan.onRefusal,
+            taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
+            taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
+            taskAttentionPolicy: plan.attentionPolicy,
+            taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+            projects: plan.parentMeta.projects,
+          });
+          this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
         }
+        return config;
+      });
+      // Records exist: this process owns these attempts from here on.
+      for (const plan of plans) {
+        this.beginOwnedTaskAttempt(plan.taskId, "reservation");
+      }
+      return null;
+    };
+
+    let commitOutcome: Result<TaskCreateResult[], string> | null;
+    try {
+      commitOutcome = await this.runCancellableAcquisition(
+        (callback) =>
+          this.desktopInputCoordinator.withReservations(
+            plans.flatMap((plan) =>
+              plan.taskDesktopOwnerWorkspaceId == null
+                ? []
+                : [
+                    {
+                      ownerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+                      borrowerWorkspaceId: plan.taskId,
+                    },
+                  ]
+            ),
+            callback
+          ),
+        signal,
+        commit,
+        interrupted
       );
     } catch (error) {
       return Err(getErrorMessage(error));
     }
+    if (commitOutcome != null) return commitOutcome;
 
+    // Post-commit fence, immediately before scheduling: an abort that landed after the mutator
+    // ran reconciles the live reservations to interrupted with an OWNED write (never detached).
+    if (canceledInsideCommit || signal?.aborted) {
+      for (const plan of plans) {
+        const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
+        let transitioned = canceledInsideCommit;
+        if (!canceledInsideCommit) {
+          await this.editWorkspaceEntry(
+            plan.taskId,
+            (ws) => {
+              if (ws.taskStatus !== plan.status) return;
+              ws.taskStatus = "interrupted";
+              ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
+              transitioned = true;
+            },
+            { allowMissing: true }
+          );
+        }
+        if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+        this.settleOwnedTaskAttempt(plan.taskId, ownedAttempt, "reservation-canceled");
+        this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
+        await this.emitWorkspaceMetadata(plan.taskId);
+      }
+      return interrupted();
+    }
+
+    progress.enter("launch");
     for (const result of results) {
       await this.emitWorkspaceMetadata(result.taskId);
     }
@@ -3505,6 +4147,28 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return Ok(results);
+  }
+
+  /**
+   * A reservation canceled before its send was admitted: reclaim whatever was materialized and
+   * persist the owned settlement (`interrupted`, "Reservation canceled") instead of launching.
+   */
+  private async cancelReservedLaunch(
+    plan: TaskLaunchPlan,
+    initLogger?: InitLogger,
+    materialized?: { runtime: Runtime; preservePhysicalWorkspace: boolean }
+  ): Promise<void> {
+    initLogger?.logComplete(-1);
+    if (materialized != null) {
+      await this.cleanupMaterializedTaskWorkspace(
+        materialized.runtime,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        plan.taskId,
+        { preservePhysicalWorkspace: materialized.preservePhysicalWorkspace }
+      );
+    }
+    await this.markTaskLaunchFailed(plan.taskId, TASK_RESERVATION_CANCELED_MESSAGE);
   }
 
   private async cleanupMaterializedTaskWorkspace(
@@ -3694,6 +4358,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private async markTaskLaunchFailed(taskId: string, message: string): Promise<void> {
     assert(taskId.length > 0, "markTaskLaunchFailed requires taskId");
+    // The launch owner gives up: settle exactly the attempt it owned when it decided.
+    const ownedAttempt = this.ownedAttemptByTaskId.get(taskId);
     let transitionedToInterrupted = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
@@ -3709,6 +4375,7 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
+    this.settleOwnedTaskAttempt(taskId, ownedAttempt, "launch-failed");
     await this.emitWorkspaceMetadata(taskId);
     this.rejectWaiters(taskId, new Error(message));
     this.scheduleMaybeStartQueuedTasks();
@@ -3754,8 +4421,22 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // A queued record this process did not reserve (restart-rebuilt, legacy) becomes owned by
+    // the launch itself; an owned reservation keeps its identity through the launch.
+    if (!this.ownedAttemptByTaskId.has(plan.taskId)) {
+      this.beginOwnedTaskAttempt(plan.taskId, "launch");
+    }
+    if (plan.abortSignal?.aborted) {
+      await this.cancelReservedLaunch(plan);
+      return;
+    }
+
     // Revalidate persisted bindings on restart before materializing a checkout or starting init.
     if (!(await this.admitTaskDesktopRecovery(plan.taskId))) return;
+    if (plan.abortSignal?.aborted) {
+      await this.cancelReservedLaunch(plan);
+      return;
+    }
 
     // isolation: "none" tasks were queued pointing at the parent's checkout. When that checkout
     // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
@@ -3795,6 +4476,15 @@ export class TaskService implements AgentTaskIntegration {
     // any other materialized path means the fork fallback created a real (deletable) workspace.
     const sharesParentCheckout =
       taskWasShared && materialized.workspacePath === persistedSharedPath;
+    const cancelMaterializedLaunch = () =>
+      this.cancelReservedLaunch(plan, initLogger, {
+        runtime: materialized.runtimeForTaskWorkspace,
+        preservePhysicalWorkspace: sharesParentCheckout,
+      });
+    if (plan.abortSignal?.aborted) {
+      await cancelMaterializedLaunch();
+      return;
+    }
 
     const entryAfterMaterialize = findWorkspaceEntry(
       this.config.loadConfigOrDefault(),
@@ -3865,6 +4555,10 @@ export class TaskService implements AgentTaskIntegration {
       { allowMissing: true }
     );
     await this.emitWorkspaceMetadata(plan.taskId);
+    if (plan.abortSignal?.aborted) {
+      await cancelMaterializedLaunch();
+      return;
+    }
 
     const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
     if (!entryBeforeSend) {
@@ -3957,6 +4651,12 @@ export class TaskService implements AgentTaskIntegration {
       reasoningMode: plan.effectiveReasoningMode,
       experiments: plan.experiments,
     };
+    // Linearization point: cancellation observed here guarantees "never launched"; past the
+    // admission below only a Stop (Layer 2) ends the execution.
+    if (plan.abortSignal?.aborted) {
+      await cancelMaterializedLaunch();
+      return;
+    }
     const sendResult =
       plan.start.kind === "sendMessage"
         ? await this.workspaceService.sendMessage(plan.taskId, plan.start.prompt, startOptions, {
@@ -4909,6 +5609,7 @@ export class TaskService implements AgentTaskIntegration {
             }
           }
           const preservedQueuedPrompt = coerceNonEmptyString(refreshedEntry.workspace.taskPrompt);
+          this.beginOwnedTaskAttempt(taskId, "reactivation");
           const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
             ownerWorkspaceId: ancestorWorkspaceId,
             prompt: preservedQueuedPrompt
@@ -8861,14 +9562,7 @@ export class TaskService implements AgentTaskIntegration {
       backgroundOnMessageQueued?: boolean;
       onExecutionStarted?: () => void | Promise<void>;
     }
-  ): Promise<{
-    reportMarkdown: string;
-    title?: string;
-    structuredOutput?: unknown;
-    planFilePath?: string;
-    model?: string;
-    thinkingLevel?: ThinkingLevel;
-  }> {
+  ): Promise<AgentTaskReport> {
     assert(taskId.length > 0, "waitForAgentReport: taskId must be non-empty");
 
     // Report monotonicity invariant: check the in-memory cache before any status-based
@@ -10985,6 +11679,9 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
 
+    // Reawakening is a new attempt of this process: invalidate the previous attempt's
+    // settlement before the admission that follows (current ownership wins).
+    this.beginOwnedTaskAttempt(workspaceId, "reawaken");
     let transitionedToRunning = false;
     await this.editActiveWorkspaceEntry(
       workspaceId,
@@ -11914,6 +12611,7 @@ export class TaskService implements AgentTaskIntegration {
     if (workspace?.parentWorkspaceId == null || workspace.taskDesktopOwnerWorkspaceId == null) {
       return;
     }
+    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
     let transitionedToInterrupted = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
@@ -11941,6 +12639,8 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
+    // Verified idle inside the edit (no stream, no pending turn, no execution mirror).
+    this.settleOwnedTaskAttempt(workspaceId, ownedAttempt, "user-stop-idle");
     this.rejectWaiters(workspaceId, new Error("Task interrupted"));
     await this.emitWorkspaceMetadata(workspaceId);
     this.scheduleMaybeStartQueuedTasks();
@@ -12092,6 +12792,8 @@ export class TaskService implements AgentTaskIntegration {
       "failAgentTaskTerminally: errorMessage must be non-empty"
     );
 
+    // A terminal failure ends the stream's attempt: settle the attempt owned at this decision.
+    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
     let transitionedToInterrupted = false;
     let parentWorkspaceId = entry.workspace.parentWorkspaceId;
     await this.editWorkspaceEntry(
@@ -12107,6 +12809,7 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     }
+    this.settleOwnedTaskAttempt(workspaceId, ownedAttempt, "terminal-failure");
     await this.emitWorkspaceMetadata(workspaceId);
 
     if (parentWorkspaceId) {
@@ -13394,6 +14097,7 @@ export class TaskService implements AgentTaskIntegration {
     }
   ): boolean {
     this.markTaskForegroundRelevant(taskId);
+    this.notifyAttemptSettlementListeners(taskId);
 
     const cfg = this.config.loadConfigOrDefault();
     const index = this.buildAgentTaskIndex(cfg);
