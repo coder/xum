@@ -2011,6 +2011,40 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
     });
 
+    it("keeps a replayed init card partial while a failed full replay retries", async () => {
+      createAndAddWorkspace(store, workspaceId);
+      const attempt = await chatAttempt(workspaceId, 1);
+      attempt.push({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 1_000,
+        replay: true,
+      });
+      attempt.push({ type: "init-end", exitCode: 0, timestamp: 1_001, replay: true });
+      expect(await waitUntil(() => state().messages.some((m) => m.type === "workspace-init"))).toBe(
+        true
+      );
+      expect(state().isTranscriptStale).toBe(true);
+
+      // The attempt dies before caught-up: the lone card must not surface during backoff.
+      // Hold the retry in its startup await so the post-failure state can be observed.
+      let releaseStartup: () => void = () => undefined;
+      mockGetStartupAutoRetryModel.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseStartup = () => resolve({ success: true, data: null });
+          })
+      );
+      attempt.close();
+      expect(
+        await waitUntil(() => mockGetStartupAutoRetryModel.mock.calls.length >= 2, 3_000)
+      ).toBe(true);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().messages.some((m) => m.type === "workspace-init")).toBe(true);
+      expect(state().isTranscriptStale).toBe(true);
+      releaseStartup();
+    });
+
     it("keeps the stale skeleton deadline running across quick subscribe retries", async () => {
       await useShortDeadlineStore();
       await hydrateCachedRow();

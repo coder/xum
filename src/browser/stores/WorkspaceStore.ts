@@ -1576,7 +1576,9 @@ export class WorkspaceStore {
     transient.historicalMessages.length = 0;
     transient.pendingStreamEvents.length = 0;
     transient.onChatIteratorOpen = false;
-    transient.fullReplayInFlight = false;
+    // fullReplayInFlight is deliberately kept: rows a failed full replay already applied
+    // (the init card) stay partial through the retry backoff until the next attempt's
+    // establishment redefines the mode or caught-up lands.
     this.lastUserPromptStore.bump(workspaceId);
   }
 
