@@ -366,6 +366,12 @@ describe("WorkflowRunStore", () => {
     using tmp = new DisposableTempDir("workflow-runs-step-task-snapshot");
     const store = await createStore(tmp.path);
 
+    await store.recordStepStarted("wfr_123", {
+      stepId: "source-a",
+      inputHash: "hash:source-a",
+      taskId: "task_source-a",
+      startedAt: "2026-05-29T00:00:01.000Z",
+    });
     await store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
       stepId: "source-a",
       inputHash: "hash:source-a",
@@ -397,6 +403,12 @@ describe("WorkflowRunStore", () => {
     using tmp = new DisposableTempDir("workflow-runs-step-failed-task-snapshot");
     const store = await createStore(tmp.path);
 
+    await store.recordStepStarted("wfr_123", {
+      stepId: "source-b",
+      inputHash: "hash:source-b",
+      taskId: "task_source-b_bad",
+      startedAt: "2026-05-29T00:00:01.000Z",
+    });
     await store.recordStepFailedAndAppendTaskEvent("wfr_123", {
       stepId: "source-b",
       inputHash: "hash:source-b",
@@ -501,6 +513,504 @@ describe("WorkflowRunStore", () => {
       )
     ).rejects.toThrow(/lease lost/);
     await expect(store.getRun("wfr_123")).resolves.toMatchObject({ status: "running" });
+  });
+
+  test("fences agent attempt writes to the current started attempt in both directions", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-attempt-fence");
+    const store = await createStore(tmp.path);
+    const attempt = { stepId: "summarize", inputHash: "hash:summarize" };
+
+    // No checkpoint yet: neither terminal write may land.
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
+        ...attempt,
+        taskId: "task_1",
+        result: { reportMarkdown: "early" },
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:02.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+    await expect(
+      store.recordStepFailedIfCurrent("wfr_123", {
+        ...attempt,
+        taskId: "task_1",
+        error: "no report",
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:02.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+
+    await store.recordStepStarted("wfr_123", {
+      ...attempt,
+      taskId: "task_1",
+      startedAt: "2026-05-29T00:00:01.000Z",
+    });
+    // Replacement attempt supersedes task_1.
+    await store.recordStepFailedIfCurrent("wfr_123", {
+      ...attempt,
+      taskId: "task_1",
+      title: "Summarize",
+      error: "agent task ended without a report",
+      startedAt: "2026-05-29T00:00:01.000Z",
+      completedAt: "2026-05-29T00:00:02.000Z",
+    });
+    await store.recordStepStarted("wfr_123", {
+      ...attempt,
+      taskId: "task_2",
+      startedAt: "2026-05-29T00:00:03.000Z",
+    });
+
+    // Obsolete attempt: late success and late failure are both rejected.
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
+        ...attempt,
+        taskId: "task_1",
+        result: { reportMarkdown: "late success" },
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:04.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+    await expect(
+      store.recordStepFailedAndAppendTaskEvent("wfr_123", {
+        ...attempt,
+        taskId: "task_1",
+        error: "late validation failure",
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:04.000Z",
+        validationAt: "2026-05-29T00:00:04.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+    await expect(
+      store.recordStepTimeoutMetadata("wfr_123", {
+        ...attempt,
+        taskId: "task_1",
+        startedAt: "2026-05-29T00:00:01.000Z",
+        timeout: { executionStartedAt: "2026-05-29T00:00:04.000Z" },
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+    // A different replay identity for the same step id is a different attempt too.
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
+        stepId: attempt.stepId,
+        inputHash: "hash:other",
+        taskId: "task_2",
+        result: { reportMarkdown: "wrong identity" },
+        startedAt: "2026-05-29T00:00:03.000Z",
+        completedAt: "2026-05-29T00:00:04.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+
+    await store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
+      ...attempt,
+      taskId: "task_2",
+      result: { reportMarkdown: "current success" },
+      startedAt: "2026-05-29T00:00:03.000Z",
+      completedAt: "2026-05-29T00:00:05.000Z",
+    });
+    // Once settled, even the current attempt cannot be rewritten.
+    await expect(
+      store.recordStepFailedIfCurrent("wfr_123", {
+        ...attempt,
+        taskId: "task_2",
+        error: "late failure",
+        startedAt: "2026-05-29T00:00:03.000Z",
+        completedAt: "2026-05-29T00:00:06.000Z",
+      })
+    ).rejects.toThrow(/not the current started attempt/);
+
+    const run = await store.getRun("wfr_123");
+    expect(run.steps).toMatchObject([{ ...attempt, taskId: "task_2", status: "completed" }]);
+    expect(run.events.filter((event) => event.type === "task")).toMatchObject([
+      { taskId: "task_1", status: "failed", title: "Summarize" },
+      { taskId: "task_2", status: "completed" },
+    ]);
+    expect(run.events.some((event) => event.type === "validation")).toBe(false);
+  });
+
+  test("rejects ordinary step writes on terminal runs even with a valid lease", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-terminal-fence");
+    const store = await createStore(tmp.path);
+    const attempt = { stepId: "summarize", inputHash: "hash:summarize", taskId: "task_1" };
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    const lease = { expectedLeaseOwnerId: "runner-a" };
+    await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", lease);
+    await store.recordStepStarted(
+      "wfr_123",
+      { ...attempt, startedAt: "2026-05-29T00:00:01.000Z" },
+      lease
+    );
+    // Stop lands while the runner still holds a valid lease.
+    await store.appendStatus("wfr_123", "interrupted", "2026-05-29T00:00:02.000Z");
+
+    const lateCallbackWrites = [
+      () =>
+        store.recordStepCompletedAndAppendTaskEvent(
+          "wfr_123",
+          {
+            ...attempt,
+            result: { reportMarkdown: "late" },
+            startedAt: "2026-05-29T00:00:01.000Z",
+            completedAt: "2026-05-29T00:00:03.000Z",
+          },
+          lease
+        ),
+      () =>
+        store.recordStepFailedIfCurrent(
+          "wfr_123",
+          {
+            ...attempt,
+            error: "late",
+            startedAt: "2026-05-29T00:00:01.000Z",
+            completedAt: "2026-05-29T00:00:03.000Z",
+          },
+          lease
+        ),
+      () =>
+        store.recordStepStarted(
+          "wfr_123",
+          { stepId: "other", inputHash: "hash:other", startedAt: "2026-05-29T00:00:03.000Z" },
+          lease
+        ),
+      () =>
+        store.recordStepFailed(
+          "wfr_123",
+          {
+            stepId: "other",
+            inputHash: "hash:other",
+            error: "late",
+            startedAt: "2026-05-29T00:00:01.000Z",
+            completedAt: "2026-05-29T00:00:03.000Z",
+          },
+          lease
+        ),
+      () =>
+        store.appendTaskEventIfMissing(
+          "wfr_123",
+          { ...attempt, status: "failed", at: "2026-05-29T00:00:03.000Z" },
+          lease
+        ),
+    ];
+    for (const write of lateCallbackWrites) {
+      await expect(write()).rejects.toThrow(/interrupted/);
+    }
+
+    await store.releaseLease("wfr_123", "runner-a");
+    for (const terminal of ["completed", "failed"] as const) {
+      using terminalTmp = new DisposableTempDir(`workflow-runs-terminal-fence-${terminal}`);
+      const terminalStore = await createStore(terminalTmp.path);
+      await terminalStore.recordStepStarted("wfr_123", {
+        ...attempt,
+        startedAt: "2026-05-29T00:00:01.000Z",
+      });
+      await terminalStore.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z");
+      await terminalStore.appendStatus("wfr_123", terminal, "2026-05-29T00:00:02.000Z");
+      await expect(
+        terminalStore.recordStepFailedIfCurrent("wfr_123", {
+          ...attempt,
+          error: "late",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        })
+      ).rejects.toThrow(new RegExp(terminal));
+      await expect(
+        terminalStore.recordStepCompleted("wfr_123", {
+          ...attempt,
+          result: { reportMarkdown: "late" },
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        })
+      ).rejects.toThrow(new RegExp(terminal));
+      await expect(
+        (await terminalStore.getRun("wfr_123")).steps.map((step) => step.status)
+      ).toEqual(["started"]);
+    }
+    await expect((await store.getRun("wfr_123")).steps.map((step) => step.status)).toEqual([
+      "started",
+    ]);
+  });
+
+  test("accepts cancellation settlement only from the draining lease owner on an interrupted run", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-cancellation-settlement");
+    const store = await createStore(tmp.path);
+    const attemptA = { stepId: "a", inputHash: "hash:a", taskId: "task_a" };
+    const attemptB = { stepId: "b", inputHash: "hash:b", taskId: "task_b" };
+    const attemptC = { stepId: "c", inputHash: "hash:c", taskId: "task_c" };
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    const lease = { expectedLeaseOwnerId: "runner-a" };
+    await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", lease);
+    for (const attempt of [attemptA, attemptB, attemptC]) {
+      await store.recordStepStarted(
+        "wfr_123",
+        { ...attempt, startedAt: "2026-05-29T00:00:01.000Z" },
+        lease
+      );
+    }
+    await store.appendStatus("wfr_123", "interrupted", "2026-05-29T00:00:02.000Z");
+
+    // Only an aborted runner may open the settlement, and only the current lease owner.
+    const liveSignal = new AbortController().signal;
+    await expect(
+      store.openCancellationSettlement("wfr_123", "runner-a", liveSignal)
+    ).rejects.toThrow(/abort/);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      store.openCancellationSettlement("wfr_123", "runner-b", aborted.signal)
+    ).rejects.toThrow(/lease lost/);
+
+    using settlement = await store.openCancellationSettlement(
+      "wfr_123",
+      "runner-a",
+      aborted.signal
+    );
+    const draining = { ...lease, settlement };
+    await store.recordStepCompletedAndAppendTaskEvent(
+      "wfr_123",
+      {
+        ...attemptA,
+        result: { reportMarkdown: "reported before stop" },
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:03.000Z",
+      },
+      draining
+    );
+    await store.recordStepFailedIfCurrent(
+      "wfr_123",
+      {
+        ...attemptB,
+        error: "agent task ended without a report",
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:03.000Z",
+      },
+      draining
+    );
+    // The capability never authorizes another owner's writes or an obsolete attempt.
+    await expect(
+      store.recordStepFailedIfCurrent(
+        "wfr_123",
+        {
+          ...attemptC,
+          error: "foreign",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        },
+        { expectedLeaseOwnerId: "runner-b", settlement }
+      )
+    ).rejects.toThrow(/lease/);
+    await expect(
+      store.recordStepFailedIfCurrent(
+        "wfr_123",
+        {
+          ...attemptA,
+          error: "obsolete",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        },
+        draining
+      )
+    ).rejects.toThrow(/not the current started attempt/);
+    // Ordinary (non-settlement) writes stay rejected while interrupted.
+    await expect(
+      store.recordStepFailedIfCurrent(
+        "wfr_123",
+        {
+          ...attemptC,
+          error: "ordinary",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        },
+        lease
+      )
+    ).rejects.toThrow(/interrupted/);
+
+    const run = await store.getRun("wfr_123");
+    expect(run.status).toBe("interrupted");
+    expect(run.steps.map((step) => [step.taskId, step.status])).toEqual([
+      ["task_a", "completed"],
+      ["task_b", "failed"],
+      ["task_c", "started"],
+    ]);
+    expect(run.events.filter((event) => event.type === "task")).toMatchObject([
+      { taskId: "task_a", status: "completed" },
+      { taskId: "task_b", status: "failed" },
+    ]);
+
+    // A closed capability is inert; a re-opened one still cannot touch completed/failed runs.
+    settlement.close();
+    await expect(
+      store.recordStepFailedIfCurrent(
+        "wfr_123",
+        {
+          ...attemptC,
+          error: "after close",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:04.000Z",
+        },
+        draining
+      )
+    ).rejects.toThrow(/interrupted/);
+    await store.releaseLease("wfr_123", "runner-a");
+
+    // A failed run stays closed to settlement even for its own draining lease owner.
+    using failedTmp = new DisposableTempDir("workflow-runs-cancellation-settlement-failed");
+    const failedStore = await createStore(failedTmp.path);
+    await expect(failedStore.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    await failedStore.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", lease);
+    await failedStore.recordStepStarted(
+      "wfr_123",
+      { ...attemptC, startedAt: "2026-05-29T00:00:01.000Z" },
+      lease
+    );
+    await failedStore.appendStatus("wfr_123", "failed", "2026-05-29T00:00:02.000Z", lease);
+    using reopened = await failedStore.openCancellationSettlement(
+      "wfr_123",
+      "runner-a",
+      aborted.signal
+    );
+    await expect(
+      failedStore.recordStepFailedIfCurrent(
+        "wfr_123",
+        {
+          ...attemptC,
+          error: "terminal run",
+          startedAt: "2026-05-29T00:00:01.000Z",
+          completedAt: "2026-05-29T00:00:03.000Z",
+        },
+        { ...lease, settlement: reopened }
+      )
+    ).rejects.toThrow(/failed/);
+    await failedStore.releaseLease("wfr_123", "runner-a");
+  });
+
+  test("authorizes replay adoption by the current lease during the resume transition only", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-replay-adoption");
+    const store = await createStore(tmp.path);
+    const attempt = { stepId: "summarize", inputHash: "hash:summarize", taskId: "task_prior" };
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", {
+      expectedLeaseOwnerId: "runner-a",
+    });
+    await store.recordStepStarted(
+      "wfr_123",
+      { ...attempt, startedAt: "2026-05-29T00:00:01.000Z" },
+      { expectedLeaseOwnerId: "runner-a" }
+    );
+    await store.appendStatus("wfr_123", "interrupted", "2026-05-29T00:00:02.000Z");
+    await store.releaseLease("wfr_123", "runner-a");
+
+    await expect(store.acquireLease("wfr_123", "runner-b", 2000)).resolves.toBe(true);
+    const newLease = { expectedLeaseOwnerId: "runner-b" };
+    const adoption = {
+      ...attempt,
+      result: { reportMarkdown: "prior attempt report" },
+      startedAt: "2026-05-29T00:00:01.000Z",
+      completedAt: "2026-05-29T00:00:03.000Z",
+    };
+    // Holding the lease is not enough before the resume transition is durable.
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent("wfr_123", adoption, newLease)
+    ).rejects.toThrow(/interrupted/);
+    await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:03.000Z", {
+      ...newLease,
+      allowInterruptedResume: true,
+    });
+    // The stale original lease cannot adopt; exact checkpoint identity is required.
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent("wfr_123", adoption, {
+        expectedLeaseOwnerId: "runner-a",
+      })
+    ).rejects.toThrow(/lease lost/);
+    await expect(
+      store.recordStepCompletedAndAppendTaskEvent(
+        "wfr_123",
+        { ...adoption, taskId: "task_other" },
+        newLease
+      )
+    ).rejects.toThrow(/not the current started attempt/);
+    await store.recordStepCompletedAndAppendTaskEvent("wfr_123", adoption, newLease);
+
+    const run = await store.getRun("wfr_123");
+    expect(run.steps).toMatchObject([{ ...attempt, status: "completed" }]);
+    expect(run.events.filter((event) => event.type === "task")).toMatchObject([
+      { taskId: "task_prior", status: "completed" },
+    ]);
+    await store.releaseLease("wfr_123", "runner-b");
+  });
+
+  test("replays crash-split journals: task event without step and step without task event", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-split-journals");
+    const store = await createStore(tmp.path);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+    await store.recordStepStarted("wfr_123", {
+      stepId: "a",
+      inputHash: "hash:a",
+      taskId: "task_a",
+      startedAt: "2026-05-29T00:00:01.000Z",
+    });
+    await store.recordStepStarted("wfr_123", {
+      stepId: "b",
+      inputHash: "hash:b",
+      taskId: "task_b",
+      startedAt: "2026-05-29T00:00:01.000Z",
+    });
+    // Crash after the task event append but before the step record (event-without-step).
+    await fs.appendFile(
+      path.join(runDir, "events.jsonl"),
+      `${JSON.stringify({
+        sequence: 1,
+        type: "task",
+        at: "2026-05-29T00:00:02.000Z",
+        stepId: "a",
+        taskId: "task_a",
+        status: "completed",
+      })}\n`
+    );
+    // Crash after the step record but before the task event (step-without-event).
+    await fs.appendFile(
+      path.join(runDir, "steps.jsonl"),
+      `${JSON.stringify({
+        stepId: "b",
+        inputHash: "hash:b",
+        taskId: "task_b",
+        status: "completed",
+        result: { reportMarkdown: "b done" },
+        startedAt: "2026-05-29T00:00:01.000Z",
+        completedAt: "2026-05-29T00:00:02.000Z",
+      })}\n`
+    );
+
+    const replayed = await store.getRun("wfr_123");
+    // The step record, not the event, is the checkpoint: "a" is still started and replayable.
+    expect(replayed.steps).toMatchObject([
+      { stepId: "a", status: "started" },
+      { stepId: "b", status: "completed" },
+    ]);
+    await expect(store.getCompletedStep("wfr_123", "a", "hash:a")).resolves.toBeNull();
+    await expect(store.getCompletedStep("wfr_123", "b", "hash:b")).resolves.toMatchObject({
+      result: { reportMarkdown: "b done" },
+    });
+
+    // Settling "a" for real dedupes the orphaned task event; backfilling "b" adds exactly one.
+    await store.recordStepCompletedAndAppendTaskEvent("wfr_123", {
+      stepId: "a",
+      inputHash: "hash:a",
+      taskId: "task_a",
+      result: { reportMarkdown: "a done" },
+      startedAt: "2026-05-29T00:00:01.000Z",
+      completedAt: "2026-05-29T00:00:03.000Z",
+    });
+    await store.appendTaskEventIfMissing("wfr_123", {
+      stepId: "b",
+      taskId: "task_b",
+      status: "completed",
+      at: "2026-05-29T00:00:03.000Z",
+    });
+    const settled = await store.getRun("wfr_123");
+    expect(settled.events.filter((event) => event.type === "task")).toMatchObject([
+      { stepId: "a", taskId: "task_a", status: "completed" },
+      { stepId: "b", taskId: "task_b", status: "completed" },
+    ]);
+    expect(settled.steps.map((step) => step.status)).toEqual(["completed", "completed"]);
   });
 
   test("replays terminal status from journal when run file is stale", async () => {
