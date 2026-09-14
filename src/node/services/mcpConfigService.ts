@@ -92,6 +92,21 @@ function canonicalPluginKeys(values: unknown[]): string[] {
   );
 }
 
+/** Shared by MCP mutations, admission fences, and backup restore's consent revocation. */
+export function acquireGlobalMcpConfigLock(
+  muxRoot: string,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {}
+): Promise<() => Promise<void>> {
+  return acquireCrossProcessLock({
+    lockPath: path.join(muxRoot, "mcp-config.lock"),
+    acquireTimeoutMs: options.timeoutMs ?? 60_000,
+    staleMs: 5 * 60_000,
+    timeoutMessage:
+      "Another Mux process is currently updating MCP settings. Wait for it to finish and try again.",
+    signal: options.signal,
+  });
+}
+
 export class MCPConfigService {
   private readonly config: Config;
   readonly claudeDesign: ClaudeDesignService;
@@ -522,14 +537,7 @@ export class MCPConfigService {
     options: { signal?: AbortSignal; timeoutMs?: number } = {}
   ): Promise<() => Promise<void>> {
     await this.ensureMuxRootDir();
-    return acquireCrossProcessLock({
-      lockPath: path.join(this.config.rootDir, "mcp-config.lock"),
-      acquireTimeoutMs: options.timeoutMs ?? 60_000,
-      staleMs: 5 * 60_000,
-      timeoutMessage:
-        "Another Mux process is currently updating MCP settings. Wait for it to finish and try again.",
-      signal: options.signal,
-    });
+    return acquireGlobalMcpConfigLock(this.config.rootDir, options);
   }
 
   private runExclusive<T>(fn: () => Promise<T>): Promise<T> {

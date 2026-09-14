@@ -4,6 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as jsonc from "jsonc-parser";
+import { Config } from "@/node/config";
+import { MCPConfigService } from "@/node/services/mcpConfigService";
+import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -2040,6 +2043,120 @@ describe("backup payload", () => {
     expect(jsonc.parse(await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8"))).toEqual({
       servers: { notes: "node notes.js" },
     });
+  });
+
+  it("serializes MCP restore planning and writes with a held global consent fence", async () => {
+    const name = "plugin:0123456789abcdef:echo";
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    const original = JSON.stringify({ servers: {}, enabledPluginServers: [name] });
+    await writeFixtureFile(muxRoot, "mcp.jsonc", original);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const service = new MCPConfigService(new Config(muxRoot));
+    const releaseFence = await service.acquireGlobalPluginEnablementFence(name, {
+      timeoutMs: 1_000,
+    });
+    const attempted = Promise.withResolvers<void>();
+    const acquire = crossProcessLock.acquireCrossProcessLock;
+    const lockSpy = spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation(
+      (options) => {
+        const result = acquire(options);
+        if (options.lockPath === path.join(muxRoot, "mcp-config.lock")) attempted.resolve();
+        return result;
+      }
+    );
+    const restore = restoreBackupPayload({ muxRoot, payload });
+    try {
+      // Observe the real acquisition, not an arbitrary sleep. An unfenced restore
+      // finishes instead of reaching this boundary, so the regression fails promptly.
+      expect(
+        await Promise.race([
+          attempted.promise.then(() => "waiting"),
+          restore.then(() => "restored"),
+        ])
+      ).toBe("waiting");
+      expect(await fs.readFile(configPath, "utf8")).toBe(original);
+
+      // Simulate the current lock holder changing local-only settings. Restore
+      // must merge these AFTER acquiring the lock, not save a pre-lock plan.
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({
+          servers: { localOnly: { url: "https://example.com/mcp" } },
+          enabledPluginServers: [name],
+        })
+      );
+      await releaseFence();
+      await restore;
+      expect(jsonc.parse(await fs.readFile(configPath, "utf8"))).toEqual({
+        servers: { localOnly: { url: "https://example.com/mcp" } },
+      });
+      const denied = await captureRejection(
+        service.acquireGlobalPluginEnablementFence(name, { timeoutMs: 1_000 })
+      );
+      expect(denied).toBeInstanceOf(Error);
+      expect((denied as Error).message).toContain("disabled globally");
+    } finally {
+      await releaseFence();
+      await restore.catch(() => undefined);
+      lockSpy.mockRestore();
+    }
+  });
+
+  it("releases the MCP restore lock after approval and persistence failures", async () => {
+    const name = "plugin:0123456789abcdef:echo";
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    const original = JSON.stringify({ servers: {}, enabledPluginServers: [name] });
+    await writeFixtureFile(muxRoot, "mcp.jsonc", original);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const service = new MCPConfigService(new Config(muxRoot));
+    const lockPath = path.join(muxRoot, "mcp-config.lock");
+    const writeError = new Error("Injected MCP restore write failure");
+
+    for (const phase of ["approval", "write"] as const) {
+      const variant =
+        phase === "approval"
+          ? withPayloadFileText(
+              payload,
+              "mcp.jsonc",
+              JSON.stringify({
+                servers: { new: "node new.js" },
+                enabledPluginServers: REDACTED_BACKUP_VALUE,
+              })
+            )
+          : payload;
+      const openFile = fs.open;
+      const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+        if (
+          phase === "write" &&
+          args[0] === configPath &&
+          typeof args[1] === "number" &&
+          (args[1] & fs.constants.O_WRONLY) !== 0
+        ) {
+          expect((await fs.stat(lockPath)).isFile()).toBe(true);
+          throw writeError;
+        }
+        return openFile(...args);
+      });
+      try {
+        const error = await captureRejection(restoreBackupPayload({ muxRoot, payload: variant }));
+        if (phase === "approval") expect(error).toBeInstanceOf(BackupCommandApprovalRequiredError);
+        else expect(error).toBe(writeError);
+      } finally {
+        openSpy.mockRestore();
+      }
+      expect(await fs.readFile(configPath, "utf8")).toBe(original);
+      // Reacquisition exercises cleanup through the real admission interface.
+      const release = await service.acquireGlobalPluginEnablementFence(name, { timeoutMs: 1_000 });
+      await release();
+    }
   });
 
   it("rejects duplicate plugin enablement fields before restoring any settings", async () => {

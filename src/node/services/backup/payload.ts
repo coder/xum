@@ -18,6 +18,7 @@ import {
   type BackupProjectBundleEntry,
   type BackupProjectBundleManifest,
 } from "@/common/config/schemas/settingsBackup";
+import { acquireGlobalMcpConfigLock } from "@/node/services/mcpConfigService";
 import { projectPathHashSuffix } from "@/node/services/memoryService";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -2599,6 +2600,13 @@ export async function restoreBackupPayload(
       .filter((file) => file.path !== "preferences.json")
       .map((file) => file.path)
   );
+  // Restore revokes local plugin consent. Serialize its local reads, approval
+  // check and writes with admission and ordinary MCP mutations, not just the
+  // final write: a pre-lock plan could overwrite a newer local configuration.
+  // Keep the existing whole-payload preflight before any settings are changed.
+  await using _mcpLock = restoredPaths.has("mcp.jsonc")
+    ? { [Symbol.asyncDispose]: await acquireGlobalMcpConfigLock(options.muxRoot) }
+    : undefined;
   // Recomputed here rather than trusted from the preview, so an approval cannot authorize
   // a command the repository changed between the preview and this restore.
   assertBackupCommandsApproved(
