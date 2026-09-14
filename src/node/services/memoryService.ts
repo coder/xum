@@ -1931,13 +1931,19 @@ export class MemoryService extends EventEmitter {
         // unchanged and in the form every build reads, until this note's own
         // copy is installed — then the record flips to it in one write. No
         // pending record precedes the install (it would replace the receipt),
-        // so a retry recognizes an installed-but-unflipped copy by its
-        // identical bytes at this descendant's own import slot; a downgrade
-        // in that window sees the receipt as before plus, at worst, one
-        // redundant copy this build claims on return. The install is exempt
-        // from the capacity check: at most one extra file per outstanding
-        // shared receipt (prior state, bounded), and the creator's normal
-        // deletion returns the slot once nobody relies on its copy.
+        // so a copy installed before the flip carries no receipt: a retry
+        // finds an identical file at this descendant's import slot and treats
+        // it like any identical occupied candidate — reused with a plain
+        // created: false receipt, never claimed. The slot is inside the
+        // writable notebook, so the owner may have written that file itself,
+        // and destructive provenance is only ever taken from a receipt
+        // recorded before the install (targetStamp), never from a byte
+        // match. The bounded outcome of a crash there (and of a downgrade in
+        // the window, which sees the receipt as before) is one redundant copy
+        // adoption never deletes. The install is exempt from the capacity
+        // check: at most one extra file per outstanding shared receipt (prior
+        // state, bounded), and the creator's normal deletion returns the slot
+        // once nobody relies on its copy.
         let migration = false;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
@@ -2054,20 +2060,6 @@ export class MemoryService extends EventEmitter {
           if (target === null) {
             skipped++;
             continue;
-          }
-          // A migration interrupted between its install and its receipt flip
-          // left this note's own copy at its import slot with no record: the
-          // identical file found there is that copy (this descendant's slot;
-          // see `migration`) and is claimed rather than reused as the owner's.
-          if (migration && !target.write && target.relPath !== previous?.target) {
-            const stamp = await adoptionTargetStamp(store.physicalPath(target.relPath));
-            if (stamp === null) {
-              skipped++;
-              transientSkips++;
-              continue;
-            }
-            record.created = true;
-            record.targetStamp = stamp;
           }
         }
         if (target.write) {
