@@ -4146,81 +4146,32 @@ export class TaskService implements AgentTaskIntegration {
       // signal itself before its store write).
       progress.enter("checkpoint");
       if (signal?.aborted) return interrupted();
-      for (const [index, result] of results.entries()) {
-        // Workflow callers durably checkpoint returned task IDs before task records are persisted.
-        // If config persistence fails afterward, replay sees a started step whose task is not found
-        // and restarts it instead of duplicating an already-launched child after a crash.
-        await options.onTaskReserved?.(index, result);
-      }
-
-      progress.enter("config-commit");
-      await this.config.editConfig((config) => {
-        // Fence inside the mutator: an abort that landed while waiting for the config lock (or
-        // during the checkpoint) persists the plans interrupted instead of live reservations.
-        canceledInsideCommit = signal?.aborted === true;
-        for (const plan of plans) {
-          const runtime = createRuntimeForWorkspace({
-            runtimeConfig: plan.taskRuntimeConfig,
-            projectPath: plan.parentMeta.projectPath,
-            name: plan.parentMeta.name,
-          });
-          const workspacePath =
-            plan.sharedWorkspacePath ??
-            runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
-          const trunkBranch =
-            coerceNonEmptyString(plan.preferredTrunkBranch) ??
-            coerceNonEmptyString(plan.parentMeta.name);
-          if (!trunkBranch) {
-            throw new Error("Task.createMany: parent workspace name missing");
-          }
-          let projectConfig = config.projects.get(plan.configProjectPath);
-          if (!projectConfig) {
-            projectConfig = { workspaces: [] };
-            config.projects.set(plan.configProjectPath, projectConfig);
-          }
-          projectConfig.workspaces.push({
-            kind: plan.workspaceKind,
-            path: workspacePath,
-            id: plan.taskId,
-            name: plan.workspaceName,
-            title: plan.title,
-            createdAt: plan.createdAt,
-            runtimeConfig: plan.taskRuntimeConfig,
-            aiSettings:
-              plan.effectiveThinkingLevel !== undefined
-                ? {
-                    model: plan.canonicalModel,
-                    thinkingLevel: plan.effectiveThinkingLevel,
-                    ...(plan.effectiveReasoningMode != null
-                      ? { reasoningMode: plan.effectiveReasoningMode }
-                      : {}),
-                  }
-                : undefined,
-            parentWorkspaceId: plan.parentWorkspaceId,
-            agentId: plan.agentId,
-            agentType: plan.agentType,
-            workflowTask: plan.workflowTask,
-            bestOf: plan.bestOf,
-            taskStatus: canceledInsideCommit ? "interrupted" : plan.status,
-            taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
-            taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
-            taskTrunkBranch: trunkBranch,
-            taskModelString: plan.taskModelString,
-            taskThinkingLevel: plan.effectiveThinkingLevel,
-            taskOnRefusal: plan.onRefusal,
-            taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
-            taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
-            taskAttentionPolicy: plan.attentionPolicy,
-            taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
-            projects: plan.parentMeta.projects,
-          });
-          this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
+      // Ownership BEFORE exposure: every id a checkpoint callback may durably record is owned by
+      // this process from here, whatever happens to the callbacks or the commit. The identity is
+      // kept through a successful commit (the launch reuses it) and, when the pre-launch path
+      // fails, settled once nothing can launch — a checkpointed id must never read back to the
+      // runner as "no attempt owned by this process".
+      const ownedAttempts = new Map(
+        plans.map((plan) => [
+          plan.taskId,
+          this.beginOwnedTaskAttempt(plan.taskId, "reservation", signal),
+        ])
+      );
+      try {
+        for (const [index, result] of results.entries()) {
+          // Workflow callers durably checkpoint returned task IDs before task records are
+          // persisted. If config persistence fails afterward, replay sees a started step whose
+          // task is not found and restarts it instead of duplicating an already-launched child
+          // after a crash.
+          await options.onTaskReserved?.(index, result);
         }
-        return config;
-      });
-      // Records exist: this process owns these attempts from here on (with their cancellation).
-      for (const plan of plans) {
-        this.beginOwnedTaskAttempt(plan.taskId, "reservation", signal);
+        progress.enter("config-commit");
+        await this.commitReservations(plans, signal, () => {
+          canceledInsideCommit = true;
+        });
+      } catch (error: unknown) {
+        await this.settleFailedReservations(plans, ownedAttempts, signal, error);
+        throw error;
       }
       return null;
     };
@@ -4293,6 +4244,144 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return Ok(results);
+  }
+
+  /** The reservation's owned config write (see createManyUnderTaskTreeLifecycleLocks). */
+  private async commitReservations(
+    plans: ReadonlyArray<
+      TaskLaunchPlan & { status: "queued" | "starting"; sharedWorkspacePath?: string }
+    >,
+    signal: AbortSignal | undefined,
+    onCanceledInsideCommit: () => void
+  ): Promise<void> {
+    await this.config.editConfig((config) => {
+      // Fence inside the mutator: an abort that landed while waiting for the config lock (or
+      // during the checkpoint) persists the plans interrupted instead of live reservations.
+      const canceledInsideCommit = signal?.aborted === true;
+      if (canceledInsideCommit) onCanceledInsideCommit();
+      for (const plan of plans) {
+        const runtime = createRuntimeForWorkspace({
+          runtimeConfig: plan.taskRuntimeConfig,
+          projectPath: plan.parentMeta.projectPath,
+          name: plan.parentMeta.name,
+        });
+        const workspacePath =
+          plan.sharedWorkspacePath ??
+          runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
+        const trunkBranch =
+          coerceNonEmptyString(plan.preferredTrunkBranch) ??
+          coerceNonEmptyString(plan.parentMeta.name);
+        if (!trunkBranch) {
+          throw new Error("Task.createMany: parent workspace name missing");
+        }
+        let projectConfig = config.projects.get(plan.configProjectPath);
+        if (!projectConfig) {
+          projectConfig = { workspaces: [] };
+          config.projects.set(plan.configProjectPath, projectConfig);
+        }
+        projectConfig.workspaces.push({
+          kind: plan.workspaceKind,
+          path: workspacePath,
+          id: plan.taskId,
+          name: plan.workspaceName,
+          title: plan.title,
+          createdAt: plan.createdAt,
+          runtimeConfig: plan.taskRuntimeConfig,
+          aiSettings:
+            plan.effectiveThinkingLevel !== undefined
+              ? {
+                  model: plan.canonicalModel,
+                  thinkingLevel: plan.effectiveThinkingLevel,
+                  ...(plan.effectiveReasoningMode != null
+                    ? { reasoningMode: plan.effectiveReasoningMode }
+                    : {}),
+                }
+              : undefined,
+          parentWorkspaceId: plan.parentWorkspaceId,
+          agentId: plan.agentId,
+          agentType: plan.agentType,
+          workflowTask: plan.workflowTask,
+          bestOf: plan.bestOf,
+          taskStatus: canceledInsideCommit ? "interrupted" : plan.status,
+          taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
+          taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+          taskTrunkBranch: trunkBranch,
+          taskModelString: plan.taskModelString,
+          taskThinkingLevel: plan.effectiveThinkingLevel,
+          taskOnRefusal: plan.onRefusal,
+          taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
+          taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
+          taskAttentionPolicy: plan.attentionPolicy,
+          taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+          projects: plan.parentMeta.projects,
+        });
+        this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
+      }
+      return config;
+    });
+  }
+
+  /**
+   * The owned pre-launch path ended before scheduling (a checkpoint callback or the config commit
+   * failed). Launchability must be KNOWN before the attempt is settled: a record the failed write
+   * still committed would be picked up by the scheduler, so it is fenced (interrupted) first; an
+   * unreadable config or a failed fence leaves the attempt unsettled (indeterminate) rather than
+   * guessed. Failure or absence alone is never authority — the fence is.
+   */
+  private async settleFailedReservations(
+    plans: ReadonlyArray<TaskLaunchPlan & { status: "queued" | "starting" }>,
+    ownedAttempts: ReadonlyMap<string, OwnedTaskAttempt>,
+    signal: AbortSignal | undefined,
+    error: unknown
+  ): Promise<void> {
+    const message = signal?.aborted
+      ? TASK_RESERVATION_CANCELED_MESSAGE
+      : `Reservation failed: ${getErrorMessage(error)}`;
+    for (const plan of plans) {
+      let committed: boolean;
+      try {
+        committed =
+          findWorkspaceEntry(
+            this.config.loadConfigOrDefault({ throwOnError: true }),
+            plan.taskId
+          ) != null;
+      } catch (readError: unknown) {
+        log.warn("Task reservation failed and its config state is unreadable; attempt unresolved", {
+          taskId: plan.taskId,
+          error: readError,
+        });
+        continue;
+      }
+      if (committed) {
+        try {
+          let transitioned = false;
+          await this.editWorkspaceEntry(
+            plan.taskId,
+            (ws) => {
+              if (ws.taskStatus !== plan.status) return;
+              ws.taskStatus = "interrupted";
+              ws.taskLaunchError = message;
+              transitioned = true;
+            },
+            { allowMissing: true }
+          );
+          if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+          this.rejectWaiters(plan.taskId, new Error(message));
+          await this.emitWorkspaceMetadata(plan.taskId);
+        } catch (fenceError: unknown) {
+          log.warn("Task reservation failed and its committed record could not be fenced", {
+            taskId: plan.taskId,
+            error: fenceError,
+          });
+          continue;
+        }
+      }
+      this.settleOwnedTaskAttempt(
+        plan.taskId,
+        ownedAttempts.get(plan.taskId),
+        "reservation-failed"
+      );
+    }
   }
 
   /**
@@ -4830,7 +4919,17 @@ export class TaskService implements AgentTaskIntegration {
       throw new Error(message);
     }
 
-    await this.setTaskStatus(plan.taskId, "running");
+    // A Stop can land between the pre-send check and this write (Layer 2 persists "interrupted"
+    // BEFORE stopping the admitted turn). Only a record still in its reserved "starting" state
+    // becomes "running"; a stopped record keeps its terminal status and its owned settlement.
+    const transitioned = await this.setTaskStatus(plan.taskId, "running", {
+      onlyFromStatus: "starting",
+    });
+    if (!transitioned) {
+      log.debug("startReservedAgentTask: reservation no longer starting after admission", {
+        taskId: plan.taskId,
+      });
+    }
     this.scheduleMaybeStartQueuedTasks();
   }
 
@@ -11728,10 +11827,24 @@ export class TaskService implements AgentTaskIntegration {
     await this.startReservedAgentTask(plan);
   }
 
-  private async setTaskStatus(workspaceId: string, status: AgentTaskStatus): Promise<void> {
+  /**
+   * Returns whether the status was written. With `onlyFromStatus`, the transition is skipped (and
+   * false returned) when the record no longer holds that status — a guarded write for callers
+   * racing a Stop that already persisted a terminal status.
+   */
+  private async setTaskStatus(
+    workspaceId: string,
+    status: AgentTaskStatus,
+    options?: { onlyFromStatus?: AgentTaskStatus }
+  ): Promise<boolean> {
     assert(workspaceId.length > 0, "setTaskStatus: workspaceId must be non-empty");
 
+    let written = false;
     const update = (workspace: WorkspaceConfigEntry) => {
+      if (options?.onlyFromStatus != null && workspace.taskStatus !== options.onlyFromStatus) {
+        return;
+      }
+      written = true;
       workspace.taskStatus = status;
       if (status === "running") {
         workspace.taskPrompt = undefined;
@@ -11742,12 +11855,13 @@ export class TaskService implements AgentTaskIntegration {
     } else {
       await this.editWorkspaceEntry(workspaceId, update);
     }
+    if (!written) return false;
 
     await this.emitWorkspaceMetadata(workspaceId);
 
     if (status === "running") {
       const waiters = this.pendingStartWaitersByTaskId.get(workspaceId);
-      if (!waiters || waiters.length === 0) return;
+      if (!waiters || waiters.length === 0) return true;
       this.pendingStartWaitersByTaskId.delete(workspaceId);
       for (const waiter of waiters) {
         try {
@@ -11757,6 +11871,7 @@ export class TaskService implements AgentTaskIntegration {
         }
       }
     }
+    return true;
   }
 
   /**
