@@ -1875,7 +1875,6 @@ describe("StreamManager - stopWhen configuration", () => {
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
     toolPolicy?: ToolPolicy;
     onStepSettled?: TurnExecutionOptions["onStepSettled"];
-    selectContextBudgetContinuationEntryId?: () => string | undefined;
     modelString?: string;
     tools?: Record<string, Tool>;
     contextBudgetMemoryWritable?: boolean;
@@ -2027,7 +2026,7 @@ describe("StreamManager - stopWhen configuration", () => {
     "budget %s stops with only turn-end input queued and evaluates settled fallback usage",
     async (decision) => {
       const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-        Promise.resolve(decision)
+        Promise.resolve({ decision })
       );
       const sessionHistory = tool({ inputSchema: z.object({}) });
       const [, stop] = buildStopWhenForTests()({
@@ -2078,12 +2077,12 @@ describe("StreamManager - stopWhen configuration", () => {
     ["rollover", "continue-entry"],
     ["block", undefined],
   ] as const)(
-    "budget %s binds the selected continuation entry into the stop cause",
+    "budget %s binds the session's designated continuation into the stop cause",
     async (decision, expectedEntryId) => {
       const request: Parameters<BuildStopWhenCondition>[0] = {
         hasQueuedMessages: () => false,
-        onStepSettled: () => Promise.resolve(decision),
-        selectContextBudgetContinuationEntryId: () => "continue-entry",
+        // The session names its successor with the decision; a blocked stop hands over to none.
+        onStepSettled: () => Promise.resolve({ decision, continuationEntryId: "continue-entry" }),
         modelString: "anthropic:claude-sonnet-4-5",
       };
       const [, stop] = buildStopWhenForTests()(request);
@@ -2109,7 +2108,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("a settled successful new_context result is reported alongside its siblings", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop] = buildStopWhenForTests()({
       hasQueuedMessages: () => false,
@@ -2160,7 +2159,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop, required] = buildStopWhenForTests()({
       onStepSettled,
