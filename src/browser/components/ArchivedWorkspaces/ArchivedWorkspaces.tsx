@@ -44,7 +44,7 @@ interface ArchivedWorkspacesProps {
   projectPath: string;
   projectName: string;
   workspaces: FrontendWorkspaceMetadata[] | undefined;
-  /** Message from a failed archived list request; shown while expanded instead of an empty list */
+  /** Message from a failed archived list request; shown while expanded above any cached rows */
   loadError?: string;
   /** Called after a workspace is unarchived or deleted to refresh the list */
   onWorkspacesChanged?: () => void;
@@ -812,7 +812,8 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           </button>
           <ArchiveIcon className="text-muted h-4 w-4" />
           <span className="text-foreground font-medium">
-            Archived Workspaces{loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
+            Archived Workspaces
+            {isExpanded && loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
           </span>
           {isExpanded && <CostBadge cost={totalCost} loading={costsLoading} size="lg" />}
           <span className="flex-1" />
@@ -898,6 +899,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             aria-label="Archived workspaces"
             className="border-border border-t"
           >
+            {loadError !== undefined && (
+              <div className="text-error px-4 py-3 text-center text-sm">
+                Failed to load archived workspaces: {loadError}
+              </div>
+            )}
+
             {/* Search input with select all */}
             {workspaces.length > 1 && (
               <div className="border-border flex items-center gap-2 border-b px-4 py-2">
@@ -925,147 +932,143 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
             {/* Timeline grouped list */}
             <div>
-              {filteredWorkspaces.length === 0 ? (
-                <div
-                  className={cn(
-                    "px-4 py-6 text-center text-sm",
-                    loadError !== undefined ? "text-error" : "text-muted"
-                  )}
-                >
-                  {loadError !== undefined
-                    ? `Failed to load archived workspaces: ${loadError}`
-                    : loadedWorkspaces === undefined
-                      ? "Loading archived workspaces…"
-                      : searchQuery.trim()
-                        ? `No workspaces match "${searchQuery}"`
-                        : "No archived workspaces"}
-                </div>
-              ) : (
-                Array.from(groupedWorkspaces.entries()).map(([period, periodWorkspaces]) => (
-                  <div key={period}>
-                    {/* Period header */}
-                    <div className="bg-bg-dark text-muted flex items-center gap-2 px-4 py-1.5 text-xs font-medium">
-                      <span>{period}</span>
-                      <CostBadge cost={periodCosts.get(period)} loading={costsLoading} />
+              {filteredWorkspaces.length === 0
+                ? loadError === undefined && (
+                    <div className="text-muted px-4 py-6 text-center text-sm">
+                      {loadedWorkspaces === undefined
+                        ? "Loading archived workspaces…"
+                        : searchQuery.trim()
+                          ? `No workspaces match "${searchQuery}"`
+                          : "No archived workspaces"}
                     </div>
-                    {/* Workspaces in this period */}
-                    {periodWorkspaces.map((workspace) => {
-                      const isProcessing = processingIds.has(workspace.id) || workspace.isRemoving;
-                      const isSelected = selectedIds.has(workspace.id);
-                      const workspaceNameForTooltip =
-                        workspace.title && workspace.title !== workspace.name
-                          ? workspace.name
-                          : undefined;
-                      const displayTitle = workspace.title ?? workspace.name;
-                      const canDeleteWorktree = canDeleteManagedWorktree(workspace);
-                      const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
+                  )
+                : Array.from(groupedWorkspaces.entries()).map(([period, periodWorkspaces]) => (
+                    <div key={period}>
+                      {/* Period header */}
+                      <div className="bg-bg-dark text-muted flex items-center gap-2 px-4 py-1.5 text-xs font-medium">
+                        <span>{period}</span>
+                        <CostBadge cost={periodCosts.get(period)} loading={costsLoading} />
+                      </div>
+                      {/* Workspaces in this period */}
+                      {periodWorkspaces.map((workspace) => {
+                        const isProcessing =
+                          processingIds.has(workspace.id) || workspace.isRemoving;
+                        const isSelected = selectedIds.has(workspace.id);
+                        const workspaceNameForTooltip =
+                          workspace.title && workspace.title !== workspace.name
+                            ? workspace.name
+                            : undefined;
+                        const displayTitle = workspace.title ?? workspace.name;
+                        const canDeleteWorktree = canDeleteManagedWorktree(workspace);
+                        const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
 
-                      return (
-                        <div
-                          key={workspace.id}
-                          className={cn(
-                            "border-border flex items-center gap-3 border-b px-4 py-2.5 last:border-b-0",
-                            isProcessing && "opacity-50",
-                            isSelected && "bg-white/5"
-                          )}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onClick={(e) => handleCheckboxClick(workspace.id, e)}
-                            onChange={() => undefined} // Controlled by onClick for shift-click support
-                            className="h-4 w-4 rounded border-gray-600 bg-transparent"
-                            aria-label={`Select ${displayTitle}`}
-                          />
-                          <RuntimeBadge
-                            runtimeConfig={workspace.runtimeConfig}
-                            isWorking={false}
-                            workspacePath={workspace.namedWorkspacePath}
-                            workspaceName={workspaceNameForTooltip}
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="text-foreground truncate text-sm font-medium">
-                              {displayTitle}
+                        return (
+                          <div
+                            key={workspace.id}
+                            className={cn(
+                              "border-border flex items-center gap-3 border-b px-4 py-2.5 last:border-b-0",
+                              isProcessing && "opacity-50",
+                              isSelected && "bg-white/5"
+                            )}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onClick={(e) => handleCheckboxClick(workspace.id, e)}
+                              onChange={() => undefined} // Controlled by onClick for shift-click support
+                              className="h-4 w-4 rounded border-gray-600 bg-transparent"
+                              aria-label={`Select ${displayTitle}`}
+                            />
+                            <RuntimeBadge
+                              runtimeConfig={workspace.runtimeConfig}
+                              isWorking={false}
+                              workspacePath={workspace.namedWorkspacePath}
+                              workspaceName={workspaceNameForTooltip}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="text-foreground truncate text-sm font-medium">
+                                {displayTitle}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {workspace.archivedAt && (
+                                  <span className="text-muted text-xs">
+                                    {new Date(workspace.archivedAt).toLocaleString(undefined, {
+                                      month: "short",
+                                      day: "numeric",
+                                      hour: "numeric",
+                                      minute: "2-digit",
+                                    })}
+                                  </span>
+                                )}
+                                <CostBadge
+                                  cost={costsByWorkspace[workspace.id]}
+                                  loading={costsLoading}
+                                  size="sm"
+                                />
+                              </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                              {workspace.archivedAt && (
-                                <span className="text-muted text-xs">
-                                  {new Date(workspace.archivedAt).toLocaleString(undefined, {
-                                    month: "short",
-                                    day: "numeric",
-                                    hour: "numeric",
-                                    minute: "2-digit",
-                                  })}
-                                </span>
-                              )}
-                              <CostBadge
-                                cost={costsByWorkspace[workspace.id]}
-                                loading={costsLoading}
-                                size="sm"
-                              />
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) =>
-                                    void handleUnarchive(workspace.id, event.currentTarget)
-                                  }
-                                  disabled={isProcessing}
-                                  className="text-muted hover:text-foreground rounded p-1.5 transition-colors hover:bg-white/10 disabled:opacity-50"
-                                  aria-label={`Restore workspace ${displayTitle}`}
-                                >
-                                  <ArchiveRestoreIcon className="h-4 w-4" />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent>Restore to sidebar</TooltipContent>
-                            </Tooltip>
-                            {canDeleteWorktree && (
+                            <div className="flex items-center gap-1">
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
                                     onClick={(event) =>
-                                      void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                      void handleUnarchive(workspace.id, event.currentTarget)
                                     }
                                     disabled={isProcessing}
-                                    className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"
-                                    aria-label={`Remove local checkout for workspace ${displayTitle}`}
+                                    className="text-muted hover:text-foreground rounded p-1.5 transition-colors hover:bg-white/10 disabled:opacity-50"
+                                    aria-label={`Restore workspace ${displayTitle}`}
                                   >
-                                    {isDeletingWorktree ? (
-                                      <Loader2 className="h-4 w-4 animate-spin" />
-                                    ) : (
-                                      <FolderX className="h-4 w-4" />
-                                    )}
+                                    <ArchiveRestoreIcon className="h-4 w-4" />
                                   </button>
                                 </TooltipTrigger>
-                                <TooltipContent>Remove local checkout</TooltipContent>
+                                <TooltipContent>Restore to sidebar</TooltipContent>
                               </Tooltip>
-                            )}
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) =>
-                                    void handleDelete(workspace.id, {
-                                      bypassForceConfirm: event.shiftKey,
-                                    })
-                                  }
-                                  disabled={isProcessing}
-                                  className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-red-400 disabled:opacity-50"
-                                  aria-label={`Delete workspace ${displayTitle}`}
-                                >
-                                  <Trash2 className="h-4 w-4" />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent>Delete permanently (local branch too)</TooltipContent>
-                            </Tooltip>
+                              {canDeleteWorktree && (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <button
+                                      onClick={(event) =>
+                                        void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                      }
+                                      disabled={isProcessing}
+                                      className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"
+                                      aria-label={`Remove local checkout for workspace ${displayTitle}`}
+                                    >
+                                      {isDeletingWorktree ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <FolderX className="h-4 w-4" />
+                                      )}
+                                    </button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>Remove local checkout</TooltipContent>
+                                </Tooltip>
+                              )}
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    onClick={(event) =>
+                                      void handleDelete(workspace.id, {
+                                        bypassForceConfirm: event.shiftKey,
+                                      })
+                                    }
+                                    disabled={isProcessing}
+                                    className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-red-400 disabled:opacity-50"
+                                    aria-label={`Delete workspace ${displayTitle}`}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  Delete permanently (local branch too)
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))
-              )}
+                        );
+                      })}
+                    </div>
+                  ))}
             </div>
           </div>
         )}

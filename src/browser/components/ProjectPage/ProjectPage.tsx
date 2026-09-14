@@ -89,13 +89,21 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
 
   const syncArchivedState = useCallback(() => {
     const next = Array.from(archivedMapRef.current.values());
-    setArchivedWorkspaces((prev) => {
-      if (prev && archivedListsEqual(prev, next)) return prev;
-      // Persist to localStorage for optimistic cache on next load
-      updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
-      return next;
-    });
+    // Persist outside the state updater: a restore navigates away before its refresh
+    // resolves, and an unmounted component's updater never runs, so the next mount
+    // would otherwise start from a cache that still lists the restored workspace.
+    updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
+    setArchivedWorkspaces((prev) => (prev && archivedListsEqual(prev, next) ? prev : next));
   }, [projectPath]);
+
+  const replaceArchivedList = useCallback(
+    (allArchived: FrontendWorkspaceMetadata[]) => {
+      const projectArchived = allArchived.filter((w) => w.projectPath === projectPath);
+      archivedMapRef.current = new Map(projectArchived.map((w) => [w.id, w]));
+      syncArchivedState();
+    },
+    [projectPath, syncArchivedState]
+  );
 
   // Keep archived metadata off the project page startup path.
   useEffect(() => {
@@ -106,10 +114,8 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
       try {
         const allArchived = await api.workspace.list({ archived: true });
         if (cancelled) return;
-        const projectArchived = allArchived.filter((w) => w.projectPath === projectPath);
-        archivedMapRef.current = new Map(projectArchived.map((w) => [w.id, w]));
         setArchivedLoadError(undefined);
-        syncArchivedState();
+        replaceArchivedList(allArchived);
       } catch (error) {
         console.error("Failed to load archived workspaces:", error);
         if (!cancelled) setArchivedLoadError(getErrorMessage(error));
@@ -120,7 +126,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     return () => {
       cancelled = true;
     };
-  }, [api, projectPath, syncArchivedState, archivedExpanded]);
+  }, [api, replaceArchivedList, archivedExpanded]);
 
   // Subscribe to metadata events to reactively update archived list
   useEffect(() => {
@@ -170,9 +176,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           onWorkspacesChanged={() => {
             // Refresh archived list after unarchive/delete
             if (!api) return;
-            void api.workspace.list({ archived: true }).then((all) => {
-              setArchivedWorkspaces(all.filter((w) => w.projectPath === projectPath));
-            });
+            void api.workspace.list({ archived: true }).then(replaceArchivedList);
           }}
         />
       </div>

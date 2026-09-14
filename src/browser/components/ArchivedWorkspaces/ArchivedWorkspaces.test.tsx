@@ -2,7 +2,13 @@ import "../../../../tests/ui/dom";
 
 import { type ComponentProps, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  waitForElementToBeRemoved,
+} from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
@@ -26,7 +32,7 @@ import {
   getArchivedWorkspacesExpandedKey,
   getArchivedWorkspacesKey,
 } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
 
@@ -197,7 +203,10 @@ describe("ArchivedWorkspaces", () => {
     expect(getSessionUsageBatchMock).not.toHaveBeenCalled();
     expect(view.queryByRole("region", { name: "Archived workspaces" })).toBeNull();
     expect(readWorkspaceId).not.toHaveBeenCalled();
+    // A collapsed header must not advertise a count it cannot keep fresh.
+    expect(view.getByText("Archived Workspaces").textContent).toBe("Archived Workspaces");
     fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    expect(view.getByText("Archived Workspaces (1)")).toBeTruthy();
     await waitFor(() => expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1));
     expect(getSessionUsageBatchMock).toHaveBeenCalledWith({ workspaceIds: [workspace.id] });
     fireEvent.click(view.getByLabelText("Collapse archived workspaces"));
@@ -254,17 +263,62 @@ describe("ArchivedWorkspaces", () => {
 
   test("resets archived state when the project page switches projects", () => {
     stubPageChrome();
-    const list = mock(() => Promise.resolve([]));
-    stubPageApi(list, getSessionUsageBatchMock);
-    updatePersistedState(getArchivedWorkspacesKey("/project-a"), [
-      createWorkspace({ id: "a-1", projectPath: "/project-a" }),
-    ]);
+    stubPageApi(
+      mock(() => new Promise<FrontendWorkspaceMetadata[]>(() => undefined)),
+      getSessionUsageBatchMock
+    );
+    const cached = createWorkspace({ id: "a-1", name: "from-a", projectPath: "/project-a" });
+    updatePersistedState(getArchivedWorkspacesKey("/project-a"), [cached]);
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/project-a"), true);
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/project-b"), true);
     const view = render(<ProjectPage {...pageProps} projectPath="/project-a" projectName="a" />);
-    expect(view.getByText("Archived Workspaces (1)")).toBeTruthy();
+    expect(view.getByLabelText("Restore workspace from-a")).toBeTruthy();
     view.rerender(<ProjectPage {...pageProps} projectPath="/project-b" projectName="b" />);
-    expect(view.queryByText("Archived Workspaces (1)")).toBeNull();
-    expect(view.getByText("Archived Workspaces")).toBeTruthy();
-    expect(list).not.toHaveBeenCalled();
+    expect(view.queryByLabelText("Restore workspace from-a")).toBeNull();
+    expect(view.getByRole("region", { name: "Archived workspaces" }).textContent).toContain(
+      "Loading archived workspaces"
+    );
+  });
+
+  test("shows a refresh failure above cached rows without hiding them", () => {
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const workspace = createWorkspace({ id: "cached-1", name: "cached" });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath="/tmp/project"
+        projectName="project"
+        workspaces={[workspace]}
+        loadError="disk on fire"
+      />
+    );
+    const region = view.getByRole("region", { name: "Archived workspaces" });
+    expect(region.textContent).toContain("Failed to load archived workspaces: disk on fire");
+    expect(view.getByLabelText("Restore workspace cached")).toBeTruthy();
+  });
+
+  test("persists the refreshed archive list after a restore", async () => {
+    stubPageChrome();
+    const workspace = createWorkspace({ id: "restore-me", name: "restore-me" });
+    const list = mock(() => Promise.resolve([workspace]));
+    stubPageApi(list, getSessionUsageBatchMock);
+    updatePersistedState(getArchivedWorkspacesExpandedKey(workspace.projectPath), true);
+    const view = render(
+      <ProjectPage
+        {...pageProps}
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+      />
+    );
+    const restore = await waitFor(() => view.getByLabelText("Restore workspace restore-me"));
+    list.mockImplementation(() => Promise.resolve<FrontendWorkspaceMetadata[]>([]));
+    fireEvent.click(restore);
+    await waitForElementToBeRemoved(() => view.queryByLabelText("Restore workspace restore-me"));
+    expect(
+      readPersistedState<FrontendWorkspaceMetadata[] | undefined>(
+        getArchivedWorkspacesKey(workspace.projectPath),
+        undefined
+      )
+    ).toEqual([]);
   });
 
   test("distinguishes a pending archive load from an empty archive", () => {
