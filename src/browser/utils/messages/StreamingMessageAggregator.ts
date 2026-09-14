@@ -683,21 +683,6 @@ export class StreamingMessageAggregator {
   // reconnect. Consumed in handleToolCallStart, cleared in cleanupStreamState.
   private stashedToolExecutionStarts = new Map<string, Map<string, number>>();
 
-  // Session-level timing stats: model -> stats (totals computed on-the-fly)
-  private sessionTimingStats: Record<
-    string,
-    {
-      totalDurationMs: number;
-      totalToolExecutionMs: number;
-      totalTtftMs: number;
-      ttftCount: number;
-      responseCount: number;
-      totalOutputTokens: number;
-      totalReasoningTokens: number;
-      totalStreamingMs: number; // Cumulative streaming time (for accurate tok/s)
-    }
-  > = {};
-
   // Workspace creation timestamp (used for recency calculation)
   // REQUIRED: Backend guarantees every workspace has createdAt via config.ts
   private readonly createdAt: string;
@@ -798,11 +783,6 @@ export class StreamingMessageAggregator {
     } catch {
       // Ignore localStorage errors
     }
-  }
-
-  /** Clear all session timing stats (in-memory only). */
-  clearSessionTimingStats(): void {
-    this.sessionTimingStats = {};
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
@@ -995,81 +975,6 @@ export class StreamingMessageAggregator {
 
     // Drop unconsumed execution starts (e.g. the tool part never materialized).
     this.stashedToolExecutionStarts.delete(messageId);
-
-    // Capture timing stats before removing the stream context
-    const context = this.activeStreams.get(messageId);
-    if (context) {
-      const endTime = Date.now();
-      const message = this.messages.get(messageId);
-
-      // Prefer backend-provided duration (computed in the same clock domain as tool/delta timestamps).
-      // Fall back to renderer-based timing translated into the renderer clock.
-      const durationMsFromMetadata = message?.metadata?.duration;
-      const fallbackStartTime = this.translateServerTime(context, context.serverStartTime);
-      const fallbackDurationMs = Math.max(0, endTime - fallbackStartTime);
-      const durationMs =
-        typeof durationMsFromMetadata === "number" && Number.isFinite(durationMsFromMetadata)
-          ? durationMsFromMetadata
-          : fallbackDurationMs;
-
-      const ttftMs =
-        context.serverFirstTokenTime !== null
-          ? Math.max(0, context.serverFirstTokenTime - context.serverStartTime)
-          : null;
-
-      // Get output tokens from cumulative usage (if available).
-      // Fall back to message metadata for abort/error cases where clearTokenState was
-      // called before cleanupStreamState (e.g., stream abort event handler ordering).
-      const cumulativeUsage = this.activeStreamUsage.get(messageId)?.cumulative.usage;
-      const metadataUsage = message?.metadata?.usage;
-      const outputTokens = cumulativeUsage?.outputTokens ?? metadataUsage?.outputTokens ?? 0;
-      const reasoningTokens =
-        cumulativeUsage?.reasoningTokens ?? metadataUsage?.reasoningTokens ?? 0;
-
-      // Account for in-progress tool calls (can happen on abort/error)
-      let totalToolExecutionMs = context.toolExecutionMs;
-      if (context.pendingToolStarts.size > 0) {
-        const serverEndTime = context.serverStartTime + durationMs;
-        for (const toolStartTime of context.pendingToolStarts.values()) {
-          const toolMs = serverEndTime - toolStartTime;
-          if (toolMs > 0) {
-            totalToolExecutionMs += toolMs;
-          }
-        }
-      }
-
-      // Streaming duration excludes TTFT and tool execution - used for avg tok/s
-      const streamingMs = Math.max(0, durationMs - (ttftMs ?? 0) - totalToolExecutionMs);
-
-      const mode = message?.metadata?.mode ?? context.mode;
-
-      // Use composite key model:mode for per-model+mode stats
-      // Old data (no mode) will just use model as key, maintaining backward compat
-      const statsKey = mode ? `${context.model}:${mode}` : context.model;
-
-      // Accumulate into per-model stats (totals computed on-the-fly in getSessionTimingStats)
-      const modelStats = this.sessionTimingStats[statsKey] ?? {
-        totalDurationMs: 0,
-        totalToolExecutionMs: 0,
-        totalTtftMs: 0,
-        ttftCount: 0,
-        responseCount: 0,
-        totalOutputTokens: 0,
-        totalReasoningTokens: 0,
-        totalStreamingMs: 0,
-      };
-      modelStats.totalDurationMs += durationMs;
-      modelStats.totalToolExecutionMs += totalToolExecutionMs;
-      modelStats.responseCount += 1;
-      modelStats.totalOutputTokens += outputTokens;
-      modelStats.totalReasoningTokens += reasoningTokens;
-      modelStats.totalStreamingMs += streamingMs;
-      if (ttftMs !== null) {
-        modelStats.totalTtftMs += ttftMs;
-        modelStats.ttftCount += 1;
-      }
-      this.sessionTimingStats[statsKey] = modelStats;
-    }
 
     this.activeStreams.delete(messageId);
     // Restore persisted status - clears transient displayStatus, preserves status_set values
@@ -1800,112 +1705,6 @@ export class StreamingMessageAggregator {
       liveTokenCount: this.getStreamingTokenCount(messageId),
       liveTPS: this.getStreamingTPS(messageId),
       mode: context.mode,
-    };
-  }
-
-  /**
-   * Get aggregate timing statistics across all completed streams in this session.
-   * Totals are computed on-the-fly from per-model data.
-   * Returns null if no streams have completed yet.
-   *
-   * Session timing keys use format "model" or "model:mode" (e.g., "claude-opus-4:plan").
-   * The byModelAndMode map preserves this structure for mode breakdown display.
-   */
-  getSessionTimingStats(): {
-    totalDurationMs: number;
-    totalToolExecutionMs: number;
-    totalStreamingMs: number;
-    averageTtftMs: number | null;
-    responseCount: number;
-    totalOutputTokens: number;
-    totalReasoningTokens: number;
-    /** Per-model timing breakdown (keys are composite: "model" or "model:mode") */
-    byModel: Record<
-      string,
-      {
-        totalDurationMs: number;
-        totalToolExecutionMs: number;
-        totalStreamingMs: number;
-        averageTtftMs: number | null;
-        responseCount: number;
-        totalOutputTokens: number;
-        totalReasoningTokens: number;
-        /** Mode extracted from composite key, undefined for old data */
-        mode?: string;
-      }
-    >;
-  } | null {
-    const modelEntries = Object.entries(this.sessionTimingStats);
-    if (modelEntries.length === 0) return null;
-
-    // Aggregate totals from per-model stats
-    let totalDurationMs = 0;
-    let totalToolExecutionMs = 0;
-    let totalStreamingMs = 0;
-    let totalTtftMs = 0;
-    let ttftCount = 0;
-    let responseCount = 0;
-    let totalOutputTokens = 0;
-    let totalReasoningTokens = 0;
-
-    const byModel: Record<
-      string,
-      {
-        totalDurationMs: number;
-        totalToolExecutionMs: number;
-        totalStreamingMs: number;
-        averageTtftMs: number | null;
-        responseCount: number;
-        totalOutputTokens: number;
-        totalReasoningTokens: number;
-        mode?: string;
-      }
-    > = {};
-
-    for (const [key, stats] of modelEntries) {
-      // Parse composite key: "model" or "model:mode"
-      // Model names can contain colons (e.g., "mux-gateway:provider/model")
-      // so we look for ":plan" or ":exec" suffix specifically
-      let mode: string | undefined;
-      if (key.endsWith(":plan")) {
-        mode = "plan";
-      } else if (key.endsWith(":exec")) {
-        mode = "exec";
-      }
-
-      // Accumulate totals
-      totalDurationMs += stats.totalDurationMs;
-      totalToolExecutionMs += stats.totalToolExecutionMs;
-      totalStreamingMs += stats.totalStreamingMs ?? 0;
-      totalTtftMs += stats.totalTtftMs;
-      ttftCount += stats.ttftCount;
-      responseCount += stats.responseCount;
-      totalOutputTokens += stats.totalOutputTokens;
-      totalReasoningTokens += stats.totalReasoningTokens;
-
-      // Convert to display format (with computed average)
-      // Keep composite key as-is - StatsTab will parse/aggregate as needed
-      byModel[key] = {
-        totalDurationMs: stats.totalDurationMs,
-        totalToolExecutionMs: stats.totalToolExecutionMs,
-        totalStreamingMs: stats.totalStreamingMs ?? 0,
-        averageTtftMs: stats.ttftCount > 0 ? stats.totalTtftMs / stats.ttftCount : null,
-        responseCount: stats.responseCount,
-        totalOutputTokens: stats.totalOutputTokens,
-        totalReasoningTokens: stats.totalReasoningTokens,
-        mode,
-      };
-    }
-
-    return {
-      totalDurationMs,
-      totalToolExecutionMs,
-      totalStreamingMs,
-      averageTtftMs: ttftCount > 0 ? totalTtftMs / ttftCount : null,
-      responseCount,
-      totalOutputTokens,
-      totalReasoningTokens,
-      byModel,
     };
   }
 

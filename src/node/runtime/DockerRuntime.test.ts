@@ -113,7 +113,6 @@ function getGhSetupCall(runtime: CredentialTestDockerRuntime): ExecCall | undefi
 }
 
 describe("DockerRuntime constructor", () => {
-
   it("should return /src for workspace path", () => {
     const runtime = new DockerRuntime({ image: "ubuntu:22.04" });
     expect(runtime.getWorkspacePath("/any/project", "any-branch")).toBe("/src");

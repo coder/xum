@@ -2481,7 +2481,6 @@ export class WorkspaceStore {
    * Clear timing stats for a workspace.
    *
    * - Clears backend-persisted timing file (session-timing.json) when available.
-   * - Clears in-memory timing derived from StreamingMessageAggregator.
    */
   clearTimingStats(workspaceId: string): void {
     if (this.client) {
@@ -2499,12 +2498,6 @@ export class WorkspaceStore {
         .catch((error) => {
           console.warn(`Failed to clear timing stats for ${workspaceId}:`, error);
         });
-    }
-
-    const aggregator = this.aggregators.get(workspaceId);
-    if (aggregator) {
-      aggregator.clearSessionTimingStats();
-      this.states.bump(workspaceId);
     }
   }
 
@@ -2755,10 +2748,6 @@ export class WorkspaceStore {
     }
 
     return null;
-  }
-
-  getWorkspaceLastUserPrompt(workspaceId: string): string | null {
-    return this.getWorkspaceLastUserPromptInfo(workspaceId)?.text ?? null;
   }
 
   getWorkspaceLastUserPromptSnapshot(workspaceId: string): WorkspaceLastUserPromptSnapshot {
@@ -4983,10 +4972,6 @@ export function useWorkspaceLastUserPromptInfo(
   return fallback?.workspaceId === workspaceId && fallback.historyEpoch === historyEpoch
     ? (displayed ?? fallback.prompt)
     : displayed;
-}
-
-export function useWorkspaceLastUserPrompt(workspaceId: string): string | null {
-  return useWorkspaceLastUserPromptInfo(workspaceId)?.text ?? null;
 }
 
 /**

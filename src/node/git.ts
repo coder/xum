@@ -222,54 +222,6 @@ export async function createWorktree(
   }
 }
 
-/**
- * Get the main repository path from a worktree path
- * @param worktreePath Path to a git worktree
- * @returns Path to the main repository, or null if not found
- */
-export async function getMainWorktreeFromWorktree(worktreePath: string): Promise<string | null> {
-  try {
-    // Get the worktree list from the worktree itself
-    using proc = execFileAsync("git", ["-C", worktreePath, "worktree", "list", "--porcelain"]);
-    const { stdout } = await proc.result;
-    const lines = stdout.split("\n");
-
-    // The first worktree in the list is always the main worktree
-    for (const line of lines) {
-      if (line.startsWith("worktree ")) {
-        return line.slice("worktree ".length);
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-export async function removeWorktree(
-  projectPath: string,
-  workspacePath: string,
-  options: { force: boolean } = { force: false }
-): Promise<WorktreeResult> {
-  // Clean up stale lock before git operations on main repo
-  cleanStaleLock(projectPath);
-
-  try {
-    // Remove the worktree (from the main repository context)
-    const args = ["-C", projectPath, "worktree", "remove", workspacePath];
-    if (options.force) {
-      args.push("--force");
-    }
-    using proc = execFileAsync("git", args);
-    await proc.result;
-    return { success: true };
-  } catch (error) {
-    const message = getErrorMessage(error);
-    return { success: false, error: message };
-  }
-}
-
 export async function pruneWorktrees(projectPath: string): Promise<WorktreeResult> {
   // Clean up stale lock before git operations on main repo
   cleanStaleLock(projectPath);
