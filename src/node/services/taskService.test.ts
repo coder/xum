@@ -8,6 +8,7 @@ import { existsSync } from "fs";
 import * as os from "os";
 import { execSync } from "node:child_process";
 import {
+  TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
@@ -31965,6 +31966,292 @@ describe("TaskService", () => {
       } finally {
         await session.dispose();
         await sessionHarness.cleanup();
+      }
+    });
+  });
+
+  describe("teardown ownership and lock isolation", () => {
+    const rootId = "root-teardown";
+    const unrelatedParentId = "1111111111";
+
+    /** Fire only the termination timers immediately; every other timer keeps its delay. */
+    function shortenTerminationTimers(): () => void {
+      const originalSetTimeout = globalThis.setTimeout;
+      const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        timeout?: number
+      ) => {
+        if (
+          timeout === TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS ||
+          timeout === TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+        ) {
+          return originalSetTimeout(handler, 0);
+        }
+        return originalSetTimeout(handler, timeout);
+      }) as typeof setTimeout);
+      return () => spy.mockRestore();
+    }
+
+    async function setupTree(descendants: Array<string | { id: string; parent: string }>) {
+      const descendantEntries = descendants.map((descendant) =>
+        typeof descendant === "string" ? { id: descendant, parent: rootId } : descendant
+      );
+      const config = await createTestConfig(rootDir);
+      const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: projectPath,
+            id: unrelatedParentId,
+            name: "unrelated-parent",
+            createdAt: new Date().toISOString(),
+            runtimeConfig: { type: "local" },
+            aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+          },
+          projectWorkspace(projectPath, "root", rootId),
+          ...descendantEntries.map(({ id, parent }) =>
+            projectWorkspace(projectPath, id, id, {
+              parentWorkspaceId: parent,
+              agentType: "explore",
+              taskStatus: "running",
+            })
+          ),
+        ],
+        testTaskSettings(4, 3)
+      );
+      return { config, projectPath };
+    }
+
+    async function waitUntil(condition: () => boolean, label: string): Promise<void> {
+      const deadline = Date.now() + 2_000;
+      while (!condition()) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    }
+
+    /** Controlled stopStream: hung ids never settle until the test resolves them. */
+    function controlledStopStream(hungIds: Set<string>) {
+      const pending = new Map<string, ReturnType<typeof Promise.withResolvers<Result<void>>>>();
+      const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+        if (!hungIds.has(workspaceId)) return Promise.resolve(Ok(undefined));
+        const gate = Promise.withResolvers<Result<void>>();
+        pending.set(workspaceId, gate);
+        return gate.promise;
+      });
+      return { stopStream, pending };
+    }
+
+    test("a hung descendant stop neither holds the global mutex nor unbounds teardown; its latch is retained", async () => {
+      const stuckId = "task-stuck";
+      const siblingId = "task-sibling";
+      const { config } = await setupTree([stuckId, siblingId]);
+      stubStableIds(config, ["unrelatedchild1"]);
+      const { stopStream, pending } = controlledStopStream(new Set([stuckId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const clearQueue = mock((_workspaceId: string): Result<void> => Ok(undefined));
+      const { workspaceService } = createWorkspaceServiceMocks({ clearQueue });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        const waiter = taskService
+          .waitForAgentReport(stuckId, { timeoutMs: 5_000, requestingWorkspaceId: rootId })
+          .then(
+            () => "resolved" as const,
+            (error: unknown) => (error instanceof Error ? error.message : "rejected")
+          );
+        const teardown = taskService.terminateAllDescendantAgentTasks(rootId);
+        // The stop is pending (hung) — an unrelated tree must still be able to create tasks.
+        await waitUntil(() => pending.has(stuckId), "the hung stop to be issued");
+        const unrelated = await taskService.createMany([
+          {
+            parentWorkspaceId: unrelatedParentId,
+            kind: "agent" as const,
+            agentId: "explore",
+            prompt: "unrelated work",
+            title: "Unrelated",
+          },
+        ]);
+        expect(unrelated.success).toBe(true);
+
+        const interrupted = await teardown;
+        expect(new Set(interrupted)).toEqual(new Set([stuckId, siblingId]));
+        expect(findWorkspaceInConfig(config, stuckId)?.taskStatus).toBe("interrupted");
+        expect(findWorkspaceInConfig(config, siblingId)?.taskStatus).toBe("interrupted");
+        expect(await waiter).toBe("Parent workspace interrupted");
+        // Exactly one queue clear and one stop per descendant, issued while latched.
+        expect(clearQueue.mock.calls.map((call) => call[0]).sort()).toEqual(
+          [stuckId, siblingId].sort()
+        );
+        expect(stopStream.mock.calls.filter((call) => call[0] === stuckId)).toHaveLength(1);
+        expect(stopStream.mock.calls.filter((call) => call[0] === siblingId)).toHaveLength(1);
+        // Hung cleanup keeps the latch; the settled sibling is free.
+        expect(taskService.isWorkspaceStopInProgress(stuckId)).toBe(true);
+        expect(taskService.isWorkspaceStopInProgress(siblingId)).toBe(false);
+
+        // The original promise settling later is only a recheck, and settlement evidence for a
+        // plain (idle-at-capture) child was already recorded, so the latch drops now.
+        pending.get(stuckId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(stuckId)).toBe(false);
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("several hung descendants are bounded by the aggregate deadline, not n × per-child timeout", async () => {
+      const hung = ["task-hung-a", "task-hung-b", "task-hung-c"];
+      const { config } = await setupTree(hung);
+      const { stopStream } = controlledStopStream(new Set(hung));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const events: string[] = [];
+      const originalSetTimeout = globalThis.setTimeout;
+      const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        timeout?: number
+      ) => {
+        if (timeout === TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS) {
+          events.push("child-armed");
+          return originalSetTimeout(() => {
+            events.push("child-fired");
+            handler();
+          }, 0);
+        }
+        if (timeout === TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS) {
+          events.push("aggregate-armed");
+          return originalSetTimeout(handler, 0);
+        }
+        return originalSetTimeout(handler, timeout);
+      }) as typeof setTimeout);
+      try {
+        const interrupted = await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(new Set(interrupted)).toEqual(new Set(hung));
+        // Every descendant's stop is issued and its per-child deadline armed BEFORE the first
+        // per-child deadline fires: the waits run concurrently under one aggregate deadline,
+        // never chained one 20 s timeout after another.
+        expect(stopStream).toHaveBeenCalledTimes(hung.length);
+        const firstFired = events.indexOf("child-fired");
+        expect(firstFired).toBeGreaterThan(0);
+        expect(events.slice(0, firstFired).filter((e) => e === "child-armed").length).toBe(
+          hung.length
+        );
+        expect(events.filter((e) => e === "aggregate-armed")).toHaveLength(1);
+        for (const id of hung) {
+          expect(findWorkspaceInConfig(config, id)?.taskStatus).toBe("interrupted");
+          expect(taskService.isWorkspaceStopInProgress(id)).toBe(true);
+        }
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test("a latch releases only when the captured owner settled AND its cleanup finished, in either order", async () => {
+      const childId = "task-owned";
+      const { config } = await setupTree([childId]);
+      const { stopStream, pending } = controlledStopStream(new Set([childId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      // The child owns an admitted turn at capture; settlement arrives via the seam signal.
+      const turnGeneration = Symbol("captured-turn");
+      const turnSettledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
+      const { workspaceService } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock(() => turnGeneration),
+        onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+          turnSettledListeners.add(listener);
+          return () => turnSettledListeners.delete(listener);
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const settleTurn = (turn: symbol) => {
+        for (const listener of turnSettledListeners) listener(childId, turn);
+      };
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("interrupted");
+        // Persisted interrupted status alone is not evidence: owner unsettled, cleanup pending.
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+
+        // Order 1: owner settles while cleanup is still pending → still latched.
+        settleTurn(Symbol("unrelated-generation"));
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        settleTurn(turnGeneration);
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        // Cleanup's ORIGINAL promise settling rechecks and now releases.
+        pending.get(childId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("cleanup settling before the owner keeps the latch until the owner's authoritative settlement", async () => {
+      const childId = "task-owned-late";
+      const { config } = await setupTree([childId]);
+      const { stopStream, pending } = controlledStopStream(new Set([childId]));
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const turnGeneration = Symbol("captured-turn");
+      const turnSettledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
+      const { workspaceService } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock(() => turnGeneration),
+        onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+          turnSettledListeners.add(listener);
+          return () => turnSettledListeners.delete(listener);
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        // Order 2: cleanup resolves (even with stop success) but the owner is still live.
+        pending.get(childId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        // Persisted-status callers merely recheck; they cannot manufacture evidence.
+        (
+          taskService as unknown as { releaseRetainedStopLatches: (id: string) => void }
+        ).releaseRetainedStopLatches(childId);
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        for (const listener of turnSettledListeners) listener(childId, turnGeneration);
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+      } finally {
+        restoreTimers();
+      }
+    });
+
+    test("stopping a subtree and terminating a subtree issue clearQueue/stopStream once per descendant outside the mutex", async () => {
+      const childId = "task-subtree";
+      const grandchildId = "task-subtree-leaf";
+      const { config } = await setupTree([childId, { id: grandchildId, parent: childId }]);
+      const { stopStream, pending } = controlledStopStream(new Set([grandchildId]));
+      const isStreaming = mock(() => true);
+      const { aiService } = createAIServiceMocks(config, { stopStream, isStreaming });
+      const clearQueue = mock((_workspaceId: string): Result<void> => Ok(undefined));
+      const { workspaceService } = createWorkspaceServiceMocks({ clearQueue });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const restoreTimers = shortenTerminationTimers();
+      try {
+        const stopping = taskService.stopDescendantAgentTask(rootId, childId);
+        await waitUntil(() => pending.has(grandchildId), "the hung grandchild stop to be issued");
+        // Global mutex free while the grandchild's stop hangs.
+        const lock = await taskService.acquireTaskCreationLock();
+        await lock[Symbol.asyncDispose]();
+        const stopped = await stopping;
+        expect(stopped.success).toBe(true);
+        expect(clearQueue.mock.calls.filter((call) => call[0] === grandchildId)).toHaveLength(1);
+        expect(clearQueue.mock.calls.filter((call) => call[0] === childId)).toHaveLength(1);
+        expect(stopStream.mock.calls.filter((call) => call[0] === grandchildId)).toHaveLength(1);
+        expect(findWorkspaceInConfig(config, grandchildId)?.taskStatus).toBe("interrupted");
+        expect(taskService.isWorkspaceStopInProgress(grandchildId)).toBe(true);
+        pending.get(grandchildId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(grandchildId)).toBe(false);
+      } finally {
+        restoreTimers();
       }
     });
   });

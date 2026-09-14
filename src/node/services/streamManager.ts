@@ -323,6 +323,12 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   onStreamConstructed?: () => Promise<void>;
   assertAdmissionCurrent?: () => Promise<void>;
   withAdmissionCurrent?: (construct: () => void) => Promise<void>;
+  /**
+   * Provider-start fence: false once a stop cascade latched the workspace or bumped its epoch
+   * after this turn's admission. Checked synchronously right before provider construction so
+   * no start can slip between the cascade's capture and the request.
+   */
+  stopFence?: () => boolean;
 }
 
 type StreamRequestInput = StreamRequestOptions & {
@@ -847,6 +853,8 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
 interface PendingStreamStartHandle {
   readonly abortSignal: AbortSignal;
   readonly syntheticMessageId: string;
+  /** Cancel this start before its provider request (startup abort settles it). */
+  abort(reason: StreamAbortReason): void;
   finish(): void;
 }
 
@@ -856,6 +864,13 @@ export interface StopStreamOptions {
   abortReason?: StreamAbortReason;
   /** Teardown of an already-settled attempt must not manufacture a second raw terminal. */
   emitIfMissing?: boolean;
+  /**
+   * Execution the caller captured when it decided to stop. When the workspace's current
+   * registered (or pending) start is a DIFFERENT message, the call is a no-op success: a late
+   * stop must never cancel a replacement admitted after the caller's capture. Defense in depth
+   * only — admission barriers, not this guard, keep replacements from starting mid-stop.
+   */
+  expectedMessageId?: string;
 }
 
 interface MockStreamLifecycle {
@@ -1008,6 +1023,7 @@ export class StreamManager {
     return {
       abortSignal: abortController.signal,
       syntheticMessageId,
+      abort: (reason) => abortController.abort(reason),
       finish: () => {
         if (finished) return;
         finished = true;
@@ -5454,6 +5470,12 @@ export class StreamManager {
         // Record cleanup ownership inside the callback, even if releasing the lock fails.
         const construct = () => {
           if (streamAbortController.signal.aborted) return;
+          // Final synchronous gate before the provider is invoked: a stop that latched after
+          // the earlier checks settles this start as a startup abort instead of a request.
+          if (options.stopFence?.() === false) {
+            streamAbortController.abort("startup");
+            return;
+          }
           registeredStream = this.createStreamAtomically(options, {
             streamToken,
             runtimeTempDir,
@@ -5761,6 +5783,17 @@ export class StreamManager {
     // register a replacement. Never look up a new engine after an asynchronous stop step.
     const pending = this.pendingStreamStarts.get(workspaceId);
     const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
+    if (options?.expectedMessageId != null) {
+      const currentMessageId = streamInfo?.messageId ?? pending?.syntheticMessageId;
+      if (currentMessageId != null && currentMessageId !== options.expectedMessageId) {
+        log.debug("stopStream: skipping stop of a replacement execution", {
+          workspaceId,
+          expectedMessageId: options.expectedMessageId,
+          currentMessageId,
+        });
+        return Ok(undefined);
+      }
+    }
     const mockLifecycle = this.mockStreamLifecycle;
     const isActuallyStreaming = mockLifecycle
       ? mockLifecycle.isStreaming(workspaceId)

@@ -477,6 +477,20 @@ export interface TurnAdmissionHost {
   disposeQueueCut(workspaceId: string, entryId: string): boolean;
   /** Observe `queued-message-changed` for every session (successor outcomes are recorded there). */
   onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void;
+  /**
+   * The session's admitted turn (TurnCoordinator generation) while one is preparing, streaming
+   * or completing; undefined when idle or without a session. A stop cascade captures this to
+   * know which owner must settle before its latch may drop.
+   */
+  getActiveTurnGeneration(workspaceId: string): symbol | undefined;
+  /**
+   * Fires when an admitted turn generation ends for good (finished, preempted, or failed before
+   * any stream), emitted by the owning session's coordinator transition — the authoritative
+   * settlement of that turn, never inferred from an idle probe.
+   */
+  onWorkspaceTurnSettled(
+    listener: (workspaceId: string, turnGeneration: symbol) => void
+  ): () => void;
 }
 
 /**
@@ -625,6 +639,15 @@ export interface AgentTaskIntegration {
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  /**
+   * Admission barrier: true while a stop cascade holds this workspace's latch (from its epoch
+   * bump until the stopped execution has authoritatively settled and cleanup finished). Every
+   * path that could start or feed an execution refuses with
+   * WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE while this is true.
+   */
+  isWorkspaceStopInProgress(workspaceId: string): boolean;
+  /** Monotonic stop generation; an accepted turn captures it at admission for the start fence. */
+  getWorkspaceStopEpoch(workspaceId: string): number;
 }
 
 export interface WorkspaceTurnTaskHost {

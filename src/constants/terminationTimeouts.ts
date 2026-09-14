@@ -1,5 +1,11 @@
 export const TASK_TERMINATION_TOOL_TIMEOUT_MS = 5 * 60 * 1000;
 export const TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS = 20 * 1000;
+/**
+ * Bounds one teardown's WHOLE unlocked cleanup phase (every descendant's clearQueue + stopStream
+ * raced concurrently), so a cascade costs at most this, not descendants × per-child timeout.
+ */
+export const TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS =
+  2 * TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS;
 export const TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS = 2 * 60 * 1000;
 export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 

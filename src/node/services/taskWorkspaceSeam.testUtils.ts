@@ -33,6 +33,8 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     markQueueCutSourceHandled: () => undefined,
     disposeQueueCut: () => false,
     onQueuedMessageChanged: () => () => undefined,
+    getActiveTurnGeneration: () => undefined,
+    onWorkspaceTurnSettled: () => () => undefined,
     archive: () => Promise.resolve(Ok({ kind: "archived" })),
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
@@ -91,6 +93,8 @@ export function makeAgentTaskIntegrationFake(
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    isWorkspaceStopInProgress: () => false,
+    getWorkspaceStopEpoch: () => 0,
     ...overrides,
   };
 }

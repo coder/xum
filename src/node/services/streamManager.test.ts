@@ -1867,6 +1867,43 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
   });
 });
 
+describe("StreamManager - stop scoped to a captured execution", () => {
+  test("expectedMessageId skips a replacement start and still stops the captured one", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-stop";
+    // A start is pending (admitted turn between registration and its provider request).
+    const pending = manager.beginStreamStart({ workspaceId });
+    try {
+      // A late stop captured for an OLDER execution must not cancel this replacement.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: "older-execution" })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(false);
+      // The stop captured for THIS execution proceeds.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: pending.syntheticMessageId })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(true);
+    } finally {
+      pending.finish();
+    }
+  });
+
+  test("a registered stream with a different messageId is left untouched by a scoped stop", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-registered";
+    const abortController = new AbortController();
+    const streamInfo = createStreamInfoForTests({ messageId: "replacement-B", abortController });
+    getWorkspaceStreamsForTests(manager).set(workspaceId, streamInfo);
+    expect(await manager.stopStream(workspaceId, { expectedMessageId: "captured-A" })).toEqual(
+      Ok(undefined)
+    );
+    expect(abortController.signal.aborted).toBe(false);
+    expect(getWorkspaceStreamsForTests(manager).get(workspaceId)).toBe(streamInfo);
+    getWorkspaceStreamsForTests(manager).delete(workspaceId);
+  });
+});
+
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {

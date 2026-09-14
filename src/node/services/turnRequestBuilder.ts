@@ -294,6 +294,8 @@ export interface StreamMessageOptions {
   /** Revalidate recorded admission after asynchronous startup, without acquiring new authority. */
   assertAdmissionCurrent?: () => Promise<void>;
   withAdmissionCurrent?: (construct: () => void) => Promise<void>;
+  /** See TurnExecutionOptions.stopFence; captured at the turn's admission by the session. */
+  stopFence?: () => boolean;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
