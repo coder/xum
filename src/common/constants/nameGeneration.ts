@@ -14,3 +14,11 @@ export const NAME_GEN_PREFERRED_MODELS = [
   getKnownModel("HAIKU").id,
   getKnownModel("GPT_56_LUNA").id,
 ];
+
+/**
+ * Output reserve for the propose_name tool call. Anthropic rejects requests whose
+ * max_tokens does not exceed thinking.budget_tokens, so a naming request that
+ * serializes an Anthropic thinking budget sets maxOutputTokens = budget + this.
+ * A name and a short title need far less than this.
+ */
+export const NAME_GEN_MAX_OUTPUT_TOKENS = 1024;

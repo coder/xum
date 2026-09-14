@@ -89,7 +89,7 @@ import {
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { lookupMinThinkingLevelOverride } from "@/common/utils/thinking/policy";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import {
@@ -7950,48 +7950,63 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const metadata = metadataResult?.success ? metadataResult.data : undefined;
 
     // Defensive config read: tests construct the service with partial Config mocks.
-    let agentAiDefaults: AgentAiDefaults | undefined;
+    let cfg: Pick<ProjectsConfig, "agentAiDefaults" | "defaultModel" | "minThinkingLevelByModel">;
     try {
-      agentAiDefaults = this.config.loadConfigOrDefault().agentAiDefaults;
+      cfg = this.config.loadConfigOrDefault();
     } catch {
-      agentAiDefaults = undefined;
+      cfg = {};
     }
     const nameBucket = metadata?.aiSettingsByAgent?.name_workspace;
+    // The workspace's active model (selected agent first; legacy settings can be
+    // stale once per-agent settings exist), or the caller's models for a workspace
+    // that does not exist yet.
+    const activeModels = metadata
+      ? deriveSideChannelModelCandidates(metadata)
+      : extraFallbackModels;
     const resolved = resolveAgentAiSettings({
       targetAgentId: "name_workspace",
       profile: "interactive",
-      agentAiDefaults,
+      agentAiDefaults: cfg.agentAiDefaults,
       targetWorkspaceSettings: nameBucket
         ? { model: nameBucket.model, thinkingLevel: nameBucket.thinkingLevel }
         : undefined,
+      // A thinking-only naming override inherits the model the user actually
+      // works with (active workspace/caller model, then the configured app
+      // default), not the built-in constant.
+      fallbacks: activeModels.map((model) => ({ model })),
+      defaultModel: cfg.defaultModel,
+      minThinkingLevelByModel: cfg.minThinkingLevelByModel,
     });
 
     const candidates: NameGenerationCandidate[] = [];
-    if (
-      resolved.sources.model.tier !== "default" ||
-      resolved.sources.thinkingLevel.tier !== "default"
-    ) {
-      // Thinking-only overrides are still explicit settings when the model inherits.
-      // Selected (not effective) thinking: the generator clamps against the
-      // creation-time route/config receipt rather than this resolver's view.
-      candidates.push({
-        model: resolved.selected.model,
-        thinkingLevel: resolved.selected.thinkingLevel,
-      });
+    const withFloor = (model: string, thinkingLevel?: ThinkingLevel): NameGenerationCandidate => {
+      const minThinkingLevel = lookupMinThinkingLevelOverride(cfg.minThinkingLevelByModel, model);
+      return {
+        model,
+        ...(thinkingLevel !== undefined && { thinkingLevel }),
+        ...(minThinkingLevel !== undefined && { minThinkingLevel }),
+      };
+    };
+    const modelTier = resolved.sources.model.tier;
+    const explicitNamingModel = modelTier !== "fallback" && modelTier !== "default";
+    if (explicitNamingModel || resolved.sources.thinkingLevel.tier !== "default") {
+      // Only explicit naming settings lead. Thinking-only overrides count (the
+      // model then inherits); an inherited model alone does not, so an unset
+      // naming agent keeps the hardcoded small models first. Selected (not
+      // effective) thinking: the generator clamps against the creation-time
+      // route/config receipt rather than this resolver's view.
+      candidates.push(withFloor(resolved.selected.model, resolved.selected.thinkingLevel));
     }
     const pushFallback = (model: string | undefined) => {
       if (model && !candidates.some((candidate) => candidate.model === model)) {
-        candidates.push({ model });
+        candidates.push(withFloor(model));
       }
     };
     for (const preferred of NAME_GEN_PREFERRED_MODELS) {
       pushFallback(preferred);
     }
-    if (metadata) {
-      // Legacy settings can be stale once the selected agent has its own model.
-      for (const model of deriveSideChannelModelCandidates(metadata)) {
-        pushFallback(model);
-      }
+    for (const model of activeModels) {
+      pushFallback(model);
     }
     for (const model of extraFallbackModels) {
       pushFallback(model);

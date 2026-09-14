@@ -12,6 +12,7 @@ import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./w
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
@@ -20995,6 +20996,8 @@ describe("WorkspaceService naming model candidates", () => {
 
   function createNamingService(options: {
     agentAiDefaults?: AgentAiDefaults;
+    defaultModel?: string;
+    minThinkingLevelByModel?: Record<string, ThinkingLevel>;
     metadata?: Partial<FrontendWorkspaceMetadata>;
   }): WorkspaceService {
     const metadata = options.metadata
@@ -21015,6 +21018,8 @@ describe("WorkspaceService naming model candidates", () => {
         loadConfigOrDefault: mock(() => ({
           projects: new Map(),
           agentAiDefaults: options.agentAiDefaults,
+          defaultModel: options.defaultModel,
+          minThinkingLevelByModel: options.minThinkingLevelByModel,
         })),
       },
       aiService: createMockAIService({
@@ -21044,6 +21049,91 @@ describe("WorkspaceService naming model candidates", () => {
       expect(candidates[0]).toEqual({ model: DEFAULT_MODEL, thinkingLevel });
     }
   );
+
+  test("thinking-only naming settings inherit the workspace's active model, not the app default", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+      metadata: {
+        agentId: "ask",
+        aiSettingsByAgent: {
+          exec: { model: "openai:gpt-5.4", thinkingLevel: "off" },
+          ask: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+        },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual([
+      "openai:gpt-5.6-sol",
+      ...NAME_GEN_PREFERRED_MODELS,
+      "openai:gpt-5.4",
+    ]);
+    expect(candidates[0]).toEqual({ model: "openai:gpt-5.6-sol", thinkingLevel: "medium" });
+  });
+
+  test("thinking-only naming settings inherit the caller's model for a workspace that does not exist yet", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined, [
+      "openai:gpt-5.6-sol",
+    ]);
+
+    expect(candidates).toEqual([
+      { model: "openai:gpt-5.6-sol", thinkingLevel: "medium" },
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+    ]);
+  });
+
+  test("thinking-only naming settings fall back to the configured default model", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined);
+
+    expect(candidates[0]).toEqual({ model: "openai:gpt-5.6-terra", thinkingLevel: "medium" });
+  });
+
+  test("an active model without naming settings does not displace the hardcoded small models", async () => {
+    const service = createNamingService({
+      defaultModel: "openai:gpt-5.6-terra",
+      metadata: {
+        agentId: "exec",
+        aiSettingsByAgent: { exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" } },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual([
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+      { model: "openai:gpt-5.6-sol" },
+    ]);
+  });
+
+  test("carries each candidate's per-model thinking floor override", async () => {
+    const service = createNamingService({
+      agentAiDefaults: NAMING_DEFAULTS,
+      minThinkingLevelByModel: {
+        "google:gemini-3.8-flash": "high",
+        [NAME_GEN_PREFERRED_MODELS[0]]: "low",
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual([
+      { model: "google:gemini-3.8-flash", thinkingLevel: "medium", minThinkingLevel: "high" },
+      { model: NAME_GEN_PREFERRED_MODELS[0], minThinkingLevel: "low" },
+      { model: NAME_GEN_PREFERRED_MODELS[1] },
+    ]);
+  });
 
   test("keeps legacy model fallback for workspaces without per-agent settings", async () => {
     const service = createNamingService({
