@@ -3,6 +3,7 @@ import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
+import { log } from "@/node/services/log";
 import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
@@ -186,6 +187,46 @@ describe("Config snapshots", () => {
       expect(build).toHaveBeenCalledTimes(8);
       expect(external.find((entry) => entry.id === "active")?.title).toBe("External");
     } finally {
+      build.mockRestore();
+    }
+  });
+
+  it("does not memoize a lenient build that degraded on an unreadable legacy metadata file", async () => {
+    const legacyPath = path.join(root, "legacy");
+    await saveWorkspaces([{ path: legacyPath }]);
+    const legacyId = config.generateLegacyId(projectPath, legacyPath);
+    const metadataPath = path.join(config.sessionsDir, legacyId, "metadata.json");
+    fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+    fs.writeFileSync(metadataPath, "{ not json");
+    const internals = config as unknown as { buildWorkspaceMetadata: BuildWorkspaceMetadata };
+    const build = spyOn(internals, "buildWorkspaceMetadata");
+    const logError = spyOn(log, "error").mockImplementation(() => undefined);
+    try {
+      const snapshot = config.loadConfigOrDefault();
+      // Fallback identity while the file is unreadable; nothing to migrate, so the snapshot
+      // identity stays put and only the memo could hide the repair.
+      const [degraded] = await Promise.all([
+        config.getAllWorkspaceMetadata({ probeCheckouts: false }),
+        config.getAllWorkspaceMetadata({ probeCheckouts: false }),
+      ]);
+      expect(degraded.map((entry) => entry.id)).toEqual([legacyId]);
+      expect(build).toHaveBeenCalledTimes(1);
+      expect(config.loadConfigOrDefault()).toBe(snapshot);
+
+      fs.writeFileSync(
+        metadataPath,
+        JSON.stringify({
+          id: "stable-legacy-id",
+          name: "legacy",
+          createdAt: older,
+          runtimeConfig: { type: "local" },
+        })
+      );
+      const repaired = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(repaired.map((entry) => entry.id)).toEqual(["stable-legacy-id"]);
+    } finally {
+      logError.mockRestore();
       build.mockRestore();
     }
   });

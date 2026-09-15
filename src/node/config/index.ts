@@ -984,6 +984,16 @@ interface WorkspaceMetadataMemoEntry {
   legacyAliasIds: Set<string>;
 }
 
+/**
+ * Build-internal options: `degraded` is set when a lenient build swallowed a
+ * legacy metadata.json read/parse failure and substituted fallback identity
+ * for an entry. Such a build reflects a transient or repairable disk state,
+ * not the config snapshot, so the memo must not retain it.
+ */
+interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
+  degraded?: { value: boolean };
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -3348,16 +3358,29 @@ export class Config {
       // Memoize the in-flight promise: the startup burst issues several
       // enumerations before the first one resolves.
       const legacyAliasIds = new Set<string>();
+      const degraded = { value: false };
       const result = this.buildWorkspaceMetadata(config, config.projects, {
         ...options,
         legacyAliasIds,
+        degraded,
       });
       const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
       entry = created;
       memo.set(memoKey, created);
-      result.catch(() => {
+      const forget = () => {
         if (memo.get(memoKey) === created) memo.delete(memoKey);
-      });
+      };
+      result.then(() => {
+        // A degraded lenient build substituted fallback identity for a legacy entry whose
+        // metadata.json was unreadable or malformed, and it records no migration, so the
+        // snapshot identity would never change. Retaining it would hide the real stable id
+        // from registry-only callers until an unrelated write or restart even after the
+        // file is repaired. Callers already joined on the in-flight promise still share the
+        // one build; only the retention is skipped.
+        if (!degraded.value) return;
+        log.debug("Not memoizing degraded workspace metadata build", { memoKey });
+        forget();
+      }, forget);
     }
     const metadata = await entry.result;
     if (options.legacyAliasIds !== undefined) {
@@ -3391,9 +3414,12 @@ export class Config {
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
-    options?: WorkspaceMetadataOptions
+    options?: WorkspaceMetadataBuildOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const probeCheckouts = options?.probeCheckouts ?? true;
+    const markDegraded = () => {
+      if (options?.degraded) options.degraded.value = true;
+    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -3608,6 +3634,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
+                  markDegraded();
                   continue;
                 }
                 throw readError;
@@ -3637,6 +3664,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
+              markDegraded();
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -3844,6 +3872,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
+          markDegraded();
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
