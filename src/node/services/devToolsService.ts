@@ -353,8 +353,10 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
-    // Self-healing: if the run was cleared during an active stream,
-    // recreate it so steps aren't orphaned.
+    // Self-healing: if the run was cleared (or evicted by retention) during an
+    // active stream, recreate it so steps aren't orphaned. After eviction the
+    // original run line is still on disk; replay keeps that first line and
+    // ignores this duplicate.
     if (!data.runs.has(step.runId)) {
       const autoRun: DevToolsRun = {
         id: step.runId,
@@ -396,11 +398,21 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
+    const entry: DevToolsLogEntry = { type: "step-update", stepId, update };
+    const json = JSON.stringify(entry);
+
     const existing = data.steps.get(stepId);
     if (!existing) {
-      log.warn(
-        `DevToolsService.updateStep skipped missing step ${stepId} in workspace ${workspaceId}`
-      );
+      // Disk is authoritative and retention eviction is memory-only: when an
+      // overlapping request's step is evicted while still in flight, its final
+      // duration/output/usage must still reach devtools.jsonl. Memory, byte
+      // accounting, and events stay untouched because nothing retains the step;
+      // replay skips updates for unretained steps, so a stale id is harmless.
+      log.debug("DevToolsService.updateStep persisting update for unretained step", {
+        workspaceId,
+        stepId,
+      });
+      await this.appendToFile(workspaceId, json);
       return;
     }
 
@@ -408,8 +420,6 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
-    const entry: DevToolsLogEntry = { type: "step-update", stepId, update };
-    const json = JSON.stringify(entry);
     this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length));
 
     await this.appendToFile(workspaceId, json);
@@ -698,6 +708,11 @@ export class DevToolsService extends EventEmitter {
       const entry = JSON.parse(line) as DevToolsLogEntry;
       switch (entry.type) {
         case "run": {
+          // A second run line for the same id comes from createStep's
+          // self-heal after eviction; the original carries the run metadata.
+          if (data.runs.has(entry.run.id)) {
+            break;
+          }
           this.insertRun(data, entry.run, line.length);
           break;
         }

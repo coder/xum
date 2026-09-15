@@ -759,6 +759,38 @@ describe("DevToolsService", () => {
         expect(logContents).toContain('"step-2"');
       });
 
+      it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const update: Partial<DevToolsStep> = {
+          durationMs: 1234,
+          output: { finishReason: "stop" },
+        };
+        await service.updateStep("ws-1", "step-1", update);
+
+        // Still evicted: the update must not resurrect the step in memory.
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        const stepUpdates = logContents
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as { type: string; stepId?: string; update?: unknown })
+          .filter((entry) => entry.type === "step-update");
+        expect(stepUpdates).toEqual([{ type: "step-update", stepId: "step-1", update }]);
+      });
+
       it("retains only the newest runs that fit the budget when replaying a log", async () => {
         const config = createTestConfig({ sessionsDir, enabled: true });
         const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
@@ -767,6 +799,11 @@ describe("DevToolsService", () => {
           lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
           lines.push(JSON.stringify({ type: "step", step: bigStep(index, 40_000) }));
         }
+        // An in-flight step finalized after its run was evicted: the update is
+        // persisted for a step the replay no longer retains and must be ignored.
+        lines.push(
+          JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 5 } })
+        );
         await fs.mkdir(path.dirname(logPath), { recursive: true });
         await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
 
