@@ -149,6 +149,62 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     await session.dispose();
   });
 
+  test.each(["continuousCompaction", "tokenBudget"] as const)(
+    "idle compaction publishes a summary under %s",
+    async (strategy) => {
+      const workspaceId = `idle-${strategy}`;
+      const model = "openai:gpt-4o";
+      const outcome = mock((_success: boolean) => undefined);
+      const h = await createAgentSessionHarness({ workspaceId, onIdleCompactionOutcome: outcome });
+      historyCleanup = h.cleanup;
+      try {
+        expect(
+          (
+            await h.historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("earlier-user", "user", "Preserve the earlier investigation")
+            )
+          ).success
+        ).toBe(true);
+        const stream = spyOn(h.aiService, "streamMessage");
+        expect(
+          (
+            await h.session.sendMessage("Summarize the idle workspace", {
+              model,
+              agentId: "compact",
+              experiments: { [strategy]: true },
+              muxMetadata: {
+                type: "compaction-request",
+                rawCommand: "/compact",
+                parsed: {},
+                source: "idle-compaction",
+              },
+            })
+          ).success
+        ).toBe(true);
+        expect(stream).toHaveBeenCalledTimes(1);
+        expect(stream.mock.calls[0][0].onStepSettled).toBeUndefined();
+        await runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-end",
+          workspaceId,
+          messageId: "test-assistant-message",
+          parts: [{ type: "text", text: "The investigation is complete; retain its conclusions." }],
+          metadata: { model, agentId: "compact", finishReason: "stop" },
+        });
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
+        expect(history.data[0].metadata?.compacted).toBe("idle");
+        expect(outcome).toHaveBeenCalledTimes(1);
+        expect(outcome).toHaveBeenCalledWith(true);
+        expect(stream).toHaveBeenCalledTimes(1);
+      } finally {
+        await h.session.dispose();
+      }
+    }
+  );
+
   test("tracks a compaction request when a synthetic snapshot follows it", async () => {
     const model = "openai:gpt-4o";
     const { session } = await createSessionHarness({

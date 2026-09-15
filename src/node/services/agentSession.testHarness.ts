@@ -183,6 +183,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   workspaceGoalService?: WorkspaceGoalService;
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  onIdleCompactionOutcome?: (success: boolean) => void;
   captureEvents?: boolean;
 }
 
@@ -231,6 +232,7 @@ export async function createAgentSessionHarness(
     workspaceGoalService: options.workspaceGoalService,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
+    onIdleCompactionOutcome: options.onIdleCompactionOutcome,
   });
 
   const events: WorkspaceChatMessage[] = [];

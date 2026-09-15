@@ -248,6 +248,52 @@ describe("AgentSession token-budget lifecycle", () => {
     };
   }
 
+  test("manual compaction publishes a summary and clears globally enabled token-budget state", async () => {
+    const h = await setup();
+    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+    );
+    await seedHistory(h, 20_000);
+    const state = h.session as unknown as {
+      contextBudgetGeneration: number;
+      contextBudgetWarningClaimed: boolean;
+      contextBudgetFlushClaimed: boolean;
+    };
+    state.contextBudgetWarningClaimed = true;
+    state.contextBudgetFlushClaimed = true;
+    const generation = state.contextBudgetGeneration;
+    expect(
+      (
+        await h.session.sendMessage("Summarize the conversation", {
+          model,
+          agentId: "compact",
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      ).success
+    ).toBe(true);
+    expect(state.contextBudgetGeneration).toBeGreaterThan(generation);
+    expect(state.contextBudgetWarningClaimed).toBe(false);
+    expect(state.contextBudgetFlushClaimed).toBe(false);
+    expect(h.requests).toHaveLength(1);
+    expect(h.requests[0].onStepSettled).toBeUndefined();
+    h.completions[0].settle({
+      status: "completed",
+      streamEnd: {
+        type: "stream-end",
+        workspaceId,
+        parts: [{ type: "text", text: "The earlier task is complete; preserve its decisions." }],
+        metadata: { model, agentId: "compact", finishReason: "stop" },
+      },
+    });
+    await h.session.waitForIdle();
+    const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success);
+    expect(history.data.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
+    expect(history.data[0].metadata?.compacted).toBe("user");
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    expect(h.requests).toHaveLength(1);
+  });
+
   for (const field of [
     "inputTokens",
     "outputTokens",

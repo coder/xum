@@ -185,7 +185,7 @@ describe("AgentSession continuous compaction wiring", () => {
     }
 
     for (const phase of ["prepare", "summarize"] as const) {
-      test.each(["complete", "reject", "reset", "shutdown"] as const)(
+      test.each(["complete", "reject", "reset", "shutdown", "dispose"] as const)(
         `retains eager ${phase} execution until the original Promise settles: %s`,
         async (outcome) => {
           const { h, compactor, deps, coordinator, releases, start } = await setupEager();
@@ -218,11 +218,22 @@ describe("AgentSession continuous compaction wiring", () => {
               shutdown = h.session.finishShutdown();
               expect(coordinator.closing).toBe(true);
             }
+            if (outcome === "dispose") {
+              shutdown = h.session.dispose();
+              expect(coordinator.disposed).toBe(true);
+            }
             await compactor.waitForIdle();
             expect(eagerRelease).not.toHaveBeenCalled();
             release.resolve();
             await job.done;
             expect(eagerRelease).toHaveBeenCalledTimes(1);
+            if (outcome === "dispose") {
+              expect(Reflect.get(compactor, "staged")).toBeNull();
+              expect((await rows(h)).some((row) => row.metadata?.compactionBoundary)).toBe(false);
+              expect(
+                await h.historyService.getContinuousCompactionJournal(workspaceId).read()
+              ).toBeNull();
+            }
             // A settled eager job must never strand the real shutdown drain.
             await (shutdown ?? h.session.finishShutdown());
             expect(eagerRelease).toHaveBeenCalledTimes(1);
@@ -271,6 +282,7 @@ describe("AgentSession continuous compaction wiring", () => {
     "disabled-usage-terminal",
     "terminal-error",
     "failed-consumed-apply",
+    "dispose-during-finalization",
   ] as const)("%s commits a consumed journal before retry or new work", async (mode) => {
     const h = await setup();
     const source = createMuxMessage("live-answer", "assistant", "", {
@@ -380,6 +392,64 @@ describe("AgentSession continuous compaction wiring", () => {
     source.parts.push({ type: "text", text: "post-swap crash growth" });
     await h.historyService.writePartial(workspaceId, source);
     streaming = false;
+    if (mode === "dispose-during-finalization") {
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const persist = deps.compactionHandler.persistContinuousCompaction.bind(
+        deps.compactionHandler
+      );
+      spyOn(deps.compactionHandler, "persistContinuousCompaction").mockImplementation(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return persist(...args);
+        }
+      );
+      const finalizing = internals(h.session).runContinuousCompactionObservation(() =>
+        compactor.observe(0, { ...context, enabled: false, phase: "stream-end" })
+      );
+      let disposing: Promise<void> | undefined;
+      try {
+        await entered.promise;
+        disposing = h.session.dispose();
+        release.resolve();
+        const verdict = await finalizing;
+        await disposing;
+        // Disposal cancels the observer, not its durable recovery obligation. Preserve the
+        // journal until a new session can fold it; do not publish from the disposed session.
+        const disposedOutcome = {
+          verdict,
+          published: (await rows(h))[0].id === journal.boundary.id,
+          journalRetained: (await store.read()) !== null,
+        };
+        const restarted = await createAgentSessionHarness({
+          workspaceId,
+          config: h.config,
+          historyService: h.historyService,
+        });
+        try {
+          // Recovery must precede retry; this fixture has no provider engine to resume.
+          Reflect.set(restarted.session, "scheduleStartupAutoRetryIfNeeded", () =>
+            Promise.resolve("completed")
+          );
+          await restarted.session.runStartupRecovery();
+          expect((await rows(restarted))[0].id).toBe(journal.boundary.id);
+          expect(await store.read()).toBeNull();
+        } finally {
+          await restarted.session.dispose();
+        }
+        expect(disposedOutcome).toEqual({
+          verdict: "none",
+          published: false,
+          journalRetained: true,
+        });
+      } finally {
+        release.resolve();
+        await finalizing;
+        await disposing;
+      }
+      return;
+    }
     if (mode === "failed-consumed-apply") {
       const { coordinator } = internals(h.session);
       const token = coordinator.beginCompactionObservation("continuous");
@@ -442,6 +512,45 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(retryChecks).toBe(1);
     expect(await store.read()).toBeNull();
   });
+
+  test.each(["token-budget", "compaction-request", "model-changed"] as const)(
+    "consumed swaps do not bypass the mid-stream %s guard",
+    async (guard) => {
+      const h = await setup();
+      const state = internals(h.session);
+      state.activeStreamContext = {
+        modelString: model,
+        providersConfig: null,
+        options: {
+          ...sendOptions,
+          experiments: { continuousCompaction: false, tokenBudget: guard === "token-budget" },
+        },
+      };
+      if (guard === "compaction-request") {
+        Reflect.set(h.session, "activeCompactionRequest", { id: "manual-compact" });
+      }
+      spyOn(state.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
+      const observation = spyOn(state, "runContinuousCompactionObservation");
+      const reset = spyOn(state.continuousCompactor, "reset");
+      const accounting = deferred<void>();
+      const preview = h.session as unknown as { previewGoalAccountingFromUsage(): Promise<void> };
+      spyOn(preview, "previewGoalAccountingFromUsage").mockReturnValue(accounting.promise);
+      h.aiEmitter.emit("usage-delta", {
+        type: "usage-delta",
+        workspaceId,
+        messageId: "live-answer",
+        usage: { inputTokens: 90_000, outputTokens: 1, totalTokens: 90_001 },
+      });
+      // The handler captured the old model before accounting suspended. A replacement stream
+      // must not inherit that old usage observation, even when a consumed swap remains.
+      if (guard === "model-changed") state.activeStreamContext.modelString = "openai:gpt-4.1";
+      accounting.resolve();
+      await accounting.promise;
+      // These entry points latch synchronously after accounting: no sleep or I/O race.
+      expect(observation).not.toHaveBeenCalled();
+      expect(reset).not.toHaveBeenCalled();
+    }
+  );
 
   test("does not activate a prefix without the captured options required by fast-stop fallback", async () => {
     const h = await setup();
@@ -541,26 +650,36 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(await journal.exists()).toBe(false);
   });
 
-  test("on-send apply preserves the new user turn without running a compact turn", async () => {
-    const h = await setup(72);
-    spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
-      async (_percent, context) => {
-        expect(context.phase).toBe("on-send");
-        await appendBoundary(h);
-        return "applied";
-      }
-    );
-    const result = await h.session.sendMessage("Keep going with the next task", sendOptions);
-    expect(result.success).toBe(true);
-    const history = await rows(h);
-    expect(history[0].id).toBe("continuous-boundary");
-    expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
-      text: "Keep going with the next task",
-    });
-    expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
-      false
-    );
-  });
+  test.each([false, true])(
+    "on-send apply preserves the new user turn (token budget enabled: %s)",
+    async (tokenBudget) => {
+      const h = await setup(72);
+      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+        async (_percent, context) => {
+          expect(context.phase).toBe("on-send");
+          await appendBoundary(h);
+          return "applied";
+        }
+      );
+      const stream = spyOn(h.aiService, "streamMessage");
+      const result = await h.session.sendMessage("Keep going with the next task", {
+        ...sendOptions,
+        experiments: { continuousCompaction: true, tokenBudget },
+      });
+      expect(result.success).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+      // Continuous must actually apply, not merely suppress the competing budget callback.
+      expect(stream.mock.calls[0][0].onStepSettled).toBeUndefined();
+      const history = await rows(h);
+      expect(history[0].id).toBe("continuous-boundary");
+      expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
+        text: "Keep going with the next task",
+      });
+      expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
+        false
+      );
+    }
+  );
 
   test.each([72, 76])(
     "without a staged summary on-send falls back only at force (%s%%)",

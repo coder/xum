@@ -994,29 +994,53 @@ describe("ContinuousCompactor", () => {
     expect(completed).toHaveBeenCalledTimes(1);
   });
 
-  it("settings changes during finalization cannot invalidate a consumed journal's durable fold", async () => {
-    const { answer, journal } = await activateJournaledSwap();
-    assert(live, "Live fixture missing");
-    answer.parts = live.parts;
-    await store.historyService.writePartial(workspaceId, answer);
-    streaming = false;
-    live = undefined;
-    const entered = deferred();
-    const release = deferred();
-    const original = handler.persistContinuousCompaction.bind(handler);
-    spyOn(handler, "persistContinuousCompaction").mockImplementation(async (...args) => {
-      entered.resolve();
-      await release.promise;
-      return original(...args);
-    });
-    const finalizing = compactor.observe(0, { ...context, enabled: false });
-    await entered.promise;
-    compactor.reset("disabled");
-    compactor.reset("threshold-changed");
-    release.resolve();
-    expect(await finalizing).toBe("applied");
-    expect((await rows())[0].id).toBe(journal.boundary.id);
-  });
+  it.each(["disabled", "threshold-changed", "shutdown", "shutdown-then-dispose"])(
+    "%s during finalization preserves the consumed journal's recovery obligation",
+    async (reason) => {
+      const { answer, journal, journalStore, dependencies } = await activateJournaledSwap();
+      assert(live, "Live fixture missing");
+      answer.parts = live.parts;
+      await store.historyService.writePartial(workspaceId, answer);
+      streaming = false;
+      live = undefined;
+      const entered = deferred();
+      const release = deferred();
+      const original = handler.persistContinuousCompaction.bind(handler);
+      spyOn(handler, "persistContinuousCompaction").mockImplementation(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return original(...args);
+      });
+      const finalizing = compactor.observe(0, { ...context, enabled: false });
+      await entered.promise;
+      try {
+        if (reason === "shutdown-then-dispose") {
+          // AgentSession's guardian shuts down before disposal. Shutdown releases journal
+          // ownership without deleting it; a bare engine dispose would clean its own receipt.
+          compactor.reset("shutdown");
+          compactor.reset("dispose");
+        } else {
+          compactor.reset(reason);
+        }
+        release.resolve();
+        if (reason === "shutdown" || reason === "shutdown-then-dispose") {
+          // Teardown cancels the current fold, but the next session must still recover it.
+          expect(await finalizing).toBe("none");
+          expect((await rows())[0].id).not.toBe(journal.boundary.id);
+          expect(await journalStore.read()).not.toBeNull();
+          compactor = new ContinuousCompactor(dependencies);
+          expect(await compactor.recover()).toBe(true);
+        } else {
+          expect(await finalizing).toBe("applied");
+        }
+        expect((await rows())[0].id).toBe(journal.boundary.id);
+        expect(await journalStore.read()).toBeNull();
+      } finally {
+        release.resolve();
+        await finalizing;
+      }
+    }
+  );
 
   it("stays seamless and finalizes a consumed swap despite lowered usage, preserving new parts", async () => {
     const { answer, journal, journalStore } = await activateJournaledSwap();
