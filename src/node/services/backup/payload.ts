@@ -1772,9 +1772,11 @@ function assertBackupMcpRedactions(
 
 /**
  * With `contents`, entries for unselected categories and, when MCP is left out, the
- * `mcpRedactions` list are dropped before they are validated: they describe files this
- * selection never opens, so their shape cannot be allowed to fail a restore of everything
- * else. Entries whose category cannot be told (no string path) are still validated.
+ * `mcpRedactions` list are dropped before they are counted or validated: they describe
+ * files this selection never opens, so neither their shape nor their number can be allowed
+ * to fail a restore of everything else. The manifest document itself was already charged
+ * to the byte budget and walked whole before this point. Entries whose category cannot be
+ * told (no string path) are still validated.
  */
 function parseManifest(raw: string, portable: boolean, contents?: BackupContents): BackupManifest {
   const tree = jsonc.parseTree(raw);
@@ -1798,7 +1800,6 @@ function parseManifest(raw: string, portable: boolean, contents?: BackupContents
     assertBackupMcpRedactions(mcpRedactions);
   }
   if (!Array.isArray(manifest.files)) throw new Error("Invalid backup manifest");
-  assertBackupFileCount(manifest.files.length);
   if (contents) {
     manifest.files = manifest.files.filter(
       (file: unknown) =>
@@ -1807,6 +1808,7 @@ function parseManifest(raw: string, portable: boolean, contents?: BackupContents
         isSelectedPayloadPath(file.path, contents)
     );
   }
+  assertBackupFileCount(manifest.files.length);
   if (mcpRedactions !== undefined) {
     const paths = new Set<string>();
     for (const jsonPath of mcpRedactions) {

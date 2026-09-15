@@ -886,10 +886,14 @@ describe("backup payload", () => {
   it("rejects a manifest with too many files before reading its entries", async () => {
     const destination = path.join(tempDir, "too-many-manifest-files");
     await fs.mkdir(destination);
-    const files = Array.from({ length: MAX_BACKUP_FILE_COUNT + 1 }, (_, index) => ({
-      path: `skills/count/file-${index}.md`,
-      sha256: sha256Hex(""),
-    }));
+    await fs.writeFile(path.join(destination, "AGENTS.md"), "");
+    const files = [
+      { path: "AGENTS.md", sha256: sha256Hex("") },
+      ...Array.from({ length: MAX_BACKUP_FILE_COUNT + 1 }, (_, index) => ({
+        path: `skills/count/file-${index}.md`,
+        sha256: sha256Hex(""),
+      })),
+    ];
     const manifest = {
       schemaVersion: BACKUP_SCHEMA_VERSION,
       exportedAt: "2026-08-07T00:00:00.000Z",
@@ -903,6 +907,12 @@ describe("backup payload", () => {
     const rejected = await captureRejection(readBackupPayload(destination));
     expect((rejected as { code?: string }).code).toBe("INVALID_BACKUP");
     expect((rejected as Error).message).toBe(`Backup has more than ${MAX_BACKUP_FILE_COUNT} files`);
+
+    // Entries of an unselected category are dropped before they are counted.
+    const skillsUnselected = await readBackupPayload(destination, {
+      contents: resolveBackupContents({ includeSkills: false }),
+    });
+    expect(skillsUnselected.manifest.files.map((file) => file.path)).toEqual(["AGENTS.md"]);
 
     await fs.writeFile(
       manifestPath,
