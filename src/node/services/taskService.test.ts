@@ -641,6 +641,7 @@ describe("TaskService", () => {
         drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
       };
       return {
+        config,
         parentId,
         aiService,
         historyService,
@@ -827,6 +828,71 @@ describe("TaskService", () => {
       ).toMatchObject({ status: "delivered" });
     });
 
+    for (const owner of ["parent", "ancestor"] as const) {
+      test(
+        "consumes an older continuation after reactivation (owned by " + owner + ")",
+        async () => {
+          const oldRecord = workspaceTurnRecord("owner", taskId, "wst_older", "completed", {
+            messageId: "old-final",
+            reportMarkdown,
+          });
+          const generationId = [oldRecord.handleId, oldRecord.status, oldRecord.updatedAt].join(
+            ":"
+          );
+          const fixture = await setup({ generationId });
+          const ownerId = owner === "parent" ? fixture.parentId : "higher-ancestor";
+          await fixture.config.editConfig((cfg) => {
+            const entry = findWorkspaceEntry(cfg, fixture.parentId);
+            assert(entry);
+            const project = cfg.projects.get(entry.projectPath);
+            assert(project);
+            if (owner === "ancestor") {
+              entry.workspace.parentWorkspaceId = ownerId;
+              project.workspaces.push(projectWorkspace(entry.projectPath, "ancestor", ownerId));
+            }
+            project.workspaces.push(
+              projectWorkspace(entry.projectPath, "child", taskId, {
+                parentWorkspaceId: fixture.parentId,
+                taskStatus: "reported",
+                taskExecutionId: "wst_newer",
+              })
+            );
+            return cfg;
+          });
+          const store = new TaskHandleStore(fixture.config);
+          await store.upsertWorkspaceTurn({ ...oldRecord, ownerWorkspaceId: ownerId });
+          const newRecord = {
+            ...oldRecord,
+            ownerWorkspaceId: ownerId,
+            handleId: "wst_newer",
+            messageId: "new-final",
+          };
+          await store.upsertWorkspaceTurn(newRecord);
+          const newer = await fixture.terminalAttentionStore.enqueueIfAbsent({
+            ownerWorkspaceId: fixture.parentId,
+            sourceKind: "agent_task",
+            sourceId: taskId,
+            generationId: [newRecord.handleId, newRecord.status, newRecord.updatedAt].join(":"),
+          });
+          assert(newer);
+          fixture.assistant.parts = [
+            toolPart("task_await", { results: [{ ...completed, messageId: "old-final" }] }),
+          ];
+          await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+          fixture.resumeStream.mockImplementation(async () => {
+            const pending = await fixture.terminalAttentionStore.listPending(fixture.parentId);
+            expect(pending.map((notification) => notification.id)).toEqual([newer.id]);
+            return Ok({ started: true });
+          });
+          await fixture.drain();
+          expect(fixture.resumeStream).toHaveBeenCalledTimes(1);
+          expect(
+            await fixture.terminalAttentionStore.get(fixture.parentId, fixture.notification.id)
+          ).toMatchObject({ status: "delivered" });
+        }
+      );
+    }
+
     for (const identity of ["current", "old", "initial"] as const) {
       test("matches continuation consumption to its execution (" + identity + ")", async () => {
         const record = workspaceTurnRecord("owner", taskId, "wst_continuation", "completed", {
@@ -835,9 +901,9 @@ describe("TaskService", () => {
         });
         const generationId = [record.handleId, record.status, record.updatedAt].join(":");
         const fixture = await setup({ generationId });
-        spyOn(fixture.taskService, "getDescendantAgentTaskExecutionSnapshot").mockResolvedValue({
+        await new TaskHandleStore(fixture.config).upsertWorkspaceTurn({
+          ...record,
           ownerWorkspaceId: fixture.parentId,
-          record,
         });
         fixture.assistant.parts = [
           toolPart("task_await", {
