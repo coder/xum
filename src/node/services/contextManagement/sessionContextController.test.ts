@@ -139,8 +139,9 @@ test("durable completion records the tail summary before notifying the external 
 test("controller transitions latch synchronously and map settings resets onto the compactor", async () => {
   const h = (harness = await createAgentSessionHarness({ workspaceId: "transitions" }));
   const controller = controllerOf(h);
+  // Strategies are controller-private; reach the engine through the same names the session uses.
   const compactor = Reflect.get(
-    controller.continuous,
+    Reflect.get(controller, "continuous") as object,
     "continuousCompactor"
   ) as ContinuousCompactor;
   const reset = spyOn(compactor, "reset");
