@@ -561,6 +561,281 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  describe("terminal report consumption", () => {
+    const taskId = "late-awaited-child";
+    const reportMarkdown = "The delegated investigation is complete.";
+    const completed = { status: "completed", taskId, reportMarkdown };
+    const awaitOutput = { results: [completed] };
+    const toolPart = (toolName: string, output: unknown): DynamicToolPart => ({
+      type: "dynamic-tool",
+      toolCallId: "await-report",
+      toolName,
+      input: { task_ids: [taskId] },
+      state: "output-available",
+      output,
+    });
+
+    async function setup(options: { generationId?: string } = {}) {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const terminalAttentionStore = new TerminalAttentionStore(config);
+      const resumeStream = mock(
+        (): Promise<Result<{ started: boolean }, SendMessageError>> =>
+          Promise.resolve(Ok({ started: true }))
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({ resumeStream });
+      const { historyService, taskService, aiService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const user = createMuxMessage("request", "user", "Investigate", { timestamp: Date.now() });
+      await historyService.appendToHistory(parentId, user);
+      // Real streams append a placeholder before a late report, then finalize it in place.
+      const assistant = createMuxMessage("parent-response", "assistant", "", {
+        timestamp: Date.now(),
+        requestHistorySequence: user.metadata?.historySequence,
+      });
+      await historyService.appendToHistory(parentId, assistant);
+      const report = createMuxMessage(
+        "late-report",
+        "user",
+        formatSubagentReportEnvelope({
+          taskId,
+          agentType: "explore",
+          title: "Investigation",
+          status: "completed",
+          reportMarkdown,
+        }),
+        { timestamp: Date.now(), synthetic: true, uiVisible: true }
+      );
+      await historyService.appendToHistory(parentId, report);
+      const notification = await terminalAttentionStore.enqueueIfAbsent({
+        ownerWorkspaceId: parentId,
+        sourceKind: "agent_task",
+        sourceId: taskId,
+        ...options,
+      });
+      assert(notification);
+      const internal = taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      };
+      return {
+        parentId,
+        aiService,
+        historyService,
+        taskService,
+        terminalAttentionStore,
+        resumeStream,
+        assistant,
+        report,
+        notification,
+        drain: () => internal.drainTerminalAttention(parentId),
+      };
+    }
+
+    for (const [name, part] of [
+      ["task", toolPart("task", completed)],
+      [
+        "grouped task",
+        toolPart("task", { status: "completed", reports: [{ taskId, reportMarkdown }] }),
+      ],
+      ["task_await", toolPart("task_await", awaitOutput)],
+      [
+        "completed receipts from a failed kernel evaluation",
+        toolPart("code_execution", {
+          success: false,
+          toolCalls: [{ toolName: "task_await", result: awaitOutput }],
+        }),
+      ],
+      [
+        "partially completed group",
+        toolPart("task", {
+          status: "running",
+          reports: [{ taskId, reportMarkdown }],
+        }),
+      ],
+      [
+        "kernel receipts",
+        toolPart("code_execution", {
+          success: true,
+          toolCalls: [{ toolName: "task_await", result: awaitOutput }],
+        }),
+      ],
+      [
+        "persisted nested calls",
+        {
+          ...toolPart("code_execution", { success: true }),
+          nestedCalls: [toolPart("task_await", awaitOutput)],
+        },
+      ],
+    ] satisfies Array<[string, DynamicToolPart]>) {
+      test("does not wake after a mid-stream report was consumed through " + name, async () => {
+        const fixture = await setup();
+        fixture.assistant.parts = [part, { type: "text", text: "Findings incorporated." }];
+        expect(
+          await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant)
+        ).toEqual(Ok(undefined));
+        await fixture.drain();
+        await fixture.drain();
+        expect(fixture.resumeStream).not.toHaveBeenCalled();
+        expect(
+          await fixture.terminalAttentionStore.get(fixture.parentId, fixture.notification.id)
+        ).toMatchObject({ status: "delivered" });
+      });
+    }
+
+    test("waits for idle before inspecting the final response", async () => {
+      const fixture = await setup();
+      const readHistory = spyOn(fixture.historyService, "getHistoryFromLatestBoundary");
+      const isStreaming = spyOn(fixture.aiService, "isStreaming").mockReturnValue(true);
+      await fixture.drain();
+      expect(readHistory).not.toHaveBeenCalled();
+      expect(await fixture.terminalAttentionStore.listPending(fixture.parentId)).toHaveLength(1);
+      fixture.assistant.parts = [
+        toolPart("task_await", awaitOutput),
+        { type: "text", text: "Done." },
+      ];
+      await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+      isStreaming.mockReturnValue(false);
+      await fixture.drain();
+      expect(fixture.resumeStream).not.toHaveBeenCalled();
+      expect(await fixture.terminalAttentionStore.listPending(fixture.parentId)).toHaveLength(0);
+    });
+
+    test("reconciles a covered response in the drain without a stream-end callback", async () => {
+      const fixture = await setup();
+      await fixture.historyService.appendToHistory(
+        fixture.parentId,
+        createMuxMessage("informed-response", "assistant", "Already incorporated.", {
+          timestamp: Date.now(),
+          requestHistorySequence: fixture.report.metadata?.historySequence,
+        })
+      );
+      await fixture.drain();
+      expect(fixture.resumeStream).not.toHaveBeenCalled();
+    });
+
+    for (const [name, part] of [
+      ["running snapshot", toolPart("task_await", { results: [{ taskId, status: "running" }] })],
+      [
+        "failed wait",
+        toolPart("task_await", { results: [{ taskId, status: "error", error: "failed" }] }),
+      ],
+      ["missing report", toolPart("task_await", { results: [{ taskId, status: "completed" }] })],
+      ["unrelated tool", toolPart("file_read", awaitOutput)],
+      [
+        "failed nested call",
+        toolPart("code_execution", {
+          success: true,
+          toolCalls: [{ toolName: "task_await", result: awaitOutput, error: "failed" }],
+        }),
+      ],
+      [
+        "pending outer call",
+        {
+          type: "dynamic-tool",
+          toolName: "code_execution",
+          toolCallId: "pending",
+          input: {},
+          state: "input-available",
+          nestedCalls: [toolPart("task_await", awaitOutput)],
+        },
+      ],
+    ] satisfies Array<[string, DynamicToolPart]>) {
+      test("keeps the wake for a " + name, async () => {
+        const fixture = await setup();
+        fixture.assistant.parts = [part, { type: "text", text: "Done." }];
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(1);
+      });
+    }
+
+    for (const metadata of [{ partial: true }, { agentId: "compact" }]) {
+      test(
+        "does not acknowledge incomplete/compaction output " + JSON.stringify(metadata),
+        async () => {
+          const fixture = await setup();
+          fixture.assistant.parts = [toolPart("task_await", awaitOutput)];
+          fixture.assistant.metadata = { ...fixture.assistant.metadata, ...metadata };
+          await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+          await fixture.drain();
+          expect(fixture.resumeStream).toHaveBeenCalledTimes(1);
+        }
+      );
+    }
+
+    test("only consumes completed entries returned by a thresholded await", async () => {
+      const fixture = await setup();
+      const otherId = "still-running-at-await-return";
+      fixture.resumeStream.mockImplementation(async () => {
+        const pending = await fixture.terminalAttentionStore.listPending(fixture.parentId);
+        expect(pending.map((notification) => notification.sourceId)).toEqual([otherId]);
+        return Ok({ started: true });
+      });
+      fixture.assistant.parts = [
+        toolPart("task_await", {
+          results: [completed, { taskId: otherId, status: "running" }],
+        }),
+      ];
+      await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+      await fixture.historyService.appendToHistory(
+        fixture.parentId,
+        createMuxMessage(
+          "later-sibling-report",
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: otherId,
+            agentType: "explore",
+            title: "Investigation",
+            status: "completed",
+            reportMarkdown,
+          }),
+          { timestamp: Date.now(), synthetic: true, uiVisible: true }
+        )
+      );
+      await fixture.terminalAttentionStore.enqueueIfAbsent({
+        ownerWorkspaceId: fixture.parentId,
+        sourceKind: "agent_task",
+        sourceId: otherId,
+      });
+      await fixture.drain();
+      expect(fixture.resumeStream).toHaveBeenCalledTimes(1);
+      expect(
+        await fixture.terminalAttentionStore.get(fixture.parentId, fixture.notification.id)
+      ).toMatchObject({ status: "delivered" });
+    });
+
+    for (const identity of ["current", "old", "initial"] as const) {
+      test("matches continuation consumption to its execution (" + identity + ")", async () => {
+        const record = workspaceTurnRecord("owner", taskId, "wst_continuation", "completed", {
+          messageId: "current-final",
+          reportMarkdown,
+        });
+        const generationId = [record.handleId, record.status, record.updatedAt].join(":");
+        const fixture = await setup({ generationId });
+        spyOn(fixture.taskService, "getDescendantAgentTaskExecutionSnapshot").mockResolvedValue({
+          ownerWorkspaceId: fixture.parentId,
+          record,
+        });
+        fixture.assistant.parts = [
+          toolPart("task_await", {
+            results: [
+              {
+                ...completed,
+                ...(identity === "initial"
+                  ? {}
+                  : { messageId: identity === "current" ? "current-final" : "old-final" }),
+              },
+            ],
+          }),
+        ];
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(identity === "current" ? 0 : 1);
+      });
+    }
+  });
+
   test("late report still resumes an intentionally backgrounded parent once", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
