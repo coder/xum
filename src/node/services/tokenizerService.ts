@@ -11,7 +11,7 @@ import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessi
 import { log } from "./log";
 import type { AIService } from "./aiService";
 import type { ProviderService } from "./providerService";
-import type { HistoryService } from "./historyService";
+import { mergeTranscriptPartial, type HistoryService } from "./historyService";
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -25,28 +25,6 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
     }
   }
   return max;
-}
-
-/**
- * Mirror what the renderer sees mid-stream: chat.jsonl holds an empty placeholder row for the
- * in-flight assistant turn while partial.json carries its actual content, so the partial
- * replaces the row sharing its historySequence (or is appended when no row matches).
- */
-function mergePartialIntoHistory(history: MuxMessage[], partial: MuxMessage | null): MuxMessage[] {
-  if (!partial) {
-    return history;
-  }
-  const partialSeq = partial.metadata?.historySequence;
-  const placeholderIndex =
-    partialSeq === undefined
-      ? -1
-      : history.findIndex((message) => message.metadata?.historySequence === partialSeq);
-  if (placeholderIndex < 0) {
-    return [...history, partial];
-  }
-  const merged = [...history];
-  merged[placeholderIndex] = partial;
-  return merged;
 }
 
 export class TokenizerService {
@@ -76,7 +54,9 @@ export class TokenizerService {
    * The renderer used to upload its full message list with every recalculation (tool-call-end,
    * stream end, ...). During an active stream that was ~36 KB/s of redundant WebSocket traffic
    * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
-   * backend reads chat.jsonl + partial.json, which it already owns.
+   * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
+   * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
+   * from being replaced by a partial snapshot read just before the commit.
    */
   async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
     const [metadata, historyResult, partial] = await Promise.all([
@@ -89,7 +69,7 @@ export class TokenizerService {
     }
     return this.calculateStats(
       input.workspaceId,
-      mergePartialIntoHistory(historyResult.data, partial),
+      mergeTranscriptPartial(historyResult.data, partial),
       input.model,
       this.providerService.getConfig(),
       metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null

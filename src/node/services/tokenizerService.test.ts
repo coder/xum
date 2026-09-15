@@ -76,6 +76,22 @@ describe("TokenizerService", () => {
       }
     });
 
+    test("keeps a fuller committed history row over a stale partial for the same turn", async () => {
+      // Unlocked reads: partial.json can be observed just before commitPartial while the
+      // history read lands after the finalized row was appended.
+      const committed = createMuxMessage("msg2", "assistant", "final text", { historySequence: 2 });
+      committed.parts.push({ type: "text", text: "second part" });
+      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }), committed];
+      partial = createMuxMessage("msg2", "assistant", "final", { historySequence: 2 });
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        expect(statsSpy).toHaveBeenCalledWith(history, "gpt-4", {}, expect.anything());
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
     test("appends a partial that has no matching history row", async () => {
       history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
       partial = createMuxMessage("msg2", "assistant", "streamed", { historySequence: 2 });
