@@ -807,6 +807,80 @@ describe("DevToolsService", () => {
         expect(await runIds(service)).toEqual(["run-3"]);
       });
 
+      it("never retains a self-healed step under a run evicted while its appends were queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+
+        // run-a exists on disk but was evicted from memory by an oversized run.
+        await service.createRun("ws-1", runAt(0));
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", bigStep(1, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Hold the write queue so run-0's self-heal is still pending while run-2's
+        // oversized step evicts the healed run.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        const lateStep = makeStep({
+          id: "step-0-late",
+          runId: "run-0",
+          rawChunks: rawChunksOf(30_000),
+        });
+        try {
+          const pendingWrites = [
+            service.createStep("ws-1", lateStep),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-0")).toBeNull();
+
+        // Every step-created is preceded by run-created for its run, and no step
+        // is announced for a run that is gone.
+        const announcedRuns = new Set<string>();
+        for (const event of events) {
+          if (event.type === "run-created") {
+            announcedRuns.add(event.run.id);
+          } else if (event.type === "step-created") {
+            expect(announcedRuns.has(event.step.runId)).toBe(true);
+          }
+        }
+        expect(
+          events.some((event) => event.type === "step-created" && event.step.id === lateStep.id)
+        ).toBe(false);
+
+        // Disk is authoritative: the healed run line and the late step line both landed.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain(`"${lateStep.id}"`);
+
+        // Accounting: a leaked 30 KB orphan would push run-3 + run-4 (75 KB) over the
+        // 100 KB budget and evict run-3; without the leak both fit.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, 30_000));
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 45_000));
+        expect(await runIds(service)).toEqual(["run-3", "run-4"]);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,

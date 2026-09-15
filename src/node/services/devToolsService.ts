@@ -352,6 +352,12 @@ export class DevToolsService extends EventEmitter {
     // active stream, recreate it so steps aren't orphaned. After eviction the
     // original run line is still on disk; replay keeps that first line and
     // ignores this duplicate.
+    //
+    // The healed run and the step enter memory in the same synchronous section
+    // before either append is awaited: an await in between let a concurrent
+    // write evict the healed run, after which setStep retained a step (and its
+    // bytes) under a run no longer in data.runs, where evictRun never reclaims it.
+    let healedRunJson: string | undefined;
     if (!data.runs.has(step.runId)) {
       const autoRun: DevToolsRun = {
         id: step.runId,
@@ -359,23 +365,31 @@ export class DevToolsService extends EventEmitter {
         startedAt: step.startedAt,
       };
       const runEntry: DevToolsLogEntry = { type: "run", run: autoRun };
-      const runJson = JSON.stringify(runEntry);
-      this.emitEvicted(workspaceId, this.insertRun(data, autoRun, runJson.length));
-      await this.appendToFile(workspaceId, runJson);
-      if (data.runs.has(autoRun.id)) {
-        this.emitWorkspaceEvent(workspaceId, {
-          type: "run-created",
-          run: this.buildRunSummary(data, autoRun.id),
-        });
-      }
+      healedRunJson = JSON.stringify(runEntry);
+      this.emitEvicted(workspaceId, this.insertRun(data, autoRun, healedRunJson.length));
     }
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
     this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
+
+    if (healedRunJson !== undefined) {
+      const runAppend = this.appendToFile(workspaceId, healedRunJson);
+      if (data.runs.has(step.runId)) {
+        this.emitWorkspaceEvent(workspaceId, {
+          type: "run-created",
+          run: this.buildRunSummary(data, step.runId),
+        });
+      }
+      await runAppend;
+    }
     await this.appendToFile(workspaceId, json);
 
-    this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
+    // Both may have been evicted while the appends were queued; only announce
+    // what readers can still see.
+    if (data.steps.has(step.id)) {
+      this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
+    }
     if (data.runs.has(step.runId)) {
       const summary = this.buildRunSummary(data, step.runId);
       this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
