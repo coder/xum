@@ -3780,7 +3780,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     options?: ActiveWorkflowRunIdsOptions
   ): Promise<Set<string>> {
-    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
+    let activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
+    // Converge on the installed cache: a dormant (archived) read resolves a DETACHED empty
+    // Set, and a workflow event can install and populate the shared one in the microtask
+    // gap above. Returning the detached copy would let an authoritative list response that
+    // lands after the event clear the activity the event just delivered to the renderer.
+    // (Same applies to the pathological detached disk probe in resolve's fallback.)
+    const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+    if (installed != null && installed !== activeRunIds) {
+      activeRunIds = installed;
+    }
     if (
       activeRunIds.size > 0 &&
       // Installation re-check in THIS continuation: an eviction (removal, or
@@ -3830,6 +3839,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // so only the event path installs one: read paths (the activity list walks every
       // config-known id) would otherwise fill this map with an empty Set per archived
       // workspace, thousands on long-lived deployments, that nothing ever reads back.
+      // The detached result is provisional: getActiveWorkflowRunIds swaps in the shared
+      // Set if an event installed one before the caller's continuation ran.
       if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
         const activeRunIds = new Set<string>();
         if (options?.installDormant === true) {

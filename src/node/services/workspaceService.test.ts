@@ -2636,6 +2636,51 @@ describe("WorkspaceService workflow activity", () => {
     }
   });
 
+  test("archived reads converge on a set a workflow event installs during the await", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const internals = workspaceService as unknown as {
+        getActiveWorkflowRunIds: (workspaceId: string) => Promise<ReadonlySet<string>>;
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
+
+      // The list-style read resolves its (dormant, detached) answer synchronously; the event
+      // lands in the microtask gap before the read's continuation runs.
+      const read = internals.getActiveWorkflowRunIds("archived");
+      const event = workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "running",
+      });
+      await event;
+      expect([...(await read)]).toEqual(["wfr_live"]);
+      expect(internals.activeWorkflowRunIdsByWorkspace.get("archived")).toBe(await read);
+      // Dormant stores are never scanned on either path.
+      expect(scanSpy).not.toHaveBeenCalled();
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("caches active workflow run counts and updates emitted activity from status events", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
