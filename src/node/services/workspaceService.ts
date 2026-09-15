@@ -4510,6 +4510,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // bounds how many transient sessions exist at once (see STARTUP_RECOVERY_CONCURRENCY).
     this.deferWorkspaceCleanup(async () => {
       const slot = await this.startupRecoverySemaphore.acquire();
+      // Disposal of a non-promoted session, when withStartupSession queued one.
+      let disposal: Promise<void> | undefined;
       try {
         // Waited-for recoveries would otherwise each throw from createSession after
         // beginShutdown() has already swept the transient registry.
@@ -4547,21 +4549,38 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             return;
           }
         }
-        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(current));
+        await this.withStartupSession(
+          trimmed,
+          (session) => session.runStartupRecovery(current),
+          (settled) => {
+            disposal = settled;
+          }
+        );
       } catch (error) {
         log.warn("Failed to run startup recovery for workspace", {
           workspaceId: trimmed,
           error: getErrorMessage(error),
         });
       } finally {
+        // AgentSession.dispose detaches its AIService listeners only after its awaited cleanup
+        // settles, so releasing on recovery completion would let the next admitted session
+        // overlap with an undisposed one and stack past the cap. A promoted session is live by
+        // design and queues no disposal, so its slot frees immediately. The tracked promise
+        // never rejects (trackWorkspaceCleanup logs failures).
+        if (disposal !== undefined) await disposal;
         slot.release();
       }
     });
   }
 
+  /**
+   * `onDisposal` receives the tracked disposal promise when the session is NOT promoted, so a
+   * caller that budgets live sessions can wait for teardown without owning the session.
+   */
   private async withStartupSession<T>(
     workspaceId: string,
-    run: (session: AgentSession) => Promise<T>
+    run: (session: AgentSession) => Promise<T>,
+    onDisposal?: (settled: Promise<void>) => void
   ): Promise<T> {
     workspaceId = workspaceId.trim();
     assert(workspaceId.length > 0, "workspaceId must not be empty");
@@ -4585,7 +4604,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // physical read cannot block startup or make a later caller adopt a closing session.
       if (this.transientStartupRecoverySessions.get(workspaceId) === session) {
         this.transientStartupRecoverySessions.delete(workspaceId);
-        this.deferWorkspaceCleanup(() => session.dispose());
+        const settled = this.trackWorkspaceCleanup(() => session.dispose());
+        onDisposal?.(settled);
       }
     }
   }

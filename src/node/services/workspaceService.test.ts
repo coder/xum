@@ -11031,6 +11031,84 @@ describe("WorkspaceService initialize", () => {
     );
   });
 
+  test("holds a startup-recovery slot until the transient session's disposal settles", async () => {
+    const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 2 }, (_, i) => `ws-${i}`);
+    // The first admitted session is promoted (recovery left activity alive); the rest are
+    // transient and must be disposed before their slot is reusable.
+    const promoted = ids[0];
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+      sessions: Map<string, AgentSession>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const recoveries = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const disposals = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
+      (workspaceId) => {
+        const recovery = Promise.withResolvers<void>();
+        recoveries.set(workspaceId, recovery);
+        return {
+          ...createCompactionAdmissionMocks(),
+          runStartupRecovery: mock(() => recovery.promise),
+          shouldRetainAfterStartupRecovery: mock(() => workspaceId === promoted),
+          scheduleStartupRecovery: mock(() => undefined),
+          onChatEvent: mock(() => () => undefined),
+          onMetadataEvent: mock(() => () => undefined),
+          dispose: mock(() => {
+            const disposal = Promise.withResolvers<void>();
+            disposals.set(workspaceId, disposal);
+            return disposal.promise;
+          }),
+        } as unknown as AgentSession;
+      }
+    );
+    const created = () => createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId);
+
+    await workspaceService.initialize();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+    const [, transient] = created();
+
+    // A transient session whose recovery finished but whose dispose is still pending keeps
+    // its slot: listeners and heap are only released when dispose settles.
+    recoveries.get(transient)!.resolve();
+    await flush();
+    expect(disposals.has(transient)).toBe(true);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+
+    disposals.get(transient)!.resolve();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 1);
+
+    // A promoted session is live by design and releases its slot as soon as recovery ends.
+    recoveries.get(promoted)!.resolve();
+    await flush();
+    expect(startupAccess.sessions.get(promoted)).toBeDefined();
+    expect(disposals.has(promoted)).toBe(false);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 2);
+
+    // Drain in rounds: each disposal admits another session whose gates appear late.
+    for (const _round of ids) {
+      for (const recovery of recoveries.values()) recovery.resolve();
+      await flush();
+      for (const disposal of disposals.values()) disposal.resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+    expect(created().sort()).toEqual([...ids].sort());
+    startupAccess.sessions.delete(promoted);
+  });
+
   test("skips queued startup recoveries whose workspace was archived or removed while waiting", async () => {
     const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 4 }, (_, i) => `ws-${i}`);
     const archivedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 1];
