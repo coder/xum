@@ -567,7 +567,11 @@ describe("AgentSession continuous compaction wiring", () => {
     const h = await setup();
     const retained = createMuxMessage("retained-user", "user", "Earlier task");
     await h.historyService.appendToHistory(workspaceId, retained);
-    const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+    const handler = (
+      Reflect.get(h.session, "contextController") as {
+        transitionalCompactionHandler: CompactionHandler;
+      }
+    ).transitionalCompactionHandler;
     const preparation = handler.beginPreparation(() => true);
     const source = await rows(h);
     expect(
@@ -951,7 +955,11 @@ describe("AgentSession continuous compaction wiring", () => {
         }
         return read(id);
       });
-      const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+      const handler = (
+        Reflect.get(h.session, "contextController") as {
+          transitionalCompactionHandler: CompactionHandler;
+        }
+      ).transitionalCompactionHandler;
       spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
         async (_usage, context) => {
           if (context.phase !== "mid-stream") return "none";

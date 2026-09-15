@@ -7,11 +7,15 @@ import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
 import {
-  AgentSession,
+  type AgentSession,
   clearProviderConfigFixableAbandonMarkers,
   type AgentSessionAIService,
 } from "./agentSession";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
@@ -2129,7 +2133,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,

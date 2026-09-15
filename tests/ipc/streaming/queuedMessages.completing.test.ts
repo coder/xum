@@ -89,11 +89,14 @@ describe("Queued messages during stream completion", () => {
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -160,11 +163,14 @@ describe("Queued messages during stream completion", () => {
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -234,11 +240,14 @@ describe("Queued messages during stream completion", () => {
     const aiService = env.services.aiService;
 
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -368,11 +377,14 @@ describe("Queued messages during stream completion", () => {
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -477,11 +489,14 @@ describe("Queued messages during stream completion", () => {
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const originalHandleCompletion = compactionHandler.handleCompletion.bind(compactionHandler);
     const handleCompletionSpy = jest
@@ -559,11 +574,14 @@ describe("Queued messages during stream completion", () => {
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
     type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+      contextController: {
+        transitionalCompactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
     };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .transitionalCompactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();

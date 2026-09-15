@@ -1,6 +1,5 @@
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, test, mock, afterEach } from "bun:test";
-import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -9,7 +8,11 @@ import { createTestHistoryService } from "./testHistoryService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStreamLifecycleMocks,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 
 // NOTE: These tests focus on the event wiring (tool-call-end -> callback).
 // The actual post-compaction state computation is covered elsewhere.
@@ -211,7 +214,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     const onPostCompactionStateChange = mock(() => undefined);
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,

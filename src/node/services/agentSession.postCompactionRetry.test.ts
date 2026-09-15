@@ -4,7 +4,6 @@ import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 
-import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -17,6 +16,7 @@ import {
   createFailedTurnHandle,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
+  createTestAgentSession,
 } from "./agentSession.testHarness";
 
 function contextExceededResult(messageId: string) {
@@ -154,7 +154,7 @@ describe("AgentSession post-compaction context retry", () => {
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -307,7 +307,7 @@ describe("AgentSession post-compaction context retry", () => {
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -450,7 +450,7 @@ describe("AgentSession post-compaction context retry", () => {
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,

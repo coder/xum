@@ -30,7 +30,7 @@ const options = { model: "openai:gpt-4o", agentId: "exec" };
 const fixtures: AgentSessionHarness[] = [];
 
 interface Internals {
-  compactionMonitor: CompactionMonitor;
+  contextController: { compactionMonitor: CompactionMonitor };
   coordinator: TurnCoordinator;
   compactionCancellation: CompactionCancellation;
   fileChangeTracker: FileChangeTracker;
@@ -158,8 +158,8 @@ describe("compaction cancellation runtime", () => {
     });
     await fileIO.writeFile(h.storage.path, unsupported);
     const before = await h.rows();
-    spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-    spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+    spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
       usagePercentage: 95,
@@ -206,8 +206,8 @@ describe("compaction cancellation runtime", () => {
         .dispatchPendingCompactionFollowUpIfNeeded()
         .catch((error: unknown) => String(error));
       expect(failedCleanup).toContain("injected cleanup failure");
-      spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-      spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+      spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+      spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
         shouldShowWarning: usagePercentage > 70,
         shouldForceCompact: usagePercentage > 70,
         usagePercentage,
@@ -248,8 +248,8 @@ describe("compaction cancellation runtime", () => {
 
   test("automatic input still starts legacy compaction without cancellation debt", async () => {
     const h = await fixture();
-    spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-    spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+    spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
       usagePercentage: 95,

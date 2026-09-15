@@ -10,6 +10,7 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 
 /**
@@ -64,10 +65,13 @@ describe("WorkspaceService config resurrection regression", () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-resurrection-"));
     config = new Config(tempDir);
 
+    const historyService = {} as unknown as HistoryService;
+    const aiService = new EventEmitter() as unknown as AIService;
     service = new WorkspaceService(
       config,
-      {} as HistoryService,
-      new EventEmitter() as unknown as AIService,
+      historyService,
+      aiService,
+      new ContextManagementService({ config, historyService, aiService }),
       new EventEmitter() as unknown as InitStateManager,
       {
         updateRecency: mock(() =>

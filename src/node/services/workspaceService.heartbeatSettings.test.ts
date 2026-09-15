@@ -8,6 +8,7 @@ import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import { HEARTBEAT_DEFAULT_CONTEXT_MODE } from "@/constants/heartbeat";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 
 const TEST_WORKSPACE_ID = "test-ws";
@@ -72,10 +73,13 @@ describe("WorkspaceService heartbeat settings", () => {
       }),
     } as unknown as Config;
 
+    const historyService = {} as unknown as HistoryService;
+    const aiService = new EventEmitter() as unknown as AIService;
     service = new WorkspaceService(
       mockConfig,
-      {} as HistoryService,
-      new EventEmitter() as unknown as AIService,
+      historyService,
+      aiService,
+      new ContextManagementService({ config: mockConfig, historyService, aiService }),
       new EventEmitter() as unknown as InitStateManager,
       {
         updateRecency: mock(() =>

@@ -258,8 +258,8 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       await historyService.appendToHistory(workspaceId, cutAssistant("cut"));
 
       // Force the on-send compaction divert for the wake continuation.
-      const internals = session as unknown as { compactionMonitor: unknown };
-      internals.compactionMonitor = {
+      const internals = session as unknown as { contextController: { compactionMonitor: unknown } };
+      internals.contextController.compactionMonitor = {
         checkBeforeSend: mock(() => ({
           shouldShowWarning: true,
           shouldForceCompact: true,

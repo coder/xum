@@ -7,12 +7,16 @@ import { createMuxMessage } from "@/common/types/message";
 import type { MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import { AgentSession } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import type { AIService, StreamMessageOptions } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -69,7 +73,7 @@ describe("AgentSession file-change notification (turn start)", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config: config as unknown as Config,
       historyService,

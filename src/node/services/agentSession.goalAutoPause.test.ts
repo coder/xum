@@ -7,7 +7,7 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
-import { AgentSession } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { createMuxMessage } from "@/common/types/message";
@@ -21,7 +21,11 @@ import {
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
-import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
 const SEND_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o", agentId: "exec" };
@@ -105,7 +109,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
   } as unknown as BackgroundProcessManager;
 
   const aiService = createAiService(workspaceId, () => session.closingSignal);
-  const session = new AgentSession({
+  const session = createTestAgentSession({
     workspaceId,
     config,
     historyService,

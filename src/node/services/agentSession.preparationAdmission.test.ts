@@ -323,8 +323,9 @@ describe("preparation admission", () => {
 
   test("a stale automatic on-send compaction append is rolled back before its request can be replayed", async () => {
     const h = await harness("stale-compaction-append");
-    const monitor = (h.session as unknown as { compactionMonitor: CompactionMonitor })
-      .compactionMonitor;
+    const monitor = (
+      h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor;
     spyOn(monitor, "getThreshold").mockReturnValue(0.85);
     spyOn(monitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,

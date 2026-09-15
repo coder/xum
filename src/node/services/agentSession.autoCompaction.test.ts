@@ -15,12 +15,13 @@ import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import { AgentSession } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
+  createTestAgentSession,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
@@ -76,7 +77,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       materializeFileAtMentionsSnapshot: (
         text: string
       ) => Promise<{ snapshotMessage: MuxMessage; materializedTokens: string[] } | null>;
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
     };
 
     internals.materializeFileAtMentionsSnapshot = mock((_text: string) =>
@@ -86,7 +87,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })
     );
 
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -257,7 +258,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const internals = session as unknown as {
       materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
     };
 
     // Materialization can execute skill dynamic-context directives (side effects),
@@ -266,7 +267,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const materializeSkillSnapshots = mock(() => Promise.resolve([]));
     internals.materializeAgentSkillSnapshots = materializeSkillSnapshots;
 
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -317,8 +318,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         if (!seedResult.success) throw new Error(seedResult.error);
       }
 
-      const internals = session as unknown as { compactionMonitor: CompactionMonitor };
-      internals.compactionMonitor = {
+      const internals = session as unknown as {
+        contextController: { compactionMonitor: CompactionMonitor };
+      };
+      internals.contextController.compactionMonitor = {
         checkBeforeSend: mock(() => ({
           shouldShowWarning: true,
           shouldForceCompact: true,
@@ -414,7 +417,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: false,
@@ -468,7 +473,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -914,7 +921,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       }),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -931,7 +938,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     }));
     const checkMidStream = mock((_params: unknown) => false);
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend,
       checkMidStream,
       resetForNewStream: mock(() => undefined),
@@ -1036,7 +1045,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -1055,7 +1064,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       };
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend,
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
@@ -1148,7 +1159,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -1158,12 +1169,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const internals = session as unknown as {
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
       sendMessage: AgentSession["sendMessage"];
     };
 
     let midStreamChecks = 0;
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: false,
         shouldForceCompact: false,
@@ -1299,7 +1310,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -1314,7 +1325,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return midStreamChecks === 1;
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: false,
         shouldForceCompact: false,
@@ -1465,7 +1478,9 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     historyCleanup = harness.cleanup;
 
     // Cross the on-send threshold unconditionally.
-    (harness.session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      harness.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -1506,8 +1521,11 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         workspaceId: "ws-auto-compaction-synthetic-guidance",
       });
 
-      const monitor = (fixture.session as unknown as { compactionMonitor: CompactionMonitor })
-        .compactionMonitor;
+      const monitor = (
+        fixture.session as unknown as {
+          contextController: { compactionMonitor: CompactionMonitor };
+        }
+      ).contextController.compactionMonitor;
       let firstCheck = true;
       spyOn(monitor, "checkBeforeSend").mockImplementation(() => {
         const high = firstCheck;

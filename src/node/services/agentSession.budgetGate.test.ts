@@ -5,9 +5,9 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
-import { AgentSession } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle } from "./agentSession.testHarness";
+import { createStartedTurnHandle, createTestAgentSession } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -94,7 +94,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     setMessageQueued: mock((_workspaceId: string, _queued: boolean) => undefined),
   } as unknown as BackgroundProcessManager;
 
-  const session: AgentSession = new AgentSession({
+  const session: AgentSession = createTestAgentSession({
     workspaceId,
     config,
     historyService,

@@ -16,7 +16,7 @@ import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSessi
 const workspaceId = "consumer-pending-owner";
 const model = "openai:gpt-4o";
 interface SessionAccess {
-  compactionHandler: CompactionHandler;
+  contextController: { transitionalCompactionHandler: CompactionHandler };
   coordinator: TurnCoordinator;
   turnsSinceLastAttachment: number;
   getPostCompactionAttachmentsIfNeeded(
@@ -69,7 +69,7 @@ describe("pending snapshot consumers", () => {
         },
       });
       const session = h.session as unknown as SessionAccess;
-      const handler = session.compactionHandler;
+      const handler = session.contextController.transitionalCompactionHandler;
       const consumer = spyOn(session.coordinator, "consumeCompletion");
       async function publish(id: string) {
         const edit = createMuxMessage(id, "assistant", "");

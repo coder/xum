@@ -22,7 +22,7 @@ interface PreparationInputs {
   }>;
   materializeAgentSkillSnapshots(): Promise<MuxMessage[]>;
   materializeMcpPromptSnapshots(metadata: unknown, invokingId: string): Promise<MuxMessage[]>;
-  compactionMonitor: CompactionMonitor;
+  contextController: { compactionMonitor: CompactionMonitor };
 }
 
 async function fixture() {
@@ -281,7 +281,7 @@ describe("prepared history publication", () => {
     await h.session.cancelCompaction(true);
     const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
     const stop = await storage.read();
-    spyOn(h.inputs.compactionMonitor, "checkBeforeSend").mockReturnValue({
+    spyOn(h.inputs.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
       usagePercentage: 99,
@@ -289,7 +289,7 @@ describe("prepared history publication", () => {
       contextTokens: 99_000,
       maxTokens: 100_000,
     });
-    spyOn(h.inputs.compactionMonitor, "getThreshold").mockReturnValue(0.85);
+    spyOn(h.inputs.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.85);
     expect(await h.session.sendMessage("inspect input", options)).toEqual(Ok(undefined));
     const rows = await h.rows();
     expect(rows).toHaveLength(1);

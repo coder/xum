@@ -8,6 +8,7 @@ import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import {
   STARTUP_RECOVERY_CONCURRENCY,
   WorkspaceService,
@@ -246,21 +247,31 @@ function createWorkspaceServiceForTest(options: {
   initStateManager?: InitStateManager;
   extensionMetadata?: ExtensionMetadataService;
   backgroundProcessManager?: BackgroundProcessManager;
-  sessionUsageService?: WorkspaceServiceArgs[6];
-  policyService?: WorkspaceServiceArgs[7];
-  telemetryService?: WorkspaceServiceArgs[8];
-  experimentsService?: WorkspaceServiceArgs[9];
-  sessionTimingService?: WorkspaceServiceArgs[10];
-  streamManager?: WorkspaceServiceArgs[11];
-  secretsStore?: WorkspaceServiceArgs[12];
+  sessionUsageService?: WorkspaceServiceArgs[7];
+  policyService?: WorkspaceServiceArgs[8];
+  telemetryService?: WorkspaceServiceArgs[9];
+  experimentsService?: WorkspaceServiceArgs[10];
+  sessionTimingService?: WorkspaceServiceArgs[11];
+  streamManager?: WorkspaceServiceArgs[12];
+  secretsStore?: WorkspaceServiceArgs[13];
 }): WorkspaceService {
   // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   const defaultHistoryService: HistoryService = {} as HistoryService;
+  const config = options.config as Config;
+  const historyService = options.historyService ?? defaultHistoryService;
+  const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
-    options.config as Config,
-    options.historyService ?? defaultHistoryService,
-    options.aiService ?? createMockAIService(),
+    config,
+    historyService,
+    aiService,
+    new ContextManagementService({
+      config,
+      historyService,
+      aiService,
+      sessionUsageService: options.sessionUsageService,
+      telemetryService: options.telemetryService,
+    }),
     options.initStateManager ?? (mockInitStateManager as InitStateManager),
     options.extensionMetadata ?? (mockExtensionMetadataService as ExtensionMetadataService),
     options.backgroundProcessManager ?? (mockBackgroundProcessManager as BackgroundProcessManager),
@@ -8104,6 +8115,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       config,
       historyService,
       aiService,
+      new ContextManagementService({ config, historyService, aiService }),
       initStateManager,
       extensionMetadata,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -13149,6 +13161,7 @@ describe("WorkspaceService pending auto-title", () => {
       config,
       historyService,
       aiService,
+      new ContextManagementService({ config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -15507,15 +15520,17 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
     } as unknown as AIService;
     const { historyService, cleanup } = await createTestHistoryService();
     cleanupHistory = cleanup;
+    const config = {
+      srcDir: "/tmp/test",
+      sessionsDir: "/tmp/test/sessions",
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock(() => null),
+    } as unknown as Config;
     return new WorkspaceService(
-      {
-        srcDir: "/tmp/test",
-        sessionsDir: "/tmp/test/sessions",
-        generateStableId: mock(() => "test-id"),
-        findWorkspace: mock(() => null),
-      } as unknown as Config,
+      config,
       historyService,
       aiService,
+      new ContextManagementService({ config, historyService, aiService }),
       {
         on: mock(() => undefined),
         getInitState: mock(() => undefined),
@@ -16122,6 +16137,7 @@ describe("WorkspaceService remove timing rollup", () => {
         mockConfig as Config,
         historyService,
         aiService,
+        new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager,
@@ -17114,6 +17130,7 @@ describe("WorkspaceService metadata listeners", () => {
       mockConfig as Config,
       historyService,
       aiService,
+      new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -17177,6 +17194,7 @@ describe("WorkspaceService metadata listeners", () => {
       mockConfig as Config,
       historyService,
       aiService,
+      new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -17880,7 +17898,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
-      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[11],
+      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
     });
   });
 
@@ -19031,6 +19049,11 @@ describe("WorkspaceService archive init cancellation", () => {
       mockConfig as Config,
       historyService,
       mockAIService,
+      new ContextManagementService({
+        config: mockConfig as Config,
+        historyService,
+        aiService: mockAIService,
+      }),
       mockInitStateManager as InitStateManager,
       {} as ExtensionMetadataService,
       { cleanup: mock(() => Promise.resolve()) } as unknown as BackgroundProcessManager
@@ -20679,7 +20702,7 @@ describe("WorkspaceService init cancellation", () => {
     const policyService = {
       isEnforced: mock(() => true),
       isRuntimeAllowed: mock(() => false),
-    } as unknown as WorkspaceServiceArgs[7];
+    } as unknown as WorkspaceServiceArgs[8];
 
     try {
       const workspaceService = createWorkspaceServiceForTest({
@@ -21207,6 +21230,11 @@ describe("WorkspaceService init cancellation", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager,
@@ -21295,6 +21323,11 @@ describe("WorkspaceService init cancellation", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager
@@ -21371,6 +21404,11 @@ describe("WorkspaceService init cancellation", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager
@@ -21443,6 +21481,11 @@ describe("WorkspaceService init cancellation", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager
@@ -21523,6 +21566,11 @@ describe("WorkspaceService init cancellation", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager
@@ -22118,6 +22166,7 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       extensionMetadata,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -22248,6 +22297,12 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({
+        config,
+        historyService,
+        aiService: mockAIService,
+        sessionUsageService,
+      }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager,
@@ -22367,6 +22422,7 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -22480,6 +22536,7 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -22591,6 +22648,7 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -22701,6 +22759,7 @@ describe("WorkspaceService fork", () => {
       config,
       historyService,
       mockAIService,
+      new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -23081,6 +23140,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       mockConfig as Config,
       historyService,
       mockAIService,
+      new ContextManagementService({
+        config: mockConfig as Config,
+        historyService,
+        aiService: mockAIService,
+      }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager
@@ -23214,6 +23278,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager as InitStateManager,
         {} as ExtensionMetadataService,
         {} as BackgroundProcessManager
@@ -23448,6 +23517,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager

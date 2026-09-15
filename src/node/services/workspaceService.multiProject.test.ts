@@ -19,6 +19,7 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { Ok } from "@/common/types/result";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -84,10 +85,13 @@ function createMockAIService(metadata?: WorkspaceMetadata): AIService {
   } as unknown as AIService;
 }
 function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): WorkspaceService {
+  const config = options.config as Config;
+  const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
-    options.config as Config,
+    config,
     options.historyService,
-    options.aiService ?? createMockAIService(),
+    aiService,
+    new ContextManagementService({ config, historyService: options.historyService, aiService }),
     options.initStateManager ?? createMockInitStateManager(),
     mockExtensionMetadataService as ExtensionMetadataService,
     mockBackgroundProcessManager as BackgroundProcessManager,
@@ -610,6 +614,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
       mockConfig as Config,
       historyService,
       mockAIService,
+      new ContextManagementService({
+        config: mockConfig as Config,
+        historyService,
+        aiService: mockAIService,
+      }),
       createMockInitStateManager(),
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager,
@@ -658,6 +667,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
       mockConfig as Config,
       historyService,
       mockAIService,
+      new ContextManagementService({
+        config: mockConfig as Config,
+        historyService,
+        aiService: mockAIService,
+      }),
       createMockInitStateManager(),
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager,
@@ -678,16 +692,19 @@ describe("WorkspaceService multi-project lifecycle", () => {
   test("createMultiProject rejects when the experiment is disabled", async () => {
     const generateStableIdMock = mock(() => "ws-disabled");
     const loadConfigOrDefaultMock = mock(() => ({ projects: new Map() }));
+    const config = {
+      generateStableId: generateStableIdMock,
+      loadConfigOrDefault: loadConfigOrDefaultMock,
+    } as unknown as Config;
+    const aiService = {
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
     const workspaceService = new WorkspaceService(
-      {
-        generateStableId: generateStableIdMock,
-        loadConfigOrDefault: loadConfigOrDefaultMock,
-      } as unknown as Config,
+      config,
       historyService,
-      {
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService,
+      aiService,
+      new ContextManagementService({ config, historyService, aiService }),
       createMockInitStateManager(),
       mockExtensionMetadataService as ExtensionMetadataService,
       mockBackgroundProcessManager as BackgroundProcessManager,
@@ -993,6 +1010,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
           mockConfig as Config,
           historyService,
           mockAIService,
+          new ContextManagementService({
+            config: mockConfig as Config,
+            historyService,
+            aiService: mockAIService,
+          }),
           {
             on: mock(() => undefined as unknown as InitStateManager),
             getInitState: getInitStateMock,
@@ -1345,6 +1367,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
         mockConfig as Config,
         historyService,
         mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
         createMockInitStateManager(),
         mockExtensionMetadataService as ExtensionMetadataService,
         mockBackgroundProcessManager as BackgroundProcessManager,

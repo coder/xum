@@ -22,6 +22,7 @@ import { IdleDispatcher } from "./idleDispatcher";
 import type { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 
 async function waitForCondition(
@@ -194,10 +195,13 @@ describe("HeartbeatService", () => {
       executeHeartbeat: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
     }> = {}
   ): WorkspaceService {
+    const historyService = {} as unknown as HistoryService;
+    const aiService = new EventEmitter() as unknown as AIService;
     const realWorkspaceService = new WorkspaceService(
       mockConfig,
-      {} as HistoryService,
-      new EventEmitter() as unknown as AIService,
+      historyService,
+      aiService,
+      new ContextManagementService({ config: mockConfig, historyService, aiService }),
       new EventEmitter() as unknown as InitStateManager,
       mockExtensionMetadata,
       {} as BackgroundProcessManager

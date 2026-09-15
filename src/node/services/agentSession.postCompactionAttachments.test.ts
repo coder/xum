@@ -14,8 +14,8 @@ import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
-import { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { CompactionHandler } from "./compactionHandler";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -146,7 +146,7 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
     loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 
-  return new AgentSession({
+  return createTestAgentSession({
     workspaceId: WORKSPACE_ID,
     config,
     historyService,
@@ -159,7 +159,7 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
 interface PrivateSessionAccess {
   compactionOccurred: boolean;
   turnsSinceLastAttachment: number;
-  compactionHandler: CompactionHandler;
+  contextController: { transitionalCompactionHandler: CompactionHandler };
   getPostCompactionAttachmentsIfNeeded: () => Promise<PostCompactionAttachment[] | null>;
 }
 
@@ -490,7 +490,7 @@ describe("AgentSession post-compaction attachments", () => {
       ]);
       await (
         session as unknown as PrivateSessionAccess
-      ).compactionHandler.ackPendingStateConsumed();
+      ).contextController.transitionalCompactionHandler.ackPendingStateConsumed();
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getLoadedSkillNames(attachments)).toEqual(["react-effects"]);
       expect(getLoadedSkillAttachment(attachments)?.skills[0]?.body).toContain(

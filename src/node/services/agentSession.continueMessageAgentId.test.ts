@@ -5,8 +5,8 @@ import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/messa
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
-import { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
@@ -171,7 +171,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       await historyService.appendToHistory("ws", message);
     }
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,

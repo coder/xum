@@ -15,8 +15,7 @@ import {
   type StreamErrorMessage,
   type WorkspaceChatMessage,
 } from "@/common/orpc/types";
-import { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestAgentSession } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 interface ReplayHarnessStreamInfo {
@@ -408,7 +407,7 @@ describe("AgentSession pre-stream errors", () => {
       }),
     } as unknown as BackgroundProcessManager;
 
-    const sessionWithPersistedPreference = new AgentSession({
+    const sessionWithPersistedPreference = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -419,7 +418,7 @@ describe("AgentSession pre-stream errors", () => {
     await sessionWithPersistedPreference.setAutoRetryEnabled(false);
     await sessionWithPersistedPreference.dispose();
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,

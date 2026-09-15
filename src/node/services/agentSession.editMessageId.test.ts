@@ -6,9 +6,12 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
-import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
@@ -54,7 +57,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     return {
       historyService,
       streamMessage,
-      session: new AgentSession({
+      session: createTestAgentSession({
         workspaceId,
         config,
         historyService,

@@ -7,8 +7,12 @@ import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
-import { AgentSession, type AgentSessionAIService } from "./agentSession";
-import { createStreamLifecycleMocks, createAgentSessionHarness } from "./agentSession.testHarness";
+import type { AgentSession, AgentSessionAIService } from "./agentSession";
+import {
+  createStreamLifecycleMocks,
+  createAgentSessionHarness,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
@@ -74,7 +78,7 @@ function createSession(args: {
     loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 
-  return new AgentSession({
+  return createTestAgentSession({
     workspaceId: WORKSPACE_ID,
     config,
     historyService: args.historyService,

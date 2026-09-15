@@ -1820,10 +1820,10 @@ describe("AgentSession queued message tool-call dispatch", () => {
       aiServiceOverrides: { streamMessage },
     });
     const internals = session as unknown as {
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
       getAutoRetryPreferencePath(): string;
     };
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: () => ({
         shouldShowWarning: true,
         shouldForceCompact: true,

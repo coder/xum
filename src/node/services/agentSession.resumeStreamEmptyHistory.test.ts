@@ -1,7 +1,6 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 
-import { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -47,7 +46,7 @@ describe("AgentSession.resumeStream", () => {
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,

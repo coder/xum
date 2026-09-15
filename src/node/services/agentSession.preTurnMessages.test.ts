@@ -6,9 +6,12 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {
@@ -42,7 +45,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     return {
       historyService,
       streamMessage,
-      session: new AgentSession({
+      session: createTestAgentSession({
         workspaceId,
         config,
         historyService,
