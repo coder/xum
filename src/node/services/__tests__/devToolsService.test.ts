@@ -971,6 +971,41 @@ describe("DevToolsService", () => {
         expect(events.some((event) => event.type === "step-created")).toBe(false);
       });
 
+      it("tracks only in-flight steps of an evicted run for late updates", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-done", runId: "run-1", stepNumber: 1, durationMs: 10 })
+        );
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-open", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lineCountBefore = (await fs.readFile(logPath, "utf-8")).split("\n").length;
+
+        // A finalized step can never be updated again, so it is not tracked.
+        await service.updateStep("ws-1", "step-done", { durationMs: 11 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore);
+
+        // The in-flight step's completing update lands...
+        await service.updateStep("ws-1", "step-open", { durationMs: 20 });
+        const afterCompletion = await fs.readFile(logPath, "utf-8");
+        expect(afterCompletion.split("\n")).toHaveLength(lineCountBefore + 1);
+        expect(afterCompletion).toContain('"stepId":"step-open","update":{"durationMs":20}');
+
+        // ...and releases the id: a second late update is skipped.
+        await service.updateStep("ws-1", "step-open", { durationMs: 21 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore + 1);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,

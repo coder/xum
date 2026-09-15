@@ -61,11 +61,13 @@ interface WorkspaceData {
   retainedBytes: number;
   loaded: boolean;
   /**
-   * Steps dropped from memory by retention since the last clear(). A late
-   * updateStep for one of these must still reach disk (eviction is memory-only),
-   * while an update for a cleared or unknown step must not re-populate the
-   * truncated log with an orphan line. Ids are short strings and the set grows
-   * only with live evictions (it is reset after replay and on clear()).
+   * In-flight steps dropped from memory by live retention since the last
+   * clear(). A late updateStep for one of these must still reach disk (eviction
+   * is memory-only), while an update for a cleared or unknown step must not
+   * re-populate the truncated log with an orphan line. Bounded by the number of
+   * evicted steps that have not finished yet: finalized steps are never added
+   * (they receive no further updates), an id is removed once its completing
+   * update lands, and the set is reset after replay and on clear().
    */
   evictedStepIds: Set<string>;
   /**
@@ -140,13 +142,24 @@ function replacedStepBytes(existing: DevToolsStep, update: Partial<DevToolsStep>
   return bytes;
 }
 
+function isStepInFlight(step: Pick<DevToolsStep, "durationMs" | "error">): boolean {
+  return step.durationMs == null && step.error == null;
+}
+
+/** Whether applying `update` finishes a step (it will not be updated again). */
+function completesStep(update: Partial<DevToolsStep>): boolean {
+  return update.durationMs != null || update.error != null;
+}
+
 function evictRun(data: WorkspaceData, runId: string): void {
   data.runs.delete(runId);
   for (const [stepId, step] of data.steps) {
     if (step.runId === runId) {
       data.steps.delete(stepId);
       data.stepBytes.delete(stepId);
-      data.evictedStepIds.add(stepId);
+      if (isStepInFlight(step)) {
+        data.evictedStepIds.add(stepId);
+      }
     }
   }
   data.retainedBytes -= data.runBytes.get(runId) ?? 0;
@@ -428,6 +441,9 @@ export class DevToolsService extends EventEmitter {
         stepId,
       });
       await this.appendToFile(workspaceId, json);
+      if (completesStep(update)) {
+        data.evictedStepIds.delete(stepId);
+      }
       return;
     }
 
@@ -839,9 +855,7 @@ export class DevToolsService extends EventEmitter {
       return;
     }
 
-    const staleSteps = Array.from(data.steps.values()).filter(
-      (step) => step.durationMs == null && step.error == null
-    );
+    const staleSteps = Array.from(data.steps.values()).filter(isStepInFlight);
     if (staleSteps.length === 0) {
       return;
     }
