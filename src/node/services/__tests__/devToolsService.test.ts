@@ -1166,6 +1166,56 @@ describe("DevToolsService", () => {
         expect((await restarted.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
       });
 
+      it("does not remember an evicted run's late step when clear() runs during its append", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        // Hold the disk-only append of run-1's late step and clear() meanwhile.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const lateStep = service.createStep(
+            "ws-1",
+            makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+          );
+          // getRuns resolves once createStep has taken the disk-only branch and
+          // is parked on its queued append.
+          expect(await runIds(service)).toEqual(["run-2"]);
+          const cleared = service.clear("ws-1");
+          releaseQueue();
+          await Promise.all([lateStep, cleared]);
+          const appendsBeforeFinalize = appendFileSpy.mock.calls.length;
+
+          // The request finalizes after the user cleared the log.
+          await service.updateStep("ws-1", "step-a2", {
+            durationMs: 5,
+            rawChunks: rawChunksOf(10_000),
+          });
+          expect(appendFileSpy.mock.calls.length).toBe(appendsBeforeFinalize);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+        expect(await service.getRuns("ws-1")).toEqual([]);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,

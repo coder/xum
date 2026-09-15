@@ -413,9 +413,17 @@ export class DevToolsService extends EventEmitter {
       // Eviction is memory-only and disk is authoritative: an evicted run that
       // is still streaming keeps logging to disk, where replay reassembles it
       // under its original header, but it is not brought back into memory and
-      // nothing is announced. Its later updates land via evictedStepIds.
+      // nothing is announced. Its later updates land via evictedStepIds, but
+      // only if no clear() happened while the append was queued: clear()
+      // empties that set and truncates the log, and re-adding the id here
+      // would let the step's finalization write an orphan update into it.
+      const clearGeneration = data.clearGeneration;
       await this.appendToFile(workspaceId, json);
-      if (isStepInFlight(step)) {
+      if (
+        isStepInFlight(step) &&
+        this.workspaces.get(workspaceId) === data &&
+        data.clearGeneration === clearGeneration
+      ) {
         data.evictedStepIds.add(step.id);
       }
       return;
@@ -501,6 +509,7 @@ export class DevToolsService extends EventEmitter {
         stepId,
       });
       await this.appendToFile(workspaceId, json);
+      // Safe unguarded: after a clear() during the await the set is already empty.
       if (completesStep(update)) {
         data.evictedStepIds.delete(stepId);
       }
