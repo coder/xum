@@ -87,10 +87,6 @@ describe("findMissingKnownModels", () => {
     expect(missing.sort()).toEqual(
       Object.values(KNOWN_MODELS)
         .map((model) => model.id)
-        // Provisional unannounced entries (GPT-6 Sol) are intentionally
-        // uncovered so unpublished pricing stays unknown; they never count
-        // as missing.
-        .filter((id) => id !== KNOWN_MODELS.GPT_6_SOL.id)
         .sort()
     );
   });

@@ -140,7 +140,9 @@ const MODEL_DEFINITIONS = {
   // API; OpenAI has published no model page, pricing, context window, or
   // capability docs, and the GPT-6 launch shipped only Astra. Prepared here so
   // it can be enabled quickly at release, but default-hidden (see
-  // DEFAULT_HIDDEN_MODELS) until OpenAI confirms it. Deliberately additive:
+  // DEFAULT_HIDDEN_MODELS) until OpenAI confirms it. Its stats are a
+  // maintainer-authorized PROVISIONAL ESTIMATE copied from the GPT-5.6 Sol
+  // baseline (see models-extra.ts). Deliberately additive:
   // no aliases (`sol` stays on GPT-5.6 Sol until OpenAI documents the tier
   // succession), not warmed, and ordered after the GPT-5.6 tiers and Astra so
   // GPT-5.6 Sol stays the first 1.05M-context candidate for compaction

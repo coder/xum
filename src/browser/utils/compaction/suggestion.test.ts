@@ -105,9 +105,10 @@ describe("getHigherContextCompactionSuggestion", () => {
   test("never auto-suggests default-hidden models even when policy leaves only them", () => {
     // Policy allows the small current model plus only default-hidden entries
     // (restricted Daybreak tiers, provisional GPT-6 Sol). Without the
-    // default-hidden exclusion, the 1.05M-context Daybreak Blue entry would win
-    // the higher-context scan (GPT-6 Sol has no stats at all) and "Compact &
-    // retry" would route to a model most users cannot call.
+    // default-hidden exclusion, the provisional GPT-6 Sol entry (1.05M-context
+    // estimate, first such candidate in registry order) would win the
+    // higher-context scan and "Compact & retry" would route to a model most
+    // users cannot call.
     const hiddenOnlyPolicy: EffectivePolicy = {
       policyFormatVersion: "0.1",
       providerAccess: [

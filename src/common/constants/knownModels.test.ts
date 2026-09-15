@@ -70,12 +70,13 @@ describe("Known Models Integration", () => {
     // compaction "switch model" suggestions (same invariant as Astra above).
     const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
     expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_SOL.id));
-    // Budget safety: unpublished pricing must resolve as unknown (null stats),
-    // not a defined $0 — a defined $0 total bypasses the CLI --budget
-    // unknown-pricing rejection on a billable API model. Goal budgets already
-    // reject all-zero rates via modelHasPricingData; null stats make both
-    // paths treat the model as unpriced (see models-extra.ts).
-    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).toBeNull();
+    // Pricing provenance: the stats are a maintainer-authorized PROVISIONAL
+    // ESTIMATE copied 1:1 from the effective gpt-5.6-sol baseline (see the
+    // gpt-6-sol comment in models-extra.ts). Pinning equality keeps the
+    // estimate pegged to the baseline: a divergence must be a conscious
+    // decision (ideally replacing it with official GPT-6 Sol pricing).
+    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).not.toBeNull();
+    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).toEqual(getModelStats(KNOWN_MODELS.GPT.id));
   });
 
   test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {

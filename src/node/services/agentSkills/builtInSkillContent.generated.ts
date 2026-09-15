@@ -4048,7 +4048,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "{/* END KNOWN_MODELS_TABLE */}",
       "",
-      "Daybreak Blue, Daybreak Red, and GPT-6 Sol are hidden by default; enable them per model in **Settings → Models**. GPT-6 Sol is provisional: OpenAI has not officially announced it (the id has only been sighted on the API), so Xum treats its specs and pricing as unknown — budgeted sessions and goals reject it until official numbers land.",
+      "Daybreak Blue, Daybreak Red, and GPT-6 Sol are hidden by default; enable them per model in **Settings → Models**. GPT-6 Sol is provisional: OpenAI has not officially announced it (the id has only been sighted on the API). Its listed limits and pricing are an explicitly provisional estimate copied from GPT-5.6 Sol, so cost tracking and budget enforcement for this model are estimates that may understate real spend until official pricing replaces them.",
       "",
       "### Pro reasoning mode (GPT-5.6 and GPT-6 Astra)",
       "",

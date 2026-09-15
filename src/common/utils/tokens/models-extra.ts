@@ -476,17 +476,40 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-04-30",
   },
 
-  // GPT-6 Sol deliberately has NO entry here (PROVISIONAL, NOT OFFICIALLY
-  // ANNOUNCED as of 2026-09-15; see the GPT_6_SOL comment in knownModels.ts).
-  // OpenAI has published no specs or pricing for the id, and an entry with
-  // placeholder costs would be unsafe: explicit $0 rates make getTotalCost
-  // return a defined $0, which bypasses the CLI --budget "unknown pricing"
-  // rejection and would let a billable API model spend past the cap. (Goal
-  // budgets were already safe either way: modelHasPricingData rejects all-zero
-  // rates.) Null stats make both paths treat the model as unpriced — the CLI
-  // --budget check rejects sessions whose total cost is unknown, and goal
-  // budgets refuse the model — until OpenAI publishes real numbers (add the
-  // entry then; the curated-coverage exemption lives in updateModelsData.ts).
+  // GPT-6 Sol - PROVISIONAL ESTIMATE, NOT OFFICIAL PRICING (model unannounced
+  // as of 2026-09-15; see the GPT_6_SOL comment in knownModels.ts). Per explicit
+  // maintainer authorization, pricing and token limits are copied 1:1 from
+  // GPT_56_SOL_STATS — the repo's effective gpt-5.6-sol baseline (this override
+  // wins over LiteLLM's stale upstream row) — so cost tracking and budgets have
+  // a labeled estimate instead of treating the model as unpriced. Copying by
+  // reference keeps the estimate pegged to the baseline until replaced.
+  // Consequences while the estimate stands: goal budgets accept the model
+  // (modelHasPricingData sees nonzero rates) and CLI --budget enforces the cap
+  // against these estimated rates — if real pricing lands higher (Astra bills
+  // 2x Sol), spend is under-counted until the entry is corrected. Replacing
+  // this with the official model-page numbers is a REQUIRED item on the PR's
+  // before-undraft checklist. Capability flags and knowledge_cutoff are
+  // deliberately omitted: nothing official is published for this id, and
+  // copying them would assert facts about an unreleased model rather than a
+  // pricing estimate.
+  "gpt-6-sol": {
+    max_input_tokens: GPT_56_SOL_STATS.max_input_tokens,
+    max_output_tokens: GPT_56_SOL_STATS.max_output_tokens,
+    input_cost_per_token: GPT_56_SOL_STATS.input_cost_per_token,
+    input_cost_per_token_above_200k_tokens: GPT_56_SOL_STATS.input_cost_per_token_above_200k_tokens,
+    output_cost_per_token: GPT_56_SOL_STATS.output_cost_per_token,
+    output_cost_per_token_above_200k_tokens:
+      GPT_56_SOL_STATS.output_cost_per_token_above_200k_tokens,
+    cache_read_input_token_cost: GPT_56_SOL_STATS.cache_read_input_token_cost,
+    cache_read_input_token_cost_above_200k_tokens:
+      GPT_56_SOL_STATS.cache_read_input_token_cost_above_200k_tokens,
+    cache_creation_input_token_cost: GPT_56_SOL_STATS.cache_creation_input_token_cost,
+    cache_creation_input_token_cost_above_200k_tokens:
+      GPT_56_SOL_STATS.cache_creation_input_token_cost_above_200k_tokens,
+    tiered_pricing_threshold_tokens: GPT_56_SOL_STATS.tiered_pricing_threshold_tokens,
+    litellm_provider: "openai",
+    mode: "chat",
+  },
 
   // GPT-5.5 Pro - Released April 23, 2026
   // Native 1.05M context, 128K max output; Responses API only.
