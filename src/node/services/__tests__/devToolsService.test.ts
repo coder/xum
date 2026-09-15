@@ -964,6 +964,64 @@ describe("DevToolsService", () => {
       expect(detail?.steps[0]?.rawChunks).toEqual([{ data: payload }]);
     });
 
+    it("skips stale finalization when replay fails before EOF so a completed step is not marked interrupted", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
+        }),
+        JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 4321 } }),
+      ];
+      const contents = `${lines.join("\n")}\n`;
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, contents, "utf-8");
+
+      // The first read delivers only the run and step lines; the next read fails,
+      // so replay stops before the step's completion update.
+      const cutBytes = Buffer.byteLength(`${lines[0]}\n${lines[1]}\n`, "utf-8");
+      const originalOpen = fs.open;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        const handle = await originalOpen(...args);
+        if (args[0] !== logPath) {
+          return handle;
+        }
+        const realRead = handle.read.bind(handle);
+        let reads = 0;
+        handle.read = ((buffer: Buffer, offset: number, length: number, position: number) => {
+          reads += 1;
+          if (reads > 1) {
+            throw new Error("simulated read failure");
+          }
+          return realRead(buffer, offset, Math.min(length, cutBytes), position);
+        }) as typeof handle.read;
+        return handle;
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        // Partial state is kept so the workspace stays usable...
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-1"]);
+        expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]?.durationMs).toBeNull();
+        // ...but nothing is written over a step that may have completed on disk.
+        const afterPartialLoad = await fs.readFile(logPath, "utf-8");
+        expect(afterPartialLoad).toBe(contents);
+        expect(afterPartialLoad).not.toContain("Interrupted (stale)");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // A healthy restart sees the original completion, not a fabricated interruption.
+      const healthyService = new DevToolsService(config);
+      const detail = await healthyService.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.error).toBeNull();
+    });
+
     it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
       const config = createTestConfig({ sessionsDir, enabled: true });
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");

@@ -60,6 +60,13 @@ interface WorkspaceData {
   stepBytes: Map<string, number>;
   retainedBytes: number;
   loaded: boolean;
+  /**
+   * Whether the on-disk log was replayed to EOF (or did not exist). After a
+   * failed partial replay, memory is a prefix of the file, so a step that looks
+   * in progress may have completed on disk; stale finalization must not write
+   * an "Interrupted (stale)" line over it.
+   */
+  replayComplete: boolean;
   /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
 }
@@ -502,6 +509,7 @@ export class DevToolsService extends EventEmitter {
     data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
+    data.replayComplete = true;
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
@@ -598,6 +606,7 @@ export class DevToolsService extends EventEmitter {
       stepBytes: new Map<string, number>(),
       retainedBytes: 0,
       loaded: false,
+      replayComplete: false,
       clearGeneration: 0,
     };
     this.workspaces.set(workspaceId, data);
@@ -699,15 +708,18 @@ export class DevToolsService extends EventEmitter {
       for await (const line of readLines(filePath)) {
         this.replayLogLine(workspaceId, data, line);
       }
+      data.replayComplete = true;
     } catch (error) {
       // Any failure still marks the workspace loaded with whatever partial state
       // was replayed. Leaving `loaded` false made every later createRun/createStep
       // re-run the failing load against a multi-hundred-MB file.
-      if (!(isRecord(error) && error.code === "ENOENT")) {
-        log.warn("DevTools: failed to load devtools.jsonl, continuing with partial state", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
+      if (isRecord(error) && error.code === "ENOENT") {
+        data.replayComplete = true;
+      } else {
+        log.warn(
+          "DevTools: failed to load devtools.jsonl, continuing with partial state (replay incomplete, stale finalization skipped)",
+          { workspaceId, error: getErrorMessage(error) }
+        );
       }
     }
 
@@ -773,6 +785,9 @@ export class DevToolsService extends EventEmitter {
       data.loaded,
       "DevToolsService.finalizeStaleStepsForLoadedWorkspace requires loaded workspace data"
     );
+    if (!data.replayComplete) {
+      return;
+    }
 
     const staleSteps = Array.from(data.steps.values()).filter(
       (step) => step.durationMs == null && step.error == null
