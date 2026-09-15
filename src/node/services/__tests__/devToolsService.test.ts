@@ -938,6 +938,46 @@ describe("DevToolsService", () => {
       expect(runs.map((run) => run.id)).toEqual(["run-new", "run-boundary"]);
     });
 
+    it("replays the entries before a final line larger than the tail window", async () => {
+      const TAIL_BYTES = 4096;
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        // Older history larger than the window, so the shifted window still
+        // starts mid-line and must skip this partial entry.
+        JSON.stringify({
+          type: "step",
+          step: makeStep({
+            id: "step-ancient",
+            runId: "run-ancient",
+            rawChunks: [{ data: "y".repeat(TAIL_BYTES * 2) }],
+          }),
+        }),
+        JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") }),
+        JSON.stringify({ type: "step", step: makeStep({ id: "step-old", runId: "run-old" }) }),
+        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-02T00:00:00.000Z") }),
+        JSON.stringify({ type: "step", step: makeStep({ id: "step-new", runId: "run-new" }) }),
+        // A finalized step whose raw payload alone exceeds the tail window, so the
+        // naive tail cut lands inside it and sees no newline at all.
+        JSON.stringify({
+          type: "step-update",
+          stepId: "step-new",
+          update: { rawChunks: [{ data: "x".repeat(TAIL_BYTES * 3) }] },
+        }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config, { loadTailBytes: TAIL_BYTES });
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs.map((run) => run.id)).toEqual(["run-new", "run-old"]);
+      const detail = await service.getRunWithSteps("ws-1", "run-new");
+      expect(detail?.steps.map((step) => step.id)).toEqual(["step-new"]);
+      // The oversized update itself is dropped: it cannot be retained within the window.
+      expect(detail?.steps[0]?.rawChunks).toBeNull();
+    });
+
     it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
       const config = createTestConfig({ sessionsDir, enabled: true });
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");

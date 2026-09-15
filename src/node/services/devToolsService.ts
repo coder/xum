@@ -63,35 +63,119 @@ interface WorkspaceData {
 
 export interface DevToolsServiceOptions {
   maxRetainedBytesPerWorkspace?: number;
+  loadTailBytes?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Index of the first newline byte in [from, to), or -1. */
+async function findNewlineForward(
+  handle: fs.FileHandle,
+  chunk: Buffer,
+  from: number,
+  to: number
+): Promise<number> {
+  let position = from;
+  while (position < to) {
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      Math.min(chunk.length, to - position),
+      position
+    );
+    if (bytesRead === 0) {
+      break;
+    }
+    const index = chunk.subarray(0, bytesRead).indexOf(0x0a);
+    if (index !== -1) {
+      return position + index;
+    }
+    position += bytesRead;
+  }
+  return -1;
+}
+
+/** Index of the last newline byte in [0, before), or -1. */
+async function findNewlineBackward(
+  handle: fs.FileHandle,
+  chunk: Buffer,
+  before: number
+): Promise<number> {
+  let end = before;
+  while (end > 0) {
+    const start = Math.max(0, end - chunk.length);
+    const { bytesRead } = await handle.read(chunk, 0, end - start, start);
+    if (bytesRead === 0) {
+      break;
+    }
+    const index = chunk.subarray(0, bytesRead).lastIndexOf(0x0a);
+    if (index !== -1) {
+      return start + index;
+    }
+    end = start;
+  }
+  return -1;
+}
+
+/** Whether a line starting after `newlineIndex` has room to end before `end`. */
+function hasCompleteLineAfter(newlineIndex: number, end: number): boolean {
+  return newlineIndex !== -1 && newlineIndex + 1 < end;
+}
+
 /**
  * Yield the lines in the last `maxTailBytes` of a file without ever holding the
- * whole file in memory. When the read starts mid-file, the partial first line
- * is discarded so replay begins on a line boundary.
+ * whole file in memory. When the read starts mid-file, replay begins at the
+ * first line boundary inside the window. If the window holds no complete line,
+ * the file ends in a single line larger than the window (a multi-MB rawChunks
+ * payload); that entry could not be retained anyway, so it is dropped and the
+ * window is moved to end where it starts, keeping the complete entries before it
+ * (otherwise the newest run would vanish after a restart).
  */
 async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGenerator<string> {
   const handle = await fs.open(filePath, "r");
   try {
     const { size } = await handle.stat();
-    let position = Math.max(0, size - maxTailBytes);
     const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
-    let skipPartialFirstLine = false;
-    if (position > 0) {
-      // A cut that lands right after a newline starts on a complete line; only skip when
-      // the preceding byte shows we are mid-line.
-      const { bytesRead } = await handle.read(chunk, 0, 1, position - 1);
-      skipPartialFirstLine = bytesRead === 0 || chunk[0] !== 0x0a;
+    let end = size;
+    let start = Math.max(0, size - maxTailBytes);
+
+    if (start > 0) {
+      // Including the byte before the cut lets a cut that lands right after a
+      // newline keep its first line.
+      let firstNewline = await findNewlineForward(handle, chunk, start - 1, end);
+      if (!hasCompleteLineAfter(firstNewline, end)) {
+        // The window is inside the file's final (newline-terminated) line.
+        const oversizedLineStart = (await findNewlineBackward(handle, chunk, start)) + 1;
+        if (oversizedLineStart === 0) {
+          return;
+        }
+        end = oversizedLineStart;
+        start = Math.max(0, end - maxTailBytes);
+        if (start > 0) {
+          firstNewline = await findNewlineForward(handle, chunk, start - 1, end);
+          if (!hasCompleteLineAfter(firstNewline, end)) {
+            // Two oversized lines back to back; not worth chasing further.
+            return;
+          }
+        }
+      }
+      if (start > 0) {
+        start = firstNewline + 1;
+      }
     }
+
     const decoder = new StringDecoder("utf-8");
     let pending = "";
-
-    while (position < size) {
-      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    let position = start;
+    while (position < end) {
+      const { bytesRead } = await handle.read(
+        chunk,
+        0,
+        Math.min(chunk.length, end - position),
+        position
+      );
       if (bytesRead === 0) {
         break;
       }
@@ -100,17 +184,11 @@ async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGene
 
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
-      for (const line of lines) {
-        if (skipPartialFirstLine) {
-          skipPartialFirstLine = false;
-          continue;
-        }
-        yield line;
-      }
+      yield* lines;
     }
 
     pending += decoder.end();
-    if (pending.length > 0 && !skipPartialFirstLine) {
+    if (pending.length > 0) {
       yield pending;
     }
   } finally {
@@ -222,6 +300,7 @@ export class DevToolsService extends EventEmitter {
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
   private readonly maxRetainedBytesPerWorkspace: number;
+  private readonly loadTailBytes: number;
 
   constructor(
     private readonly config: Config,
@@ -230,6 +309,7 @@ export class DevToolsService extends EventEmitter {
     super();
     this.maxRetainedBytesPerWorkspace =
       options?.maxRetainedBytesPerWorkspace ?? MAX_RETAINED_BYTES_PER_WORKSPACE;
+    this.loadTailBytes = options?.loadTailBytes ?? LOAD_TAIL_BYTES;
   }
 
   get enabled(): boolean {
@@ -708,7 +788,7 @@ export class DevToolsService extends EventEmitter {
     const filePath = this.getSessionFilePath(workspaceId);
 
     try {
-      for await (const line of readTailLines(filePath, LOAD_TAIL_BYTES)) {
+      for await (const line of readTailLines(filePath, this.loadTailBytes)) {
         this.replayLogLine(workspaceId, data, line);
       }
     } catch (error) {
