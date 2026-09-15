@@ -32,10 +32,7 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
  * in-flight assistant turn while partial.json carries its actual content, so the partial
  * replaces the row sharing its historySequence (or is appended when no row matches).
  */
-function mergePartialIntoHistory(
-  history: MuxMessage[],
-  partial: MuxMessage | null
-): MuxMessage[] {
+function mergePartialIntoHistory(history: MuxMessage[], partial: MuxMessage | null): MuxMessage[] {
   if (!partial) {
     return history;
   }
