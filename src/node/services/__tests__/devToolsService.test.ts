@@ -722,6 +722,43 @@ describe("DevToolsService", () => {
         expect(detail?.steps[0]?.rawChunks).toEqual(rawChunksOf(BUDGET_BYTES));
       });
 
+      it("still persists a run's queued entries when it is evicted before its append runs", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        // Hold the per-workspace write queue on its first disk append so run-1 is
+        // still pending when run-2's oversized step evicts it from memory.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.createRun("ws-1", runAt(1)),
+            service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" })),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"run-1"');
+        expect(logContents).toContain('"step-1"');
+        expect(logContents).toContain('"run-2"');
+        expect(logContents).toContain('"step-2"');
+      });
+
       it("retains only the newest runs that fit the budget when replaying a log", async () => {
         const config = createTestConfig({ sessionsDir, enabled: true });
         const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
@@ -858,6 +895,43 @@ describe("DevToolsService", () => {
       await service.createRun("ws-1", makeRun("run-1"));
       await service.clear("ws-1");
 
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+    });
+
+    it("skips appends that were queued before clear()", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      // Hold the write queue on run-0's append so run-1's append is still
+      // queued (not executed) when clear() runs.
+      const originalAppendFile = fs.appendFile;
+      let releaseQueue: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+        await gate;
+        return originalAppendFile(...args);
+      });
+      let appendedJson: string[] = [];
+      try {
+        const run0 = service.createRun("ws-1", makeRun("run-0"));
+        const run1 = service.createRun("ws-1", makeRun("run-1"));
+        // getRuns resolves after both runs are in memory and their appends are queued.
+        expect((await service.getRuns("ws-1")).map((run) => run.id).sort()).toEqual([
+          "run-0",
+          "run-1",
+        ]);
+        const cleared = service.clear("ws-1");
+
+        releaseQueue();
+        await Promise.all([run0, run1, cleared]);
+        appendedJson = appendFileSpy.mock.calls.map((call) => String(call[1]));
+      } finally {
+        appendFileSpy.mockRestore();
+      }
+
+      // run-0's append was already executing; run-1's was still queued and must be dropped.
+      expect(appendedJson.some((json) => json.includes('"run-0"'))).toBe(true);
+      expect(appendedJson.some((json) => json.includes('"run-1"'))).toBe(false);
       expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
     });
   });

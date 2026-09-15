@@ -57,7 +57,7 @@ interface WorkspaceData {
   stepBytes: Map<string, number>;
   retainedBytes: number;
   loaded: boolean;
-  /** Incremented on each clear() for defense-in-depth against stale state. */
+  /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
 }
 
@@ -332,10 +332,14 @@ export class DevToolsService extends EventEmitter {
     const entry: DevToolsLogEntry = { type: "run", run };
     const json = JSON.stringify(entry);
     this.insertRun(data, run, json.length);
-    await this.appendToFile(workspaceId, entry, json);
+    await this.appendToFile(workspaceId, json);
 
-    const summary = this.buildRunSummary(data, run.id);
-    this.emitWorkspaceEvent(workspaceId, { type: "run-created", run: summary });
+    // The run may have been evicted or cleared while the append was queued;
+    // it is no longer visible to readers, so announce nothing.
+    if (data.runs.has(run.id)) {
+      const summary = this.buildRunSummary(data, run.id);
+      this.emitWorkspaceEvent(workspaceId, { type: "run-created", run: summary });
+    }
   }
 
   async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
@@ -360,17 +364,19 @@ export class DevToolsService extends EventEmitter {
       const runEntry: DevToolsLogEntry = { type: "run", run: autoRun };
       const runJson = JSON.stringify(runEntry);
       this.insertRun(data, autoRun, runJson.length);
-      await this.appendToFile(workspaceId, runEntry, runJson);
-      this.emitWorkspaceEvent(workspaceId, {
-        type: "run-created",
-        run: this.buildRunSummary(data, autoRun.id),
-      });
+      await this.appendToFile(workspaceId, runJson);
+      if (data.runs.has(autoRun.id)) {
+        this.emitWorkspaceEvent(workspaceId, {
+          type: "run-created",
+          run: this.buildRunSummary(data, autoRun.id),
+        });
+      }
     }
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
     this.setStep(data, step, json.length);
-    await this.appendToFile(workspaceId, entry, json);
+    await this.appendToFile(workspaceId, json);
 
     this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
     if (data.runs.has(step.runId)) {
@@ -406,7 +412,7 @@ export class DevToolsService extends EventEmitter {
     const json = JSON.stringify(entry);
     this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length));
 
-    await this.appendToFile(workspaceId, entry, json);
+    await this.appendToFile(workspaceId, json);
 
     this.emitWorkspaceEvent(workspaceId, {
       type: "step-updated",
@@ -530,7 +536,7 @@ export class DevToolsService extends EventEmitter {
     }
 
     // Deleting the entry (rather than clearing it in place) makes stale queued
-    // appends no-ops via the existence guard in appendToFile.
+    // appends no-ops via the workspace guard in appendToFile.
     this.workspaces.delete(workspaceId);
     this.pendingRunMetadata.delete(workspaceId);
 
@@ -619,8 +625,7 @@ export class DevToolsService extends EventEmitter {
   /**
    * Drop the oldest runs (by append order) and their steps until both the run
    * and byte bounds hold. `writingRunId` is the run the caller just inserted or
-   * grew; it is never evicted, so a single oversized run stays visible (and its
-   * pending disk append is not suppressed by the appendToFile existence guard).
+   * grew; it is never evicted, so a single oversized run stays visible.
    */
   private enforceRetention(data: WorkspaceData, writingRunId: string): void {
     while (
@@ -824,25 +829,16 @@ export class DevToolsService extends EventEmitter {
     return next;
   }
 
-  /** `json` is the caller's serialization of `entry`, shared with retention accounting. */
-  private async appendToFile(
-    workspaceId: string,
-    entry: DevToolsLogEntry,
-    json: string
-  ): Promise<void> {
+  /** `json` is the caller's serialized log entry, shared with retention accounting. */
+  private async appendToFile(workspaceId: string, json: string): Promise<void> {
+    // Capture the generation now: only clear() (generation bump) or
+    // removeWorkspaceData() (entry deleted) may cancel a queued write. The run
+    // or step may already be gone from memory when the write executes because
+    // retention eviction is memory-only, and the on-disk log must still get it.
+    const clearGeneration = this.workspaces.get(workspaceId)?.clearGeneration;
     return this.enqueueWrite(workspaceId, async () => {
-      // Defense-in-depth: skip stale writes after clear() by requiring current entities.
       const data = this.workspaces.get(workspaceId);
-      if (!data) {
-        return;
-      }
-      if (entry.type === "run" && !data.runs.has(entry.run.id)) {
-        return;
-      }
-      if (entry.type === "step" && !data.steps.has(entry.step.id)) {
-        return;
-      }
-      if (entry.type === "step-update" && !data.steps.has(entry.stepId)) {
+      if (!data || data.clearGeneration !== clearGeneration) {
         return;
       }
 
