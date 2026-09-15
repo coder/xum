@@ -881,6 +881,96 @@ describe("DevToolsService", () => {
         expect(await runIds(service)).toEqual(["run-3", "run-4"]);
       });
 
+      it("does not emit step-updated for a step whose run was evicted while its append was queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+        // Hold the queue on step-1's update so run-2's oversized step evicts run-1
+        // before that update's append settles.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.updateStep("ws-1", "step-1", { durationMs: 77 }),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const evictedAt = events.findIndex(
+          (event) => event.type === "runs-evicted" && event.runIds.includes("run-1")
+        );
+        expect(evictedAt).toBeGreaterThan(-1);
+        const afterEviction = events.slice(evictedAt + 1);
+        expect(
+          afterEviction.some(
+            (event) =>
+              (event.type === "step-updated" || event.type === "step-created") &&
+              event.step.runId === "run-1"
+          )
+        ).toBe(false);
+        expect(
+          afterEviction.some((event) => event.type === "run-updated" && event.run.id === "run-1")
+        ).toBe(false);
+        // The update itself still reached disk (eviction is memory-only).
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"durationMs":77');
+      });
+
+      it("publishes nothing for a self-healed run when its step line fails to persist", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+
+        const originalAppendFile = fs.appendFile;
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          if (String(args[1]).includes('"type":"step"')) {
+            throw new Error("ENOSPC: no space left on device");
+          }
+          return originalAppendFile(...args);
+        });
+        let failure: unknown;
+        try {
+          // run-healed is not in memory, so createStep self-heals it first.
+          await service
+            .createStep("ws-1", makeStep({ id: "step-healed", runId: "run-healed" }))
+            .catch((error: unknown) => {
+              failure = error;
+            });
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain("ENOSPC");
+
+        expect(
+          events.some((event) => event.type === "run-created" && event.run.id === "run-healed")
+        ).toBe(false);
+        expect(events.some((event) => event.type === "step-created")).toBe(false);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,
@@ -1143,6 +1233,25 @@ describe("DevToolsService", () => {
       await service.clear("ws-1");
 
       expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+    });
+
+    it("does not append an update for a step that was cleared", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      await service.createRun("ws-1", makeRun("run-1"));
+      await service.createStep(
+        "ws-1",
+        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+      );
+      await service.clear("ws-1");
+
+      // The request finalizes after the user cleared the log.
+      await service.updateStep("ws-1", "step-1", {
+        durationMs: 5,
+        rawChunks: [{ data: "x".repeat(10_000) }],
+      });
+
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+      expect(await service.getRuns("ws-1")).toEqual([]);
     });
 
     it("skips appends that were queued before clear()", async () => {

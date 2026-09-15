@@ -61,6 +61,14 @@ interface WorkspaceData {
   retainedBytes: number;
   loaded: boolean;
   /**
+   * Steps dropped from memory by retention since the last clear(). A late
+   * updateStep for one of these must still reach disk (eviction is memory-only),
+   * while an update for a cleared or unknown step must not re-populate the
+   * truncated log with an orphan line. Ids are short strings and the set grows
+   * only with live evictions (it is reset after replay and on clear()).
+   */
+  evictedStepIds: Set<string>;
+  /**
    * Whether the on-disk log was replayed to EOF (or did not exist). After a
    * failed partial replay, memory is a prefix of the file, so a step that looks
    * in progress may have completed on disk; stale finalization must not write
@@ -138,6 +146,7 @@ function evictRun(data: WorkspaceData, runId: string): void {
     if (step.runId === runId) {
       data.steps.delete(stepId);
       data.stepBytes.delete(stepId);
+      data.evictedStepIds.add(stepId);
     }
   }
   data.retainedBytes -= data.runBytes.get(runId) ?? 0;
@@ -329,12 +338,7 @@ export class DevToolsService extends EventEmitter {
     this.emitEvicted(workspaceId, this.insertRun(data, run, json.length));
     await this.appendToFile(workspaceId, json);
 
-    // The run may have been evicted or cleared while the append was queued;
-    // it is no longer visible to readers, so announce nothing.
-    if (data.runs.has(run.id)) {
-      const summary = this.buildRunSummary(data, run.id);
-      this.emitWorkspaceEvent(workspaceId, { type: "run-created", run: summary });
-    }
+    this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
 
   async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
@@ -373,27 +377,21 @@ export class DevToolsService extends EventEmitter {
     const json = JSON.stringify(entry);
     this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
 
-    if (healedRunJson !== undefined) {
-      const runAppend = this.appendToFile(workspaceId, healedRunJson);
-      if (data.runs.has(step.runId)) {
-        this.emitWorkspaceEvent(workspaceId, {
-          type: "run-created",
-          run: this.buildRunSummary(data, step.runId),
-        });
-      }
-      await runAppend;
-    }
-    await this.appendToFile(workspaceId, json);
+    // Publish only after both lines are durable: if an append rejects (disk
+    // full), the caller sees the error and subscribers never learn of a run
+    // whose step could never finalize. Both appends are queued before either
+    // is awaited so a rejected run line does not leave the step line unqueued.
+    const runAppend =
+      healedRunJson === undefined ? undefined : this.appendToFile(workspaceId, healedRunJson);
+    const stepAppend = this.appendToFile(workspaceId, json);
+    await runAppend;
+    await stepAppend;
 
-    // Both may have been evicted while the appends were queued; only announce
-    // what readers can still see.
-    if (data.steps.has(step.id)) {
-      this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
+    if (healedRunJson !== undefined) {
+      this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
     }
-    if (data.runs.has(step.runId)) {
-      const summary = this.buildRunSummary(data, step.runId);
-      this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
-    }
+    this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", step.runId);
   }
 
   async updateStep(
@@ -412,12 +410,20 @@ export class DevToolsService extends EventEmitter {
 
     const existing = data.steps.get(stepId);
     if (!existing) {
+      if (!data.evictedStepIds.has(stepId)) {
+        // Cleared (the log was truncated) or never seen: appending would leave
+        // an orphan update, possibly MBs of raw payload, that replay cannot show.
+        log.debug("DevToolsService.updateStep skipping update for cleared or unknown step", {
+          workspaceId,
+          stepId,
+        });
+        return;
+      }
       // Disk is authoritative and retention eviction is memory-only: when an
       // overlapping request's step is evicted while still in flight, its final
       // duration/output/usage must still reach devtools.jsonl. Memory, byte
-      // accounting, and events stay untouched because nothing retains the step;
-      // replay skips updates for unretained steps, so a stale id is harmless.
-      log.debug("DevToolsService.updateStep persisting update for unretained step", {
+      // accounting, and events stay untouched because nothing retains the step.
+      log.debug("DevToolsService.updateStep persisting update for evicted step", {
         workspaceId,
         stepId,
       });
@@ -436,15 +442,8 @@ export class DevToolsService extends EventEmitter {
 
     await this.appendToFile(workspaceId, json);
 
-    this.emitWorkspaceEvent(workspaceId, {
-      type: "step-updated",
-      step: mergedStep,
-    });
-
-    if (data.runs.has(mergedStep.runId)) {
-      const summary = this.buildRunSummary(data, mergedStep.runId);
-      this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
-    }
+    this.emitStepEventIfRetained(workspaceId, data, "step-updated", stepId);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", mergedStep.runId);
   }
 
   async finalizeStaleSteps(workspaceId: string): Promise<void> {
@@ -520,6 +519,7 @@ export class DevToolsService extends EventEmitter {
     data.steps.clear();
     data.runBytes.clear();
     data.stepBytes.clear();
+    data.evictedStepIds.clear();
     data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
@@ -576,6 +576,38 @@ export class DevToolsService extends EventEmitter {
   }
 
   /**
+   * Every event that follows an await must go through these guards: while the
+   * disk append was queued the run or step may have been evicted, cleared, or
+   * its workspace removed, and each of those already told subscribers to drop
+   * it (runs-evicted / cleared). Announcing it afterwards would resurrect it
+   * in the renderer, possibly with its raw payload, under a run that no
+   * longer exists. The payload is read from memory at emit time so it is
+   * exactly what readers see.
+   */
+  private emitRunEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "run-created" | "run-updated",
+    runId: string
+  ): void {
+    if (this.workspaces.get(workspaceId) === data && data.runs.has(runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, run: this.buildRunSummary(data, runId) });
+    }
+  }
+
+  private emitStepEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "step-created" | "step-updated",
+    stepId: string
+  ): void {
+    const step = this.workspaces.get(workspaceId) === data ? data.steps.get(stepId) : undefined;
+    if (step && data.runs.has(step.runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, step });
+    }
+  }
+
+  /**
    * Tell live subscribers which runs retention just dropped, so the renderer
    * releases them too instead of showing a run whose steps are gone. Replay
    * evictions are not announced: the snapshot already reflects them.
@@ -620,6 +652,7 @@ export class DevToolsService extends EventEmitter {
       stepBytes: new Map<string, number>(),
       retainedBytes: 0,
       loaded: false,
+      evictedStepIds: new Set<string>(),
       replayComplete: false,
       clearGeneration: 0,
     };
@@ -737,6 +770,9 @@ export class DevToolsService extends EventEmitter {
       }
     }
 
+    // Replay evictions cannot receive live updates (every live call awaits
+    // ensureLoaded first), so only evictions from here on need remembering.
+    data.evictedStepIds.clear();
     data.loaded = true;
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
   }
