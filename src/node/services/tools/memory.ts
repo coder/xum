@@ -63,12 +63,12 @@ function buildMemoryDescription(config: ToolConfiguration): string {
   const baseDescription =
     config.memoryWritePath != null
       ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be written, and this request allows exactly one call. ` +
-        "There is no second step, so do not read first (view is unavailable here; the file's current text, if any, is preloaded above). Commands:\n" +
+        "There is no second step, so do not read first (view is unavailable here; a possibly truncated excerpt of the file, if any, is preloaded above). Commands:\n" +
         "- create: write the complete file (REPLACES existing contents)\n" +
         "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
         "view, delete, rename, and every other path are refused. " +
-        `The resulting file is limited to ${MEMORY_MAX_FILE_BYTES} bytes. Keep notes concise and essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full file can be read in the next window.`
+        `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget; prefer a small prepend over re-emitting existing notes. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full file can be read in the next window.`
       : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
     return baseDescription;

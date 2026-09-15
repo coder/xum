@@ -510,6 +510,25 @@ describe("memory tool", () => {
       }
     );
 
+    it("prepends a brief update without rewriting an unshown suffix", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      // The duplicate in the unseen suffix makes a text-match edit ambiguous; a prepend does
+      // not need to re-emit the existing file or know whether its contents contain duplicates.
+      const previous = `checkpoint\n${".".repeat(32 * 1024)}\ncheckpoint`;
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: previous })).success
+      ).toBe(true);
+      const update = "Latest state: resume here.";
+      const result = await run(createMemoryTool(fixture.config), {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: update,
+      });
+      expect(result.success).toBe(true);
+      expect(await readNotes(fixture)).toBe(`${update}\n${previous}`);
+    });
+
     it("caps the resulting notes file, not just the payload", async () => {
       using fixture = await createFixture({ memoryWritePath: notes });
       expect(
