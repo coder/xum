@@ -4503,7 +4503,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Waited-for recoveries would otherwise each throw from createSession after
         // beginShutdown() has already swept the transient registry.
         if (this.shuttingDown) return;
-        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(metadata));
+        // The permit wait is a window in which the user can archive or remove this workspace.
+        // Archive disposes only sessions that already exist, and the session's own archived
+        // guard covers just the auto-retry step and treats a removed entry as live, so an
+        // interrupted turn could otherwise resume in a workspace the user just put away.
+        // Re-read the registry (memoized per config snapshot, so this is one build per edit)
+        // and hand recovery the current metadata rather than the scheduling-time copy.
+        let current = metadata;
+        let registry: FrontendWorkspaceMetadata[] | undefined;
+        try {
+          registry = await this.config.getAllWorkspaceMetadata({
+            throwOnError: true,
+            probeCheckouts: false,
+          });
+        } catch (error) {
+          // Unreadable config must not silently cancel every queued chat's recovery; fall back
+          // to the scheduling-time snapshot and let the session's dispatch-time guards decide.
+          log.debug("Startup recovery revalidation failed; using scheduling-time metadata", {
+            workspaceId: trimmed,
+            error: getErrorMessage(error),
+          });
+        }
+        if (registry !== undefined) {
+          current = registry.find((entry) => entry.id === trimmed);
+          if (
+            current === undefined ||
+            isWorkspaceArchived(current.archivedAt, current.unarchivedAt)
+          ) {
+            log.debug("Skipping startup recovery: workspace archived or removed while queued", {
+              workspaceId: trimmed,
+            });
+            return;
+          }
+        }
+        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(current));
       } catch (error) {
         log.warn("Failed to run startup recovery for workspace", {
           workspaceId: trimmed,
