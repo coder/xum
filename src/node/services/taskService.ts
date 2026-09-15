@@ -1522,7 +1522,10 @@ export class TaskService implements AgentTaskIntegration {
    * trees before any drain) and not on an unrelated scheduler trigger.
    */
   private readonly queueRechecksOwedByStopLatch = new Set<string>();
-  /** Attempt ownership ledger (see OwnedTaskAttempt); replaced before any new admission. */
+  /**
+   * Attempt ownership ledger (see OwnedTaskAttempt); replaced before any new admission, dropped
+   * once the attempt's report is durable (releaseReportedTaskAttempt).
+   */
   private readonly ownedAttemptByTaskId = new Map<string, OwnedTaskAttempt>();
   /** Authoritative settlement of exactly the owned attempt it names; dropped with that attempt. */
   private readonly attemptSettlementByTaskId = new Map<
@@ -2123,6 +2126,32 @@ export class TaskService implements AgentTaskIntegration {
     this.notifyAttemptSettlementListeners(taskId);
   }
 
+  /**
+   * The ledger entries of an attempt whose report is durable are redundant: every reader
+   * (inspectAttemptOutcome, waitForAgentReport) classifies a persisted report first, so neither
+   * this attempt's ownership nor its settlement can decide an outcome again. Dropping them keeps
+   * the per-task ledgers bounded by the tasks still able to end without a report, instead of by
+   * every task ever attempted in this process.
+   *
+   * `attempt` is the identity captured at the stream-end event that carried the report (see the
+   * stream-end listener), so the drop names the attempt the report belongs to — a task reawakened
+   * (markInterruptedTaskRunning, not under the task's event lock) while that report waited for
+   * the lock or for its writes owns a different identity and stays owned; an older report never
+   * decides the new attempt's outcome. Called only after every ancestor artifact write succeeded:
+   * a report that is not durable everywhere leaves the entries in place.
+   *
+   * Interrupted-without-report receipts are deliberately NOT dropped here or on stop: an ancestor
+   * that has not yet read terminal-no-report still needs the receipt after config cleanup, and no
+   * consumer acknowledgement exists yet to bound that retention.
+   */
+  private releaseReportedTaskAttempt(taskId: string, attempt: OwnedTaskAttempt | undefined): void {
+    if (attempt == null || this.ownedAttemptByTaskId.get(taskId) !== attempt) return;
+    this.ownedAttemptByTaskId.delete(taskId);
+    if (this.attemptSettlementByTaskId.get(taskId)?.attempt === attempt) {
+      this.attemptSettlementByTaskId.delete(taskId);
+    }
+  }
+
   private notifyAttemptSettlementListeners(taskId: string): void {
     const listeners = this.attemptSettlementListenersByTaskId.get(taskId);
     if (!listeners) return;
@@ -2537,6 +2566,10 @@ export class TaskService implements AgentTaskIntegration {
       const taskOrigin = {
         executionId: this.getAgentTaskExecutionId(payload.workspaceId),
         stopEpoch: this.getWorkspaceStopEpoch(payload.workspaceId),
+        // The attempt whose stream just ended: captured in the event's own tick, before the lock
+        // wait or any handler await could let a reawakening replace it (see
+        // releaseReportedTaskAttempt).
+        ownedAttempt: this.ownedAttemptByTaskId.get(payload.workspaceId),
       };
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
@@ -12261,7 +12294,11 @@ export class TaskService implements AgentTaskIntegration {
     // time, before waiting on the workspace event lock; the entry-time capture
     // below is a fallback for direct callers (tests) only.
     eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot,
-    eventTimeTaskOrigin?: { executionId: string | null; stopEpoch: number }
+    eventTimeTaskOrigin?: {
+      executionId: string | null;
+      stopEpoch: number;
+      ownedAttempt: OwnedTaskAttempt | undefined;
+    }
   ): Promise<void> {
     // Cut attribution must reflect the state at the ended stream's own event,
     // not whatever input engaged while the lock wait or the awaits below ran
@@ -12272,6 +12309,7 @@ export class TaskService implements AgentTaskIntegration {
     const taskOrigin = eventTimeTaskOrigin ?? {
       executionId: this.getAgentTaskExecutionId(event.workspaceId),
       stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
+      ownedAttempt: this.ownedAttemptByTaskId.get(event.workspaceId),
     };
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
@@ -12630,10 +12668,17 @@ export class TaskService implements AgentTaskIntegration {
     // even if the interruption status landed before the provider emitted stream-end.
     if (status === "interrupted") {
       if (isPlanLike && proposePlanResult && entry.workspace.workflowTask != null) {
-        await this.handleSuccessfulWorkflowProposePlan({ workspaceId, entry, proposePlanResult });
+        await this.handleSuccessfulWorkflowProposePlan({
+          workspaceId,
+          entry,
+          proposePlanResult,
+          reportedAttempt: taskOrigin.ownedAttempt,
+        });
         return;
       }
-      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, reportArgs);
+      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, reportArgs, {
+        reportedAttempt: taskOrigin.ownedAttempt,
+      });
       return;
     }
     if (status === "reported") {
@@ -12719,7 +12764,12 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (reportArgs) {
-      const finalization = await this.finalizeAgentTaskReport(workspaceId, entry, reportArgs);
+      const finalization = await this.finalizeAgentTaskReport(
+        workspaceId,
+        entry,
+        reportArgs,
+        taskOrigin.ownedAttempt
+      );
       if (finalization.finalized) {
         await this.finalizeTerminationPhaseForReportedTask(workspaceId);
       }
@@ -12728,7 +12778,12 @@ export class TaskService implements AgentTaskIntegration {
 
     if (isPlanLike && proposePlanResult) {
       if (entry.workspace.workflowTask != null) {
-        await this.handleSuccessfulWorkflowProposePlan({ workspaceId, entry, proposePlanResult });
+        await this.handleSuccessfulWorkflowProposePlan({
+          workspaceId,
+          entry,
+          proposePlanResult,
+          reportedAttempt: taskOrigin.ownedAttempt,
+        });
         return;
       }
       await this.handleSuccessfulProposePlanAutoHandoff({
@@ -13253,10 +13308,15 @@ export class TaskService implements AgentTaskIntegration {
       structuredOutput?: unknown;
       planFilePath?: string;
     } | null,
-    options?: { rejectionError?: Error }
+    options?: { rejectionError?: Error; reportedAttempt?: OwnedTaskAttempt }
   ): Promise<void> {
     if (reportArgs) {
-      const finalization = await this.finalizeAgentTaskReport(workspaceId, entry, reportArgs);
+      const finalization = await this.finalizeAgentTaskReport(
+        workspaceId,
+        entry,
+        reportArgs,
+        options?.reportedAttempt
+      );
       if (!finalization.finalized) {
         this.rejectWaiters(workspaceId, new Error(finalization.message));
       }
@@ -13285,6 +13345,7 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string;
     entry: { projectPath: string; workspace: WorkspaceConfigEntry };
     proposePlanResult: { planPath: string };
+    reportedAttempt: OwnedTaskAttempt | undefined;
   }): Promise<void> {
     assert(
       args.workspaceId.length > 0,
@@ -13373,11 +13434,16 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const finalization = await this.finalizeAgentTaskReport(args.workspaceId, args.entry, {
-      reportMarkdown: planSummary.content,
-      title: "Proposed plan",
-      planFilePath: planSummary.path,
-    });
+    const finalization = await this.finalizeAgentTaskReport(
+      args.workspaceId,
+      args.entry,
+      {
+        reportMarkdown: planSummary.content,
+        title: "Proposed plan",
+        planFilePath: planSummary.path,
+      },
+      args.reportedAttempt
+    );
     if (finalization.finalized) {
       await this.finalizeTerminationPhaseForReportedTask(args.workspaceId);
     } else {
@@ -13980,7 +14046,9 @@ export class TaskService implements AgentTaskIntegration {
       title?: string;
       structuredOutput?: unknown;
       planFilePath?: string;
-    }
+    },
+    /** The attempt whose stream carried this report (see releaseReportedTaskAttempt). */
+    reportedAttempt: OwnedTaskAttempt | undefined
   ): Promise<AgentReportFinalizationResult> {
     this.markTaskForegroundRelevant(childWorkspaceId);
 
@@ -14072,7 +14140,8 @@ export class TaskService implements AgentTaskIntegration {
         childWorkspaceId,
         childEntry,
         latestEntryBeforeReport,
-        reportArgs
+        reportArgs,
+        reportedAttempt
       );
     const published =
       bestOfParentWorkspaceId != null
@@ -14215,7 +14284,8 @@ export class TaskService implements AgentTaskIntegration {
       title?: string;
       structuredOutput?: unknown;
       planFilePath?: string;
-    }
+    },
+    reportedAttempt: OwnedTaskAttempt | undefined
   ): Promise<{
     parentWorkspaceId: string;
     latestChildEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined;
@@ -14313,6 +14383,7 @@ export class TaskService implements AgentTaskIntegration {
     // Persist the completed report in the session dirs of all ancestors so `task_await` can
     // retrieve it after cleanup/restart (even if the task workspace itself is deleted).
     const persistedAtMs = Date.now();
+    let persistedInEveryAncestor = ancestorWorkspaceIds.length > 0;
     for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
       try {
         const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
@@ -14332,12 +14403,16 @@ export class TaskService implements AgentTaskIntegration {
           nowMs: persistedAtMs,
         });
       } catch (error: unknown) {
+        persistedInEveryAncestor = false;
         log.error("Failed to persist subagent report artifact", {
           workspaceId: ancestorWorkspaceId,
           childTaskId: childWorkspaceId,
           error,
         });
       }
+    }
+    if (persistedInEveryAncestor) {
+      this.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
     }
 
     return { parentWorkspaceId, latestChildEntry, isWorkflowOwnedChildReport };

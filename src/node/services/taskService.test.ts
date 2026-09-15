@@ -32946,6 +32946,204 @@ describe("TaskService", () => {
         restoreTimers();
       }
     });
+
+    interface AttemptLedgerInternals {
+      ownedAttemptByTaskId: Map<string, { generation: number }>;
+      attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
+      completedReportsByTaskId: Map<string, unknown>;
+      shouldAllowLegacyInvalidWorkflowOutputSchema: (...args: unknown[]) => Promise<boolean>;
+    }
+    const ledgerInternals = (taskService: TaskService) =>
+      taskService as unknown as AttemptLedgerInternals;
+
+    function reportStreamEnd(taskId: string, reportMarkdown: string): StreamEndEvent {
+      return {
+        type: "stream-end",
+        workspaceId: taskId,
+        messageId: `assistant-${taskId}`,
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: `agent-report-${taskId}`,
+            toolName: "agent_report",
+            input: { reportMarkdown },
+            state: "output-available",
+            output: { success: true },
+          },
+          { type: "text", text: reportMarkdown },
+        ],
+      };
+    }
+
+    test.each(["running", "interrupted"] as const)(
+      "publishing the owned attempt's report drops its ledger entries (%s at stream end); the durable report still decides",
+      async (statusAtStreamEnd) => {
+        const taskId = `task-outcome-published-${statusAtStreamEnd}`;
+        const { config } = await setupTree([
+          { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        ]);
+        const { taskService } = createTaskServiceHarness(config);
+        const internals = ledgerInternals(taskService);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const attempt = internals.ownedAttemptByTaskId.get(taskId);
+        expect(attempt).toBeDefined();
+        if (statusAtStreamEnd === "interrupted") {
+          // Stopped before its stream ended: the no-report receipt is retained until the report
+          // that follows makes it redundant.
+          await taskService.terminateAllDescendantAgentTasks(rootId);
+          expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+          expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+            kind: "terminal-no-report",
+          });
+        }
+
+        await handleTaskServiceStreamEndForTest(
+          taskService,
+          reportStreamEnd(taskId, "final answer")
+        );
+
+        expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
+        expect(internals.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        expect(internals.attemptSettlementByTaskId.has(taskId)).toBe(false);
+        const reported = { kind: "reported", report: { reportMarkdown: "final answer" } };
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
+        // Not just the in-memory cache: the persisted artifact answers, here and in a fresh process.
+        internals.completedReportsByTaskId.clear();
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
+        const { taskService: freshService } = createTaskServiceHarness(config);
+        expect(await freshService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
+      }
+    );
+
+    test.each(["before publication", "inside publication"] as const)(
+      "an attempt reawakened while an older report is blocked %s survives that report's cleanup",
+      async (blockPoint) => {
+        const taskId = `task-outcome-survive-${blockPoint.replace(" ", "-")}`;
+        const { config } = await setupTree([
+          { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        ]);
+        const { taskService } = createTaskServiceHarness(config);
+        const internals = ledgerInternals(taskService);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        const firstAttempt = internals.ownedAttemptByTaskId.get(taskId);
+        expect(firstAttempt).toBeDefined();
+
+        const blocked = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let restore: () => void;
+        if (blockPoint === "before publication") {
+          // The last await finalizeAgentTaskReport takes before publishAgentTaskReport starts.
+          const original = internals.shouldAllowLegacyInvalidWorkflowOutputSchema.bind(taskService);
+          const spy = spyOn(
+            internals,
+            "shouldAllowLegacyInvalidWorkflowOutputSchema"
+          ).mockImplementationOnce(async (...args: unknown[]) => {
+            blocked.resolve();
+            await release.promise;
+            return original(...args);
+          });
+          restore = () => spy.mockRestore();
+        } else {
+          // The publication's own first write (its status flip to "reported"), held before it lands.
+          const originalEditConfig = config.editConfig.bind(config);
+          let held = false;
+          const spy = spyOn(config, "editConfig").mockImplementation(async (updater) => {
+            if (!held) {
+              const probe = updater(structuredClone(config.loadConfigOrDefault()));
+              const probed = Array.from(probe.projects.values())
+                .flatMap((project) => project.workspaces)
+                .find((workspace) => workspace.id === taskId);
+              if (probed?.taskStatus === "reported") {
+                held = true;
+                blocked.resolve();
+                await release.promise;
+              }
+            }
+            return originalEditConfig(updater);
+          });
+          restore = () => spy.mockRestore();
+        }
+        try {
+          const publication = handleTaskServiceStreamEndForTest(
+            taskService,
+            reportStreamEnd(taskId, "older report")
+          );
+          await blocked.promise;
+          // The user resumes the (still interrupted) task while the older report is in flight.
+          expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+          const secondAttempt = internals.ownedAttemptByTaskId.get(taskId);
+          expect(secondAttempt).toBeDefined();
+          expect(secondAttempt).not.toBe(firstAttempt);
+          release.resolve();
+          await publication;
+
+          expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
+          // The older report's cleanup names the attempt it belonged to; the new one stays owned.
+          expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
+        } finally {
+          release.resolve();
+          restore();
+        }
+      }
+    );
+
+    test("a report whose artifact could not be persisted keeps the attempt's ledger entries", async () => {
+      const taskId = "task-outcome-unpersisted";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      // A directory where the report body must be written fails the ancestor artifact write.
+      await fsPromises.mkdir(
+        getSubagentReportArtifactPath(path.join(config.sessionsDir, rootId), taskId),
+        { recursive: true }
+      );
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = ledgerInternals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      expect(attempt).toBeDefined();
+
+      await handleTaskServiceStreamEndForTest(taskService, reportStreamEnd(taskId, "lost report"));
+
+      expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
+      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      // A fresh process has no durable report to classify from.
+      const { taskService: freshService } = createTaskServiceHarness(config);
+      expect((await freshService.readAttemptOutcome(taskId, requesting)).kind).toBe(
+        "indeterminate"
+      );
+    });
+
+    test("a stream end without a report leaves the interrupted attempt's receipt in place", async () => {
+      const taskId = "task-outcome-no-report-end";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const internals = ledgerInternals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      expect(attempt).toBeDefined();
+
+      // Cut short by the stop: no explicit `stop` finish, so nothing is promoted to a report.
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: taskId,
+        messageId: `assistant-${taskId}`,
+        metadata: { model: "openai:gpt-5.2", finishReason: "abort" },
+        parts: [{ type: "text", text: "stopped before reporting" }],
+      });
+
+      expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
+      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+    });
   });
 
   describe("cancellable reservation", () => {
