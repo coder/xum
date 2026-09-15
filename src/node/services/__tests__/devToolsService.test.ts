@@ -759,6 +759,34 @@ describe("DevToolsService", () => {
         expect(logContents).toContain('"step-2"');
       });
 
+      it("evicts newer runs when the oldest in-flight run grows past the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        for (const index of [2, 3]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(await runIds(service)).toEqual(["run-1", "run-2", "run-3"]);
+
+        // The oldest run is the one being written, so it is protected; the
+        // newer runs behind it must be evicted instead of nothing at all.
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(BUDGET_BYTES + 1) });
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Accounting check: shrink run-1 again, then add a run that fits only if
+        // run-2/run-3 bytes were released (their ~20 KB would push this over).
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(1_000) });
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 85_000));
+        expect(await runIds(service)).toEqual(["run-1", "run-4"]);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,

@@ -635,18 +635,26 @@ export class DevToolsService extends EventEmitter {
   /**
    * Drop the oldest runs (by append order) and their steps until both the run
    * and byte bounds hold. `writingRunId` is the run the caller just inserted or
-   * grew; it is never evicted, so a single oversized run stays visible.
+   * grew; it is never evicted, so a single oversized run stays visible. It is
+   * skipped rather than treated as a stop: an old in-flight run that grows
+   * late must still push out the newer runs behind it.
    */
   private enforceRetention(data: WorkspaceData, writingRunId: string): void {
     while (
       data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE ||
       data.retainedBytes > this.maxRetainedBytesPerWorkspace
     ) {
-      const oldestRunId = data.runs.keys().next().value;
-      if (oldestRunId === undefined || oldestRunId === writingRunId) {
+      let oldestEvictableRunId: string | undefined;
+      for (const runId of data.runs.keys()) {
+        if (runId !== writingRunId) {
+          oldestEvictableRunId = runId;
+          break;
+        }
+      }
+      if (oldestEvictableRunId === undefined) {
         return;
       }
-      evictRun(data, oldestRunId);
+      evictRun(data, oldestEvictableRunId);
     }
   }
 
