@@ -31,7 +31,6 @@ import {
 } from "./bashMonitorRegistryStore";
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
@@ -1564,10 +1563,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.processes.set(processId, proc);
 
     if (config.monitor && !proc.isForeground) {
-      const pollIntervalMs =
-        runtime instanceof LocalBaseRuntime
-          ? MONITOR_POLL_INTERVAL_MS_LOCAL
-          : MONITOR_POLL_INTERVAL_MS_REMOTE;
+      // The fast tick is only affordable when the handle probes host-local record files with
+      // fs (see spawnProcess); devcontainer records need a docker exec per probe, so they
+      // poll at the remote cadence like SSH.
+      const pollIntervalMs = spawnRecordsAreHostLocal(runtime)
+        ? MONITOR_POLL_INTERVAL_MS_LOCAL
+        : MONITOR_POLL_INTERVAL_MS_REMOTE;
       const armMetadata: MonitorArmedPayload = {
         processId,
         taskId: `bash:${processId}`,
