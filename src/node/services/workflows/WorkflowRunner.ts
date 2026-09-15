@@ -1461,26 +1461,31 @@ export class WorkflowRunner {
     };
     // Fail-fast stopped the siblings through interruptRun; each still gets its report-first
     // disposition (bounded settlement wait) so a report that landed before the stop is kept.
+    // Siblings are disposed concurrently and independently: their settlement waits share one
+    // teardown-scale bound instead of stacking it per sibling, one sibling's failure never
+    // skips another's disposition, and every disposition is awaited before the original
+    // failure propagates. Each write still runs under the attempt and lease fences.
     const disposeSiblings = async (failed: StartedWorkflowAgentState): Promise<void> => {
-      for (const state of states) {
-        if (state === failed || state.terminalResult != null) {
-          continue;
-        }
-        try {
-          await this.disposeStartedAttempt(runId, sequence, toAttempt(state), {
-            leaseGuard: options.leaseGuard,
-            ...(options.waitOptions?.abortSignal != null
-              ? { abortSignal: options.waitOptions.abortSignal }
-              : {}),
-            wait: "pending-or-live",
-          });
-        } catch (error) {
-          log.warn(`[workflow-runner] Draining pipeline sibling ${state.spec.id} failed`, {
-            runId,
-            error: getErrorMessage(error),
-          });
-        }
-      }
+      await Promise.allSettled(
+        states
+          .filter((state) => state !== failed && state.terminalResult == null)
+          .map(async (state) => {
+            try {
+              await this.disposeStartedAttempt(runId, sequence, toAttempt(state), {
+                leaseGuard: options.leaseGuard,
+                ...(options.waitOptions?.abortSignal != null
+                  ? { abortSignal: options.waitOptions.abortSignal }
+                  : {}),
+                wait: "pending-or-live",
+              });
+            } catch (error) {
+              log.warn(`[workflow-runner] Draining pipeline sibling ${state.spec.id} failed`, {
+                runId,
+                error: getErrorMessage(error),
+              });
+            }
+          })
+      );
     };
 
     let settled = await Promise.race(

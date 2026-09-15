@@ -287,6 +287,108 @@ describe("WorkflowRunner attempt disposition", () => {
     expect(createAgentTasks.mock.calls.at(-1)?.[0].map((spec) => spec.id)).toEqual(["fail"]);
   });
 
+  test("pipeline fail-fast disposes live siblings concurrently, keeping their reports and the original error", async () => {
+    for (const failureMode of ["wait-rejects", "validation-fails"] as const) {
+      using tmp = new DisposableTempDir(`workflow-runner-pipeline-sibling-drain-${failureMode}`);
+      const store = await createStore(
+        tmp.path,
+        `export default function workflow({ agent, pipeline }) {
+  const schema = { type: "object", properties: { label: { type: "string" } }, required: ["label"] };
+  return pipeline(["first", "reported", "silent"], (item) => agent("Stage " + item, { id: item, schema }));
+}
+`
+      );
+      const stopRequested = createDeferred();
+      const interruptRun = mock(async () => {
+        stopRequested.resolve();
+      });
+      // Each sibling's bounded settlement wait must be ENTERED before any of them is released:
+      // a serial drain can never get here because its first wait would hold the second back.
+      const SIBLINGS = ["task_reported", "task_silent"];
+      const settlementEntered = new Set<string>();
+      const settlementReleased = createDeferred();
+      let barrierReached = false;
+      let releasedBeforeBarrier = false;
+      let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+      const enterSettlementWait = (taskId: string): Promise<void> => {
+        settlementEntered.add(taskId);
+        if (SIBLINGS.every((sibling) => settlementEntered.has(sibling))) {
+          // Counts only if no wait was released before every sibling had entered.
+          barrierReached = !releasedBeforeBarrier;
+          if (fallbackTimer != null) clearTimeout(fallbackTimer);
+          settlementReleased.resolve();
+        } else {
+          // Only a serialized drain ever fires this: it keeps the red run from hanging for the
+          // full settlement bound and is cleared once both siblings have entered.
+          fallbackTimer ??= setTimeout(() => {
+            releasedBeforeBarrier = true;
+            settlementReleased.resolve();
+          }, 250);
+        }
+        return settlementReleased.promise;
+      };
+      const runner = createRunner(store, {
+        async runAgent() {
+          throw new Error("pipeline must reserve through createAgentTasks");
+        },
+        async createAgentTasks(specs, lifecycle) {
+          for (const [index, spec] of specs.entries()) {
+            await lifecycle?.onTaskCreated?.(index, `task_${spec.id}`);
+          }
+          return specs.map((spec) => ({ taskId: `task_${spec.id}`, status: "running" as const }));
+        },
+        async waitForAgentTask(taskId) {
+          if (taskId === "task_first") {
+            if (failureMode === "wait-rejects") {
+              throw new Error("first child failed");
+            }
+            // Schema demands a label; this validation failure must fail fast like a rejection.
+            return { taskId, reportMarkdown: "first", structuredOutput: {} };
+          }
+          // Siblings are still live when fail-fast fires; they settle only after the stop.
+          await stopRequested.promise;
+          throw new Error("Task interrupted");
+        },
+        readSettledAgentResult: async (taskId): Promise<TaskAttemptOutcome<WorkflowAgentResult>> =>
+          taskId === "task_first" ? { kind: "terminal-no-report" } : { kind: "cleanup-pending" },
+        async waitForAttemptSettlement(taskId) {
+          await enterSettlementWait(taskId);
+          if (!barrierReached) {
+            return { kind: "timeout" };
+          }
+          // A report that landed during the stop is retained; a silent child is settled failed.
+          return taskId === "task_reported"
+            ? { kind: "reported", report: { ...report(taskId), structuredOutput: { label: "r" } } }
+            : { kind: "terminal-no-report" };
+        },
+        interruptRun,
+      });
+
+      await expect(runner.run(RUN_ID)).rejects.toThrow(
+        failureMode === "wait-rejects"
+          ? "first child failed"
+          : /structured output failed schema validation/
+      );
+      expect(barrierReached).toBe(true);
+      expect(interruptRun).toHaveBeenCalledTimes(1);
+      const run = await store.getRun(RUN_ID);
+      expect(run.status).toBe("failed");
+      expect(
+        run.steps.map((step) => [step.stepId, step.status]).sort((a, b) => a[0].localeCompare(b[0]))
+      ).toEqual([
+        ["first", "failed"],
+        ["reported", "completed"],
+        ["silent", "failed"],
+      ]);
+      expect(
+        run.steps.find((step) => step.stepId === "reported")?.result?.structuredOutput
+      ).toEqual({ label: "r" });
+      // Every settled sibling is disposed and the lease is free for a checkpoint retry.
+      await waitForLeaseLockRelease(tmp.path);
+      await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
+    }
+  });
+
   test("adopts a report persisted before the waiter aborted instead of failing the attempt", async () => {
     using tmp = new DisposableTempDir("workflow-runner-adopt-before-abort");
     const store = await createStore(tmp.path);
