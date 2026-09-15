@@ -27,7 +27,9 @@ interface InternalSession {
   clearStartupAutoRetryAbandon(): Promise<void>;
   recordGoalAccountingFromUsage(input: unknown): Promise<void>;
   updateStartupAutoRetryAbandonFromAbort(...args: unknown[]): Promise<void>;
-  observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void>;
+  contextController: {
+    continuous: { observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void> };
+  };
   coordinator: TurnCoordinator;
   getEditTruncateTargetId(messageId: string): Promise<string>;
 }
@@ -216,7 +218,10 @@ describe("AgentSession turn completion", () => {
       },
     });
     const consumer = observePolicy(h.session);
-    const observation = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
+    const observation = spyOn(
+      internal(h.session).contextController.continuous,
+      "observeContinuousCompactionAtStreamEnd"
+    );
     const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
     let reading: ReturnType<typeof spyOn<typeof fileIO, "readFile">> | undefined;
     let failed = false;
@@ -501,7 +506,10 @@ describe("AgentSession turn completion", () => {
       });
       const consumer = observePolicy(h.session);
       const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
-      const compaction = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
+      const compaction = spyOn(
+        internal(h.session).contextController.continuous,
+        "observeContinuousCompactionAtStreamEnd"
+      );
       const send = h.session.sendMessage("hello", sendOptions);
       try {
         await envelopeEntered.promise;

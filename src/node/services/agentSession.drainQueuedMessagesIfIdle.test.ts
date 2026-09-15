@@ -26,7 +26,7 @@ interface PrivateSessionAccess {
   midStreamCompactionPending: boolean;
   coordinator: TurnCoordinator;
   activeStreamContext?: { modelString: string; options?: unknown; providersConfig: null };
-  interruptForCompaction: () => Promise<void>;
+  contextController: { summarize: { interruptForCompaction: () => Promise<void> } };
 }
 
 describe("AgentSession.drainQueuedMessagesIfIdle", () => {
@@ -142,7 +142,7 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
       Err({ type: "unknown", raw: "compaction request rejected before admission" })
     );
 
-    await privateSession.interruptForCompaction();
+    await privateSession.contextController.summarize.interruptForCompaction();
 
     expect(privateSession.midStreamCompactionPending).toBe(false);
     expect(dispatch).toHaveBeenCalledTimes(1);

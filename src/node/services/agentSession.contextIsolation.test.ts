@@ -47,7 +47,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
     );
   });
   const continuousState = continuous.session as unknown as {
-    continuousCompactor: ContinuousCompactor;
+    contextController: { continuous: { continuousCompactor: ContinuousCompactor } };
   };
   const budgetState = budget.session as unknown as {
     contextBudgetGeneration: number;
@@ -95,13 +95,15 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   expect(budgetState.contextBudgetGeneration).toBe(budgetGeneration);
   expect(budgetState.contextBudgetWarningClaimed).toBe(true);
   const continuousGeneration: unknown = Reflect.get(
-    continuousState.continuousCompactor,
+    continuousState.contextController.continuous.continuousCompactor,
     "generation"
   );
   assert(typeof continuousGeneration === "number", "The compactor must have a generation fence");
   expect((await budget.session.interruptStream({ abandonPartial: true })).success).toBe(true);
   expect(budgetState.contextBudgetWarningClaimed).toBe(false);
-  expect(Reflect.get(continuousState.continuousCompactor, "generation")).toBe(continuousGeneration);
+  expect(
+    Reflect.get(continuousState.contextController.continuous.continuousCompactor, "generation")
+  ).toBe(continuousGeneration);
 
   for (const id of ["continuous", "budget"]) {
     const history = await continuous.historyService.getHistoryFromLatestBoundary(id);

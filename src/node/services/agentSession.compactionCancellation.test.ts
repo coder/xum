@@ -30,17 +30,21 @@ const options = { model: "openai:gpt-4o", agentId: "exec" };
 const fixtures: AgentSessionHarness[] = [];
 
 interface Internals {
-  contextController: { compactionMonitor: CompactionMonitor };
+  contextController: {
+    compactionMonitor: CompactionMonitor;
+    continuous: {
+      continuousCompactor: ContinuousCompactor;
+      recoverCompaction(): Promise<boolean>;
+      observeCompaction(
+        ...args: Parameters<ContinuousCompactor["observe"]>
+      ): ReturnType<ContinuousCompactor["observe"]>;
+    };
+    summarize: { interruptForCompaction(): Promise<void> };
+  };
   coordinator: TurnCoordinator;
   compactionCancellation: CompactionCancellation;
   fileChangeTracker: FileChangeTracker;
-  continuousCompactor: ContinuousCompactor;
-  recoverCompaction(): Promise<boolean>;
-  interruptForCompaction(): Promise<void>;
   compactionRecoveryBlocked(): Promise<boolean>;
-  observeCompaction(
-    ...args: Parameters<ContinuousCompactor["observe"]>
-  ): ReturnType<ContinuousCompactor["observe"]>;
   dispatchPendingFollowUp(): Promise<boolean>;
   scheduleStartupAutoRetryIfNeeded(): Promise<string>;
 }
@@ -105,8 +109,9 @@ describe("compaction cancellation runtime", () => {
         order.push("abandon");
         abandon();
       });
-      const reset = h.state.continuousCompactor.reset.bind(h.state.continuousCompactor);
-      spyOn(h.state.continuousCompactor, "reset").mockImplementation((reason) => {
+      const compactor = h.state.contextController.continuous.continuousCompactor;
+      const reset = compactor.reset.bind(compactor);
+      spyOn(compactor, "reset").mockImplementation((reason) => {
         order.push(reason);
         reset(reason);
       });
@@ -2040,12 +2045,13 @@ describe("compaction cancellation runtime", () => {
         await h.session.cancelCompaction();
         return blocked;
       });
-      const recover = spyOn(h.state.continuousCompactor, "recover").mockResolvedValue(true);
-      const observe = spyOn(h.state.continuousCompactor, "observe").mockResolvedValue("applied");
+      const strategy = h.state.contextController.continuous;
+      const recover = spyOn(strategy.continuousCompactor, "recover").mockResolvedValue(true);
+      const observe = spyOn(strategy.continuousCompactor, "observe").mockResolvedValue("applied");
       expect(
         kind === "recover"
-          ? await h.state.recoverCompaction()
-          : await h.state.observeCompaction(95, {
+          ? await strategy.recoverCompaction()
+          : await strategy.observeCompaction(95, {
               enabled: true,
               model: options.model,
               contextWindowTokens: 100_000,
@@ -2096,7 +2102,7 @@ describe("compaction cancellation runtime", () => {
       completion.resolve({ status: "aborted", abortReason: "system" });
       return Ok(undefined);
     });
-    const compact = h.state.interruptForCompaction();
+    const compact = h.state.contextController.summarize.interruptForCompaction();
     try {
       await entered.promise;
       await h.session.cancelCompaction();
@@ -2608,8 +2614,9 @@ describe("compaction cancellation runtime", () => {
       fixtures.push(fresh);
       const freshStream = spyOn(fresh.aiService, "streamMessage");
       const state = fresh.session as unknown as Internals;
-      const recovery = spyOn(state.continuousCompactor, "recover");
-      expect(await state.recoverCompaction()).toBe(false);
+      const strategy = state.contextController.continuous;
+      const recovery = spyOn(strategy.continuousCompactor, "recover");
+      expect(await strategy.recoverCompaction()).toBe(false);
       expect(await state.scheduleStartupAutoRetryIfNeeded()).toBe("completed");
       expect(await state.dispatchPendingFollowUp()).toBe(false);
       expect(recovery).not.toHaveBeenCalled();
