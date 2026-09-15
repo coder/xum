@@ -816,14 +816,12 @@ describe("DevToolsService", () => {
           events.push(event);
         });
 
-        // run-a exists on disk but was evicted from memory by an oversized run.
-        await service.createRun("ws-1", runAt(0));
         await service.createRun("ws-1", runAt(1));
         await service.createStep("ws-1", bigStep(1, BUDGET_BYTES + 1));
         expect(await runIds(service)).toEqual(["run-1"]);
 
-        // Hold the write queue so run-0's self-heal is still pending while run-2's
-        // oversized step evicts the healed run.
+        // Hold the write queue so the unknown run's self-heal is still pending
+        // while run-2's oversized step evicts the healed run.
         const originalAppendFile = fs.appendFile;
         let releaseQueue: () => void = () => undefined;
         const gate = new Promise<void>((resolve) => {
@@ -834,8 +832,8 @@ describe("DevToolsService", () => {
           return originalAppendFile(...args);
         });
         const lateStep = makeStep({
-          id: "step-0-late",
-          runId: "run-0",
+          id: "step-unknown-late",
+          runId: "run-unknown",
           rawChunks: rawChunksOf(30_000),
         });
         try {
@@ -852,7 +850,7 @@ describe("DevToolsService", () => {
         }
 
         expect(await runIds(service)).toEqual(["run-2"]);
-        expect(await service.getRunWithSteps("ws-1", "run-0")).toBeNull();
+        expect(await service.getRunWithSteps("ws-1", "run-unknown")).toBeNull();
 
         // Every step-created is preceded by run-created for its run, and no step
         // is announced for a run that is gone.
@@ -1112,6 +1110,60 @@ describe("DevToolsService", () => {
         // ...and releases the id: a second late update is skipped.
         await service.updateStep("ws-1", "step-open", { durationMs: 21 });
         expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore + 1);
+      });
+
+      it("logs a late step of an evicted run to disk only, without resurrecting the run", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        const runA: DevToolsRun = {
+          ...runAt(1),
+          toolPolicy: [{ regex_match: "bash", action: "disable" }],
+          requestHistorySequence: 42,
+        };
+        await service.createRun("ws-1", runA);
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const eventCountAfterEviction = events.length;
+
+        // run-1 is still streaming and logs another step after its eviction.
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.updateStep("ws-1", "step-a2", { durationMs: 20 });
+        await service.updateStep("ws-1", "step-a1", { durationMs: 10 });
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+        expect(events.slice(eventCountAfterEviction)).toEqual([]);
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"id":"step-a2"');
+        expect(logContents).toContain('"stepId":"step-a2","update":{"durationMs":20}');
+        expect(logContents).toContain('"stepId":"step-a1","update":{"durationMs":10}');
+        // No healed stand-in header was written for run-1.
+        expect(logContents.match(/"type":"run","run":\{"id":"run-1"/g)).toHaveLength(1);
+
+        // Restart with the default budget: the run comes back under its original
+        // header with both steps and their updates, in order.
+        const restarted = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const detail = await restarted.getRunWithSteps("ws-1", "run-1");
+        expect(detail?.run).toMatchObject(runA);
+        expect(detail?.steps.map((step) => [step.id, step.durationMs])).toEqual([
+          ["step-a1", 10],
+          ["step-a2", 20],
+        ]);
+        expect((await restarted.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
       });
 
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {

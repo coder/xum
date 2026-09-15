@@ -49,6 +49,8 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
  */
 export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
 const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
+/** FIFO cap on remembered evicted run ids; see WorkspaceData.evictedRunIds. */
+const MAX_TRACKED_EVICTED_RUNS = 4 * MAX_RETAINED_RUNS_PER_WORKSPACE;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
 
 interface WorkspaceData {
@@ -70,6 +72,17 @@ interface WorkspaceData {
    * update lands, and the set is reset after replay and on clear().
    */
   evictedStepIds: Set<string>;
+  /**
+   * Runs dropped from memory by live retention since the last clear(), oldest
+   * first. A still-active run whose id is here must not be resurrected by
+   * createStep's self-heal: its real header (startedAt, toolPolicy,
+   * requestHistorySequence) is still on disk and replay restores it, whereas a
+   * healed stand-in would carry the new step's timestamp and no metadata. Capped
+   * at MAX_TRACKED_EVICTED_RUNS by dropping the oldest id; a run that ages out
+   * and then logs another step falls back to the self-heal, which is accepted.
+   * Reset after replay and on clear(), like evictedStepIds.
+   */
+  evictedRunIds: Set<string>;
   /**
    * Whether the on-disk log was replayed to EOF (or did not exist). After a
    * failed partial replay, memory is a prefix of the file, so a step that looks
@@ -171,6 +184,13 @@ function evictRun(data: WorkspaceData, runId: string): void {
   for (const step of removeRun(data, runId)) {
     if (isStepInFlight(step)) {
       data.evictedStepIds.add(step.id);
+    }
+  }
+  data.evictedRunIds.add(runId);
+  if (data.evictedRunIds.size > MAX_TRACKED_EVICTED_RUNS) {
+    const oldest = data.evictedRunIds.keys().next().value;
+    if (oldest !== undefined) {
+      data.evictedRunIds.delete(oldest);
     }
   }
 }
@@ -386,10 +406,25 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
-    // Self-healing: if the run was cleared (or evicted by retention) during an
-    // active stream, recreate it so steps aren't orphaned. After eviction the
-    // original run line is still on disk; replay keeps that first line and
-    // ignores this duplicate.
+    const entry: DevToolsLogEntry = { type: "step", step };
+    const json = JSON.stringify(entry);
+
+    if (!data.runs.has(step.runId) && data.evictedRunIds.has(step.runId)) {
+      // Eviction is memory-only and disk is authoritative: an evicted run that
+      // is still streaming keeps logging to disk, where replay reassembles it
+      // under its original header, but it is not brought back into memory and
+      // nothing is announced. Its later updates land via evictedStepIds.
+      await this.appendToFile(workspaceId, json);
+      if (isStepInFlight(step)) {
+        data.evictedStepIds.add(step.id);
+      }
+      return;
+    }
+
+    // Self-healing: if the run was cleared during an active stream (or its
+    // eviction aged out of evictedRunIds), recreate it so steps aren't
+    // orphaned. Should the original header still be on disk, replay keeps that
+    // first line and ignores this duplicate.
     //
     // The healed run and the step enter memory in the same synchronous section
     // before either append is awaited: an await in between let a concurrent
@@ -409,8 +444,6 @@ export class DevToolsService extends EventEmitter {
       appends.push(this.appendToFile(workspaceId, runJson));
     }
 
-    const entry: DevToolsLogEntry = { type: "step", step };
-    const json = JSON.stringify(entry);
     this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
     appends.push(this.appendToFile(workspaceId, json));
 
@@ -568,6 +601,7 @@ export class DevToolsService extends EventEmitter {
     data.runBytes.clear();
     data.stepBytes.clear();
     data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
     data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
@@ -725,6 +759,7 @@ export class DevToolsService extends EventEmitter {
       retainedBytes: 0,
       loaded: false,
       evictedStepIds: new Set<string>(),
+      evictedRunIds: new Set<string>(),
       replayComplete: false,
       clearGeneration: 0,
     };
@@ -845,6 +880,7 @@ export class DevToolsService extends EventEmitter {
     // Replay evictions cannot receive live updates (every live call awaits
     // ensureLoaded first), so only evictions from here on need remembering.
     data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
     data.loaded = true;
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
   }
