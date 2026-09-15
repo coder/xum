@@ -12639,6 +12639,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
 
+        // The cascade above persisted every descendant's terminal status (each keeps its own
+        // retained stop latch until it settles), so this workspace's hard-interrupt latch has
+        // done its job. Release it BEFORE the user's send-now: queued dispatch honors the stop
+        // barrier and would otherwise hold the very entry the user asked to send, with nothing
+        // left to drain it after the finally. A failed cascade keeps the latch until the finally.
+        if (allowQueueDispatch && descendantsSettled) {
+          releaseHardStopLatch?.();
+          releaseHardStopLatch = undefined;
+        }
+
         // Handle queued messages based on option
         if (allowQueueDispatch && options?.sendQueuedImmediately) {
           // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
