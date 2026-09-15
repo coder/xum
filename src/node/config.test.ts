@@ -163,6 +163,49 @@ describe("Config", () => {
       expect(reloaded.hiddenModelsInitialized).toBe(true);
     });
 
+    it("keeps the local-preference migration pending when a later seed extends a seeded list", async () => {
+      // The Daybreak seed created this list, but no browser has migrated its
+      // legacy local hides yet (hiddenModelsInitialized never set). The GPT-6
+      // Sol seed must not flip the marker: doing so would make
+      // migrateLocalModelPrefsToBackend treat the seeded list as authoritative
+      // and drop the user's local hidden-model choices.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [blue, red],
+          migrations: { daybreakModelsHidden: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([blue, red, sol6]);
+      expect(reloaded.hiddenModelsInitialized).toBe(false);
+    });
+
+    it.each([
+      { name: "default model", config: { defaultModel: sol6 } },
+      {
+        name: "agent AI defaults",
+        config: { agentAiDefaults: { exec: { modelString: sol6 } } },
+      },
+      {
+        name: "model fallback chain",
+        config: { modelFallbacks: { [unrelated]: { models: [sol6] } } },
+      },
+    ])("does not hide a seeded model the config references via $name", async ({ config: cfg }) => {
+      // An explicit reference is a prior opt-in (early adopters used the id as
+      // a custom model string before this entry existed); the seed only changes
+      // the default for users who never chose the model.
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [], ...cfg }));
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([blue, red]);
+      // The seed flag still records as run: later loads must not re-hide.
+      await flushConfigEdits();
+      expect(new Config(tempDir).getClientConfig().hiddenModels).toEqual([blue, red]);
+    });
+
     it("does not re-hide GPT-6 Sol after a user re-enables it", async () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),

@@ -1872,6 +1872,41 @@ export class Config {
       parsed.migrations = hiddenMigrations;
       configModified = true;
     }
+    // Legacy root subagentAiDefaults (written by older builds and by the
+    // save-time downgrade projection) folds into the canonical nested
+    // `subagent` profile here; nothing outside this load and the save
+    // projection may read or write the legacy root map. Computed before the
+    // hidden-model seeds so they can treat referenced models as opt-ins.
+    const agentAiDefaults = mergeLegacySubagentAiDefaults(
+      normalizeAgentAiDefaults(parsed.agentAiDefaults),
+      parsed.subagentAiDefaults
+    );
+    // Explicit model references in this config are prior opt-ins: hiding a
+    // model the user already chose (e.g. an early adopter of a provisional id
+    // via a custom model string) would silently drop it from the selector, so
+    // seeds only change the default for users who never referenced the model.
+    // Provider-catalog entries live in the separate providers store and are not
+    // consulted here; hidden entries stay usable as custom model strings and
+    // can be re-enabled in Settings → Models.
+    const referencedModelIds = new Set<string>();
+    const addReferencedModel = (value: unknown): void => {
+      const normalized = normalizeOptionalModelString(value);
+      if (normalized !== undefined) {
+        referencedModelIds.add(normalized);
+      }
+    };
+    addReferencedModel(parsed.defaultModel);
+    addReferencedModel(parsed.advisorModelString);
+    for (const [source, entry] of Object.entries(modelFallbacks ?? {})) {
+      addReferencedModel(source);
+      for (const target of entry.models) {
+        addReferencedModel(target);
+      }
+    }
+    for (const entry of Object.values(agentAiDefaults)) {
+      addReferencedModel(entry.modelString);
+      addReferencedModel(entry.subagent?.modelString);
+    }
     // Each seed-once flag hides the models that shipped default-hidden with it.
     // Flags are frozen history: a flag that already ran must never re-hide its
     // models (users may have re-enabled them since), so later default-hidden
@@ -1888,29 +1923,34 @@ export class Config {
     const pendingSeeds = hiddenModelSeeds.filter((seed) => hiddenMigrations[seed.flag] !== true);
     if (pendingSeeds.length > 0) {
       // Seed once, without losing unrelated hides or re-hiding models users later enable.
+      //
+      // hiddenModelsInitialized may flip only on the FIRST seed pass: an array
+      // that predates every seed was user/backend-authored (authoritative), but
+      // once any seed has run, a defined array may itself be seed-created while
+      // a browser's legacy local-preference migration is still pending —
+      // flipping the marker then would make migrateLocalModelPrefsToBackend
+      // treat the seeded list as authoritative and drop the user's local hides.
+      const anySeedRanBefore = hiddenModelSeeds.some(
+        (seed) => hiddenMigrations[seed.flag] === true
+      );
       parsed.migrations = {
         ...hiddenMigrations,
         ...Object.fromEntries(pendingSeeds.map((seed) => [seed.flag, true])),
         hiddenModelsInitialized:
-          hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
+          hiddenMigrations.hiddenModelsInitialized === true ||
+          (!anySeedRanBefore && existingHiddenModels !== undefined),
       };
-      parsed.hiddenModels = [
-        ...new Set([
-          ...(existingHiddenModels ?? []),
-          ...pendingSeeds.flatMap((seed) => seed.modelIds),
-        ]),
-      ];
+      const seedIds = pendingSeeds
+        .flatMap((seed) => seed.modelIds)
+        .filter((id) => !referencedModelIds.has(id));
+      // Leave hiddenModels untouched when there is nothing to write: creating
+      // an empty array here would fabricate a defined preference list.
+      if (existingHiddenModels !== undefined || seedIds.length > 0) {
+        parsed.hiddenModels = [...new Set([...(existingHiddenModels ?? []), ...seedIds])];
+      }
       configModified = true;
     }
     const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
-    // Legacy root subagentAiDefaults (written by older builds and by the
-    // save-time downgrade projection) folds into the canonical nested
-    // `subagent` profile here; nothing outside this load and the save
-    // projection may read or write the legacy root map.
-    const agentAiDefaults = mergeLegacySubagentAiDefaults(
-      normalizeAgentAiDefaults(parsed.agentAiDefaults),
-      parsed.subagentAiDefaults
-    );
 
     if (shouldInvalidateSessionUsageCaches) {
       // Invalidate stale usage caches only when model id formats changed.
