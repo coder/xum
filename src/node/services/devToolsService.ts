@@ -151,19 +151,36 @@ function completesStep(update: Partial<DevToolsStep>): boolean {
   return update.durationMs != null || update.error != null;
 }
 
-function evictRun(data: WorkspaceData, runId: string): void {
+/** Drop a run, its steps, and their byte accounting. Returns the removed steps. */
+function removeRun(data: WorkspaceData, runId: string): DevToolsStep[] {
   data.runs.delete(runId);
+  const removedSteps: DevToolsStep[] = [];
   for (const [stepId, step] of data.steps) {
     if (step.runId === runId) {
       data.steps.delete(stepId);
       data.stepBytes.delete(stepId);
-      if (isStepInFlight(step)) {
-        data.evictedStepIds.add(stepId);
-      }
+      removedSteps.push(step);
     }
   }
   data.retainedBytes -= data.runBytes.get(runId) ?? 0;
   data.runBytes.delete(runId);
+  return removedSteps;
+}
+
+function evictRun(data: WorkspaceData, runId: string): void {
+  for (const step of removeRun(data, runId)) {
+    if (isStepInFlight(step)) {
+      data.evictedStepIds.add(step.id);
+    }
+  }
+}
+
+function removeStep(data: WorkspaceData, step: DevToolsStep): void {
+  data.steps.delete(step.id);
+  const bytes = data.stepBytes.get(step.id) ?? 0;
+  data.stepBytes.delete(step.id);
+  data.runBytes.set(step.runId, (data.runBytes.get(step.runId) ?? 0) - bytes);
+  data.retainedBytes -= bytes;
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
@@ -349,7 +366,11 @@ export class DevToolsService extends EventEmitter {
     const entry: DevToolsLogEntry = { type: "run", run };
     const json = JSON.stringify(entry);
     this.emitEvicted(workspaceId, this.insertRun(data, run, json.length));
-    await this.appendToFile(workspaceId, json);
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.runs.get(run.id) === run) {
+        removeRun(data, run.id);
+      }
+    });
 
     this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
@@ -374,33 +395,39 @@ export class DevToolsService extends EventEmitter {
     // before either append is awaited: an await in between let a concurrent
     // write evict the healed run, after which setStep retained a step (and its
     // bytes) under a run no longer in data.runs, where evictRun never reclaims it.
-    let healedRunJson: string | undefined;
+    let healedRun: DevToolsRun | undefined;
+    const appends: Array<Promise<void>> = [];
     if (!data.runs.has(step.runId)) {
-      const autoRun: DevToolsRun = {
+      healedRun = {
         id: step.runId,
         workspaceId,
         startedAt: step.startedAt,
       };
-      const runEntry: DevToolsLogEntry = { type: "run", run: autoRun };
-      healedRunJson = JSON.stringify(runEntry);
-      this.emitEvicted(workspaceId, this.insertRun(data, autoRun, healedRunJson.length));
+      const runEntry: DevToolsLogEntry = { type: "run", run: healedRun };
+      const runJson = JSON.stringify(runEntry);
+      this.emitEvicted(workspaceId, this.insertRun(data, healedRun, runJson.length));
+      appends.push(this.appendToFile(workspaceId, runJson));
     }
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
     this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
+    appends.push(this.appendToFile(workspaceId, json));
 
     // Publish only after both lines are durable: if an append rejects (disk
     // full), the caller sees the error and subscribers never learn of a run
     // whose step could never finalize. Both appends are queued before either
     // is awaited so a rejected run line does not leave the step line unqueued.
-    const runAppend =
-      healedRunJson === undefined ? undefined : this.appendToFile(workspaceId, healedRunJson);
-    const stepAppend = this.appendToFile(workspaceId, json);
-    await runAppend;
-    await stepAppend;
+    await this.persistOrRollback(appends, () => {
+      if (data.steps.get(step.id) === step) {
+        removeStep(data, step);
+      }
+      if (healedRun !== undefined && data.runs.get(healedRun.id) === healedRun) {
+        removeRun(data, healedRun.id);
+      }
+    });
 
-    if (healedRunJson !== undefined) {
+    if (healedRun !== undefined) {
       this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
     }
     this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
@@ -451,12 +478,17 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
+    const previousBytes = data.stepBytes.get(stepId) ?? 0;
     this.emitEvicted(
       workspaceId,
       this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length))
     );
 
-    await this.appendToFile(workspaceId, json);
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.steps.get(stepId) === mergedStep) {
+        this.setStep(data, existing, previousBytes);
+      }
+    });
 
     this.emitStepEventIfRetained(workspaceId, data, "step-updated", stepId);
     this.emitRunEventIfRetained(workspaceId, data, "run-updated", mergedStep.runId);
@@ -589,6 +621,30 @@ export class DevToolsService extends EventEmitter {
 
   private emitWorkspaceEvent(workspaceId: string, event: DevToolsEvent): void {
     this.emit(`update:${workspaceId}`, event);
+  }
+
+  /**
+   * Memory is mutated before the disk append (so a concurrent write cannot
+   * slip between them), which means a rejected append (disk full) would leave
+   * an unpersisted run or step visible until restart. Wait for every append to
+   * settle, and if any failed run the caller's rollback for the entity it was
+   * writing, then rethrow the first failure. Runs that retention evicted to
+   * make room are not restored: they are on disk, which is authoritative, and
+   * come back on the next load. The rollback must check the entity is still
+   * the one it inserted, since eviction or clear() may have removed it already.
+   */
+  private async persistOrRollback(
+    appends: Array<Promise<void>>,
+    rollback: () => void
+  ): Promise<void> {
+    const results = await Promise.allSettled(appends);
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (failure) {
+      rollback();
+      throw failure.reason;
+    }
   }
 
   /**

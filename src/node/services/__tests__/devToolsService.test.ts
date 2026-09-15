@@ -969,6 +969,114 @@ describe("DevToolsService", () => {
           events.some((event) => event.type === "run-created" && event.run.id === "run-healed")
         ).toBe(false);
         expect(events.some((event) => event.type === "step-created")).toBe(false);
+        // The unpersisted healed run and its step are rolled back, not left as ghosts.
+        expect(await runIds(service)).toEqual(["run-1"]);
+        expect(await service.getRunWithSteps("ws-1", "run-healed")).toBeNull();
+      });
+
+      describe("rollback when the append fails", () => {
+        const entryBytes = (entry: unknown) => JSON.stringify(entry).length;
+        const rejectAppendsContaining = (needle: string) => {
+          const originalAppendFile = fs.appendFile;
+          return spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+            if (String(args[1]).includes(needle)) {
+              throw new Error("ENOSPC: no space left on device");
+            }
+            return originalAppendFile(...args);
+          });
+        };
+        const expectRejects = async (promise: Promise<void>) => {
+          let failure: unknown;
+          await promise.catch((error: unknown) => {
+            failure = error;
+          });
+          expect((failure as Error | undefined)?.message).toContain("ENOSPC");
+        };
+
+        it("createRun leaves memory and accounting untouched when its run line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const step1 = bigStep(1, 40_000);
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", step1);
+
+          const spy = rejectAppendsContaining('"run-2"');
+          try {
+            await expectRejects(service.createRun("ws-1", runAt(2)));
+          } finally {
+            spy.mockRestore();
+          }
+          expect(await runIds(service)).toEqual(["run-1"]);
+
+          // Size run-3's step so everything fits the budget only if run-2's line
+          // was un-accounted: leaking it would evict run-1.
+          const retained =
+            entryBytes({ type: "run", run: runAt(1) }) +
+            entryBytes({ type: "step", step: step1 }) +
+            entryBytes({ type: "run", run: runAt(3) });
+          const leaked = entryBytes({ type: "run", run: runAt(2) });
+          const payload =
+            BUDGET_BYTES - retained - entryBytes({ type: "step", step: bigStep(3, 0) });
+          const step3 = bigStep(3, payload - Math.ceil(leaked / 2));
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", step3);
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("createStep leaves memory and accounting untouched when its step line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+          const spy = rejectAppendsContaining('"step-1b"');
+          try {
+            await expectRejects(
+              service.createStep(
+                "ws-1",
+                makeStep({ id: "step-1b", runId: "run-1", rawChunks: rawChunksOf(50_000) })
+              )
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          const detail = await service.getRunWithSteps("ws-1", "run-1");
+          expect(detail?.steps.map((step) => step.id)).toEqual(["step-1"]);
+          expect((await service.getRuns("ws-1"))[0]?.stepCount).toBe(1);
+
+          // A leaked 50 KB step would push run-1 + run-3 (55 KB) over budget.
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("updateStep restores the previous step when its update line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const original = makeStep({ id: "step-1", runId: "run-1", durationMs: null });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", original);
+
+          const spy = rejectAppendsContaining('"type":"step-update"');
+          try {
+            await expectRejects(
+              service.updateStep("ws-1", "step-1", {
+                durationMs: 99,
+                rawChunks: rawChunksOf(50_000),
+              })
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]).toEqual(original);
+
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
       });
 
       it("tracks only in-flight steps of an evicted run for late updates", async () => {
