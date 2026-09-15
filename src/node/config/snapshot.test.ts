@@ -3,7 +3,15 @@ import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
-import type { Workspace } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+
+/** Signature of Config's private buildWorkspaceMetadata, spied on to count rebuilds. */
+type BuildWorkspaceMetadata = (
+  config: ProjectsConfig,
+  projects: Iterable<[string, ProjectConfig]>,
+  options?: { legacyAliasIds?: Set<string> }
+) => Promise<FrontendWorkspaceMetadata[]>;
 
 const older = "2026-01-01T00:00:00.000Z";
 const newer = "2026-02-01T00:00:00.000Z";
@@ -108,6 +116,103 @@ describe("Config snapshots", () => {
       read.mockRestore();
     }
     expect(config.loadConfigOrDefault()).toEqual(new Config(root).loadConfigOrDefault());
+  });
+
+  it("memoizes registry-only enumerations per config snapshot and option slot", async () => {
+    const internals = config as unknown as { buildWorkspaceMetadata: BuildWorkspaceMetadata };
+    const original = internals.buildWorkspaceMetadata.bind(config);
+    const build = spyOn(internals, "buildWorkspaceMetadata").mockImplementation(
+      async (snapshot, projects, options) => {
+        const result = await original(snapshot, projects, options);
+        // Stand-in for a second legacy metadata.json alias surfaced by the walk.
+        options?.legacyAliasIds?.add("alias-from-build");
+        return result;
+      }
+    );
+    try {
+      const firstAliases = new Set<string>();
+      const first = await config.getAllWorkspaceMetadata({
+        probeCheckouts: false,
+        legacyAliasIds: firstAliases,
+      });
+      const secondAliases = new Set<string>();
+      const second = await config.getAllWorkspaceMetadata({
+        probeCheckouts: false,
+        legacyAliasIds: secondAliases,
+      });
+      expect(build).toHaveBeenCalledTimes(1);
+      expect(second).not.toBe(first);
+      expect(second).toEqual(first);
+      expect(second[0]).toBe(first[0]);
+      expect(firstAliases).toEqual(new Set(["alias-from-build"]));
+      expect(secondAliases).toEqual(new Set(["alias-from-build"]));
+
+      // Concurrent callers of one slot share the in-flight build.
+      const [a, b] = await Promise.all([
+        config.getAllWorkspaceMetadata({ probeCheckouts: false, archived: "archived" }),
+        config.getAllWorkspaceMetadata({ probeCheckouts: false, archived: "archived" }),
+      ]);
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(a.map((entry) => entry.id)).toEqual(["archived"]);
+      expect(b).toEqual(a);
+
+      // Filter and strictness are separate slots; the probing variant is never memoized.
+      await config.getAllWorkspaceMetadata({ probeCheckouts: false, archived: "active" });
+      await config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true });
+      expect(build).toHaveBeenCalledTimes(4);
+      await config.getAllWorkspaceMetadata();
+      await config.getAllWorkspaceMetadata();
+      expect(build).toHaveBeenCalledTimes(6);
+
+      // A write from this process yields a new snapshot, so the next read rebuilds.
+      await config.editConfig((snapshot) => {
+        snapshot.projects.get(projectPath)!.workspaces[0].title = "Changed";
+        return snapshot;
+      });
+      const rebuilt = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(build).toHaveBeenCalledTimes(7);
+      expect(rebuilt.find((entry) => entry.id === "active")?.title).toBe("Changed");
+      expect(first.find((entry) => entry.id === "active")?.title).toBeUndefined();
+      await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(build).toHaveBeenCalledTimes(7);
+
+      // An external rewrite changes the stat key and invalidates too.
+      const configPath = path.join(root, "config.json");
+      fs.writeFileSync(
+        configPath,
+        fs.readFileSync(configPath, "utf-8").replace('"title": "Changed"', '"title": "External"')
+      );
+      const external = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(build).toHaveBeenCalledTimes(8);
+      expect(external.find((entry) => entry.id === "active")?.title).toBe("External");
+    } finally {
+      build.mockRestore();
+    }
+  });
+
+  it("drops a failed registry-only build from the memo", async () => {
+    const internals = config as unknown as { buildWorkspaceMetadata: BuildWorkspaceMetadata };
+    const original = internals.buildWorkspaceMetadata.bind(config);
+    const build = spyOn(internals, "buildWorkspaceMetadata")
+      .mockImplementationOnce(() => Promise.reject(new Error("legacy metadata unreadable")))
+      .mockImplementation(original);
+    try {
+      const failure = await config
+        .getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+        .then(
+          () => "resolved",
+          (error: unknown) => (error instanceof Error ? error.message : "non-error")
+        );
+      expect(failure).toBe("legacy metadata unreadable");
+      const recovered = await config.getAllWorkspaceMetadata({
+        probeCheckouts: false,
+        throwOnError: true,
+      });
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(recovered.map((entry) => entry.id).sort()).toEqual(["active", "archived"]);
+    } finally {
+      build.mockRestore();
+    }
   });
 
   it("reloads the saved runtime projection with normalized keys and hierarchy", async () => {

@@ -964,10 +964,24 @@ interface WorkspaceMetadataOptions {
    * mount would otherwise block the whole enumeration, and per-request
    * callers (workspace MCP override resolution) would pay one probe per
    * registered workspace on every request.
+   *
+   * CONTRACT: `false` results are memoized per config snapshot and the
+   * returned entries are shared between callers. Treat them as read-only;
+   * copy before mutating.
    */
   probeCheckouts?: boolean;
 
   archived?: "all" | "active" | "archived";
+}
+
+/**
+ * Memoized registry-only enumeration for one loaded config snapshot. The
+ * build's own alias collection is retained so later callers passing their
+ * own `legacyAliasIds` out-parameter still receive every alias.
+ */
+interface WorkspaceMetadataMemoEntry {
+  result: Promise<FrontendWorkspaceMetadata[]>;
+  legacyAliasIds: Set<string>;
 }
 
 export class Config {
@@ -1372,6 +1386,22 @@ export class Config {
     writeId: string;
   };
   private workspaceIndexConfig?: ProjectsConfig;
+  /**
+   * Registry-only (probeCheckouts: false) enumerations keyed on the loaded
+   * ProjectsConfig snapshot, then on the filter/strictness options. Every
+   * caller of that variant (startup recovery, activity list scoping, MCP
+   * override resolution, ...) used to rebuild ~40 fields per registered
+   * workspace; with thousands of archived entries a heap walk found ten
+   * live copies of the same list. Snapshot identity is the natural change
+   * signal: loadConfigOrDefault hands out the same object until config.json's
+   * stat key changes, and saveConfig drops the snapshot, so both this
+   * process's edits and other backends' rewrites invalidate the memo. The
+   * WeakMap lets a superseded snapshot's memo die with it.
+   */
+  private readonly workspaceMetadataMemo = new WeakMap<
+    ProjectsConfig,
+    Map<string, WorkspaceMetadataMemoEntry>
+  >();
   private workspaceIndex = new Map<
     string,
     {
@@ -3302,7 +3332,40 @@ export class Config {
     options?: WorkspaceMetadataOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
-    return this.buildWorkspaceMetadata(config, config.projects, options);
+    // The probing variant mutates each entry (transcriptOnly) and does per-workspace I/O, so
+    // only the registry-only variant is memoized; see workspaceMetadataMemo.
+    if (options?.probeCheckouts !== false) {
+      return this.buildWorkspaceMetadata(config, config.projects, options);
+    }
+    // Strict and lenient builds differ in outcome only when a legacy entry is unreadable
+    // (strict throws, lenient degrades), so they must not serve each other's slot.
+    const memoKey = `${options.archived ?? "all"}:${options.throwOnError ? "strict" : "lenient"}`;
+    const memo =
+      this.workspaceMetadataMemo.get(config) ?? new Map<string, WorkspaceMetadataMemoEntry>();
+    this.workspaceMetadataMemo.set(config, memo);
+    let entry = memo.get(memoKey);
+    if (entry === undefined) {
+      // Memoize the in-flight promise: the startup burst issues several
+      // enumerations before the first one resolves.
+      const legacyAliasIds = new Set<string>();
+      const result = this.buildWorkspaceMetadata(config, config.projects, {
+        ...options,
+        legacyAliasIds,
+      });
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      entry = created;
+      memo.set(memoKey, created);
+      result.catch(() => {
+        if (memo.get(memoKey) === created) memo.delete(memoKey);
+      });
+    }
+    const metadata = await entry.result;
+    if (options.legacyAliasIds !== undefined) {
+      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
+    }
+    // Fresh array, shared entries: callers of this variant only read (verified when the memo
+    // was added), and the array copy keeps one caller's filter/sort from leaking into another.
+    return metadata.slice();
   }
 
   async getWorkspaceMetadataById(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
