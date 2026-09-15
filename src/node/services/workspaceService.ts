@@ -15022,6 +15022,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         }
       }
+      // LAST step, no awaits below: converge every scoped row on the live workflow-run cache.
+      // Rows were built from a per-id copy of the Set inside Promise.all, and the archived
+      // read path resolves a DETACHED empty Set (installing one per idle archived workspace
+      // is the memory cost this list avoids). A workflow event landing during the awaits
+      // above installs or mutates the shared Set after that copy was taken, and an
+      // authoritative response built from the copy would clear the run the event just
+      // delivered to the renderer. Removed ids cannot re-enter: eviction deletes their
+      // cache entry and the local tombstone is re-checked.
+      for (const workspaceId of new Set([...workspaceIds, ...Object.keys(activityById)])) {
+        const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+        if (installed == null) continue;
+        const row = activityById[workspaceId];
+        if (row != null) {
+          activityById[workspaceId] = mergeActiveWorkflowRuns(row, installed);
+          continue;
+        }
+        if (
+          installed.size === 0 ||
+          !workspaceIds.has(workspaceId) ||
+          this.extensionMetadata.isWorkspaceDeleted(workspaceId)
+        ) {
+          continue;
+        }
+        const merged = this.mergeCurrentActiveBashMonitorCount(
+          workspaceId,
+          mergeActiveWorkflowRuns(
+            this.overlayPendingGoal(workspaceId, snapshots.get(workspaceId) ?? null),
+            installed
+          )
+        );
+        if (merged != null) {
+          activityById[workspaceId] = merged;
+        }
+      }
       return activityById;
     } catch (error) {
       log.error("Failed to list activity:", error);

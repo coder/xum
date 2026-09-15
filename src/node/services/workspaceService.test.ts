@@ -2636,6 +2636,65 @@ describe("WorkspaceService workflow activity", () => {
     }
   });
 
+  test("activity list reports an archived run installed by an event during its later awaits", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // The list reads snapshots once before the per-id probes and again afterwards; gate
+      // the second read so the event lands after the archived probe resolved its detached
+      // empty set but before the response is assembled.
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      const secondReadReached = Promise.withResolvers<void>();
+      const secondReadGate = Promise.withResolvers<void>();
+      let snapshotReads = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotReads += 1;
+          if (snapshotReads === 2) {
+            secondReadReached.resolve();
+            await secondReadGate.promise;
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const list = workspaceService.getActivityList();
+        await secondReadReached.promise;
+        await workspaceService.emitWorkflowRunActivity({
+          workspaceId: "archived",
+          runId: "wfr_live",
+          status: "running",
+        });
+        secondReadGate.resolve();
+        expect((await list)?.archived?.activeWorkflowRunIds).toEqual(["wfr_live"]);
+        expect(scanSpy).not.toHaveBeenCalled();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("archived reads converge on a set a workflow event installs during the await", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
