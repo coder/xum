@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import path from "node:path";
 
@@ -332,13 +333,64 @@ export async function readToolInstructions(
   const globalContents = collectInstructionContents([...sources.global].reverse());
   const contextContents = collectInstructionContents(sources.context);
 
-  return extractToolInstructions(globalContents, contextContents, modelString, {
+  return extractToolInstructionsCached(globalContents, contextContents, modelString, {
     ...getToolAvailabilityOptions({
       workspaceId: metadata.id,
       parentWorkspaceId: metadata.parentWorkspaceId,
     }),
     agentInstructions,
   });
+}
+
+/**
+ * Parsed tool-instruction cache keyed by a hash of every input that determines
+ * `extractToolInstructions` output. Instruction files are still re-read on every
+ * turn (external edits and SSH runtimes stay fresh), but parsing the markdown
+ * was ~140 ms of main-thread work per turn on a live server even when nothing
+ * had changed, so byte-identical inputs skip the parse. Bounded so a process
+ * that cycles through many workspaces/models cannot grow it without limit;
+ * eviction is insertion-order FIFO, which is adequate for a small bound.
+ */
+const TOOL_INSTRUCTIONS_PARSE_CACHE_MAX_ENTRIES = 64;
+const toolInstructionsParseCache = new Map<string, Record<string, string>>();
+
+function extractToolInstructionsCached(
+  globalContents: readonly string[],
+  contextContents: readonly string[],
+  modelString: string,
+  options: Parameters<typeof extractToolInstructions>[3]
+): Record<string, string> {
+  // Arrays are serialized (not joined) so file boundaries and global/context
+  // placement are part of the key; option fields are listed explicitly so key
+  // order in the options object cannot affect the hash.
+  const key = createHash("sha1")
+    .update(
+      JSON.stringify([
+        globalContents,
+        contextContents,
+        modelString,
+        options?.enableAgentReport ?? null,
+        options?.enableReviewPane ?? null,
+        options?.enableMuxGlobalAgentsTools ?? null,
+        options?.agentInstructions ?? null,
+      ])
+    )
+    .digest("hex");
+
+  const cached = toolInstructionsParseCache.get(key);
+  if (cached) {
+    return { ...cached };
+  }
+
+  const parsed = extractToolInstructions(globalContents, contextContents, modelString, options);
+  if (toolInstructionsParseCache.size >= TOOL_INSTRUCTIONS_PARSE_CACHE_MAX_ENTRIES) {
+    const oldestKey = toolInstructionsParseCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      toolInstructionsParseCache.delete(oldestKey);
+    }
+  }
+  toolInstructionsParseCache.set(key, { ...parsed });
+  return parsed;
 }
 
 /**
