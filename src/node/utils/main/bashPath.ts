@@ -6,7 +6,7 @@
  */
 
 import { execSync, type ExecSyncOptionsWithStringEncoding } from "child_process";
-import { existsSync } from "fs";
+import { accessSync, constants as fsConstants, existsSync, statSync } from "fs";
 import path from "path";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -16,6 +16,7 @@ const BASH_PATH_ERROR_COOLDOWN_MS = 30_000;
 
 let cachedBashPath: string | null = null;
 let cachedBashPathError: { message: string; lastCheckedMs: number } | null = null;
+let cachedUnixBashPath: string | null = null;
 
 type ExecSyncFn = (command: string, options: ExecSyncOptionsWithStringEncoding) => string;
 type ExistsSyncFn = (path: string) => boolean;
@@ -194,6 +195,44 @@ function findWindowsBash(params: FindWindowsBashParams): string | null {
   return null;
 }
 
+function isExecutableFile(p: string): boolean {
+  try {
+    if (!statSync(p).isFile()) {
+      return false;
+    }
+    accessSync(p, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve bash to an absolute path on Unix.
+ *
+ * Spawning the bare name "bash" makes every child PATH-search after fork (one failed
+ * execve per PATH entry ahead of bash) while the parent blocks on libuv's exec-status
+ * pipe, so we resolve once here and cache the result for the process lifetime.
+ */
+function findUnixBash(env: NodeJS.ProcessEnv): string {
+  const pathEntries = (env.PATH ?? "").split(path.delimiter);
+  for (const dir of pathEntries) {
+    if (!path.isAbsolute(dir)) {
+      continue;
+    }
+    const candidate = path.join(dir, "bash");
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (isExecutableFile("/bin/bash")) {
+    return "/bin/bash";
+  }
+
+  return "bash";
+}
+
 export interface GetBashPathForPlatformParams {
   platform: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
@@ -203,7 +242,7 @@ export interface GetBashPathForPlatformParams {
 
 export function getBashPathForPlatform(params: GetBashPathForPlatformParams): string {
   if (params.platform !== "win32") {
-    return "bash";
+    return findUnixBash(params.env ?? process.env);
   }
 
   const bashPath = findWindowsBash({
@@ -224,7 +263,8 @@ export function getBashPathForPlatform(params: GetBashPathForPlatformParams): st
 /**
  * Get the bash executable path for the current platform
  *
- * @returns Path to bash executable. On Unix/macOS returns "bash",
+ * @returns Path to bash executable. On Unix/macOS returns the absolute path of the first
+ *          `bash` on PATH (falling back to /bin/bash, then bare "bash"),
  *          on Windows returns full path to Git Bash if found.
  * @throws Error if Git Bash cannot be found on Windows
  */
@@ -239,9 +279,9 @@ export function getBashPath(
 ): string {
   const platform = params.platform ?? process.platform;
 
-  // On Unix/Linux/macOS, bash is in PATH
   if (platform !== "win32") {
-    return "bash";
+    cachedUnixBashPath ??= getBashPathForPlatform({ platform, env: params.env });
+    return cachedUnixBashPath;
   }
 
   // Use cached path if available
@@ -278,6 +318,7 @@ export function getBashPath(
 export function resetBashPathCache(): void {
   cachedBashPath = null;
   cachedBashPathError = null;
+  cachedUnixBashPath = null;
 }
 
 /**

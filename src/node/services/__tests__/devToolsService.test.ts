@@ -4,7 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import type { DevToolsEvent, DevToolsRun, DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
-import { DevToolsService } from "@/node/services/devToolsService";
+import { DevToolsService, MAX_RETAINED_RUNS_PER_WORKSPACE } from "@/node/services/devToolsService";
 
 function makeRun(id: string, startedAt = "2025-06-01T00:00:00Z"): DevToolsRun {
   return { id, workspaceId: "ws-1", startedAt };
@@ -502,7 +502,7 @@ describe("DevToolsService", () => {
 
       const service = new DevToolsService(config);
 
-      const originalReadFile = fs.readFile;
+      const originalOpen = fs.open;
       let logReadCount = 0;
       let releaseReadGate!: () => void;
       const readGate = new Promise<void>((resolve) => {
@@ -514,17 +514,17 @@ describe("DevToolsService", () => {
         firstReadStartedResolve = resolve;
       });
 
-      const mockedReadFile = (async (...args: Parameters<typeof fs.readFile>) => {
+      const mockedOpen = (async (...args: Parameters<typeof fs.open>) => {
         const [filePath] = args;
         if (filePath === logPath) {
           logReadCount += 1;
           firstReadStartedResolve();
           await readGate;
         }
-        return originalReadFile(...args);
-      }) as typeof fs.readFile;
+        return originalOpen(...args);
+      }) as typeof fs.open;
 
-      const readFileSpy = spyOn(fs, "readFile").mockImplementation(mockedReadFile);
+      const openSpy = spyOn(fs, "open").mockImplementation(mockedOpen);
 
       try {
         const firstCreateStep = service.createStep(
@@ -544,7 +544,7 @@ describe("DevToolsService", () => {
         releaseReadGate();
         await Promise.all([firstCreateStep, secondCreateStep]);
       } finally {
-        readFileSpy.mockRestore();
+        openSpy.mockRestore();
       }
 
       const runWithSteps = await service.getRunWithSteps("ws-1", "run-1");
@@ -609,11 +609,930 @@ describe("DevToolsService", () => {
       expect(runWithSteps?.steps[0]?.error).toBe("boom");
     });
 
+    it("retains only the newest runs when the log holds more than the bound", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const total = MAX_RETAINED_RUNS_PER_WORKSPACE + 20;
+
+      const lines: string[] = [];
+      for (let index = 1; index <= total; index += 1) {
+        const runId = `run-${index}`;
+        const startedAt = new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString();
+        lines.push(JSON.stringify({ type: "run", run: makeRun(runId, startedAt) }));
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({ id: `step-${index}`, runId, startedAt }),
+          })
+        );
+      }
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs[0]?.id).toBe(`run-${total}`);
+      expect(runs.at(-1)?.id).toBe(`run-${total - MAX_RETAINED_RUNS_PER_WORKSPACE + 1}`);
+      expect(runs.every((run) => run.stepCount === 1)).toBe(true);
+      expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+    });
+
+    it("evicts the oldest run and its steps when createRun exceeds the bound", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+
+      await service.createRun("ws-1", makeRun("run-oldest", "2025-01-01T00:00:00.000Z"));
+      await service.createStep("ws-1", makeStep({ id: "step-oldest", runId: "run-oldest" }));
+      for (let index = 1; index <= MAX_RETAINED_RUNS_PER_WORKSPACE; index += 1) {
+        const startedAt = new Date(Date.UTC(2025, 0, 2, 0, 0, index)).toISOString();
+        await service.createRun("ws-1", makeRun(`run-${index}`, startedAt));
+      }
+
+      const runs = await service.getRuns("ws-1");
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs.some((run) => run.id === "run-oldest")).toBe(false);
+      expect(await service.getRunWithSteps("ws-1", "run-oldest")).toBeNull();
+
+      // Eviction is memory-only; the on-disk log keeps the full history.
+      const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+      expect(logContents).toContain("step-oldest");
+    });
+
+    describe("byte budget", () => {
+      const BUDGET_BYTES = 100_000;
+      const rawChunksOf = (bytes: number): unknown[] => [{ data: "x".repeat(bytes) }];
+      const bigStep = (index: number, bytes: number) =>
+        makeStep({ id: `step-${index}`, runId: `run-${index}`, rawChunks: rawChunksOf(bytes) });
+      const runAt = (index: number) =>
+        makeRun(`run-${index}`, new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString());
+      const runIds = async (service: DevToolsService) =>
+        (await service.getRuns("ws-1")).map((run) => run.id).sort();
+
+      it("evicts the oldest runs and their steps once retained bytes exceed the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+
+        for (let index = 1; index <= 3; index += 1) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 40_000));
+        }
+        expect(await runIds(service)).toEqual(["run-2", "run-3"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        // A single run larger than the whole budget still survives as the newest.
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-4"]);
+        expect((await service.getRunWithSteps("ws-1", "run-4"))?.steps.map((s) => s.id)).toEqual([
+          "step-4",
+        ]);
+
+        // Eviction is memory-only; the on-disk log keeps every entry.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        for (let index = 1; index <= 4; index += 1) {
+          expect(logContents).toContain(`"run-${index}"`);
+          expect(logContents).toContain(`"step-${index}"`);
+        }
+      });
+
+      it("updateStep replaces the step's accounted size instead of adding to it", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", makeStep({ id: "step-2", runId: "run-2" }));
+
+        // Re-sending the same 60 KB payload must not count it twice (120 KB > budget).
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        expect(await runIds(service)).toEqual(["run-1", "run-2"]);
+
+        // Growing the same step past the budget evicts the older run, not the updated one.
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(BUDGET_BYTES) });
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const detail = await service.getRunWithSteps("ws-1", "run-2");
+        expect(detail?.steps[0]?.rawChunks).toEqual(rawChunksOf(BUDGET_BYTES));
+      });
+
+      it("still persists a run's queued entries when it is evicted before its append runs", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        // Hold the per-workspace write queue on its first disk append so run-1 is
+        // still pending when run-2's oversized step evicts it from memory.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.createRun("ws-1", runAt(1)),
+            service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" })),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"run-1"');
+        expect(logContents).toContain('"step-1"');
+        expect(logContents).toContain('"run-2"');
+        expect(logContents).toContain('"step-2"');
+      });
+
+      it("evicts newer runs when the oldest in-flight run grows past the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        for (const index of [2, 3]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(await runIds(service)).toEqual(["run-1", "run-2", "run-3"]);
+
+        // The oldest run is the one being written, so it is protected; the
+        // newer runs behind it must be evicted instead of nothing at all.
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(BUDGET_BYTES + 1) });
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Accounting check: shrink run-1 again, then add a run that fits only if
+        // run-2/run-3 bytes were released (their ~20 KB would push this over).
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(1_000) });
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 85_000));
+        expect(await runIds(service)).toEqual(["run-1", "run-4"]);
+      });
+
+      it("emits runs-evicted with the dropped run ids so live subscribers release them", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const evictedBatches: string[][] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          if (event.type === "runs-evicted") {
+            evictedBatches.push(event.runIds);
+          }
+        });
+
+        for (const index of [1, 2]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(evictedBatches).toEqual([]);
+
+        // One oversized step pushes both older runs out in a single eviction pass.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, BUDGET_BYTES + 1));
+        expect(evictedBatches).toEqual([["run-1", "run-2"]]);
+        expect(await runIds(service)).toEqual(["run-3"]);
+      });
+
+      it("never retains a self-healed step under a run evicted while its appends were queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", bigStep(1, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Hold the write queue so the unknown run's self-heal is still pending
+        // while run-2's oversized step evicts the healed run.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        const lateStep = makeStep({
+          id: "step-unknown-late",
+          runId: "run-unknown",
+          rawChunks: rawChunksOf(30_000),
+        });
+        try {
+          const pendingWrites = [
+            service.createStep("ws-1", lateStep),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-unknown")).toBeNull();
+
+        // Every step-created is preceded by run-created for its run, and no step
+        // is announced for a run that is gone.
+        const announcedRuns = new Set<string>();
+        for (const event of events) {
+          if (event.type === "run-created") {
+            announcedRuns.add(event.run.id);
+          } else if (event.type === "step-created") {
+            expect(announcedRuns.has(event.step.runId)).toBe(true);
+          }
+        }
+        expect(
+          events.some((event) => event.type === "step-created" && event.step.id === lateStep.id)
+        ).toBe(false);
+
+        // Disk is authoritative: the healed run line and the late step line both landed.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain(`"${lateStep.id}"`);
+
+        // Accounting: a leaked 30 KB orphan would push run-3 + run-4 (75 KB) over the
+        // 100 KB budget and evict run-3; without the leak both fit.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, 30_000));
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 45_000));
+        expect(await runIds(service)).toEqual(["run-3", "run-4"]);
+      });
+
+      it("does not emit step-updated for a step whose run was evicted while its append was queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+        // Hold the queue on step-1's update so run-2's oversized step evicts run-1
+        // before that update's append settles.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.updateStep("ws-1", "step-1", { durationMs: 77 }),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const evictedAt = events.findIndex(
+          (event) => event.type === "runs-evicted" && event.runIds.includes("run-1")
+        );
+        expect(evictedAt).toBeGreaterThan(-1);
+        const afterEviction = events.slice(evictedAt + 1);
+        expect(
+          afterEviction.some(
+            (event) =>
+              (event.type === "step-updated" || event.type === "step-created") &&
+              event.step.runId === "run-1"
+          )
+        ).toBe(false);
+        expect(
+          afterEviction.some((event) => event.type === "run-updated" && event.run.id === "run-1")
+        ).toBe(false);
+        // The update itself still reached disk (eviction is memory-only).
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"durationMs":77');
+      });
+
+      it("publishes nothing for a self-healed run when its step line fails to persist", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+
+        const originalAppendFile = fs.appendFile;
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          if (String(args[1]).includes('"type":"step"')) {
+            throw new Error("ENOSPC: no space left on device");
+          }
+          return originalAppendFile(...args);
+        });
+        let failure: unknown;
+        try {
+          // run-healed is not in memory, so createStep self-heals it first.
+          await service
+            .createStep("ws-1", makeStep({ id: "step-healed", runId: "run-healed" }))
+            .catch((error: unknown) => {
+              failure = error;
+            });
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain("ENOSPC");
+
+        expect(
+          events.some((event) => event.type === "run-created" && event.run.id === "run-healed")
+        ).toBe(false);
+        expect(events.some((event) => event.type === "step-created")).toBe(false);
+        // The unpersisted healed run and its step are rolled back, not left as ghosts.
+        expect(await runIds(service)).toEqual(["run-1"]);
+        expect(await service.getRunWithSteps("ws-1", "run-healed")).toBeNull();
+      });
+
+      describe("rollback when the append fails", () => {
+        const entryBytes = (entry: unknown) => JSON.stringify(entry).length;
+        const rejectAppendsContaining = (needle: string) => {
+          const originalAppendFile = fs.appendFile;
+          return spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+            if (String(args[1]).includes(needle)) {
+              throw new Error("ENOSPC: no space left on device");
+            }
+            return originalAppendFile(...args);
+          });
+        };
+        const expectRejects = async (promise: Promise<void>) => {
+          let failure: unknown;
+          await promise.catch((error: unknown) => {
+            failure = error;
+          });
+          expect((failure as Error | undefined)?.message).toContain("ENOSPC");
+        };
+
+        it("createRun leaves memory and accounting untouched when its run line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const step1 = bigStep(1, 40_000);
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", step1);
+
+          const spy = rejectAppendsContaining('"run-2"');
+          try {
+            await expectRejects(service.createRun("ws-1", runAt(2)));
+          } finally {
+            spy.mockRestore();
+          }
+          expect(await runIds(service)).toEqual(["run-1"]);
+
+          // Size run-3's step so everything fits the budget only if run-2's line
+          // was un-accounted: leaking it would evict run-1.
+          const retained =
+            entryBytes({ type: "run", run: runAt(1) }) +
+            entryBytes({ type: "step", step: step1 }) +
+            entryBytes({ type: "run", run: runAt(3) });
+          const leaked = entryBytes({ type: "run", run: runAt(2) });
+          const payload =
+            BUDGET_BYTES - retained - entryBytes({ type: "step", step: bigStep(3, 0) });
+          const step3 = bigStep(3, payload - Math.ceil(leaked / 2));
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", step3);
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("createStep leaves memory and accounting untouched when its step line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+          const spy = rejectAppendsContaining('"step-1b"');
+          try {
+            await expectRejects(
+              service.createStep(
+                "ws-1",
+                makeStep({ id: "step-1b", runId: "run-1", rawChunks: rawChunksOf(50_000) })
+              )
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          const detail = await service.getRunWithSteps("ws-1", "run-1");
+          expect(detail?.steps.map((step) => step.id)).toEqual(["step-1"]);
+          expect((await service.getRuns("ws-1"))[0]?.stepCount).toBe(1);
+
+          // A leaked 50 KB step would push run-1 + run-3 (55 KB) over budget.
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("updateStep restores the previous step when its update line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const original = makeStep({ id: "step-1", runId: "run-1", durationMs: null });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", original);
+
+          const spy = rejectAppendsContaining('"type":"step-update"');
+          try {
+            await expectRejects(
+              service.updateStep("ws-1", "step-1", {
+                durationMs: 99,
+                rawChunks: rawChunksOf(50_000),
+              })
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]).toEqual(original);
+
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+      });
+
+      it("tracks only in-flight steps of an evicted run for late updates", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-done", runId: "run-1", stepNumber: 1, durationMs: 10 })
+        );
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-open", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lineCountBefore = (await fs.readFile(logPath, "utf-8")).split("\n").length;
+
+        // A finalized step can never be updated again, so it is not tracked.
+        await service.updateStep("ws-1", "step-done", { durationMs: 11 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore);
+
+        // The in-flight step's completing update lands...
+        await service.updateStep("ws-1", "step-open", { durationMs: 20 });
+        const afterCompletion = await fs.readFile(logPath, "utf-8");
+        expect(afterCompletion.split("\n")).toHaveLength(lineCountBefore + 1);
+        expect(afterCompletion).toContain('"stepId":"step-open","update":{"durationMs":20}');
+
+        // ...and releases the id: a second late update is skipped.
+        await service.updateStep("ws-1", "step-open", { durationMs: 21 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore + 1);
+      });
+
+      it("logs a late step of an evicted run to disk only, without resurrecting the run", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        const runA: DevToolsRun = {
+          ...runAt(1),
+          toolPolicy: [{ regex_match: "bash", action: "disable" }],
+          requestHistorySequence: 42,
+        };
+        await service.createRun("ws-1", runA);
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const eventCountAfterEviction = events.length;
+
+        // run-1 is still streaming and logs another step after its eviction.
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.updateStep("ws-1", "step-a2", { durationMs: 20 });
+        await service.updateStep("ws-1", "step-a1", { durationMs: 10 });
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+        expect(events.slice(eventCountAfterEviction)).toEqual([]);
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"id":"step-a2"');
+        expect(logContents).toContain('"stepId":"step-a2","update":{"durationMs":20}');
+        expect(logContents).toContain('"stepId":"step-a1","update":{"durationMs":10}');
+        // No healed stand-in header was written for run-1.
+        expect(logContents.match(/"type":"run","run":\{"id":"run-1"/g)).toHaveLength(1);
+
+        // Restart with the default budget: the run comes back under its original
+        // header with both steps and their updates, in order.
+        const restarted = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const detail = await restarted.getRunWithSteps("ws-1", "run-1");
+        expect(detail?.run).toMatchObject(runA);
+        expect(detail?.steps.map((step) => [step.id, step.durationMs])).toEqual([
+          ["step-a1", 10],
+          ["step-a2", 20],
+        ]);
+        expect((await restarted.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+      });
+
+      it("does not remember an evicted run's late step when clear() runs during its append", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        // Hold the disk-only append of run-1's late step and clear() meanwhile.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const lateStep = service.createStep(
+            "ws-1",
+            makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+          );
+          // getRuns resolves once createStep has taken the disk-only branch and
+          // is parked on its queued append.
+          expect(await runIds(service)).toEqual(["run-2"]);
+          const cleared = service.clear("ws-1");
+          releaseQueue();
+          await Promise.all([lateStep, cleared]);
+          const appendsBeforeFinalize = appendFileSpy.mock.calls.length;
+
+          // The request finalizes after the user cleared the log.
+          await service.updateStep("ws-1", "step-a2", {
+            durationMs: 5,
+            rawChunks: rawChunksOf(10_000),
+          });
+          expect(appendFileSpy.mock.calls.length).toBe(appendsBeforeFinalize);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+        expect(await service.getRuns("ws-1")).toEqual([]);
+      });
+
+      it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const update: Partial<DevToolsStep> = {
+          durationMs: 1234,
+          output: { finishReason: "stop" },
+        };
+        await service.updateStep("ws-1", "step-1", update);
+
+        // Still evicted: the update must not resurrect the step in memory.
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        const stepUpdates = logContents
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as { type: string; stepId?: string; update?: unknown })
+          .filter((entry) => entry.type === "step-update");
+        expect(stepUpdates).toEqual([{ type: "step-update", stepId: "step-1", update }]);
+      });
+
+      it("retains only the newest runs that fit the budget when replaying a log", async () => {
+        const config = createTestConfig({ sessionsDir, enabled: true });
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lines: string[] = [];
+        for (let index = 1; index <= 5; index += 1) {
+          lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
+          lines.push(JSON.stringify({ type: "step", step: bigStep(index, 40_000) }));
+        }
+        // An in-flight step finalized after its run was evicted: the update is
+        // persisted for a step the replay no longer retains and must be ignored.
+        lines.push(
+          JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 5 } })
+        );
+        await fs.mkdir(path.dirname(logPath), { recursive: true });
+        await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+        const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+        expect(await runIds(service)).toEqual(["run-4", "run-5"]);
+        expect((await service.getRunWithSteps("ws-1", "run-5"))?.steps.map((s) => s.id)).toEqual([
+          "step-5",
+        ]);
+        expect(await service.getRunWithSteps("ws-1", "run-3")).toBeNull();
+      });
+    });
+
+    it("applies a large final step-update on load so stale finalization leaves a completed step alone", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
+        }),
+        JSON.stringify({
+          type: "step-update",
+          stepId: "step-1",
+          update: {
+            durationMs: 4321,
+            output: { finishReason: "stop" },
+            rawChunks: [{ data: "x".repeat(200_000) }],
+          },
+        }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.output).toEqual({ finishReason: "stop" });
+      expect((await service.getRuns("ws-1"))[0]?.isInProgress).toBe(false);
+
+      // The step completed on disk, so nothing is stale: no extra line is appended.
+      const contents = await fs.readFile(logPath, "utf-8");
+      expect(contents).not.toContain("Interrupted (stale)");
+      expect(contents.split("\n").filter((line) => line.trim().length > 0)).toHaveLength(
+        lines.length
+      );
+    });
+
+    it("keeps a single run whose many small lines exceed the budget, with every step applied", async () => {
+      const BUDGET_BYTES = 20_000;
+      const STEP_COUNT = 40;
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [JSON.stringify({ type: "run", run: makeRun("run-1") })];
+      for (let index = 1; index <= STEP_COUNT; index += 1) {
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({
+              id: `step-${index}`,
+              runId: "run-1",
+              stepNumber: index,
+              durationMs: null,
+              rawChunks: [{ data: "x".repeat(2_000) }],
+            }),
+          })
+        );
+        lines.push(
+          JSON.stringify({
+            type: "step-update",
+            stepId: `step-${index}`,
+            update: { durationMs: index },
+          })
+        );
+      }
+      expect(lines.join("\n").length).toBeGreaterThan(BUDGET_BYTES * 3);
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+      const runs = await service.getRuns("ws-1");
+      expect(runs.map((run) => run.id)).toEqual(["run-1"]);
+      expect(runs[0]?.stepCount).toBe(STEP_COUNT);
+
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps.map((step) => step.durationMs)).toEqual(
+        Array.from({ length: STEP_COUNT }, (_, index) => index + 1)
+      );
+    });
+
+    it("parses a line that spans several read chunks", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      // LOAD_CHUNK_BYTES is 1 MiB; a 2.5 MB payload forces the line across three reads.
+      const payload = "y".repeat(2_500_000);
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", rawChunks: [{ data: payload }] }),
+        }),
+        JSON.stringify({ type: "run", run: makeRun("run-2", "2025-06-02T00:00:00Z") }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.rawChunks).toEqual([{ data: payload }]);
+    });
+
+    it("skips stale finalization when replay fails before EOF so a completed step is not marked interrupted", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
+        }),
+        JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 4321 } }),
+      ];
+      const contents = `${lines.join("\n")}\n`;
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, contents, "utf-8");
+
+      // The first read delivers only the run and step lines; the next read fails,
+      // so replay stops before the step's completion update.
+      const cutBytes = Buffer.byteLength(`${lines[0]}\n${lines[1]}\n`, "utf-8");
+      const originalOpen = fs.open;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        const handle = await originalOpen(...args);
+        if (args[0] !== logPath) {
+          return handle;
+        }
+        const realRead = handle.read.bind(handle);
+        let reads = 0;
+        handle.read = ((buffer: Buffer, offset: number, length: number, position: number) => {
+          reads += 1;
+          if (reads > 1) {
+            throw new Error("simulated read failure");
+          }
+          return realRead(buffer, offset, Math.min(length, cutBytes), position);
+        }) as typeof handle.read;
+        return handle;
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        // Partial state is kept so the workspace stays usable...
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-1"]);
+        expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]?.durationMs).toBeNull();
+        // ...but nothing is written over a step that may have completed on disk.
+        const afterPartialLoad = await fs.readFile(logPath, "utf-8");
+        expect(afterPartialLoad).toBe(contents);
+        expect(afterPartialLoad).not.toContain("Interrupted (stale)");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // A healthy restart sees the original completion, not a fabricated interruption.
+      const healthyService = new DevToolsService(config);
+      const detail = await healthyService.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.error).toBeNull();
+    });
+
+    it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run: makeRun("run-persisted") })}\n`,
+        "utf-8"
+      );
+
+      const originalOpen = fs.open;
+      let logOpenCount = 0;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        if (args[0] === logPath) {
+          logOpenCount += 1;
+          throw new RangeError("Invalid string length");
+        }
+        return originalOpen(...args);
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:01Z"));
+        await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:00:02Z"));
+
+        expect(logOpenCount).toBe(1);
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+        expect(logOpenCount).toBe(1);
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // Appends kept working despite the failed load.
+      const logContents = await fs.readFile(logPath, "utf-8");
+      expect(logContents).toContain("run-persisted");
+      expect(logContents).toContain('"run-1"');
+      expect(logContents).toContain('"run-2"');
+    });
+
     it("clear truncates persisted file", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       await service.createRun("ws-1", makeRun("run-1"));
       await service.clear("ws-1");
 
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+    });
+
+    it("does not append an update for a step that was cleared", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      await service.createRun("ws-1", makeRun("run-1"));
+      await service.createStep(
+        "ws-1",
+        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+      );
+      await service.clear("ws-1");
+
+      // The request finalizes after the user cleared the log.
+      await service.updateStep("ws-1", "step-1", {
+        durationMs: 5,
+        rawChunks: [{ data: "x".repeat(10_000) }],
+      });
+
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+      expect(await service.getRuns("ws-1")).toEqual([]);
+    });
+
+    it("skips appends that were queued before clear()", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      // Hold the write queue on run-0's append so run-1's append is still
+      // queued (not executed) when clear() runs.
+      const originalAppendFile = fs.appendFile;
+      let releaseQueue: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+        await gate;
+        return originalAppendFile(...args);
+      });
+      let appendedJson: string[] = [];
+      try {
+        const run0 = service.createRun("ws-1", makeRun("run-0"));
+        const run1 = service.createRun("ws-1", makeRun("run-1"));
+        // getRuns resolves after both runs are in memory and their appends are queued.
+        expect((await service.getRuns("ws-1")).map((run) => run.id).sort()).toEqual([
+          "run-0",
+          "run-1",
+        ]);
+        const cleared = service.clear("ws-1");
+
+        releaseQueue();
+        await Promise.all([run0, run1, cleared]);
+        appendedJson = appendFileSpy.mock.calls.map((call) => String(call[1]));
+      } finally {
+        appendFileSpy.mockRestore();
+      }
+
+      // run-0's append was already executing; run-1's was still queued and must be dropped.
+      expect(appendedJson.some((json) => json.includes('"run-0"'))).toBe(true);
+      expect(appendedJson.some((json) => json.includes('"run-1"'))).toBe(false);
       expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
     });
   });

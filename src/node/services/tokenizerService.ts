@@ -11,6 +11,7 @@ import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessi
 import { log } from "./log";
 import type { AIService } from "./aiService";
 import type { ProviderService } from "./providerService";
+import { mergeTranscriptPartial, type HistoryService } from "./historyService";
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -38,24 +39,56 @@ export class TokenizerService {
   constructor(
     sessionUsageService: SessionUsageService,
     private readonly aiService: Pick<AIService, "getWorkspaceMetadata">,
-    private readonly providerService: Pick<ProviderService, "getConfig">
+    private readonly providerService: Pick<ProviderService, "getConfig">,
+    private readonly historyService: Pick<
+      HistoryService,
+      "getHistoryFromLatestBoundary" | "readPartial"
+    >
   ) {
     this.sessionUsageService = sessionUsageService;
   }
 
-  async calculateWorkspaceStats(input: {
-    workspaceId: string;
-    messages: MuxMessage[];
-    model: string;
-  }): Promise<ChatStats> {
-    const metadata = await this.aiService.getWorkspaceMetadata(input.workspaceId);
-    return this.calculateStats(
+  /**
+   * Compute stats for the workspace's active context from the backend's own copy of history.
+   *
+   * The renderer used to upload its full message list with every recalculation (tool-call-end,
+   * stream end, ...). During an active stream that was ~36 KB/s of redundant WebSocket traffic
+   * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
+   * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
+   * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
+   * from being replaced by a partial snapshot read just before the commit. The partial read is
+   * strict: a missing file is a normal "no in-flight turn" (null), and malformed JSON still
+   * self-heals to null inside readPartial, but an I/O or permission failure rejects like a
+   * history-read failure does, instead of silently persisting a cache that omits the turn.
+   *
+   * The calculation generation is claimed before any read so the latest-calculation guard
+   * orders overlapping requests by arrival: a request that read an older transcript but
+   * finished its reads later must not become "latest" and persist the older snapshot.
+   */
+  async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
+    const calcId = this.beginCalculation(input.workspaceId);
+    const [metadata, historyResult, partial] = await Promise.all([
+      this.aiService.getWorkspaceMetadata(input.workspaceId),
+      this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
+      this.historyService.readPartial(input.workspaceId, { throwOnError: true }),
+    ]);
+    if (!historyResult.success) {
+      throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
+    }
+    return this.calculateStatsForGeneration(
+      calcId,
       input.workspaceId,
-      input.messages,
+      mergeTranscriptPartial(historyResult.data, partial),
       input.model,
       this.providerService.getConfig(),
       metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null
     );
+  }
+
+  private beginCalculation(workspaceId: string): number {
+    const calcId = ++this.nextCalcId;
+    this.latestCalcIdByWorkspace.set(workspaceId, calcId);
+    return calcId;
   }
 
   /**
@@ -96,14 +129,30 @@ export class TokenizerService {
       typeof workspaceId === "string" && workspaceId.length > 0,
       "Tokenizer calculateStats requires workspaceId"
     );
+    return this.calculateStatsForGeneration(
+      this.beginCalculation(workspaceId),
+      workspaceId,
+      messages,
+      model,
+      providersConfig,
+      parentWorkspaceId
+    );
+  }
+
+  private async calculateStatsForGeneration(
+    calcId: number,
+    workspaceId: string,
+    messages: MuxMessage[],
+    model: string,
+    providersConfig: ProvidersConfigMap | null,
+    parentWorkspaceId: string | null
+  ): Promise<ChatStats> {
     assert(Array.isArray(messages), "Tokenizer calculateStats requires an array of messages");
     assert(
       typeof model === "string" && model.length > 0,
       "Tokenizer calculateStats requires model name"
     );
 
-    const calcId = ++this.nextCalcId;
-    this.latestCalcIdByWorkspace.set(workspaceId, calcId);
     const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
 
     const stats = await calculateTokenStats(

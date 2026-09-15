@@ -964,10 +964,34 @@ interface WorkspaceMetadataOptions {
    * mount would otherwise block the whole enumeration, and per-request
    * callers (workspace MCP override resolution) would pay one probe per
    * registered workspace on every request.
+   *
+   * CONTRACT: `false` results are memoized per config snapshot and the
+   * returned entries are shared between callers. Treat them as read-only;
+   * copy before mutating.
    */
   probeCheckouts?: boolean;
 
   archived?: "all" | "active" | "archived";
+}
+
+/**
+ * Memoized registry-only enumeration for one loaded config snapshot. The
+ * build's own alias collection is retained so later callers passing their
+ * own `legacyAliasIds` out-parameter still receive every alias.
+ */
+interface WorkspaceMetadataMemoEntry {
+  result: Promise<FrontendWorkspaceMetadata[]>;
+  legacyAliasIds: Set<string>;
+}
+
+/**
+ * Build-internal options: `degraded` is set when a lenient build swallowed a
+ * legacy metadata.json read/parse failure and substituted fallback identity
+ * for an entry. Such a build reflects a transient or repairable disk state,
+ * not the config snapshot, so the memo must not retain it.
+ */
+interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
+  degraded?: { value: boolean };
 }
 
 export class Config {
@@ -1372,6 +1396,22 @@ export class Config {
     writeId: string;
   };
   private workspaceIndexConfig?: ProjectsConfig;
+  /**
+   * Registry-only (probeCheckouts: false) enumerations keyed on the loaded
+   * ProjectsConfig snapshot, then on the filter/strictness options. Every
+   * caller of that variant (startup recovery, activity list scoping, MCP
+   * override resolution, ...) used to rebuild ~40 fields per registered
+   * workspace; with thousands of archived entries a heap walk found ten
+   * live copies of the same list. Snapshot identity is the natural change
+   * signal: loadConfigOrDefault hands out the same object until config.json's
+   * stat key changes, and saveConfig drops the snapshot, so both this
+   * process's edits and other backends' rewrites invalidate the memo. The
+   * WeakMap lets a superseded snapshot's memo die with it.
+   */
+  private readonly workspaceMetadataMemo = new WeakMap<
+    ProjectsConfig,
+    Map<string, WorkspaceMetadataMemoEntry>
+  >();
   private workspaceIndex = new Map<
     string,
     {
@@ -3302,7 +3342,53 @@ export class Config {
     options?: WorkspaceMetadataOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
-    return this.buildWorkspaceMetadata(config, config.projects, options);
+    // The probing variant mutates each entry (transcriptOnly) and does per-workspace I/O, so
+    // only the registry-only variant is memoized; see workspaceMetadataMemo.
+    if (options?.probeCheckouts !== false) {
+      return this.buildWorkspaceMetadata(config, config.projects, options);
+    }
+    // Strict and lenient builds differ in outcome only when a legacy entry is unreadable
+    // (strict throws, lenient degrades), so they must not serve each other's slot.
+    const memoKey = `${options.archived ?? "all"}:${options.throwOnError ? "strict" : "lenient"}`;
+    const memo =
+      this.workspaceMetadataMemo.get(config) ?? new Map<string, WorkspaceMetadataMemoEntry>();
+    this.workspaceMetadataMemo.set(config, memo);
+    let entry = memo.get(memoKey);
+    if (entry === undefined) {
+      // Memoize the in-flight promise: the startup burst issues several
+      // enumerations before the first one resolves.
+      const legacyAliasIds = new Set<string>();
+      const degraded = { value: false };
+      const result = this.buildWorkspaceMetadata(config, config.projects, {
+        ...options,
+        legacyAliasIds,
+        degraded,
+      });
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      entry = created;
+      memo.set(memoKey, created);
+      const forget = () => {
+        if (memo.get(memoKey) === created) memo.delete(memoKey);
+      };
+      result.then(() => {
+        // A degraded lenient build substituted fallback identity for a legacy entry whose
+        // metadata.json was unreadable or malformed, and it records no migration, so the
+        // snapshot identity would never change. Retaining it would hide the real stable id
+        // from registry-only callers until an unrelated write or restart even after the
+        // file is repaired. Callers already joined on the in-flight promise still share the
+        // one build; only the retention is skipped.
+        if (!degraded.value) return;
+        log.debug("Not memoizing degraded workspace metadata build", { memoKey });
+        forget();
+      }, forget);
+    }
+    const metadata = await entry.result;
+    if (options.legacyAliasIds !== undefined) {
+      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
+    }
+    // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
+    // caller's in-place filter/sort from leaking into another.
+    return metadata.slice();
   }
 
   async getWorkspaceMetadataById(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
@@ -3328,9 +3414,12 @@ export class Config {
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
-    options?: WorkspaceMetadataOptions
+    options?: WorkspaceMetadataBuildOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const probeCheckouts = options?.probeCheckouts ?? true;
+    const markDegraded = () => {
+      if (options?.degraded) options.degraded.value = true;
+    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -3545,6 +3634,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
+                  markDegraded();
                   continue;
                 }
                 throw readError;
@@ -3574,6 +3664,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
+              markDegraded();
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -3781,6 +3872,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
+          markDegraded();
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);

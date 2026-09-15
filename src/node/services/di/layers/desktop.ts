@@ -314,7 +314,7 @@ export const DesktopBridgeLive: Layer.Layer<
 export const TerminalEditorLive: Layer.Layer<
   TerminalEditorTags,
   never,
-  ConfigTag | SecretsStoreTag | Workspace | SessionUsage | AI | Provider
+  ConfigTag | SecretsStoreTag | Workspace | SessionUsage | AI | Provider | History
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -324,7 +324,12 @@ export const TerminalEditorLive: Layer.Layer<
     const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag);
     // Editor service for opening workspaces in code editors
     const editorService = new EditorService(config, yield* Workspace);
-    const tokenizerService = new TokenizerService(yield* SessionUsage, aiService, yield* Provider);
+    const tokenizerService = new TokenizerService(
+      yield* SessionUsage,
+      aiService,
+      yield* Provider,
+      yield* History
+    );
     const instructionsService = new InstructionsService(config, aiService, tokenizerService);
     return Context.empty().pipe(
       Context.add(PTY, ptyService),

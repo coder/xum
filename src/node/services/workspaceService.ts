@@ -21,6 +21,7 @@ import {
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
@@ -415,6 +416,23 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+
+/**
+ * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
+ * session registers ~20 listeners on the shared AIService, so an unbounded burst over every
+ * active workspace trips MaxListenersExceededWarning and pins N sessions' worth of heap
+ * during launch; recovery is best-effort background work with no latency requirement.
+ */
+export const STARTUP_RECOVERY_CONCURRENCY = 8;
+
+interface ActiveWorkflowRunIdsOptions {
+  /**
+   * Install the shared Set for an ARCHIVED workspace too. Only workflow status events need
+   * that (so later events accumulate without a disk scan); read paths leave dormant
+   * workspaces out of the cache. See resolveActiveWorkflowRunIds.
+   */
+  installDormant?: boolean;
+}
 
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
@@ -1887,6 +1905,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // Startup recovery may need a short-lived session even before the workspace is opened.
   // Promote only sessions that keep retry/stream activity alive after the initial check.
   private readonly transientStartupRecoverySessions = new Map<string, AgentSession>();
+  private readonly startupRecoverySemaphore = new AsyncSemaphore(STARTUP_RECOVERY_CONCURRENCY);
   private readonly sessionSubscriptions = new Map<
     string,
     { chat: () => void; metadata: () => void }
@@ -3757,8 +3776,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return activeRunIds;
   }
 
-  private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
-    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
+  private async getActiveWorkflowRunIds(
+    workspaceId: string,
+    options?: ActiveWorkflowRunIdsOptions
+  ): Promise<Set<string>> {
+    let activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
+    // Converge on the installed cache: a dormant (archived) read resolves a DETACHED empty
+    // Set, and a workflow event can install and populate the shared one in the microtask
+    // gap above. Returning the detached copy would let an authoritative list response that
+    // lands after the event clear the activity the event just delivered to the renderer.
+    // (Same applies to the pathological detached disk probe in resolve's fallback.)
+    const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+    if (installed != null && installed !== activeRunIds) {
+      activeRunIds = installed;
+    }
     if (
       activeRunIds.size > 0 &&
       // Installation re-check in THIS continuation: an eviction (removal, or
@@ -3775,7 +3806,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return activeRunIds;
   }
 
-  private async resolveActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
+  private async resolveActiveWorkflowRunIds(
+    workspaceId: string,
+    options?: ActiveWorkflowRunIdsOptions
+  ): Promise<Set<string>> {
     assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
     // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
     // lifted for re-registration) can race an in-flight bootstrap. A waiter
@@ -3801,10 +3835,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceId
       )?.workspace;
       // Archived stores are dormant until unarchive invalidates this cache. Live workflow
-      // events still update the shared Set without scanning archived session directories.
+      // events still update the shared Set without scanning archived session directories,
+      // so only the event path installs one: read paths (the activity list walks every
+      // config-known id) would otherwise fill this map with an empty Set per archived
+      // workspace, thousands on long-lived deployments, that nothing ever reads back.
+      // The detached result is provisional: getActiveWorkflowRunIds swaps in the shared
+      // Set if an event installed one before the caller's continuation ran.
       if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
         const activeRunIds = new Set<string>();
-        this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+        if (options?.installDormant === true) {
+          this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+        }
         return activeRunIds;
       }
 
@@ -3844,7 +3885,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // idle revived workspace emits fabricated zero-count entries forever.
     let detachedSize = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
+      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId, {
+        installDormant: true,
+      });
       if (isActiveWorkflowRunStatus(event.status)) {
         activeRunIds.add(event.runId);
       } else {
@@ -4463,21 +4506,81 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    // Still fire-and-forget through the cleanup tracker (shutdown awaits it); the permit only
+    // bounds how many transient sessions exist at once (see STARTUP_RECOVERY_CONCURRENCY).
     this.deferWorkspaceCleanup(async () => {
+      const slot = await this.startupRecoverySemaphore.acquire();
+      // Disposal of a non-promoted session, when withStartupSession queued one.
+      let disposal: Promise<void> | undefined;
       try {
-        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(metadata));
+        // Waited-for recoveries would otherwise each throw from createSession after
+        // beginShutdown() has already swept the transient registry.
+        if (this.shuttingDown) return;
+        // The permit wait is a window in which the user can archive or remove this workspace.
+        // Archive disposes only sessions that already exist, and the session's own archived
+        // guard covers just the auto-retry step and treats a removed entry as live, so an
+        // interrupted turn could otherwise resume in a workspace the user just put away.
+        // Re-read the registry (memoized per config snapshot, so this is one build per edit)
+        // and hand recovery the current metadata rather than the scheduling-time copy.
+        let current = metadata;
+        let registry: FrontendWorkspaceMetadata[] | undefined;
+        try {
+          registry = await this.config.getAllWorkspaceMetadata({
+            throwOnError: true,
+            probeCheckouts: false,
+          });
+        } catch (error) {
+          // Unreadable config must not silently cancel every queued chat's recovery; fall back
+          // to the scheduling-time snapshot and let the session's dispatch-time guards decide.
+          log.debug("Startup recovery revalidation failed; using scheduling-time metadata", {
+            workspaceId: trimmed,
+            error: getErrorMessage(error),
+          });
+        }
+        if (registry !== undefined) {
+          current = registry.find((entry) => entry.id === trimmed);
+          if (
+            current === undefined ||
+            isWorkspaceArchived(current.archivedAt, current.unarchivedAt)
+          ) {
+            log.debug("Skipping startup recovery: workspace archived or removed while queued", {
+              workspaceId: trimmed,
+            });
+            return;
+          }
+        }
+        await this.withStartupSession(
+          trimmed,
+          (session) => session.runStartupRecovery(current),
+          (settled) => {
+            disposal = settled;
+          }
+        );
       } catch (error) {
         log.warn("Failed to run startup recovery for workspace", {
           workspaceId: trimmed,
           error: getErrorMessage(error),
         });
+      } finally {
+        // AgentSession.dispose detaches its AIService listeners only after its awaited cleanup
+        // settles, so releasing on recovery completion would let the next admitted session
+        // overlap with an undisposed one and stack past the cap. A promoted session is live by
+        // design and queues no disposal, so its slot frees immediately. The tracked promise
+        // never rejects (trackWorkspaceCleanup logs failures).
+        if (disposal !== undefined) await disposal;
+        slot.release();
       }
     });
   }
 
+  /**
+   * `onDisposal` receives the tracked disposal promise when the session is NOT promoted, so a
+   * caller that budgets live sessions can wait for teardown without owning the session.
+   */
   private async withStartupSession<T>(
     workspaceId: string,
-    run: (session: AgentSession) => Promise<T>
+    run: (session: AgentSession) => Promise<T>,
+    onDisposal?: (settled: Promise<void>) => void
   ): Promise<T> {
     workspaceId = workspaceId.trim();
     assert(workspaceId.length > 0, "workspaceId must not be empty");
@@ -4501,7 +4604,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // physical read cannot block startup or make a later caller adopt a closing session.
       if (this.transientStartupRecoverySessions.get(workspaceId) === session) {
         this.transientStartupRecoverySessions.delete(workspaceId);
-        this.deferWorkspaceCleanup(() => session.dispose());
+        const settled = this.trackWorkspaceCleanup(() => session.dispose());
+        onDisposal?.(settled);
       }
     }
   }
@@ -14916,6 +15020,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               activityById[workspaceId] = merged;
             }
           }
+        }
+      }
+      // LAST step, no awaits below: converge every scoped row on the live workflow-run cache.
+      // Rows were built from a per-id copy of the Set inside Promise.all, and the archived
+      // read path resolves a DETACHED empty Set (installing one per idle archived workspace
+      // is the memory cost this list avoids). A workflow event landing during the awaits
+      // above installs or mutates the shared Set after that copy was taken, and an
+      // authoritative response built from the copy would clear the run the event just
+      // delivered to the renderer. Removed ids cannot re-enter: eviction deletes their
+      // cache entry and the local tombstone is re-checked.
+      for (const workspaceId of new Set([...workspaceIds, ...Object.keys(activityById)])) {
+        const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+        if (installed == null) continue;
+        const row = activityById[workspaceId];
+        if (row != null) {
+          activityById[workspaceId] = mergeActiveWorkflowRuns(row, installed);
+          continue;
+        }
+        if (
+          installed.size === 0 ||
+          !workspaceIds.has(workspaceId) ||
+          this.extensionMetadata.isWorkspaceDeleted(workspaceId)
+        ) {
+          continue;
+        }
+        const merged = this.mergeCurrentActiveBashMonitorCount(
+          workspaceId,
+          mergeActiveWorkflowRuns(
+            this.overlayPendingGoal(workspaceId, snapshots.get(workspaceId) ?? null),
+            installed
+          )
+        );
+        if (merged != null) {
+          activityById[workspaceId] = merged;
         }
       }
       return activityById;

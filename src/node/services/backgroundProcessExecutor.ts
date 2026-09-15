@@ -34,6 +34,7 @@ import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
@@ -286,7 +287,15 @@ export async function spawnProcess(
     }
 
     log.debug(`BackgroundProcessExecutor.spawnProcess: Spawned with PID ${pid}`);
-    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath);
+    // Monitors poll this handle every 100ms on local runtimes. A shell probe there forks the
+    // (multi-GB) main process for each wc/tail/cat, which profiled as the main thread spending
+    // over half its time inside fork(); host-local records are plain files, so read them
+    // with fs and keep the local poll path spawn-free. Remote/devcontainer records are only
+    // reachable through runtime.exec.
+    const probe: SpawnRecordProbe = spawnRecordsAreHostLocal(runtime)
+      ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath)
+      : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath);
+    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath, probe);
     return { success: true, handle, pid, outputDir };
   } catch (error) {
     const errorMessage = errorMsg(error);
@@ -311,40 +320,110 @@ export async function spawnProcess(
 }
 
 /**
- * Unified handle to a background process.
- * Uses runtime.exec for all operations, working identically for local and SSH.
- *
- * Output files (output.log, exit_code) are on the runtime's filesystem.
- * This handle provides lifecycle management via execBuffered commands.
+ * Strict reads of a spawn record's output.log and exit_code files, polled on every monitor
+ * tick. Every method throws on a missing/unreadable output file or an unreadable (including
+ * dangling-symlink) exit marker so the monitor's failure policy can retire the monitor
+ * instead of misreading the miss as "empty output" or "still running".
  */
-class RuntimeBackgroundHandle implements BackgroundHandle {
-  private terminated = false;
+interface SpawnRecordProbe {
+  /** Byte size of output.log. */
+  outputFileSize(): Promise<number>;
+  /** output.log contents from `offset` to (at least) `fileSize`, plus the offset read up to. */
+  readOutputFrom(offset: number, fileSize: number): Promise<{ content: string; newOffset: number }>;
+  /** Raw exit marker contents; "" when the marker does not exist yet (process still running). */
+  readExitCodeMarker(): Promise<string>;
+}
 
+/** Host-local records: plain Node fs calls, no child process per tick. */
+class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
+  constructor(
+    private readonly outputPath: string,
+    private readonly exitCodePath: string
+  ) {}
+
+  async outputFileSize(): Promise<number> {
+    return (await fs.stat(this.outputPath)).size;
+  }
+
+  async readOutputFrom(
+    offset: number,
+    fileSize: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const fd = await fs.open(this.outputPath, "r");
+    try {
+      const buffer = Buffer.alloc(fileSize - offset);
+      const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
+      return {
+        content: buffer.subarray(0, bytesRead).toString("utf-8"),
+        newOffset: offset + bytesRead,
+      };
+    } finally {
+      await fd.close();
+    }
+  }
+
+  async readExitCodeMarker(): Promise<string> {
+    // lstat does not follow symlinks: only a truly absent path means "still running". A
+    // dangling-symlink marker passes lstat and then fails readFile (which follows the link),
+    // surfacing as a probe failure exactly like the shell probe's `[ ! -L ]` guard.
+    try {
+      await fs.lstat(this.exitCodePath);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return "";
+      throw error;
+    }
+    return fs.readFile(this.exitCodePath, "utf-8");
+  }
+}
+
+/** Remote/container records: reachable only through runtime.exec shell commands. */
+class ShellSpawnRecordProbe implements SpawnRecordProbe {
   constructor(
     private readonly runtime: Runtime,
-    private readonly pid: number,
-    public readonly outputDir: string,
+    private readonly outputPath: string,
+    private readonly exitCodePath: string,
     private readonly quotePath: (p: string) => string
   ) {}
 
-  private assertMonitorProbeSucceeded(operation: string, exitCode: number): void {
+  private assertProbeSucceeded(operation: string, exitCode: number): void {
     if (exitCode !== 0) {
       throw new Error(`${operation} exited with code ${exitCode}`);
     }
   }
 
-  private async probeForMonitor<T>(
-    probe: () => Promise<T>
-  ): Promise<BackgroundMonitorProbeResult<T>> {
-    try {
-      return { success: true, value: await probe() };
-    } catch (error) {
-      return { success: false, error: errorMsg(error) };
-    }
+  async outputFileSize(): Promise<number> {
+    const filePath = this.quotePath(this.outputPath);
+    // No || fallback: a deleted or unreadable output file must fail the strict probe so the
+    // monitor's failure policy can retire it instead of parsing the miss as an empty file.
+    const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    this.assertProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
+    return parseInt(sizeResult.stdout.trim(), 10) || 0;
   }
 
-  private async getExitCodeStrict(): Promise<number | null> {
-    const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
+  async readOutputFrom(
+    offset: number,
+    _fileSize: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const filePath = this.quotePath(this.outputPath);
+    // Read from offset to end of file using tail -c (faster than dd bs=1)
+    // tail -c +N means "start at byte N" (1-indexed)
+    const readResult = await execBuffered(
+      this.runtime,
+      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
+      { cwd: FALLBACK_CWD, timeout: 30 }
+    );
+    this.assertProbeSucceeded("readOutput tail probe", readResult.exitCode);
+    return {
+      content: readResult.stdout,
+      newOffset: offset + Buffer.byteLength(readResult.stdout),
+    };
+  }
+
+  async readExitCodeMarker(): Promise<string> {
+    const exitCodePath = this.quotePath(this.exitCodePath);
     // Absent marker means still running (exit 0, empty). File operators other than -h/-L
     // follow symlinks, so a dangling-symlink marker reads as absent to -e; require -L to
     // also fail before declaring absence, letting cat surface the dangling link (like any
@@ -357,11 +436,45 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         timeout: 10,
       }
     );
-    this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
-    const parsed = parseExitCode(result.stdout);
+    this.assertProbeSucceeded("getExitCode", result.exitCode);
+    return result.stdout;
+  }
+}
+
+/**
+ * Unified handle to a background process.
+ * Lifecycle operations (terminate, writeMeta) go through runtime.exec for every runtime;
+ * per-tick record reads go through the SpawnRecordProbe selected at spawn time.
+ *
+ * Output files (output.log, exit_code) are on the runtime's filesystem.
+ */
+class RuntimeBackgroundHandle implements BackgroundHandle {
+  private terminated = false;
+
+  constructor(
+    private readonly runtime: Runtime,
+    private readonly pid: number,
+    public readonly outputDir: string,
+    private readonly quotePath: (p: string) => string,
+    private readonly probe: SpawnRecordProbe
+  ) {}
+
+  private async probeForMonitor<T>(
+    probe: () => Promise<T>
+  ): Promise<BackgroundMonitorProbeResult<T>> {
+    try {
+      return { success: true, value: await probe() };
+    } catch (error) {
+      return { success: false, error: errorMsg(error) };
+    }
+  }
+
+  private async getExitCodeStrict(): Promise<number | null> {
+    const marker = await this.probe.readExitCodeMarker();
+    const parsed = parseExitCode(marker);
     // A nonempty marker that fails to parse is a corrupted write, not a still-running process.
-    if (parsed == null && result.stdout.trim().length > 0) {
-      throw new Error(`getExitCode marker is not a number: ${result.stdout.trim().slice(0, 32)}`);
+    if (parsed == null && marker.trim().length > 0) {
+      throw new Error(`getExitCode marker is not a number: ${marker.trim().slice(0, 32)}`);
     }
     return parsed;
   }
@@ -435,21 +548,9 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
-  private async readOutputFileSize(): Promise<number> {
-    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-    // No || fallback: a deleted or unreadable output file must fail the strict probe so the
-    // monitor's failure policy can retire it instead of parsing the miss as an empty file.
-    const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
-      cwd: FALLBACK_CWD,
-      timeout: 10,
-    });
-    this.assertMonitorProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
-    return parseInt(sizeResult.stdout.trim(), 10) || 0;
-  }
-
   async getOutputFileSize(): Promise<number> {
     try {
-      return await this.readOutputFileSize();
+      return await this.probe.outputFileSize();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getOutputFileSize: Error: ${errorMsg(error)}`);
       return 0;
@@ -457,31 +558,17 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   }
 
   private async readOutputStrict(offset: number): Promise<{ content: string; newOffset: number }> {
-    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-    const fileSize = await this.readOutputFileSize();
+    const fileSize = await this.probe.outputFileSize();
 
     if (offset >= fileSize) {
       return { content: "", newOffset: offset };
     }
 
-    // Read from offset to end of file using tail -c (faster than dd bs=1)
-    // tail -c +N means "start at byte N" (1-indexed)
-    const readResult = await execBuffered(
-      this.runtime,
-      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
-      { cwd: FALLBACK_CWD, timeout: 30 }
-    );
-    this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
-
-    return {
-      content: readResult.stdout,
-      newOffset: offset + Buffer.byteLength(readResult.stdout),
-    };
+    return this.probe.readOutputFrom(offset, fileSize);
   }
 
   /**
    * Read output from output.log at the given byte offset.
-   * Uses tail -c to read from offset - works on both Linux and macOS.
    */
   async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
     try {

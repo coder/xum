@@ -1,7 +1,9 @@
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
+import { StringDecoder } from "string_decoder";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type {
   DevToolsEvent,
   DevToolsLogEntry,
@@ -14,16 +16,191 @@ import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
+/**
+ * Retention policy for in-memory DevTools state.
+ *
+ * devtools.jsonl is append-only and grows without bound: a live server was
+ * observed with 58 files totalling 6.8 GB (largest 1.18 GB) and ~4 GB of live
+ * heap made of replayed runs/steps, because every workspace file was read whole
+ * and every run ever logged was kept. Files past V8's max string length also
+ * made the whole-file read throw, and the failed load was retried on every
+ * subsequent createRun/createStep.
+ *
+ * Policy: only the newest MAX_RETAINED_RUNS_PER_WORKSPACE runs (with their
+ * steps) are kept per workspace, evicting the oldest by append order as new runs
+ * arrive. Load replays the whole file forward, streamed in LOAD_CHUNK_BYTES
+ * reads so it is never materialized in memory, applying every line through the
+ * same retention as the live path; peak memory is the retention budget plus one
+ * line regardless of file size. Replaying from byte 0 (rather than a byte-offset
+ * tail cut) is deliberate: lines depend on earlier lines (a step needs its run
+ * header, an update needs its step), so any cut point loses or corrupts the
+ * newest run in some layout. Steps whose run was already evicted are dropped.
+ * The DevTools panel therefore shows a bounded recent window rather than the
+ * full history; the on-disk file is left untouched (compaction is a follow-up).
+ *
+ * The run bound alone does not cap memory: a single streamed step carries the
+ * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
+ * events in `rawChunks`/`rawResponse` plus multi-MB `rawRequest` strings), so
+ * 100 such runs are still hundreds of MB. Retained runs are therefore also
+ * capped at MAX_RETAINED_BYTES_PER_WORKSPACE, measured as the length of the
+ * JSON lines appended to devtools.jsonl (already serialized for the write) and
+ * attributed to the owning run. The run being written is never evicted, even
+ * when it alone exceeds the budget.
+ */
+export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
+const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
+/** FIFO cap on remembered evicted run ids; see WorkspaceData.evictedRunIds. */
+const MAX_TRACKED_EVICTED_RUNS = 4 * MAX_RETAINED_RUNS_PER_WORKSPACE;
+const LOAD_CHUNK_BYTES = 1024 * 1024;
+
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
   steps: Map<string, DevToolsStep>;
+  /** Approximate JSON bytes retained per run: the run entry plus its current steps. */
+  runBytes: Map<string, number>;
+  /** Approximate JSON bytes of each retained step, so an update replaces rather than adds. */
+  stepBytes: Map<string, number>;
+  retainedBytes: number;
   loaded: boolean;
-  /** Incremented on each clear() for defense-in-depth against stale state. */
+  /**
+   * In-flight steps dropped from memory by live retention since the last
+   * clear(). A late updateStep for one of these must still reach disk (eviction
+   * is memory-only), while an update for a cleared or unknown step must not
+   * re-populate the truncated log with an orphan line. Bounded by the number of
+   * evicted steps that have not finished yet: finalized steps are never added
+   * (they receive no further updates), an id is removed once its completing
+   * update lands, and the set is reset after replay and on clear().
+   */
+  evictedStepIds: Set<string>;
+  /**
+   * Runs dropped from memory by live retention since the last clear(), oldest
+   * first. A still-active run whose id is here must not be resurrected by
+   * createStep's self-heal: its real header (startedAt, toolPolicy,
+   * requestHistorySequence) is still on disk and replay restores it, whereas a
+   * healed stand-in would carry the new step's timestamp and no metadata. Capped
+   * at MAX_TRACKED_EVICTED_RUNS by dropping the oldest id; a run that ages out
+   * and then logs another step falls back to the self-heal, which is accepted.
+   * Reset after replay and on clear(), like evictedStepIds.
+   */
+  evictedRunIds: Set<string>;
+  /**
+   * Whether the on-disk log was replayed to EOF (or did not exist). After a
+   * failed partial replay, memory is a prefix of the file, so a step that looks
+   * in progress may have completed on disk; stale finalization must not write
+   * an "Interrupted (stale)" line over it.
+   */
+  replayComplete: boolean;
+  /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
+}
+
+export interface DevToolsServiceOptions {
+  maxRetainedBytesPerWorkspace?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Yield every line of a file in order, streamed in LOAD_CHUNK_BYTES reads with
+ * an await between chunks, so memory holds one chunk plus one pending line and
+ * the event loop is never blocked for the whole file.
+ */
+async function* readLines(filePath: string): AsyncGenerator<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
+    const decoder = new StringDecoder("utf-8");
+    let pending = "";
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        break;
+      }
+      position += bytesRead;
+      pending += decoder.write(chunk.subarray(0, bytesRead));
+
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      yield* lines;
+    }
+
+    pending += decoder.end();
+    if (pending.length > 0) {
+      yield pending;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function jsonLength(value: unknown): number {
+  const json = JSON.stringify(value);
+  return json === undefined ? 0 : json.length;
+}
+
+/**
+ * Bytes of `existing` that `update` overwrites. Subtracting them keeps a step
+ * that is re-sent (or finalized) from being counted once per update; the values
+ * replaced are normally `null` placeholders, so this is cheap even for large
+ * payloads.
+ */
+function replacedStepBytes(existing: DevToolsStep, update: Partial<DevToolsStep>): number {
+  let bytes = 0;
+  for (const key of Object.keys(update) as Array<keyof DevToolsStep>) {
+    bytes += jsonLength(existing[key]);
+  }
+  return bytes;
+}
+
+function isStepInFlight(step: Pick<DevToolsStep, "durationMs" | "error">): boolean {
+  return step.durationMs == null && step.error == null;
+}
+
+/** Whether applying `update` finishes a step (it will not be updated again). */
+function completesStep(update: Partial<DevToolsStep>): boolean {
+  return update.durationMs != null || update.error != null;
+}
+
+/** Drop a run, its steps, and their byte accounting. Returns the removed steps. */
+function removeRun(data: WorkspaceData, runId: string): DevToolsStep[] {
+  data.runs.delete(runId);
+  const removedSteps: DevToolsStep[] = [];
+  for (const [stepId, step] of data.steps) {
+    if (step.runId === runId) {
+      data.steps.delete(stepId);
+      data.stepBytes.delete(stepId);
+      removedSteps.push(step);
+    }
+  }
+  data.retainedBytes -= data.runBytes.get(runId) ?? 0;
+  data.runBytes.delete(runId);
+  return removedSteps;
+}
+
+function evictRun(data: WorkspaceData, runId: string): void {
+  for (const step of removeRun(data, runId)) {
+    if (isStepInFlight(step)) {
+      data.evictedStepIds.add(step.id);
+    }
+  }
+  data.evictedRunIds.add(runId);
+  if (data.evictedRunIds.size > MAX_TRACKED_EVICTED_RUNS) {
+    const oldest = data.evictedRunIds.keys().next().value;
+    if (oldest !== undefined) {
+      data.evictedRunIds.delete(oldest);
+    }
+  }
+}
+
+function removeStep(data: WorkspaceData, step: DevToolsStep): void {
+  data.steps.delete(step.id);
+  const bytes = data.stepBytes.get(step.id) ?? 0;
+  data.stepBytes.delete(step.id);
+  data.runBytes.set(step.runId, (data.runBytes.get(step.runId) ?? 0) - bytes);
+  data.retainedBytes -= bytes;
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
@@ -98,9 +275,15 @@ export class DevToolsService extends EventEmitter {
    * one pending metadata payload per request instead of a single workspace slot.
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
+  private readonly maxRetainedBytesPerWorkspace: number;
 
-  constructor(private readonly config: Config) {
+  constructor(
+    private readonly config: Config,
+    options?: DevToolsServiceOptions
+  ) {
     super();
+    this.maxRetainedBytesPerWorkspace =
+      options?.maxRetainedBytesPerWorkspace ?? MAX_RETAINED_BYTES_PER_WORKSPACE;
   }
 
   get enabled(): boolean {
@@ -200,11 +383,16 @@ export class DevToolsService extends EventEmitter {
       }
     }
 
-    data.runs.set(run.id, run);
-    await this.appendToFile(workspaceId, { type: "run", run });
+    const entry: DevToolsLogEntry = { type: "run", run };
+    const json = JSON.stringify(entry);
+    this.emitEvicted(workspaceId, this.insertRun(data, run, json.length));
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.runs.get(run.id) === run) {
+        removeRun(data, run.id);
+      }
+    });
 
-    const summary = this.buildRunSummary(data, run.id);
-    this.emitWorkspaceEvent(workspaceId, { type: "run-created", run: summary });
+    this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
 
   async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
@@ -218,30 +406,73 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
-    // Self-healing: if the run was cleared during an active stream,
-    // recreate it so steps aren't orphaned.
+    const entry: DevToolsLogEntry = { type: "step", step };
+    const json = JSON.stringify(entry);
+
+    if (!data.runs.has(step.runId) && data.evictedRunIds.has(step.runId)) {
+      // Eviction is memory-only and disk is authoritative: an evicted run that
+      // is still streaming keeps logging to disk, where replay reassembles it
+      // under its original header, but it is not brought back into memory and
+      // nothing is announced. Its later updates land via evictedStepIds, but
+      // only if no clear() happened while the append was queued: clear()
+      // empties that set and truncates the log, and re-adding the id here
+      // would let the step's finalization write an orphan update into it.
+      const clearGeneration = data.clearGeneration;
+      await this.appendToFile(workspaceId, json);
+      if (
+        isStepInFlight(step) &&
+        this.workspaces.get(workspaceId) === data &&
+        data.clearGeneration === clearGeneration
+      ) {
+        data.evictedStepIds.add(step.id);
+      }
+      return;
+    }
+
+    // Self-healing: if the run was cleared during an active stream (or its
+    // eviction aged out of evictedRunIds), recreate it so steps aren't
+    // orphaned. Should the original header still be on disk, replay keeps that
+    // first line and ignores this duplicate.
+    //
+    // The healed run and the step enter memory in the same synchronous section
+    // before either append is awaited: an await in between let a concurrent
+    // write evict the healed run, after which setStep retained a step (and its
+    // bytes) under a run no longer in data.runs, where evictRun never reclaims it.
+    let healedRun: DevToolsRun | undefined;
+    const appends: Array<Promise<void>> = [];
     if (!data.runs.has(step.runId)) {
-      const autoRun: DevToolsRun = {
+      healedRun = {
         id: step.runId,
         workspaceId,
         startedAt: step.startedAt,
       };
-      data.runs.set(autoRun.id, autoRun);
-      await this.appendToFile(workspaceId, { type: "run", run: autoRun });
-      this.emitWorkspaceEvent(workspaceId, {
-        type: "run-created",
-        run: this.buildRunSummary(data, autoRun.id),
-      });
+      const runEntry: DevToolsLogEntry = { type: "run", run: healedRun };
+      const runJson = JSON.stringify(runEntry);
+      this.emitEvicted(workspaceId, this.insertRun(data, healedRun, runJson.length));
+      appends.push(this.appendToFile(workspaceId, runJson));
     }
 
-    data.steps.set(step.id, step);
-    await this.appendToFile(workspaceId, { type: "step", step });
+    this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
+    appends.push(this.appendToFile(workspaceId, json));
 
-    this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
-    if (data.runs.has(step.runId)) {
-      const summary = this.buildRunSummary(data, step.runId);
-      this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
+    // Publish only after both lines are durable: if an append rejects (disk
+    // full), the caller sees the error and subscribers never learn of a run
+    // whose step could never finalize. Both appends are queued before either
+    // is awaited so a rejected run line does not leave the step line unqueued.
+    await this.persistOrRollback(appends, () => {
+      if (data.steps.get(step.id) === step) {
+        removeStep(data, step);
+      }
+      if (healedRun !== undefined && data.runs.get(healedRun.id) === healedRun) {
+        removeRun(data, healedRun.id);
+      }
+    });
+
+    if (healedRun !== undefined) {
+      this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
     }
+    this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", step.runId);
   }
 
   async updateStep(
@@ -255,11 +486,33 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
+    const entry: DevToolsLogEntry = { type: "step-update", stepId, update };
+    const json = JSON.stringify(entry);
+
     const existing = data.steps.get(stepId);
     if (!existing) {
-      log.warn(
-        `DevToolsService.updateStep skipped missing step ${stepId} in workspace ${workspaceId}`
-      );
+      if (!data.evictedStepIds.has(stepId)) {
+        // Cleared (the log was truncated) or never seen: appending would leave
+        // an orphan update, possibly MBs of raw payload, that replay cannot show.
+        log.debug("DevToolsService.updateStep skipping update for cleared or unknown step", {
+          workspaceId,
+          stepId,
+        });
+        return;
+      }
+      // Disk is authoritative and retention eviction is memory-only: when an
+      // overlapping request's step is evicted while still in flight, its final
+      // duration/output/usage must still reach devtools.jsonl. Memory, byte
+      // accounting, and events stay untouched because nothing retains the step.
+      log.debug("DevToolsService.updateStep persisting update for evicted step", {
+        workspaceId,
+        stepId,
+      });
+      await this.appendToFile(workspaceId, json);
+      // Safe unguarded: after a clear() during the await the set is already empty.
+      if (completesStep(update)) {
+        data.evictedStepIds.delete(stepId);
+      }
       return;
     }
 
@@ -267,23 +520,20 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
-    data.steps.set(stepId, mergedStep);
+    const previousBytes = data.stepBytes.get(stepId) ?? 0;
+    this.emitEvicted(
+      workspaceId,
+      this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length))
+    );
 
-    await this.appendToFile(workspaceId, {
-      type: "step-update",
-      stepId,
-      update,
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.steps.get(stepId) === mergedStep) {
+        this.setStep(data, existing, previousBytes);
+      }
     });
 
-    this.emitWorkspaceEvent(workspaceId, {
-      type: "step-updated",
-      step: mergedStep,
-    });
-
-    if (data.runs.has(mergedStep.runId)) {
-      const summary = this.buildRunSummary(data, mergedStep.runId);
-      this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
-    }
+    this.emitStepEventIfRetained(workspaceId, data, "step-updated", stepId);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", mergedStep.runId);
   }
 
   async finalizeStaleSteps(workspaceId: string): Promise<void> {
@@ -357,8 +607,14 @@ export class DevToolsService extends EventEmitter {
     const data = this.getOrCreateWorkspaceData(workspaceId);
     data.runs.clear();
     data.steps.clear();
+    data.runBytes.clear();
+    data.stepBytes.clear();
+    data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
+    data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
+    data.replayComplete = true;
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
@@ -394,7 +650,7 @@ export class DevToolsService extends EventEmitter {
     }
 
     // Deleting the entry (rather than clearing it in place) makes stale queued
-    // appends no-ops via the existence guard in appendToFile.
+    // appends no-ops via the workspace guard in appendToFile.
     this.workspaces.delete(workspaceId);
     this.pendingRunMetadata.delete(workspaceId);
 
@@ -408,6 +664,73 @@ export class DevToolsService extends EventEmitter {
 
   private emitWorkspaceEvent(workspaceId: string, event: DevToolsEvent): void {
     this.emit(`update:${workspaceId}`, event);
+  }
+
+  /**
+   * Memory is mutated before the disk append (so a concurrent write cannot
+   * slip between them), which means a rejected append (disk full) would leave
+   * an unpersisted run or step visible until restart. Wait for every append to
+   * settle, and if any failed run the caller's rollback for the entity it was
+   * writing, then rethrow the first failure. Runs that retention evicted to
+   * make room are not restored: they are on disk, which is authoritative, and
+   * come back on the next load. The rollback must check the entity is still
+   * the one it inserted, since eviction or clear() may have removed it already.
+   */
+  private async persistOrRollback(
+    appends: Array<Promise<void>>,
+    rollback: () => void
+  ): Promise<void> {
+    const results = await Promise.allSettled(appends);
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (failure) {
+      rollback();
+      throw failure.reason;
+    }
+  }
+
+  /**
+   * Every event that follows an await must go through these guards: while the
+   * disk append was queued the run or step may have been evicted, cleared, or
+   * its workspace removed, and each of those already told subscribers to drop
+   * it (runs-evicted / cleared). Announcing it afterwards would resurrect it
+   * in the renderer, possibly with its raw payload, under a run that no
+   * longer exists. The payload is read from memory at emit time so it is
+   * exactly what readers see.
+   */
+  private emitRunEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "run-created" | "run-updated",
+    runId: string
+  ): void {
+    if (this.workspaces.get(workspaceId) === data && data.runs.has(runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, run: this.buildRunSummary(data, runId) });
+    }
+  }
+
+  private emitStepEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "step-created" | "step-updated",
+    stepId: string
+  ): void {
+    const step = this.workspaces.get(workspaceId) === data ? data.steps.get(stepId) : undefined;
+    if (step && data.runs.has(step.runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, step });
+    }
+  }
+
+  /**
+   * Tell live subscribers which runs retention just dropped, so the renderer
+   * releases them too instead of showing a run whose steps are gone. Replay
+   * evictions are not announced: the snapshot already reflects them.
+   */
+  private emitEvicted(workspaceId: string, runIds: string[]): void {
+    if (runIds.length > 0) {
+      this.emitWorkspaceEvent(workspaceId, { type: "runs-evicted", runIds });
+    }
   }
 
   /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
@@ -440,11 +763,79 @@ export class DevToolsService extends EventEmitter {
     data = {
       runs: new Map<string, DevToolsRun>(),
       steps: new Map<string, DevToolsStep>(),
+      runBytes: new Map<string, number>(),
+      stepBytes: new Map<string, number>(),
+      retainedBytes: 0,
       loaded: false,
+      evictedStepIds: new Set<string>(),
+      evictedRunIds: new Set<string>(),
+      replayComplete: false,
       clearGeneration: 0,
     };
     this.workspaces.set(workspaceId, data);
     return data;
+  }
+
+  /** Returns the run ids retention evicted to make room. */
+  private insertRun(data: WorkspaceData, run: DevToolsRun, bytes: number): string[] {
+    data.runs.set(run.id, run);
+    this.addRunBytes(data, run.id, bytes);
+    return this.enforceRetention(data, run.id);
+  }
+
+  /** Returns the run ids retention evicted to make room. */
+  private setStep(data: WorkspaceData, step: DevToolsStep, bytes: number): string[] {
+    const previousBytes = data.stepBytes.get(step.id) ?? 0;
+    data.steps.set(step.id, step);
+    data.stepBytes.set(step.id, bytes);
+    this.addRunBytes(data, step.runId, bytes - previousBytes);
+    return this.enforceRetention(data, step.runId);
+  }
+
+  /** Size of `existing` after applying `update`, given the update's serialized length. */
+  private updatedStepBytes(
+    data: WorkspaceData,
+    existing: DevToolsStep,
+    update: Partial<DevToolsStep>,
+    updateJsonBytes: number
+  ): number {
+    const previousBytes = data.stepBytes.get(existing.id) ?? 0;
+    return Math.max(0, previousBytes + updateJsonBytes - replacedStepBytes(existing, update));
+  }
+
+  private addRunBytes(data: WorkspaceData, runId: string, delta: number): void {
+    data.runBytes.set(runId, (data.runBytes.get(runId) ?? 0) + delta);
+    data.retainedBytes += delta;
+  }
+
+  /**
+   * Drop the oldest runs (by append order) and their steps until both the run
+   * and byte bounds hold. `writingRunId` is the run the caller just inserted or
+   * grew; it is never evicted, so a single oversized run stays visible. It is
+   * skipped rather than treated as a stop: an old in-flight run that grows
+   * late must still push out the newer runs behind it. Returns the evicted
+   * run ids in eviction order.
+   */
+  private enforceRetention(data: WorkspaceData, writingRunId: string): string[] {
+    const evictedRunIds: string[] = [];
+    while (
+      data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE ||
+      data.retainedBytes > this.maxRetainedBytesPerWorkspace
+    ) {
+      let oldestEvictableRunId: string | undefined;
+      for (const runId of data.runs.keys()) {
+        if (runId !== writingRunId) {
+          oldestEvictableRunId = runId;
+          break;
+        }
+      }
+      if (oldestEvictableRunId === undefined) {
+        break;
+      }
+      evictRun(data, oldestEvictableRunId);
+      evictedRunIds.push(oldestEvictableRunId);
+    }
+    return evictedRunIds;
   }
 
   private async ensureLoaded(workspaceId: string): Promise<void> {
@@ -475,61 +866,82 @@ export class DevToolsService extends EventEmitter {
 
   private async loadFromDisk(workspaceId: string, data: WorkspaceData): Promise<void> {
     const filePath = this.getSessionFilePath(workspaceId);
-    let raw = "";
 
     try {
-      raw = await fs.readFile(filePath, "utf-8");
+      for await (const line of readLines(filePath)) {
+        this.replayLogLine(workspaceId, data, line);
+      }
+      data.replayComplete = true;
     } catch (error) {
+      // Any failure still marks the workspace loaded with whatever partial state
+      // was replayed. Leaving `loaded` false made every later createRun/createStep
+      // re-run the failing load against a multi-hundred-MB file.
       if (isRecord(error) && error.code === "ENOENT") {
-        data.loaded = true;
-        return;
-      }
-      throw error;
-    }
-
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-
-      try {
-        const entry = JSON.parse(line) as DevToolsLogEntry;
-        switch (entry.type) {
-          case "run": {
-            data.runs.set(entry.run.id, entry.run);
-            break;
-          }
-          case "step": {
-            data.steps.set(entry.step.id, applyStepBackwardCompatibilityDefaults(entry.step));
-            break;
-          }
-          case "step-update": {
-            const existing = data.steps.get(entry.stepId);
-            if (existing) {
-              data.steps.set(
-                entry.stepId,
-                applyStepBackwardCompatibilityDefaults({
-                  ...existing,
-                  ...entry.update,
-                })
-              );
-            }
-            break;
-          }
-          default: {
-            log.warn("Skipping unknown devtools.jsonl entry type", {
-              workspaceId,
-            });
-          }
-        }
-      } catch {
-        log.warn("Skipping corrupted devtools.jsonl line");
+        data.replayComplete = true;
+      } else {
+        log.warn(
+          "DevTools: failed to load devtools.jsonl, continuing with partial state (replay incomplete, stale finalization skipped)",
+          { workspaceId, error: getErrorMessage(error) }
+        );
       }
     }
 
+    // Replay evictions cannot receive live updates (every live call awaits
+    // ensureLoaded first), so only evictions from here on need remembering.
+    data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
     data.loaded = true;
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
+  }
+
+  private replayLogLine(workspaceId: string, data: WorkspaceData, line: string): void {
+    if (!line.trim()) {
+      return;
+    }
+
+    try {
+      const entry = JSON.parse(line) as DevToolsLogEntry;
+      switch (entry.type) {
+        case "run": {
+          // A second run line for the same id comes from createStep's
+          // self-heal after eviction; the original carries the run metadata.
+          if (data.runs.has(entry.run.id)) {
+            break;
+          }
+          this.insertRun(data, entry.run, line.length);
+          break;
+        }
+        case "step": {
+          // Steps for runs already evicted during replay have no reader; skip them.
+          if (!data.runs.has(entry.step.runId)) {
+            break;
+          }
+          this.setStep(data, applyStepBackwardCompatibilityDefaults(entry.step), line.length);
+          break;
+        }
+        case "step-update": {
+          const existing = data.steps.get(entry.stepId);
+          if (existing) {
+            this.setStep(
+              data,
+              applyStepBackwardCompatibilityDefaults({
+                ...existing,
+                ...entry.update,
+              }),
+              this.updatedStepBytes(data, existing, entry.update, line.length)
+            );
+          }
+          break;
+        }
+        default: {
+          log.warn("Skipping unknown devtools.jsonl entry type", {
+            workspaceId,
+          });
+        }
+      }
+    } catch {
+      log.warn("Skipping corrupted devtools.jsonl line");
+    }
   }
 
   private async finalizeStaleStepsForLoadedWorkspace(
@@ -540,10 +952,11 @@ export class DevToolsService extends EventEmitter {
       data.loaded,
       "DevToolsService.finalizeStaleStepsForLoadedWorkspace requires loaded workspace data"
     );
+    if (!data.replayComplete) {
+      return;
+    }
 
-    const staleSteps = Array.from(data.steps.values()).filter(
-      (step) => step.durationMs == null && step.error == null
-    );
+    const staleSteps = Array.from(data.steps.values()).filter(isStepInFlight);
     if (staleSteps.length === 0) {
       return;
     }
@@ -626,25 +1039,21 @@ export class DevToolsService extends EventEmitter {
     return next;
   }
 
-  private async appendToFile(workspaceId: string, entry: DevToolsLogEntry): Promise<void> {
+  /** `json` is the caller's serialized log entry, shared with retention accounting. */
+  private async appendToFile(workspaceId: string, json: string): Promise<void> {
+    // Capture the generation now: only clear() (generation bump) or
+    // removeWorkspaceData() (entry deleted) may cancel a queued write. The run
+    // or step may already be gone from memory when the write executes because
+    // retention eviction is memory-only, and the on-disk log must still get it.
+    const clearGeneration = this.workspaces.get(workspaceId)?.clearGeneration;
     return this.enqueueWrite(workspaceId, async () => {
-      // Defense-in-depth: skip stale writes after clear() by requiring current entities.
       const data = this.workspaces.get(workspaceId);
-      if (!data) {
-        return;
-      }
-      if (entry.type === "run" && !data.runs.has(entry.run.id)) {
-        return;
-      }
-      if (entry.type === "step" && !data.steps.has(entry.step.id)) {
-        return;
-      }
-      if (entry.type === "step-update" && !data.steps.has(entry.stepId)) {
+      if (!data || data.clearGeneration !== clearGeneration) {
         return;
       }
 
       await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
-        fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8")
+        fs.appendFile(filePath, `${json}\n`, "utf-8")
       );
     });
   }

@@ -12,6 +12,8 @@ const extractTagContent = (message: string, tagName: string): string | null => {
   return match ? match[1].trim() : null;
 };
 import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
+import { randomUUID } from "node:crypto";
+import * as markdown from "@/node/utils/main/markdown";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 
 // Note: in this file we avoid tests that are merely tautological assertions of constants. Only
@@ -395,6 +397,79 @@ Native mode guidance is scoped.
       expect(toolInstructions.bash).toBe(
         ["Native shell guidance.", "Claude compat shell guidance."].join("\n\n")
       );
+    });
+  });
+
+  describe("readToolInstructions parse cache", () => {
+    const metadata = (): WorkspaceMetadata => ({
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    });
+    const model = "anthropic:claude-sonnet-4-20250514";
+    let extractToolSectionSpy: Mock<typeof markdown.extractToolSection>;
+
+    beforeEach(() => {
+      extractToolSectionSpy = spyOn(markdown, "extractToolSection");
+    });
+
+    afterEach(() => {
+      extractToolSectionSpy.mockRestore();
+    });
+
+    test("parses once for byte-identical sources and re-parses when content or model changes", async () => {
+      // Unique token keeps this test independent of cache entries left by other tests.
+      const guidance = `Shell guidance ${randomUUID()}.`;
+      const agentsPath = path.join(workspaceDir, "AGENTS.md");
+      await fs.writeFile(agentsPath, `## Tool: bash\n${guidance}\n`);
+
+      const first = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(first.bash).toBe(guidance);
+      const parseCallsAfterFirst = extractToolSectionSpy.mock.calls.length;
+      expect(parseCallsAfterFirst).toBeGreaterThan(0);
+
+      const second = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(second).toEqual(first);
+      expect(extractToolSectionSpy.mock.calls.length).toBe(parseCallsAfterFirst);
+
+      // Cached results must not alias each other: mutating one call's result
+      // cannot leak into the next.
+      second.bash = "mutated";
+      const third = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(third.bash).toBe(guidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBe(parseCallsAfterFirst);
+
+      // Changing the model changes the available tool set, so it must re-parse.
+      await readToolInstructions(metadata(), runtime, workspaceDir, "openai:gpt-5");
+      const parseCallsAfterModelChange = extractToolSectionSpy.mock.calls.length;
+      expect(parseCallsAfterModelChange).toBeGreaterThan(parseCallsAfterFirst);
+
+      // Editing the file on disk is picked up on the next call.
+      const updatedGuidance = `${guidance} Updated.`;
+      await fs.writeFile(agentsPath, `## Tool: bash\n${updatedGuidance}\n`);
+      const afterEdit = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(afterEdit.bash).toBe(updatedGuidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBeGreaterThan(parseCallsAfterModelChange);
+    });
+
+    test("moving identical content between global and workspace scope invalidates the cache", async () => {
+      const guidance = `Scoped guidance ${randomUUID()}.`;
+      const section = `## Tool: bash\n${guidance}\n`;
+      const workspaceAgentsPath = path.join(workspaceDir, "AGENTS.md");
+      const globalAgentsPath = path.join(globalDir, "AGENTS.md");
+
+      await fs.writeFile(workspaceAgentsPath, section);
+      const fromWorkspace = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(fromWorkspace.bash).toBe(guidance);
+      const parseCallsAfterWorkspace = extractToolSectionSpy.mock.calls.length;
+
+      await fs.rm(workspaceAgentsPath);
+      await fs.writeFile(globalAgentsPath, section);
+      const fromGlobal = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(fromGlobal.bash).toBe(guidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBeGreaterThan(parseCallsAfterWorkspace);
     });
   });
 

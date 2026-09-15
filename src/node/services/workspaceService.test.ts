@@ -8,7 +8,12 @@ import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
-import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import {
+  STARTUP_RECOVERY_CONCURRENCY,
+  WorkspaceService,
+  generateForkBranchName,
+  generateForkTitle,
+} from "./workspaceService";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -2586,6 +2591,9 @@ describe("WorkspaceService workflow activity", () => {
         ),
       });
       const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+      const internals = workspaceService as unknown as {
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
       const activity = await workspaceService.getActivityList();
       expect(activity?.active?.activeWorkflowRunIds).toEqual(["wfr_active"]);
       expect(activity?.unarchived?.activeWorkflowRunIds).toEqual(["wfr_unarchived"]);
@@ -2594,12 +2602,19 @@ describe("WorkspaceService workflow activity", () => {
       expect(metadataSpy.mock.calls.every(([options]) => options?.probeCheckouts === false)).toBe(
         true
       );
+      // The list walk installs caches only for the stores it actually bootstrapped; a dormant
+      // archived workspace gets no placeholder entry.
+      expect([...internals.activeWorkflowRunIdsByWorkspace.keys()].sort()).toEqual([
+        "active",
+        "unarchived",
+      ]);
 
       await workspaceService.emitWorkflowRunActivity({
         workspaceId: "archived",
         runId: "wfr_live",
         status: "running",
       });
+      expect(internals.activeWorkflowRunIdsByWorkspace.has("archived")).toBe(true);
       expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
         "wfr_live",
       ]);
@@ -2615,6 +2630,110 @@ describe("WorkspaceService workflow activity", () => {
         "wfr_archived",
       ]);
       expect(scanSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("activity list reports an archived run installed by an event during its later awaits", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // The list reads snapshots once before the per-id probes and again afterwards; gate
+      // the second read so the event lands after the archived probe resolved its detached
+      // empty set but before the response is assembled.
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      const secondReadReached = Promise.withResolvers<void>();
+      const secondReadGate = Promise.withResolvers<void>();
+      let snapshotReads = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotReads += 1;
+          if (snapshotReads === 2) {
+            secondReadReached.resolve();
+            await secondReadGate.promise;
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const list = workspaceService.getActivityList();
+        await secondReadReached.promise;
+        await workspaceService.emitWorkflowRunActivity({
+          workspaceId: "archived",
+          runId: "wfr_live",
+          status: "running",
+        });
+        secondReadGate.resolve();
+        expect((await list)?.archived?.activeWorkflowRunIds).toEqual(["wfr_live"]);
+        expect(scanSpy).not.toHaveBeenCalled();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("archived reads converge on a set a workflow event installs during the await", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const internals = workspaceService as unknown as {
+        getActiveWorkflowRunIds: (workspaceId: string) => Promise<ReadonlySet<string>>;
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
+
+      // The list-style read resolves its (dormant, detached) answer synchronously; the event
+      // lands in the microtask gap before the read's continuation runs.
+      const read = internals.getActiveWorkflowRunIds("archived");
+      const event = workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "running",
+      });
+      await event;
+      expect([...(await read)]).toEqual(["wfr_live"]);
+      expect(internals.activeWorkflowRunIdsByWorkspace.get("archived")).toBe(await read);
+      // Dormant stores are never scanned on either path.
+      expect(scanSpy).not.toHaveBeenCalled();
     } finally {
       scanSpy.mockRestore();
       await cleanup();
@@ -10915,6 +11034,210 @@ describe("WorkspaceService initialize", () => {
     startupAccess.sessions.delete("ws-promoted");
   });
 
+  test("bounds concurrent transient startup-recovery sessions while recovering every chat", async () => {
+    const ids = Array.from({ length: 30 }, (_, index) => `ws-${index}`);
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const gates: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
+    let live = 0;
+    let peakLive = 0;
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(() => {
+      live += 1;
+      peakLive = Math.max(peakLive, live);
+      const gate = Promise.withResolvers<void>();
+      gates.push(gate);
+      return {
+        ...createCompactionAdmissionMocks(),
+        runStartupRecovery: mock(() => gate.promise),
+        shouldRetainAfterStartupRecovery: mock(() => false),
+        scheduleStartupRecovery: mock(() => undefined),
+        dispose: mock(() => {
+          live -= 1;
+        }),
+      } as unknown as AgentSession;
+    });
+
+    await workspaceService.initialize();
+    await flush();
+    // Only a permit's worth of sessions exist while every recovery is still in flight.
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY);
+
+    // Finishing one recovery admits exactly one queued workspace.
+    gates[0].resolve();
+    await flush();
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY + 1);
+
+    for (let released = 1; released < ids.length; released++) {
+      gates[released].resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+    expect(peakLive).toBe(STARTUP_RECOVERY_CONCURRENCY);
+    expect(createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId).sort()).toEqual(
+      [...ids].sort()
+    );
+  });
+
+  test("holds a startup-recovery slot until the transient session's disposal settles", async () => {
+    const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 2 }, (_, i) => `ws-${i}`);
+    // The first admitted session is promoted (recovery left activity alive); the rest are
+    // transient and must be disposed before their slot is reusable.
+    const promoted = ids[0];
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+      sessions: Map<string, AgentSession>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const recoveries = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const disposals = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
+      (workspaceId) => {
+        const recovery = Promise.withResolvers<void>();
+        recoveries.set(workspaceId, recovery);
+        return {
+          ...createCompactionAdmissionMocks(),
+          runStartupRecovery: mock(() => recovery.promise),
+          shouldRetainAfterStartupRecovery: mock(() => workspaceId === promoted),
+          scheduleStartupRecovery: mock(() => undefined),
+          onChatEvent: mock(() => () => undefined),
+          onMetadataEvent: mock(() => () => undefined),
+          dispose: mock(() => {
+            const disposal = Promise.withResolvers<void>();
+            disposals.set(workspaceId, disposal);
+            return disposal.promise;
+          }),
+        } as unknown as AgentSession;
+      }
+    );
+    const created = () => createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId);
+
+    await workspaceService.initialize();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+    const [, transient] = created();
+
+    // A transient session whose recovery finished but whose dispose is still pending keeps
+    // its slot: listeners and heap are only released when dispose settles.
+    recoveries.get(transient)!.resolve();
+    await flush();
+    expect(disposals.has(transient)).toBe(true);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+
+    disposals.get(transient)!.resolve();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 1);
+
+    // A promoted session is live by design and releases its slot as soon as recovery ends.
+    recoveries.get(promoted)!.resolve();
+    await flush();
+    expect(startupAccess.sessions.get(promoted)).toBeDefined();
+    expect(disposals.has(promoted)).toBe(false);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 2);
+
+    // Drain in rounds: each disposal admits another session whose gates appear late.
+    for (const _round of ids) {
+      for (const recovery of recoveries.values()) recovery.resolve();
+      await flush();
+      for (const disposal of disposals.values()) disposal.resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+    expect(created().sort()).toEqual([...ids].sort());
+    startupAccess.sessions.delete(promoted);
+  });
+
+  test("skips queued startup recoveries whose workspace was archived or removed while waiting", async () => {
+    const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 4 }, (_, i) => `ws-${i}`);
+    const archivedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 1];
+    const removedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 2];
+    // Mutable registry: the mock re-reads it on every call, standing in for the memo refresh
+    // that a real archive/remove edit triggers via the config snapshot change.
+    const registry = ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id }));
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(registry.map((entry) => ({ ...entry })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const gates: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
+    const recoveredWith = new Map<string, WorkspaceMetadata | undefined>();
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
+      (workspaceId) => {
+        const gate = Promise.withResolvers<void>();
+        gates.push(gate);
+        return {
+          ...createCompactionAdmissionMocks(),
+          runStartupRecovery: mock((metadata?: WorkspaceMetadata) => {
+            recoveredWith.set(workspaceId, metadata);
+            return gate.promise;
+          }),
+          shouldRetainAfterStartupRecovery: mock(() => false),
+          scheduleStartupRecovery: mock(() => undefined),
+          dispose: mock(() => undefined),
+        } as unknown as AgentSession;
+      }
+    );
+
+    await workspaceService.initialize();
+    await flush();
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY);
+
+    // While the tail is still waiting on a permit, the user archives one workspace, removes
+    // another, and retitles a third.
+    const archivedEntry = registry.find((entry) => entry.id === archivedWhileQueued)!;
+    archivedEntry.archivedAt = "2026-03-20T00:00:00.000Z";
+    registry.splice(
+      registry.findIndex((entry) => entry.id === removedWhileQueued),
+      1
+    );
+    const retitled = ids[STARTUP_RECOVERY_CONCURRENCY + 3];
+    registry.find((entry) => entry.id === retitled)!.title = "Renamed while queued";
+
+    // Array iteration is live: gates pushed by newly admitted sessions are released too.
+    for (const gate of gates) {
+      gate.resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+
+    const recovered = createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId).sort();
+    expect(recovered).toEqual(
+      ids.filter((id) => id !== archivedWhileQueued && id !== removedWhileQueued).sort()
+    );
+    // Recovery sees the registry as it is after the wait, not the scheduling-time snapshot.
+    expect(recoveredWith.get(retitled)?.title).toBe("Renamed while queued");
+  });
+
   test("disposes transient startup-recovery sessions that go idle", async () => {
     const dispose = mock(() => undefined);
     const fakeSession = {
@@ -10933,10 +11256,12 @@ describe("WorkspaceService initialize", () => {
     const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
       () => fakeSession
     );
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
 
     startupAccess.startStartupRecovery("live-ws");
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(createSessionSpy).toHaveBeenCalledWith("live-ws");
     expect(dispose).toHaveBeenCalledTimes(1);
@@ -10963,10 +11288,12 @@ describe("WorkspaceService initialize", () => {
       sessions: Map<string, AgentSession>;
     };
     spyOn(startupAccess, "createSession").mockImplementation(() => fakeSession);
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
 
     startupAccess.startStartupRecovery("live-ws");
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(dispose).not.toHaveBeenCalled();
     expect(startupAccess.sessions.get("live-ws")).toBe(fakeSession);

@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import { createServer } from "http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -3250,6 +3259,102 @@ describe("MCPServerManager", () => {
     expect(next.toolServerNames).toEqual({});
   });
 
+  test("getToolsForWorkspace serves the cached tool catalog and refreshes it in the background", async () => {
+    const workspaceId = "ws-tools-stale-while-revalidate";
+    configService.listServers = mock(() => Promise.resolve({ modern: stdioConfig("cmd") }));
+    const instance = testInstance("modern", { tools: { alpha: testTool() } });
+    const heldRefresh = Promise.withResolvers<void>();
+    let refreshCalls = 0;
+    const refreshTools = mock(() => {
+      refreshCalls += 1;
+      if (refreshCalls !== 1) return Promise.resolve();
+      return heldRefresh.promise.then(() => {
+        instance.tools = { alpha: testTool(), beta: testTool() };
+      });
+    });
+    (instance as { refreshTools?: typeof refreshTools }).refreshTools = refreshTools;
+    access.startServers = mock(() =>
+      Promise.resolve({
+        instances: new Map([["modern", instance]]),
+        failedServerNames: [],
+        timedOutServerNames: [],
+      })
+    );
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(0);
+
+    // The refresh is held open: an awaited tools/list would hang this send.
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(second.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(1);
+
+    // Deduped per instance while the first refresh is still in flight.
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(third.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(1);
+
+    heldRefresh.resolve();
+    await Bun.sleep(0);
+
+    const fourth = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(fourth.tools).sort()).toEqual(["modern_alpha", "modern_beta"]);
+    expect(refreshTools).toHaveBeenCalledTimes(2);
+  });
+
+  test("timed-out server retries back off exponentially and reset on a config change", async () => {
+    const workspaceId = "ws-timeout-retry-backoff";
+    let command = "cmd-1";
+    configService.listServers = mock(() =>
+      Promise.resolve({ flaky: { transport: "stdio" as const, command, disabled: false } })
+    );
+    const startServersMock = mock(() =>
+      Promise.resolve(
+        startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] })
+      )
+    );
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const base = Date.now();
+    setSystemTime(new Date(base));
+    try {
+      // Initial start times out; the first cached-path retry runs at once.
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(2);
+
+      // One retry timeout: the next serve inside the base window skips it.
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(2);
+      setSystemTime(new Date(base + 4_999));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(2);
+      setSystemTime(new Date(base + 5_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(3);
+
+      // Two retry timeouts: the window doubles.
+      setSystemTime(new Date(base + 5_000 + 9_999));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(3);
+      setSystemTime(new Date(base + 5_000 + 10_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(4);
+
+      // A config change restarts the server and clears its backoff, so the
+      // following serve retries immediately again.
+      command = "cmd-2";
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(5);
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(6);
+    } finally {
+      setSystemTime();
+    }
+  });
+
   test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {
     const workspaceId = "ws-prompt-freshness";
     configService.listServers = mock(() =>
@@ -4856,32 +4961,16 @@ describe("MCPServerManager", () => {
     expect(Object.keys(toolsResult.tools)).not.toContain("serverb_tool");
   });
 
-  test("a publication landing during the leased tool refresh is honored before the serve returns", async () => {
-    // Leased (deferred-restart) path: an authoritative parent publication
-    // replaces the recorded overrides while `refreshModernInstanceTools` is
-    // awaiting, but its own listServers is still pending — so
-    // `enabledServerNames` is stale unless the repair runs AFTER the refresh.
-    const workspaceId = "ws-publish-during-leased-refresh";
-    const servers = {
-      serverA: stdioConfig("cmd-a"),
-      serverB: stdioConfig("cmd-b"),
-      serverC: stdioConfig("cmd-c"),
-    };
-    let gateListServers = false;
-    const gatedListServers: Array<() => void> = [];
-    configService.listServers = mock(() => {
-      if (!gateListServers) return Promise.resolve(servers);
-      return new Promise<typeof servers>((resolve) => {
-        gatedListServers.push(() => resolve(servers));
-      });
-    });
-    let releaseRefresh: () => void = () => undefined;
-    const refreshB = mock(
-      () =>
-        new Promise<void>((resolve) => {
-          releaseRefresh = resolve;
-        })
+  test("the leased deferred-restart path serves without waiting on a hung tool refresh", async () => {
+    const workspaceId = "ws-leased-hung-tool-refresh";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        serverA: stdioConfig("cmd-a"),
+        serverB: stdioConfig("cmd-b"),
+        serverC: stdioConfig("cmd-c"),
+      })
     );
+    const refreshB = mock(() => new Promise<void>(() => undefined));
     access.startServers = mock(() =>
       Promise.resolve(
         startResult([
@@ -4894,38 +4983,14 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     manager.acquireLease(workspaceId);
 
-    // Signature change while leased → deferred restart path, which awaits the
-    // modern tool refresh (B blocks).
-    const inFlight = manager.getToolsForWorkspace(
+    // Signature change while leased → deferred restart path. B's refresh
+    // never settles; the serve must still return the held catalogs, filtered
+    // to the newly enabled set.
+    const served = await manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { overrides: { disabledServers: ["serverC"] } })
     );
-    while (refreshB.mock.calls.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    // Parent publication revokes B; its listServers stays pending.
-    gateListServers = true;
-    const publication = manager.applyWorkspaceOverrides(workspaceId, {
-      disabledServers: ["serverC", "serverB"],
-    });
-    releaseRefresh();
-    // Keep the publication's listServers pending until the serve's repair
-    // re-derives too (a second gated call) — or the serve returns without one.
-    let settled = false;
-    const servedPromise = inFlight.finally(() => {
-      settled = true;
-    });
-    while (!settled) {
-      if (gatedListServers.length >= 2) {
-        for (const release of gatedListServers.splice(0)) release();
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    for (const release of gatedListServers.splice(0)) release();
-    await publication;
-
-    const served = await servedPromise;
-    expect(Object.keys(served.tools)).toContain("servera_tool");
-    expect(Object.keys(served.tools)).not.toContain("serverb_tool");
+    expect(refreshB).toHaveBeenCalledTimes(1);
+    expect(Object.keys(served.tools).sort()).toEqual(["servera_tool", "serverb_tool"]);
   });
 
   test("getToolsForWorkspace filters disabled-server failures from leased stats", async () => {
