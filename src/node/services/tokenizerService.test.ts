@@ -1,60 +1,46 @@
-import { beforeEach, describe, expect, test, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, spyOn } from "bun:test";
+import * as fs from "fs/promises";
+import * as path from "path";
 import { TokenizerService } from "./tokenizerService";
+import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
+import { createTestHistoryService } from "./testHistoryService";
 import * as tokenizerUtils from "@/node/utils/main/tokenizer";
 import * as statsUtils from "@/common/utils/tokens/tokenStatsCalculator";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { Ok, Err } from "@/common/types/result";
+import { Err } from "@/common/types/result";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 
 describe("TokenizerService", () => {
   let sessionUsageService: SessionUsageService;
+  let historyService: HistoryService;
+  let sessionsDir: string;
+  let cleanupHistory: () => Promise<void>;
   let service: TokenizerService;
-  let history: MuxMessage[];
-  let historyError: string | null;
-  let partial: MuxMessage | null;
-  // Unreadable partial.json (not ENOENT). Mirrors HistoryService.readPartial: swallowed and
-  // reported as null unless the caller opts into throwOnError.
-  let partialReadError: Error | null;
-  // Per-call gates for the history read so tests can control completion order.
-  let historyReadGates: Array<() => void>;
-  let gateHistoryReads: boolean;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     sessionUsageService = {
       setTokenStatsCache: () => Promise.resolve(),
     } as unknown as SessionUsageService;
-    history = [];
-    historyError = null;
-    partial = null;
-    partialReadError = null;
-    historyReadGates = [];
-    gateHistoryReads = false;
+    const testHistory = await createTestHistoryService();
+    historyService = testHistory.historyService;
+    sessionsDir = testHistory.config.sessionsDir;
+    cleanupHistory = testHistory.cleanup;
     service = new TokenizerService(
       sessionUsageService,
       { getWorkspaceMetadata: () => Promise.resolve({ success: false, error: "not found" }) },
       { getConfig: () => ({}) },
-      {
-        getHistoryFromLatestBoundary: () => {
-          const snapshot = history;
-          const result = historyError === null ? Ok(snapshot) : Err(historyError);
-          if (!gateHistoryReads) return Promise.resolve(result);
-          return new Promise((resolve) => {
-            historyReadGates.push(() => resolve(result));
-          });
-        },
-        readPartial: (_workspaceId, options) => {
-          if (partialReadError !== null) {
-            return options?.throwOnError ? Promise.reject(partialReadError) : Promise.resolve(null);
-          }
-          return Promise.resolve(partial);
-        },
-      }
+      historyService
     );
   });
 
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
   describe("calculateWorkspaceStats", () => {
+    const WS = "ws";
     const mockResult = {
       consumers: [{ name: "User", tokens: 1, percentage: 100 }],
       totalTokens: 1,
@@ -63,34 +49,64 @@ describe("TokenizerService", () => {
       usageHistory: [],
     };
 
+    async function seedHistory(...messages: MuxMessage[]): Promise<void> {
+      for (const message of messages) {
+        const result = await historyService.appendToHistory(WS, message);
+        expect(result.success).toBe(true);
+      }
+    }
+
+    async function writePartial(message: MuxMessage): Promise<void> {
+      const result = await historyService.writePartial(WS, message);
+      expect(result.success).toBe(true);
+    }
+
+    /** Rows handed to the tokenizer, reduced to what the merge decides: which row, how much of it. */
+    function tokenizedRows(statsSpy: { mock: { calls: unknown[][] } }): Array<{
+      id: string;
+      texts: string[];
+    }> {
+      const [messages] = statsSpy.mock.calls[0] as [MuxMessage[]];
+      return messages.map((message) => ({
+        id: message.id,
+        texts: message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      }));
+    }
+
     test("tokenizes the backend's own history without a caller-supplied message list", async () => {
-      history = [
+      await seedHistory(
         createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }),
-        createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }),
-      ];
+        createMuxMessage("msg2", "assistant", "World", { historySequence: 2 })
+      );
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
-        const result = await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        const result = await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
         expect(result).toBe(mockResult);
-        expect(statsSpy).toHaveBeenCalledWith(history, "gpt-4", {}, expect.anything());
+        expect(tokenizedRows(statsSpy)).toEqual([
+          { id: "msg1", texts: ["Hello"] },
+          { id: "msg2", texts: ["World"] },
+        ]);
+        expect(statsSpy.mock.calls[0][1]).toBe("gpt-4");
       } finally {
         statsSpy.mockRestore();
       }
     });
 
     test("substitutes the in-flight partial for its empty placeholder row", async () => {
-      const placeholder = createMuxMessage("msg2", "assistant", "", { historySequence: 2 });
-      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }), placeholder];
-      partial = createMuxMessage("msg2", "assistant", "streamed so far", { historySequence: 2 });
+      await seedHistory(
+        createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }),
+        createMuxMessage("msg2", "assistant", "", { historySequence: 2 })
+      );
+      await writePartial(
+        createMuxMessage("msg2", "assistant", "streamed so far", { historySequence: 2 })
+      );
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
-        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
-        expect(statsSpy).toHaveBeenCalledWith(
-          [history[0], partial],
-          "gpt-4",
-          {},
-          expect.anything()
-        );
+        await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        expect(tokenizedRows(statsSpy)).toEqual([
+          { id: "msg1", texts: ["Hello"] },
+          { id: "msg2", texts: ["streamed so far"] },
+        ]);
       } finally {
         statsSpy.mockRestore();
       }
@@ -101,59 +117,76 @@ describe("TokenizerService", () => {
       // history read lands after the finalized row was appended.
       const committed = createMuxMessage("msg2", "assistant", "final text", { historySequence: 2 });
       committed.parts.push({ type: "text", text: "second part" });
-      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }), committed];
-      partial = createMuxMessage("msg2", "assistant", "final", { historySequence: 2 });
+      await seedHistory(
+        createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }),
+        committed
+      );
+      await writePartial(createMuxMessage("msg2", "assistant", "final", { historySequence: 2 }));
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
-        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
-        expect(statsSpy).toHaveBeenCalledWith(history, "gpt-4", {}, expect.anything());
+        await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        expect(tokenizedRows(statsSpy)).toEqual([
+          { id: "msg1", texts: ["Hello"] },
+          { id: "msg2", texts: ["final text", "second part"] },
+        ]);
       } finally {
         statsSpy.mockRestore();
       }
     });
 
     test("appends a partial that has no matching history row", async () => {
-      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
-      partial = createMuxMessage("msg2", "assistant", "streamed", { historySequence: 2 });
+      await seedHistory(createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }));
+      await writePartial(createMuxMessage("msg2", "assistant", "streamed", { historySequence: 2 }));
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
-        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
-        expect(statsSpy).toHaveBeenCalledWith(
-          [history[0], partial],
-          "gpt-4",
-          {},
-          expect.anything()
-        );
+        await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        expect(tokenizedRows(statsSpy)).toEqual([
+          { id: "msg1", texts: ["Hello"] },
+          { id: "msg2", texts: ["streamed"] },
+        ]);
       } finally {
         statsSpy.mockRestore();
       }
     });
 
     test("rejects when partial.json is unreadable instead of undercounting the in-flight turn", async () => {
-      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
-      partialReadError = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      await seedHistory(createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }));
+      // A directory at the partial path fails the real read with EISDIR: neither the
+      // "missing" (ENOENT) nor the "malformed JSON" branch readPartial self-heals.
+      await fs.mkdir(path.join(sessionsDir, WS, "partial.json"), { recursive: true });
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
         const error = await service
-          .calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" })
+          .calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" })
           .then(
             () => null,
             (e: unknown) => e
           );
         expect(error).toBeInstanceOf(Error);
-        expect((error as Error).message).toContain("EACCES");
+        expect((error as { code?: string }).code).toBe("EISDIR");
         expect(statsSpy).not.toHaveBeenCalled();
       } finally {
         statsSpy.mockRestore();
       }
     });
 
+    test("treats a malformed partial.json as no in-flight turn under the strict read", async () => {
+      await seedHistory(createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }));
+      const sessionDir = path.join(sessionsDir, WS);
+      await fs.mkdir(sessionDir, { recursive: true });
+      await fs.writeFile(path.join(sessionDir, "partial.json"), "{ not json", "utf-8");
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        const result = await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        expect(result).toBe(mockResult);
+        expect(tokenizedRows(statsSpy)).toEqual([{ id: "msg1", texts: ["Hello"] }]);
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
     test("persists the cache of the most recently requested calculation, not the last to finish reading", async () => {
-      const older = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
-      const newer = [
-        ...older,
-        createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }),
-      ];
+      await seedHistory(createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }));
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockImplementation((messages) =>
         Promise.resolve({
           ...mockResult,
@@ -164,18 +197,35 @@ describe("TokenizerService", () => {
       const persistSpy = spyOn(sessionUsageService, "setTokenStatsCache").mockResolvedValue(
         undefined
       );
+      // Real reads run immediately; only the hand-back of each result is held so the test
+      // controls which request observes its transcript first and which finishes last.
+      const releaseRead: Array<() => void> = [];
+      const readSettled: Array<Promise<void>> = [];
+      const realRead = historyService.getHistoryFromLatestBoundary.bind(historyService);
+      const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+        (workspaceId, skip) => {
+          const read = realRead(workspaceId, skip);
+          readSettled.push(read.then(() => undefined));
+          return read.then(
+            (result) =>
+              new Promise((resolve) => {
+                releaseRead.push(() => resolve(result));
+              })
+          );
+        }
+      );
       try {
-        gateHistoryReads = true;
-        history = older;
-        const requestA = service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
-        history = newer;
-        const requestB = service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
-        expect(historyReadGates).toHaveLength(2);
+        const requestA = service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        await readSettled[0];
+        await seedHistory(createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }));
+        const requestB = service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        await readSettled[1];
+        expect(releaseRead).toHaveLength(2);
 
-        // B's reads land first; A's stall and complete afterwards with its older snapshot.
-        historyReadGates[1]();
+        // B (newer transcript) completes first; A (older transcript) completes afterwards.
+        releaseRead[1]();
         await requestB;
-        historyReadGates[0]();
+        releaseRead[0]();
         await requestA;
 
         const persisted = persistSpy.mock.calls.map(([, cache]) => cache.history.messageCount);
@@ -183,15 +233,18 @@ describe("TokenizerService", () => {
       } finally {
         statsSpy.mockRestore();
         persistSpy.mockRestore();
+        readSpy.mockRestore();
       }
     });
 
     test("rejects when history cannot be read instead of tokenizing nothing", async () => {
-      historyError = "disk exploded";
+      const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+        Err("disk exploded")
+      );
       const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
       try {
         const error = await service
-          .calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" })
+          .calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" })
           .then(
             () => null,
             (e: unknown) => e
@@ -201,6 +254,7 @@ describe("TokenizerService", () => {
         expect(statsSpy).not.toHaveBeenCalled();
       } finally {
         statsSpy.mockRestore();
+        readSpy.mockRestore();
       }
     });
   });
