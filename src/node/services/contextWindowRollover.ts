@@ -112,7 +112,7 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
       // The pinned memory tool resolves create-or-update atomically (see
       // MemoryService.writePinnedFile), so no on-disk existence verdict is needed here and a
       // stale one cannot waste the only step this turn gets.
-      "If an excerpt is preloaded above, prefer a brief insert at insert_line 0 to preserve any unshown content. Use str_replace only when the full file is visible and the match is unique. Otherwise use create for a compact rewrite, which replaces the entire existing file, including unshown content.",
+      "If the full file is visible and sufficient space is known, use a brief insert at insert_line 0 or str_replace with a unique match. If the preload is truncated or headroom is unknown, use create for a compact checkpoint of the essential known state within this step's output budget. It replaces the entire existing file, including unshown content.",
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }

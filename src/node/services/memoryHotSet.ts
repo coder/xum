@@ -313,7 +313,7 @@ function formatHotMemoryFileBlock(
   if (item.truncated) {
     lines.push(
       options?.flushPreload
-        ? "[truncated preload excerpt; prefer a brief insert at insert_line 0 to preserve unshown content. create replaces the entire file]"
+        ? "[truncated preload excerpt; remaining storage space is unknown. Use create for a compact checkpoint of essential known state within the step's output budget; it replaces the entire file, including unshown content]"
         : `[truncated: view ${item.path} with the memory tool for the full content]`
     );
   }

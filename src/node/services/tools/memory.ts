@@ -68,7 +68,7 @@ function buildMemoryDescription(config: ToolConfiguration): string {
         "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
         "view, delete, rename, and every other path are refused. " +
-        `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget; prefer a small prepend over re-emitting existing notes. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full file can be read in the next window.`
+        `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget. Use a prepend or text replacement only when the full file is visible and sufficient space is known. Otherwise use create for a compact checkpoint of the essential known state; it replaces the entire file, including unshown content. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full saved file can be read in the next window.`
       : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
     return baseDescription;

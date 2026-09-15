@@ -561,6 +561,18 @@ describe("memory tool", () => {
         ).success
       ).toBe(true);
       expect(await readNotes(fixture)).toBe("c".repeat(MEMORY_MAX_FILE_BYTES));
+      // When the file is full, a compact checkpoint still fits without a preceding delete.
+      const checkpoint = "latest essential state";
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "create",
+            path: notes,
+            file_text: checkpoint,
+          })
+        ).success
+      ).toBe(true);
+      expect(await readNotes(fixture)).toBe(checkpoint);
     });
 
     it("rejects a pin that is not a file inside a scope", async () => {
