@@ -56,7 +56,10 @@ export class TokenizerService {
    * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
    * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
    * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
-   * from being replaced by a partial snapshot read just before the commit.
+   * from being replaced by a partial snapshot read just before the commit. The partial read is
+   * strict: a missing file is a normal "no in-flight turn" (null), and malformed JSON still
+   * self-heals to null inside readPartial, but an I/O or permission failure rejects like a
+   * history-read failure does, instead of silently persisting a cache that omits the turn.
    *
    * The calculation generation is claimed before any read so the latest-calculation guard
    * orders overlapping requests by arrival: a request that read an older transcript but
@@ -67,7 +70,7 @@ export class TokenizerService {
     const [metadata, historyResult, partial] = await Promise.all([
       this.aiService.getWorkspaceMetadata(input.workspaceId),
       this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
-      this.historyService.readPartial(input.workspaceId),
+      this.historyService.readPartial(input.workspaceId, { throwOnError: true }),
     ]);
     if (!historyResult.success) {
       throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
