@@ -145,12 +145,30 @@ test("controller transitions latch synchronously and map settings resets onto th
     "continuousCompactor"
   ) as ContinuousCompactor;
   const reset = spyOn(compactor, "reset");
-  // Reasons that used to be session-local names reach the engine under its existing vocabulary,
-  // and a `(): void` signature alone does not prove synchronous latching: assert no Promise.
+  // A void signature alone cannot prove latching. The real engine must invalidate old work
+  // before this caller can yield, not merely receive a deferred reset request.
+  const generation = () => Reflect.get(compactor, "generation") as number;
+  let before = generation();
   expect(controller.reset("settings-changed")).toBeUndefined();
+  expect(generation()).toBeGreaterThan(before);
   expect(reset).toHaveBeenLastCalledWith("context-changed");
+  before = generation();
   expect(controller.reset("context-refresh")).toBeUndefined();
+  expect(generation()).toBeGreaterThan(before);
   expect(reset).toHaveBeenLastCalledWith("context-mutation");
   expect(reset).toHaveBeenCalledTimes(2);
+
+  before = generation();
+  expect(controller.onUserInterrupt({ abandonPartial: false })).toBeUndefined();
+  expect(generation()).toBe(before);
+  expect(controller.onUserInterrupt({ abandonPartial: true })).toBeUndefined();
+  expect(generation()).toBeGreaterThan(before);
+
+  before = generation();
+  expect(controller.beginShutdown()).toBeUndefined();
+  expect(generation()).toBeGreaterThan(before);
+  before = generation();
+  expect(controller.dispose()).toBeUndefined();
+  expect(generation()).toBeGreaterThan(before);
   expect(controller.isApplying()).toBe(false);
 });

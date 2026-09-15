@@ -248,56 +248,71 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     }
   });
 
-  test("on-send compaction consuming a wake stamps the correlation on the follow-up", async () => {
-    const workspaceId = "workspace-turn-compaction-stamp";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({
-      workspaceId,
-    });
-    try {
-      await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));
-      await historyService.appendToHistory(workspaceId, cutAssistant("cut"));
+  test.each(["history", "explicit"] as const)(
+    "on-send compaction consuming a wake stamps the %s correlation on the follow-up",
+    async (source) => {
+      const workspaceTurn =
+        source === "explicit"
+          ? {
+              taskHandleId: "wst_compaction_continuation",
+              ownerWorkspaceId: "parentworkspace",
+              turnId: "fresh-turn",
+            }
+          : undefined;
+      const workspaceId = "workspace-turn-compaction-stamp";
+      const { session, cleanup, historyService } = await createAgentSessionHarness({
+        workspaceId,
+      });
+      try {
+        await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));
+        await historyService.appendToHistory(workspaceId, cutAssistant("cut"));
 
-      // Force the on-send compaction divert for the wake continuation.
-      const internals = session as unknown as { contextController: { compactionMonitor: unknown } };
-      internals.contextController.compactionMonitor = {
-        checkBeforeSend: mock(() => ({
-          shouldShowWarning: true,
-          shouldForceCompact: true,
-          usagePercentage: 99,
-          thresholdPercentage: 85,
-        })),
-        checkMidStream: mock(() => false),
-        resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
-      };
+        // Force the on-send compaction divert for the wake continuation.
+        const internals = session as unknown as {
+          contextController: { compactionMonitor: unknown };
+        };
+        internals.contextController.compactionMonitor = {
+          checkBeforeSend: mock(() => ({
+            shouldShowWarning: true,
+            shouldForceCompact: true,
+            usagePercentage: 99,
+            thresholdPercentage: 85,
+          })),
+          checkMidStream: mock(() => false),
+          resetForNewStream: mock(() => undefined),
+          setThreshold: mock(() => undefined),
+          getThreshold: mock(() => 0.85),
+        };
 
-      const result = await session.sendMessage(
-        "monitor wake",
-        {
-          model: "anthropic:claude-sonnet-4-5",
-          agentId: "exec",
-          muxMetadata: { type: "bash-monitor-wake", records: [] },
-        },
-        { agentInitiated: true }
-      );
-      expect(result.success).toBe(true);
+        const result = await session.sendMessage(
+          "monitor wake",
+          {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            muxMetadata: { type: "bash-monitor-wake", records: [], workspaceTurn },
+          },
+          { agentInitiated: true }
+        );
+        expect(result.success).toBe(true);
 
-      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(historyResult.success).toBe(true);
-      if (!historyResult.success) throw new Error("history read failed");
-      const compactionRequest = historyResult.data.find(
-        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
-      );
-      const requestMeta = compactionRequest?.metadata?.muxMetadata;
-      if (requestMeta?.type !== "compaction-request") {
-        throw new Error("expected a persisted compaction request");
+        const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(historyResult.success).toBe(true);
+        if (!historyResult.success) throw new Error("history read failed");
+        const compactionRequest = historyResult.data.find(
+          (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+        );
+        const requestMeta = compactionRequest?.metadata?.muxMetadata;
+        if (requestMeta?.type !== "compaction-request") {
+          throw new Error("expected a persisted compaction request");
+        }
+        expect(requestMeta.parsed.followUpContent?.agentInitiated).toBe(true);
+        expect(requestMeta.parsed.followUpContent?.workspaceTurnMetadata).toEqual(
+          workspaceTurn == null ? correlation : { type: "workspace-turn-task", ...workspaceTurn }
+        );
+      } finally {
+        await session.dispose();
+        await cleanup();
       }
-      expect(requestMeta.parsed.followUpContent?.agentInitiated).toBe(true);
-      expect(requestMeta.parsed.followUpContent?.workspaceTurnMetadata).toEqual(correlation);
-    } finally {
-      await session.dispose();
-      await cleanup();
     }
-  });
+  );
 });
