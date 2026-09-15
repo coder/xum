@@ -266,6 +266,7 @@ import {
   runInlineAbandonedBranchSummary,
   type BranchSummaryAiService,
 } from "@/node/services/branchSummary";
+import { resolveContextStrategy } from "@/node/services/contextManagement/selection";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -5295,21 +5296,22 @@ export class AgentSession {
   }
 
   private isTokenBudgetActive(options?: SendMessageOptions): boolean {
-    const enabled = (id: ExperimentId) =>
-      typeof this.aiService.isExperimentEnabled === "function" &&
-      this.aiService.isExperimentEnabled(id);
-    if (!(options?.experiments?.tokenBudget ?? enabled(EXPERIMENT_IDS.TOKEN_BUDGET))) return false;
+    const selection = resolveContextStrategy({
+      experiments: options?.experiments,
+      isEnabled: (id) =>
+        typeof this.aiService.isExperimentEnabled === "function" &&
+        this.aiService.isExperimentEnabled(id),
+      isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
+    });
     if (
-      (options?.experiments?.continuousCompaction ??
-        enabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)) ||
-      this.isRlmCompactionEnabled(options)
+      selection.tokenBudgetSuppressedBy === "continuous" ||
+      selection.tokenBudgetSuppressedBy === "rlm"
     ) {
       log.debug("Token-budget rollover yields to continuous/RLM compaction", {
         workspaceId: this.workspaceId,
       });
-      return false;
     }
-    return !isCompactionRequestMetadata(options?.muxMetadata);
+    return selection.configured === "token-budget" && selection.tokenBudgetSuppressedBy == null;
   }
 
   /**
@@ -6961,13 +6963,16 @@ export class AgentSession {
     options?: SendMessageOptions
   ): SessionCompactionContext {
     const providersConfig = this.getProvidersConfigSafe();
-    const enabled =
-      options?.experiments?.continuousCompaction ??
-      (typeof this.aiService.isExperimentEnabled === "function" &&
-        this.aiService.isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION));
+    const selection = resolveContextStrategy({
+      experiments: options?.experiments,
+      isEnabled: (id) =>
+        typeof this.aiService.isExperimentEnabled === "function" &&
+        this.aiService.isExperimentEnabled(id),
+      isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
+    });
     return {
       enabled:
-        enabled &&
+        selection.configured === "continuous" &&
         this.compactionMonitor.getThreshold() < 1 &&
         !this.coordinator.disposed &&
         !this.coordinator.closing &&
