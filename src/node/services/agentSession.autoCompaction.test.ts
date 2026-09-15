@@ -17,6 +17,7 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
+import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
@@ -374,22 +375,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(unstamped).toBeUndefined();
   });
 
-  test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {
-    const { session } = await createSessionHarness({
-      workspaceId: "ws-auto-compaction-goal-kind",
-    });
-
-    const followUp = (
-      session as unknown as {
-        buildAutoCompactionFollowUp: (params: {
-          messageText: string;
-          options: SendMessageOptions;
-          modelForStream: string;
-          goalKind?: typeof GOAL_CONTINUATION_KIND;
-          goalId?: string;
-        }) => CompactionFollowUpRequest;
-      }
-    ).buildAutoCompactionFollowUp({
+  test("preserves goal kind and goal identity on auto-compaction follow-up requests", () => {
+    // The builder is a pure shared helper now; no session fixture is needed to reach it.
+    const followUp = buildAutoCompactionFollowUp({
       messageText: "Continue goal",
       options: { model: "openai:gpt-4o", agentId: "exec" },
       modelForStream: "openai:gpt-4o",
@@ -401,7 +389,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
     // stay goal-scoped instead of degrading to a legacy unscoped row.
     expect(followUp.goalId).toBe("goal-compaction-scope");
-    await session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {
