@@ -55,7 +55,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -1472,6 +1472,7 @@ export class Config {
       hiddenModels: [...DEFAULT_HIDDEN_MODELS],
       migrations: {
         daybreakModelsHidden: true,
+        gpt6SolModelHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
@@ -1871,16 +1872,33 @@ export class Config {
       parsed.migrations = hiddenMigrations;
       configModified = true;
     }
-    if (hiddenMigrations.daybreakModelsHidden !== true) {
+    // Each seed-once flag hides the models that shipped default-hidden with it.
+    // Flags are frozen history: a flag that already ran must never re-hide its
+    // models (users may have re-enabled them since), so later default-hidden
+    // additions get their own flag instead of reusing daybreakModelsHidden.
+    const hiddenModelSeeds = [
+      {
+        flag: "daybreakModelsHidden",
+        modelIds: [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id],
+      },
+      // Provisional, unannounced GPT-6 Sol (see knownModels.ts): hidden until
+      // OpenAI officially releases it.
+      { flag: "gpt6SolModelHidden", modelIds: [KNOWN_MODELS.GPT_6_SOL.id] },
+    ] as const;
+    const pendingSeeds = hiddenModelSeeds.filter((seed) => hiddenMigrations[seed.flag] !== true);
+    if (pendingSeeds.length > 0) {
       // Seed once, without losing unrelated hides or re-hiding models users later enable.
       parsed.migrations = {
         ...hiddenMigrations,
-        daybreakModelsHidden: true,
+        ...Object.fromEntries(pendingSeeds.map((seed) => [seed.flag, true])),
         hiddenModelsInitialized:
           hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
       };
       parsed.hiddenModels = [
-        ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
+        ...new Set([
+          ...(existingHiddenModels ?? []),
+          ...pendingSeeds.flatMap((seed) => seed.modelIds),
+        ]),
       ];
       configModified = true;
     }

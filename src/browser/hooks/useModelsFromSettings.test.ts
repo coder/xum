@@ -1057,7 +1057,11 @@ describe("Daybreak settings and selector visibility", () => {
     act(() => hook.result.current.unhideModel(first));
     await waitFor(() => expect(hook.result.current.models).toContain(first));
     expect(hook.result.current.models).not.toContain(second);
-    expect(persist).toHaveBeenLastCalledWith({ hiddenModels: [second, KNOWN_MODELS.GPT_PRO.id] });
+    // The provisional GPT-6 Sol entry stays hidden throughout (it is default-hidden
+    // and never toggled here), so it rides along in the persisted hide list.
+    expect(persist).toHaveBeenLastCalledWith({
+      hiddenModels: [second, KNOWN_MODELS.GPT_6_SOL.id, KNOWN_MODELS.GPT_PRO.id],
+    });
 
     hook.unmount();
     hook = renderHook(() => useModelsFromSettings());

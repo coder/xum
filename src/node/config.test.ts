@@ -42,7 +42,10 @@ describe("Config", () => {
   describe("Daybreak visibility migration", () => {
     const blue = "openai:daybreak-blue-latest";
     const red = "openai:daybreak-red-latest";
+    const sol6 = "openai:gpt-6-sol";
     const unrelated = "openrouter:openai/gpt-5";
+    // Every seed flag has already run; new default-hidden additions must extend this.
+    const allSeedFlags = { daybreakModelsHidden: true, gpt6SolModelHidden: true };
 
     const malformedHiddenModels = [
       undefined,
@@ -66,7 +69,7 @@ describe("Config", () => {
         );
         await flushConfigEdits();
         const reloaded = new Config(tempDir).getClientConfig();
-        expect(reloaded.hiddenModels).toEqual([blue, red]);
+        expect(reloaded.hiddenModels).toEqual([blue, red, sol6]);
         expect(reloaded.hiddenModelsInitialized).toBe(false);
       }
     );
@@ -79,7 +82,7 @@ describe("Config", () => {
           JSON.stringify({
             projects: [],
             hiddenModels,
-            migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+            migrations: { ...allSeedFlags, hiddenModelsInitialized: true },
           })
         );
         await flushConfigEdits();
@@ -100,7 +103,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           hiddenModels: [null, unrelated, ""],
-          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+          migrations: { ...allSeedFlags, hiddenModelsInitialized: true },
         })
       );
       await flushConfigEdits();
@@ -126,7 +129,7 @@ describe("Config", () => {
         );
       }
       const seeded = config.getClientConfig();
-      expect(seeded.hiddenModels).toEqual([...new Set([...(hiddenModels ?? []), blue, red])]);
+      expect(seeded.hiddenModels).toEqual([...new Set([...(hiddenModels ?? []), blue, red, sol6])]);
       expect(seeded.hiddenModelsInitialized).toBe(hiddenModels !== undefined);
       expect(seeded.defaultModel).toBe(persisted ? KNOWN_MODELS.GPT.id : undefined);
       await flushConfigEdits();
@@ -141,6 +144,38 @@ describe("Config", () => {
       }
       await config.updateModelPreferences({ hiddenModels: [] });
       expect(new Config(tempDir).getClientConfig().hiddenModels).toEqual([]);
+    });
+
+    it("seeds only GPT-6 Sol for configs that already ran the Daybreak seed", async () => {
+      // The user re-enabled the Daybreak models after their seed; a later seed
+      // flag must not re-hide them (seed flags are frozen history).
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [unrelated],
+          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([unrelated, sol6]);
+      expect(reloaded.hiddenModelsInitialized).toBe(true);
+    });
+
+    it("does not re-hide GPT-6 Sol after a user re-enables it", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [],
+          migrations: { ...allSeedFlags, hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([]);
+      expect(reloaded.hiddenModelsInitialized).toBe(true);
     });
   });
 

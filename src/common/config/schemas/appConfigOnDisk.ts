@@ -116,6 +116,12 @@ export const AppConfigMigrationsSchema = z
     execSubagentDefaultsSplit: z.boolean().optional(),
     userPreferencesInitialized: z.boolean().optional(),
     daybreakModelsHidden: z.boolean().optional(),
+    /**
+     * One-time hide seed for the provisional (unannounced) GPT-6 Sol entry;
+     * separate from daybreakModelsHidden because configs that already ran the
+     * Daybreak seed never re-run it.
+     */
+    gpt6SolModelHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
     /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
