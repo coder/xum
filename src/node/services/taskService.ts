@@ -7537,12 +7537,21 @@ export class TaskService implements AgentTaskIntegration {
           // a stable child ID's older receipt consume a later assignment's notification.
           consumed = reports.some((report) => report.messageId == null);
         } else {
-          const execution = await this.getDescendantAgentTaskExecutionSnapshot(
+          // Resolve the notification's assignment, not the child's latest execution: the
+          // parent may already have reawakened that child before this drain gets its turn.
+          const [handleId] = notification.generationId.split(":");
+          if (!isWorkspaceTurnTaskId(handleId)) continue;
+          const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+          const owners = [
             ownerWorkspaceId,
-            notification.sourceId
-          );
-          if (execution?.record.status === "completed") {
-            const record = execution.record;
+            ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, ownerWorkspaceId),
+          ];
+          let record: WorkspaceTurnTaskHandleRecord | null = null;
+          for (const ownerId of owners) {
+            record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(ownerId, handleId);
+            if (record != null) break;
+          }
+          if (record?.status === "completed" && record.workspaceId === notification.sourceId) {
             const generation =
               this.getWorkspaceTurnManager().workspaceTurnTerminalAttentionGenerationId(record);
             consumed =
