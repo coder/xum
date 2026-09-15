@@ -33,17 +33,36 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
  * memory. Steps whose run falls outside the retained window are dropped. The
  * DevTools panel therefore shows a bounded recent window rather than the full
  * history; the on-disk file is left untouched (rotation is a follow-up).
+ *
+ * The run bound alone does not cap memory: a single streamed step carries the
+ * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
+ * events in `rawChunks`/`rawResponse` plus multi-MB `rawRequest` strings), so
+ * 100 such runs are still hundreds of MB. Retained runs are therefore also
+ * capped at MAX_RETAINED_BYTES_PER_WORKSPACE, measured as the length of the
+ * JSON lines appended to devtools.jsonl (already serialized for the write) and
+ * attributed to the owning run. The run being written is never evicted, even
+ * when it alone exceeds the budget.
  */
 export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
+export const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
 export const LOAD_TAIL_BYTES = 32 * 1024 * 1024;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
   steps: Map<string, DevToolsStep>;
+  /** Approximate JSON bytes retained per run: the run entry plus its current steps. */
+  runBytes: Map<string, number>;
+  /** Approximate JSON bytes of each retained step, so an update replaces rather than adds. */
+  stepBytes: Map<string, number>;
+  retainedBytes: number;
   loaded: boolean;
   /** Incremented on each clear() for defense-in-depth against stale state. */
   clearGeneration: number;
+}
+
+export interface DevToolsServiceOptions {
+  maxRetainedBytesPerWorkspace?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -93,25 +112,35 @@ async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGene
   }
 }
 
-/** Drop the oldest runs (by append order) and their steps past the retention bound. */
-function evictRunsBeyondBound(data: WorkspaceData): void {
-  while (data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE) {
-    const oldestRunId = data.runs.keys().next().value;
-    if (oldestRunId === undefined) {
-      return;
-    }
-    data.runs.delete(oldestRunId);
-    for (const [stepId, step] of data.steps) {
-      if (step.runId === oldestRunId) {
-        data.steps.delete(stepId);
-      }
-    }
-  }
+function jsonLength(value: unknown): number {
+  const json = JSON.stringify(value);
+  return json === undefined ? 0 : json.length;
 }
 
-function insertRun(data: WorkspaceData, run: DevToolsRun): void {
-  data.runs.set(run.id, run);
-  evictRunsBeyondBound(data);
+/**
+ * Bytes of `existing` that `update` overwrites. Subtracting them keeps a step
+ * that is re-sent (or finalized) from being counted once per update; the values
+ * replaced are normally `null` placeholders, so this is cheap even for large
+ * payloads.
+ */
+function replacedStepBytes(existing: DevToolsStep, update: Partial<DevToolsStep>): number {
+  let bytes = 0;
+  for (const key of Object.keys(update) as Array<keyof DevToolsStep>) {
+    bytes += jsonLength(existing[key]);
+  }
+  return bytes;
+}
+
+function evictRun(data: WorkspaceData, runId: string): void {
+  data.runs.delete(runId);
+  for (const [stepId, step] of data.steps) {
+    if (step.runId === runId) {
+      data.steps.delete(stepId);
+      data.stepBytes.delete(stepId);
+    }
+  }
+  data.retainedBytes -= data.runBytes.get(runId) ?? 0;
+  data.runBytes.delete(runId);
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
@@ -186,9 +215,15 @@ export class DevToolsService extends EventEmitter {
    * one pending metadata payload per request instead of a single workspace slot.
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
+  private readonly maxRetainedBytesPerWorkspace: number;
 
-  constructor(private readonly config: Config) {
+  constructor(
+    private readonly config: Config,
+    options?: DevToolsServiceOptions
+  ) {
     super();
+    this.maxRetainedBytesPerWorkspace =
+      options?.maxRetainedBytesPerWorkspace ?? MAX_RETAINED_BYTES_PER_WORKSPACE;
   }
 
   get enabled(): boolean {
@@ -288,8 +323,10 @@ export class DevToolsService extends EventEmitter {
       }
     }
 
-    insertRun(data, run);
-    await this.appendToFile(workspaceId, { type: "run", run });
+    const entry: DevToolsLogEntry = { type: "run", run };
+    const json = JSON.stringify(entry);
+    this.insertRun(data, run, json.length);
+    await this.appendToFile(workspaceId, entry, json);
 
     const summary = this.buildRunSummary(data, run.id);
     this.emitWorkspaceEvent(workspaceId, { type: "run-created", run: summary });
@@ -314,16 +351,20 @@ export class DevToolsService extends EventEmitter {
         workspaceId,
         startedAt: step.startedAt,
       };
-      insertRun(data, autoRun);
-      await this.appendToFile(workspaceId, { type: "run", run: autoRun });
+      const runEntry: DevToolsLogEntry = { type: "run", run: autoRun };
+      const runJson = JSON.stringify(runEntry);
+      this.insertRun(data, autoRun, runJson.length);
+      await this.appendToFile(workspaceId, runEntry, runJson);
       this.emitWorkspaceEvent(workspaceId, {
         type: "run-created",
         run: this.buildRunSummary(data, autoRun.id),
       });
     }
 
-    data.steps.set(step.id, step);
-    await this.appendToFile(workspaceId, { type: "step", step });
+    const entry: DevToolsLogEntry = { type: "step", step };
+    const json = JSON.stringify(entry);
+    this.setStep(data, step, json.length);
+    await this.appendToFile(workspaceId, entry, json);
 
     this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
     if (data.runs.has(step.runId)) {
@@ -355,13 +396,11 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
-    data.steps.set(stepId, mergedStep);
+    const entry: DevToolsLogEntry = { type: "step-update", stepId, update };
+    const json = JSON.stringify(entry);
+    this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length));
 
-    await this.appendToFile(workspaceId, {
-      type: "step-update",
-      stepId,
-      update,
-    });
+    await this.appendToFile(workspaceId, entry, json);
 
     this.emitWorkspaceEvent(workspaceId, {
       type: "step-updated",
@@ -445,6 +484,9 @@ export class DevToolsService extends EventEmitter {
     const data = this.getOrCreateWorkspaceData(workspaceId);
     data.runs.clear();
     data.steps.clear();
+    data.runBytes.clear();
+    data.stepBytes.clear();
+    data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
     this.pendingRunMetadata.delete(workspaceId);
@@ -528,11 +570,63 @@ export class DevToolsService extends EventEmitter {
     data = {
       runs: new Map<string, DevToolsRun>(),
       steps: new Map<string, DevToolsStep>(),
+      runBytes: new Map<string, number>(),
+      stepBytes: new Map<string, number>(),
+      retainedBytes: 0,
       loaded: false,
       clearGeneration: 0,
     };
     this.workspaces.set(workspaceId, data);
     return data;
+  }
+
+  private insertRun(data: WorkspaceData, run: DevToolsRun, bytes: number): void {
+    data.runs.set(run.id, run);
+    this.addRunBytes(data, run.id, bytes);
+    this.enforceRetention(data, run.id);
+  }
+
+  private setStep(data: WorkspaceData, step: DevToolsStep, bytes: number): void {
+    const previousBytes = data.stepBytes.get(step.id) ?? 0;
+    data.steps.set(step.id, step);
+    data.stepBytes.set(step.id, bytes);
+    this.addRunBytes(data, step.runId, bytes - previousBytes);
+    this.enforceRetention(data, step.runId);
+  }
+
+  /** Size of `existing` after applying `update`, given the update's serialized length. */
+  private updatedStepBytes(
+    data: WorkspaceData,
+    existing: DevToolsStep,
+    update: Partial<DevToolsStep>,
+    updateJsonBytes: number
+  ): number {
+    const previousBytes = data.stepBytes.get(existing.id) ?? 0;
+    return Math.max(0, previousBytes + updateJsonBytes - replacedStepBytes(existing, update));
+  }
+
+  private addRunBytes(data: WorkspaceData, runId: string, delta: number): void {
+    data.runBytes.set(runId, (data.runBytes.get(runId) ?? 0) + delta);
+    data.retainedBytes += delta;
+  }
+
+  /**
+   * Drop the oldest runs (by append order) and their steps until both the run
+   * and byte bounds hold. `writingRunId` is the run the caller just inserted or
+   * grew; it is never evicted, so a single oversized run stays visible (and its
+   * pending disk append is not suppressed by the appendToFile existence guard).
+   */
+  private enforceRetention(data: WorkspaceData, writingRunId: string): void {
+    while (
+      data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE ||
+      data.retainedBytes > this.maxRetainedBytesPerWorkspace
+    ) {
+      const oldestRunId = data.runs.keys().next().value;
+      if (oldestRunId === undefined || oldestRunId === writingRunId) {
+        return;
+      }
+      evictRun(data, oldestRunId);
+    }
   }
 
   private async ensureLoaded(workspaceId: string): Promise<void> {
@@ -593,7 +687,7 @@ export class DevToolsService extends EventEmitter {
       const entry = JSON.parse(line) as DevToolsLogEntry;
       switch (entry.type) {
         case "run": {
-          insertRun(data, entry.run);
+          this.insertRun(data, entry.run, line.length);
           break;
         }
         case "step": {
@@ -602,18 +696,19 @@ export class DevToolsService extends EventEmitter {
           if (!data.runs.has(entry.step.runId)) {
             break;
           }
-          data.steps.set(entry.step.id, applyStepBackwardCompatibilityDefaults(entry.step));
+          this.setStep(data, applyStepBackwardCompatibilityDefaults(entry.step), line.length);
           break;
         }
         case "step-update": {
           const existing = data.steps.get(entry.stepId);
           if (existing) {
-            data.steps.set(
-              entry.stepId,
+            this.setStep(
+              data,
               applyStepBackwardCompatibilityDefaults({
                 ...existing,
                 ...entry.update,
-              })
+              }),
+              this.updatedStepBytes(data, existing, entry.update, line.length)
             );
           }
           break;
@@ -723,7 +818,12 @@ export class DevToolsService extends EventEmitter {
     return next;
   }
 
-  private async appendToFile(workspaceId: string, entry: DevToolsLogEntry): Promise<void> {
+  /** `json` is the caller's serialization of `entry`, shared with retention accounting. */
+  private async appendToFile(
+    workspaceId: string,
+    entry: DevToolsLogEntry,
+    json: string
+  ): Promise<void> {
     return this.enqueueWrite(workspaceId, async () => {
       // Defense-in-depth: skip stale writes after clear() by requiring current entities.
       const data = this.workspaces.get(workspaceId);
@@ -741,7 +841,7 @@ export class DevToolsService extends EventEmitter {
       }
 
       await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
-        fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8")
+        fs.appendFile(filePath, `${json}\n`, "utf-8")
       );
     });
   }

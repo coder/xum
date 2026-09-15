@@ -663,6 +663,85 @@ describe("DevToolsService", () => {
       expect(logContents).toContain("step-oldest");
     });
 
+    describe("byte budget", () => {
+      const BUDGET_BYTES = 100_000;
+      const rawChunksOf = (bytes: number): unknown[] => [{ data: "x".repeat(bytes) }];
+      const bigStep = (index: number, bytes: number) =>
+        makeStep({ id: `step-${index}`, runId: `run-${index}`, rawChunks: rawChunksOf(bytes) });
+      const runAt = (index: number) =>
+        makeRun(`run-${index}`, new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString());
+      const runIds = async (service: DevToolsService) =>
+        (await service.getRuns("ws-1")).map((run) => run.id).sort();
+
+      it("evicts the oldest runs and their steps once retained bytes exceed the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+
+        for (let index = 1; index <= 3; index += 1) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 40_000));
+        }
+        expect(await runIds(service)).toEqual(["run-2", "run-3"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        // A single run larger than the whole budget still survives as the newest.
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-4"]);
+        expect((await service.getRunWithSteps("ws-1", "run-4"))?.steps.map((s) => s.id)).toEqual([
+          "step-4",
+        ]);
+
+        // Eviction is memory-only; the on-disk log keeps every entry.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        for (let index = 1; index <= 4; index += 1) {
+          expect(logContents).toContain(`"run-${index}"`);
+          expect(logContents).toContain(`"step-${index}"`);
+        }
+      });
+
+      it("updateStep replaces the step's accounted size instead of adding to it", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", makeStep({ id: "step-2", runId: "run-2" }));
+
+        // Re-sending the same 60 KB payload must not count it twice (120 KB > budget).
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        expect(await runIds(service)).toEqual(["run-1", "run-2"]);
+
+        // Growing the same step past the budget evicts the older run, not the updated one.
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(BUDGET_BYTES) });
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const detail = await service.getRunWithSteps("ws-1", "run-2");
+        expect(detail?.steps[0]?.rawChunks).toEqual(rawChunksOf(BUDGET_BYTES));
+      });
+
+      it("retains only the newest runs that fit the budget when replaying a log", async () => {
+        const config = createTestConfig({ sessionsDir, enabled: true });
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lines: string[] = [];
+        for (let index = 1; index <= 5; index += 1) {
+          lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
+          lines.push(JSON.stringify({ type: "step", step: bigStep(index, 40_000) }));
+        }
+        await fs.mkdir(path.dirname(logPath), { recursive: true });
+        await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+        const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+        expect(await runIds(service)).toEqual(["run-4", "run-5"]);
+        expect((await service.getRunWithSteps("ws-1", "run-5"))?.steps.map((s) => s.id)).toEqual([
+          "step-5",
+        ]);
+        expect(await service.getRunWithSteps("ws-1", "run-3")).toBeNull();
+      });
+    });
+
     it("replays only the tail of an oversized log, starting on a line boundary", async () => {
       const config = createTestConfig({ sessionsDir, enabled: true });
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
