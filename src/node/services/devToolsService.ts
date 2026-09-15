@@ -331,7 +331,7 @@ export class DevToolsService extends EventEmitter {
 
     const entry: DevToolsLogEntry = { type: "run", run };
     const json = JSON.stringify(entry);
-    this.insertRun(data, run, json.length);
+    this.emitEvicted(workspaceId, this.insertRun(data, run, json.length));
     await this.appendToFile(workspaceId, json);
 
     // The run may have been evicted or cleared while the append was queued;
@@ -365,7 +365,7 @@ export class DevToolsService extends EventEmitter {
       };
       const runEntry: DevToolsLogEntry = { type: "run", run: autoRun };
       const runJson = JSON.stringify(runEntry);
-      this.insertRun(data, autoRun, runJson.length);
+      this.emitEvicted(workspaceId, this.insertRun(data, autoRun, runJson.length));
       await this.appendToFile(workspaceId, runJson);
       if (data.runs.has(autoRun.id)) {
         this.emitWorkspaceEvent(workspaceId, {
@@ -377,7 +377,7 @@ export class DevToolsService extends EventEmitter {
 
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
-    this.setStep(data, step, json.length);
+    this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
     await this.appendToFile(workspaceId, json);
 
     this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
@@ -420,7 +420,10 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
-    this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length));
+    this.emitEvicted(
+      workspaceId,
+      this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length))
+    );
 
     await this.appendToFile(workspaceId, json);
 
@@ -562,6 +565,17 @@ export class DevToolsService extends EventEmitter {
     this.emit(`update:${workspaceId}`, event);
   }
 
+  /**
+   * Tell live subscribers which runs retention just dropped, so the renderer
+   * releases them too instead of showing a run whose steps are gone. Replay
+   * evictions are not announced: the snapshot already reflects them.
+   */
+  private emitEvicted(workspaceId: string, runIds: string[]): void {
+    if (runIds.length > 0) {
+      this.emitWorkspaceEvent(workspaceId, { type: "runs-evicted", runIds });
+    }
+  }
+
   /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
   async hasWorkspaceData(workspaceId: string): Promise<boolean> {
     assert(
@@ -602,18 +616,20 @@ export class DevToolsService extends EventEmitter {
     return data;
   }
 
-  private insertRun(data: WorkspaceData, run: DevToolsRun, bytes: number): void {
+  /** Returns the run ids retention evicted to make room. */
+  private insertRun(data: WorkspaceData, run: DevToolsRun, bytes: number): string[] {
     data.runs.set(run.id, run);
     this.addRunBytes(data, run.id, bytes);
-    this.enforceRetention(data, run.id);
+    return this.enforceRetention(data, run.id);
   }
 
-  private setStep(data: WorkspaceData, step: DevToolsStep, bytes: number): void {
+  /** Returns the run ids retention evicted to make room. */
+  private setStep(data: WorkspaceData, step: DevToolsStep, bytes: number): string[] {
     const previousBytes = data.stepBytes.get(step.id) ?? 0;
     data.steps.set(step.id, step);
     data.stepBytes.set(step.id, bytes);
     this.addRunBytes(data, step.runId, bytes - previousBytes);
-    this.enforceRetention(data, step.runId);
+    return this.enforceRetention(data, step.runId);
   }
 
   /** Size of `existing` after applying `update`, given the update's serialized length. */
@@ -637,9 +653,11 @@ export class DevToolsService extends EventEmitter {
    * and byte bounds hold. `writingRunId` is the run the caller just inserted or
    * grew; it is never evicted, so a single oversized run stays visible. It is
    * skipped rather than treated as a stop: an old in-flight run that grows
-   * late must still push out the newer runs behind it.
+   * late must still push out the newer runs behind it. Returns the evicted
+   * run ids in eviction order.
    */
-  private enforceRetention(data: WorkspaceData, writingRunId: string): void {
+  private enforceRetention(data: WorkspaceData, writingRunId: string): string[] {
+    const evictedRunIds: string[] = [];
     while (
       data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE ||
       data.retainedBytes > this.maxRetainedBytesPerWorkspace
@@ -652,10 +670,12 @@ export class DevToolsService extends EventEmitter {
         }
       }
       if (oldestEvictableRunId === undefined) {
-        return;
+        break;
       }
       evictRun(data, oldestEvictableRunId);
+      evictedRunIds.push(oldestEvictableRunId);
     }
+    return evictedRunIds;
   }
 
   private async ensureLoaded(workspaceId: string): Promise<void> {

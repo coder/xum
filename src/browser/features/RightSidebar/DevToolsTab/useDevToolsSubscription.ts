@@ -68,6 +68,18 @@ export function useDevToolsSubscription(workspaceId: string) {
           case "step-updated":
             setStepsByRun((previousStepsByRun) => upsertStep(previousStepsByRun, event.step));
             break;
+          case "runs-evicted": {
+            const evictedRunIds = new Set(event.runIds);
+            setRuns((previousRuns) => previousRuns.filter((run) => !evictedRunIds.has(run.id)));
+            setStepsByRun((previousStepsByRun) => {
+              const nextStepsByRun = new Map(previousStepsByRun);
+              for (const runId of evictedRunIds) {
+                nextStepsByRun.delete(runId);
+              }
+              return nextStepsByRun;
+            });
+            break;
+          }
           case "cleared":
             setRuns([]);
             setStepsByRun(new Map());

@@ -106,6 +106,8 @@ export type DevToolsEvent =
   | { type: "run-updated"; run: DevToolsRunSummary }
   | { type: "step-created"; step: DevToolsStep }
   | { type: "step-updated"; step: DevToolsStep }
+  /** Retention dropped these runs (and their steps) from memory; the on-disk log keeps them. */
+  | { type: "runs-evicted"; runIds: string[] }
   | { type: "cleared" };
 
 /** One line in devtools.jsonl — append-only log format. */

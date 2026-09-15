@@ -787,6 +787,30 @@ describe("DevToolsService", () => {
         expect(await runIds(service)).toEqual(["run-1", "run-4"]);
       });
 
+      it("emits runs-evicted with the dropped run ids so live subscribers release them", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const evictedBatches: string[][] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          if (event.type === "runs-evicted") {
+            evictedBatches.push(event.runIds);
+          }
+        });
+
+        for (const index of [1, 2]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(evictedBatches).toEqual([]);
+
+        // One oversized step pushes both older runs out in a single eviction pass.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, BUDGET_BYTES + 1));
+        expect(evictedBatches).toEqual([["run-1", "run-2"]]);
+        expect(await runIds(service)).toEqual(["run-3"]);
+      });
+
       it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
         const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
           maxRetainedBytesPerWorkspace: BUDGET_BYTES,
