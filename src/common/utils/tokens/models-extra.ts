@@ -481,10 +481,12 @@ export const modelsExtra: Record<string, ModelData> = {
   // OpenAI has published no specs or pricing for the id, and an entry with
   // placeholder costs would be unsafe: explicit $0 rates make getTotalCost
   // return a defined $0, which bypasses the CLI --budget "unknown pricing"
-  // rejection and the goal-budget modelHasPricingData guard, allowing unbounded
-  // spend on a billable API model. Null stats keep every budget path
-  // fail-closed until OpenAI publishes real numbers (add the entry then; the
-  // curated-coverage exemption lives in updateModelsData.ts).
+  // rejection and would let a billable API model spend past the cap. (Goal
+  // budgets were already safe either way: modelHasPricingData rejects all-zero
+  // rates.) Null stats make both paths treat the model as unpriced — the CLI
+  // --budget check rejects sessions whose total cost is unknown, and goal
+  // budgets refuse the model — until OpenAI publishes real numbers (add the
+  // entry then; the curated-coverage exemption lives in updateModelsData.ts).
 
   // GPT-5.5 Pro - Released April 23, 2026
   // Native 1.05M context, 128K max output; Responses API only.

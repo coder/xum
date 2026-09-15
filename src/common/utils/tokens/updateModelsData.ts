@@ -158,9 +158,9 @@ function providesUsableMetadata(entry: unknown): boolean {
  *
  * Provisional curated entries listed in PROVISIONAL_UNCOVERED_MODEL_IDS are
  * intentionally uncovered: giving them placeholder stats would define a $0
- * cost that bypasses budget enforcement (see the GPT-6 Sol comment in
- * models-extra.ts). Remove an id from that set once its official model page
- * ships and a real models-extra/models.json entry lands.
+ * cost that the CLI --budget check accepts as spend (see the GPT-6 Sol
+ * comment in models-extra.ts). Remove an id from that set once its official
+ * model page ships and a real models-extra/models.json entry lands.
  */
 const PROVISIONAL_UNCOVERED_MODEL_IDS = new Set<string>([KNOWN_MODELS.GPT_6_SOL.id]);
 

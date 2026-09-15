@@ -71,9 +71,10 @@ describe("Known Models Integration", () => {
     const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
     expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_SOL.id));
     // Budget safety: unpublished pricing must resolve as unknown (null stats),
-    // not a defined $0 — a $0 rate bypasses the CLI --budget unknown-pricing
-    // rejection and the goal-budget modelHasPricingData guard on a billable
-    // API model (see models-extra.ts).
+    // not a defined $0 — a defined $0 total bypasses the CLI --budget
+    // unknown-pricing rejection on a billable API model. Goal budgets already
+    // reject all-zero rates via modelHasPricingData; null stats make both
+    // paths treat the model as unpriced (see models-extra.ts).
     expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).toBeNull();
   });
 
