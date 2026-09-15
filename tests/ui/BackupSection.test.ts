@@ -1029,6 +1029,28 @@ describe("BackupSection", () => {
     expect(canvas.queryByText("Projects to reimport")).toBeNull();
   });
 
+  test("makes no MCP coverage claim when the export preview failed", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: "mcp.jsonc is not valid JSONC",
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Kept on this device");
+    expect(canvas.queryByText("Every MCP value is in the backup.")).toBeNull();
+    expect(canvas.getByText("Not computed because the export preview failed.")).toBeTruthy();
+  });
+
   test("reports a skipped project bundle after a preview", async () => {
     const { view } = renderBackupSection({
       backupPreview: {

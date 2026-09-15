@@ -932,6 +932,10 @@ export function BackupSection() {
                 <p className="text-muted mt-2 text-xs">
                   MCP server configuration is not in the backup, so all of it stays here.
                 </p>
+              ) : preview.pushError ? (
+                <p className="text-muted mt-2 text-xs">
+                  Not computed because the export preview failed.
+                </p>
               ) : preview.redactions.length === 0 ? (
                 <p className="text-muted mt-2 text-xs">Every MCP value is in the backup.</p>
               ) : (
