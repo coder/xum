@@ -28,6 +28,17 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
 
 export const BACKUP_SCHEMA_VERSION = 1;
+/**
+ * Written only when the backup carries a literal MCP header value. Builds before this one
+ * restore a header as the same-named local value or nothing, so they would drop every header
+ * the user chose to carry while reporting a complete restore; a schema version they do not
+ * know makes them refuse the backup instead. Backups without literal headers keep version 1
+ * so a downgraded build can still restore them.
+ */
+export const BACKUP_SCHEMA_VERSION_LITERAL_HEADERS = 2;
+type BackupSchemaVersion =
+  | typeof BACKUP_SCHEMA_VERSION
+  | typeof BACKUP_SCHEMA_VERSION_LITERAL_HEADERS;
 export const BACKUP_MANIFEST_FILE = "manifest.json";
 /**
  * The opt-in project bundle lives beside the core payload, never inside its manifest: an
@@ -110,7 +121,7 @@ export interface BackupManifestFile {
 export type BackupRedactionPath = jsonc.JSONPath;
 
 export interface BackupManifest {
-  schemaVersion: typeof BACKUP_SCHEMA_VERSION;
+  schemaVersion: BackupSchemaVersion;
   exportedAt: string;
   muxVersion: string;
   sourceLabel: string;
@@ -1509,6 +1520,25 @@ function mcpConfigRequiresPublishApproval(content: string, options: McpProjectio
   return false;
 }
 
+/** A header value carried verbatim: neither a `{secret: NAME}` reference nor a marker. */
+function mcpConfigCarriesLiteralHeaders(content: string): boolean {
+  const errors: jsonc.ParseError[] = [];
+  const parsed = readRecord(jsonc.parse(content, errors));
+  if (errors.length > 0 || !parsed) return false;
+  const servers = readRecord(readOwn(parsed, "servers"));
+  if (!servers) return false;
+  return Object.values(servers).some((server) => {
+    const serverRecord = readRecord(server);
+    const headers = serverRecord && readRecord(readOwn(serverRecord, "headers"));
+    return (
+      headers !== undefined &&
+      Object.values(headers).some(
+        (value) => typeof value === "string" && value !== REDACTED_BACKUP_VALUE
+      )
+    );
+  });
+}
+
 function isRecursivelyCollected(filePath: string): boolean {
   return (
     filePath.startsWith("skills/") ||
@@ -1599,7 +1629,10 @@ export async function createBackupPayload(
 
   return {
     manifest: {
-      schemaVersion: BACKUP_SCHEMA_VERSION,
+      schemaVersion:
+        mcpFile && mcpConfigCarriesLiteralHeaders(mcpFile.content.toString("utf-8"))
+          ? BACKUP_SCHEMA_VERSION_LITERAL_HEADERS
+          : BACKUP_SCHEMA_VERSION,
       exportedAt: options.exportedAt ?? new Date().toISOString(),
       muxVersion: normalizeMuxVersion(options.muxVersion),
       sourceLabel: options.sourceLabel,
@@ -1786,7 +1819,8 @@ function parseManifest(raw: string, portable: boolean, contents?: BackupContents
   if (!isPlainObject(value)) throw new Error("Invalid backup manifest");
   const manifest: Partial<BackupManifest> = value;
   if (
-    manifest.schemaVersion !== BACKUP_SCHEMA_VERSION ||
+    (manifest.schemaVersion !== BACKUP_SCHEMA_VERSION &&
+      manifest.schemaVersion !== BACKUP_SCHEMA_VERSION_LITERAL_HEADERS) ||
     typeof manifest.exportedAt !== "string" ||
     typeof manifest.muxVersion !== "string" ||
     typeof manifest.sourceLabel !== "string"

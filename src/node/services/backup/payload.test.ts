@@ -11,6 +11,7 @@ import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BACKUP_SCHEMA_VERSION,
+  BACKUP_SCHEMA_VERSION_LITERAL_HEADERS,
   BackupCommandApprovalRequiredError,
   assertBackupCommandsApproved,
   MAX_BACKUP_DIRECTORY_COUNT,
@@ -60,6 +61,7 @@ import {
   MAX_BACKUP_PROJECT_ENTRIES,
   resolveBackupContents,
   sanitizeBackupGitRemote,
+  type BackupContents,
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
@@ -303,6 +305,38 @@ describe("backup payload", () => {
     expect(payload.redactions).toEqual([]);
     // Published verbatim means reviewed before publication.
     expect(scanBackupFilesForSecrets(payload.files, CONTENTS)).toEqual(["mcp.jsonc"]);
+  });
+
+  it("marks a backup carrying literal header values with a version older builds refuse", async () => {
+    await writeFixtureFile(muxRoot, "mcp.jsonc", MCP_WITH_CREDENTIAL_FIELDS);
+    const exportWith = (contents: BackupContents) =>
+      createBackupPayload({
+        muxRoot,
+        contents,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+
+    const literal = await exportWith(CONTENTS);
+    expect(literal.manifest.schemaVersion).toBe(BACKUP_SCHEMA_VERSION_LITERAL_HEADERS);
+    const destination = path.join(tempDir, "literal-headers");
+    await writeBackupPayload(destination, literal);
+    const read = await readBackupPayload(destination, { contents: CONTENTS });
+    expect(read.manifest.schemaVersion).toBe(BACKUP_SCHEMA_VERSION_LITERAL_HEADERS);
+
+    // Markers and references restore on any build, so those backups keep the common version.
+    const headersDeselected = await exportWith(resolveBackupContents({ includeMcpHeaders: false }));
+    expect(headersDeselected.manifest.schemaVersion).toBe(BACKUP_SCHEMA_VERSION);
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { api: { url: "https://example.com/mcp", headers: { Secret: { secret: "S" } } } },
+      })
+    );
+    const referencesOnly = await exportWith(CONTENTS);
+    expect(referencesOnly.manifest.schemaVersion).toBe(BACKUP_SCHEMA_VERSION);
   });
 
   it("leaves header values and stdio commands out when their categories are not selected", async () => {
