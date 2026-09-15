@@ -780,6 +780,38 @@ describe("DevToolsService", () => {
       expect(detail?.steps.map((step) => step.id)).toEqual(["step-new"]);
     });
 
+    it("keeps the first tail line when the cut lands exactly on a line boundary", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+
+      const tailLines = [
+        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-03T00:00:00.000Z") }),
+      ];
+      // Pad the boundary entry so it starts exactly at size - LOAD_TAIL_BYTES, right after
+      // the previous line's newline. It is a complete line and must be replayed.
+      const boundaryRun = (padLength: number) =>
+        JSON.stringify({
+          type: "run",
+          run: {
+            ...makeRun("run-boundary", "2025-01-02T00:00:00.000Z"),
+            pad: "b".repeat(padLength),
+          },
+        });
+      const tailRestBytes = tailLines.join("\n").length + 2; // boundary + trailing newlines
+      const boundaryTarget = LOAD_TAIL_BYTES - tailRestBytes;
+      const boundary = boundaryRun(boundaryTarget - boundaryRun(0).length);
+
+      const contents = `${JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") })}\n${boundary}\n${tailLines.join("\n")}\n`;
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, contents, "utf-8");
+      expect((await fs.stat(logPath)).size - LOAD_TAIL_BYTES).toBe(contents.indexOf(boundary));
+
+      const service = new DevToolsService(config);
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs.map((run) => run.id)).toEqual(["run-new", "run-boundary"]);
+    });
+
     it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
       const config = createTestConfig({ sessionsDir, enabled: true });
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");

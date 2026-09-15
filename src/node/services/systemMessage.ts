@@ -354,27 +354,26 @@ export async function readToolInstructions(
 const TOOL_INSTRUCTIONS_PARSE_CACHE_MAX_ENTRIES = 64;
 const toolInstructionsParseCache = new Map<string, Record<string, string>>();
 
+type ExtractToolInstructionsOptions = NonNullable<Parameters<typeof extractToolInstructions>[3]>;
+
 function extractToolInstructionsCached(
   globalContents: readonly string[],
   contextContents: readonly string[],
   modelString: string,
-  options: Parameters<typeof extractToolInstructions>[3]
+  options: ExtractToolInstructionsOptions | undefined
 ): Record<string, string> {
   // Arrays are serialized (not joined) so file boundaries and global/context
-  // placement are part of the key; option fields are listed explicitly so key
-  // order in the options object cannot affect the hash.
+  // placement are part of the key. The Record type forces every option field
+  // into the key in a fixed order, so adding an option without hashing it is a
+  // compile error rather than a stale-cache bug.
+  const keyedOptions: Record<keyof ExtractToolInstructionsOptions, unknown> = {
+    enableAgentReport: options?.enableAgentReport ?? null,
+    enableReviewPane: options?.enableReviewPane ?? null,
+    enableMuxGlobalAgentsTools: options?.enableMuxGlobalAgentsTools ?? null,
+    agentInstructions: options?.agentInstructions ?? null,
+  };
   const key = createHash("sha1")
-    .update(
-      JSON.stringify([
-        globalContents,
-        contextContents,
-        modelString,
-        options?.enableAgentReport ?? null,
-        options?.enableReviewPane ?? null,
-        options?.enableMuxGlobalAgentsTools ?? null,
-        options?.agentInstructions ?? null,
-      ])
-    )
+    .update(JSON.stringify([globalContents, contextContents, modelString, keyedOptions]))
     .digest("hex");
 
   const cached = toolInstructionsParseCache.get(key);

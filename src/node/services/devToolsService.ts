@@ -44,7 +44,7 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
  * when it alone exceeds the budget.
  */
 export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
-export const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
+const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
 export const LOAD_TAIL_BYTES = 32 * 1024 * 1024;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
 
@@ -79,8 +79,14 @@ async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGene
   try {
     const { size } = await handle.stat();
     let position = Math.max(0, size - maxTailBytes);
-    let skipPartialFirstLine = position > 0;
     const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
+    let skipPartialFirstLine = false;
+    if (position > 0) {
+      // A cut that lands right after a newline starts on a complete line; only skip when
+      // the preceding byte shows we are mid-line.
+      const { bytesRead } = await handle.read(chunk, 0, 1, position - 1);
+      skipPartialFirstLine = bytesRead === 0 || chunk[0] !== 0x0a;
+    }
     const decoder = new StringDecoder("utf-8");
     let pending = "";
 

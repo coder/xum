@@ -73,11 +73,9 @@ describe("WorkspaceConsumerManager", () => {
     await waitForCalculation(manager, "ws-1");
 
     expect(calculateStats).toHaveBeenCalledTimes(1);
-    const payload = calculateStats.mock.calls[0][0];
-    expect(payload).toEqual({ workspaceId: "ws-1", model: "gpt-4" });
-    // Regression guard for the ~36 KB/s upstream leak: the request must stay a few bytes
+    // Regression guard for the ~36 KB/s upstream leak: only identifiers cross the wire,
     // regardless of how large the renderer's copy of the transcript is.
-    expect(JSON.stringify(payload).length).toBeLessThan(100);
+    expect(calculateStats.mock.calls[0][0]).toEqual({ workspaceId: "ws-1", model: "gpt-4" });
 
     expect(manager.getCachedState("ws-1")).toEqual({
       consumers: STATS.consumers,

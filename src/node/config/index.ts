@@ -3363,8 +3363,8 @@ export class Config {
     if (options.legacyAliasIds !== undefined) {
       for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
     }
-    // Fresh array, shared entries: callers of this variant only read (verified when the memo
-    // was added), and the array copy keeps one caller's filter/sort from leaking into another.
+    // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
+    // caller's in-place filter/sort from leaking into another.
     return metadata.slice();
   }
 
