@@ -28,11 +28,15 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
  *
  * Policy: only the newest MAX_RETAINED_RUNS_PER_WORKSPACE runs (with their
  * steps) are kept per workspace, evicting the oldest by append order as new runs
- * arrive; and on load only the last LOAD_TAIL_BYTES of the file are replayed,
- * streamed in LOAD_CHUNK_BYTES reads so the file is never materialized in
- * memory. Steps whose run falls outside the retained window are dropped. The
- * DevTools panel therefore shows a bounded recent window rather than the full
- * history; the on-disk file is left untouched (rotation is a follow-up).
+ * arrive. Load replays the whole file forward, streamed in LOAD_CHUNK_BYTES
+ * reads so it is never materialized in memory, applying every line through the
+ * same retention as the live path; peak memory is the retention budget plus one
+ * line regardless of file size. Replaying from byte 0 (rather than a byte-offset
+ * tail cut) is deliberate: lines depend on earlier lines (a step needs its run
+ * header, an update needs its step), so any cut point loses or corrupts the
+ * newest run in some layout. Steps whose run was already evicted are dropped.
+ * The DevTools panel therefore shows a bounded recent window rather than the
+ * full history; the on-disk file is left untouched (compaction is a follow-up).
  *
  * The run bound alone does not cap memory: a single streamed step carries the
  * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
@@ -45,7 +49,6 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
  */
 export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
 const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
-export const LOAD_TAIL_BYTES = 32 * 1024 * 1024;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
 
 interface WorkspaceData {
@@ -63,119 +66,26 @@ interface WorkspaceData {
 
 export interface DevToolsServiceOptions {
   maxRetainedBytesPerWorkspace?: number;
-  loadTailBytes?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-/** Index of the first newline byte in [from, to), or -1. */
-async function findNewlineForward(
-  handle: fs.FileHandle,
-  chunk: Buffer,
-  from: number,
-  to: number
-): Promise<number> {
-  let position = from;
-  while (position < to) {
-    const { bytesRead } = await handle.read(
-      chunk,
-      0,
-      Math.min(chunk.length, to - position),
-      position
-    );
-    if (bytesRead === 0) {
-      break;
-    }
-    const index = chunk.subarray(0, bytesRead).indexOf(0x0a);
-    if (index !== -1) {
-      return position + index;
-    }
-    position += bytesRead;
-  }
-  return -1;
-}
-
-/** Index of the last newline byte in [0, before), or -1. */
-async function findNewlineBackward(
-  handle: fs.FileHandle,
-  chunk: Buffer,
-  before: number
-): Promise<number> {
-  let end = before;
-  while (end > 0) {
-    const start = Math.max(0, end - chunk.length);
-    const { bytesRead } = await handle.read(chunk, 0, end - start, start);
-    if (bytesRead === 0) {
-      break;
-    }
-    const index = chunk.subarray(0, bytesRead).lastIndexOf(0x0a);
-    if (index !== -1) {
-      return start + index;
-    }
-    end = start;
-  }
-  return -1;
-}
-
-/** Whether a line starting after `newlineIndex` has room to end before `end`. */
-function hasCompleteLineAfter(newlineIndex: number, end: number): boolean {
-  return newlineIndex !== -1 && newlineIndex + 1 < end;
-}
-
 /**
- * Yield the lines in the last `maxTailBytes` of a file without ever holding the
- * whole file in memory. When the read starts mid-file, replay begins at the
- * first line boundary inside the window. If the window holds no complete line,
- * the file ends in a single line larger than the window (a multi-MB rawChunks
- * payload); that entry could not be retained anyway, so it is dropped and the
- * window is moved to end where it starts, keeping the complete entries before it
- * (otherwise the newest run would vanish after a restart).
+ * Yield every line of a file in order, streamed in LOAD_CHUNK_BYTES reads with
+ * an await between chunks, so memory holds one chunk plus one pending line and
+ * the event loop is never blocked for the whole file.
  */
-async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGenerator<string> {
+async function* readLines(filePath: string): AsyncGenerator<string> {
   const handle = await fs.open(filePath, "r");
   try {
-    const { size } = await handle.stat();
     const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
-    let end = size;
-    let start = Math.max(0, size - maxTailBytes);
-
-    if (start > 0) {
-      // Including the byte before the cut lets a cut that lands right after a
-      // newline keep its first line.
-      let firstNewline = await findNewlineForward(handle, chunk, start - 1, end);
-      if (!hasCompleteLineAfter(firstNewline, end)) {
-        // The window is inside the file's final (newline-terminated) line.
-        const oversizedLineStart = (await findNewlineBackward(handle, chunk, start)) + 1;
-        if (oversizedLineStart === 0) {
-          return;
-        }
-        end = oversizedLineStart;
-        start = Math.max(0, end - maxTailBytes);
-        if (start > 0) {
-          firstNewline = await findNewlineForward(handle, chunk, start - 1, end);
-          if (!hasCompleteLineAfter(firstNewline, end)) {
-            // Two oversized lines back to back; not worth chasing further.
-            return;
-          }
-        }
-      }
-      if (start > 0) {
-        start = firstNewline + 1;
-      }
-    }
-
     const decoder = new StringDecoder("utf-8");
     let pending = "";
-    let position = start;
-    while (position < end) {
-      const { bytesRead } = await handle.read(
-        chunk,
-        0,
-        Math.min(chunk.length, end - position),
-        position
-      );
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
       if (bytesRead === 0) {
         break;
       }
@@ -300,7 +210,6 @@ export class DevToolsService extends EventEmitter {
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
   private readonly maxRetainedBytesPerWorkspace: number;
-  private readonly loadTailBytes: number;
 
   constructor(
     private readonly config: Config,
@@ -309,7 +218,6 @@ export class DevToolsService extends EventEmitter {
     super();
     this.maxRetainedBytesPerWorkspace =
       options?.maxRetainedBytesPerWorkspace ?? MAX_RETAINED_BYTES_PER_WORKSPACE;
-    this.loadTailBytes = options?.loadTailBytes ?? LOAD_TAIL_BYTES;
   }
 
   get enabled(): boolean {
@@ -788,7 +696,7 @@ export class DevToolsService extends EventEmitter {
     const filePath = this.getSessionFilePath(workspaceId);
 
     try {
-      for await (const line of readTailLines(filePath, this.loadTailBytes)) {
+      for await (const line of readLines(filePath)) {
         this.replayLogLine(workspaceId, data, line);
       }
     } catch (error) {
@@ -825,8 +733,7 @@ export class DevToolsService extends EventEmitter {
           break;
         }
         case "step": {
-          // Steps for runs outside the retained window (cut off by the tail
-          // read or already evicted) have no reader; skip them.
+          // Steps for runs already evicted during replay have no reader; skip them.
           if (!data.runs.has(entry.step.runId)) {
             break;
           }

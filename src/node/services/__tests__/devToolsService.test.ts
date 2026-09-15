@@ -4,11 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import type { DevToolsEvent, DevToolsRun, DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
-import {
-  DevToolsService,
-  LOAD_TAIL_BYTES,
-  MAX_RETAINED_RUNS_PER_WORKSPACE,
-} from "@/node/services/devToolsService";
+import { DevToolsService, MAX_RETAINED_RUNS_PER_WORKSPACE } from "@/node/services/devToolsService";
 
 function makeRun(id: string, startedAt = "2025-06-01T00:00:00Z"): DevToolsRun {
   return { id, workspaceId: "ws-1", startedAt };
@@ -868,114 +864,104 @@ describe("DevToolsService", () => {
       });
     });
 
-    it("replays only the tail of an oversized log, starting on a line boundary", async () => {
-      const config = createTestConfig({ sessionsDir, enabled: true });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-
-      const tailLines = [
-        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-02T00:00:00.000Z") }),
-        JSON.stringify({ type: "step", step: makeStep({ id: "step-new", runId: "run-new" }) }),
-      ];
-      // Size the phantom entry so the tail cut (size - LOAD_TAIL_BYTES) lands
-      // exactly at its opening brace, mid-line after the junk prefix. The bytes
-      // after the cut are then a *valid* run entry, so only the partial-first-line
-      // skip (not corrupted-JSON handling) keeps run-phantom out of memory.
-      const phantomRun = (padLength: number) =>
-        JSON.stringify({
-          type: "run",
-          run: {
-            ...makeRun("run-phantom", "2025-01-01T00:00:01.000Z"),
-            pad: "p".repeat(padLength),
-          },
-        });
-      const tailRestBytes = tailLines.join("\n").length + 2; // trailing newlines
-      const phantomTarget = LOAD_TAIL_BYTES - tailRestBytes;
-      const phantom = phantomRun(phantomTarget - phantomRun(0).length);
-      expect(phantom.length).toBe(phantomTarget);
-
-      const contents = `${JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") })}\n${"junk".repeat(4)}${phantom}\n${tailLines.join("\n")}\n`;
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-      await fs.writeFile(logPath, contents, "utf-8");
-      expect((await fs.stat(logPath)).size - LOAD_TAIL_BYTES).toBe(contents.indexOf(phantom));
-
-      const service = new DevToolsService(config);
-      const runs = await service.getRuns("ws-1");
-
-      expect(runs.map((run) => run.id)).toEqual(["run-new"]);
-      const detail = await service.getRunWithSteps("ws-1", "run-new");
-      expect(detail?.steps.map((step) => step.id)).toEqual(["step-new"]);
-    });
-
-    it("keeps the first tail line when the cut lands exactly on a line boundary", async () => {
-      const config = createTestConfig({ sessionsDir, enabled: true });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-
-      const tailLines = [
-        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-03T00:00:00.000Z") }),
-      ];
-      // Pad the boundary entry so it starts exactly at size - LOAD_TAIL_BYTES, right after
-      // the previous line's newline. It is a complete line and must be replayed.
-      const boundaryRun = (padLength: number) =>
-        JSON.stringify({
-          type: "run",
-          run: {
-            ...makeRun("run-boundary", "2025-01-02T00:00:00.000Z"),
-            pad: "b".repeat(padLength),
-          },
-        });
-      const tailRestBytes = tailLines.join("\n").length + 2; // boundary + trailing newlines
-      const boundaryTarget = LOAD_TAIL_BYTES - tailRestBytes;
-      const boundary = boundaryRun(boundaryTarget - boundaryRun(0).length);
-
-      const contents = `${JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") })}\n${boundary}\n${tailLines.join("\n")}\n`;
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-      await fs.writeFile(logPath, contents, "utf-8");
-      expect((await fs.stat(logPath)).size - LOAD_TAIL_BYTES).toBe(contents.indexOf(boundary));
-
-      const service = new DevToolsService(config);
-      const runs = await service.getRuns("ws-1");
-
-      expect(runs.map((run) => run.id)).toEqual(["run-new", "run-boundary"]);
-    });
-
-    it("replays the entries before a final line larger than the tail window", async () => {
-      const TAIL_BYTES = 4096;
+    it("applies a large final step-update on load so stale finalization leaves a completed step alone", async () => {
       const config = createTestConfig({ sessionsDir, enabled: true });
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
       const lines = [
-        // Older history larger than the window, so the shifted window still
-        // starts mid-line and must skip this partial entry.
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
         JSON.stringify({
           type: "step",
-          step: makeStep({
-            id: "step-ancient",
-            runId: "run-ancient",
-            rawChunks: [{ data: "y".repeat(TAIL_BYTES * 2) }],
-          }),
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
         }),
-        JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") }),
-        JSON.stringify({ type: "step", step: makeStep({ id: "step-old", runId: "run-old" }) }),
-        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-02T00:00:00.000Z") }),
-        JSON.stringify({ type: "step", step: makeStep({ id: "step-new", runId: "run-new" }) }),
-        // A finalized step whose raw payload alone exceeds the tail window, so the
-        // naive tail cut lands inside it and sees no newline at all.
         JSON.stringify({
           type: "step-update",
-          stepId: "step-new",
-          update: { rawChunks: [{ data: "x".repeat(TAIL_BYTES * 3) }] },
+          stepId: "step-1",
+          update: {
+            durationMs: 4321,
+            output: { finishReason: "stop" },
+            rawChunks: [{ data: "x".repeat(200_000) }],
+          },
         }),
       ];
       await fs.mkdir(path.dirname(logPath), { recursive: true });
       await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
 
-      const service = new DevToolsService(config, { loadTailBytes: TAIL_BYTES });
-      const runs = await service.getRuns("ws-1");
+      const service = new DevToolsService(config);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.output).toEqual({ finishReason: "stop" });
+      expect((await service.getRuns("ws-1"))[0]?.isInProgress).toBe(false);
 
-      expect(runs.map((run) => run.id)).toEqual(["run-new", "run-old"]);
-      const detail = await service.getRunWithSteps("ws-1", "run-new");
-      expect(detail?.steps.map((step) => step.id)).toEqual(["step-new"]);
-      // The oversized update itself is dropped: it cannot be retained within the window.
-      expect(detail?.steps[0]?.rawChunks).toBeNull();
+      // The step completed on disk, so nothing is stale: no extra line is appended.
+      const contents = await fs.readFile(logPath, "utf-8");
+      expect(contents).not.toContain("Interrupted (stale)");
+      expect(contents.split("\n").filter((line) => line.trim().length > 0)).toHaveLength(
+        lines.length
+      );
+    });
+
+    it("keeps a single run whose many small lines exceed the budget, with every step applied", async () => {
+      const BUDGET_BYTES = 20_000;
+      const STEP_COUNT = 40;
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [JSON.stringify({ type: "run", run: makeRun("run-1") })];
+      for (let index = 1; index <= STEP_COUNT; index += 1) {
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({
+              id: `step-${index}`,
+              runId: "run-1",
+              stepNumber: index,
+              durationMs: null,
+              rawChunks: [{ data: "x".repeat(2_000) }],
+            }),
+          })
+        );
+        lines.push(
+          JSON.stringify({
+            type: "step-update",
+            stepId: `step-${index}`,
+            update: { durationMs: index },
+          })
+        );
+      }
+      expect(lines.join("\n").length).toBeGreaterThan(BUDGET_BYTES * 3);
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+      const runs = await service.getRuns("ws-1");
+      expect(runs.map((run) => run.id)).toEqual(["run-1"]);
+      expect(runs[0]?.stepCount).toBe(STEP_COUNT);
+
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps.map((step) => step.durationMs)).toEqual(
+        Array.from({ length: STEP_COUNT }, (_, index) => index + 1)
+      );
+    });
+
+    it("parses a line that spans several read chunks", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      // LOAD_CHUNK_BYTES is 1 MiB; a 2.5 MB payload forces the line across three reads.
+      const payload = "y".repeat(2_500_000);
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", rawChunks: [{ data: payload }] }),
+        }),
+        JSON.stringify({ type: "run", run: makeRun("run-2", "2025-06-02T00:00:00Z") }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.rawChunks).toEqual([{ data: payload }]);
     });
 
     it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
