@@ -245,16 +245,17 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
-  // Claude Opus 5.1 - successor to Opus 5 at the same pricing/shape: $5/M input,
-  // $25/M output, cache write 1.25x input / cache read 0.1x input, native 1M
-  // context, 128K max output, full effort ladder with native xhigh and max.
+  // Claude Opus 5.1 - successor to Opus 5 at the same pricing/shape ($5/M input,
+  // $25/M output, cache write 1.25x input, native 1M context, 128K max output,
+  // full effort ladder with native xhigh and max) except cheaper cache reads
+  // (0.025x input, mirroring the cut Fable 5.1 / Mythos 5.1 shipped with).
   "claude-opus-5-1": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000005, // $5 per million input tokens
     output_cost_per_token: 0.000025, // $25 per million output tokens
     cache_creation_input_token_cost: 0.00000625, // $6.25 per million tokens (1.25× input)
-    cache_read_input_token_cost: 0.0000005, // $0.50 per million tokens (0.1× input)
+    cache_read_input_token_cost: 0.000000125, // $0.125 per million tokens (0.025× input)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,

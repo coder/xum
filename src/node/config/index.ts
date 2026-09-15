@@ -953,7 +953,8 @@ function normalizeAdvisorPositiveInteger(value: number | null, label: string): n
  * `held` (issued inside a window, or re-run under a lock editConfig took for it), or `none`.
  */
 type RegistrationLockState =
-  { kind: "held"; lock: ProjectRegistrationLockHandle } | { kind: "none" };
+  | { kind: "held"; lock: ProjectRegistrationLockHandle }
+  | { kind: "none" };
 
 /**
  * Thrown inside the edit queue when the edit could not take the registration file lock in

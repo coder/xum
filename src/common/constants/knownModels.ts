@@ -59,9 +59,10 @@ const MODEL_DEFINITIONS = {
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Opus 5.1 - successor to Opus 5 (released July 24, 2026) at unchanged pricing
-  // ($5/M input, $25/M output). API id `claude-opus-5-1`; Opus 5 stays usable as the
-  // custom model string `anthropic:claude-opus-5`.
+  // Claude Opus 5.1 - successor to Opus 5 (released July 24, 2026) at the same pricing
+  // ($5/M input, $25/M output) except cheaper cache reads (0.025x input, mirroring the
+  // cut Fable 5.1 / Mythos 5.1 shipped with). API id `claude-opus-5-1`; Opus 5 stays
+  // usable as the custom model string `anthropic:claude-opus-5`.
   OPUS: {
     provider: "anthropic",
     providerModelId: "claude-opus-5-1",
