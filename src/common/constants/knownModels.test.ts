@@ -10,6 +10,7 @@ import {
   TOKENIZER_MODEL_OVERRIDES,
 } from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
+import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
 describe("Known Models Integration", () => {
@@ -69,6 +70,11 @@ describe("Known Models Integration", () => {
     // compaction "switch model" suggestions (same invariant as Astra above).
     const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
     expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_SOL.id));
+    // Budget safety: unpublished pricing must resolve as unknown (null stats),
+    // not a defined $0 — a $0 rate bypasses the CLI --budget unknown-pricing
+    // rejection and the goal-budget modelHasPricingData guard on a billable
+    // API model (see models-extra.ts).
+    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).toBeNull();
   });
 
   test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {

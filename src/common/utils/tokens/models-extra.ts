@@ -476,24 +476,15 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-04-30",
   },
 
-  // GPT-6 Sol - PROVISIONAL, NOT OFFICIALLY ANNOUNCED (verified 2026-09-15; see
-  // the GPT_6_SOL comment in knownModels.ts). OpenAI has published no specs or
-  // pricing for this id. Token limits below are provisional placeholders taken
-  // from the values that GPT-5.6 Sol and GPT-6 Astra share (1.05M context, 128K
-  // max output) so the curated-registry coverage bar is met; they must be
-  // re-verified against the official model page at release. Costs are an
-  // explicit 0 — unpublished pricing must not produce plausible-looking cost
-  // estimates, so usage reports $0 (the same behavior as providers without
-  // per-token costs, e.g. subscription routes) until real rates land.
-  // Capability flags are omitted because none are documented.
-  "gpt-6-sol": {
-    max_input_tokens: 1050000,
-    max_output_tokens: 128000,
-    input_cost_per_token: 0, // unpublished; do not invent a rate
-    output_cost_per_token: 0, // unpublished; do not invent a rate
-    litellm_provider: "openai",
-    mode: "chat",
-  },
+  // GPT-6 Sol deliberately has NO entry here (PROVISIONAL, NOT OFFICIALLY
+  // ANNOUNCED as of 2026-09-15; see the GPT_6_SOL comment in knownModels.ts).
+  // OpenAI has published no specs or pricing for the id, and an entry with
+  // placeholder costs would be unsafe: explicit $0 rates make getTotalCost
+  // return a defined $0, which bypasses the CLI --budget "unknown pricing"
+  // rejection and the goal-budget modelHasPricingData guard, allowing unbounded
+  // spend on a billable API model. Null stats keep every budget path
+  // fail-closed until OpenAI publishes real numbers (add the entry then; the
+  // curated-coverage exemption lives in updateModelsData.ts).
 
   // GPT-5.5 Pro - Released April 23, 2026
   // Native 1.05M context, 128K max output; Responses API only.

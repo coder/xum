@@ -155,13 +155,24 @@ function providesUsableMetadata(entry: unknown): boolean {
  * Coverage uses getModelStats' own lookup keys and usability bar, so any key
  * form the runtime can resolve (bare, provider-scoped, models-extra override)
  * counts, and an entry that loses its token limits still counts as missing.
+ *
+ * Provisional curated entries listed in PROVISIONAL_UNCOVERED_MODEL_IDS are
+ * intentionally uncovered: giving them placeholder stats would define a $0
+ * cost that bypasses budget enforcement (see the GPT-6 Sol comment in
+ * models-extra.ts). Remove an id from that set once its official model page
+ * ships and a real models-extra/models.json entry lands.
  */
+const PROVISIONAL_UNCOVERED_MODEL_IDS = new Set<string>([KNOWN_MODELS.GPT_6_SOL.id]);
+
 export function findMissingKnownModels(
   catalog: ModelCatalogData,
   extra: Record<string, unknown> = modelsExtra
 ): string[] {
   const missing: string[] = [];
   for (const model of Object.values(KNOWN_MODELS)) {
+    if (PROVISIONAL_UNCOVERED_MODEL_IDS.has(model.id)) {
+      continue;
+    }
     const covered = generateModelLookupKeys(model.id).some(
       (key) => providesUsableMetadata(catalog[key]) || providesUsableMetadata(extra[key])
     );
