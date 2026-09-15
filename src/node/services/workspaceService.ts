@@ -1,3 +1,4 @@
+import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -2422,6 +2423,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly config: Config,
     private readonly historyService: HistoryService,
     private readonly aiService: AIService,
+    private readonly contextManagement: ContextManagementService,
     private readonly initStateManager: InitStateManager,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
@@ -4711,6 +4713,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
     return new AgentSession({
+      contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
       workspaceId,

@@ -34,6 +34,7 @@ import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CoderService } from "@/node/services/coderService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
+import type { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -276,6 +277,11 @@ export class CoderOauth extends Context.Service<CoderOauth, CoderOauthService>()
 export class CopilotOauth extends Context.Service<CopilotOauth, CopilotOauthService>()(
   "xum/CopilotOauth"
 ) {}
+export class ContextManagement extends Context.Service<
+  ContextManagement,
+  ContextManagementService
+>()("xum/ContextManagement") {}
+
 // Clock-driven workers and the timeline/refine pair they record into.
 export class IdleCompaction extends Context.Service<IdleCompaction, IdleCompactionService>()(
   "xum/IdleCompaction"
@@ -306,6 +312,7 @@ export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
  * field plus the graph-internal `TerminalAttentionStore`.
  */
 export type CoreTags =
+  | ContextManagement
   | History
   | InitStateManagerTag
   | Provider

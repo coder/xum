@@ -20,6 +20,7 @@ import type {
   WorkspaceSessionLocator,
 } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
+import type { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import type { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ProviderService } from "@/node/services/providerService";
@@ -77,6 +78,7 @@ export interface CoreServicesOptions {
 export type CoreOptions = Omit<CoreServicesOptions, keyof ConfigStores>;
 
 export interface CoreServices {
+  contextManagement: ContextManagementService;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;

@@ -204,7 +204,10 @@ import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoal
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { CompactionHandler } from "./compactionHandler";
+import type { CompactionHandler } from "./compactionHandler";
+import type { ContextManagementService } from "./contextManagement/contextManagementService";
+import type { SessionContextController } from "./contextManagement/sessionContextController";
+import type { SessionContextHost } from "./contextManagement/sessionContextHost";
 import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { Scope } from "effect";
@@ -278,7 +281,6 @@ import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
-import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
 import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
@@ -741,6 +743,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
 }
 
 interface AgentSessionOptions {
+  contextManagement: ContextManagementService;
   effectRunner?: EffectRunner;
   appFiberScope?: Scope.Scope;
   workspaceId: string;
@@ -1033,8 +1036,7 @@ export class AgentSession {
    * cuts register, so entries that never cut a turn retain nothing here.
    */
   private readonly queueCutReceipts = new Map<string, QueueCutReceipt>();
-  private readonly compactionHandler: CompactionHandler;
-  private readonly compactionMonitor: CompactionMonitor;
+  private readonly contextController: SessionContextController;
   private readonly continuousCompactor: ContinuousCompactor;
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
@@ -1273,7 +1275,6 @@ export class AgentSession {
       streamManager,
       mcpServerManager,
       initStateManager,
-      telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
       sessionUsageService,
@@ -1321,36 +1322,22 @@ export class AgentSession {
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
 
-    this.compactionHandler = new CompactionHandler({
+    const contextHost: SessionContextHost = {
       workspaceId: this.workspaceId,
-      historyService: this.historyService,
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-      telemetryService,
       emitter: this.emitter,
-      onCompactionComplete: (metadata) => {
-        // RLM keep-recent floor: tail copies after the boundary mean the
-        // summary is no longer the last row; stash its ID so the stream-end
-        // follow-up dispatch can target it directly.
-        // Reset on every completion: a resumeless continuous fold may precede a
-        // legacy compaction whose current follow-up is on its final summary row.
-        this.coordinator.recordCompactionSummary(
-          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
-        );
-        onCompactionComplete?.(metadata);
-      },
-      onIdleCompactionOutcome,
-    });
-
-    this.compactionMonitor = new CompactionMonitor(
-      this.workspaceId,
-      (event: CompactionStatusEvent) => this.emitChatEvent(event)
-    );
+      coordinator: this.coordinator,
+      emitChatEvent: (event) => this.emitChatEvent(event),
+      onCompactionComplete: (metadata) => onCompactionComplete?.(metadata),
+      onIdleCompactionOutcome: (success) => onIdleCompactionOutcome?.(success),
+    };
+    this.contextController = options.contextManagement.openSession(contextHost);
 
     this.continuousCompactor = new ContinuousCompactor({
       workspaceId: this.workspaceId,
       enterExecution: () => this.coordinator.enterExecution(),
       historyService: this.historyService,
-      compactionHandler: this.compactionHandler,
+      compactionHandler: this.contextController.transitionalCompactionHandler,
       streamManager: {
         isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
         setPrefixSwap: (workspaceId, swap) =>
@@ -4319,7 +4306,7 @@ export class AgentSession {
       const providersConfigForCompaction = this.getProvidersConfigSafe();
       // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
       if (await this.recoverCompaction()) this.clearUsageState();
-      const compactionResult = this.compactionMonitor.checkBeforeSend({
+      const compactionResult = this.contextController.checkBeforeSend({
         model: modelForStream,
         usage: this.getUsageState(),
         use1MContext: this.is1MContextEnabledForModel(
@@ -4348,7 +4335,7 @@ export class AgentSession {
       // A staged fold needs no compact turn. Without one, the experiment waits
       // until the force threshold; the legacy path retains its on-send threshold.
       const shouldCompactBeforeSend =
-        this.compactionMonitor.getThreshold() < 1 &&
+        this.contextController.autoCompactionThreshold < 1 &&
         (continuousContext.enabled
           ? continuousResult === "fallback" && compactionResult.shouldForceCompact
           : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
@@ -4637,7 +4624,7 @@ export class AgentSession {
         contextBudgetPrefix[0].metadata.muxMetadata.final === true;
       if (
         flushPrefix &&
-        (this.pendingRollover == null || this.compactionMonitor.getThreshold() >= 1) &&
+        (this.pendingRollover == null || this.contextController.autoCompactionThreshold >= 1) &&
         userMessage.metadata?.muxMetadata?.contextBudgetFlush === true
       ) {
         optionsForStream = this.degradeFlushEntryToContinuation(userMessage, optionsForStream);
@@ -5290,8 +5277,8 @@ export class AgentSession {
 
   setAutoCompactionThreshold(threshold: number): void {
     this.assertNotDisposed("setAutoCompactionThreshold");
-    const previous = this.compactionMonitor.getThreshold();
-    this.compactionMonitor.setThreshold(threshold);
+    const previous = this.contextController.autoCompactionThreshold;
+    this.contextController.setAutoCompactionThreshold(threshold);
     if (previous !== threshold) this.continuousCompactor.reset("threshold-changed");
   }
 
@@ -5680,7 +5667,7 @@ export class AgentSession {
     if (
       !context ||
       context.contextBudgetRetried ||
-      this.compactionMonitor.getThreshold() >= 1 ||
+      this.contextController.autoCompactionThreshold >= 1 ||
       this.coordinator.admissionBlocked ||
       this.coordinator.editBlocked(editReservation?.id) ||
       this.coordinator.disposed ||
@@ -6011,7 +5998,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
+          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
         requestAssemblySnapshot: snapshot,
       });
@@ -6190,7 +6177,7 @@ export class AgentSession {
           outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
           ...estimateLastStepToolResults(lastAssistant),
           modelContextLimit: maxTokens,
-          threshold: this.compactionMonitor.getThreshold(),
+          threshold: this.contextController.autoCompactionThreshold,
           warningEmitted: this.contextBudgetWarningClaimed,
         })
       : {
@@ -6203,7 +6190,7 @@ export class AgentSession {
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
-      const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
+      const rolloverEnabled = this.contextController.autoCompactionThreshold < 1;
       // The hard ceiling reserves OUTPUT_RESERVE_TOKENS for the step's output; a model whose
       // inherent thinking minimum needs a larger flush cap must find that extra room too. A
       // refusal may hand the flush to a fallback model with its own (possibly higher) minimum,
@@ -6247,7 +6234,7 @@ export class AgentSession {
         admitted?.success &&
         this.contextBudgetGeneration === generation &&
         this.pendingRollover != null &&
-        this.compactionMonitor.getThreshold() < 1
+        this.contextController.autoCompactionThreshold < 1
       ) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
         // invalidated by registry changes that happen during the flush turn itself. The flush
@@ -6272,7 +6259,7 @@ export class AgentSession {
       userMessage.parts = [{ type: "text", text: "Continue" }];
       const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
       userMessage.metadata.muxMetadata = rest;
-      if (this.compactionMonitor.getThreshold() >= 1) {
+      if (this.contextController.autoCompactionThreshold >= 1) {
         // Rollover was disabled after the pair was queued: drop the paired rollover entry and
         // the stale claims so nothing seals the window if rollover is re-enabled later, and a
         // later genuine rollover may offer the flush this turn never delivered.
@@ -6282,7 +6269,7 @@ export class AgentSession {
           this.emitQueuedMessageChanged();
       }
     }
-    if (this.pendingRollover != null && this.compactionMonitor.getThreshold() >= 1) {
+    if (this.pendingRollover != null && this.contextController.autoCompactionThreshold >= 1) {
       // Rollover was disabled after the intent was recorded (e.g. during a flush turn that
       // ended without a settled tool step): a stale intent must not seal a later, unrelated
       // send once rollover is re-enabled.
@@ -6301,7 +6288,7 @@ export class AgentSession {
       hasUnconsumedNewContextRequest(history.data) &&
       (await this.checkContextBudgetHistoryAccess(options)).success;
     const shouldRollover =
-      this.compactionMonitor.getThreshold() < 1 &&
+      this.contextController.autoCompactionThreshold < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover" || modelRequested);
     const rollover: AgentSession["pendingRollover"] =
       shouldRollover && hasRolloverEligibleMessages(history.data)
@@ -6316,7 +6303,7 @@ export class AgentSession {
             maxTokens: recordedLimit,
             budgetTokens: getContextBudgetRolloverPoint(
               recordedLimit,
-              this.compactionMonitor.getThreshold()
+              this.contextController.autoCompactionThreshold
             ),
           })
         : undefined;
@@ -6368,7 +6355,7 @@ export class AgentSession {
     if (
       !this.contextBudgetWarningClaimed &&
       this.contextBudgetMemoryWritable !== undefined &&
-      this.compactionMonitor.getThreshold() < 1 &&
+      this.contextController.autoCompactionThreshold < 1 &&
       (this.pendingBudgetWarning != null || decision.decision === "warn")
     ) {
       return Ok({
@@ -6378,7 +6365,7 @@ export class AgentSession {
             maxTokens: recordedLimit,
             budgetTokens: getContextBudgetRolloverPoint(
               recordedLimit,
-              this.compactionMonitor.getThreshold()
+              this.contextController.autoCompactionThreshold
             ),
             memoryWritable: this.contextBudgetMemoryWritable,
             sessionHistoryAvailable:
@@ -6461,7 +6448,7 @@ export class AgentSession {
       context.providersConfig ?? null,
       { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
     );
-    const threshold = this.compactionMonitor.getThreshold();
+    const threshold = this.contextController.autoCompactionThreshold;
     const contextTokens = usage
       ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
       : 0;
@@ -6503,7 +6490,7 @@ export class AgentSession {
     // "block" only exists at threshold 100%, where requests are not offered and never honored.
     if (decision.decision === "block") return { decision: "block" };
     if (context.contextBudgetFlushTurn === true) {
-      if (this.compactionMonitor.getThreshold() >= 1) {
+      if (this.contextController.autoCompactionThreshold >= 1) {
         // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
         // stale intent. The paired "Continue" is kept on purpose: with the intent gone it
         // dispatches as an ordinary continuation of the interrupted work in this window, and a
@@ -7054,8 +7041,8 @@ export class AgentSession {
   }
 
   private async buildContinuousCompactionAttachments(head: MuxMessage[]) {
-    const pending = await this.compactionHandler.peekPendingState();
-    const warm = await this.compactionHandler.peekCarryoverState();
+    const pending = await this.contextController.compaction.peekPendingState();
+    const warm = await this.contextController.compaction.peekCarryoverState();
     return this.buildAttachmentsFromContext({
       diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
       loadedSkills: mergeLoadedSkillSnapshots([
@@ -7086,7 +7073,7 @@ export class AgentSession {
     return {
       enabled:
         selection.configured === "continuous" &&
-        this.compactionMonitor.getThreshold() < 1 &&
+        this.contextController.autoCompactionThreshold < 1 &&
         !this.coordinator.disposed &&
         !this.coordinator.closing &&
         !this.continuousCompactionAbandoned &&
@@ -7100,7 +7087,7 @@ export class AgentSession {
           this.is1MContextEnabledForModel(model, options, providersConfig),
           providersConfig
         ) ?? 0,
-      thresholdPercent: this.compactionMonitor.getThreshold() * 100,
+      thresholdPercent: this.contextController.autoCompactionThreshold * 100,
       systemMessageTokens:
         this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
         this.lastSystemMessageTokens,
@@ -7126,7 +7113,7 @@ export class AgentSession {
         this.continuousCompactor.reset("disabled");
         return;
       }
-      const usage = this.compactionMonitor.checkBeforeSend({
+      const usage = this.contextController.checkBeforeSend({
         model,
         usage: this.getUsageState(),
         use1MContext: this.is1MContextEnabledForModel(
@@ -7292,7 +7279,7 @@ export class AgentSession {
         this.coordinator.admissionBlocked
       )
         return;
-      const pressure = this.compactionMonitor.checkBeforeSend({
+      const pressure = this.contextController.checkBeforeSend({
         model: context.modelString,
         usage: this.getUsageState(),
         use1MContext: this.is1MContextEnabledForModel(
@@ -7942,7 +7929,7 @@ export class AgentSession {
     let completionTransferred = false;
     try {
       // Reset per-stream flags (used for retries / crash-safe bookkeeping).
-      this.compactionMonitor.resetForNewStream();
+      this.contextController.onStreamStarting();
       this.clearLiveUsageState();
       this.pendingPostCompactionStateToAcknowledge = null;
       this.activeStreamHadAnyDelta = false;
@@ -8078,7 +8065,7 @@ export class AgentSession {
           flushMuxMetadata?.contextBudgetFlush === true &&
           finalRow?.type === "context-budget-warning" &&
           this.pendingRollover == null &&
-          this.compactionMonitor.getThreshold() < 1
+          this.contextController.autoCompactionThreshold < 1
         ) {
           // The promised reset needs the same admission as any rollover; surface a failure
           // now (as the reset itself would) instead of resuming a flush that cannot be sealed.
@@ -8396,7 +8383,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
+          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
         // A flush turn stays bounded to one step even when token-budget mode was disabled
         // after its trigger was persisted (the callback then only stops it).
@@ -8847,7 +8834,10 @@ export class AgentSession {
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
     try {
-      await this.compactionHandler.discardPendingState("context_exceeded", pendingState);
+      await this.contextController.transitionalCompactionHandler.discardPendingState(
+        "context_exceeded",
+        pendingState
+      );
       this.onPostCompactionStateChange?.();
     } catch (error) {
       log.warn("Failed to discard pending post-compaction state", {
@@ -9445,7 +9435,7 @@ export class AgentSession {
       });
       this.clearLiveUsageState();
 
-      const handled = await this.compactionHandler.handleCompletion(
+      const handled = await this.contextController.compaction.handleCompletion(
         streamEndPayload,
         completedCompactionRequest?.id,
         () =>
@@ -9478,7 +9468,9 @@ export class AgentSession {
           if (this.pendingPostCompactionStateToAcknowledge === pendingStateToAcknowledge)
             this.pendingPostCompactionStateToAcknowledge = null;
           try {
-            await this.compactionHandler.ackPendingStateConsumed(pendingStateToAcknowledge);
+            await this.contextController.compaction.ackPendingStateConsumed(
+              pendingStateToAcknowledge
+            );
             if (
               !this.coordinator.isCurrentTurn(turn) ||
               !this.coordinator.isCurrentOperation(operation)
@@ -9865,7 +9857,7 @@ export class AgentSession {
       )
         return;
       if (this.activeStreamContext !== streamContext) return;
-      const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
+      const shouldInterruptForCompaction = this.contextController.checkMidStream({
         model: modelForUsage,
         usage: payload.usage,
         use1MContext: this.is1MContextEnabledForModel(
@@ -11404,10 +11396,11 @@ export class AgentSession {
       !hasActiveNonCompletingTurn
     ) {
       const turn = this.coordinator.turnId;
-      const rollbackResult = await this.compactionHandler.rollbackHeartbeatContextResetBoundary(
-        summaryMessage,
-        () => this.coordinator.turnId === turn
-      );
+      const rollbackResult =
+        await this.contextController.compaction.rollbackHeartbeatContextResetBoundary(
+          summaryMessage,
+          () => this.coordinator.turnId === turn
+        );
       if (!rollbackResult.success) {
         throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
       }
@@ -11482,7 +11475,7 @@ export class AgentSession {
     this.pendingPostCompactionStateToAcknowledge = null;
     // The destructive history operation already fenced its captured context under the locks.
     // Retire compatible old bytes for downgrades; preserve newer publications and unknown schemas.
-    await this.compactionHandler.discardPendingStateDurably("context-boundary");
+    await this.contextController.compaction.discardPendingStateDurably("context-boundary");
     this.onPostCompactionStateChange?.();
   }
 
@@ -11574,7 +11567,7 @@ export class AgentSession {
     includeReadFiles: boolean
   ): Promise<PostCompactionAttachment[] | null> {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
-    const pendingState = await this.compactionHandler.peekPendingState();
+    const pendingState = await this.contextController.compaction.peekPendingState();
     if (pendingState !== null) {
       this.pendingPostCompactionStateToAcknowledge = pendingState;
       this.compactionOccurred = true;
@@ -11602,7 +11595,7 @@ export class AgentSession {
 
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
-      const warm = await this.compactionHandler.peekCarryoverState();
+      const warm = await this.contextController.compaction.peekCarryoverState();
       this.pendingPostCompactionStateToAcknowledge = warm;
       this.turnsSinceLastAttachment = 0;
       return this.generatePostCompactionAttachments(includeReadFiles, warm);
@@ -12212,7 +12205,7 @@ export class AgentSession {
     }
 
     const turn = this.coordinator.turnId;
-    const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({
+    const result = await this.contextController.compaction.appendHeartbeatContextResetBoundary({
       boundaryText: params.boundaryText,
       pendingFollowUp: params.pendingFollowUp,
       publication: { generation: captured.data.generation },
@@ -12244,7 +12237,7 @@ export class AgentSession {
    * Returns paths that will be reinjected, or null if no pending compaction.
    */
   async getPendingTrackedFilePaths(): Promise<string[] | null> {
-    return this.compactionHandler.peekCachedFilePaths();
+    return this.contextController.compaction.peekCachedFilePaths();
   }
 
   private assertNotDisposed(operation: string): void {

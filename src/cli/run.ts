@@ -650,6 +650,7 @@ async function main(): Promise<number> {
   }
   const {
     aiService,
+    contextManagement,
     historyService,
     initStateManager,
     backgroundProcessManager,
@@ -736,6 +737,7 @@ async function main(): Promise<number> {
   turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
+    contextManagement,
     effectRunner: coreRuntime.get(EffectRunnerTag),
     appFiberScope,
     workspaceId,

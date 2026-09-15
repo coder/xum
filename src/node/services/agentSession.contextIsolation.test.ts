@@ -23,6 +23,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   harnesses.push(continuous);
   const budget = await createAgentSessionHarness({
     workspaceId: "budget",
+    contextManagement: continuous.contextManagement,
     config: continuous.config,
     historyService: continuous.historyService,
     aiService: continuous.aiService,

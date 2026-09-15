@@ -400,6 +400,7 @@ async function createWorkflowContext(options: {
     // below would lose TypeScript's definite-assignment narrowing.
     const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      contextManagement: services.contextManagement,
       effectRunner: services.runtime.get(EffectRunnerTag),
       appFiberScope: services.appFiberScope,
       workspaceId,

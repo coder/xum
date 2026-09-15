@@ -1,3 +1,4 @@
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { eventSpine } from "./events/eventSpine";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
@@ -165,11 +166,32 @@ function createMockAiService(args: {
   return { aiEmitter, aiService };
 }
 
+/** Direct session fixtures bypass the app graph, but still use the real context controller. */
+export function createTestAgentSession(
+  options: Omit<ConstructorParameters<typeof AgentSession>[0], "contextManagement"> & {
+    contextManagement?: ContextManagementService;
+  }
+): AgentSession {
+  return new AgentSession({
+    ...options,
+    contextManagement:
+      options.contextManagement ??
+      new ContextManagementService({
+        config: options.config,
+        historyService: options.historyService,
+        aiService: options.aiService,
+        sessionUsageService: options.sessionUsageService,
+        telemetryService: options.telemetryService,
+      }),
+  });
+}
+
 export interface AgentSessionHarnessOptions extends Pick<
   ConstructorParameters<typeof AgentSession>[0],
   "effectRunner" | "appFiberScope" | "isStopInProgress" | "getStopEpoch" | "onTurnSettled"
 > {
   workspaceId: string;
+  contextManagement?: ContextManagementService;
   config?: Config;
   historyService?: HistoryService;
   aiService?: AgentSessionAIService;
@@ -189,6 +211,7 @@ export interface AgentSessionHarnessOptions extends Pick<
 
 export interface AgentSessionHarness {
   session: AgentSession;
+  contextManagement: ContextManagementService;
   config: Config;
   historyService: HistoryService;
   cleanup: () => Promise<void>;
@@ -219,7 +242,15 @@ export async function createAgentSessionHarness(
     options.backgroundProcessManager ??
     createMockBackgroundProcessManager(options.backgroundProcessManagerOverrides);
 
+  const contextManagement =
+    options.contextManagement ??
+    new ContextManagementService({
+      config,
+      historyService,
+      aiService,
+    });
   const session: AgentSession = new AgentSession({
+    contextManagement,
     effectRunner: options.effectRunner,
     appFiberScope: options.appFiberScope,
     workspaceId: options.workspaceId,
@@ -247,6 +278,7 @@ export async function createAgentSessionHarness(
 
   return {
     session,
+    contextManagement,
     config,
     historyService,
     cleanup,

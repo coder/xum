@@ -20,6 +20,7 @@ import {
   createAgentPluginsMcpProvider,
 } from "@/node/services/agentPlugins/mcpConfig";
 import { AIService } from "@/node/services/aiService";
+import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -28,6 +29,7 @@ import {
   AI,
   BackgroundProcessManagerTag,
   ConfigTag,
+  ContextManagement,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -413,7 +415,24 @@ export const MCPServerManagerLive = Layer.effect(
 );
 
 // ---------------------------------------------------------------------------
-// S6 — WorkspaceService. Its constructor needs nothing beyond S3 (the MCP
+// Context management owns app dependencies; controllers are opened synchronously per session.
+export const ContextManagementLive = Layer.effect(
+  ContextManagement,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    return new ContextManagementService({
+      config: yield* ConfigTag,
+      historyService: yield* History,
+      aiService: yield* AI,
+      sessionUsageService: yield* SessionUsage,
+      // Telemetry is optional in headless roots, unlike the desktop-only Telemetry tag.
+      telemetryService: opts.telemetryService,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S6 — WorkspaceService. Its constructor needs S4's ContextManagement (the MCP
 // manager and memory consolidation collaborators arrive through setters in
 // CoreWiringLive); it is staged after MCPServerManager only to keep the former
 // body's construction order, not because of a dependency.
@@ -430,6 +449,7 @@ export const WorkspaceLive = Layer.effect(
       yield* ConfigTag,
       yield* History,
       yield* AI,
+      yield* ContextManagement,
       yield* InitStateManagerTag,
       yield* ExtensionMetadata,
       yield* BackgroundProcessManagerTag,
@@ -674,7 +694,9 @@ const S1 = Layer.mergeAll(
 const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
-const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive).pipe(Layer.provideMerge(S3));
+const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(
+  Layer.provideMerge(S3)
+);
 const S5 = MCPServerManagerLive.pipe(Layer.provideMerge(S4));
 const S6 = WorkspaceLive.pipe(Layer.provideMerge(S5));
 const S7 = TaskLive.pipe(Layer.provideMerge(S6));
@@ -694,6 +716,7 @@ export const CoreLive: Layer.Layer<
 /** Tagged context → the plain `CoreServices` object the roots hand out. */
 export function coreServicesFromContext(context: Context.Context<CoreTags>): CoreServices {
   return {
+    contextManagement: Context.get(context, ContextManagement),
     historyService: Context.get(context, History),
     initStateManager: Context.get(context, InitStateManagerTag),
     providerService: Context.get(context, Provider),

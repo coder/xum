@@ -19,6 +19,7 @@ import {
   AI,
   BackgroundProcessManagerTag,
   ConfigTag,
+  ContextManagement,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -53,6 +54,7 @@ import { createCoreServices, type CoreServicesRoot } from "./coreServicesRoot";
  * di/layers/core.ts); `Record<keyof CoreServices, …>` keeps it exhaustive.
  */
 const CORE_FIELD_TAGS: Record<keyof CoreServices, Context.Key<CoreTags, unknown>> = {
+  contextManagement: ContextManagement,
   historyService: History,
   initStateManager: InitStateManagerTag,
   providerService: Provider,
@@ -105,6 +107,8 @@ describe("createCoreServices", () => {
     >) {
       expect(root.runtime.get(tag)).toBe(root[field]);
     }
+    const workspace = root.workspaceService as unknown as Pick<CoreServices, "contextManagement">;
+    expect(workspace.contextManagement).toBe(root.contextManagement);
     expect(root.appFiberScope).toBe(root.runtime.get(AppFiberScopeTag));
     expect(root.appFiberScope.state._tag).not.toBe("Closed");
     expect(root.runtime.get(EffectRunnerTag)).toBeDefined();
