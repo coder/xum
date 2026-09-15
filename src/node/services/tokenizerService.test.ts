@@ -4,22 +4,112 @@ import type { SessionUsageService } from "./sessionUsageService";
 import * as tokenizerUtils from "@/node/utils/main/tokenizer";
 import * as statsUtils from "@/common/utils/tokens/tokenStatsCalculator";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { Ok, Err } from "@/common/types/result";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 
 describe("TokenizerService", () => {
   let sessionUsageService: SessionUsageService;
   let service: TokenizerService;
+  let history: MuxMessage[];
+  let historyError: string | null;
+  let partial: MuxMessage | null;
 
   beforeEach(() => {
     sessionUsageService = {
       setTokenStatsCache: () => Promise.resolve(),
     } as unknown as SessionUsageService;
+    history = [];
+    historyError = null;
+    partial = null;
     service = new TokenizerService(
       sessionUsageService,
       { getWorkspaceMetadata: () => Promise.resolve({ success: false, error: "not found" }) },
-      { getConfig: () => ({}) }
+      { getConfig: () => ({}) },
+      {
+        getHistoryFromLatestBoundary: () =>
+          Promise.resolve(historyError === null ? Ok(history) : Err(historyError)),
+        readPartial: () => Promise.resolve(partial),
+      }
     );
+  });
+
+  describe("calculateWorkspaceStats", () => {
+    const mockResult = {
+      consumers: [{ name: "User", tokens: 1, percentage: 100 }],
+      totalTokens: 1,
+      model: "gpt-4",
+      tokenizerName: "cl100k",
+      usageHistory: [],
+    };
+
+    test("tokenizes the backend's own history without a caller-supplied message list", async () => {
+      history = [
+        createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }),
+        createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }),
+      ];
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        const result = await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        expect(result).toBe(mockResult);
+        expect(statsSpy).toHaveBeenCalledWith(history, "gpt-4", {}, expect.anything());
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
+    test("substitutes the in-flight partial for its empty placeholder row", async () => {
+      const placeholder = createMuxMessage("msg2", "assistant", "", { historySequence: 2 });
+      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 }), placeholder];
+      partial = createMuxMessage("msg2", "assistant", "streamed so far", { historySequence: 2 });
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        expect(statsSpy).toHaveBeenCalledWith(
+          [history[0], partial],
+          "gpt-4",
+          {},
+          expect.anything()
+        );
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
+    test("appends a partial that has no matching history row", async () => {
+      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
+      partial = createMuxMessage("msg2", "assistant", "streamed", { historySequence: 2 });
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        await service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        expect(statsSpy).toHaveBeenCalledWith(
+          [history[0], partial],
+          "gpt-4",
+          {},
+          expect.anything()
+        );
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
+    test("rejects when history cannot be read instead of tokenizing nothing", async () => {
+      historyError = "disk exploded";
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        const error = await service
+          .calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" })
+          .then(
+            () => null,
+            (e: unknown) => e
+          );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("disk exploded");
+        expect(statsSpy).not.toHaveBeenCalled();
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
   });
 
   describe("countTokens", () => {

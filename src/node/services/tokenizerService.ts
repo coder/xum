@@ -11,6 +11,7 @@ import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessi
 import { log } from "./log";
 import type { AIService } from "./aiService";
 import type { ProviderService } from "./providerService";
+import type { HistoryService } from "./historyService";
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -26,6 +27,31 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   return max;
 }
 
+/**
+ * Mirror what the renderer sees mid-stream: chat.jsonl holds an empty placeholder row for the
+ * in-flight assistant turn while partial.json carries its actual content, so the partial
+ * replaces the row sharing its historySequence (or is appended when no row matches).
+ */
+function mergePartialIntoHistory(
+  history: MuxMessage[],
+  partial: MuxMessage | null
+): MuxMessage[] {
+  if (!partial) {
+    return history;
+  }
+  const partialSeq = partial.metadata?.historySequence;
+  const placeholderIndex =
+    partialSeq === undefined
+      ? -1
+      : history.findIndex((message) => message.metadata?.historySequence === partialSeq);
+  if (placeholderIndex < 0) {
+    return [...history, partial];
+  }
+  const merged = [...history];
+  merged[placeholderIndex] = partial;
+  return merged;
+}
+
 export class TokenizerService {
   private readonly sessionUsageService: SessionUsageService;
 
@@ -38,20 +64,35 @@ export class TokenizerService {
   constructor(
     sessionUsageService: SessionUsageService,
     private readonly aiService: Pick<AIService, "getWorkspaceMetadata">,
-    private readonly providerService: Pick<ProviderService, "getConfig">
+    private readonly providerService: Pick<ProviderService, "getConfig">,
+    private readonly historyService: Pick<
+      HistoryService,
+      "getHistoryFromLatestBoundary" | "readPartial"
+    >
   ) {
     this.sessionUsageService = sessionUsageService;
   }
 
-  async calculateWorkspaceStats(input: {
-    workspaceId: string;
-    messages: MuxMessage[];
-    model: string;
-  }): Promise<ChatStats> {
-    const metadata = await this.aiService.getWorkspaceMetadata(input.workspaceId);
+  /**
+   * Compute stats for the workspace's active context from the backend's own copy of history.
+   *
+   * The renderer used to upload its full message list with every recalculation (tool-call-end,
+   * stream end, ...). During an active stream that was ~36 KB/s of redundant WebSocket traffic
+   * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
+   * backend reads chat.jsonl + partial.json, which it already owns.
+   */
+  async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
+    const [metadata, historyResult, partial] = await Promise.all([
+      this.aiService.getWorkspaceMetadata(input.workspaceId),
+      this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
+      this.historyService.readPartial(input.workspaceId),
+    ]);
+    if (!historyResult.success) {
+      throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
+    }
     return this.calculateStats(
       input.workspaceId,
-      input.messages,
+      mergePartialIntoHistory(historyResult.data, partial),
       input.model,
       this.providerService.getConfig(),
       metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null

@@ -246,9 +246,10 @@ export const tokenizer = {
     output: z.array(z.number()),
   },
   calculateStats: {
+    // Backend reads the history itself; shipping the renderer's copy here cost ~36 KB/s per
+    // tab during streaming (see TokenizerService.calculateWorkspaceStats).
     input: z.object({
       workspaceId: z.string(),
-      messages: z.array(MuxMessageSchema),
       model: z.string(),
     }),
     output: ChatStatsSchema,
