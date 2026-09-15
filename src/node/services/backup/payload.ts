@@ -1807,9 +1807,13 @@ function assertBackupMcpRedactions(
  * With `contents`, entries for unselected categories and, when MCP is left out, the
  * `mcpRedactions` list are dropped before they are counted or validated: they describe
  * files this selection never opens, so neither their shape nor their number can be allowed
- * to fail a restore of everything else. The manifest document itself was already charged
- * to the byte budget and walked whole before this point. Entries whose category cannot be
- * told (no string path) are still validated.
+ * to fail a restore of everything else. The selection filters entries, not the document: the
+ * manifest is parsed and checked for duplicate keys whole first, because the filter classifies
+ * an entry by its `path` key and a duplicate key lets the tree and `JSON.parse` disagree about
+ * that value, so a crafted entry could look unselected to one and selected to the other. The
+ * repository tree is likewise validated whole before checkout (gitRepo.ts): unselected content
+ * is still checked out, only not restored. Entries whose category cannot be told (no string
+ * path) are still validated.
  */
 function parseManifest(raw: string, portable: boolean, contents?: BackupContents): BackupManifest {
   const tree = jsonc.parseTree(raw);
