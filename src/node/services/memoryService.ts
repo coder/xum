@@ -3232,7 +3232,7 @@ export class MemoryService extends EventEmitter {
    * Under the target mutation lock: `create` replaces an existing file (even one that is no longer
    * readable as a memory file), `str_replace`/`insert` create a missing file from their payload,
    * the per-scope file cap does not apply, and the actual result is capped at `maxFileBytes`
-   * (which must tighten the ordinary cap).
+   * (which must not exceed the ordinary cap).
    */
   async writePinnedFile(
     ctx: MemoryScopeContext,
@@ -4011,9 +4011,9 @@ function computeInsertUpdate(
 }
 
 /**
- * `maxFileBytes` tightens the cap for one file (writePinnedFile caps the context notes at
- * their preload size); callers check it against the actual updated content INSIDE the target
- * mutation lock, so a concurrent edit cannot slip an oversized result past it.
+ * `maxFileBytes` optionally tightens the ordinary storage cap for one file. Callers check it
+ * against the actual updated content INSIDE the target mutation lock, so a concurrent edit
+ * cannot slip an oversized result past it. Prompt preload budgets are enforced separately.
  */
 function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   const bytes = Buffer.byteLength(content, "utf-8");

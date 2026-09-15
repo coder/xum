@@ -4,7 +4,11 @@ import type { MemoryToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type MemoryScope, type MemoryScopeAccess } from "@/common/constants/memory";
+import {
+  MEMORY_MAX_FILE_BYTES,
+  type MemoryScope,
+  type MemoryScopeAccess,
+} from "@/common/constants/memory";
 import { CONTEXT_NOTES_RESERVED_BYTES } from "@/common/constants/contextBudget";
 import type { z } from "zod";
 import {
@@ -64,7 +68,7 @@ function buildMemoryDescription(config: ToolConfiguration): string {
         "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
         "view, delete, rename, and every other path are refused. " +
-        `The resulting file is limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes (essential state first).`
+        `The resulting file is limited to ${MEMORY_MAX_FILE_BYTES} bytes. Keep notes concise and essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full file can be read in the next window.`
       : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
     return baseDescription;
@@ -186,10 +190,10 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           pinnedMutationUsed = true;
-          // The single call must not fail on a stale existence verdict (create vs update) and
-          // the notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES, so the service
-          // resolves create-or-update and caps the actual result under its mutation lock. A
-          // refused write changed nothing, so it frees the slot.
+          // Resolve create-or-update and cap the actual result under the mutation lock. Use
+          // the ordinary storage cap, not the preload budget: rejecting a larger checkpoint
+          // would waste the last preservation step before rollover. A refused write changed
+          // nothing, so it frees the slot.
           const result =
             checkWriteAccess(input.path!) ??
             (await memoryService.writePinnedFile(
@@ -204,7 +208,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
                       insertLine: input.insert_line!,
                       insertText: input.insert_text!,
                     },
-              CONTEXT_NOTES_RESERVED_BYTES,
+              MEMORY_MAX_FILE_BYTES,
               "agent",
               toolCallId,
               // Stop during the flush must not let the write land once the lock is acquired.

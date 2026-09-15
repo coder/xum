@@ -17,7 +17,11 @@ import {
 } from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
-import type { MemoryScopeAccess, MemoryScope } from "@/common/constants/memory";
+import {
+  MEMORY_MAX_FILE_BYTES,
+  type MemoryScopeAccess,
+  type MemoryScope,
+} from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel, type ToolConfiguration } from "@/common/utils/tools/tools";
 
@@ -388,7 +392,7 @@ describe("memory tool", () => {
       const oversized = await run(fixture.tool, {
         command: "create",
         path: notes,
-        file_text: "x".repeat(8 * 1024 + 1),
+        file_text: "x".repeat(MEMORY_MAX_FILE_BYTES + 1),
       });
       expect(oversized.success).toBe(false);
       if (!oversized.success) expect(oversized.error).toContain("limited to");
@@ -420,7 +424,7 @@ describe("memory tool", () => {
         command: "insert",
         path: notes,
         insert_line: 0,
-        insert_text: "y".repeat(8 * 1024 + 1),
+        insert_text: "y".repeat(MEMORY_MAX_FILE_BYTES + 1),
         file_text: "",
       });
       expect(oversizedInsert.success).toBe(false);
@@ -482,6 +486,30 @@ describe("memory tool", () => {
       ).toBe(true);
     });
 
+    it.each(["create", "str_replace", "insert"] as const)(
+      "preserves a final %s larger than the preloaded excerpt",
+      async (command) => {
+        using fixture = await createFixture({ memoryWritePath: notes });
+        const previous = "previous checkpoint";
+        expect(
+          (await run(fixture.tool, { command: "create", path: notes, file_text: previous })).success
+        ).toBe(true);
+        // A final save this size was rejected before rollover, leaving stale notes behind.
+        const update = "Latest state: resume here.\n".padEnd(10_818, ".");
+        const mutation =
+          command === "create"
+            ? { command, file_text: update }
+            : command === "str_replace"
+              ? { command, old_str: previous, new_str: update }
+              : { command, insert_line: 0, insert_text: update };
+        const result = await run(createMemoryTool(fixture.config), { ...mutation, path: notes });
+        expect(result.success).toBe(true);
+        expect(await readNotes(fixture)).toBe(
+          command === "insert" ? `${update}\n${previous}` : update
+        );
+      }
+    );
+
     it("caps the resulting notes file, not just the payload", async () => {
       using fixture = await createFixture({ memoryWritePath: notes });
       expect(
@@ -489,7 +517,7 @@ describe("memory tool", () => {
           await run(fixture.tool, {
             command: "create",
             path: notes,
-            file_text: "a".repeat(6 * 1024),
+            file_text: "a".repeat(MEMORY_MAX_FILE_BYTES - 1024),
           })
         ).success
       ).toBe(true);
@@ -497,21 +525,23 @@ describe("memory tool", () => {
         command: "insert",
         path: notes,
         insert_line: 0,
-        insert_text: "b".repeat(3 * 1024),
+        insert_text: "b".repeat(1024),
       });
       expect(grow.success).toBe(false);
       if (!grow.success) expect(grow.error).toContain("limited to");
-      // Replacing content that frees space is fine.
+      expect(await readNotes(fixture)).toBe("a".repeat(MEMORY_MAX_FILE_BYTES - 1024));
+      // Replacing up to the exact storage cap is fine.
       expect(
         (
           await run(createMemoryTool(fixture.config), {
             command: "str_replace",
             path: notes,
-            old_str: "a".repeat(6 * 1024),
-            new_str: "c".repeat(7 * 1024),
+            old_str: "a".repeat(MEMORY_MAX_FILE_BYTES - 1024),
+            new_str: "c".repeat(MEMORY_MAX_FILE_BYTES),
           })
         ).success
       ).toBe(true);
+      expect(await readNotes(fixture)).toBe("c".repeat(MEMORY_MAX_FILE_BYTES));
     });
 
     it("rejects a pin that is not a file inside a scope", async () => {
