@@ -14,6 +14,12 @@ describe("TokenizerService", () => {
   let history: MuxMessage[];
   let historyError: string | null;
   let partial: MuxMessage | null;
+  // Unreadable partial.json (not ENOENT). Mirrors HistoryService.readPartial: swallowed and
+  // reported as null unless the caller opts into throwOnError.
+  let partialReadError: Error | null;
+  // Per-call gates for the history read so tests can control completion order.
+  let historyReadGates: Array<() => void>;
+  let gateHistoryReads: boolean;
 
   beforeEach(() => {
     sessionUsageService = {
@@ -22,14 +28,28 @@ describe("TokenizerService", () => {
     history = [];
     historyError = null;
     partial = null;
+    partialReadError = null;
+    historyReadGates = [];
+    gateHistoryReads = false;
     service = new TokenizerService(
       sessionUsageService,
       { getWorkspaceMetadata: () => Promise.resolve({ success: false, error: "not found" }) },
       { getConfig: () => ({}) },
       {
-        getHistoryFromLatestBoundary: () =>
-          Promise.resolve(historyError === null ? Ok(history) : Err(historyError)),
-        readPartial: () => Promise.resolve(partial),
+        getHistoryFromLatestBoundary: () => {
+          const snapshot = history;
+          const result = historyError === null ? Ok(snapshot) : Err(historyError);
+          if (!gateHistoryReads) return Promise.resolve(result);
+          return new Promise((resolve) => {
+            historyReadGates.push(() => resolve(result));
+          });
+        },
+        readPartial: (_workspaceId, options) => {
+          if (partialReadError !== null) {
+            return options?.throwOnError ? Promise.reject(partialReadError) : Promise.resolve(null);
+          }
+          return Promise.resolve(partial);
+        },
       }
     );
   });
@@ -106,6 +126,63 @@ describe("TokenizerService", () => {
         );
       } finally {
         statsSpy.mockRestore();
+      }
+    });
+
+    test("rejects when partial.json is unreadable instead of undercounting the in-flight turn", async () => {
+      history = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
+      partialReadError = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        const error = await service
+          .calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" })
+          .then(
+            () => null,
+            (e: unknown) => e
+          );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("EACCES");
+        expect(statsSpy).not.toHaveBeenCalled();
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
+    test("persists the cache of the most recently requested calculation, not the last to finish reading", async () => {
+      const older = [createMuxMessage("msg1", "user", "Hello", { historySequence: 1 })];
+      const newer = [
+        ...older,
+        createMuxMessage("msg2", "assistant", "World", { historySequence: 2 }),
+      ];
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockImplementation((messages) =>
+        Promise.resolve({
+          ...mockResult,
+          totalTokens: messages.length,
+          consumers: [{ name: "User", tokens: messages.length, percentage: 100 }],
+        })
+      );
+      const persistSpy = spyOn(sessionUsageService, "setTokenStatsCache").mockResolvedValue(
+        undefined
+      );
+      try {
+        gateHistoryReads = true;
+        history = older;
+        const requestA = service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        history = newer;
+        const requestB = service.calculateWorkspaceStats({ workspaceId: "ws", model: "gpt-4" });
+        expect(historyReadGates).toHaveLength(2);
+
+        // B's reads land first; A's stall and complete afterwards with its older snapshot.
+        historyReadGates[1]();
+        await requestB;
+        historyReadGates[0]();
+        await requestA;
+
+        const persisted = persistSpy.mock.calls.map(([, cache]) => cache.history.messageCount);
+        expect(persisted).toEqual([2]);
+      } finally {
+        statsSpy.mockRestore();
+        persistSpy.mockRestore();
       }
     });
 

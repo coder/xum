@@ -57,8 +57,13 @@ export class TokenizerService {
    * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
    * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
    * from being replaced by a partial snapshot read just before the commit.
+   *
+   * The calculation generation is claimed before any read so the latest-calculation guard
+   * orders overlapping requests by arrival: a request that read an older transcript but
+   * finished its reads later must not become "latest" and persist the older snapshot.
    */
   async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
+    const calcId = this.beginCalculation(input.workspaceId);
     const [metadata, historyResult, partial] = await Promise.all([
       this.aiService.getWorkspaceMetadata(input.workspaceId),
       this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
@@ -67,13 +72,20 @@ export class TokenizerService {
     if (!historyResult.success) {
       throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
     }
-    return this.calculateStats(
+    return this.calculateStatsForGeneration(
+      calcId,
       input.workspaceId,
       mergeTranscriptPartial(historyResult.data, partial),
       input.model,
       this.providerService.getConfig(),
       metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null
     );
+  }
+
+  private beginCalculation(workspaceId: string): number {
+    const calcId = ++this.nextCalcId;
+    this.latestCalcIdByWorkspace.set(workspaceId, calcId);
+    return calcId;
   }
 
   /**
@@ -114,14 +126,30 @@ export class TokenizerService {
       typeof workspaceId === "string" && workspaceId.length > 0,
       "Tokenizer calculateStats requires workspaceId"
     );
+    return this.calculateStatsForGeneration(
+      this.beginCalculation(workspaceId),
+      workspaceId,
+      messages,
+      model,
+      providersConfig,
+      parentWorkspaceId
+    );
+  }
+
+  private async calculateStatsForGeneration(
+    calcId: number,
+    workspaceId: string,
+    messages: MuxMessage[],
+    model: string,
+    providersConfig: ProvidersConfigMap | null,
+    parentWorkspaceId: string | null
+  ): Promise<ChatStats> {
     assert(Array.isArray(messages), "Tokenizer calculateStats requires an array of messages");
     assert(
       typeof model === "string" && model.length > 0,
       "Tokenizer calculateStats requires model name"
     );
 
-    const calcId = ++this.nextCalcId;
-    this.latestCalcIdByWorkspace.set(workspaceId, calcId);
     const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
 
     const stats = await calculateTokenStats(
