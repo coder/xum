@@ -9,6 +9,7 @@ import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
   DEFAULT_MODEL_KEY,
+  DEFAULT_RUNTIME_KEY,
   HIDDEN_MODELS_KEY,
   RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
@@ -219,6 +220,63 @@ describe("WorkspaceContext", () => {
       expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
     }
   );
+
+  test("keeps runtime toggles made during the startup config load ahead of the stale response", async () => {
+    createMockAPI({
+      localStorage: {
+        [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: false }),
+      },
+    });
+    const cfg = await createMockORPCClient().config.getConfig();
+    let resolveConfig!: (value: typeof cfg) => void;
+    const pendingConfig = new Promise<typeof cfg>((resolve) => {
+      resolveConfig = resolve;
+    });
+    currentClientMock.config = {
+      getConfig: () => pendingConfig,
+      updateModelPreferences: () => Promise.resolve(),
+    };
+    await setup();
+    act(() => {
+      updatePersistedState(RUNTIME_ENABLEMENT_KEY, { ssh: true });
+      updatePersistedState(DEFAULT_RUNTIME_KEY, "ssh");
+    });
+    // The stale startup response predates both toggles; seeding it would revert them.
+    resolveConfig({
+      ...cfg,
+      hiddenModels: ["openai:daybreak-blue-latest"],
+      hiddenModelsInitialized: true,
+      runtimeEnablement: {},
+      defaultRuntime: null,
+    });
+    await waitFor(() =>
+      expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([
+        "openai:daybreak-blue-latest",
+      ])
+    );
+    expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: true });
+    expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBe("ssh");
+
+    // Once the startup window has passed, the backend is authoritative again.
+    cleanup();
+    getWorkspaceStoreRaw().dispose();
+    currentClientMock.config = {
+      getConfig: () =>
+        Promise.resolve({
+          ...cfg,
+          hiddenModels: [],
+          hiddenModelsInitialized: true,
+          runtimeEnablement: { ssh: false },
+          defaultRuntime: null,
+        }),
+      updateModelPreferences: () => Promise.resolve(),
+    };
+    await setup();
+    await waitFor(() =>
+      expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
+    );
+    expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBeNull();
+  });
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
