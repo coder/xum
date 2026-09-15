@@ -4,7 +4,11 @@ import * as os from "os";
 import * as path from "path";
 import type { DevToolsEvent, DevToolsRun, DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
-import { DevToolsService } from "@/node/services/devToolsService";
+import {
+  DevToolsService,
+  LOAD_TAIL_BYTES,
+  MAX_RETAINED_RUNS_PER_WORKSPACE,
+} from "@/node/services/devToolsService";
 
 function makeRun(id: string, startedAt = "2025-06-01T00:00:00Z"): DevToolsRun {
   return { id, workspaceId: "ws-1", startedAt };
@@ -502,7 +506,7 @@ describe("DevToolsService", () => {
 
       const service = new DevToolsService(config);
 
-      const originalReadFile = fs.readFile;
+      const originalOpen = fs.open;
       let logReadCount = 0;
       let releaseReadGate!: () => void;
       const readGate = new Promise<void>((resolve) => {
@@ -514,17 +518,17 @@ describe("DevToolsService", () => {
         firstReadStartedResolve = resolve;
       });
 
-      const mockedReadFile = (async (...args: Parameters<typeof fs.readFile>) => {
+      const mockedOpen = (async (...args: Parameters<typeof fs.open>) => {
         const [filePath] = args;
         if (filePath === logPath) {
           logReadCount += 1;
           firstReadStartedResolve();
           await readGate;
         }
-        return originalReadFile(...args);
-      }) as typeof fs.readFile;
+        return originalOpen(...args);
+      }) as typeof fs.open;
 
-      const readFileSpy = spyOn(fs, "readFile").mockImplementation(mockedReadFile);
+      const openSpy = spyOn(fs, "open").mockImplementation(mockedOpen);
 
       try {
         const firstCreateStep = service.createStep(
@@ -544,7 +548,7 @@ describe("DevToolsService", () => {
         releaseReadGate();
         await Promise.all([firstCreateStep, secondCreateStep]);
       } finally {
-        readFileSpy.mockRestore();
+        openSpy.mockRestore();
       }
 
       const runWithSteps = await service.getRunWithSteps("ws-1", "run-1");
@@ -607,6 +611,135 @@ describe("DevToolsService", () => {
       expect(runWithSteps).not.toBeNull();
       expect(runWithSteps?.steps).toHaveLength(1);
       expect(runWithSteps?.steps[0]?.error).toBe("boom");
+    });
+
+    it("retains only the newest runs when the log holds more than the bound", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const total = MAX_RETAINED_RUNS_PER_WORKSPACE + 20;
+
+      const lines: string[] = [];
+      for (let index = 1; index <= total; index += 1) {
+        const runId = `run-${index}`;
+        const startedAt = new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString();
+        lines.push(JSON.stringify({ type: "run", run: makeRun(runId, startedAt) }));
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({ id: `step-${index}`, runId, startedAt }),
+          })
+        );
+      }
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs[0]?.id).toBe(`run-${total}`);
+      expect(runs.at(-1)?.id).toBe(`run-${total - MAX_RETAINED_RUNS_PER_WORKSPACE + 1}`);
+      expect(runs.every((run) => run.stepCount === 1)).toBe(true);
+      expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+    });
+
+    it("evicts the oldest run and its steps when createRun exceeds the bound", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+
+      await service.createRun("ws-1", makeRun("run-oldest", "2025-01-01T00:00:00.000Z"));
+      await service.createStep("ws-1", makeStep({ id: "step-oldest", runId: "run-oldest" }));
+      for (let index = 1; index <= MAX_RETAINED_RUNS_PER_WORKSPACE; index += 1) {
+        const startedAt = new Date(Date.UTC(2025, 0, 2, 0, 0, index)).toISOString();
+        await service.createRun("ws-1", makeRun(`run-${index}`, startedAt));
+      }
+
+      const runs = await service.getRuns("ws-1");
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs.some((run) => run.id === "run-oldest")).toBe(false);
+      expect(await service.getRunWithSteps("ws-1", "run-oldest")).toBeNull();
+
+      // Eviction is memory-only; the on-disk log keeps the full history.
+      const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+      expect(logContents).toContain("step-oldest");
+    });
+
+    it("replays only the tail of an oversized log, starting on a line boundary", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+
+      const tailLines = [
+        JSON.stringify({ type: "run", run: makeRun("run-new", "2025-01-02T00:00:00.000Z") }),
+        JSON.stringify({ type: "step", step: makeStep({ id: "step-new", runId: "run-new" }) }),
+      ];
+      // Size the phantom entry so the tail cut (size - LOAD_TAIL_BYTES) lands
+      // exactly at its opening brace, mid-line after the junk prefix. The bytes
+      // after the cut are then a *valid* run entry, so only the partial-first-line
+      // skip (not corrupted-JSON handling) keeps run-phantom out of memory.
+      const phantomRun = (padLength: number) =>
+        JSON.stringify({
+          type: "run",
+          run: {
+            ...makeRun("run-phantom", "2025-01-01T00:00:01.000Z"),
+            pad: "p".repeat(padLength),
+          },
+        });
+      const tailRestBytes = tailLines.join("\n").length + 2; // trailing newlines
+      const phantomTarget = LOAD_TAIL_BYTES - tailRestBytes;
+      const phantom = phantomRun(phantomTarget - phantomRun(0).length);
+      expect(phantom.length).toBe(phantomTarget);
+
+      const contents = `${JSON.stringify({ type: "run", run: makeRun("run-old", "2025-01-01T00:00:00.000Z") })}\n${"junk".repeat(4)}${phantom}\n${tailLines.join("\n")}\n`;
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, contents, "utf-8");
+      expect((await fs.stat(logPath)).size - LOAD_TAIL_BYTES).toBe(contents.indexOf(phantom));
+
+      const service = new DevToolsService(config);
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs.map((run) => run.id)).toEqual(["run-new"]);
+      const detail = await service.getRunWithSteps("ws-1", "run-new");
+      expect(detail?.steps.map((step) => step.id)).toEqual(["step-new"]);
+    });
+
+    it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run: makeRun("run-persisted") })}\n`,
+        "utf-8"
+      );
+
+      const originalOpen = fs.open;
+      let logOpenCount = 0;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        if (args[0] === logPath) {
+          logOpenCount += 1;
+          throw new RangeError("Invalid string length");
+        }
+        return originalOpen(...args);
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:01Z"));
+        await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:00:02Z"));
+
+        expect(logOpenCount).toBe(1);
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+        expect(logOpenCount).toBe(1);
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // Appends kept working despite the failed load.
+      const logContents = await fs.readFile(logPath, "utf-8");
+      expect(logContents).toContain("run-persisted");
+      expect(logContents).toContain('"run-1"');
+      expect(logContents).toContain('"run-2"');
     });
 
     it("clear truncates persisted file", async () => {

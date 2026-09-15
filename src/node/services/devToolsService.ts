@@ -1,7 +1,9 @@
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
+import { StringDecoder } from "string_decoder";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type {
   DevToolsEvent,
   DevToolsLogEntry,
@@ -14,6 +16,28 @@ import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
+/**
+ * Retention policy for in-memory DevTools state.
+ *
+ * devtools.jsonl is append-only and grows without bound: a live server was
+ * observed with 58 files totalling 6.8 GB (largest 1.18 GB) and ~4 GB of live
+ * heap made of replayed runs/steps, because every workspace file was read whole
+ * and every run ever logged was kept. Files past V8's max string length also
+ * made the whole-file read throw, and the failed load was retried on every
+ * subsequent createRun/createStep.
+ *
+ * Policy: only the newest MAX_RETAINED_RUNS_PER_WORKSPACE runs (with their
+ * steps) are kept per workspace, evicting the oldest by append order as new runs
+ * arrive; and on load only the last LOAD_TAIL_BYTES of the file are replayed,
+ * streamed in LOAD_CHUNK_BYTES reads so the file is never materialized in
+ * memory. Steps whose run falls outside the retained window are dropped. The
+ * DevTools panel therefore shows a bounded recent window rather than the full
+ * history; the on-disk file is left untouched (rotation is a follow-up).
+ */
+export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
+export const LOAD_TAIL_BYTES = 32 * 1024 * 1024;
+const LOAD_CHUNK_BYTES = 1024 * 1024;
+
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
   steps: Map<string, DevToolsStep>;
@@ -24,6 +48,70 @@ interface WorkspaceData {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Yield the lines in the last `maxTailBytes` of a file without ever holding the
+ * whole file in memory. When the read starts mid-file, the partial first line
+ * is discarded so replay begins on a line boundary.
+ */
+async function* readTailLines(filePath: string, maxTailBytes: number): AsyncGenerator<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const { size } = await handle.stat();
+    let position = Math.max(0, size - maxTailBytes);
+    let skipPartialFirstLine = position > 0;
+    const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
+    const decoder = new StringDecoder("utf-8");
+    let pending = "";
+
+    while (position < size) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        break;
+      }
+      position += bytesRead;
+      pending += decoder.write(chunk.subarray(0, bytesRead));
+
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        if (skipPartialFirstLine) {
+          skipPartialFirstLine = false;
+          continue;
+        }
+        yield line;
+      }
+    }
+
+    pending += decoder.end();
+    if (pending.length > 0 && !skipPartialFirstLine) {
+      yield pending;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Drop the oldest runs (by append order) and their steps past the retention bound. */
+function evictRunsBeyondBound(data: WorkspaceData): void {
+  while (data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE) {
+    const oldestRunId = data.runs.keys().next().value;
+    if (oldestRunId === undefined) {
+      return;
+    }
+    data.runs.delete(oldestRunId);
+    for (const [stepId, step] of data.steps) {
+      if (step.runId === oldestRunId) {
+        data.steps.delete(stepId);
+      }
+    }
+  }
+}
+
+function insertRun(data: WorkspaceData, run: DevToolsRun): void {
+  data.runs.set(run.id, run);
+  evictRunsBeyondBound(data);
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
@@ -200,7 +288,7 @@ export class DevToolsService extends EventEmitter {
       }
     }
 
-    data.runs.set(run.id, run);
+    insertRun(data, run);
     await this.appendToFile(workspaceId, { type: "run", run });
 
     const summary = this.buildRunSummary(data, run.id);
@@ -226,7 +314,7 @@ export class DevToolsService extends EventEmitter {
         workspaceId,
         startedAt: step.startedAt,
       };
-      data.runs.set(autoRun.id, autoRun);
+      insertRun(data, autoRun);
       await this.appendToFile(workspaceId, { type: "run", run: autoRun });
       this.emitWorkspaceEvent(workspaceId, {
         type: "run-created",
@@ -475,61 +563,70 @@ export class DevToolsService extends EventEmitter {
 
   private async loadFromDisk(workspaceId: string, data: WorkspaceData): Promise<void> {
     const filePath = this.getSessionFilePath(workspaceId);
-    let raw = "";
 
     try {
-      raw = await fs.readFile(filePath, "utf-8");
+      for await (const line of readTailLines(filePath, LOAD_TAIL_BYTES)) {
+        this.replayLogLine(workspaceId, data, line);
+      }
     } catch (error) {
-      if (isRecord(error) && error.code === "ENOENT") {
-        data.loaded = true;
-        return;
-      }
-      throw error;
-    }
-
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-
-      try {
-        const entry = JSON.parse(line) as DevToolsLogEntry;
-        switch (entry.type) {
-          case "run": {
-            data.runs.set(entry.run.id, entry.run);
-            break;
-          }
-          case "step": {
-            data.steps.set(entry.step.id, applyStepBackwardCompatibilityDefaults(entry.step));
-            break;
-          }
-          case "step-update": {
-            const existing = data.steps.get(entry.stepId);
-            if (existing) {
-              data.steps.set(
-                entry.stepId,
-                applyStepBackwardCompatibilityDefaults({
-                  ...existing,
-                  ...entry.update,
-                })
-              );
-            }
-            break;
-          }
-          default: {
-            log.warn("Skipping unknown devtools.jsonl entry type", {
-              workspaceId,
-            });
-          }
-        }
-      } catch {
-        log.warn("Skipping corrupted devtools.jsonl line");
+      // Any failure still marks the workspace loaded with whatever partial state
+      // was replayed. Leaving `loaded` false made every later createRun/createStep
+      // re-run the failing load against a multi-hundred-MB file.
+      if (!(isRecord(error) && error.code === "ENOENT")) {
+        log.warn("DevTools: failed to load devtools.jsonl, continuing with partial state", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
       }
     }
 
     data.loaded = true;
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
+  }
+
+  private replayLogLine(workspaceId: string, data: WorkspaceData, line: string): void {
+    if (!line.trim()) {
+      return;
+    }
+
+    try {
+      const entry = JSON.parse(line) as DevToolsLogEntry;
+      switch (entry.type) {
+        case "run": {
+          insertRun(data, entry.run);
+          break;
+        }
+        case "step": {
+          // Steps for runs outside the retained window (cut off by the tail
+          // read or already evicted) have no reader; skip them.
+          if (!data.runs.has(entry.step.runId)) {
+            break;
+          }
+          data.steps.set(entry.step.id, applyStepBackwardCompatibilityDefaults(entry.step));
+          break;
+        }
+        case "step-update": {
+          const existing = data.steps.get(entry.stepId);
+          if (existing) {
+            data.steps.set(
+              entry.stepId,
+              applyStepBackwardCompatibilityDefaults({
+                ...existing,
+                ...entry.update,
+              })
+            );
+          }
+          break;
+        }
+        default: {
+          log.warn("Skipping unknown devtools.jsonl entry type", {
+            workspaceId,
+          });
+        }
+      }
+    } catch {
+      log.warn("Skipping corrupted devtools.jsonl line");
+    }
   }
 
   private async finalizeStaleStepsForLoadedWorkspace(

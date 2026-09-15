@@ -276,7 +276,7 @@ export function createDevToolsMiddleware(
         log.warn("DevTools: failed to create run", {
           workspaceId,
           runId,
-          error,
+          error: getErrorMessage(error),
         });
       }
     })();
@@ -325,7 +325,7 @@ export function createDevToolsMiddleware(
         workspaceId,
         runId,
         stepType,
-        error,
+        error: getErrorMessage(error),
       });
       return null;
     }
@@ -385,7 +385,7 @@ export function createDevToolsMiddleware(
           log.warn("DevTools: failed to persist step finalization", {
             workspaceId,
             stepId,
-            error,
+            error: getErrorMessage(error),
           });
         }
       };
@@ -536,7 +536,7 @@ export function createDevToolsMiddleware(
           log.warn("DevTools: failed to persist step finalization", {
             workspaceId,
             stepId,
-            error,
+            error: getErrorMessage(error),
           });
         }
       };
