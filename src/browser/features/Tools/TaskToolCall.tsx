@@ -310,13 +310,38 @@ interface TaskRowProps {
   agentType?: string;
   title?: string;
   depth?: number;
-  /** Tree relationship to the calling workspace (task_list scope:"tree" rows). */
+  /** Tree relationship to the calling workspace (task_list scope:"tree"/"instance" rows). */
   relationship?: string;
+  /** Project the root workspace belongs to (task_list scope:"instance" rows only). */
+  projectPath?: string;
+  /** Availability snapshot at listing time (task_list scope:"instance" rows only). */
+  activity?: string;
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
   variant?: "default" | "await";
 }
+
+/**
+ * Last path segment of a project path, tolerating either separator and a trailing separator.
+ * The full path is noise inside a compact row; the basename is what a user recognizes.
+ */
+function projectBasename(projectPath: string): string {
+  const segments = projectPath.split(/[\\/]+/).filter((segment) => segment.length > 0);
+  return segments[segments.length - 1] ?? projectPath;
+}
+
+/** Instance-row context (project basename + activity) shared by both TaskRow variants. */
+const TaskRowInstanceContext: React.FC<{ projectPath?: string; activity?: string }> = (props) => (
+  <>
+    {props.projectPath && (
+      <span className="text-muted max-w-[160px] truncate text-[10px]">
+        {projectBasename(props.projectPath)}
+      </span>
+    )}
+    {props.activity && <span className="text-muted text-[10px]">{props.activity}</span>}
+  </>
+);
 
 function isTaskRowElapsedActive(status: string): boolean {
   return (
@@ -379,6 +404,7 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
             {props.relationship && (
               <span className="text-muted text-[10px]">{props.relationship}</span>
             )}
+            <TaskRowInstanceContext projectPath={props.projectPath} activity={props.activity} />
             {typeof props.depth === "number" && props.depth > 0 && (
               <span className="text-muted text-[10px]">depth {props.depth}</span>
             )}
@@ -407,6 +433,7 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
         <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
       )}
       {props.relationship && <span className="text-muted text-[10px]">{props.relationship}</span>}
+      <TaskRowInstanceContext projectPath={props.projectPath} activity={props.activity} />
       {typeof props.depth === "number" && props.depth > 0 && (
         <span className="text-muted text-[10px]">depth: {props.depth}</span>
       )}
@@ -1699,6 +1726,10 @@ const TaskListItem: React.FC<{
     // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
     // self) — the key context for interpreting the tree view and addressing peer messages.
     relationship={task.relationship}
+    // Instance-scope rows additionally carry the project and an activity snapshot; both are
+    // absent on every other row, so ordinary listings render exactly as before.
+    projectPath={task.projectPath}
+    activity={task.activity}
     openWorkspaceId={task.workspaceId}
   />
 );
