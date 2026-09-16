@@ -51,7 +51,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   };
   const budgetState = budget.session as unknown as {
     contextBudgetGeneration: number;
-    contextBudgetWarningClaimed: boolean;
+    pendingBudgetPrompt?: "warn" | "handoff";
   };
   continuous.session.setAutoCompactionThreshold(0.6);
   budget.session.setAutoCompactionThreshold(0.7);
@@ -88,19 +88,21 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
       memoryWritable: true,
     })
   ).toMatchObject({ decision: "warn" });
-  expect(budgetState.contextBudgetWarningClaimed).toBe(true);
+  // Settlement queues intent; only durable publication claims an advisory. Another
+  // workspace changing its compaction threshold must leave this pending intent intact.
+  expect(budgetState.pendingBudgetPrompt).toBe("warn");
 
   const budgetGeneration = budgetState.contextBudgetGeneration;
   continuous.session.setAutoCompactionThreshold(0.8);
   expect(budgetState.contextBudgetGeneration).toBe(budgetGeneration);
-  expect(budgetState.contextBudgetWarningClaimed).toBe(true);
+  expect(budgetState.pendingBudgetPrompt).toBe("warn");
   const continuousGeneration: unknown = Reflect.get(
     continuousState.contextController.continuous.continuousCompactor,
     "generation"
   );
   assert(typeof continuousGeneration === "number", "The compactor must have a generation fence");
   expect((await budget.session.interruptStream({ abandonPartial: true })).success).toBe(true);
-  expect(budgetState.contextBudgetWarningClaimed).toBe(false);
+  expect(budgetState.pendingBudgetPrompt).toBeUndefined();
   expect(
     Reflect.get(continuousState.contextController.continuous.continuousCompactor, "generation")
   ).toBe(continuousGeneration);
