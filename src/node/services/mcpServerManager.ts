@@ -2294,24 +2294,28 @@ export class MCPServerManager {
   }
 
   /**
-   * Backoff records to carry into a same-signature full restart forced by a
+   * Backoff state to carry into a same-signature full restart forced by a
    * closed companion instance. That restart replaces the cache entry, so
-   * without this the backed-off server would be started again at once and
-   * charge another startup timeout every time a companion dies. Only servers
-   * still enabled and still inside their window carry over.
+   * without this a backed-off server would be started again at once and
+   * charge another startup timeout every time a companion dies, and one whose
+   * window had already elapsed would restart its schedule from the base
+   * instead of continuing it. `records` keeps every still-enabled, still-down
+   * server's history for the outcome accounting of the new batch; `waiting`
+   * names the ones still inside their window, which stay out of that batch.
    */
-  private backedOffServersToCarry(
+  private timedOutRetryBackoffToCarry(
     entry: WorkspaceServers,
     enabledServers: MCPServerMap
-  ): Map<string, TimedOutRetryBackoff> {
-    const carried = new Map<string, TimedOutRetryBackoff>();
+  ): { records: Map<string, TimedOutRetryBackoff>; waiting: Set<string> } {
+    const records = new Map<string, TimedOutRetryBackoff>();
+    const waiting = new Set<string>();
     const now = Date.now();
     for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
       if (enabledServers[serverName] === undefined || entry.instances.has(serverName)) continue;
-      if (this.timedOutRetryWaitMs(entry, serverName, now) <= 0) continue;
-      carried.set(serverName, backoff);
+      records.set(serverName, backoff);
+      if (this.timedOutRetryWaitMs(entry, serverName, now) > 0) waiting.add(serverName);
     }
-    return carried;
+    return { records, waiting };
   }
 
   /**
@@ -3367,14 +3371,14 @@ export class MCPServerManager {
       // changed signature is a config change and starts everything afresh.
       const carriedBackoff =
         retained === undefined && current?.configSignature === signature
-          ? this.backedOffServersToCarry(current, enabledServers)
-          : new Map<string, TimedOutRetryBackoff>();
+          ? this.timedOutRetryBackoffToCarry(current, enabledServers)
+          : { records: new Map<string, TimedOutRetryBackoff>(), waiting: new Set<string>() };
       const serversToStart = addedServerNames
         ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
-        : carriedBackoff.size === 0
+        : carriedBackoff.waiting.size === 0
           ? enabledServers
           : Object.fromEntries(
-              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.has(name))
+              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.waiting.has(name))
             );
       if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
@@ -3409,8 +3413,8 @@ export class MCPServerManager {
         () => this.markActivity(workspaceId),
         workspaceId
       );
-      // Carried servers were not attempted this time but are still down.
-      const startFailedNames = [...startedFailedNames, ...carriedBackoff.keys()];
+      // Still-waiting servers were not attempted this time but are still down.
+      const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -3469,7 +3473,7 @@ export class MCPServerManager {
             delete retained.timedOutRetryBackoff;
             this.recordStartupTimeoutOutcomes(
               retained,
-              startTimedOutNames,
+              Object.keys(serversToStart),
               startTimedOutNames,
               startTimedOutAtMs
             );
@@ -3491,17 +3495,21 @@ export class MCPServerManager {
             enabledServersGeneration: configGenerationUsed,
             stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
             timedOutServerNames: [
-              ...carriedBackoff.keys(),
+              ...carriedBackoff.waiting,
               ...startTimedOutNames,
               ...invalidatedKeys,
             ],
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
-            ...(carriedBackoff.size > 0 ? { timedOutRetryBackoff: new Map(carriedBackoff) } : {}),
+            ...(carriedBackoff.records.size > 0
+              ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }
+              : {}),
           };
+          // Attempted names, not just timed-out ones: a carried record whose
+          // server came up this time must clear rather than linger.
           this.recordStartupTimeoutOutcomes(
             entry,
-            startTimedOutNames,
+            Object.keys(serversToStart),
             startTimedOutNames,
             startTimedOutAtMs
           );

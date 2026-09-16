@@ -3440,6 +3440,54 @@ describe("MCPServerManager", () => {
     expect(Object.keys(startServersMock.mock.calls[2][0] as object)).toEqual(["flaky"]);
   });
 
+  test("a closed companion's restart after the window elapsed continues the schedule", async () => {
+    const workspaceId = "ws-timeout-backoff-closed-companion-elapsed";
+    configService.listServers = mock(() =>
+      Promise.resolve({ healthy: stdioConfig("cmd-h"), flaky: stdioConfig("cmd-f") })
+    );
+    const startServersMock = mock((servers: unknown) => {
+      const names = Object.keys(servers as Record<string, unknown>);
+      return Promise.resolve(
+        startResult(
+          names.filter((name) => name === "healthy").map((name) => [name] as [string]),
+          names.includes("flaky")
+            ? { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }
+            : {}
+        )
+      );
+    });
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const base = Date.now();
+    setSystemTime(new Date(base));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    // The window has elapsed when the companion dies, so the full restart
+    // includes the flaky server; its second timeout is failure number two.
+    setSystemTime(new Date(base + 60_000));
+    (
+      access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, { isClosed: boolean }>;
+      }
+    ).instances.get("healthy")!.isClosed = true;
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(Object.keys(startServersMock.mock.calls[1][0] as object).sort()).toEqual([
+      "flaky",
+      "healthy",
+    ]);
+
+    // Second window is 120 s, not the 60 s base again.
+    setSystemTime(new Date(base + 60_000 + 119_999));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    setSystemTime(new Date(base + 60_000 + 120_000));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(startServersMock.mock.calls[2][0] as object)).toEqual(["flaky"]);
+  });
+
   test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {
     const workspaceId = "ws-prompt-freshness";
     configService.listServers = mock(() =>
