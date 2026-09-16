@@ -10,10 +10,10 @@ import {
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_ADVANCE_MIN_TOKENS,
+  WARNING_RESERVE_TOKENS,
   FLUSH_RESERVE_TOKENS,
   FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
-import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ANTHROPIC_THINKING_BUDGETS, type ThinkingLevel } from "@/common/types/thinking";
@@ -64,16 +64,14 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
-/** Share the usable rollover budget so warnings do not promise the model's unreachable full window. */
-export function getContextBudgetRolloverPoint(
-  modelContextLimit: number,
-  threshold: number
-): number {
-  assert(threshold > 0 && threshold < 1, "Rollover point requires an enabled fractional threshold");
-  return Math.min(
-    getContextBudgetHardCeiling(modelContextLimit),
-    Math.floor((modelContextLimit * (threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT)) / 100)
+/** The slider is an agent handoff target, not a second forced-rollover ceiling. */
+export function getContextBudgetHandoffPoint(modelContextLimit: number, threshold: number): number {
+  assert(
+    Number.isFinite(modelContextLimit) && modelContextLimit > 0,
+    "Handoff requires a finite positive model context limit"
   );
+  assert(threshold > 0 && threshold < 1, "Handoff point requires an enabled fractional threshold");
+  return Math.floor(modelContextLimit * threshold);
 }
 
 /** Heuristic-only check. Provider dispatch uses the node real-encoding adapter.
@@ -101,10 +99,11 @@ export interface StepBudgetInput {
   modelContextLimit: number | null | undefined;
   threshold: number;
   warningEmitted: boolean;
+  handoffRequested: boolean;
 }
 
 export interface StepBudgetEvaluation {
-  decision: "continue" | "warn" | "rollover" | "block";
+  decision: "continue" | "warn" | "handoff" | "rollover" | "block";
   flushOpportunity: boolean;
   projected: number;
   /** Undefined means unknown, not unlimited. The caller should log that limitation. */
@@ -155,28 +154,24 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     };
   }
   if (input.threshold >= 1) return result;
-  // A flush opportunity means one more notes-writing step fits below the hard ceiling.
-  // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
   const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
-  const rolloverAt = getContextBudgetRolloverPoint(limit, input.threshold);
-  if (projected >= rolloverAt) {
-    return { ...result, decision: "rollover", flushOpportunity: safeFlush };
+  // Advisories are best-effort. Skip stages without headroom rather than forcing an early
+  // rollover; the final assembled-payload preflight remains authoritative before dispatch.
+  if (input.handoffRequested || hardProjected + WARNING_RESERVE_TOKENS >= hardCeiling)
+    return result;
+  const handoffAt = getContextBudgetHandoffPoint(limit, input.threshold);
+  if (projected >= handoffAt) {
+    return { ...result, decision: "handoff", flushOpportunity: safeFlush };
   }
-  // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
-  // window really ends; anchor the absolute advance floor there. Whatever the threshold, at
-  // least half of the usable window stays warning-free instead of warning on the first request.
   const warnAt = Math.max(
-    rolloverAt / 2,
+    handoffAt / 2,
     Math.min(
       limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
-      rolloverAt - WARNING_ADVANCE_MIN_TOKENS
+      handoffAt - WARNING_ADVANCE_MIN_TOKENS
     )
   );
   if (!input.warningEmitted && projected >= warnAt) {
-    // Never spend the last usable context tokens telling the agent to flush notes.
-    return safeFlush
-      ? { ...result, decision: "warn", flushOpportunity: true }
-      : { ...result, decision: "rollover" };
+    return { ...result, decision: "warn", flushOpportunity: safeFlush };
   }
   return result;
 }
