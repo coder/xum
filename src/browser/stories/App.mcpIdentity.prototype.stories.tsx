@@ -3,13 +3,10 @@ import { createPortal } from "react-dom";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { ExternalLink, Plug } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar, expandProjects } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
-import { createMockORPCClient } from "./mocks/orpc";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { blurActiveElement, waitForScrollStabilization } from "./storyPlayHelpers";
 import notionIcon from "./assets/notion-mcp.prototype.svg";
@@ -22,7 +19,7 @@ export default {
     docs: {
       description: {
         component:
-          "Design-only inserts in the real App, MCP settings rows, and GenericToolCall headers. Compare Current and Proposed with identical fixtures. No backend metadata or remote icon loading is implemented.",
+          "Design-only inserts in the real App's GenericToolCall headers (chat identity lands in slice 3). Compare Current and Proposed with identical fixtures. Settings identity is implemented: see App/MCP Identity.",
       },
     },
   },
@@ -55,7 +52,6 @@ const CONNECTIONS = [
 ] as const;
 
 type Connection = (typeof CONNECTIONS)[number];
-type Surface = "chat" | "settings";
 
 function setupIdentityStory(phone: boolean) {
   if (phone) collapseLeftSidebar();
@@ -134,27 +130,6 @@ function setupIdentityStory(phone: boolean) {
       ),
     ],
   });
-  // Only the existing mock API is replaced. All settings controls remain the real ones.
-  const mcpClient = createMockORPCClient({
-    globalMcpServers: {
-      "notion-work": { transport: "http", url: CONNECTIONS[0].endpoint, disabled: false },
-      "local-docs": {
-        transport: "stdio",
-        command: "bun",
-        args: ["run", "docs-server.ts"],
-        disabled: false,
-      },
-    },
-    mcpTestResults: new Map([
-      [
-        "notion-work",
-        { success: true, tools: ["notion_ai_search", "notion_fetch", "notion_create_pages"] },
-      ],
-      ["local-docs", { success: true, tools: ["search", "read"] }],
-    ]),
-  });
-  client.mcp = mcpClient.mcp;
-  updatePersistedState(getMCPTestResultsKey("__global__"), {});
   return client;
 }
 
@@ -224,21 +199,18 @@ function Identity(props: { connection: Connection; compact: boolean }) {
   );
 }
 
-function IdentityPrototype(props: { surface: Surface; phone?: boolean; proposed?: boolean }) {
+function IdentityPrototype(props: { phone?: boolean; proposed?: boolean }) {
   const host = useRef<HTMLDivElement>(null);
   const [slots, setSlots] = useState<Array<{ node: HTMLElement; connection: Connection }>>([]);
   useEffect(() => {
     if (!props.proposed || !host.current) return;
     const root = host.current;
     const owned: HTMLElement[] = [];
-    const targets =
-      props.surface === "chat"
-        ? ([
-            [NOTION_SEARCH, CONNECTIONS[0]],
-            [NOTION_FETCH, CONNECTIONS[0]],
-            [LOCAL_SEARCH, CONNECTIONS[1]],
-          ] as const)
-        : CONNECTIONS.map((connection) => [connection.key, connection] as const);
+    const targets = [
+      [NOTION_SEARCH, CONNECTIONS[0]],
+      [NOTION_FETCH, CONNECTIONS[0]],
+      [LOCAL_SEARCH, CONNECTIONS[1]],
+    ] as const;
     // Disposable story-only inserts: keep the actual app shell, rows, headers and
     // handlers. Never replace React-owned text/children or add production mock props.
     // The observer disconnects as soon as this story's async fixture has mounted.
@@ -268,18 +240,12 @@ function IdentityPrototype(props: { surface: Surface; phone?: boolean; proposed?
       observer.disconnect();
       for (const node of owned) node.remove();
     };
-  }, [props.proposed, props.surface]);
+  }, [props.proposed]);
   return (
     <div ref={host} className="h-full w-full">
-      <AppWithMocks
-        setup={() => setupIdentityStory(props.phone === true && props.surface === "chat")}
-      />
+      <AppWithMocks setup={() => setupIdentityStory(props.phone === true)} />
       {slots.map(({ node, connection }, index) =>
-        createPortal(
-          <Identity connection={connection} compact={props.surface === "chat"} />,
-          node,
-          String(index)
-        )
+        createPortal(<Identity connection={connection} compact />, node, String(index))
       )}
     </div>
   );
@@ -301,23 +267,14 @@ async function prepareChat(canvasElement: HTMLElement, proposed: boolean) {
     ).not.toBeInTheDocument();
 }
 
-async function prepareSettings(canvasElement: HTMLElement, proposed: boolean) {
-  const canvas = within(canvasElement);
-  // Settings stories expose the real sidebar first, including at phone widths.
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
-  await userEvent.click(await canvas.findByRole("button", { name: "MCP" }));
-  await canvas.findByText("notion-work", { exact: true });
-  if (proposed) await canvas.findByRole("button", { name: "Server information: notion-work" });
-}
-
 export const CurrentChat: AppStory = {
-  render: () => <IdentityPrototype surface="chat" />,
+  render: () => <IdentityPrototype />,
   parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
   play: async ({ canvasElement }) => prepareChat(canvasElement, false),
 };
 export const ProposedChat: AppStory = {
   ...CurrentChat,
-  render: () => <IdentityPrototype surface="chat" proposed />,
+  render: () => <IdentityPrototype proposed />,
   play: async ({ canvasElement }) => prepareChat(canvasElement, true),
 };
 export const ChatServerDetails: AppStory = {
@@ -339,32 +296,11 @@ export const ChatServerDetails: AppStory = {
     await userEvent.click(info);
   },
 };
-export const CurrentSettings: AppStory = {
-  render: () => <IdentityPrototype surface="settings" />,
-  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
-  play: async ({ canvasElement }) => prepareSettings(canvasElement, false),
-};
-export const ProposedSettings: AppStory = {
-  ...CurrentSettings,
-  render: () => <IdentityPrototype surface="settings" proposed />,
-  play: async ({ canvasElement }) => prepareSettings(canvasElement, true),
-};
-export const SettingsServerDetails: AppStory = {
-  ...ProposedSettings,
-  play: async ({ canvasElement }) => {
-    await prepareSettings(canvasElement, true);
-    await userEvent.click(
-      within(canvasElement).getByRole("button", { name: "Server information: notion-work" })
-    );
-    await within(document.body).findByRole("dialog", { name: "About notion-work" });
-  },
-};
-
 const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
 const phoneGlobals = { viewport: { value: "mobile1", isRotated: false } };
 export const ChatPhone: AppStory = {
   ...ProposedChat,
-  render: () => <IdentityPrototype surface="chat" phone proposed />,
+  render: () => <IdentityPrototype phone proposed />,
   globals: phoneGlobals,
   parameters: phoneParameters,
   play: async (context) => {
@@ -379,17 +315,5 @@ export const ChatPhone: AppStory = {
         );
       }
     }
-  },
-};
-export const SettingsPhone: AppStory = {
-  ...ProposedSettings,
-  render: () => <IdentityPrototype surface="settings" phone proposed />,
-  globals: phoneGlobals,
-  parameters: phoneParameters,
-  play: async (context) => {
-    await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
-    await prepareSettings(context.canvasElement, true);
-    if (window.innerWidth < 768)
-      await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
   },
 };

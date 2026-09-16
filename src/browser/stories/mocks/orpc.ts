@@ -41,7 +41,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
-import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
+import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
@@ -268,11 +268,8 @@ export interface MockORPCClientOptions {
       toolAllowlist?: Record<string, string[]>;
     }
   >;
-  /** MCP test results - maps server name to tools list or error */
-  mcpTestResults?: Map<
-    string,
-    { success: true; tools: string[] } | { success: false; error: string }
-  >;
+  /** MCP test results - maps server name to tools list (optionally with serverInfo) or error */
+  mcpTestResults?: Map<string, MockMcpTestResult>;
   /** Custom listBranches implementation (for testing non-git repos) */
   listBranches?: (input: {
     projectPath: string;
@@ -360,7 +357,9 @@ interface MockMcpOverrides {
   toolAllowlist?: Record<string, string[]>;
 }
 
-type MockMcpTestResult = { success: true; tools: string[] } | { success: false; error: string };
+type MockMcpTestResult =
+  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity }
+  | { success: false; error: string };
 
 /**
  * Creates a mock ORPC client for Storybook.

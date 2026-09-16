@@ -33,10 +33,20 @@ import { Switch } from "@/browser/components/Switch/Switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
-import type { CachedMCPTestResult, MCPServerInfo, MCPServerTransport } from "@/common/types/mcp";
+import type {
+  CachedMCPTestResult,
+  MCPServerIdentity,
+  MCPServerInfo,
+  MCPServerTransport,
+} from "@/common/types/mcp";
 import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeadersEditor";
+import {
+  MCPServerIdentityBadge,
+  describeConfiguredConnection,
+  stripServerInfo,
+} from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 import {
   mcpHeaderRowsToRecord,
   mcpHeadersRecordToRows,
@@ -769,6 +779,14 @@ export const MCPSettingsSection: React.FC = () => {
     clearResult: clearTestResult,
   } = useMCPTestCache("__global__");
   const [testingServer, setTestingServer] = useState<string | null>(null);
+  // Server-reported identity is display-only and lives in memory for one
+  // configuration load: refresh() starts a new generation and drops all
+  // branding, and a test that started under an older generation may cache its
+  // tools but never brands the row. Every entry in `branding` therefore belongs
+  // to the current load. Persisting it would need a backend-produced binding to
+  // the tested configuration (follow-up); users re-test to see it again.
+  const loadGeneration = useRef(0);
+  const [branding, setBranding] = useState<Record<string, MCPServerIdentity>>({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
 
   interface EditableServer {
@@ -831,6 +849,8 @@ export const MCPSettingsSection: React.FC = () => {
   const refresh = useCallback(async () => {
     if (!api) return;
     const request = ++refreshRequest.current.id;
+    loadGeneration.current += 1;
+    setBranding({});
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
@@ -941,10 +961,15 @@ export const MCPSettingsSection: React.FC = () => {
   const handleTest = useCallback(
     async (name: string) => {
       if (!api) return;
+      const generation = loadGeneration.current;
       setTestingServer(name);
       try {
         const result = await api.mcp.test({ name });
-        cacheTestResult(name, result);
+        cacheTestResult(name, stripServerInfo(result));
+        const serverInfo = result.success ? result.serverInfo : undefined;
+        if (serverInfo && generation === loadGeneration.current) {
+          setBranding((prev) => ({ ...prev, [name]: serverInfo }));
+        }
       } catch (err) {
         cacheTestResult(name, {
           success: false,
@@ -1014,26 +1039,13 @@ export const MCPSettingsSection: React.FC = () => {
 
       // For remote servers, always run a test immediately after adding so OAuth-required servers can
       // surface an OAuth callout without requiring a manual Test click.
-      setTestingServer(serverName);
-      try {
-        const testResult = await api.mcp.test({
-          name: serverName,
-        });
-        cacheTestResult(serverName, testResult);
-      } catch (err) {
-        cacheTestResult(serverName, {
-          success: false,
-          error: err instanceof Error ? err.message : "Test failed",
-        });
-      } finally {
-        setTestingServer(null);
-      }
+      await handleTest(serverName);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add MCP server");
     } finally {
       setAddingServer(false);
     }
-  }, [api, newServer, newTestResult, refresh, cacheTestResult, globalSecretKeys]);
+  }, [api, newServer, newTestResult, refresh, cacheTestResult, handleTest, globalSecretKeys]);
 
   const handleStartEdit = useCallback((name: string, entry: MCPServerInfo) => {
     setEditing({
@@ -1183,7 +1195,7 @@ export const MCPSettingsSection: React.FC = () => {
             }),
       });
 
-      setNewTestResult({ result, testedAt: Date.now() });
+      setNewTestResult({ result: stripServerInfo(result), testedAt: Date.now() });
     } catch (err) {
       setNewTestResult({
         result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
@@ -1299,6 +1311,12 @@ export const MCPSettingsSection: React.FC = () => {
                               shrinks their min-content so they cannot starve the actions
                               column at ~375px. */}
                           <div className="flex flex-wrap items-center gap-2">
+                            {branding[name] && !isEditing && (
+                              <MCPServerIdentityBadge
+                                connection={describeConfiguredConnection(name, entry)}
+                                identity={branding[name]}
+                              />
+                            )}
                             <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
                               {displayName}
                             </span>

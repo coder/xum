@@ -5,7 +5,7 @@ import { Switch } from "@/browser/components/Switch/Switch";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { cn } from "@/common/lib/utils";
-import type { MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { MCPServerIdentity, MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import {
   Dialog,
   DialogContent,
@@ -14,6 +14,11 @@ import {
 } from "@/browser/components/Dialog/Dialog";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
+import {
+  MCPServerIdentityBadge,
+  describeConfiguredConnection,
+  stripServerInfo,
+} from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 
 interface WorkspaceMCPModalProps {
   workspaceId: string;
@@ -39,6 +44,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // this workspace's plugin: keys while the dialog was open).
   const [overridesRevision, setOverridesRevision] = useState<string | null>(null);
   const [loadingTools, setLoadingTools] = useState<Record<string, boolean>>({});
+  // Server-reported identity is display-only and scoped to one configuration
+  // load (each open of the dialog): loadData starts a new generation and drops
+  // all branding; a fetch that started under an older generation still caches
+  // its tools but never brands the row. See MCPSettingsSection for the same
+  // contract; branding is never persisted with the test cache.
+  const loadGeneration = useRef(0);
+  const [branding, setBranding] = useState<Record<string, MCPServerIdentity>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,6 +72,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     reloadCacheRef.current();
 
     const loadData = async () => {
+      loadGeneration.current += 1;
+      setBranding({});
       setLoading(true);
       setError(null);
       try {
@@ -86,10 +100,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const fetchTools = useCallback(
     async (serverName: string) => {
       if (!api) return;
+      const generation = loadGeneration.current;
       setLoadingTools((prev) => ({ ...prev, [serverName]: true }));
       try {
         const result = await api.mcp.test({ projectPath, name: serverName, workspaceId });
-        setResult(serverName, result);
+        setResult(serverName, stripServerInfo(result));
+        const serverInfo = result.success ? result.serverInfo : undefined;
+        if (serverInfo && generation === loadGeneration.current) {
+          setBranding((prev) => ({ ...prev, [serverName]: serverInfo }));
+        }
         if (!result.success) {
           setError(`Failed to fetch tools for ${serverName}: ${result.error}`);
         }
@@ -361,7 +380,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               names must stay fully readable, and only overflow-wrap:
                               anywhere shrinks intrinsic min-content so the dialog's
                               grid track cannot be inflated by an unbroken token. */}
-                          <div className="font-medium wrap-anywhere">{displayName}</div>
+                          <div className="flex min-w-0 items-center gap-2">
+                            {branding[name] && (
+                              <MCPServerIdentityBadge
+                                connection={describeConfiguredConnection(name, info)}
+                                identity={branding[name]}
+                              />
+                            )}
+                            <div className="min-w-0 font-medium wrap-anywhere">{displayName}</div>
+                          </div>
                           {info.plugin ? (
                             <div className="text-muted text-xs wrap-anywhere">
                               Agent Plugin ({info.plugin.sourceScope} · {info.plugin.sourceLocation}
