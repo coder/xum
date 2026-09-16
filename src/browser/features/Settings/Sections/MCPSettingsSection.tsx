@@ -420,22 +420,15 @@ function useMCPOAuthLogin(input: {
   };
 }
 
-const MCPOAuthRequiredCallout: React.FC<{
-  serverName: string;
-  pendingServer?: MCPOAuthPendingServerConfig;
+type MCPOAuthLoginController = ReturnType<typeof useMCPOAuthLogin>;
+
+const MCPOAuthRequiredCalloutView: React.FC<{
+  login: MCPOAuthLoginController;
   disabledReason?: string;
-  onLoginSuccess?: () => void | Promise<void>;
-}> = ({ serverName, pendingServer, disabledReason, onLoginSuccess }) => {
+}> = ({ login, disabledReason }) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
-
-  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
-    isDesktop,
-    serverName,
-    pendingServer,
-    onSuccess: onLoginSuccess,
-  });
+  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = login;
 
   const mcpOauthApi = getMCPOAuthAPI(api);
   const loginFlowMode = getMCPOAuthLoginFlowMode({
@@ -526,6 +519,24 @@ const MCPOAuthRequiredCallout: React.FC<{
       </div>
     </div>
   );
+};
+
+const MCPOAuthRequiredCallout: React.FC<{
+  serverName: string;
+  pendingServer?: MCPOAuthPendingServerConfig;
+  disabledReason?: string;
+  onLoginSuccess?: () => void | Promise<void>;
+}> = ({ serverName, pendingServer, disabledReason, onLoginSuccess }) => {
+  const { api } = useAPI();
+  const login = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName,
+    pendingServer,
+    onSuccess: onLoginSuccess,
+  });
+
+  return <MCPOAuthRequiredCalloutView login={login} disabledReason={disabledReason} />;
 };
 
 const RemoteMCPOAuthSection: React.FC<{
@@ -1130,6 +1141,45 @@ export const MCPSettingsSection: React.FC = () => {
     newServer.value.trim().length > 0 &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
+  // OAuth login for the add-server draft lives here rather than in the callout so the form
+  // can lock while the browser round-trip is pending. The success callback closes over the
+  // draft it authorized; if the user could edit fields or click "Add" in the meantime, that
+  // stale draft would be written over the newer one.
+  const newServerName = newServer.name.trim();
+  const newServerUrl = newServer.value.trim();
+  // If the server already exists in config, prefer that config for OAuth.
+  const newServerOauthPendingServer: MCPOAuthPendingServerConfig | undefined =
+    newServerName && !servers[newServerName] && newServer.transport !== "stdio" && newServerUrl
+      ? { transport: newServer.transport, url: newServerUrl }
+      : undefined;
+  const newServerOauthDisabledReason = !newServerName
+    ? "Enter a server name to enable OAuth login."
+    : (servers[newServerName]?.transport ?? newServer.transport) === "stdio"
+      ? "OAuth login is only supported for remote (http/sse) MCP servers."
+      : undefined;
+  const newServerOauthLogin = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName: newServerName,
+    pendingServer: newServerOauthPendingServer,
+    onSuccess: async () => {
+      setMcpOauthRefreshNonce((prev) => prev + 1);
+      if (!api) return;
+      // Re-read config rather than trusting the `servers` snapshot: if another writer added
+      // this name during the browser round-trip, only refresh that row's test result so we
+      // never overwrite its config with the draft.
+      const current = (await api.mcp.list({})) ?? {};
+      if (current[newServerName]) {
+        await handleTest(newServerName);
+        return;
+      }
+      // The user already named the server and authorized it in the browser.
+      // Add it now so they don't have to remember to click "Add" afterwards.
+      await handleAddServer();
+    },
+  });
+  const newServerOauthPending = newServerOauthLogin.loginInProgress;
+
   const editHeadersValidation =
     editing && editing.transport !== "stdio"
       ? mcpHeaderRowsToRecord(editing.headersRows, {
@@ -1480,6 +1530,7 @@ export const MCPSettingsSection: React.FC = () => {
                     placeholder="e.g., memory"
                     value={newServer.name}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
                   />
                 </div>
@@ -1488,6 +1539,7 @@ export const MCPSettingsSection: React.FC = () => {
                   <label className="text-muted mb-1 block text-xs">Transport</label>
                   <Select
                     value={newServer.transport}
+                    disabled={newServerOauthPending}
                     onValueChange={(value) =>
                       setNewServer((prev) => ({
                         ...prev,
@@ -1530,6 +1582,7 @@ export const MCPSettingsSection: React.FC = () => {
                     value={newServer.value}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
                     spellCheck={false}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
                   />
                 </div>
@@ -1546,7 +1599,7 @@ export const MCPSettingsSection: React.FC = () => {
                         }))
                       }
                       secretKeys={globalSecretKeys}
-                      disabled={addingServer || testingNew}
+                      disabled={addingServer || testingNew || newServerOauthPending}
                     />
                   </div>
                 )}
@@ -1588,64 +1641,9 @@ export const MCPSettingsSection: React.FC = () => {
                   !newTestResult.result.success &&
                   newTestResult.result.oauthChallenge && (
                     <div className="mt-2">
-                      <MCPOAuthRequiredCallout
-                        serverName={newServer.name.trim()}
-                        pendingServer={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return undefined;
-                          }
-
-                          // If the server already exists in config, prefer that config for OAuth.
-                          const existing = servers[pendingName];
-                          if (existing) {
-                            return undefined;
-                          }
-
-                          if (newServer.transport === "stdio") {
-                            return undefined;
-                          }
-
-                          const url = newServer.value.trim();
-                          if (!url) {
-                            return undefined;
-                          }
-
-                          return { transport: newServer.transport, url };
-                        })()}
-                        disabledReason={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return "Enter a server name to enable OAuth login.";
-                          }
-
-                          const existing = servers[pendingName];
-
-                          const transport = existing?.transport ?? newServer.transport;
-                          if (transport === "stdio") {
-                            return "OAuth login is only supported for remote (http/sse) MCP servers.";
-                          }
-
-                          return undefined;
-                        })()}
-                        onLoginSuccess={async () => {
-                          setMcpOauthRefreshNonce((prev) => prev + 1);
-                          if (!api) return;
-                          // This callback closes over the render where "Log in" was clicked, and
-                          // the browser round-trip can take a while, so `servers` may be stale.
-                          // Re-read config: if the name exists now (it already did, or the user
-                          // clicked "Add" while waiting), only refresh that row's test result so
-                          // we never overwrite its config with the old draft.
-                          const name = newServer.name.trim();
-                          const current = (await api.mcp.list({})) ?? {};
-                          if (current[name]) {
-                            await handleTest(name);
-                            return;
-                          }
-                          // The user already named the server and authorized it in the browser.
-                          // Add it now so they don't have to remember to click "Add" afterwards.
-                          await handleAddServer();
-                        }}
+                      <MCPOAuthRequiredCalloutView
+                        login={newServerOauthLogin}
+                        disabledReason={newServerOauthDisabledReason}
                       />
                     </div>
                   )}
@@ -1654,7 +1652,7 @@ export const MCPSettingsSection: React.FC = () => {
                     variant="outline"
                     size="sm"
                     onClick={() => void handleTestNewServer()}
-                    disabled={!canTest || testingNew}
+                    disabled={!canTest || testingNew || newServerOauthPending}
                   >
                     {testingNew ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1666,7 +1664,7 @@ export const MCPSettingsSection: React.FC = () => {
                   <Button
                     size="sm"
                     onClick={() => void handleAddServer()}
-                    disabled={!canAdd || addingServer}
+                    disabled={!canAdd || addingServer || newServerOauthPending}
                   >
                     {addingServer ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
