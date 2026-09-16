@@ -177,7 +177,10 @@ describe("UILayoutsProvider", () => {
     act(() => {
       writeOutcome = current()
         .setSlotKeybindOverride(3, { key: "3", ctrl: true })
-        .then(() => "saved", (error: unknown) => error);
+        .then(
+          () => "saved",
+          (error: unknown) => error
+        );
     });
     // Every pre-write read is overtaken by a refresh before it answers, and each answers with
     // the pre-restore presets it was served from.

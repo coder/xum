@@ -389,7 +389,10 @@ describe("settingsProjection", () => {
     const valid = readBackupSettings({
       settings: {
         agentAiDefaults: {
-          exec: { modelString: " openai:gpt-exec ", subagent: { modelString: "anthropic:claude-sub" } },
+          exec: {
+            modelString: " openai:gpt-exec ",
+            subagent: { modelString: "anthropic:claude-sub" },
+          },
           plan: { modelString: "", subagent: { modelString: " " } },
         },
       },
