@@ -922,7 +922,7 @@ async function findCollapsedPeerMessageToggles(canvasElement: HTMLElement) {
 /** Sibling and unrelated rows stay collapsed, the descendant row is expanded. */
 export const AgentPeerMessages: AppStory = {
   globals: {
-    viewport: { value: "mobile1", isRotated: false },
+    viewport: { value: "desktop", isRotated: false },
   },
   parameters: {
     pixel: {

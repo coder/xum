@@ -633,11 +633,15 @@ export type SendParentAgentMessageError =
   | { code: "send_failed"; message: string };
 
 /**
- * How the target relates to the sender within one task tree (parentWorkspaceId chains only).
- * "target_descendant" routes to the trusted parent→child guidance path; "peer" (sibling/cousin)
- * and "target_ancestor" take the untrusted <mux_agent_message> envelope path.
+ * Ancestry, not ownership: only descendants receive trusted parent→child guidance.
+ * Siblings/cousins, ancestors and unrelated workspaces receive untrusted envelopes.
+ * Workspace-turn ownership is a separate graph and grants no message authority.
  */
-export type AgentTreeTargetRelation = "target_descendant" | "target_ancestor" | "peer";
+export type AgentTreeTargetRelation =
+  | "target_descendant"
+  | "target_ancestor"
+  | "peer"
+  | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
 
@@ -661,7 +665,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       targetId: string;
       message: string;
-      targetRelation: "peer" | "target_ancestor";
+      targetRelation: "peer" | "target_ancestor" | "target_unrelated";
       queueDispatchMode?: TaskMessageQueueDispatchMode;
     }
   | {
@@ -6309,9 +6313,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Routes a task_send_message send by the target's relation to the sender within one task tree.
+   * Routes a task_send_message send by ancestry, without widening lifecycle ownership.
    * Descendant targets take the unchanged trusted guidance path (framing, reactivation, durable
-   * pending guidance); siblings/cousins and ancestors (including the root workspace) receive an
+   * pending guidance); siblings/cousins, ancestors and unrelated workspaces receive an
    * untrusted <mux_agent_message> envelope. The relation is computed server-side so a sender can
    * never claim parent authority it does not have.
    */
@@ -6341,7 +6345,7 @@ export class TaskService implements AgentTaskIntegration {
       targetId
     );
     if (relation == null) {
-      // Cross-tree targets and self-sends are out of scope for tree messaging.
+      // Self-sends are out of scope; cross-tree targets take the untrusted peer path.
       return Err({ code: "invalid_scope" as const });
     }
 
@@ -6622,16 +6626,17 @@ export class TaskService implements AgentTaskIntegration {
         );
       };
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
+        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
+        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
         if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
           // Root workspaces have no task lifecycle to go terminal.
           return false;
         }
         const status = workspace.taskStatus ?? "running";
         return (
-          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
-          (!hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-            status !== "running" &&
-            status !== "awaiting_report")
+          !hasLiveRunningExecution(workspace, senderWorkspaceId) &&
+          status !== "running" &&
+          status !== "awaiting_report"
         );
       };
       if (isInactivePeerSender(senderEntry.workspace)) {
@@ -6679,6 +6684,17 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
+      const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
+      const delegatedRootUnavailable = (): boolean =>
+        unrelatedRoot &&
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null;
+      const delegatedRootRefusal = {
+        code: "refused" as const,
+        reason: "Retry after the target's delegated workspace turn finishes.",
+      };
+      // Persisted defaults describe a NEW synthetic turn, never someone else's delegated execution.
+      // Pending registrations count too: accepting peer input must not steal a reserved turn.
+      if (delegatedRootUnavailable()) return Err(delegatedRootRefusal);
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
@@ -6831,10 +6847,14 @@ export class TaskService implements AgentTaskIntegration {
       // the catch below, or transient failures would consume the pair/target budgets without
       // delivering anything — eventually refusing valid peer messages until restart.
       try {
-        // Ancestor targets are often human-driven: default to turn-end so a peer message does not
-        // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
-        const effectiveDispatchMode =
-          spec.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
+        // Ancestor and unrelated targets can be human-driven. Do not cut into their turns
+        // unless explicitly requested; sibling sends retain their existing boundary.
+        const defaultDispatchModes: Record<typeof relation, TaskMessageQueueDispatchMode> = {
+          target_ancestor: "turn-end",
+          target_unrelated: "turn-end",
+          peer: "tool-end",
+        };
+        const effectiveDispatchMode = spec.queueDispatchMode ?? defaultDispatchModes[relation];
 
         // Delegated-turn correlation: if the target is currently executing a delegated workspace
         // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
@@ -6842,11 +6862,12 @@ export class TaskService implements AgentTaskIntegration {
         // stream end settles the owner's delegated turn as interrupted/superseded. Peer
         // attribution stays on the assistant payload row, so no provenance is lost; the queue
         // still counts these entries by their dedupe-key prefix.
-        const workspaceTurnMuxMetadata =
-          await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-            targetId,
-            { requireAcceptedRegistration: true }
-          );
+        const workspaceTurnMuxMetadata = unrelatedRoot
+          ? null
+          : await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+              targetId,
+              { requireAcceptedRegistration: true }
+            );
         // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
         // renders machine notifications from metadata, so a bare workspace-turn replacement would
         // present the backend trigger as a human prompt (and re-enter prompt navigation).
@@ -6867,6 +6888,22 @@ export class TaskService implements AgentTaskIntegration {
             agentId: resumeOptions.agentId,
             thinkingLevel: resumeOptions.thinkingLevel,
             reasoningMode: resumeOptions.reasoningMode,
+            muxMetadata: triggerMuxMetadata,
+            queueDispatchMode: effectiveDispatchMode,
+          };
+        } else if (unrelatedRoot) {
+          assert(!targetIsAgentTask);
+          // Honor the recipient's selected identity (including plan), not the sender's or an
+          // older history row. Without a selection, the shared history → exec fallback applies.
+          const persistedAgentId = resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
+          const resumeOptions = await this.resolveParentAutoResumeOptions(
+            targetId,
+            targetEntry,
+            defaultModel,
+            persistedAgentId ? { agentId: persistedAgentId } : undefined
+          );
+          sendOptions = {
+            ...resumeOptions,
             muxMetadata: triggerMuxMetadata,
             queueDispatchMode: effectiveDispatchMode,
           };
@@ -6926,6 +6963,10 @@ export class TaskService implements AgentTaskIntegration {
           }
           if (targetChainInterrupted()) {
             admissionRefusal = interruptedRefusal;
+            return true;
+          }
+          if (delegatedRootUnavailable()) {
+            admissionRefusal = delegatedRootRefusal;
             return true;
           }
           const freshCfg = this.config.loadConfigOrDefault();
@@ -11261,9 +11302,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Relation of `targetId` to `senderWorkspaceId` within one task tree, or null when the endpoints
-   * are the same workspace (self-sends are out of scope) or live in different trees. Only
-   * parentWorkspaceId chains define the tree; workspace-turn ownership tags are a separate graph.
+   * Relation of `targetId` to `senderWorkspaceId`, or null for self-sends. Different trees
+   * route as unrelated peers. Only parentWorkspaceId chains define ancestry;
+   * workspace-turn ownership tags are a separate, unchanged graph.
    */
   private resolveAgentTreeTargetRelation(
     parentById: Map<string, string>,
@@ -11281,7 +11322,9 @@ export class TaskService implements AgentTaskIntegration {
     // roots (including two unrelated plain workspaces, each its own root) are cross-tree.
     const senderRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, senderWorkspaceId);
     const targetRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, targetId);
-    return senderRoot === targetRoot ? "peer" : null;
+    const relation = senderRoot === targetRoot ? "peer" : "target_unrelated";
+    assert(relation !== "target_unrelated" || senderRoot !== targetRoot);
+    return relation;
   }
 
   /** True when the workspace or any agent-task ancestor carries best-of candidate metadata. */

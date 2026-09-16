@@ -15,6 +15,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
@@ -220,6 +221,7 @@ function simulateAcceptedFamilySends(
 function createTaskServiceHarness(
   config: Config,
   overrides?: {
+    historyService?: HistoryService;
     aiService?: AIService;
     workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
@@ -235,7 +237,7 @@ function createTaskServiceHarness(
   workspaceService: WorkspaceHost;
   initStateManager: InitStateManager;
 } {
-  const historyService = new HistoryService(config);
+  const historyService = overrides?.historyService ?? new HistoryService(config);
   const partialService = historyService;
 
   const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
@@ -11700,41 +11702,491 @@ describe("TaskService", () => {
     expect(message).toBe("Updated guidance from parent:\n\nFocus on the parser.");
   });
 
-  test("sendAgentTreeMessage rejects self-sends and cross-tree targets", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
+  test.each([false, true])(
+    "sendAgentTreeMessage rejects self-sends but routes cross-tree replies as untrusted messages (accepted=%s)",
+    async (accepted) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
 
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "child", "child-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "other-root", "other-root"),
-        projectWorkspace(projectPath, "other-child", "other-child", {
-          parentWorkspaceId: "other-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "root", "tree-root"),
+          projectWorkspace(projectPath, "child", "child-a", {
+            parentWorkspaceId: "tree-root",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "other-root", "other-root"),
+          projectWorkspace(projectPath, "other-child", "other-child", {
+            parentWorkspaceId: "other-root",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        sendMessage: mock(
+          async (...args: Parameters<WorkspaceHost["sendMessage"]>): Promise<Result<void>> => {
+            if (accepted) await args[3]?.onAccepted?.();
+            return Ok(undefined);
+          }
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      expect(await taskService.sendAgentTreeMessage("child-a", "child-a", "hi")).toEqual(
+        Err({ code: "invalid_scope" })
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
+      const payload = "Review the parser change; do not alter settings.";
+      expect(await taskService.sendAgentTreeMessage("child-a", "other-root", payload)).toEqual(
+        accepted
+          ? Ok({ delivery: "accepted", relation: "target_unrelated" })
+          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+      );
+      const [targetId, trigger, options, internal] = sendMessage.mock.calls[0] as Parameters<
+        WorkspaceHost["sendMessage"]
+      >;
+      expect(targetId).toBe("other-root");
+      expect(options?.queueDispatchMode).toBe("turn-end");
+      expect(internal?.synthetic).toBe(true);
+      expect(internal?.skipAutoResumeReset).toBe(true);
+      const row = internal?.preTurnMessages?.[0];
+      expect(row?.role).toBe("assistant");
+      expect(row?.metadata?.synthetic).toBe(true);
+      assert(row?.parts[0]?.type === "text");
+      const envelope = parseAgentMessageEnvelope(row.parts[0].text);
+      expect(envelope).toMatchObject({
+        from: "child-a",
+        relationship: "unrelated",
+        message: payload,
+      });
+      expect(trigger).not.toContain(payload);
+      expect(trigger).toContain(row.id);
+      assert(envelope);
+      expect(await taskService.sendAgentTreeMessage("other-root", envelope.from, "Reply")).toEqual(
+        accepted
+          ? Ok({ delivery: "accepted", relation: "target_unrelated" })
+          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+      );
+      expect(
+        await taskService.sendAgentTreeMessage("child-a", "other-child", "hi", "tool-end")
+      ).toEqual(
+        accepted
+          ? Ok({ delivery: "accepted", relation: "target_unrelated" })
+          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
+      );
+      expect(
+        (sendMessage.mock.calls[2] as Parameters<WorkspaceHost["sendMessage"]>)[2]
+          ?.queueDispatchMode
+      ).toBe("tool-end");
+    }
+  );
+
+  describe("sendAgentTreeMessage unrelated targets", () => {
+    test.each([
+      { selected: "plan", history: ["exec"], expected: "plan" },
+      { selected: "plan", history: [], expected: "plan" },
+      { selected: undefined, history: ["exec"], expected: "exec" },
+      { selected: undefined, history: [], expected: "exec" },
+      { selected: undefined, history: ["plan", "compact"], expected: "plan" },
+    ])(
+      "uses recipient identity $expected (selected=$selected, history=$history)",
+      async (entry) => {
+        const fixture = await createTestHistoryService();
+        await using _cleanup = { [Symbol.asyncDispose]: fixture.cleanup };
+        const { config, historyService } = fixture;
+        const projectPath = path.join(fixture.tempDir, "repo");
+        const hasSettings = entry.selected != null || entry.history.length > 0;
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender", { agentId: "explore" }),
+            projectWorkspace(projectPath, "target", "target", {
+              agentId: entry.selected,
+              aiSettings: hasSettings
+                ? { model: "openai:gpt-5.2", thinkingLevel: "low" }
+                : undefined,
+              aiSettingsByAgent: hasSettings
+                ? {
+                    plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
+                    exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+                  }
+                : undefined,
+            }),
+          ],
+          testTaskSettings()
+        );
+        for (const [i, agentId] of entry.history.entries()) {
+          expect(
+            (
+              await historyService.appendToHistory(
+                "target",
+                createMuxMessage(`history-${i}`, "assistant", "Prior turn", { agentId })
+              )
+            ).success
+          ).toBe(true);
+        }
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, {
+          workspaceService,
+          historyService,
+        });
+        const correlation = spyOn(
+          workspaceTurnManagerFor(taskService),
+          "getActiveWorkspaceTurnMuxMetadataForWorkspace"
+        );
+        try {
+          expect(
+            (await taskService.sendAgentTreeMessage("sender", "target", "Review this")).success
+          ).toBe(true);
+          const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
+            WorkspaceHost["sendMessage"]
+          >;
+          expect(options).toMatchObject({
+            agentId: entry.expected,
+            model: !hasSettings
+              ? defaultModel
+              : entry.expected === "plan"
+                ? "anthropic:claude-sonnet-4-5"
+                : "openai:gpt-5.2",
+            thinkingLevel: !hasSettings ? "off" : entry.expected === "plan" ? "high" : "medium",
+            queueDispatchMode: "turn-end",
+            muxMetadata: { type: "agent-peer-message", relationship: "unrelated" },
+          });
+          expect(internal?.synthetic).toBe(true);
+          expect(internal?.workspaceTurnContinuation).toBe(false);
+          expect(correlation).not.toHaveBeenCalled();
+        } finally {
+          correlation.mockRestore();
+        }
+      }
     );
 
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    test.each(["reported", "interrupted", "queued", "starting"] as const)(
+      "does not wake a foreign child that is %s",
+      async (taskStatus) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", {
+              parentWorkspaceId: "foreign-root",
+              taskStatus,
+            }),
+            projectWorkspace(projectPath, "foreign-root", "foreign-root"),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "Wake up")).toMatchObject(
+          Err({ code: "not_active", taskStatus })
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+      }
+    );
 
-    expect(await taskService.sendAgentTreeMessage("child-a", "child-a", "hi")).toEqual(
-      Err({ code: "invalid_scope" })
+    test.each([false, true])(
+      "refuses a delegated root before budget reservation (accepted=%s)",
+      async (accepted) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", { agentId: "exec" }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        const internals = taskService as unknown as {
+          agentPeerMessageBroker: AgentPeerMessageBroker;
+          activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
+        };
+        const reserve = spyOn(internals.agentPeerMessageBroker, "reserveBudget");
+        await registerLiveWorkspaceTurnHandle(
+          taskService,
+          "target",
+          "wst_foreign",
+          "sender",
+          accepted
+        );
+        try {
+          const result = await taskService.sendAgentTreeMessage(
+            "sender",
+            "target",
+            "Do not resume delegated work"
+          );
+          expect(result).toMatchObject(Err({ code: "refused" }));
+          assert(!result.success && "reason" in result.error);
+          expect(result.error.reason).toMatch(/retry.*delegated/i);
+          expect(reserve).not.toHaveBeenCalled();
+          expect(sendMessage).not.toHaveBeenCalled();
+          // Existing ownership is separate from ancestry; finishing the delegation opens messaging.
+          internals.activeWorkspaceTurnHandleByWorkspaceId.delete("target");
+          expect(
+            await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
+          ).toEqual(
+            Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+          );
+          const [, , options] = sendMessage.mock.calls[0] as Parameters<
+            WorkspaceHost["sendMessage"]
+          >;
+          expect(options?.agentId).toBe("exec");
+          expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
+        } finally {
+          reserve.mockRestore();
+        }
+      }
     );
-    expect(await taskService.sendAgentTreeMessage("child-a", "other-child", "hi")).toEqual(
-      Err({ code: "invalid_scope" })
+
+    test.each(["pre-admission", "queued"] as const)(
+      "withdraws and refunds when delegation starts %s",
+      async (phase) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", { agentId: "plan" }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+        const internals = taskService as unknown as {
+          resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
+          activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
+        };
+        reserveFamilyMessageTargetSlots(
+          taskService,
+          "target",
+          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+        );
+        const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
+        try {
+          if (phase === "pre-admission") {
+            resolve.mockImplementationOnce(async () => {
+              await registerLiveWorkspaceTurnHandle(
+                taskService,
+                "target",
+                "wst_race",
+                "owner",
+                false
+              );
+              return { model: defaultModel, agentId: "plan" };
+            });
+          }
+          const result = await taskService.sendAgentTreeMessage(
+            "sender",
+            "target",
+            "Before delegation"
+          );
+          if (phase === "queued") {
+            expect(result).toEqual(
+              Ok({
+                delivery: "queued",
+                relation: "target_unrelated",
+                queueDispatchMode: "turn-end",
+              })
+            );
+            await registerLiveWorkspaceTurnHandle(
+              taskService,
+              "target",
+              "wst_race",
+              "owner",
+              false
+            );
+            const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+              WorkspaceHost["sendMessage"]
+            >;
+            expect(internal?.admissionStale?.()).toBe(true);
+            await internal?.onCanceled?.("Delegated execution began before dispatch");
+          } else {
+            expect(result).toMatchObject(Err({ code: "refused" }));
+            expect(sendMessage).not.toHaveBeenCalled();
+          }
+          expect(await collectFullHistory(historyService, "target")).toEqual([]);
+          internals.activeWorkspaceTurnHandleByWorkspaceId.delete("target");
+          // One available budget slot proves that either cancellation path refunded the first send.
+          expect(
+            (await taskService.sendAgentTreeMessage("sender", "target", "After delegation")).success
+          ).toBe(true);
+        } finally {
+          resolve.mockRestore();
+        }
+      }
     );
-    expect(await taskService.sendAgentTreeMessage("child-a", "other-root", "hi")).toEqual(
-      Err({ code: "invalid_scope" })
+
+    test.each([
+      { endpoint: "sender", state: "archived", code: "refused" },
+      { endpoint: "target", state: "archived", code: "not_active" },
+      { endpoint: "sender", state: "stopped", code: "refused" },
+      { endpoint: "target", state: "stopped", code: "refused" },
+    ])(
+      "refunds when $endpoint becomes $state during identity resolution",
+      async ({ endpoint, state, code }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", { agentId: "plan" }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+        const internals = taskService as unknown as {
+          resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
+        };
+        const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
+        reserveFamilyMessageTargetSlots(
+          taskService,
+          "target",
+          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+        );
+        try {
+          resolve.mockImplementationOnce(async () => {
+            if (state === "stopped") taskService.markParentWorkspaceInterrupted(endpoint);
+            else
+              await config.editConfig((cfg) => {
+                const entry = findWorkspaceEntry(cfg, endpoint);
+                assert(entry);
+                entry.workspace.archivedAt = "2026-09-16T12:00:00.000Z";
+                return cfg;
+              });
+            return { model: defaultModel, agentId: "plan" };
+          });
+          expect(
+            await taskService.sendAgentTreeMessage("sender", "target", "Racing send")
+          ).toMatchObject(Err({ code }));
+          expect(sendMessage).not.toHaveBeenCalled();
+          expect(await collectFullHistory(historyService, "target")).toEqual([]);
+          // The same endpoint remains refused even before any awaited preparation.
+          expect(
+            await taskService.sendAgentTreeMessage("sender", "target", "Still unavailable")
+          ).toMatchObject(Err({ code }));
+          if (state === "stopped") taskService.resetAutoResumeCount(endpoint);
+          else
+            await config.editConfig((cfg) => {
+              const entry = findWorkspaceEntry(cfg, endpoint);
+              assert(entry);
+              entry.workspace.unarchivedAt = "2026-09-16T13:00:00.000Z";
+              return cfg;
+            });
+          expect(
+            (await taskService.sendAgentTreeMessage("sender", "target", "After user resumes"))
+              .success
+          ).toBe(true);
+        } finally {
+          resolve.mockRestore();
+        }
+      }
     );
-    expect(sendMessage).not.toHaveBeenCalled();
+
+    test.each(["workflow", "best-of"] as const)(
+      "refuses unrelated sends from a %s endpoint",
+      async (restriction) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "source-root", "source-root"),
+            projectWorkspace(projectPath, "sender", "sender", {
+              parentWorkspaceId: "source-root",
+              taskStatus: "running",
+              ...(restriction === "workflow"
+                ? { workflowTask: { runId: "wfr_peer", stepId: "step" } }
+                : { bestOf: { groupId: "group", index: 0, total: 2 } }),
+            }),
+            projectWorkspace(projectPath, "target", "target"),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "Hello")).toMatchObject(
+          Err({ code: "refused" })
+        );
+        expect(await taskService.sendAgentTreeMessage("target", "sender", "Reply")).toMatchObject(
+          Err({ code: "refused" })
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+      }
+    );
+
+    test("keeps the owner's correlation on an unrelated live child's reawakened execution", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "foreign-root", "foreign-root"),
+          projectWorkspace(projectPath, "target", "target", {
+            parentWorkspaceId: "foreign-root",
+            taskStatus: "reported",
+            taskExecutionStatus: "running",
+            taskExecutionId: "wst_live",
+            agentId: "explore",
+            taskModelString: "openai:gpt-5.2",
+            taskThinkingLevel: "medium",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", "foreign-root");
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "target", "Reply to live execution")
+      ).toEqual(
+        Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+      );
+      const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
+        WorkspaceHost["sendMessage"]
+      >;
+      expect(options).toMatchObject({
+        agentId: "explore",
+        model: "openai:gpt-5.2",
+        thinkingLevel: "medium",
+        muxMetadata: {
+          type: "workspace-turn-task",
+          taskHandleId: "wst_live",
+          ownerWorkspaceId: "foreign-root",
+          agentPeerMessageTrigger: { relationship: "unrelated", fromWorkspaceId: "sender" },
+        },
+      });
+      expect(internal?.workspaceTurnContinuation).toBe(true);
+      expect(
+        workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("target")
+      ).toMatchObject({ handleId: "wst_live", accepted: true });
+      expect((await workspaceTurnSnapshot(taskService, "foreign-root", "wst_live"))?.status).toBe(
+        "running"
+      );
+    });
   });
 
   test("sendAgentTreeMessage refuses workflow-owned and best-of endpoints for peer sends", async () => {
