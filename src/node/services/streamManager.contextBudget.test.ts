@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
 import { evaluateStepBudget } from "@/common/utils/compaction/contextBudget";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { StreamManager } from "./streamManager";
+import { StreamManager, type SettledStepBudget } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 
 describe("settled context hard ceiling", () => {
@@ -334,18 +334,19 @@ describe("settled context hard ceiling", () => {
         onStepSettled: (step) => {
           expect(Math.ceil(step.toolResultChars / 4) + 1010).toBeLessThan(119808);
           expect(step.toolResultTokens).toBeGreaterThan(119808);
-          return Promise.resolve(
-            evaluateStepBudget({
-              contextTokens: step.usage?.inputTokens ?? 0,
-              outputTokens: step.usage?.outputTokens ?? 0,
-              toolResultChars: step.toolResultChars,
-              imageParts: step.imageParts,
-              toolResultTokens: step.toolResultTokens,
-              modelContextLimit: 128000,
-              threshold: 1,
-              warningEmitted: false,
-            })
-          );
+          const { decision } = evaluateStepBudget({
+            contextTokens: step.usage?.inputTokens ?? 0,
+            outputTokens: step.usage?.outputTokens ?? 0,
+            toolResultChars: step.toolResultChars,
+            imageParts: step.imageParts,
+            toolResultTokens: step.toolResultTokens,
+            modelContextLimit: 128000,
+            threshold: 1,
+            warningEmitted: false,
+            handoffRequested: false,
+          });
+          // The session maps the internal handoff decision onto the callback's "warn" stop.
+          return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
         },
       });
       expect(started.success).toBe(true);
@@ -385,6 +386,105 @@ describe("settled context hard ceiling", () => {
         )
       ).toBe(false);
       expect(history.data.filter((row) => row.role === "user")).toHaveLength(1);
+    } finally {
+      await manager.stopStream(workspaceId);
+      await h.cleanup();
+    }
+  }, 20000);
+
+  test("a successful new_context settles as a request even when its checkpoint sibling failed", async () => {
+    const h = await createTestHistoryService();
+    const workspaceId = "new-context-sibling";
+    const messageId = "assistant-new-context";
+    let providerCalls = 0;
+    const settled: SettledStepBudget[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: () => {
+        providerCalls += 1;
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "stream-start", warnings: [] },
+              {
+                type: "tool-call",
+                toolCallId: "checkpoint",
+                toolName: "memory",
+                input: '{"command":"create"}',
+              },
+              { type: "tool-call", toolCallId: "reset", toolName: "new_context", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  inputTokens: { total: 1000, noCache: 1000, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 10, text: 10, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        });
+      },
+    });
+    const manager = new StreamManager(h.historyService);
+    const runtimeDir = path.join(h.tempDir, "runtime");
+    await fs.mkdir(runtimeDir);
+    try {
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("user", "user", "Save notes, then reset"),
+            createMuxMessage(messageId, "assistant", ""),
+          ])
+        ).success
+      ).toBe(true);
+      const started = await manager.startStream({
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model,
+        modelString: "openai:gpt-4o",
+        messages: [{ role: "user", content: "Save notes, then reset" }],
+        system: "Run tools",
+        runtime: new LocalRuntime(h.tempDir),
+        providedRuntimeTempDir: runtimeDir,
+        tools: {
+          memory: tool({
+            inputSchema: z.object({ command: z.string() }),
+            execute: () => ({ success: false, error: "memory is read-only" }),
+          }),
+          new_context: tool({
+            inputSchema: z.object({}),
+            execute: () => ({ success: true, status: "scheduled", message: "scheduled" }),
+          }),
+        },
+        onStepSettled: (step) => {
+          settled.push(step);
+          return Promise.resolve("rollover");
+        },
+      });
+      expect(started.success).toBe(true);
+      if (!started.success) throw new Error("Expected stream startup");
+      const completion = await started.data.completion;
+      expect(completion.status).toBe("completed");
+      // The request is derived from the new_context result alone; the failed sibling neither
+      // hides it nor triggers a second provider step before the rollover.
+      expect(settled.map((step) => step.newContextRequested)).toEqual([true]);
+      expect(providerCalls).toBe(1);
+      expect((await h.historyService.commitPartial(workspaceId)).success).toBe(true);
+      const history = await h.historyService.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      const resultParts = history.data
+        .find((row) => row.id === messageId)
+        ?.parts.filter((part) => part.type === "dynamic-tool");
+      expect(
+        resultParts?.map((part) => ({
+          id: part.toolCallId,
+          output: part.state === "output-available" ? part.output : undefined,
+        }))
+      ).toEqual([
+        { id: "checkpoint", output: { success: false, error: "memory is read-only" } },
+        { id: "reset", output: { success: true, status: "scheduled", message: "scheduled" } },
+      ]);
     } finally {
       await manager.stopStream(workspaceId);
       await h.cleanup();
