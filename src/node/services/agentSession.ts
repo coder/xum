@@ -5368,19 +5368,38 @@ export class AgentSession {
     return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
   }
 
-  private async checkContextBudgetNewContextAccess(
+  private async resolveContextBudgetAdvisoryPermissions(
     options: SendMessageOptions
-  ): Promise<boolean | "unknown"> {
-    if (
-      !this.isTokenBudgetActive(options) ||
-      this.contextController.autoCompactionThreshold >= 1 ||
-      applyToolPolicyToNames(["new_context"], options.toolPolicy).length === 0
-    )
-      return false;
+  ): Promise<
+    | Pick<
+        Parameters<typeof createContextBudgetWarning>[0],
+        "memoryWritable" | "sessionHistoryAvailable" | "newContextAvailable"
+      >
+    | undefined
+  > {
+    // A queued send may switch agents, policies, or experiments after the previous step settled.
+    // Resolve the dispatching turn once; an inconclusive lookup must not claim an optional advisory.
     const resolved = await this.resolveAgentForBudgetChecks(options);
-    return resolved.success
-      ? applyToolPolicyToNames(["new_context"], resolved.data.effectiveToolPolicy).length > 0
-      : "unknown";
+    if (!resolved.success) return undefined;
+    const allowed = applyToolPolicyToNames(
+      ["memory", "session_history", "new_context"],
+      resolved.data.effectiveToolPolicy
+    );
+    const memoryEnabled =
+      options.experiments?.memory ?? this.aiService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+    return {
+      memoryWritable:
+        memoryEnabled &&
+        allowed.includes("memory") &&
+        resolveMemoryAccessPolicy({
+          planLike: resolved.data.agentIsPlanLike,
+          editingCapable: isExecLikeEditingCapableInResolvedChain(
+            resolved.data.agentInheritanceChain
+          ),
+        }).workspace === "readwrite",
+      sessionHistoryAvailable: allowed.includes("session_history"),
+      newContextAvailable: allowed.includes("new_context"),
+    };
   }
 
   private async resolveAgentForBudgetChecks(
@@ -6184,14 +6203,17 @@ export class AgentSession {
       this.contextBudgetMemoryWritable !== undefined &&
       this.isTokenBudgetActive(options)
     ) {
-      const newContextAvailable = await this.checkContextBudgetNewContextAccess(options);
-      const sessionHistoryAvailable =
-        this.contextBudgetHistoryAvailable &&
-        (await this.checkContextBudgetHistoryAccess(options)).success;
+      const generation = this.contextBudgetGeneration;
+      const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
       // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
       // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
       const advisory = evaluateBudget();
-      if (advisory.decision === "warn" || advisory.decision === "handoff") {
+      if (
+        permissions &&
+        generation === this.contextBudgetGeneration &&
+        this.isTokenBudgetActive(options) &&
+        (advisory.decision === "warn" || advisory.decision === "handoff")
+      ) {
         return Ok({
           prefix: [
             createContextBudgetWarning({
@@ -6203,9 +6225,7 @@ export class AgentSession {
                 this.contextController.autoCompactionThreshold
               ),
               handoff: advisory.decision === "handoff",
-              memoryWritable: this.contextBudgetMemoryWritable,
-              sessionHistoryAvailable,
-              newContextAvailable,
+              ...permissions,
             }),
           ],
         });

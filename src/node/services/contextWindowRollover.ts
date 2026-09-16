@@ -75,9 +75,10 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
             "Your previous turn was interrupted by a context rollover; continue the task. Completed tool results remain in the previous window: retrieve them rather than re-executing their side effects.",
           ]
         : []),
-    // A model-requested reset never "filled" the window; the model chose the timing.
+    // Flush headroom does not tell us whether an earlier handoff was delivered. A model-requested
+    // reset never "filled" the window; the model chose the timing.
     ...(!rollover.flushOpportunity && rollover.requestedBy !== "model"
-      ? ["The window reached its usable limit before a handoff."]
+      ? ["The window reached its usable limit."]
       : []),
   ].join("\n");
 }
@@ -136,8 +137,9 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }
+  // Permissions do not guarantee advertising; deferred tools or middleware may still hide them.
   const checkpoint = memoryWritable
-    ? `Write or update ${CONTEXT_NOTES_MEMORY_PATH}, essential state first: goal, decisions, invariants, open tasks, blockers, and paths/IDs needed to resume. Confirm the write succeeded before requesting a new window.`
+    ? `If a writable memory tool is available to you, write or update ${CONTEXT_NOTES_MEMORY_PATH}, essential state first: goal, decisions, invariants, open tasks, blockers, and paths/IDs needed to resume. Confirm the write succeeded before requesting a new window.`
     : "Memory writes are unavailable for this turn; skip the notes steps.";
   if (handoff && sessionHistoryAvailable) {
     return [
@@ -148,7 +150,7 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
       options.newContextAvailable === false
         ? "new_context is not available under the current tool policy. Save any writable notes and continue; Xum will attempt a rollover at the usable limit or pause safely."
         : "If the new_context tool is available to you, call it in a later step; otherwise save any writable notes and continue.",
-      "If the task is already complete, finish the reply instead. The next window can retrieve this transcript with session_history.",
+      "If the task is already complete, finish the reply instead. If session_history is available in the next window, use it to retrieve this transcript.",
     ].join(" ");
   }
   const target =
@@ -159,8 +161,8 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     !sessionHistoryAvailable
       ? "History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
       : memoryWritable
-        ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (keep notes concise and essential state first; only a bounded excerpt is preloaded), then continue the current task without commentary.`
-        : "Memory writes are unavailable for this turn. Use session_history to retrieve prior windows after rollover, and continue the current task."
+        ? `If a writable memory tool is available and you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (keep notes concise and essential state first; only a bounded excerpt is preloaded), then continue the current task without commentary.`
+        : "Memory writes are unavailable for this turn. If session_history is available after rollover, use it to retrieve prior windows; continue the current task."
   }`;
 }
 

@@ -587,7 +587,8 @@ describe("AgentPluginHookService", () => {
         createMuxMessage("old-user", "user", "old request"),
         createMuxMessage("old-answer", "assistant", "old answer", {
           model: "openai:gpt-4o",
-          contextUsage: { inputTokens: 110000, outputTokens: 10, totalTokens: 110010 },
+          // Cross the usable ceiling: the handoff target no longer forces a rollover.
+          contextUsage: { inputTokens: 120000, outputTokens: 10, totalTokens: 120010 },
         }),
       ]);
       h.session.setAutoCompactionThreshold(0.7);

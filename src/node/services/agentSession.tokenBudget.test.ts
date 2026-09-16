@@ -46,8 +46,8 @@ const options: SendMessageOptions = {
   agentId: "exec",
   experiments: { tokenBudget: true },
 };
-// Resume paths re-validate memory writability from the caller's options; the harness has no
-// backend experiment service, so resumes state the Memory experiment explicitly.
+// Dispatch and resume re-validate memory writability from the caller's options; the harness has
+// no backend experiment service, so these paths state the Memory experiment explicitly.
 const resumeOptions: SendMessageOptions = {
   ...options,
   experiments: { tokenBudget: true, memory: true },
@@ -2127,6 +2127,134 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
   });
 
+  test.each([
+    {
+      label: "caller disables tools",
+      previousEnabled: true,
+      next: {
+        toolPolicy: [{ regex_match: "memory|session_history|new_context", action: "disable" }],
+      },
+      expected: {
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: false,
+      },
+    },
+    {
+      label: "caller restores tools",
+      previousEnabled: false,
+      next: {},
+      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "agent removes tools",
+      previousEnabled: true,
+      next: { agentId: "restricted" },
+      expected: {
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: false,
+      },
+    },
+    {
+      label: "read-only agent",
+      previousEnabled: true,
+      next: { agentId: "observer" },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "Memory experiment disabled",
+      previousEnabled: true,
+      next: { experiments: { tokenBudget: true, memory: false } },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+    {
+      label: "memory tool disabled",
+      previousEnabled: true,
+      next: { toolPolicy: [{ regex_match: "memory", action: "disable" }] },
+      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+    },
+  ] satisfies Array<{
+    label: string;
+    previousEnabled: boolean;
+    next: Partial<SendMessageOptions>;
+    expected: {
+      memoryWritable: boolean;
+      sessionHistoryAvailable: boolean;
+      newContextAvailable: boolean;
+    };
+  }>)(
+    "queued advisories use dispatch permissions: $label",
+    async ({ previousEnabled, next, expected }) => {
+      const h = await setup();
+      const dispatchOptions: SendMessageOptions = { ...resumeOptions, ...next };
+      if (dispatchOptions.agentId === "restricted" || dispatchOptions.agentId === "observer") {
+        const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
+        await fs.mkdir(agentsDir, { recursive: true });
+        await fs.writeFile(
+          path.join(agentsDir, `${dispatchOptions.agentId}.md`),
+          dispatchOptions.agentId === "restricted"
+            ? '---\nname: Restricted\nbase: exec\ntools:\n  remove: ["memory", "session_history", "new_context"]\n---\nRestricted agent.\n'
+            : '---\nname: Observer\ntools:\n  add: ["file_read", "memory", "session_history", "new_context"]\n---\nRead-only agent.\n'
+        );
+      }
+      const previousOptions: SendMessageOptions = {
+        ...resumeOptions,
+        ...(!previousEnabled
+          ? {
+              toolPolicy: [
+                { regex_match: "memory|session_history|new_context", action: "disable" as const },
+              ],
+            }
+          : {}),
+      };
+      const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+      expect((await h.session.sendMessage("Start work", previousOptions)).success).toBe(true);
+      expect(h.session.queueMessage("Next request", dispatchOptions)).not.toBeNull();
+      expect(
+        (await h.requests[0].onStepSettled?.(
+          step(90_000, {
+            memoryWritable: previousEnabled,
+            sessionHistoryAvailable: previousEnabled,
+          })
+        ))?.decision
+      ).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+      await h.waitForRequest(2);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(expect.objectContaining({ handoff: true, ...expected }));
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      expect(text(rows.at(-1)!)).toBe("Next request");
+    }
+  );
+
+  test("unresolved dispatch permissions omit the advisory without consuming its claim", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", resumeOptions)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
+    spyOn(
+      h.session as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
+      "resolveAgentForBudgetChecks"
+    ).mockResolvedValueOnce(Err(exceeded));
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect(text(h.requests[1].messages.at(-1)!)).toBe("Continue");
+
+    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(3);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(rolloverRows(rows)).toHaveLength(0);
+  });
+
   test.each(["larger-model", "mode-inactive"] as const)(
     "a pending handoff is omitted when the dispatching send uses a %s",
     async (change) => {
@@ -3902,7 +4030,7 @@ describe("AgentSession token-budget lifecycle", () => {
       label: "degraded recovery",
       usage: 85_000,
       toolPolicy: [
-        { regex_match: "session_.*", action: "disable" },
+        { regex_match: "memory|session_.*", action: "disable" },
       ] satisfies SendMessageOptions["toolPolicy"],
       settled: { memoryWritable: false, sessionHistoryAvailable: false },
       expected: {
@@ -3927,11 +4055,13 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     },
   ])(
-    "advisories receive the settled tool availability under $label",
+    "advisories receive the current tool permissions under $label",
     async ({ usage, toolPolicy, settled, expected }) => {
       const h = await setup();
       const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
-      expect((await h.session.sendMessage("Start", { ...options, toolPolicy })).success).toBe(true);
+      expect((await h.session.sendMessage("Start", { ...resumeOptions, toolPolicy })).success).toBe(
+        true
+      );
       expect((await h.requests[0].onStepSettled?.(step(usage, settled)))?.decision).toBe("warn");
       h.settleStream(0, { contextUsage: { inputTokens: usage } });
       await h.waitForRequest(2);
