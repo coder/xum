@@ -29638,6 +29638,140 @@ describe("TaskService", () => {
     expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
   });
 
+  test("a bash-monitor wake reawakens an inactive child under a parent-owned continuation and re-admits agent_report", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-wake-reactivation";
+    const childTaskId = "child-wake-reactivation";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "reported",
+          reportedAt: "2026-09-09T17:44:35.884Z",
+          title: "UAT Critic",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const wakeSend = mock(
+      async (
+        ...args: Parameters<WorkspaceHost["sendMessage"]>
+      ): ReturnType<WorkspaceHost["sendMessage"]> => {
+        await args[3]?.onAccepted?.();
+        return Ok(undefined);
+      }
+    );
+
+    // Before reactivation the child is done from the parent's perspective: a late report is refused.
+    let staleReportError: unknown;
+    try {
+      await taskService.reportAgentProgress(childTaskId, "call-stale", { reportMarkdown: "late" });
+    } catch (error: unknown) {
+      staleReportError = error;
+    }
+    assert(staleReportError instanceof Error, "a report from an inactive child should be refused");
+    expect(staleReportError.message).toBe(
+      "agent_report cannot send updates after the sub-agent has completed"
+    );
+
+    const outcome = await taskService.reactivateInactiveAgentTaskFromBashMonitorWake(
+      childTaskId,
+      "A background bash monitor matched output.",
+      wakeSend
+    );
+
+    expect(outcome).toEqual(Ok(undefined));
+    // The wake's own sender dispatched the continuation prompt; the host send never ran for it.
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(wakeSend).toHaveBeenCalledTimes(1);
+    const [targetId, prompt, options] = wakeSend.mock.calls[0];
+    expect(targetId).toBe(childTaskId);
+    expect(prompt).toBe("A background bash monitor matched output.");
+    const child = findWorkspaceInConfig(config, childTaskId);
+    const executionTaskId = child?.taskExecutionId;
+    assert(executionTaskId != null, "reactivated execution ID is required");
+    expect(executionTaskId).toMatch(/^wst_/);
+    expect(child?.taskExecutionStatus).toBe("running");
+    expect(options.muxMetadata).toEqual({
+      type: "workspace-turn-task",
+      taskHandleId: executionTaskId,
+      ownerWorkspaceId: parentWorkspaceId,
+      turnId: expect.any(String),
+    });
+    const execution = await workspaceTurnSnapshot(taskService, parentWorkspaceId, executionTaskId);
+    expect(execution).toMatchObject({
+      status: "running",
+      title: "UAT Critic",
+      attentionPolicy: "notify_on_terminal",
+      prompt: "A background bash monitor matched output.",
+    });
+
+    // The resumed turn's reports reach the parent again.
+    await taskService.reportAgentProgress(childTaskId, "call-verdict", {
+      reportMarkdown: "Verdict: FAIL",
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0][0]).toBe(parentWorkspaceId);
+    expect(sendMessage.mock.calls[0][1]).toContain("Verdict: FAIL");
+  });
+
+  test("a bash-monitor wake leaves non-children, running children, and live continuations to the plain wake", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-wake-passthrough";
+    const runningChildId = "running-child-wake-passthrough";
+    const reawakenedChildId = "reawakened-child-wake-passthrough";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "running-child", runningChildId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "reawakened-child", reawakenedChildId, {
+          parentWorkspaceId,
+          taskStatus: "reported",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const wakeSend = mock(
+      (): ReturnType<WorkspaceHost["sendMessage"]> => Promise.resolve(Ok(undefined))
+    );
+
+    // A parent-initiated reawakening leaves this child with a live continuation.
+    const reactivated = await taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      reawakenedChildId,
+      "Correction",
+      "tool-end"
+    );
+    expect(reactivated).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+
+    for (const workspaceId of [parentWorkspaceId, runningChildId, reawakenedChildId]) {
+      expect(
+        await taskService.reactivateInactiveAgentTaskFromBashMonitorWake(
+          workspaceId,
+          "wake",
+          wakeSend
+        )
+      ).toBeNull();
+    }
+    expect(wakeSend).not.toHaveBeenCalled();
+  });
+
   test("reawakening a stopped queued child replays its preserved initial brief", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["queuedreplayhandle", "queuedreplayturn"]);

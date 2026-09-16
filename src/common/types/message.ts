@@ -703,6 +703,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "bash-monitor-wake";
         /** One entry per wake record in the prompt, in prompt order. */
         records: BashMonitorWakeDisplayRecord[];
+        /**
+         * Present when the wake reactivates an inactive sub-agent (reported or interrupted,
+         * no live continuation): the fresh parent-owned continuation the woken turn runs
+         * under. The row keeps its wake type, which the wake reconciler reads as proof of
+         * delivery, so the turn correlation rides here instead of on a separate
+         * workspace-turn-task row.
+         */
+        workspaceTurn?: WorkspaceTurnTaskCorrelation;
       }
     | {
         type: "goal-pause-boundary";
@@ -842,9 +850,10 @@ export interface WorkspaceTurnTaskCorrelation {
 /**
  * Parse untyped muxMetadata (from persisted history or live stream info) into a
  * workspace-turn correlation. Returns null unless the value is a well-formed
- * "workspace-turn-task" marker — callers use this to attribute a workspace's active
- * stream to a specific delegated turn (e.g. archive interruption must not stop a user
- * stream that replaced an ended delegated stream).
+ * "workspace-turn-task" marker, or a "bash-monitor-wake" marker carrying one (a wake
+ * that reactivated an inactive sub-agent). Callers use this to attribute a workspace's
+ * active stream to a specific delegated turn (e.g. archive interruption must not stop a
+ * user stream that replaced an ended delegated stream).
  */
 export function parseWorkspaceTurnTaskCorrelation(
   muxMetadata: unknown
@@ -852,10 +861,17 @@ export function parseWorkspaceTurnTaskCorrelation(
   if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
     return null;
   }
-  const data = muxMetadata as Record<string, unknown>;
-  if (data.type !== "workspace-turn-task") {
+  const marker = muxMetadata as Record<string, unknown>;
+  const source =
+    marker.type === "workspace-turn-task"
+      ? marker
+      : marker.type === "bash-monitor-wake"
+        ? marker.workspaceTurn
+        : null;
+  if (typeof source !== "object" || source == null || Array.isArray(source)) {
     return null;
   }
+  const data = source as Record<string, unknown>;
   const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
   const ownerWorkspaceId =
     typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";

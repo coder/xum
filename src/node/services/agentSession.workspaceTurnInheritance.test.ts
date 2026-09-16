@@ -136,9 +136,12 @@ describe("inheritOpenWorkspaceTurnMetadata", () => {
 });
 
 describe("AgentSession workspace-turn correlation inheritance", () => {
-  async function sendAfterQueueCut(sendOptions: {
-    muxMetadata?: MuxMessageMetadata;
-  }): Promise<StreamMessageOptions["muxMetadata"]> {
+  async function sendAfterHistory(
+    history: MuxMessage[],
+    sendOptions: {
+      muxMetadata?: MuxMessageMetadata;
+    }
+  ): Promise<StreamMessageOptions["muxMetadata"]> {
     let streamedMuxMetadata: StreamMessageOptions["muxMetadata"];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       streamedMuxMetadata = opts.muxMetadata;
@@ -151,12 +154,9 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       },
     });
     try {
-      // Seed a delegated turn that was cut at a tool boundary by a queued dispatch.
-      await historyService.appendToHistory(
-        "workspace-turn-inheritance",
-        turnPrompt("delegated-prompt")
-      );
-      await historyService.appendToHistory("workspace-turn-inheritance", cutAssistant("cut"));
+      for (const message of history) {
+        await historyService.appendToHistory("workspace-turn-inheritance", message);
+      }
 
       const result = await session.sendMessage("continuation", {
         model: "anthropic:claude-sonnet-4-5",
@@ -172,16 +172,44 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     }
   }
 
+  // A delegated turn that was cut at a tool boundary by a queued dispatch.
+  const queueCutHistory = () => [turnPrompt("delegated-prompt"), cutAssistant("cut")];
+
   test("bash-monitor-wake continuation streams inherit the open turn correlation", async () => {
-    const streamed = await sendAfterQueueCut({
+    const streamed = await sendAfterHistory(queueCutHistory(), {
       muxMetadata: { type: "bash-monitor-wake", records: [] },
     });
     expect(streamed).toEqual(correlation);
   });
 
   test("manual user messages after a queue cut do not inherit the correlation", async () => {
-    const streamed = await sendAfterQueueCut({});
+    const streamed = await sendAfterHistory(queueCutHistory(), {});
     expect(streamed).toBeUndefined();
+  });
+
+  test("a wake carrying a fresh continuation streams that correlation after the old turn closed", async () => {
+    const fresh = {
+      taskHandleId: "wst_reactivated",
+      ownerWorkspaceId: "parentworkspace",
+      turnId: "turn-2",
+    };
+    const closedTurn = [
+      turnPrompt("delegated-prompt"),
+      createMuxMessage("final", "assistant", "Final report", {
+        finishReason: "stop",
+        muxMetadata: correlation,
+      }),
+    ];
+    expect(
+      await sendAfterHistory(closedTurn, {
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      })
+    ).toBeUndefined();
+    expect(
+      await sendAfterHistory(closedTurn, {
+        muxMetadata: { type: "bash-monitor-wake", records: [], workspaceTurn: fresh },
+      })
+    ).toEqual({ type: "workspace-turn-task", ...fresh });
   });
 
   test("workspace-turn correlation persists in startup retry options", async () => {

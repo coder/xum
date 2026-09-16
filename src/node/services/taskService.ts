@@ -44,6 +44,7 @@ import {
   type TaskKind,
   type WorkspaceHost,
   type WorkspaceLifecycleResult,
+  type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
@@ -5742,6 +5743,150 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * Reawaken an inactive descendant (reported, interrupted, or legacy-archived) under a fresh
+   * ancestor-owned continuation execution. Callers hold the task's event lock and have verified
+   * the child is neither streaming nor under an active continuation.
+   */
+  private async reactivateInactiveAgentTask(params: {
+    ancestorWorkspaceId: string;
+    taskId: string;
+    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
+    queueDispatchMode: TaskMessageQueueDispatchMode;
+    preTurnMessages?: MuxMessage[];
+    onPreTurnPersisted?: () => void;
+    sendMessage?: WorkspaceTurnHost["sendMessage"];
+  }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId } = params;
+    const unarchiveResult = await this.unarchiveAgentTaskAncestry(ancestorWorkspaceId, taskId);
+    if (!unarchiveResult.success) {
+      return Err({ code: "send_failed" as const, message: unarchiveResult.error });
+    }
+    const refreshedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (refreshedEntry == null) {
+      return Err({ code: "not_found" as const });
+    }
+    // Verified by the caller: not streaming and no active continuation, and
+    // concurrent task-machinery sends serialize on the lifecycle + event
+    // locks held there, so no task-driven turn admission can be in flight
+    // during this append; the rows precede the reactivation prompt row
+    // createWorkspaceTurn sends. A createWorkspaceTurn failure leaves an
+    // untriggered untrusted-labeled row behind (charge kept).
+    if (params.preTurnMessages != null && params.preTurnMessages.length > 0) {
+      const appendOutcome = await this.appendFamilyPayloadRows(
+        taskId,
+        params.preTurnMessages,
+        params.onPreTurnPersisted
+      );
+      if (!appendOutcome.success) {
+        return appendOutcome;
+      }
+    }
+    const previousAttempt = this.ownedAttemptByTaskId.get(taskId);
+    const previousSettlement = this.attemptSettlementByTaskId.get(taskId);
+    const reactivationAttempt = this.beginOwnedTaskAttempt(taskId, "reactivation");
+    const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
+      ownerWorkspaceId: ancestorWorkspaceId,
+      prompt: params.buildPrompt(refreshedEntry),
+      title:
+        coerceNonEmptyString(refreshedEntry.workspace.title) ??
+        coerceNonEmptyString(refreshedEntry.workspace.name) ??
+        "Sub-agent",
+      workspace: {
+        mode: "existing",
+        workspaceId: taskId,
+        queueDispatchMode: params.queueDispatchMode,
+      },
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
+    });
+    if (!execution.success) {
+      // A rejected reactivation must not erase the retired attempt's receipt and strand
+      // workflow recovery. Restore only our speculative ownership, never a newer attempt
+      // or its authoritative settlement. Restoring absence keeps legacy owners unknown.
+      // Do not apply this to throws: createWorkspaceTurn can throw after a successful send.
+      if (
+        this.ownedAttemptByTaskId.get(taskId) === reactivationAttempt &&
+        this.attemptSettlementByTaskId.get(taskId)?.attempt !== reactivationAttempt
+      ) {
+        if (previousAttempt != null) {
+          this.ownedAttemptByTaskId.set(taskId, previousAttempt);
+        } else {
+          this.ownedAttemptByTaskId.delete(taskId);
+        }
+        if (previousSettlement != null && previousSettlement.attempt === previousAttempt) {
+          this.attemptSettlementByTaskId.set(taskId, previousSettlement);
+        } else {
+          this.attemptSettlementByTaskId.delete(taskId);
+        }
+        this.notifyAttemptSettlementListeners(taskId);
+      }
+      return Err({ code: "send_failed" as const, message: execution.error });
+    }
+    return Ok({
+      delivery: "reactivated" as const,
+      executionTaskId: execution.data.taskId,
+    });
+  }
+
+  async reactivateInactiveAgentTaskFromBashMonitorWake(
+    workspaceId: string,
+    prompt: string,
+    send: WorkspaceTurnHost["sendMessage"]
+  ): Promise<Result<void, string> | null> {
+    assert(workspaceId.length > 0, "reactivateInactiveAgentTaskFromBashMonitorWake: workspaceId");
+    // Event lock only: the wake dispatcher's removal counterpart nests task-tree -> bash-monitor
+    // history locks, so taking the tree lock from a wake would invert that order. Removal and
+    // archive races are caught by createWorkspaceTurn's own lifecycle admission instead.
+    return this.workspaceEventLocks.withLock(workspaceId, async () => {
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, workspaceId);
+      const parentWorkspaceId = entry?.workspace.parentWorkspaceId;
+      if (
+        entry == null ||
+        parentWorkspaceId == null ||
+        // Workflow-owned children report through the runner's own journal path.
+        entry.workspace.workflowTask != null ||
+        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      ) {
+        return null;
+      }
+      const status = entry.workspace.taskStatus;
+      if (status !== "reported" && status !== "interrupted") {
+        return null;
+      }
+      // A live continuation (any ancestor's) keeps owning the child's turns; the plain wake
+      // continues it through history inheritance.
+      const currentExecution =
+        entry.workspace.taskExecutionId != null
+          ? (await this.getDescendantAgentTaskExecutionSnapshot(parentWorkspaceId, workspaceId))
+              ?.record
+          : undefined;
+      if (isActiveWorkspaceTurnTaskStatus(currentExecution?.status)) {
+        return null;
+      }
+      if (this.aiService.isStreaming(workspaceId)) {
+        return null;
+      }
+      const result = await this.reactivateInactiveAgentTask({
+        ancestorWorkspaceId: parentWorkspaceId,
+        taskId: workspaceId,
+        buildPrompt: () => prompt,
+        queueDispatchMode: "tool-end",
+        sendMessage: send,
+      });
+      if (result.success) {
+        return Ok(undefined);
+      }
+      return Err(
+        "message" in result.error && result.error.message != null
+          ? result.error.message
+          : result.error.code
+      );
+    });
+  }
+
+  /**
    * Trusted ancestor guidance keeps its dedicated lifecycle machinery: queued prompt splice,
    * inactive-task reactivation, and durable live-guidance reservation.
    */
@@ -5859,76 +6004,20 @@ export class TaskService implements AgentTaskIntegration {
             legacyArchived) &&
           !this.aiService.isStreaming(taskId)
         ) {
-          const unarchiveResult = await this.unarchiveAgentTaskAncestry(
+          return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
-            taskId
-          );
-          if (!unarchiveResult.success) {
-            return Err({ code: "send_failed" as const, message: unarchiveResult.error });
-          }
-          const refreshedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-          if (refreshedEntry == null) {
-            return Err({ code: "not_found" as const });
-          }
-          // Verified above: not streaming and no active continuation, and
-          // concurrent task-machinery sends serialize on the lifecycle + event
-          // locks held here, so no task-driven turn admission can be in flight
-          // during this append; the rows precede the reactivation prompt row
-          // createWorkspaceTurn sends. A createWorkspaceTurn failure leaves an
-          // untriggered untrusted-labeled row behind (charge kept).
-          if (options?.preTurnMessages != null && options.preTurnMessages.length > 0) {
-            const appendOutcome = await this.appendFamilyPayloadRows(
-              taskId,
-              options.preTurnMessages,
-              options.onPreTurnPersisted
-            );
-            if (!appendOutcome.success) {
-              return appendOutcome;
-            }
-          }
-          const preservedQueuedPrompt = coerceNonEmptyString(refreshedEntry.workspace.taskPrompt);
-          const previousAttempt = this.ownedAttemptByTaskId.get(taskId);
-          const previousSettlement = this.attemptSettlementByTaskId.get(taskId);
-          const reactivationAttempt = this.beginOwnedTaskAttempt(taskId, "reactivation");
-          const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
-            ownerWorkspaceId: ancestorWorkspaceId,
-            prompt: preservedQueuedPrompt
-              ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
-              : labeledMessage,
-            title:
-              coerceNonEmptyString(refreshedEntry.workspace.title) ??
-              coerceNonEmptyString(refreshedEntry.workspace.name) ??
-              "Sub-agent",
-            workspace: { mode: "existing", workspaceId: taskId, queueDispatchMode },
-            allowAgentWorkspace: true,
-            attentionPolicy: "notify_on_terminal",
-          });
-          if (!execution.success) {
-            // A rejected reactivation must not erase the retired attempt's receipt and strand
-            // workflow recovery. Restore only our speculative ownership, never a newer attempt
-            // or its authoritative settlement. Restoring absence keeps legacy owners unknown.
-            // Do not apply this to throws: createWorkspaceTurn can throw after a successful send.
-            if (
-              this.ownedAttemptByTaskId.get(taskId) === reactivationAttempt &&
-              this.attemptSettlementByTaskId.get(taskId)?.attempt !== reactivationAttempt
-            ) {
-              if (previousAttempt != null) {
-                this.ownedAttemptByTaskId.set(taskId, previousAttempt);
-              } else {
-                this.ownedAttemptByTaskId.delete(taskId);
-              }
-              if (previousSettlement != null && previousSettlement.attempt === previousAttempt) {
-                this.attemptSettlementByTaskId.set(taskId, previousSettlement);
-              } else {
-                this.attemptSettlementByTaskId.delete(taskId);
-              }
-              this.notifyAttemptSettlementListeners(taskId);
-            }
-            return Err({ code: "send_failed" as const, message: execution.error });
-          }
-          return Ok({
-            delivery: "reactivated" as const,
-            executionTaskId: execution.data.taskId,
+            taskId,
+            // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
+            // the guidance follows that brief in the reactivation prompt.
+            buildPrompt: (refreshed) => {
+              const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
+              return preservedQueuedPrompt
+                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
+                : labeledMessage;
+            },
+            queueDispatchMode,
+            preTurnMessages: options?.preTurnMessages,
+            onPreTurnPersisted: options?.onPreTurnPersisted,
           });
         }
 

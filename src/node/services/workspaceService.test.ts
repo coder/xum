@@ -71,6 +71,7 @@ import type {
   WorkspaceMetadata,
 } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
+import type { WorkspaceTurnHost } from "./taskWorkspaceSeam";
 import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
 import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 import { MemoryService } from "./memoryService";
@@ -757,6 +758,111 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await next;
       expect(h.requests).toHaveLength(2);
       expect(h.requests[0].muxMetadata).toEqual(correlation);
+      expect(h.requests[1].muxMetadata).toBeUndefined();
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("owed attention on an inactive sub-agent resumes it under the continuation the task integration opens", async () => {
+    const h = await createActiveWakeHarness();
+    const closed = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_closed",
+      ownerWorkspaceId: "parent",
+      turnId: "turn-1",
+    };
+    const fresh = { taskHandleId: "wst_fresh", ownerWorkspaceId: "parent", turnId: "turn-2" };
+    const order: string[] = [];
+    const reactivate = mock(
+      async (workspaceId: string, prompt: string, send: WorkspaceTurnHost["sendMessage"]) => {
+        const sent = await send(
+          workspaceId,
+          prompt,
+          {
+            model: h.model,
+            agentId: "exec",
+            muxMetadata: { type: "workspace-turn-task", ...fresh },
+          },
+          {
+            acceptanceOrigin: "automatic",
+            requireIdle: true,
+            onAccepted: () => {
+              order.push("turn");
+            },
+          }
+        );
+        return sent.success ? Ok(undefined) : Err("continuation send failed");
+      }
+    );
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: reactivate })
+    );
+    spyOn(h.backgroundProcessManager, "acknowledgeMonitorWake").mockImplementation(() => {
+      order.push("wake");
+    });
+    try {
+      await h.session.sendMessage(
+        "delegated",
+        { model: h.model, agentId: "exec", muxMetadata: closed },
+        { synthetic: true, agentInitiated: true }
+      );
+      await h.addAttention(10);
+      const next = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.complete();
+      await next;
+      expect(reactivate).toHaveBeenCalledWith(
+        h.workspaceId,
+        expect.any(String),
+        expect.any(Function)
+      );
+      expect(h.requests).toHaveLength(2);
+      // The resumed turn streams under the fresh continuation: neither the closed one nor unowned.
+      expect(h.requests[1].muxMetadata).toEqual({ type: "workspace-turn-task", ...fresh });
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) return;
+      const wakeRow = history.data.findLast(
+        (message) =>
+          message.role === "user" && message.metadata?.muxMetadata?.type === "bash-monitor-wake"
+      );
+      // The row keeps its wake type (the reconciler's proof of delivery) and carries the correlation.
+      expect(wakeRow?.metadata?.muxMetadata).toMatchObject({
+        type: "bash-monitor-wake",
+        workspaceTurn: fresh,
+      });
+      expect(wakeRow?.metadata?.synthetic).toBe(true);
+      // The continuation's own acceptance runs before the wake's two monitors are acknowledged.
+      expect(order).toEqual(["turn", "wake", "wake"]);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("a wake the task integration declines, or fails to reactivate before sending, dispatches plainly", async () => {
+    const h = await createActiveWakeHarness();
+    const declined = mock(() => Promise.resolve(null));
+    try {
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: declined })
+      );
+      const first = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.addAttention(10);
+      await first;
+      expect(declined).toHaveBeenCalledTimes(1);
+      expect(h.requests).toHaveLength(1);
+      expect(h.requests[0].muxMetadata).toBeUndefined();
+
+      const failed = mock(() => Promise.resolve(Err("maxParallelAgentTasks exceeded")));
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: failed })
+      );
+      const second = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.complete();
+      await h.addAttention(20);
+      await second;
+      expect(failed).toHaveBeenCalledTimes(1);
+      expect(h.requests).toHaveLength(2);
       expect(h.requests[1].muxMetadata).toBeUndefined();
     } finally {
       await h.finish();

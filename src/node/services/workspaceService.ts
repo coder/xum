@@ -2684,99 +2684,178 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async dispatchBashMonitorWake(
     dispatch: BashMonitorWakeDispatch
   ): Promise<BashMonitorWakeDispatchOutcome> {
-    return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
-      const ownerWorkspaceId = dispatch.ownerWorkspaceId;
-      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
-      if (entry == null) {
-        await dispatch.onAccepted();
-        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-        return "in-flight";
-      }
-      // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
-      // retry would spin; the wake stays owed and unarchive reconciles it.
-      if (
-        this.archivingWorkspaces.has(ownerWorkspaceId) ||
-        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
-      ) {
-        return "deferred";
-      }
-      const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-      // Pending mid-stream compaction counts as turn work: the session reads idle between the
-      // stopped stream and its compaction request, which the session sends directly.
-      const hasSessionBackedBusyState =
-        this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
-      const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-      // Cancelable attention must not cut a turn that can consume it in its current tool call.
-      // Keep it outside the queue so later manual tool-end input cannot be held behind it.
-      if (hasPendingTurn || hasSessionBackedBusyState) {
-        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-        return "deferred";
-      }
-      if (hasAiServiceStream) {
-        return "deferred";
-      }
-      // Retained Stop waits for manual replacement; an already-idle retry would spin.
-      if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
-      const sendOptions =
-        (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
-        (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
-      if (sendOptions == null) {
-        log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
-        return "deferred";
-      }
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    const gate = await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
+      this.gateBashMonitorWake(dispatch)
+    );
+    if (typeof gate === "string") return gate;
 
+    // A wake aimed at an inactive sub-agent runs as a fresh parent-owned continuation (see
+    // AgentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake). Decided outside the
+    // history lock: the reactivation takes the task's event lock and createWorkspaceTurn's
+    // lifecycle locks, while workspace removal nests task-tree -> history. The wake's own send
+    // re-enters the history lock exactly like a plain wake, and the row keeps its wake type with
+    // the continuation's correlation embedded.
+    let continuationOutcome: BashMonitorWakeDispatchOutcome | undefined;
+    const reactivation =
+      typeof this.agentTaskIntegration?.reactivateInactiveAgentTaskFromBashMonitorWake ===
+      "function"
+        ? await this.agentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake(
+            ownerWorkspaceId,
+            dispatch.prompt,
+            async (workspaceId, message, options, internal) => {
+              assert(
+                workspaceId === ownerWorkspaceId,
+                "bash monitor wake continuation must target the woken workspace"
+              );
+              const correlation = parseWorkspaceTurnTaskCorrelation(options.muxMetadata);
+              const sent = await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
+                this.sendBashMonitorWake(
+                  dispatch,
+                  message,
+                  {
+                    ...options,
+                    muxMetadata:
+                      correlation != null
+                        ? { ...dispatch.muxMetadata, workspaceTurn: correlation }
+                        : dispatch.muxMetadata,
+                  },
+                  internal
+                )
+              );
+              continuationOutcome = sent.outcome;
+              return sent.result;
+            }
+          )
+        : null;
+    if (continuationOutcome != null) return continuationOutcome;
+    if (reactivation != null && !reactivation.success) {
+      // Never lose the wake: fall back to today's plain synthetic turn.
+      log.warn("Bash monitor wake could not reactivate the inactive sub-agent; sending plainly", {
+        ownerWorkspaceId,
+        error: reactivation.error,
+      });
+    }
+
+    return this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
       // Withdrawal during send-option resolution must not enter preflight or persist settings.
       if (dispatch.cancelSignal.aborted) return "deferred";
-
-      let accepted = false;
-      const send = this.sendMessage(
-        ownerWorkspaceId,
-        dispatch.prompt,
-        {
-          ...sendOptions,
-          muxMetadata: dispatch.muxMetadata,
-        },
-        {
-          acceptanceOrigin: "automatic",
-          skipAutoResumeReset: true,
-          synthetic: true,
-          agentInitiated: true,
-          requireIdle: true,
-          cancelSignal: dispatch.cancelSignal,
-          withdrawAcceptedOnCancel: true,
-          onAccepted: async () => {
-            accepted = true;
-            await dispatch.onAccepted();
-            this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-          },
-          onAcceptedPreStreamFailure: async () => {
-            if (accepted) await dispatch.onAccepted();
-          },
-          onCanceled: async () => {
-            if (!accepted) {
-              await dispatch.onDeferred();
-              this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
-            }
-          },
-        }
-      );
-      // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
-      this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
-      let sendResult: Awaited<typeof send>;
-      try {
-        sendResult = await send;
-      } finally {
-        if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
-          this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
-        }
-      }
-      if (!sendResult.success && !accepted) {
-        if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
-        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-        return "deferred";
-      }
-      return "in-flight";
+      const sent = await this.sendBashMonitorWake(dispatch, dispatch.prompt, {
+        ...gate.sendOptions,
+        muxMetadata: dispatch.muxMetadata,
+      });
+      return sent.outcome;
     });
+  }
+
+  /** Idle/eligibility checks for a wake dispatch; runs under the owner's history lock. */
+  private async gateBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch
+  ): Promise<BashMonitorWakeDispatchOutcome | { sendOptions: SendMessageOptions }> {
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
+    if (entry == null) {
+      await dispatch.onAccepted();
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      return "in-flight";
+    }
+    // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
+    // retry would spin; the wake stays owed and unarchive reconciles it.
+    if (
+      this.archivingWorkspaces.has(ownerWorkspaceId) ||
+      isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    ) {
+      return "deferred";
+    }
+    const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
+    // Pending mid-stream compaction counts as turn work: the session reads idle between the
+    // stopped stream and its compaction request, which the session sends directly.
+    const hasSessionBackedBusyState =
+      this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
+    const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
+    // Cancelable attention must not cut a turn that can consume it in its current tool call.
+    // Keep it outside the queue so later manual tool-end input cannot be held behind it.
+    if (hasPendingTurn || hasSessionBackedBusyState) {
+      this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+      return "deferred";
+    }
+    if (hasAiServiceStream) {
+      return "deferred";
+    }
+    // Retained Stop waits for manual replacement; an already-idle retry would spin.
+    if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
+    const sendOptions =
+      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
+    if (sendOptions == null) {
+      log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
+      return "deferred";
+    }
+    // Withdrawal during send-option resolution must not enter preflight or persist settings.
+    if (dispatch.cancelSignal.aborted) return "deferred";
+    return { sendOptions };
+  }
+
+  /**
+   * The wake's send itself; runs under the owner's history lock. `internal` carries a
+   * continuation's own handle callbacks (createWorkspaceTurn), which run before the wake's
+   * acceptance bookkeeping so a turn canceled before stream start never acknowledges the wake.
+   */
+  private async sendBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch,
+    message: string,
+    options: SendMessageOptions,
+    internal?: SendMessageInternalOptions
+  ): Promise<{
+    outcome: BashMonitorWakeDispatchOutcome;
+    result: Result<void, SendMessageError>;
+  }> {
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    let accepted = false;
+    const send = this.sendMessage(ownerWorkspaceId, message, options, {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      requireIdle: true,
+      ...internal,
+      skipAutoResumeReset: true,
+      synthetic: true,
+      cancelSignal: dispatch.cancelSignal,
+      withdrawAcceptedOnCancel: true,
+      onAccepted: async () => {
+        await internal?.onAccepted?.();
+        accepted = true;
+        await dispatch.onAccepted();
+        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      },
+      onAcceptedPreStreamFailure: async (error) => {
+        await internal?.onAcceptedPreStreamFailure?.(error);
+        if (accepted) await dispatch.onAccepted();
+      },
+      onCanceled: async (reason) => {
+        await internal?.onCanceled?.(reason);
+        if (!accepted) {
+          await dispatch.onDeferred();
+          this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+        }
+      },
+    });
+    // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
+    this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
+    let result: Awaited<typeof send>;
+    try {
+      result = await send;
+    } finally {
+      if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
+        this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
+      }
+    }
+    if (!result.success && !accepted) {
+      if (!(await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked())) {
+        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+      }
+      return { outcome: "deferred", result };
+    }
+    return { outcome: "in-flight", result };
   }
 
   private readonly policyService?: PolicyService;

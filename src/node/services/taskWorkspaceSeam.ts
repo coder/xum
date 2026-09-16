@@ -648,6 +648,20 @@ export interface AgentTaskIntegration {
   isWorkspaceStopInProgress(workspaceId: string): boolean;
   /** Monotonic stop generation; an accepted turn captures it at admission for the start fence. */
   getWorkspaceStopEpoch(workspaceId: string): number;
+  /**
+   * Run a bash-monitor wake aimed at an INACTIVE sub-agent (reported or interrupted with no
+   * live continuation) as a fresh parent-owned continuation, the same way task_send_message
+   * reawakens such a child: the parent sees the resumed work in task_list/task_await,
+   * agent_report is accepted, and the turn's end delivers its result to the parent. A late
+   * wake on an inactive child would otherwise run an unowned turn whose outcome nobody hears.
+   * `send` performs the wake's own send and is invoked at most once. Resolves null when the
+   * workspace is not such a child, so the caller dispatches the plain wake instead.
+   */
+  reactivateInactiveAgentTaskFromBashMonitorWake(
+    workspaceId: string,
+    prompt: string,
+    send: WorkspaceTurnHost["sendMessage"]
+  ): Promise<Result<void, string> | null>;
 }
 
 export interface WorkspaceTurnTaskHost {

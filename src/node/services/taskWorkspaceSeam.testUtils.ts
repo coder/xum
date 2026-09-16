@@ -95,6 +95,7 @@ export function makeAgentTaskIntegrationFake(
     noteWorkspaceUnarchived: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
+    reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
     ...overrides,
   };
 }

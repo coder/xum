@@ -17,6 +17,7 @@ import {
   type TaskCreateArgs,
   type WorkspaceHost,
   type WorkspaceLifecycleResult,
+  type WorkspaceTurnHost,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
@@ -278,6 +279,13 @@ export interface WorkspaceTurnCreateArgs {
   /** Internal-only: allow a persistent descendant agent workspace as an existing target. */
   allowAgentWorkspace?: boolean;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * Internal-only: dispatch the prompt through this sender instead of
+   * workspaceService.sendMessage. A bash-monitor wake that reactivates an inactive
+   * sub-agent keeps the wake row's own metadata and acceptance callbacks while the
+   * handle lifecycle around the send stays this manager's.
+   */
+  sendMessage?: WorkspaceTurnHost["sendMessage"];
 }
 
 export interface WorkspaceTurnCreateResult {
@@ -1521,7 +1529,9 @@ export class WorkspaceTurnManager {
       });
     };
 
-    const sendResult = await this.workspaceService.sendMessage(
+    const sendMessage =
+      args.sendMessage ?? this.workspaceService.sendMessage.bind(this.workspaceService);
+    const sendResult = await sendMessage(
       targetWorkspaceId,
       prompt,
       {
@@ -4514,11 +4524,13 @@ export class WorkspaceTurnManager {
   ): boolean {
     const muxMetadata = message.metadata?.muxMetadata;
     if (!isPlainObject(muxMetadata)) return false;
-    if (muxMetadata.type === "workspace-turn-task") {
+    // A workspace-turn-task row, or the wake row that reactivated an inactive sub-agent.
+    const correlation = parseWorkspaceTurnTaskCorrelation(muxMetadata);
+    if (correlation != null) {
       return (
-        muxMetadata.taskHandleId === record.handleId &&
-        muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        muxMetadata.turnId === record.turnId
+        correlation.taskHandleId === record.handleId &&
+        correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+        correlation.turnId === record.turnId
       );
     }
     if (muxMetadata.type === "compaction-summary" && isPlainObject(muxMetadata.pendingFollowUp)) {

@@ -167,6 +167,7 @@ import {
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
   isCompactionSummaryMetadata,
+  parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   pickStartupRetrySendOptions,
   prepareUserMessageForSend,
@@ -330,18 +331,21 @@ interface CompactionRequestMetadata {
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
 // Wake continuations must retain their delegated turn correlation through candidate preparation.
+// An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
+// sub-agent under a fresh continuation) wins; a plain wake inherits the still-open turn from history.
 function resolveStreamMuxMetadata(
   options: MuxMessageMetadata | undefined,
   retry: MuxMessageMetadata | undefined,
   messages: MuxMessage[]
 ): ReturnType<typeof inheritOpenWorkspaceTurnMetadata> {
-  return options?.type === "workspace-turn-task"
-    ? options
-    : retry?.type === "workspace-turn-task"
-      ? retry
-      : retry?.type === "bash-monitor-wake"
-        ? inheritOpenWorkspaceTurnMetadata(messages)
-        : undefined;
+  const explicit =
+    parseWorkspaceTurnTaskCorrelation(options) ?? parseWorkspaceTurnTaskCorrelation(retry);
+  if (explicit != null) {
+    return { type: "workspace-turn-task", ...explicit };
+  }
+  return retry?.type === "bash-monitor-wake"
+    ? inheritOpenWorkspaceTurnMetadata(messages)
+    : undefined;
 }
 
 function manualSendPreservesGoalActivation(
@@ -4370,13 +4374,21 @@ export class AgentSession {
           | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
           | undefined;
         if (typedMuxMetadata?.type === "bash-monitor-wake") {
-          const preCompactionHistory = await this.historyService.getHistoryFromLatestBoundary(
-            this.workspaceId
-          );
-          if (preCompactionHistory.success) {
-            inheritedWorkspaceTurnMetadata = inheritOpenWorkspaceTurnMetadata(
-              preCompactionHistory.data
+          const explicitCorrelation = parseWorkspaceTurnTaskCorrelation(typedMuxMetadata);
+          if (explicitCorrelation != null) {
+            inheritedWorkspaceTurnMetadata = {
+              type: "workspace-turn-task",
+              ...explicitCorrelation,
+            };
+          } else {
+            const preCompactionHistory = await this.historyService.getHistoryFromLatestBoundary(
+              this.workspaceId
             );
+            if (preCompactionHistory.success) {
+              inheritedWorkspaceTurnMetadata = inheritOpenWorkspaceTurnMetadata(
+                preCompactionHistory.data
+              );
+            }
           }
         }
 
