@@ -116,16 +116,18 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         latest = getLayoutsConfigOrDefault(await api.uiLayouts.getAll());
       } catch {
         // Best-effort fallback: don't block writes if the config fetch fails.
-        break;
+        return latest;
       }
       if (generation === generationRef.current) {
         setLayoutPresets(latest);
         setLoaded(true);
         setLoadFailed(false);
-        break;
+        return latest;
       }
     }
-    return latest;
+    // Every read was overtaken, so none is known to reflect the presets now in config; a write
+    // derived from it could still reinstate pre-restore slots. Abort rather than guess.
+    throw new Error("Layout presets changed while saving; try again");
   }, [api, layoutPresets]);
 
   const saveAll = useCallback(
