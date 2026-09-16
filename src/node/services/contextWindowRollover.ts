@@ -204,6 +204,12 @@ export function estimateLastStepToolResults(message: MuxMessage | undefined): {
   imageParts: number;
 } {
   if (!message) return { toolResultChars: 0, imageParts: 0 };
+  return estimateToolResultSize(getLastStepToolResults(message));
+}
+
+/** Share the same last-step slice with real-encoding admission, including tolerant history reads. */
+export function getLastStepToolResults(message: MuxMessage | undefined): unknown[] {
+  if (!message) return [];
   const indices = message.metadata?.stepStartPartIndices;
   const lastStart = Array.isArray(indices) ? indices.at(-1) : undefined;
   // Damaged persisted metadata must not crash a send or hide settled tool outputs.
@@ -214,11 +220,9 @@ export function estimateLastStepToolResults(message: MuxMessage | undefined): {
     lastStart <= message.parts.length
       ? lastStart
       : 0;
-  return estimateToolResultSize(
-    message.parts
-      .slice(start)
-      .flatMap((part) =>
-        part.type === "dynamic-tool" && part.state === "output-available" ? [part.output] : []
-      )
-  );
+  return message.parts
+    .slice(start)
+    .flatMap((part) =>
+      part.type === "dynamic-tool" && part.state === "output-available" ? [part.output] : []
+    );
 }

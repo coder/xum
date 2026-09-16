@@ -7,7 +7,10 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
+import {
+  estimateFreshRequestTokensForModel,
+  estimateToolResultTokensForModel,
+} from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -37,6 +40,7 @@ import {
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
   estimateLastStepToolResults,
+  getLastStepToolResults,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 import { resolveAgentForStream, type AgentResolutionResult } from "./agentResolution";
@@ -5988,12 +5992,17 @@ export class AgentSession {
           budgetModel
         )
       : 0;
+    // Dispatch must screen the same dense tool outputs as settlement, including after restart.
+    const toolResultTokens = knownLimit
+      ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
+      : 0;
     const evaluateBudget = (): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
             contextTokens: contextTokens + newRequestTokens,
             outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
             ...estimateLastStepToolResults(lastAssistant),
+            toolResultTokens,
             modelContextLimit: maxTokens,
             threshold: this.contextController.autoCompactionThreshold,
             warningEmitted: this.contextBudgetWarningClaimed,
