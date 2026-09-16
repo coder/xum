@@ -1704,7 +1704,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.settingsOpenSection("providers-coder-login"),
         title: "Settings: Login with Coder",
-        subtitle: "Connect to a Coder deployment (AI Bridge)",
+        subtitle: "Connect to a Coder deployment (AI Gateway)",
         section: section.settings,
         keywords: ["coder", "login", "oauth", "aibridge", "deployment", "connect"],
         // Hidden when a custom OpenAI-compatible provider shadows the "coder"

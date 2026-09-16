@@ -261,7 +261,7 @@ export function sanitizeSandboxProviderEnv(options: {
   if (present.length > 0) {
     console.warn(
       `\nWARNING: no providers.jsonc was seeded into the sandbox; the server will fall back to provider env vars: ${present.join(", ")}.\n` +
-        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI bridge), the env API key may not match it and provider auth will fail.\n"
+        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI Gateway), the env API key may not match it and provider auth will fail.\n"
     );
   }
 
