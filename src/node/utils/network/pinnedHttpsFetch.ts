@@ -7,6 +7,7 @@ import * as net from "node:net";
 // package entry point is the real implementation on both Node and Bun.
 import { Agent, request } from "undici/index.js";
 import type { Client, Dispatcher } from "undici/index.js";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
 import assert from "@/common/utils/assert";
 import { isBlockedHostname, isBlockedIpAddress, normalizeHostname } from "./blockedTargets";
 
@@ -32,11 +33,10 @@ import { isBlockedHostname, isBlockedIpAddress, normalizeHostname } from "./bloc
  *    cleanup.
  */
 
-// TODO(parent): replace with the shared MCP_ICON_LIMITS.bodyMaxBytes once it lands.
 /** Maximum body bytes accepted (declared or streamed); larger responses yield null. */
-export const PINNED_FETCH_BODY_MAX_BYTES = 512 * 1024;
+const BODY_MAX_BYTES = MCP_ICON_LIMITS.bodyMaxBytes;
 /** Graceful close budget after a successful read before the agent is destroyed. */
-const SUCCESS_CLOSE_TIMEOUT_MS = 1_000;
+const SUCCESS_CLOSE_TIMEOUT_MS = MCP_ICON_LIMITS.agentCloseTimeoutMs;
 
 export interface PinnedHttpsFetchResult {
   bytes: Buffer;
@@ -221,10 +221,10 @@ export function createPinnedHttpsFetch(
         return null;
       }
       const declaredLength = parseContentLength(response.headers["content-length"]);
-      if (declaredLength !== undefined && declaredLength > PINNED_FETCH_BODY_MAX_BYTES) {
+      if (declaredLength !== undefined && declaredLength > BODY_MAX_BYTES) {
         return null;
       }
-      const bytes = await readBounded(body, PINNED_FETCH_BODY_MAX_BYTES);
+      const bytes = await readBounded(body, BODY_MAX_BYTES);
       if (bytes === null) {
         return null;
       }

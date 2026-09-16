@@ -11,11 +11,8 @@ import {
   ICONS_EXAMPLE_HOSTNAME,
   ICONS_EXAMPLE_TLS,
 } from "../../../../tests/fixtures/tls/iconsExample";
-import {
-  PINNED_FETCH_BODY_MAX_BYTES,
-  createPinnedHttpsFetch,
-  type PinnedHttpsFetchTransport,
-} from "./pinnedHttpsFetch";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { createPinnedHttpsFetch, type PinnedHttpsFetchTransport } from "./pinnedHttpsFetch";
 
 /** See src/common/types/undici.d.ts: the augmentation hides Agent's real Dispatcher type. */
 const RealAgent = Agent as new (options: Client.Options) => Dispatcher;
@@ -65,13 +62,13 @@ async function startHarness(): Promise<Harness> {
         // the header alone instead of waiting for the body.
         res.writeHead(200, {
           "content-type": "image/png",
-          "content-length": PINNED_FETCH_BODY_MAX_BYTES + 1,
+          "content-length": MCP_ICON_LIMITS.bodyMaxBytes + 1,
         });
         res.write("x");
         return;
       case "/streamed-oversize": {
         res.writeHead(200, { "content-type": "image/png" });
-        const chunks = Math.ceil(PINNED_FETCH_BODY_MAX_BYTES / CHUNK.length) + 2;
+        const chunks = Math.ceil(MCP_ICON_LIMITS.bodyMaxBytes / CHUNK.length) + 2;
         for (let i = 0; i < chunks; i++) res.write(CHUNK);
         res.end();
         return;
