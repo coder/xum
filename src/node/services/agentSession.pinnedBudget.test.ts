@@ -597,7 +597,18 @@ describe("pinned full-payload rollover admission", () => {
     const { h, config, start, assembleTools, assembly, oldCache } = fixture;
     assembleTools.mockImplementation(getToolsForModel);
     spyOn(contextLimit, "getEffectiveContextLimit").mockReturnValue(256000);
-    h.session.setAutoCompactionThreshold(0.1);
+    // A low slider only requests a handoff; this reset-lifetime test must reach the usable ceiling.
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("ceiling-reached", "assistant", "Settled work", {
+            model,
+            contextUsage: { inputTokens: 248000, outputTokens: 10, totalTokens: 248010 },
+          })
+        )
+      ).success
+    ).toBe(true);
     const sessionDir = path.join(config.sessionsDir, workspaceId);
     const mountOptions = {
       lifetime: "persistent" as const,
