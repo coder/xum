@@ -108,9 +108,19 @@ export default {
 };
 
 export const Desktop: AppStory = {
+  globals: { viewport: { value: "instanceDiscoveryLaptop", isRotated: false } },
   render: () => <AppWithMocks setup={setupInstanceDiscoveryStory} />,
   parameters: {
     ...appMeta.parameters,
+    viewport: {
+      options: {
+        instanceDiscoveryLaptop: {
+          name: "Laptop 1200",
+          styles: { width: "1200px", height: "900px" },
+          type: "desktop",
+        },
+      },
+    },
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } },
   },
   play: async ({ canvasElement }) => {

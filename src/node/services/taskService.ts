@@ -64,6 +64,8 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  INSTANCE_DISCOVERY_DEFAULT_LIMIT,
+  INSTANCE_DISCOVERY_MAX_LIMIT,
   agentReportProgressDedupePrefix,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
@@ -726,6 +728,20 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
+}
+
+export interface InstanceWorkspacesResult {
+  rows: Array<
+    Pick<WorkspaceConfigEntry, "title" | "name" | "createdAt"> & {
+      workspaceId: string;
+      projectPath: string;
+      relationship: "self" | "ancestor" | "unrelated";
+      busy: boolean;
+    }
+  >;
+  totalMatching: number;
+  nextOffset?: number;
+  callerPeerMessagingRestricted?: true;
 }
 
 export interface TerminateAgentTaskResult {
@@ -11413,6 +11429,99 @@ export class TaskService implements AgentTaskIntegration {
     throw new Error(
       `findNearestBestOfGroupUsingIndex: possible parentWorkspaceId cycle starting at ${workspaceId}`
     );
+  }
+
+  /** An on-demand root-workspace address book, separate from either ownership graph. */
+  listInstanceWorkspaces(
+    callerWorkspaceId: string,
+    options: { query?: string | null; limit?: number | null; offset?: number | null }
+  ): InstanceWorkspacesResult {
+    assert(callerWorkspaceId.length > 0, "listInstanceWorkspaces: callerWorkspaceId required");
+    const limit = options.limit ?? INSTANCE_DISCOVERY_DEFAULT_LIMIT;
+    const offset = options.offset ?? 0;
+    assert(
+      Number.isInteger(limit) && limit >= 1 && limit <= INSTANCE_DISCOVERY_MAX_LIMIT,
+      "listInstanceWorkspaces: limit out of range"
+    );
+    assert(
+      Number.isSafeInteger(offset) && offset >= 0,
+      "listInstanceWorkspaces: offset must be a nonnegative integer"
+    );
+    const query = options.query?.trim().toLowerCase() ?? "";
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    if (
+      this.isWorkflowOwnedTaskUsingIndex(index, callerWorkspaceId) ||
+      this.isBestOfChainUsingIndex(index, callerWorkspaceId)
+    ) {
+      return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
+    }
+    const callerRoot = this.resolveRootWorkspaceIdUsingParentById(
+      index.parentById,
+      callerWorkspaceId
+    );
+    const candidates: Array<{
+      row: Omit<InstanceWorkspacesResult["rows"][number], "busy">;
+      createdAtMs: number;
+    }> = [];
+    for (const [projectPath, project] of cfg.projects) {
+      for (const workspace of project.workspaces) {
+        const id = workspace.id;
+        if (
+          id == null ||
+          id.trim().length === 0 ||
+          workspace.parentWorkspaceId ||
+          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
+          this.interruptedParentWorkspaceIds.has(id) ||
+          this.isWorkspaceStopInProgress(id) ||
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
+          // Match peer-path predicates, not a new raw-tag rule. The current index contains
+          // only task children, so ordinary roots cannot match these task restrictions.
+          this.isWorkflowOwnedTaskUsingIndex(index, id) ||
+          this.isBestOfChainUsingIndex(index, id)
+        )
+          continue;
+        if (
+          query &&
+          ![id, workspace.title, workspace.name, projectPath].some((value) =>
+            value?.toLowerCase().includes(query)
+          )
+        )
+          continue;
+        assert(!workspace.parentWorkspaceId, "Instance discovery must only expose roots");
+        const createdAtMs = Date.parse(workspace.createdAt ?? "");
+        candidates.push({
+          row: {
+            workspaceId: id,
+            title: workspace.title,
+            name: workspace.name,
+            projectPath,
+            createdAt: workspace.createdAt,
+            relationship:
+              id === callerWorkspaceId ? "self" : id === callerRoot ? "ancestor" : "unrelated",
+          },
+          createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : -Infinity,
+        });
+      }
+    }
+    // Activity must not reorder pages. Missing/invalid dates sort last, including before-epoch histories.
+    candidates.sort(
+      (a, b) => b.createdAtMs - a.createdAtMs || a.row.workspaceId.localeCompare(b.row.workspaceId)
+    );
+    const totalMatching = candidates.length;
+    // No history reads or per-workspace disk access. Probe activity only for the bounded output.
+    const rows = candidates.slice(offset, offset + limit).map(({ row }) => ({
+      ...row,
+      busy:
+        this.workspaceService.isBusyForMessage(row.workspaceId) ||
+        this.aiService.isStreaming(row.workspaceId),
+    }));
+    const nextOffset = offset + rows.length < totalMatching ? offset + rows.length : undefined;
+    assert(rows.length <= limit);
+    assert(
+      nextOffset == null || (nextOffset === offset + rows.length && nextOffset < totalMatching)
+    );
+    return { rows, totalMatching, ...(nextOffset != null ? { nextOffset } : {}) };
   }
 
   /**
