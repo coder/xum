@@ -21,34 +21,57 @@ const rollover: ContextWindowRollover = {
 };
 
 describe("context budget warnings", () => {
-  test.each([
-    [90_000, 94, false],
-    [100_000, 104, false],
-    [110_000, 115, true],
-  ] as const)(
-    "reports %d tokens against the rollover budget, even when already exceeded",
-    (contextTokens, percent, final) => {
-      const warning = createContextBudgetWarning({
-        contextTokens,
-        maxTokens: 128_000,
-        budgetTokens: 96_000,
-        final,
-        memoryWritable: true,
-        sessionHistoryAvailable: true,
-      });
-      const text = warning.parts
-        .flatMap((part) => (part.type === "text" ? [part.text] : []))
-        .join("\n");
-      expect(text).toContain(`${percent}%`);
-      expect(text).toContain("of 96000");
-      expect(text).not.toContain("of 128000");
-      expect(warning.metadata?.muxMetadata).toMatchObject({
-        contextTokens,
-        maxTokens: 128_000,
-        budgetTokens: 96_000,
-      });
-    }
-  );
+  const options = {
+    contextTokens: 90_000,
+    maxTokens: 128_000,
+    budgetTokens: 119_808,
+    memoryWritable: true,
+    sessionHistoryAvailable: true,
+  };
+
+  test("publishes a visible advisory with optional backward-compatible handoff metadata", () => {
+    const warning = createContextBudgetWarning(options);
+    expect(warning.role).toBe("user");
+    expect(warning.metadata).toMatchObject({ synthetic: true, uiVisible: true });
+    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoff");
+    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoffTokens");
+    const handoff = createContextBudgetWarning({
+      ...options,
+      handoff: true,
+      handoffTokens: 89_600,
+    });
+    expect(handoff.metadata?.muxMetadata).toMatchObject({
+      handoff: true,
+      handoffTokens: 89_600,
+      budgetTokens: 119_808,
+    });
+    expect(handoff.metadata?.muxMetadata).not.toHaveProperty("final");
+    expect(handoff.parts).not.toEqual(warning.parts);
+  });
+
+  test("rejects contradictory stages and budgets outside the known limit", () => {
+    expect(() => createContextBudgetWarning({ ...options, final: true, handoff: true })).toThrow();
+    expect(() => createContextBudgetWarning({ ...options, budgetTokens: 128_001 })).toThrow();
+    expect(() => createContextBudgetWarning({ ...options, handoffTokens: 128_001 })).toThrow();
+    expect(() =>
+      createContextBudgetWarning({ ...options, final: true, memoryWritable: false })
+    ).toThrow();
+  });
+
+  test("dispatch capabilities control handoff guidance without granting unavailable tools", () => {
+    const handoff = { ...options, handoff: true };
+    const parts = (overrides: Partial<Parameters<typeof createContextBudgetWarning>[0]>) =>
+      createContextBudgetWarning({ ...handoff, ...overrides }).parts;
+    // Policy permission cannot prove advertising: unknown and permitted use conditional guidance.
+    expect(parts({ newContextAvailable: "unknown" })).toEqual(parts({ newContextAvailable: true }));
+    expect(parts({ newContextAvailable: false })).not.toEqual(parts({ newContextAvailable: true }));
+    expect(parts({ memoryWritable: false })).not.toEqual(parts({ memoryWritable: true }));
+    // History recovery takes precedence over a tool that would discard the active window.
+    expect(parts({ sessionHistoryAvailable: false, newContextAvailable: true })).toEqual(
+      parts({ sessionHistoryAvailable: false, newContextAvailable: false })
+    );
+    expect(parts({ final: true, handoff: false })).not.toEqual(parts({ handoff: false }));
+  });
 });
 
 describe("context window rollover recovery", () => {

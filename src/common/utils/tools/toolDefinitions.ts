@@ -2496,7 +2496,7 @@ export const TOOL_DEFINITIONS = {
     description:
       "Request a fresh context window (token-budget mode). Nothing happens immediately: the rollover is scheduled after this tool step settles, so sibling tool calls in the same step still complete and their results are persisted. " +
       "The next window starts with a rollover marker and can retrieve earlier transcript data through session_history; workspace files, tasks, goals and costs are preserved, and this is not a privacy reset. " +
-      "Save durable notes with the memory tool first. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
+      "Prefer this after a context handoff request or at a natural task boundary, once durable notes are saved with the memory tool and the write is confirmed. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
     schema: z.object({}).strict(),
     resultSchema: z.object({
       success: z.boolean(),

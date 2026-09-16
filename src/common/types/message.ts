@@ -640,6 +640,9 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         budgetTokens: number;
         /** Final pre-rollover flush prompt (absent on the advance warning). */
         final?: true;
+        /** Agent-led handoff request; old builds can still display it as a warning. */
+        handoff?: true;
+        handoffTokens?: number;
       }
     | {
         type: "compaction-request";
