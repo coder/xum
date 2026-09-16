@@ -839,31 +839,28 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("a wake the task integration declines, or fails to reactivate before sending, dispatches plainly", async () => {
+  test("a wake the task integration declines, fails, or throws before sending dispatches plainly", async () => {
     const h = await createActiveWakeHarness();
-    const declined = mock(() => Promise.resolve(null));
+    const integrations = [
+      mock(() => Promise.resolve(null)),
+      mock(() => Promise.resolve(Err("maxParallelAgentTasks exceeded"))),
+      mock(() => Promise.reject(new Error("config unreadable"))),
+    ];
     try {
-      h.service.setAgentTaskIntegration(
-        makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: declined })
-      );
-      const first = new Promise<void>((resolve) => h.launched.once("start", resolve));
-      await h.addAttention(10);
-      await first;
-      expect(declined).toHaveBeenCalledTimes(1);
-      expect(h.requests).toHaveLength(1);
-      expect(h.requests[0].muxMetadata).toBeUndefined();
-
-      const failed = mock(() => Promise.resolve(Err("maxParallelAgentTasks exceeded")));
-      h.service.setAgentTaskIntegration(
-        makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: failed })
-      );
-      const second = new Promise<void>((resolve) => h.launched.once("start", resolve));
-      await h.complete();
-      await h.addAttention(20);
-      await second;
-      expect(failed).toHaveBeenCalledTimes(1);
-      expect(h.requests).toHaveLength(2);
-      expect(h.requests[1].muxMetadata).toBeUndefined();
+      for (const [index, reactivate] of integrations.entries()) {
+        h.service.setAgentTaskIntegration(
+          makeAgentTaskIntegrationFake({
+            reactivateInactiveAgentTaskFromBashMonitorWake: reactivate,
+          })
+        );
+        const started = new Promise<void>((resolve) => h.launched.once("start", resolve));
+        if (index > 0) await h.complete();
+        await h.addAttention(10 * (index + 1));
+        await started;
+        expect(reactivate).toHaveBeenCalledTimes(1);
+        expect(h.requests).toHaveLength(index + 1);
+        expect(h.requests[index].muxMetadata).toBeUndefined();
+      }
     } finally {
       await h.finish();
     }

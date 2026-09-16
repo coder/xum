@@ -1921,6 +1921,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
   private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
+  /**
+   * Innermost of the task locks: held under the task-tree lock (removal) and the task event
+   * lock (a wake reactivating an inactive sub-agent). Never acquire either while holding it.
+   */
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2697,10 +2701,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // re-enters the history lock exactly like a plain wake, and the row keeps its wake type with
     // the continuation's correlation embedded.
     let continuationOutcome: BashMonitorWakeDispatchOutcome | undefined;
-    const reactivation =
+    let reactivation: Result<void, string> | null = null;
+    if (
       typeof this.agentTaskIntegration?.reactivateInactiveAgentTaskFromBashMonitorWake ===
       "function"
-        ? await this.agentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake(
+    ) {
+      try {
+        reactivation =
+          await this.agentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake(
             ownerWorkspaceId,
             dispatch.prompt,
             async (workspaceId, message, options, internal) => {
@@ -2726,8 +2734,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               continuationOutcome = sent.outcome;
               return sent.result;
             }
-          )
-        : null;
+          );
+      } catch (error: unknown) {
+        reactivation = Err(getErrorMessage(error));
+      }
+    }
+    // The continuation's send ran (even if the handle bookkeeping after it threw): its turn owns
+    // the wake now.
     if (continuationOutcome != null) return continuationOutcome;
     if (reactivation != null && !reactivation.success) {
       // Never lose the wake: fall back to today's plain synthetic turn.
@@ -2815,8 +2828,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const send = this.sendMessage(ownerWorkspaceId, message, options, {
       acceptanceOrigin: "automatic",
       agentInitiated: true,
-      requireIdle: true,
       ...internal,
+      // A wake never queues (see gateBashMonitorWake), even when the continuation found the
+      // workspace busy after the gate: the failed send defers the wake and retries after idle.
+      requireIdle: true,
       skipAutoResumeReset: true,
       synthetic: true,
       cancelSignal: dispatch.cancelSignal,

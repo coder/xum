@@ -29699,18 +29699,18 @@ describe("TaskService", () => {
     assert(executionTaskId != null, "reactivated execution ID is required");
     expect(executionTaskId).toMatch(/^wst_/);
     expect(child?.taskExecutionStatus).toBe("running");
-    expect(options.muxMetadata).toEqual({
-      type: "workspace-turn-task",
-      taskHandleId: executionTaskId,
-      ownerWorkspaceId: parentWorkspaceId,
-      turnId: expect.any(String),
-    });
     const execution = await workspaceTurnSnapshot(taskService, parentWorkspaceId, executionTaskId);
     expect(execution).toMatchObject({
       status: "running",
       title: "UAT Critic",
       attentionPolicy: "notify_on_terminal",
       prompt: "A background bash monitor matched output.",
+    });
+    expect(options.muxMetadata).toEqual({
+      type: "workspace-turn-task",
+      taskHandleId: executionTaskId,
+      ownerWorkspaceId: parentWorkspaceId,
+      turnId: execution?.turnId,
     });
 
     // The resumed turn's reports reach the parent again.
