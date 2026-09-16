@@ -371,6 +371,85 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     });
   });
 
+  test("interrupting a run blocked in a child reservation releases its lease so resume is accepted", async () => {
+    using tmp = new DisposableTempDir("workflow-service-blocked-reservation-interrupt");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    let reservationBlocked = Promise.withResolvers<void>();
+    let terminal = Promise.withResolvers<string>();
+    const reservationSignals: AbortSignal[] = [];
+    const createdTaskIds: string[] = [];
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapterFactory: () => ({
+        async runAgent() {
+          throw new Error("agent steps must reserve through createAgentTasks");
+        },
+        async createAgentTasks(_specs, lifecycle) {
+          const abortSignal = lifecycle?.abortSignal;
+          assert(abortSignal != null, "the runner must pass a reservation abort signal");
+          reservationSignals.push(abortSignal);
+          reservationBlocked.resolve();
+          // Stuck in a cancellable admission stage (tree lock / mutex) until Stop reaches it.
+          await new Promise<void>((resolve) =>
+            abortSignal.addEventListener("abort", () => resolve(), { once: true })
+          );
+          throw new Error("Workflow agent reservation failed: Interrupted (stage: mutex)");
+        },
+        async waitForAgentTask(taskId) {
+          createdTaskIds.push(taskId);
+          throw new Error("nothing was reserved");
+        },
+        async interruptRun() {
+          // Layer 2 teardown of run descendants; there are none while the reservation is blocked.
+        },
+      }),
+      generateRunId: () => "wfr_blocked_reservation",
+      runnerId: "runner-a",
+      notifyInterruptedBackgroundRunTerminal: true,
+      onBackgroundRunTerminal: (event) => {
+        terminal.resolve(event.status);
+      },
+      clock: {
+        nowIso: () => "2026-05-29T00:00:00.000Z",
+        nowMs: () => 1_000,
+      },
+    });
+    const runId = "wfr_blocked_reservation";
+
+    await service.startWorkflowInBackground({
+      script: createScript(`export default function workflow({ agent }) {
+  return { reportMarkdown: agent("Blocked child", { id: "blocked" }) };
+}
+`),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+    await reservationBlocked.promise;
+
+    await service.interruptRun({ workspaceId: "workspace-1", runId });
+    expect(reservationSignals[0]?.aborted).toBe(true);
+    await expect(terminal.promise).resolves.toBe("interrupted");
+    const interrupted = await runStore.getRun(runId);
+    expect(interrupted.status).toBe("interrupted");
+    // Nothing durable exists for the canceled reservation beyond its breadcrumb.
+    expect(interrupted.steps).toEqual([]);
+    expect(createdTaskIds).toEqual([]);
+
+    // The runner released its lease on the way out: an explicit resume is accepted
+    // (previously "Workflow run is already active") and reaches a fresh reservation.
+    reservationBlocked = Promise.withResolvers<void>();
+    terminal = Promise.withResolvers<string>();
+    await expect(
+      service.resumeRunInBackground({ workspaceId: "workspace-1", runId, projectTrusted: true })
+    ).resolves.toMatchObject({ runId, status: "running" });
+    await reservationBlocked.promise;
+    expect(reservationSignals).toHaveLength(2);
+    await service.interruptRun({ workspaceId: "workspace-1", runId });
+    await expect(terminal.promise).resolves.toBe("interrupted");
+  });
+
   test("foreground workflows that self-background persist notify_on_terminal policy", async () => {
     using tmp = new DisposableTempDir("workflow-service-self-background-notify");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });

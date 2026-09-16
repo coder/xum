@@ -1309,6 +1309,29 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     mock.restore();
   });
 
+  it("aborts a fenced start before the engine constructs a provider request", async () => {
+    using xumHome = new DisposableTempDir("ai-service-stop-fence");
+    const metadata = createLocalWorkspaceMetadata("stop-fence", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    // The session's fence closes over its admission epoch; a stop bumped it meanwhile.
+    const stopFence = mock(() => false);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [createMuxMessage("admitted-user", "user", "continue")],
+      modelString: "openai:gpt-5.2",
+      stopFence,
+    });
+    expect(result.success).toBe(true);
+    expect(stopFence).toHaveBeenCalled();
+    // The engine receives an already-aborted start (startup reason) and the same fence, so it
+    // settles the turn as a startup abort instead of invoking the provider.
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const engineOptions = harness.startStreamCalls[0];
+    expect(engineOptions.abortSignal?.aborted).toBe(true);
+    expect(engineOptions.abortSignal?.reason).toBe("startup");
+    expect(engineOptions.stopFence).toBe(stopFence);
+  });
+
   it.each([false, true])(
     "carries final recorded admission into the engine (prepared=%s)",
     async (prepared) => {

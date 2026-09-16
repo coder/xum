@@ -4,7 +4,9 @@ import * as os from "os";
 import * as path from "path";
 
 import {
+  getSubagentReportArtifactPath,
   readSubagentReportArtifact,
+  readSubagentReportArtifactStrict,
   readSubagentReportArtifactsFile,
   upsertSubagentReportArtifact,
 } from "@/node/services/subagentReportArtifacts";
@@ -85,5 +87,53 @@ describe("subagentReportArtifacts", () => {
     const artifact = await readSubagentReportArtifact(testDir, childTaskId);
 
     expect(artifact?.structuredOutput).toEqual(structuredOutput);
+  });
+
+  describe("readSubagentReportArtifactStrict", () => {
+    test("distinguishes a positively absent report from a persisted one", async () => {
+      const childTaskId = "child-strict";
+      expect(await readSubagentReportArtifactStrict(testDir, childTaskId)).toEqual({
+        kind: "absent",
+      });
+      await upsertSubagentReportArtifact({
+        workspaceId: "parent-1",
+        workspaceSessionDir: testDir,
+        childTaskId,
+        parentWorkspaceId: "parent-1",
+        ancestorWorkspaceIds: ["parent-1"],
+        reportMarkdown: "done",
+        nowMs: Date.now(),
+      });
+      const found = await readSubagentReportArtifactStrict(testDir, childTaskId);
+      expect(found.kind).toBe("found");
+      if (found.kind === "found") expect(found.artifact.reportMarkdown).toBe("done");
+    });
+
+    test("a corrupt report body is unreadable, never absent; the lenient reader still self-heals to null", async () => {
+      const childTaskId = "child-corrupt";
+      const reportPath = getSubagentReportArtifactPath(testDir, childTaskId);
+      await fsPromises.mkdir(path.dirname(reportPath), { recursive: true });
+      await fsPromises.writeFile(reportPath, "{ not json");
+      const strict = await readSubagentReportArtifactStrict(testDir, childTaskId);
+      expect(strict.kind).toBe("unreadable");
+      expect(await readSubagentReportArtifact(testDir, childTaskId)).toBeNull();
+
+      // A parseable body without a report is equally not evidence of absence.
+      await fsPromises.writeFile(reportPath, JSON.stringify({ childTaskId, reportMarkdown: "" }));
+      expect((await readSubagentReportArtifactStrict(testDir, childTaskId)).kind).toBe(
+        "unreadable"
+      );
+    });
+
+    test("an I/O failure other than ENOENT is unreadable", async () => {
+      const childTaskId = "child-eacces";
+      const reportPath = getSubagentReportArtifactPath(testDir, childTaskId);
+      // A directory where the report FILE should be: reading it fails with EISDIR, not ENOENT.
+      await fsPromises.mkdir(reportPath, { recursive: true });
+      const strict = await readSubagentReportArtifactStrict(testDir, childTaskId);
+      expect(strict.kind).toBe("unreadable");
+      if (strict.kind === "unreadable") expect(strict.error).toContain("EISDIR");
+      expect(await readSubagentReportArtifact(testDir, childTaskId)).toBeNull();
+    });
   });
 });

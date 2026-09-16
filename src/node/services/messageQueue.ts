@@ -574,6 +574,16 @@ export class MessageQueue {
     return this.entries.some((entry) => entry.dedupeKeys.has(dedupeKey));
   }
 
+  /** Whether the entry is still queued (neither dispatched nor removed). */
+  hasEntry(entryId: string): boolean {
+    return this.entries.some((entry) => entry.entryId === entryId);
+  }
+
+  /** Identity of the queued entry holding this addOnce key, for the enqueuer's own bookkeeping. */
+  getEntryIdByDedupeKey(dedupeKey: string): string | undefined {
+    return this.entries.find((entry) => entry.dedupeKeys.has(dedupeKey))?.entryId;
+  }
+
   /**
    * Whether the queue's only content is the single message queued under this dedupe key.
    * Used to supersede low-value scheduled entries (heartbeats): a later real message must
@@ -1059,6 +1069,8 @@ export class MessageQueue {
    * Caller must check {@link isEmpty} first.
    */
   dequeueNext(): {
+    /** Identity of the dispatched entry (matches the queue-cut receipt keyed at cut time). */
+    entryId?: string;
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
     internal?: QueuedMessageInternalOptions;
@@ -1176,7 +1188,13 @@ export class MessageQueue {
         }
       : undefined;
 
-    return { message: joinedMessages, options, internal, enqueuedAtMs: entry.lastAddedAtMs };
+    return {
+      entryId: entry.entryId,
+      message: joinedMessages,
+      options,
+      internal,
+      enqueuedAtMs: entry.lastAddedAtMs,
+    };
   }
 
   /**

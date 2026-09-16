@@ -131,6 +131,47 @@ export interface AppendWorkflowRunEventOptions {
   expectedLeaseOwnerId?: string;
 }
 
+/**
+ * Options for writes that settle one agent attempt (completed/failed/timeout metadata).
+ * Every such write is fenced INSIDE the store lock to the current merged `started` record with
+ * the exact `(stepId, inputHash, taskId)`; a caller-side check followed by an awaited write is
+ * never enough because a replacement attempt or a Stop can land in between.
+ */
+export interface WorkflowAgentAttemptWriteOptions extends AppendWorkflowRunEventOptions {
+  /**
+   * Draining-owner capability from `openCancellationSettlement`. The only way to settle an
+   * attempt on an `interrupted` run: a Stop persists `interrupted` while the runner still holds
+   * a valid lease, so lease validity alone is not evidence that a late callback is authorized.
+   */
+  settlement?: WorkflowCancellationSettlement;
+}
+
+/**
+ * Invocation-scoped, in-memory capability handed only to the runner instance whose abort fired.
+ * The store recognizes it by identity (never by a string flag), binds it to the lease owner that
+ * opened it, and forgets it on `close()`, so a foreign writer, a stale instance, or a plain flag
+ * cannot borrow the interrupted-run exception. Not persisted: a process restart has no draining
+ * owner, so its attempts are disposed by the next resume instead.
+ */
+export class WorkflowCancellationSettlement {
+  constructor(
+    readonly runId: string,
+    readonly ownerId: string,
+    private readonly onClose: (settlement: WorkflowCancellationSettlement) => void
+  ) {
+    assert(runId.length > 0, "WorkflowCancellationSettlement: runId is required");
+    assert(ownerId.length > 0, "WorkflowCancellationSettlement: ownerId is required");
+  }
+
+  close(): void {
+    this.onClose(this);
+  }
+
+  [Symbol.dispose](): void {
+    this.close();
+  }
+}
+
 type WorkflowRunEventDraft = WorkflowRunEvent extends infer Event
   ? Event extends WorkflowRunEvent
     ? Omit<Event, "sequence">
@@ -153,6 +194,8 @@ interface WorkflowStepLookup {
 export class WorkflowRunStore {
   private readonly sessionDir: string;
   private readonly staleLeaseMs: number;
+  /** Live draining-owner capabilities by run id; see WorkflowCancellationSettlement. */
+  private readonly cancellationSettlements = new Map<string, WorkflowCancellationSettlement>();
 
   constructor(options: WorkflowRunStoreOptions) {
     assert(options.sessionDir.length > 0, "WorkflowRunStore: sessionDir is required");
@@ -579,7 +622,7 @@ export class WorkflowRunStore {
     input: {
       stepId: string;
       inputHash: string;
-      taskId?: string;
+      taskId: string;
       // Agent-spec title for the task event row; distinct from result.title,
       // which is the sub-agent's self-reported report title.
       title?: string;
@@ -587,7 +630,7 @@ export class WorkflowRunStore {
       startedAt: string;
       completedAt: string;
     },
-    options: AppendWorkflowRunEventOptions = {}
+    options: WorkflowAgentAttemptWriteOptions = {}
   ): Promise<void> {
     // Fail fast on empty titles: the event schema enforces min(1), and letting it
     // surface as a ZodError mid-write would abort step persistence with a less
@@ -596,45 +639,171 @@ export class WorkflowRunStore {
       input.title == null || input.title.length > 0,
       "WorkflowRunStore.recordStepCompletedAndAppendTaskEvent: title must be non-empty when provided"
     );
+    const record = WorkflowStepRecordSchema.parse({
+      stepId: input.stepId,
+      inputHash: input.inputHash,
+      taskId: input.taskId,
+      result: input.result,
+      startedAt: input.startedAt,
+      completedAt: input.completedAt,
+      status: "completed",
+    });
+    await this.settleAgentAttempt(runId, input, options, {
+      record,
+      taskEvent: {
+        type: "task",
+        at: input.completedAt,
+        stepId: input.stepId,
+        taskId: input.taskId,
+        status: "completed",
+        title: input.title,
+      },
+      leadingEvents: [],
+    });
+  }
+
+  async recordStepFailedAndAppendTaskEvent(
+    runId: string,
+    input: {
+      stepId: string;
+      inputHash: string;
+      taskId: string;
+      // Agent-spec title for the task event row (see recordStepCompletedAndAppendTaskEvent).
+      title?: string;
+      error: string;
+      startedAt: string;
+      completedAt: string;
+      validationAt: string;
+      taskFailedAt?: string;
+    },
+    options: WorkflowAgentAttemptWriteOptions = {}
+  ): Promise<void> {
+    assert(
+      input.title == null || input.title.length > 0,
+      "WorkflowRunStore.recordStepFailedAndAppendTaskEvent: title must be non-empty when provided"
+    );
+    const record = WorkflowStepRecordSchema.parse({
+      stepId: input.stepId,
+      inputHash: input.inputHash,
+      taskId: input.taskId,
+      error: input.error,
+      startedAt: input.startedAt,
+      completedAt: input.completedAt,
+      status: "failed",
+    });
+    await this.settleAgentAttempt(runId, input, options, {
+      record,
+      taskEvent: {
+        type: "task",
+        at: input.taskFailedAt ?? input.completedAt,
+        stepId: input.stepId,
+        taskId: input.taskId,
+        status: "failed",
+        title: input.title,
+      },
+      leadingEvents: [
+        {
+          type: "validation",
+          at: input.validationAt,
+          stepId: input.stepId,
+          success: false,
+          message: input.error,
+        },
+      ],
+    });
+  }
+
+  /**
+   * Terminal disposition for an attempt whose child settled without a report (no validation
+   * event: nothing was validated). Rejected unless the exact attempt is still the current
+   * `started` record, so an obsolete attempt can never fail its replacement.
+   */
+  async recordStepFailedIfCurrent(
+    runId: string,
+    input: {
+      stepId: string;
+      inputHash: string;
+      taskId: string;
+      title?: string;
+      error: string;
+      startedAt: string;
+      completedAt: string;
+    },
+    options: WorkflowAgentAttemptWriteOptions = {}
+  ): Promise<void> {
+    assert(
+      input.title == null || input.title.length > 0,
+      "WorkflowRunStore.recordStepFailedIfCurrent: title must be non-empty when provided"
+    );
+    const record = WorkflowStepRecordSchema.parse({
+      stepId: input.stepId,
+      inputHash: input.inputHash,
+      taskId: input.taskId,
+      error: input.error,
+      startedAt: input.startedAt,
+      completedAt: input.completedAt,
+      status: "failed",
+    });
+    await this.settleAgentAttempt(runId, input, options, {
+      record,
+      taskEvent: {
+        type: "task",
+        at: input.completedAt,
+        stepId: input.stepId,
+        taskId: input.taskId,
+        status: "failed",
+        title: input.title,
+      },
+      leadingEvents: [],
+    });
+  }
+
+  /**
+   * Shared locked section for the agent-attempt write family: lease fence, run-state fence,
+   * attempt fence, then the step record and its task event land in one section so a crash can
+   * only split them at the append boundary (see the crash-split replay tests).
+   */
+  private async settleAgentAttempt(
+    runId: string,
+    attempt: { stepId: string; inputHash: string; taskId: string },
+    options: WorkflowAgentAttemptWriteOptions,
+    write: {
+      record: WorkflowStepRecord;
+      taskEvent: Extract<WorkflowRunEventDraft, { type: "task" }>;
+      leadingEvents: WorkflowRunEventDraft[];
+    }
+  ): Promise<void> {
     await this.withWorkflowMutationLock(runId, async () => {
       await this.withExpectedLeaseOwner(runId, options.expectedLeaseOwnerId, async () => {
-        const record = WorkflowStepRecordSchema.parse({
-          stepId: input.stepId,
-          inputHash: input.inputHash,
-          taskId: input.taskId,
-          result: input.result,
-          startedAt: input.startedAt,
-          completedAt: input.completedAt,
-          status: "completed",
-        });
         const run = await this.getRunUnlocked(runId);
-        this.assertCanAppendStepRecord(runId, run);
+        this.assertCanSettleAgentAttempt(runId, run, attempt, options);
+        const { record, taskEvent, leadingEvents } = write;
+        // The attempt fence above is the authorization for these events too: on an interrupted
+        // run they may only accompany an authorized settlement write, never stand alone.
+        const settlementAuthorized = run.status === "interrupted";
 
-        let updatedRun = this.withStepRecord(run, record);
+        let updatedRun = run;
         const eventsToAppend: WorkflowRunEvent[] = [];
+        for (const draft of leadingEvents) {
+          const event = this.createNextEventForRun(runId, updatedRun, draft, options, {
+            settlementAuthorized,
+          });
+          eventsToAppend.push(event);
+          updatedRun = this.withEvent(updatedRun, event);
+        }
+        updatedRun = this.withStepRecord(updatedRun, record);
         if (
-          input.taskId != null &&
           !updatedRun.events.some(
             (event) =>
               event.type === "task" &&
-              event.status === "completed" &&
-              event.stepId === input.stepId &&
-              event.taskId === input.taskId
+              event.status === taskEvent.status &&
+              event.stepId === taskEvent.stepId &&
+              event.taskId === taskEvent.taskId
           )
         ) {
-          const event = this.createNextEventForRun(
-            runId,
-            updatedRun,
-            {
-              type: "task",
-              at: input.completedAt,
-              stepId: input.stepId,
-              taskId: input.taskId,
-              status: "completed",
-              title: input.title,
-            },
-            options
-          );
+          const event = this.createNextEventForRun(runId, updatedRun, taskEvent, options, {
+            settlementAuthorized,
+          });
           eventsToAppend.push(event);
           updatedRun = this.withEvent(updatedRun, event);
         }
@@ -646,87 +815,44 @@ export class WorkflowRunStore {
     });
   }
 
-  async recordStepFailedAndAppendTaskEvent(
+  /**
+   * Hands the interrupted-run settlement capability to the runner whose abort fired. Verified
+   * under the lease lock so only the current lease owner can hold it; replaces any earlier
+   * capability for the run so a superseded instance loses it.
+   */
+  async openCancellationSettlement(
     runId: string,
-    input: {
-      stepId: string;
-      inputHash: string;
-      taskId?: string;
-      // Agent-spec title for the task event row (see recordStepCompletedAndAppendTaskEvent).
-      title?: string;
-      error: string;
-      startedAt: string;
-      completedAt: string;
-      validationAt: string;
-      taskFailedAt?: string;
-    },
-    options: AppendWorkflowRunEventOptions = {}
-  ): Promise<void> {
-    assert(
-      input.title == null || input.title.length > 0,
-      "WorkflowRunStore.recordStepFailedAndAppendTaskEvent: title must be non-empty when provided"
-    );
-    await this.withWorkflowMutationLock(runId, async () => {
-      await this.withExpectedLeaseOwner(runId, options.expectedLeaseOwnerId, async () => {
-        const record = WorkflowStepRecordSchema.parse({
-          stepId: input.stepId,
-          inputHash: input.inputHash,
-          taskId: input.taskId,
-          error: input.error,
-          startedAt: input.startedAt,
-          completedAt: input.completedAt,
-          status: "failed",
-        });
-        const run = await this.getRunUnlocked(runId);
-        this.assertCanAppendStepRecord(runId, run);
-
-        const validationEvent = this.createNextEventForRun(
-          runId,
-          run,
-          {
-            type: "validation",
-            at: input.validationAt,
-            stepId: input.stepId,
-            success: false,
-            message: input.error,
-          },
-          options
-        );
-        let updatedRun = this.withEvent(run, validationEvent);
-        updatedRun = this.withStepRecord(updatedRun, record);
-        const eventsToAppend: WorkflowRunEvent[] = [validationEvent];
-        if (
-          input.taskId != null &&
-          !updatedRun.events.some(
-            (event) =>
-              event.type === "task" &&
-              event.status === "failed" &&
-              event.stepId === input.stepId &&
-              event.taskId === input.taskId
-          )
-        ) {
-          const taskEvent = this.createNextEventForRun(
-            runId,
-            updatedRun,
-            {
-              type: "task",
-              at: input.taskFailedAt ?? input.completedAt,
-              stepId: input.stepId,
-              taskId: input.taskId,
-              status: "failed",
-              title: input.title,
-            },
-            options
-          );
-          eventsToAppend.push(taskEvent);
-          updatedRun = this.withEvent(updatedRun, taskEvent);
+    ownerId: string,
+    abortSignal: AbortSignal
+  ): Promise<WorkflowCancellationSettlement> {
+    assert(ownerId.length > 0, "WorkflowRunStore.openCancellationSettlement: ownerId is required");
+    if (!abortSignal.aborted) {
+      throw new Error(
+        `Workflow cancellation settlement requires an aborted runner: ${runId} (${ownerId})`
+      );
+    }
+    return await this.withExpectedLeaseOwner(runId, ownerId, () => {
+      const settlement = new WorkflowCancellationSettlement(runId, ownerId, (closing) => {
+        if (this.cancellationSettlements.get(runId) === closing) {
+          this.cancellationSettlements.delete(runId);
         }
-
-        await appendJsonLine(this.stepsFile(runId), record);
-        await appendJsonLines(this.eventsFile(runId), eventsToAppend);
-        await this.writeRunFile(runId, updatedRun);
       });
+      this.cancellationSettlements.set(runId, settlement);
+      return Promise.resolve(settlement);
     });
+  }
+
+  /** Lease owner and freshness for `already active` diagnostics; null when unleased. */
+  async getLeaseDiagnostics(
+    runId: string,
+    nowMs = Date.now()
+  ): Promise<{ ownerId: string; renewedAgoMs: number } | null> {
+    const lease = await readLease(this.leaseFile(runId));
+    if (lease == null) {
+      return null;
+    }
+    // acquiredAtMs is refreshed by every renewal, so this is lease freshness, not run age.
+    return { ownerId: lease.ownerId, renewedAgoMs: Math.max(0, nowMs - lease.acquiredAtMs) };
   }
 
   async appendTaskEventIfMissing(
@@ -755,6 +881,7 @@ export class WorkflowRunStore {
         if (alreadyRecorded) {
           return;
         }
+        this.assertCanAppendStepRecord(runId, run);
         const event = this.createNextEventForRun(
           runId,
           run,
@@ -783,20 +910,25 @@ export class WorkflowRunStore {
       startedAt: string;
       timeout: NonNullable<WorkflowStepRecord["timeout"]>;
     },
-    options: AppendWorkflowRunEventOptions = {}
+    options: WorkflowAgentAttemptWriteOptions = {}
   ): Promise<void> {
-    await this.appendStepRecord(
-      runId,
-      {
-        stepId: input.stepId,
-        inputHash: input.inputHash,
-        taskId: input.taskId,
-        startedAt: input.startedAt,
-        status: "started",
-        timeout: input.timeout,
-      },
-      options
-    );
+    const record = WorkflowStepRecordSchema.parse({
+      stepId: input.stepId,
+      inputHash: input.inputHash,
+      taskId: input.taskId,
+      startedAt: input.startedAt,
+      status: "started",
+      timeout: input.timeout,
+    });
+    // Timeout metadata re-merges the started record, so an obsolete attempt writing it late would
+    // silently point the checkpoint back at its own task id; fence it like a terminal write.
+    await this.withWorkflowMutationLock(runId, async () => {
+      await this.withExpectedLeaseOwner(runId, options.expectedLeaseOwnerId, async () => {
+        const run = await this.getRunUnlocked(runId);
+        this.assertCanSettleAgentAttempt(runId, run, input, options);
+        await appendJsonLine(this.stepsFile(runId), record);
+      });
+    });
   }
 
   async recordStepFailed(
@@ -1081,13 +1213,14 @@ export class WorkflowRunStore {
     runId: string,
     run: WorkflowRunRecord,
     event: WorkflowRunEventDraft,
-    options: AppendWorkflowRunEventOptions = {}
+    options: AppendWorkflowRunEventOptions = {},
+    fence: { settlementAuthorized: boolean } = { settlementAuthorized: false }
   ): WorkflowRunEvent {
     const parsedEvent = WorkflowRunEventSchema.parse({
       ...event,
       sequence: (run.events.at(-1)?.sequence ?? 0) + 1,
     });
-    this.assertCanAppendEvent(runId, run, parsedEvent, options);
+    this.assertCanAppendEvent(runId, run, parsedEvent, options, fence);
     return parsedEvent;
   }
 
@@ -1095,7 +1228,10 @@ export class WorkflowRunStore {
     runId: string,
     run: WorkflowRunRecord,
     event: WorkflowRunEvent,
-    options: AppendWorkflowRunEventOptions
+    options: AppendWorkflowRunEventOptions,
+    // Internal: set only by settleAgentAttempt after the attempt fence admitted a cancellation
+    // settlement write on an interrupted run (non-status events accompanying that write).
+    fence: { settlementAuthorized: boolean } = { settlementAuthorized: false }
   ): void {
     const ordered = WorkflowEventSequenceSchema.safeParse([...run.events, event]);
     if (!ordered.success) {
@@ -1103,9 +1239,10 @@ export class WorkflowRunStore {
     }
 
     const isInterruptedResumeEvent =
-      event.type === "status" &&
-      options.allowInterruptedResume === true &&
-      event.status === "running";
+      (event.type === "status" &&
+        options.allowInterruptedResume === true &&
+        event.status === "running") ||
+      (event.type !== "status" && fence.settlementAuthorized);
     const isFailedCheckpointRetryEvent =
       event.type === "status" &&
       options.allowFailedCheckpointRetry === true &&
@@ -1124,9 +1261,55 @@ export class WorkflowRunStore {
     }
   }
 
+  /**
+   * Run-state fence for ordinary (non-settlement) step and task-event writes. Checked inside the
+   * locked section and independently of the lease: interrupted runs observed in the field kept
+   * valid leases, so a late callback's lease is not evidence that it is still authorized.
+   */
   private assertCanAppendStepRecord(runId: string, run: WorkflowRunRecord): void {
     if (run.status === "interrupted") {
       throw new Error(`Workflow run interrupted: ${runId}`);
+    }
+    if (isTerminalRunStatus(run.status)) {
+      throw new Error(`Workflow run ${run.status}: ${runId}`);
+    }
+  }
+
+  /**
+   * Agent-attempt fence: the merged current record for `(stepId, inputHash)` must still be the
+   * exact `started` attempt (`taskId`). An interrupted run admits the write only through a live
+   * cancellation settlement opened by the same lease owner; completed/failed runs never do.
+   */
+  private assertCanSettleAgentAttempt(
+    runId: string,
+    run: WorkflowRunRecord,
+    attempt: { stepId: string; inputHash: string; taskId: string },
+    options: WorkflowAgentAttemptWriteOptions
+  ): void {
+    assert(attempt.taskId.length > 0, "WorkflowRunStore: agent attempt taskId is required");
+    if (isTerminalRunStatus(run.status)) {
+      throw new Error(`Workflow run ${run.status}: ${runId}`);
+    }
+    if (run.status === "interrupted") {
+      const settlement = options.settlement;
+      if (
+        settlement == null ||
+        this.cancellationSettlements.get(runId) !== settlement ||
+        settlement.runId !== runId ||
+        // The capability is bound to the lease owner that opened it; the lease itself was
+        // already verified by withExpectedLeaseOwner for that same id.
+        options.expectedLeaseOwnerId !== settlement.ownerId
+      ) {
+        throw new Error(`Workflow run interrupted: ${runId}`);
+      }
+    }
+    const current = run.steps.find(
+      (step) => step.stepId === attempt.stepId && step.inputHash === attempt.inputHash
+    );
+    if (current?.status !== "started" || current.taskId !== attempt.taskId) {
+      throw new Error(
+        `Workflow step ${attempt.stepId} task ${attempt.taskId} is not the current started attempt: ${runId}`
+      );
     }
   }
 

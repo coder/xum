@@ -344,7 +344,7 @@ describe("settled context hard ceiling", () => {
               modelContextLimit: 128000,
               threshold: 1,
               warningEmitted: false,
-            }).decision
+            })
           );
         },
       });

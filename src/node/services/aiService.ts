@@ -35,7 +35,12 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
+import {
+  ProvidersConfigStore,
+  SecretsStore,
+  type Config,
+  type WorkspaceMetadataOptions,
+} from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -62,6 +67,7 @@ import {
   type TurnCompletion,
   type TurnEngineEvent,
   type TurnStreamHandle,
+  type StopStreamOptions,
 } from "./streamManager";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -82,7 +88,6 @@ import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
-import type { StreamAbortReason } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -537,9 +542,12 @@ export class AIService extends EventEmitter {
     this.streamManager.setMockStreamLifecycle(this.mockAiStreamPlayer);
   }
 
-  async getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>> {
+  async getWorkspaceMetadata(
+    workspaceId: string,
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+  ): Promise<Result<WorkspaceMetadata>> {
     try {
-      const metadata = await this.config.getWorkspaceMetadataById(workspaceId);
+      const metadata = await this.config.getWorkspaceMetadataById(workspaceId, options);
 
       if (!metadata) {
         return Err(
@@ -1002,6 +1010,14 @@ export class AIService extends EventEmitter {
       // Prepared candidates must use the final caller's admission, not their earlier preview.
       buildOutcome.turnExecutionOptions.assertAdmissionCurrent = opts.assertAdmissionCurrent;
       buildOutcome.turnExecutionOptions.withAdmissionCurrent = opts.withAdmissionCurrent;
+      buildOutcome.turnExecutionOptions.stopFence = opts.stopFence;
+      // Stop-cascade fence: a turn admitted before the stop latched (so the cascade's single
+      // stopStream could not capture it) must not reach the provider. Abort the pending start
+      // instead; startStream then settles it through the existing startup-abort path.
+      if (opts.stopFence?.() === false) {
+        buildOutcome.logStartOutcome("stream_start_failed", "stop_in_progress");
+        pendingStart.abort("startup");
+      }
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
@@ -1043,10 +1059,7 @@ export class AIService extends EventEmitter {
     }
   }
 
-  async stopStream(
-    workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
-  ): Promise<Result<void>> {
+  async stopStream(workspaceId: string, options?: StopStreamOptions): Promise<Result<void>> {
     return this.streamManager.stopStream(workspaceId, options);
   }
 

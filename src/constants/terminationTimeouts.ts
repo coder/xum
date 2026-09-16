@@ -1,5 +1,18 @@
 export const TASK_TERMINATION_TOOL_TIMEOUT_MS = 5 * 60 * 1000;
 export const TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS = 20 * 1000;
+/**
+ * Bounds one teardown's WHOLE unlocked cleanup phase (every descendant's clearQueue + stopStream
+ * raced concurrently), so a cascade costs at most this, not descendants × per-child timeout.
+ */
+export const TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS =
+  2 * TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS;
+/** Bounds cancellable reservation stages, not entered checkpoint/config writes. */
+export const WORKFLOW_AGENT_RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
+/** Report a stalled reservation's stage once without adding a polling scheduler. */
+export const TASK_CREATE_WAIT_WARNING_MS = 30 * 1000;
+/** Resume must release its workflow lease rather than wait indefinitely for old cleanup. */
+export const WORKFLOW_ATTEMPT_SETTLEMENT_TIMEOUT_MS =
+  TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS;
 export const TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS = 2 * 60 * 1000;
 export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 
