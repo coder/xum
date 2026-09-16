@@ -18,12 +18,16 @@ describe("describeConfiguredConnection", () => {
     expect(describeConfiguredConnection("legacy", { ...entry, transport: "sse" }).transport).toBe(
       "sse"
     );
-    // Whether or not a credentialed URL keeps its origin, credentials never leave.
     const credentialed = describeConfiguredConnection("work", {
       ...entry,
       url: "https://alice:hunter2@mcp.example.com/mcp",
     });
-    expect(JSON.stringify(credentialed)).not.toMatch(/alice|hunter2|\/mcp/);
+    // The hostname may contain "mcp"; only userinfo and the path are private.
+    expect(credentialed).toEqual({
+      key: "work",
+      transport: "http",
+      origin: "https://mcp.example.com",
+    });
   });
 
   test("non-HTTPS or unparseable URLs yield no origin", () => {
