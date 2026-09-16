@@ -1136,6 +1136,8 @@ export const MCPSettingsSection: React.FC = () => {
       // never overwrite its config with the draft.
       const current = (await api.mcp.list({})) ?? {};
       if (current[newServerName]) {
+        // Install the fresh list so the row is visible before its test result lands.
+        await refresh();
         await handleTest(newServerName);
         return;
       }
