@@ -1,7 +1,13 @@
 import { z } from "zod";
-import { AppConfigOnDiskSchema, GoalDefaultsSchema } from "@/common/config/schemas/appConfigOnDisk";
+import {
+  AgentAiDefaultsEntrySchema,
+  AgentAiSubagentProfileSchema,
+  AppConfigOnDiskSchema,
+  GoalDefaultsSchema,
+} from "@/common/config/schemas/appConfigOnDisk";
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import { LayoutPresetsConfigSchema } from "@/common/orpc/schemas/uiLayouts";
+import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
@@ -132,17 +138,29 @@ function isEmptySpelling(value: unknown): boolean {
 const acceptedBy = (normalize: (value: unknown) => unknown) => (value: unknown) =>
   isEmptySpelling(value) || normalize(value) !== undefined;
 
+const ModelStringSchema = z.string().refine(acceptedBy(normalizeOptionalModelString));
+
 /**
  * Where the on-disk schema accepts values load-time normalization rejects (any string is a model
- * string, any id is a runtime, any keybind is a slot), the field schema is tightened to what the
- * normalizer accepts. Otherwise a damaged or newer-build value would pass the schema, normalize to
- * unset, and reset the target's setting, when the contract is to keep the local value and report
- * the key as unsupported. Empty spellings (`""`, `[]`, `{}`, no slots) still canonicalize to unset.
- * layoutPresets is unknown on disk; the strict schema the layouts API saves through is used.
+ * string, at the top level and inside each agent's defaults; any id is a runtime; any keybind is
+ * a slot), the field schema is tightened to what the normalizer accepts. Otherwise a damaged or
+ * newer-build value would pass the schema, normalize to unset, and reset the target's setting,
+ * when the contract is to keep the local value and report the key as unsupported. Empty
+ * spellings (`""`, `[]`, `{}`, no slots) still canonicalize to unset. layoutPresets is unknown on
+ * disk; the strict schema the layouts API saves through is used.
  */
 const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = {
-  defaultModel: z.string().refine(acceptedBy(normalizeOptionalModelString)),
-  hiddenModels: z.array(z.string().refine(acceptedBy(normalizeOptionalModelString))),
+  agentAiDefaults: z.record(
+    AgentIdSchema,
+    AgentAiDefaultsEntrySchema.extend({
+      modelString: ModelStringSchema.optional(),
+      subagent: AgentAiSubagentProfileSchema.extend({
+        modelString: ModelStringSchema.optional(),
+      }).optional(),
+    })
+  ),
+  defaultModel: ModelStringSchema,
+  hiddenModels: z.array(ModelStringSchema),
   modelFallbacks: AppConfigOnDiskSchema.shape.modelFallbacks
     .unwrap()
     .refine(acceptedBy(normalizeModelFallbacks)),

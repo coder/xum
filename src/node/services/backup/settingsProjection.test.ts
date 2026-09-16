@@ -356,4 +356,51 @@ describe("settingsProjection", () => {
       unsupported: [],
     });
   });
+
+  it("keeps the local agent defaults when a nested model string does not canonicalize", () => {
+    // The per-agent shape accepts any string as a model, and the normalizer drops what it cannot
+    // canonicalize, so without the tightened schema a bad nested model would restore as a
+    // whole-field reset over the target's valid agent defaults.
+    const current: ProjectsConfig = {
+      projects: new Map(),
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-local", thinkingLevel: "high" },
+        plan: { subagent: { modelString: "anthropic:claude-local" } },
+      },
+    };
+    for (const agentAiDefaults of [
+      { exec: { modelString: "garbage" } },
+      { exec: { modelString: "openai:gpt-exec", subagent: { modelString: "garbage" } } },
+      { plan: { modelString: "mux-gateway:openai" } },
+    ]) {
+      const read = readBackupSettings({
+        settings: { agentAiDefaults, defaultModel: "anthropic:claude-plan" },
+      });
+      expect(read).toEqual({
+        settings: { defaultModel: "anthropic:claude-plan" },
+        unsupported: ["agentAiDefaults"],
+      });
+      expect(mergeBackupSettings(current, read.settings!).agentAiDefaults).toEqual(
+        current.agentAiDefaults
+      );
+    }
+
+    // Valid nested models still apply, canonicalized, and empty spellings still mean unset.
+    const valid = readBackupSettings({
+      settings: {
+        agentAiDefaults: {
+          exec: { modelString: " openai:gpt-exec ", subagent: { modelString: "anthropic:claude-sub" } },
+          plan: { modelString: "", subagent: { modelString: " " } },
+        },
+      },
+    });
+    expect(valid.unsupported).toEqual([]);
+    expect(mergeBackupSettings(current, valid.settings!).agentAiDefaults).toEqual({
+      exec: { modelString: "openai:gpt-exec", subagent: { modelString: "anthropic:claude-sub" } },
+    });
+    expect(readBackupSettings({ settings: { agentAiDefaults: {} } })).toEqual({
+      settings: { agentAiDefaults: {} },
+      unsupported: [],
+    });
+  });
 });
