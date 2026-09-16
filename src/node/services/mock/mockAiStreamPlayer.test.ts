@@ -894,26 +894,35 @@ describe("MockAiStreamPlayer", () => {
     // Capture only the player's event timers (delays taken from the adapter schedule); every
     // other timer (stream-start watchdog, lock retries, tokenizer fallback) keeps the real clock.
     const captured: Array<{ delay: number; fire: () => void }> = [];
+    const scheduled = Promise.withResolvers<void>();
     const realSetTimeout = globalThis.setTimeout;
-    const capturingSetTimeout = ((callback: (...args: unknown[]) => void, delay?: number) => {
+    const capturingSetTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
       if (scheduledDelays.has(delay ?? 0)) {
-        captured.push({ delay: delay ?? 0, fire: () => callback() });
+        captured.push({ delay: delay ?? 0, fire: () => callback(...args) });
+        if (captured.length === expectedEvents.length) scheduled.resolve();
         return { ref: () => undefined, unref: () => undefined } as unknown as ReturnType<
           typeof setTimeout
         >;
       }
-      return realSetTimeout(callback, delay);
+      return realSetTimeout(callback, delay, ...args);
     }) as typeof setTimeout;
 
     globalThis.setTimeout = capturingSetTimeout;
     let playResult: Awaited<ReturnType<MockAiStreamPlayer["play"]>>;
     try {
       const playPromise = player.play([user], workspaceId);
-      // play() resolves only after stream-start fires, so wait for the schedule without timers.
-      for (let ticks = 0; captured.length < expectedEvents.length; ticks++) {
-        if (ticks > 10_000) throw new Error("Mock player never scheduled its event timers");
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      // play() resolves only after stream-start fires; observe scheduling directly instead of polling.
+      await Promise.race([
+        scheduled.promise,
+        playPromise.then(() => {
+          throw new Error("Mock player returned before scheduling its event timers");
+        }),
+      ]);
+      expect(captured).toHaveLength(expectedEvents.length);
       globalThis.setTimeout = realSetTimeout;
 
       const byDelay = [...captured].sort((a, b) => a.delay - b.delay);

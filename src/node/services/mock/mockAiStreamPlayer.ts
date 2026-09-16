@@ -455,6 +455,16 @@ export class MockAiStreamPlayer {
     historySequence: number,
     muxMetadata?: MuxMessageMetadata
   ): TurnStreamHandle {
+    let previousDelay = 0;
+    for (const event of events) {
+      // Node clamps out-of-range delays to an early timer; that would invalidate the due-prefix check.
+      assert(
+        event.delay >= previousDelay && event.delay === (event.delay | 0),
+        "Mock stream delays must be ordered non-negative signed 32-bit timer values"
+      );
+      previousDelay = event.delay;
+    }
+
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     const streamStart = events.find(
       (event): event is MockStreamStartEvent => event.kind === "stream-start"
@@ -478,11 +488,19 @@ export class MockAiStreamPlayer {
       settleCompletion: completionController.settle,
     });
 
-    for (const event of events) {
+    let nextEventIndex = 0;
+    for (const [index, event] of events.entries()) {
       const timer = setTimeout(() => {
-        this.enqueueEvent(workspaceId, messageId, () =>
-          this.dispatchEvent(workspaceId, event, messageId, historySequence)
-        );
+        // Overdue timers can fire out of order under load. A later deadline makes every
+        // predecessor due too, so enqueue that prefix once rather than trust callback order.
+        while (nextEventIndex <= index) {
+          const nextEvent = events[nextEventIndex];
+          assert(nextEvent, "Scheduled mock event must exist");
+          nextEventIndex++;
+          this.enqueueEvent(workspaceId, messageId, () =>
+            this.dispatchEvent(workspaceId, nextEvent, messageId, historySequence)
+          );
+        }
       }, event.delay);
       timers.push(timer);
     }
