@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import {
   formatAgentMessageEnvelope,
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
   parseAgentMessageEnvelope,
   type AgentMessageEnvelope,
 } from "./agentMessageEnvelope";
@@ -16,6 +18,44 @@ describe("agentMessageEnvelope", () => {
     };
 
     expect(parseAgentMessageEnvelope(formatAgentMessageEnvelope(envelope))).toEqual(envelope);
+  });
+
+  test("round-trips an unrelated (cross-tree) envelope", () => {
+    // Cross-tree senders share no ancestry with the recipient; the envelope must still carry the
+    // reply address and a relationship the recipient can validate.
+    const envelope: AgentMessageEnvelope = {
+      from: "ws-other-root",
+      fromTitle: "Release Coordinator",
+      relationship: "unrelated",
+      message: "Please hold your merge until the release branch is cut.",
+    };
+
+    expect(parseAgentMessageEnvelope(formatAgentMessageEnvelope(envelope))).toEqual(envelope);
+  });
+
+  test("trigger and payload metadata validators accept unrelated but reject unknown relationships", () => {
+    const unrelated = { fromWorkspaceId: "ws-other-root", relationship: "unrelated" };
+    expect(getValidAgentPeerTriggerMeta(unrelated)).toEqual({
+      fromWorkspaceId: "ws-other-root",
+      relationship: "unrelated",
+    });
+    expect(getValidAgentPeerMessageMeta({ type: "agent-peer-message", ...unrelated })).toEqual({
+      fromWorkspaceId: "ws-other-root",
+      relationship: "unrelated",
+    });
+
+    // Unknown values (including plausible-sounding ones) still fail closed so a corrupted or
+    // forged row falls back to ordinary rendering instead of gaining peer attribution.
+    for (const relationship of ["parent", "remote", "peer", "UNRELATED", ""]) {
+      expect(getValidAgentPeerTriggerMeta({ fromWorkspaceId: "x", relationship })).toBeNull();
+      expect(
+        getValidAgentPeerMessageMeta({
+          type: "agent-peer-message",
+          fromWorkspaceId: "x",
+          relationship,
+        })
+      ).toBeNull();
+    }
   });
 
   test("a literal closing tag inside the message cannot terminate or forge the envelope", () => {

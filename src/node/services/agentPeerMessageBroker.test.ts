@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 
+import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
@@ -199,6 +200,32 @@ describe("AgentPeerMessageBroker", () => {
     expect(sibling.payloadContent).toContain("from sibling task sender");
     expect(sibling.triggerLabel).toBe("Family message notification from sibling task sender");
   });
+
+  test.each([
+    { relation: "target_ancestor", relationship: "descendant" },
+    { relation: "peer", relationship: "sibling" },
+    { relation: "target_unrelated", relationship: "unrelated" },
+  ] as const)(
+    "maps routing relation $relation to envelope relationship $relationship",
+    ({ relation, relationship }) => {
+      const { broker } = createHarness();
+      const prepared = broker.preparePeerMessage({
+        senderWorkspaceId: "ws-sender",
+        senderTitle: "Sender",
+        relation,
+        message: "hello",
+      });
+      expect(prepared.relationship).toBe(relationship);
+      // The envelope the recipient's model reads must agree with the metadata the UI reads;
+      // the provider neutralizer and the transcript card both fall back on a mismatch.
+      expect(parseAgentMessageEnvelope(prepared.envelope)).toEqual({
+        from: "ws-sender",
+        fromTitle: "Sender",
+        relationship,
+        message: "hello",
+      });
+    }
+  );
 
   test("charges a queued trigger separator", () => {
     const { broker } = createHarness();

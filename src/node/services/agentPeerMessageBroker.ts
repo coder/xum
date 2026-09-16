@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 
-import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import {
+  formatAgentMessageEnvelope,
+  type AgentMessageRelationship,
+} from "@/common/utils/agentMessageEnvelope";
 import {
   MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
@@ -26,6 +29,20 @@ interface AgentPeerMessageBrokerHost {
 export type AgentPeerMessageAdmissionError =
   | { code: "refused"; reason: string }
   | { code: "rate_limited"; retryAfterMs?: number };
+
+/** Routing relations that take the untrusted envelope path (everything except parent→child). */
+export type PeerPathRelation = "target_ancestor" | "peer" | "target_unrelated";
+
+/**
+ * Routing relation (sender-centric) → envelope relationship (what the recipient reads about the
+ * sender). Exhaustive by construction so a future relation cannot silently fall through to
+ * "sibling" and overstate the sender's closeness.
+ */
+const PEER_PATH_RELATIONSHIPS: Record<PeerPathRelation, AgentMessageRelationship> = {
+  target_ancestor: "descendant",
+  peer: "sibling",
+  target_unrelated: "unrelated",
+};
 
 export class AgentPeerMessageBroker {
   // Serialize multi-step delivery per target so concurrent senders cannot interleave admission.
@@ -123,11 +140,10 @@ export class AgentPeerMessageBroker {
   preparePeerMessage(params: {
     senderWorkspaceId: string;
     senderTitle?: string;
-    relation: "target_ancestor" | "peer";
+    relation: PeerPathRelation;
     message: string;
   }) {
-    const relationship =
-      params.relation === "target_ancestor" ? ("descendant" as const) : ("sibling" as const);
+    const relationship = PEER_PATH_RELATIONSHIPS[params.relation];
     const fromTitle = params.senderTitle != null ? this.capTitle(params.senderTitle) : undefined;
     const envelope = formatAgentMessageEnvelope({
       from: params.senderWorkspaceId,
