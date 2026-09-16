@@ -1,5 +1,6 @@
 import * as path from "path";
 import { EventEmitter } from "events";
+import { log } from "./log";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
@@ -651,6 +652,24 @@ describe("ServiceContainer", () => {
       return Promise.resolve();
     });
 
+    const agentStatusStartSpy = spyOn(services.agentStatusService, "start");
+    let releaseCleanup: (() => void) | undefined;
+    let cleanupStarted: (() => void) | undefined;
+    const cleanupStartedPromise = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    const cleanupSpy = spyOn(
+      services.workspaceService,
+      "cleanupArchivedDevToolsLogs"
+    ).mockImplementation(() => {
+      expect(agentStatusStartSpy).toHaveBeenCalledTimes(1);
+      callOrder.push("devToolsCleanup");
+      return new Promise<void>((resolve) => {
+        releaseCleanup = resolve;
+        cleanupStarted?.();
+      });
+    });
+
     let coreSettled = false;
     const core = services.initializeCore().then(() => {
       coreSettled = true;
@@ -665,8 +684,31 @@ describe("ServiceContainer", () => {
     expect(workspaceInitializeSpy).not.toHaveBeenCalled();
     expect(taskHousekeepingSpy).not.toHaveBeenCalled();
 
-    await services.runStartupHousekeeping();
-    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    const recordStartupLog = (message: unknown) => {
+      if (message === "[startup] ServiceContainer.initialize completed") callOrder.push("ready");
+      if (message === "[startup] ServiceContainer housekeeping settled") callOrder.push("settled");
+    };
+    const infoSpy = spyOn(log, "info").mockImplementation(recordStartupLog);
+    const warnSpy = spyOn(log, "warn").mockImplementation(recordStartupLog);
+    try {
+      const housekeeping = services.runStartupHousekeeping();
+      await cleanupStartedPromise;
+      expect(callOrder).toEqual([
+        "recoverTasks",
+        "workspace",
+        "taskHousekeeping",
+        "ready",
+        "devToolsCleanup",
+      ]);
+      releaseCleanup?.();
+      await housekeeping;
+      expect(callOrder.at(-1)).toBe("settled");
+    } finally {
+      releaseCleanup?.();
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+    expect(cleanupSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(workspaceInitializeSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
   });

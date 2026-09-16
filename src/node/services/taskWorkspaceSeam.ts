@@ -246,6 +246,8 @@ export function resolveTaskAgentIdForResume(workspace: {
  * attribution to the state observed at the ended stream's own event.
  */
 export interface QueueCutAttributionSnapshot {
+  /** Session turn observed at emission, not after the task event lock is acquired. */
+  turnGeneration?: symbol;
   activeStream: { messageId: string; muxMetadata: unknown } | undefined;
   cutter: QueueCutCutter | undefined;
   hasPendingQueuedOrPreparingTurn: boolean;
@@ -461,6 +463,59 @@ export interface TurnAdmissionHost {
   ): Result<number>;
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
   countQueuedAgentPeerMessages(workspaceId: string): number;
+  getTurnGeneration(workspaceId: string): symbol | undefined;
+  /** Terminal task settlement releases receipts even if their source event has not arrived. */
+  clearQueueCutReceipts(workspaceId: string): void;
+  /** Receipt of a host-selected queue cut (see QueueCutReceipt); undefined once released. */
+  getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined;
+  /** The cut stream's own stream-end has been classified; the receipt may now release. */
+  markQueueCutSourceHandled(workspaceId: string, entryId: string): void;
+  /**
+   * Consume-once disposition for a successor that will never run. Returns true only for the
+   * call that flipped `disposed`; a later caller must not run recovery again.
+   */
+  disposeQueueCut(workspaceId: string, entryId: string): boolean;
+  /** Observe `queued-message-changed` for every session (successor outcomes are recorded there). */
+  onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void;
+  /**
+   * The session's admitted turn (TurnCoordinator generation) while one is preparing, streaming
+   * or completing; undefined when idle or without a session. A stop cascade captures this to
+   * know which owner must settle before its latch may drop.
+   */
+  getActiveTurnGeneration(workspaceId: string): symbol | undefined;
+  /**
+   * Fires when an admitted turn generation ends for good (finished, preempted, or failed before
+   * any stream), emitted by the owning session's coordinator transition — the authoritative
+   * settlement of that turn, never inferred from an idle probe.
+   */
+  onWorkspaceTurnSettled(
+    listener: (workspaceId: string, turnGeneration: symbol) => void
+  ): () => void;
+}
+
+/**
+ * Outcome of the queue entry selected to continue a turn the host cut at a step boundary
+ * (queued-input or context-budget stop). Recorded by AgentSession at the lifecycle points the
+ * entry actually passes — withdrawal, turn admission, stream registration — never inferred from
+ * an idle probe. `admitted` is a transfer that can still fail before streaming, so only
+ * `streaming` hands completion to the successor; `canceled`/`prestream-failed` return it to the
+ * cut stream's owner (TaskService recovery).
+ */
+export type QueueCutSuccessorState =
+  | "pending"
+  | "canceled"
+  | "prestream-failed"
+  | "streaming"
+  | { kind: "admitted"; turnGeneration: symbol };
+
+export interface QueueCutReceipt {
+  /** TurnCoordinator turn of the stream the cut ended. */
+  sourceTurnGeneration: symbol;
+  successor: QueueCutSuccessorState;
+  /** Set by the source stream-end classifier (markQueueCutSourceHandled). */
+  sourceHandled: boolean;
+  /** Set by the first disposeQueueCut caller; later callers perform no recovery. */
+  disposed: boolean;
 }
 
 export interface WorkspaceLifecycleHost {
@@ -584,6 +639,15 @@ export interface AgentTaskIntegration {
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  /**
+   * Admission barrier: true while a stop cascade holds this workspace's latch (from its epoch
+   * bump until the stopped execution has authoritatively settled and cleanup finished). Every
+   * path that could start or feed an execution refuses with
+   * WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE while this is true.
+   */
+  isWorkspaceStopInProgress(workspaceId: string): boolean;
+  /** Monotonic stop generation; an accepted turn captures it at admission for the start fence. */
+  getWorkspaceStopEpoch(workspaceId: string): number;
 }
 
 export interface WorkspaceTurnTaskHost {

@@ -1,3 +1,4 @@
+import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -49,6 +50,14 @@ interface WorkflowTaskCreateArgs {
   onRefusal?: "fail" | "fallback";
 }
 
+/** Report shape shared by every TaskService read the adapter maps onto WorkflowAgentResult. */
+interface WorkflowTaskReport {
+  reportMarkdown: string;
+  title?: string;
+  structuredOutput?: unknown;
+  planFilePath?: string;
+}
+
 interface WorkflowTaskServiceLike {
   create(
     args: WorkflowTaskCreateArgs
@@ -57,6 +66,8 @@ interface WorkflowTaskServiceLike {
     args: WorkflowTaskCreateArgs[],
     options?: {
       onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
+      /** Cancels the reservation's admission stages; entered checkpoint/config writes finish. */
+      abortSignal?: AbortSignal;
     }
   ): Promise<{ success: true; data: TaskCreateResult[] } | { success: false; error: string }>;
   waitForAgentReport(
@@ -65,12 +76,19 @@ interface WorkflowTaskServiceLike {
       requestingWorkspaceId: string;
       backgroundOnMessageQueued: boolean;
     }
-  ): Promise<{
-    reportMarkdown: string;
-    title?: string;
-    structuredOutput?: unknown;
-    planFilePath?: string;
-  }>;
+  ): Promise<WorkflowTaskReport>;
+  /**
+   * Authoritative attempt outcome (report publication and termination evidence read under one
+   * serialization). Optional so a TaskService without it yields no capability, never a guess.
+   */
+  readAttemptOutcome?(
+    taskId: string,
+    options?: { requestingWorkspaceId?: string }
+  ): Promise<TaskAttemptOutcome<WorkflowTaskReport>>;
+  waitForAttemptSettlement?(
+    taskId: string,
+    options: { abortSignal?: AbortSignal; timeoutMs: number; requestingWorkspaceId?: string }
+  ): Promise<TaskAttemptSettlement<WorkflowTaskReport>>;
   requestAgentFinalReportForTimeout?(
     taskId: string,
     options: {
@@ -130,6 +148,15 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
   private readonly experiments?: WorkflowTaskExperiments;
   private readonly modelString?: string;
   private readonly thinkingLevel?: ParsedThinkingInput;
+  // Present only when the TaskService can answer authoritatively. The runner treats an absent
+  // capability as unavailable authority (indeterminate), so these must never be stubbed.
+  readonly readSettledAgentResult?: (
+    taskId: string
+  ) => Promise<TaskAttemptOutcome<WorkflowAgentResult>>;
+  readonly waitForAttemptSettlement?: (
+    taskId: string,
+    options: { abortSignal?: AbortSignal; timeoutMs: number }
+  ) => Promise<TaskAttemptSettlement<WorkflowAgentResult>>;
 
   constructor(options: WorkflowTaskServiceAdapterOptions) {
     assert(
@@ -155,6 +182,46 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     this.experiments = options.experiments;
     this.modelString = options.modelString;
     this.thinkingLevel = options.thinkingLevel;
+    const taskService = options.taskService;
+    if (taskService.readAttemptOutcome != null) {
+      this.readSettledAgentResult = async (taskId) => {
+        assert(taskId.length > 0, "WorkflowTaskServiceAdapter.readSettledAgentResult: taskId");
+        assert(taskService.readAttemptOutcome != null, "readAttemptOutcome capability vanished");
+        // Read on behalf of the workflow parent: reports stay addressable after the child's
+        // config entry is cleaned up, which is exactly when a resume needs them.
+        const outcome = await taskService.readAttemptOutcome(taskId, {
+          requestingWorkspaceId: this.parentWorkspaceId,
+        });
+        return this.mapAttemptOutcome(taskId, outcome);
+      };
+    }
+    if (taskService.waitForAttemptSettlement != null) {
+      this.waitForAttemptSettlement = async (taskId, waitOptions) => {
+        assert(taskId.length > 0, "WorkflowTaskServiceAdapter.waitForAttemptSettlement: taskId");
+        assert(waitOptions.timeoutMs > 0, "waitForAttemptSettlement requires a positive bound");
+        assert(
+          taskService.waitForAttemptSettlement != null,
+          "waitForAttemptSettlement capability vanished"
+        );
+        const settlement = await taskService.waitForAttemptSettlement(taskId, {
+          ...(waitOptions.abortSignal != null ? { abortSignal: waitOptions.abortSignal } : {}),
+          timeoutMs: waitOptions.timeoutMs,
+          requestingWorkspaceId: this.parentWorkspaceId,
+        });
+        return settlement.kind === "timeout"
+          ? settlement
+          : this.mapAttemptOutcome(taskId, settlement);
+      };
+    }
+  }
+
+  private mapAttemptOutcome(
+    taskId: string,
+    outcome: TaskAttemptOutcome<WorkflowTaskReport>
+  ): TaskAttemptOutcome<WorkflowAgentResult> {
+    return outcome.kind === "reported"
+      ? { kind: "reported", report: toWorkflowAgentResult(taskId, outcome.report) }
+      : outcome;
   }
 
   async applyPatch(
@@ -219,15 +286,21 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
 
   async createAgentTasks(
     specs: WorkflowAgentSpec[],
-    lifecycle?: { onTaskCreated?: (index: number, taskId: string) => Promise<void> | void }
+    lifecycle?: {
+      onTaskCreated?: (index: number, taskId: string) => Promise<void> | void;
+      abortSignal?: AbortSignal;
+    }
   ): Promise<Array<{ taskId: string; status: "queued" | "starting" | "running" }>> {
     assert(specs.length > 0, "WorkflowTaskServiceAdapter.createAgentTasks: specs are required");
     if (this.taskService.createMany == null) {
       const created: Array<{ taskId: string; status: "queued" | "starting" | "running" }> = [];
       for (const [index, spec] of specs.entries()) {
+        // Single-task creation has no cancellable admission; the signal can only stop the
+        // next reservation from starting.
+        throwIfReservationCanceled(lifecycle?.abortSignal, spec.id);
         const createResult = await this.taskService.create(this.buildCreateArgs(spec));
         if (!createResult.success) {
-          throw new Error(createResult.error);
+          throw new Error(`Workflow agent reservation failed: ${createResult.error}`);
         }
         assert(createResult.data.taskId.length > 0, "createAgentTasks: taskId is required");
         await lifecycle?.onTaskCreated?.(index, createResult.data.taskId);
@@ -243,10 +316,14 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
           assert(result.taskId.length > 0, "createAgentTasks: taskId is required");
           await lifecycle?.onTaskCreated?.(index, result.taskId);
         },
+        ...(lifecycle?.abortSignal != null ? { abortSignal: lifecycle.abortSignal } : {}),
       }
     );
     if (!createResult.success) {
-      throw new Error(createResult.error);
+      // Never surface the TaskService's failure text verbatim as an Error message: the runner
+      // restarts started attempts on the exact "Task interrupted"/"Task not found" sentinels,
+      // and a canceled or failed reservation must not be mistaken for a vanished child.
+      throw new Error(`Workflow agent reservation failed: ${createResult.error}`);
     }
     if (createResult.data.length !== specs.length) {
       throw new Error("WorkflowTaskServiceAdapter.createAgentTasks: result length mismatch");
@@ -312,6 +389,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     assert(spec.id.length > 0, "WorkflowTaskServiceAdapter.runAgent: spec.id is required");
     assert(spec.prompt.length > 0, "WorkflowTaskServiceAdapter.runAgent: spec.prompt is required");
 
+    throwIfReservationCanceled(waitOptions?.abortSignal, spec.id);
     const createResult = await this.taskService.create(this.buildCreateArgs(spec));
     if (!createResult.success) {
       throw new Error(createResult.error);
@@ -380,14 +458,22 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       backgroundOnMessageQueued: waitOptions?.backgroundOnMessageQueued ?? true,
     });
 
-    return {
-      taskId,
-      reportMarkdown: report.reportMarkdown,
-      ...(report.title != null ? { title: report.title } : {}),
-      ...(report.planFilePath !== undefined ? { planFilePath: report.planFilePath } : {}),
-      ...(report.structuredOutput !== undefined
-        ? { structuredOutput: report.structuredOutput }
-        : {}),
-    };
+    return toWorkflowAgentResult(taskId, report);
+  }
+}
+
+function toWorkflowAgentResult(taskId: string, report: WorkflowTaskReport): WorkflowAgentResult {
+  return {
+    taskId,
+    reportMarkdown: report.reportMarkdown,
+    ...(report.title != null ? { title: report.title } : {}),
+    ...(report.planFilePath !== undefined ? { planFilePath: report.planFilePath } : {}),
+    ...(report.structuredOutput !== undefined ? { structuredOutput: report.structuredOutput } : {}),
+  };
+}
+
+function throwIfReservationCanceled(abortSignal: AbortSignal | undefined, stepId: string): void {
+  if (abortSignal?.aborted === true) {
+    throw new Error(`Workflow agent reservation canceled before creating ${stepId}`);
   }
 }

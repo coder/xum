@@ -4,7 +4,11 @@ import type { MemoryToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type MemoryScope, type MemoryScopeAccess } from "@/common/constants/memory";
+import {
+  MEMORY_MAX_FILE_BYTES,
+  type MemoryScope,
+  type MemoryScopeAccess,
+} from "@/common/constants/memory";
 import { CONTEXT_NOTES_RESERVED_BYTES } from "@/common/constants/contextBudget";
 import type { z } from "zod";
 import {
@@ -59,12 +63,12 @@ function buildMemoryDescription(config: ToolConfiguration): string {
   const baseDescription =
     config.memoryWritePath != null
       ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be written, and this request allows exactly one call. ` +
-        "There is no second step, so do not read first (view is unavailable here; the file's current text, if any, is preloaded above). Commands:\n" +
+        "There is no second step, so do not read first (view is unavailable here; a possibly truncated excerpt of the file, if any, is preloaded above). Commands:\n" +
         "- create: write the complete file (REPLACES existing contents)\n" +
         "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
         "view, delete, rename, and every other path are refused. " +
-        `The resulting file is limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes (essential state first).`
+        `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget. Use a prepend or text replacement only when the full file is visible and sufficient space is known. Otherwise use create for a compact checkpoint of the essential known state; it replaces the entire file, including unshown content. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full saved file can be read in the next window.`
       : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
     return baseDescription;
@@ -186,10 +190,10 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           pinnedMutationUsed = true;
-          // The single call must not fail on a stale existence verdict (create vs update) and
-          // the notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES, so the service
-          // resolves create-or-update and caps the actual result under its mutation lock. A
-          // refused write changed nothing, so it frees the slot.
+          // Resolve create-or-update and cap the actual result under the mutation lock. Use
+          // the ordinary storage cap, not the preload budget: rejecting a larger checkpoint
+          // would waste the last preservation step before rollover. A refused write changed
+          // nothing, so it frees the slot.
           const result =
             checkWriteAccess(input.path!) ??
             (await memoryService.writePinnedFile(
@@ -204,7 +208,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
                       insertLine: input.insert_line!,
                       insertText: input.insert_text!,
                     },
-              CONTEXT_NOTES_RESERVED_BYTES,
+              MEMORY_MAX_FILE_BYTES,
               "agent",
               toolCallId,
               // Stop during the flush must not let the write land once the lock is acquired.
@@ -257,6 +261,13 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
+    /**
+     * Consolidation's pin protection (pinned files are editable but never
+     * deleted/renamed), enforced by MemoryService INSIDE its target mutation
+     * lock against the owner the command's store is bound to — see
+     * MemoryService.assertNotPinnedForRemoval. Ignored by other commands.
+     */
+    rejectPinned?: boolean;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -336,7 +347,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectPinned: options?.rejectPinned }
           ))
         );
       }
@@ -355,7 +367,8 @@ export async function executeMemoryCommand(
             input.new_path,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectPinned: options?.rejectPinned }
           ))
         );
       }

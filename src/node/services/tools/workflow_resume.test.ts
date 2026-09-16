@@ -2,6 +2,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import { createWorkflowResumeTool } from "./workflow_resume";
+import { WorkflowRunAlreadyActiveError } from "@/node/services/workflows/WorkflowRunner";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import { WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE } from "@/common/utils/workflowRetryEligibility";
@@ -544,27 +545,45 @@ describe("workflow_resume tool", () => {
   });
 
   test("guides toward task_await when the run is already active", async () => {
-    using tempDir = new TestTempDir("test-workflow-resume-active");
-    const workflowService = buildWorkflowService({
-      getRun: mock(async () => buildRun({ status: "running" })),
-      resumeRun: mock(async () => {
-        throw new Error("Workflow run is already active: wfr_resume_me");
+    // The runner's typed error carries lease diagnostics; a bare legacy message (e.g. from a
+    // serialization boundary) must classify the same way.
+    const alreadyActiveErrors = [
+      new WorkflowRunAlreadyActiveError("wfr_resume_me", {
+        ownerId: "workflow-runner:workspace-1:wfr_resume_me",
+        renewedAgoMs: 12_000,
       }),
-    });
-    const tool = createWorkflowResumeTool({
-      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
-      trusted: true,
-      workflowService,
-    });
+      new Error("Workflow run is already active: wfr_resume_me"),
+    ];
+    for (const alreadyActive of alreadyActiveErrors) {
+      using tempDir = new TestTempDir("test-workflow-resume-active");
+      const workflowService = buildWorkflowService({
+        getRun: mock(async () => buildRun({ status: "running" })),
+        resumeRun: mock(async () => {
+          throw alreadyActive;
+        }),
+      });
+      const tool = createWorkflowResumeTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+        trusted: true,
+        workflowService,
+      });
 
-    await expect(
-      Promise.resolve(
-        tool.execute!(
+      let caught: unknown;
+      try {
+        await tool.execute!(
           { run_id: "wfr_resume_me", run_in_background: false, mode: null },
           mockToolCallOptions
-        )
-      )
-    ).rejects.toThrow(/task_await/);
+        );
+      } catch (error) {
+        caught = error;
+      }
+      const message = caught instanceof Error ? caught.message : String(caught);
+      expect(message).toMatch(/task_await/);
+      if (alreadyActive instanceof WorkflowRunAlreadyActiveError) {
+        expect(message).toContain("lease owner workflow-runner:workspace-1:wfr_resume_me");
+        expect(message).toContain("renewed 12s ago");
+      }
+    }
   });
 
   test("rejects non-workflow task IDs", async () => {

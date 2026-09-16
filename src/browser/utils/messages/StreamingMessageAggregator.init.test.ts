@@ -55,6 +55,117 @@ describe("Init display after cleanup changes", () => {
     }
   );
 
+  describe("creation card across context boundaries", () => {
+    const displayedTypes = (aggregator: StreamingMessageAggregator) =>
+      aggregator.getDisplayedMessages().map((message) => message.type);
+    const asChatMessage = (message: ReturnType<typeof createMuxMessage>) => ({
+      type: "message" as const,
+      ...message,
+    });
+    const compactionSummary = (id: string, historySequence: number, timestamp: number) =>
+      createMuxMessage(id, "assistant", "Compacted summary", {
+        historySequence,
+        timestamp,
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: historySequence,
+        muxMetadata: { type: "compaction-summary" },
+      });
+    const finishedInit = (timestamp: number) => ({
+      type: "init-start" as const,
+      hookPath: "/project",
+      timestamp,
+      replay: true,
+      completed: { exitCode: 0, endTime: timestamp + 1 },
+    });
+    const epoch0 = [
+      createMuxMessage("user-0", "user", "Create this workspace", {
+        historySequence: 1,
+        timestamp: 10,
+      }),
+      createMuxMessage("assistant-0", "assistant", "Done", { historySequence: 2, timestamp: 11 }),
+    ];
+    const epoch1 = [
+      compactionSummary("summary-1", 3, 100),
+      createMuxMessage("user-1", "user", "Middle turn", { historySequence: 4, timestamp: 101 }),
+    ];
+    const epoch2 = [
+      compactionSummary("summary-2", 5, 200),
+      createMuxMessage("user-2", "user", "Latest turn", { historySequence: 6, timestamp: 201 }),
+      createMuxMessage("assistant-2", "assistant", "Working", {
+        historySequence: 7,
+        timestamp: 202,
+      }),
+    ];
+
+    it("hides a finished card behind the boundary until the first turn is loaded again", () => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      aggregator.handleMessage(finishedInit(5));
+      aggregator.loadHistoricalMessages(epoch2, false);
+      expect(displayedTypes(aggregator)).toEqual([
+        "compaction-boundary",
+        "assistant",
+        "user",
+        "assistant",
+      ]);
+
+      // An older epoch that itself starts at a boundary still hides the transcript start.
+      aggregator.loadHistoricalMessages(epoch1, false, { mode: "append", skipDerivedState: true });
+      expect(displayedTypes(aggregator)).not.toContain("workspace-init");
+
+      aggregator.loadHistoricalMessages(epoch0, false, { mode: "append", skipDerivedState: true });
+      expect(displayedTypes(aggregator).slice(0, 4)).toEqual([
+        "user",
+        "workspace-init",
+        "assistant",
+        "compaction-boundary",
+      ]);
+    });
+
+    it("hides the card when a live compaction prunes the first turn", () => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      aggregator.handleMessage(finishedInit(5));
+      aggregator.loadHistoricalMessages(epoch0, false);
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init", "assistant"]);
+
+      aggregator.handleMessage(asChatMessage(compactionSummary("summary-live", 3, 100)));
+      expect(displayedTypes(aggregator)).toEqual(["compaction-boundary", "assistant"]);
+    });
+
+    it("keeps a fork's card, whose init ran after the copied boundary, in the loaded window", () => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      aggregator.loadHistoricalMessages(epoch2, false);
+      aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 300 });
+      expect(displayedTypes(aggregator)).toEqual([
+        "compaction-boundary",
+        "assistant",
+        "user",
+        "workspace-init",
+        "assistant",
+      ]);
+
+      aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 301 });
+      expect(displayedTypes(aggregator)).toContain("workspace-init");
+    });
+
+    it("only hides the card on positive evidence that the init predates the boundary", () => {
+      // A boundary without a timestamp cannot prove the init belongs to unloaded history,
+      // so a running fork init keeps its card rather than losing its progress and failure output.
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      const undatedSummary = compactionSummary("summary-undated", 5, 200);
+      delete undatedSummary.metadata?.timestamp;
+      aggregator.loadHistoricalMessages([undatedSummary, ...epoch2.slice(1)], false);
+      aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 300 });
+      expect(displayedTypes(aggregator)).toEqual([
+        "compaction-boundary",
+        "assistant",
+        "user",
+        "workspace-init",
+        "assistant",
+      ]);
+    });
+  });
+
   it("propagates steps and throttles progress until another step or completion clears it", () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
     const progress = {
@@ -164,6 +275,60 @@ describe("Init display after cleanup changes", () => {
     expect((messages[0] as InitDisplayedMessage).exitCode).toBe(0);
   });
 
+  it.each([
+    { exitCode: 0, status: "success" as const },
+    { exitCode: 1, status: "error" as const },
+  ])(
+    "never publishes a running row while replaying a completed init (exit $exitCode)",
+    ({ exitCode, status }) => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      const statuses: string[] = [];
+      const record = () => {
+        const init = aggregator
+          .getDisplayedMessages()
+          .find((message) => message.type === "workspace-init");
+        statuses.push(init ? init.status : "missing");
+      };
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1_000,
+        replay: true,
+        completed: { exitCode, endTime: 4_500 },
+      });
+      record();
+      for (const [index, line] of ["Preparing checkout", "Running hook"].entries()) {
+        aggregator.handleMessage({
+          type: "init-output",
+          line,
+          step: true,
+          timestamp: 2_000 + index,
+          lineNumber: index,
+          replay: true,
+        });
+        aggregator.flushPendingInitOutput();
+        record();
+      }
+      aggregator.handleMessage({ type: "init-end", exitCode, timestamp: 4_500, replay: true });
+      record();
+
+      expect(statuses).toEqual([status, status, status, status]);
+      const init = aggregator
+        .getDisplayedMessages()
+        .find((message) => message.type === "workspace-init");
+      expect(init).toMatchObject({
+        status,
+        exitCode,
+        durationMs: 3_500,
+        lines: [
+          { line: "Preparing checkout", isError: false, step: true },
+          { line: "Running hook", isError: false, step: true },
+        ],
+      });
+    }
+  );
+
   it("should treat replayed init-start/output for the same running init as idempotent", () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 
@@ -209,6 +374,57 @@ describe("Init display after cleanup changes", () => {
       { line: "Installing dependencies...", isError: false },
       { line: "Syncing repository over SSH...", isError: false },
     ]);
+  });
+
+  it("adopts terminal metadata when the same running init is replayed as completed", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const initRow = () =>
+      aggregator.getDisplayedMessages().find((message) => message.type === "workspace-init");
+
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+    });
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+    });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({ status: "running" });
+
+    // Reconnect after the init finished server-side: the replayed init-start already knows
+    // the outcome, so the retained row must not stay "running" until init-end is replayed.
+    aggregator.resetForReplay();
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+      replay: true,
+      completed: { exitCode: 0, endTime: 4_000 },
+    });
+    expect(initRow()).toMatchObject({
+      status: "success",
+      exitCode: 0,
+      durationMs: 3_000,
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
+
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+      replay: true,
+    });
+    aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 4_000, replay: true });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({
+      status: "success",
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
   });
 
   it("should preserve duplicate replayed init lines that share a timestamp", () => {

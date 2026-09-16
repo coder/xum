@@ -71,6 +71,67 @@ afterEach(async () => {
 });
 
 describe("compaction cancellation runtime", () => {
+  test.each([
+    { abandonPartial: false, pending: false },
+    { abandonPartial: true, pending: false },
+    { abandonPartial: false, pending: true },
+  ])(
+    "public interrupt preserves synchronous reset order (%j)",
+    async ({ abandonPartial, pending }) => {
+      const h = await fixture();
+      const budget = h.session as unknown as {
+        clearContextBudgetState(): void;
+        contextBudgetGeneration: number;
+        contextBudgetWarningClaimed: boolean;
+        contextBudgetFlushClaimed: boolean;
+      };
+      budget.contextBudgetWarningClaimed = true;
+      budget.contextBudgetFlushClaimed = true;
+      const generation = budget.contextBudgetGeneration;
+      const token = pending ? h.state.coordinator.beginCompactionObservation("continuous") : null;
+      if (pending) {
+        assert(token != null);
+        h.state.coordinator.setCompactionStage(token, "stopping");
+        expect(h.state.coordinator.midStreamCompactionPending).toBe(true);
+      }
+      const order: string[] = [];
+      const clear = budget.clearContextBudgetState.bind(budget);
+      spyOn(budget, "clearContextBudgetState").mockImplementation(() => {
+        order.push("budget");
+        clear();
+      });
+      const abandon = h.state.coordinator.abandonCompaction.bind(h.state.coordinator);
+      spyOn(h.state.coordinator, "abandonCompaction").mockImplementation(() => {
+        order.push("abandon");
+        abandon();
+      });
+      const reset = h.state.continuousCompactor.reset.bind(h.state.continuousCompactor);
+      spyOn(h.state.continuousCompactor, "reset").mockImplementation((reason) => {
+        order.push(reason);
+        reset(reason);
+      });
+      const stopping = h.session.interruptStream({ abandonPartial });
+      try {
+        // No await: admission and stale-work invalidation must precede the physical stop.
+        expect(budget.contextBudgetGeneration).toBe(generation + 1);
+        expect(budget.contextBudgetWarningClaimed).toBe(false);
+        expect(budget.contextBudgetFlushClaimed).toBe(false);
+        // Ordinary Stop cancels compaction before budget cleanup. The later abandon branch
+        // remains separate: moving either reset would change its synchronous admission fence.
+        expect(order).toEqual([
+          "abandon",
+          "user-interrupt",
+          "budget",
+          ...(abandonPartial || pending ? ["abandon", "user-interrupt"] : []),
+        ]);
+        expect((await stopping).success).toBe(true);
+      } finally {
+        await stopping;
+        if (token != null) h.state.coordinator.finishCompactionObservation(token);
+      }
+    }
+  );
+
   test("an unsupported scoped V2 cannot authorize legacy compaction", async () => {
     const h = await fixture();
     await h.session.cancelCompaction();

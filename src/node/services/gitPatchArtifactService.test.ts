@@ -1,5 +1,8 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
+import * as agentDefinitions from "@/node/services/agentDefinitions/agentDefinitionsService";
+import * as patchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 
 import { describe, expect, it, spyOn } from "bun:test";
 
@@ -54,6 +57,129 @@ describe("upsertProjectArtifact", () => {
 });
 
 describe("GitPatchArtifactService coordination", () => {
+  it.each(["ready", "failed", "skipped"] as const)(
+    "does not rediscover agents or rewrite a settled %s artifact",
+    async (status) => {
+      using tempDir = new TestTempDir("git-patch-settled");
+      const config = new Config(tempDir.path);
+      const projectPath = path.join(tempDir.path, "repo");
+      await fsPromises.mkdir(projectPath);
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            { id: "parent", name: "parent", path: projectPath },
+            {
+              id: "child",
+              name: "child",
+              path: projectPath,
+              parentWorkspaceId: "parent",
+              agentType: "exec",
+              taskStatus: "reported",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const parentSessionDir = path.join(config.sessionsDir, "parent");
+      const artifact = await upsertSubagentGitPatchArtifact({
+        workspaceId: "parent",
+        workspaceSessionDir: parentSessionDir,
+        childTaskId: "child",
+        updater: () => ({
+          childTaskId: "child",
+          parentWorkspaceId: "parent",
+          createdAtMs: 1,
+          status,
+          projectArtifacts: [{ projectPath, projectName: "repo", storageKey: "repo", status }],
+          readyProjectCount: 0,
+          failedProjectCount: 0,
+          skippedProjectCount: 0,
+          totalCommitCount: 0,
+        }),
+      });
+      const service = new GitPatchArtifactService(config);
+      const completed: string[] = [];
+      const discovery = spyOn(agentDefinitions, "readAgentDefinition");
+      const upsert = spyOn(patchArtifacts, "upsertSubagentGitPatchArtifact");
+      try {
+        await service.maybeStartGeneration("parent", "child", (id) => {
+          completed.push(id);
+          return Promise.resolve();
+        });
+        await service.waitForGeneration("child");
+        expect(discovery).not.toHaveBeenCalled();
+        expect(upsert).not.toHaveBeenCalled();
+        expect(completed).toEqual([]);
+        expect(await readSubagentGitPatchArtifact(parentSessionDir, "child")).toEqual(artifact);
+      } finally {
+        discovery.mockRestore();
+        upsert.mockRestore();
+      }
+    }
+  );
+
+  it("generates missing artifacts and refreshes settled artifacts after a continuation", async () => {
+    using tempDir = new TestTempDir("git-patch-generation");
+    const config = new Config(tempDir.path);
+    const projectPath = path.join(tempDir.path, "repo");
+    await fsPromises.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", projectPath, ...args], { encoding: "utf8" }).trim();
+    git("init", "--quiet");
+    git("config", "user.name", "Test");
+    git("config", "user.email", "test@example.com");
+    git("config", "commit.gpgsign", "false");
+    git("commit", "--quiet", "--allow-empty", "-m", "base");
+    const base = git("rev-parse", "HEAD");
+    await fsPromises.writeFile(path.join(projectPath, "result.txt"), "initial result");
+    git("add", "result.txt");
+    git("commit", "--quiet", "-m", "result");
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "parent", name: "parent", path: projectPath, runtimeConfig: { type: "local" } },
+          {
+            id: "child",
+            name: "child",
+            path: projectPath,
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId: "parent",
+            agentType: "exec",
+            taskStatus: "reported",
+            taskBaseCommitSha: base,
+          },
+        ],
+      });
+      return cfg;
+    });
+    const service = new GitPatchArtifactService(config);
+    const parentSessionDir = path.join(config.sessionsDir, "parent");
+    for (const continuation of [false, true]) {
+      if (continuation) {
+        await fsPromises.appendFile(path.join(projectPath, "result.txt"), "\ncontinued result");
+        git("commit", "--quiet", "-am", "continuation");
+      }
+      let completed = false;
+      await service.maybeStartGeneration(
+        "parent",
+        "child",
+        () => {
+          completed = true;
+          return Promise.resolve();
+        },
+        {
+          refreshForContinuation: continuation,
+        }
+      );
+      await service.waitForGeneration("child");
+      const artifact = await readSubagentGitPatchArtifact(parentSessionDir, "child");
+      expect(artifact?.status).toBe("ready");
+      expect(artifact?.totalCommitCount).toBe(continuation ? 2 : 1);
+      expect(artifact?.projectArtifacts[0]?.headCommitSha).toBe(git("rev-parse", "HEAD"));
+      expect(completed).toBe(true);
+    }
+  });
+
   it("waits for an in-flight apply operation before refreshing the stable task artifact", async () => {
     using tempDir = new TestTempDir("git-patch-artifact-lock");
     const service = new GitPatchArtifactService(new Config(tempDir.path));
@@ -160,7 +286,7 @@ describe("GitPatchArtifactService coordination", () => {
     expect(await readSubagentGitPatchArtifact(parentSessionDir, childId)).toEqual(readyArtifact);
 
     await service.maybeStartGeneration(parentId, childId, onComplete);
-    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+    expect(loadConfigSpy).not.toHaveBeenCalled();
     expect(await readSubagentGitPatchArtifact(parentSessionDir, childId)).toEqual(readyArtifact);
 
     // The snapshot is authoritative: a child the snapshot does not know about is skipped even

@@ -107,18 +107,18 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     return [
       usage,
       "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
-      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); in the next window, session_history can retrieve earlier messages.`,
+      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool. When memory hot-set loading is enabled, only a bounded excerpt is preloaded; read the remainder in the next window if needed. In the next window, session_history can retrieve earlier messages.`,
       "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume.",
       // The pinned memory tool resolves create-or-update atomically (see
       // MemoryService.writePinnedFile), so no on-disk existence verdict is needed here and a
       // stale one cannot waste the only step this turn gets.
-      "If its text is preloaded above, update it with str_replace or insert (insert_line 0 needs no contents); otherwise use create, which also replaces an existing file.",
+      "If the full file is visible and sufficient space is known, use a brief insert at insert_line 0 or str_replace with a unique match. If the preload is truncated or headroom is unknown, use create for a compact checkpoint of the essential known state within this step's output budget. It replaces the entire existing file, including unshown content.",
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }
   return `${usage} ${
     memoryWritable
-      ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (essential state first, at most 8 KiB), then continue the current task without commentary.`
+      ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (keep notes concise and essential state first; only a bounded excerpt is preloaded), then continue the current task without commentary.`
       : sessionHistoryAvailable
         ? "Memory writes are unavailable for this turn. Use session_history to retrieve prior windows after rollover, and continue the current task."
         : "Memory writes and history recovery are unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."

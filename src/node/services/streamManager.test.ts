@@ -1867,6 +1867,43 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
   });
 });
 
+describe("StreamManager - stop scoped to a captured execution", () => {
+  test("expectedMessageId skips a replacement start and still stops the captured one", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-stop";
+    // A start is pending (admitted turn between registration and its provider request).
+    const pending = manager.beginStreamStart({ workspaceId });
+    try {
+      // A late stop captured for an OLDER execution must not cancel this replacement.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: "older-execution" })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(false);
+      // The stop captured for THIS execution proceeds.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: pending.syntheticMessageId })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(true);
+    } finally {
+      pending.finish();
+    }
+  });
+
+  test("a registered stream with a different messageId is left untouched by a scoped stop", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-registered";
+    const abortController = new AbortController();
+    const streamInfo = createStreamInfoForTests({ messageId: "replacement-B", abortController });
+    getWorkspaceStreamsForTests(manager).set(workspaceId, streamInfo);
+    expect(await manager.stopStream(workspaceId, { expectedMessageId: "captured-A" })).toEqual(
+      Ok(undefined)
+    );
+    expect(abortController.signal.aborted).toBe(false);
+    expect(getWorkspaceStreamsForTests(manager).get(workspaceId)).toBe(streamInfo);
+    getWorkspaceStreamsForTests(manager).delete(workspaceId);
+  });
+});
+
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
@@ -2026,7 +2063,7 @@ describe("StreamManager - stopWhen configuration", () => {
     "budget %s stops with only turn-end input queued and evaluates settled fallback usage",
     async (decision) => {
       const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-        Promise.resolve(decision)
+        Promise.resolve({ decision })
       );
       const sessionHistory = tool({ inputSchema: z.object({}) });
       const [, stop] = buildStopWhenForTests()({
@@ -2072,9 +2109,43 @@ describe("StreamManager - stopWhen configuration", () => {
     }
   );
 
+  test.each([
+    ["warn", "continue-entry"],
+    ["rollover", "continue-entry"],
+    ["block", undefined],
+  ] as const)(
+    "budget %s binds the session's designated continuation into the stop cause",
+    async (decision, expectedEntryId) => {
+      const request: Parameters<BuildStopWhenCondition>[0] = {
+        hasQueuedMessages: () => false,
+        // The session names its successor with the decision; a blocked stop hands over to none.
+        onStepSettled: () => Promise.resolve({ decision, continuationEntryId: "continue-entry" }),
+        modelString: "anthropic:claude-sonnet-4-5",
+      };
+      const [, stop] = buildStopWhenForTests()(request);
+      const step = { steps: [{ usage: undefined, toolResults: [] }] };
+      if (decision === "block") {
+        let thrown: unknown;
+        try {
+          await stop(step);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(Error);
+      } else {
+        expect(await stop(step)).toBe(true);
+      }
+      expect(request.stopCause).toEqual({
+        kind: "context-budget",
+        decision,
+        ...(expectedEntryId != null ? { continuationEntryId: expectedEntryId } : {}),
+      });
+    }
+  );
+
   test("a settled successful new_context result is reported alongside its siblings", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop] = buildStopWhenForTests()({
       hasQueuedMessages: () => false,
@@ -2125,7 +2196,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop, required] = buildStopWhenForTests()({
       onStepSettled,

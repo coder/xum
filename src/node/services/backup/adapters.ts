@@ -8,6 +8,7 @@ import {
   MAX_BACKUP_PROJECT_ENTRIES,
   MAX_BACKUP_PROJECT_PATH_CHARS,
   sanitizeBackupGitRemote,
+  type BackupContents,
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { log } from "@/node/services/log";
@@ -250,16 +251,19 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     return JSON.stringify(projectBackupSettings(a)) !== JSON.stringify(projectBackupSettings(b));
   }
 
-  async function localFilesByPath(): Promise<Map<string, BackupFile>> {
-    return new Map((await collectAllowlistedFiles(muxRoot)).map((file) => [file.path, file]));
+  async function localFilesByPath(contents: BackupContents): Promise<Map<string, BackupFile>> {
+    return new Map(
+      (await collectAllowlistedFiles(muxRoot, contents)).map((file) => [file.path, file])
+    );
   }
 
-  async function buildPayload(overrides?: { keepLocalSecrets: true }) {
+  async function buildPayload(contents: BackupContents, overrides?: { keepLocalSecrets: true }) {
     // Both projections are the portable subsets an export writes; machine-local keys are
     // excluded by design.
     const config = options.config.loadConfigOrDefault();
     return await createBackupPayload({
       muxRoot,
+      contents,
       preferences: projectBackupPreferences(config.userPreferences ?? {}),
       settings: projectBackupSettings(config),
       muxVersion: resolveMuxVersion(),
@@ -471,7 +475,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
   return {
     async exportTo(exportOptions) {
-      const payload = await buildPayload();
+      const payload = await buildPayload(exportOptions.contents);
       const destination = await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath);
       // Owner-only like the safety snapshot: the export copies allowlisted sources that may
       // themselves be owner-only, and it lands here before the secret scan has said anything
@@ -481,7 +485,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // pushed bundle disappears from the next tree, and with it on the sidecar is written
       // fresh after the core payload.
       let scanFiles = payload.files;
-      if (exportOptions.includeProjects) {
+      if (exportOptions.contents.includeProjects) {
         const discovered = await discoverProjectRemotes();
         // The project list is read, the memory collected, and the bundle written under the
         // registration lock (taken before the memory lock, the fixed order), so a project
@@ -524,7 +528,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           },
         ];
       }
-      const secretFiles = scanBackupFilesForSecrets(scanFiles);
+      const secretFiles = scanBackupFilesForSecrets(scanFiles, exportOptions.contents);
       return {
         redactions: payload.redactions,
         secretFiles,
@@ -534,7 +538,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
     async previewRestore(previewOptions) {
       const sourceDir = await managedDir(previewOptions.repositoryRoot, previewOptions.managedPath);
-      const local = await localFilesByPath();
+      const contents = previewOptions.contents;
+      const local = await localFilesByPath(contents);
       // A repository with no backup yet is a normal first-run state, not an error:
       // nothing would be restored, and every local file is local-only.
       if (!(await backupPayloadExists(sourceDir))) {
@@ -548,7 +553,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         };
       }
 
-      const payload = await readBackupPayload(sourceDir);
+      const payload = await readBackupPayload(sourceDir, { contents });
       // The preflight restore itself runs, so a destination this payload cannot be written to
       // fails here instead of after the user accepts a plan that cannot execute. Recomputed
       // rather than carried over to the restore, for the same reason the approvals are.
@@ -608,7 +613,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
       let projectImports: BackupProjectImport[] = [];
       let projectBundleSkipped = false;
-      if (!previewOptions.includeProjects) {
+      if (!contents.includeProjects) {
         // Existence-only: with the toggle off the sidecar is never parsed, so a malformed
         // bundle cannot block a core-only preview.
         projectBundleSkipped = await projectBundleExists(sourceDir);
@@ -644,7 +649,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const payload = await readBackupPayload(sourceDir);
+      const payload = await readBackupPayload(sourceDir, { contents: validateOptions.contents });
       assertBackupCommandsApproved(
         await collectMcpCommandApprovals(muxRoot, payload.files, payload.manifest.mcpRedactions),
         validateOptions.approvedCommandTokens
@@ -652,7 +657,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The same preflight the restore runs, so a payload it would refuse is refused here,
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
-      if (!validateOptions.includeProjects) {
+      if (!validateOptions.contents.includeProjects) {
         return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
@@ -691,28 +696,33 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       };
     },
 
-    async writeSafetySnapshot(snapshotRoot) {
+    async writeSafetySnapshot(snapshotRoot, contents) {
       // Unredacted: this copy never leaves the machine, and a redacted snapshot could
-      // not restore a credential whose MCP server the restore removed.
+      // not restore a credential whose MCP server the restore removed. The selection is
+      // honoured because the restore writes nothing outside it, and a category the user left
+      // out (say, an oversized skills directory) must not be what fails the snapshot.
       // Project memory is intentionally absent here: restore snapshots exactly the
       // matched entries it will overwrite, inside the same memory-lock window as the
       // write, so nothing can edit a file between its snapshot bytes and its overwrite.
-      await writeBackupPayload(snapshotRoot, await buildPayload({ keepLocalSecrets: true }), {
-        portable: false,
-        ownerOnly: true,
-      });
+      await writeBackupPayload(
+        snapshotRoot,
+        await buildPayload(contents, { keepLocalSecrets: true }),
+        { portable: false, ownerOnly: true }
+      );
     },
 
     async restore(restoreOptions) {
       const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
-      const payload = await readBackupPayload(sourceDir);
-      const before = await localFilesByPath();
+      const contents = restoreOptions.contents;
+      const payload = await readBackupPayload(sourceDir, { contents });
+      const before = await localFilesByPath(contents);
 
       const restoreCore = async (
         registration: ProjectRegistrationLockHandle | null
       ): Promise<{ localOnlyFiles: string[]; unsupportedSettings: string[] }> => {
         const result = await restoreBackupPayload({
           muxRoot,
+          contents,
           payload,
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
@@ -769,12 +779,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       let core: { localOnlyFiles: string[]; unsupportedSettings: string[] };
       // The bundle itself is read here — the repo lock holds the checkout stable — but its
       // plan is computed inside the memory lock below, where the inputs it depends on are.
-      const bundle = restoreOptions.includeProjects ? await readProjectBundle(sourceDir) : null;
+      const bundle = contents.includeProjects ? await readProjectBundle(sourceDir) : null;
       if (bundle === null) {
         // Existence-only, like the preview: a malformed sidecar must never block a
         // core-only restore, but its presence is reported so the skip is visible.
-        projectBundleSkipped =
-          !restoreOptions.includeProjects && (await projectBundleExists(sourceDir));
+        projectBundleSkipped = !contents.includeProjects && (await projectBundleExists(sourceDir));
         core = await restoreCore(null);
       } else {
         // Only entries the caller validated as matched, to the very same destination. A
@@ -885,7 +894,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         );
       }
 
-      const after = await localFilesByPath();
+      const after = await localFilesByPath(contents);
       const changedFiles = [...after.entries()]
         .filter(([file, current]) => {
           const previous = before.get(file);

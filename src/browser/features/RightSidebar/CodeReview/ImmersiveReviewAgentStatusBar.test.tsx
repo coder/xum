@@ -48,6 +48,7 @@ function buildState(workspaceId: string, input: SeedInput): WorkspaceState {
     loading: false,
     isTranscriptCaughtUp: true,
     isHydratingTranscript: false,
+    isTranscriptStale: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],

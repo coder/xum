@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -122,6 +122,77 @@ describe("spawnProcess", () => {
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe("/right/value");
+  });
+
+  it("probes local records with fs instead of spawning a shell per poll", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-local-probe-"));
+    cleanupDirs.push(hostDir);
+    const runtime = new LocalRuntime(hostDir);
+    const result = await spawnProcess(
+      runtime,
+      "printf 'one\\ntwo\\n'; sleep 0.3; printf 'three\\n'",
+      {
+        cwd: hostDir,
+        workspaceId: `local-probe-${Date.now()}`,
+        processId: "local-probe",
+      }
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+
+    // Monitors tick every 100ms on local runtimes; each shell probe forks the main process, so
+    // the local read path must not touch runtime.exec at all.
+    const execSpy = spyOn(runtime, "exec");
+    try {
+      let offset = 0;
+      let content = "";
+      let exitCode: number | null = null;
+      for (let attempt = 0; attempt < 200 && exitCode === null; attempt++) {
+        const read = await result.handle.readOutputForMonitor!(offset);
+        expect(read.success).toBe(true);
+        if (read.success) {
+          content += read.value.content;
+          offset = read.value.newOffset;
+        }
+        const exit = await result.handle.getExitCodeForMonitor!();
+        expect(exit.success).toBe(true);
+        if (exit.success) exitCode = exit.value;
+        if (exitCode === null) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // Drain the bytes written between the last read and the exit marker.
+      const finalRead = await result.handle.readOutput(offset);
+      content += finalRead.content;
+
+      expect(exitCode).toBe(0);
+      expect(content).toBe("one\ntwo\nthree\n");
+      expect(await result.handle.getOutputFileSize()).toBe(Buffer.byteLength(content));
+      expect(execSpy).not.toHaveBeenCalled();
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it("fails the local strict probes when the output file is removed", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-local-missing-"));
+    cleanupDirs.push(hostDir);
+    const result = await spawnProcess(new LocalRuntime(hostDir), "echo hi", {
+      cwd: hostDir,
+      workspaceId: `local-missing-${Date.now()}`,
+      processId: "missing",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    expect(await waitForExit(result.handle)).toBe(0);
+
+    await fs.rm(path.join(result.outputDir, "output.log"));
+    const probe = await result.handle.readOutputForMonitor?.(0);
+    expect(probe?.success).toBe(false);
   });
 
   it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {

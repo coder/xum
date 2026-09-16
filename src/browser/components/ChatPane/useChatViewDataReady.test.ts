@@ -56,7 +56,7 @@ describe("useChatViewDataReady", () => {
         isHydratingTranscript: false,
         chatViewDataReady: result.current,
         hasRenderableMessages: false,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
@@ -85,7 +85,7 @@ describe("computeChatViewReveal", () => {
         isHydratingTranscript: true,
         chatViewDataReady: false,
         hasRenderableMessages: false,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
 
@@ -97,7 +97,7 @@ describe("computeChatViewReveal", () => {
         isHydratingTranscript: true,
         chatViewDataReady: true,
         hasRenderableMessages: false,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
 
@@ -107,7 +107,7 @@ describe("computeChatViewReveal", () => {
         isHydratingTranscript: false,
         chatViewDataReady: true,
         hasRenderableMessages: true,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
@@ -120,12 +120,12 @@ describe("computeChatViewReveal", () => {
         isHydratingTranscript: false,
         chatViewDataReady: false,
         hasRenderableMessages: false,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
   });
 
-  test("revisits with cached rows never regress to a skeleton", () => {
+  test("revisits with trustworthy cached rows never regress to a skeleton", () => {
     // Cached rows paint immediately during incremental catch-up; latched
     // known-flags make decorations renderable in that same commit.
     expect(
@@ -133,21 +133,45 @@ describe("computeChatViewReveal", () => {
         isHydratingTranscript: true,
         chatViewDataReady: true,
         hasRenderableMessages: true,
-        shouldShowStreamingBarrier: false,
+        isTranscriptStale: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
 
-  test("an active stream barrier trumps the skeleton; decorations still wait for data", () => {
+  test("stale cached rows hold the skeleton while hydrating", () => {
+    // Rows known to be missing backend content must not paint and then jump on
+    // caught-up; decorations wait for the same reveal commit.
+    expect(
+      computeChatViewReveal({
+        isHydratingTranscript: true,
+        chatViewDataReady: true,
+        hasRenderableMessages: true,
+        isTranscriptStale: true,
+      })
+    ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
+
+    // Staleness is only meaningful during hydration: once caught up the rows are
+    // authoritative and the flag cannot re-introduce a skeleton.
+    expect(
+      computeChatViewReveal({
+        isHydratingTranscript: false,
+        chatViewDataReady: true,
+        hasRenderableMessages: true,
+        isTranscriptStale: true,
+      })
+    ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
+  });
+
+  test("an empty hydrating transcript holds the skeleton; decorations still wait for data", () => {
+    // Reconnect-with-active-stream: the stream barrier renders below the skeleton
+    // rather than replacing it, so the reveal decision ignores the barrier entirely.
     const state = computeChatViewReveal({
       isHydratingTranscript: true,
       chatViewDataReady: false,
       hasRenderableMessages: false,
-      shouldShowStreamingBarrier: true,
+      isTranscriptStale: false,
     });
-    expect(state.showHydrationPlaceholder).toBe(false);
-    // Decorations may mount late here (reconnect-with-active-stream) — but
-    // they must never render while their data is merely unknown.
+    expect(state.showHydrationPlaceholder).toBe(true);
     expect(state.revealDecorations).toBe(false);
   });
 });

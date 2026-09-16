@@ -1,19 +1,13 @@
 import type { WorkspaceConsumersState } from "./WorkspaceStore";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { ChatStats } from "@/common/types/chatStats";
-import type { MuxMessage } from "@/common/types/message";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 
 const TOKENIZER_CANCELLED_MESSAGE = "Cancelled by newer request";
 
 let globalTokenStatsRequestId = 0;
 const latestRequestByWorkspace = new Map<string, number>();
 
-async function calculateTokenStatsLatest(
-  workspaceId: string,
-  messages: MuxMessage[],
-  model: string
-): Promise<ChatStats> {
+async function calculateTokenStatsLatest(workspaceId: string, model: string): Promise<ChatStats> {
   const orpcClient = window.__ORPC_CLIENT__;
   if (!orpcClient) {
     throw new Error("ORPC client not initialized");
@@ -23,11 +17,10 @@ async function calculateTokenStatsLatest(
   latestRequestByWorkspace.set(workspaceId, requestId);
 
   try {
-    const stats = await orpcClient.tokenizer.calculateStats({
-      workspaceId,
-      messages,
-      model,
-    });
+    // Only identifiers cross the wire. The backend owns the same history (chat.jsonl +
+    // partial.json) and slices it to the active context itself; uploading the renderer's copy
+    // on every tool-call-end during a stream was ~36 KB/s of redundant WebSocket traffic.
+    const stats = await orpcClient.tokenizer.calculateStats({ workspaceId, model });
     const latestRequestId = latestRequestByWorkspace.get(workspaceId);
     if (latestRequestId !== requestId) {
       throw new Error(TOKENIZER_CANCELLED_MESSAGE);
@@ -209,11 +202,6 @@ export class WorkspaceConsumerManager {
     // Run in next tick to avoid blocking caller
     void (async () => {
       try {
-        // Only count tokens for the current active context; pre-boundary
-        // transcript rows carry stale context and inflate the consumer breakdown.
-        const messages = sliceMessagesForProviderFromLatestContextBoundary(
-          aggregator.getAllMessages()
-        );
         const model = aggregator.getCurrentModel() ?? "unknown";
 
         const providersConfigFingerprint = this.getProvidersConfigVersion();
@@ -250,7 +238,7 @@ export class WorkspaceConsumerManager {
         });
 
         const fullStats = await Promise.race([
-          calculateTokenStatsLatest(workspaceId, messages, model),
+          calculateTokenStatsLatest(workspaceId, model),
           timeoutPromise,
         ]).finally(() => clearTimeout(timeoutId));
 

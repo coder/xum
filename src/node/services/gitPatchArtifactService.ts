@@ -370,6 +370,15 @@ export class GitPatchArtifactService {
     }
 
     const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
+    const existingArtifact = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
+    // Only continuations regenerate settled artifacts; skip discovery and rewrites on restart.
+    if (
+      options?.refreshForContinuation !== true &&
+      existingArtifact != null &&
+      existingArtifact.status !== "pending"
+    ) {
+      return;
+    }
 
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
@@ -418,8 +427,7 @@ export class GitPatchArtifactService {
       // (a completed artifact is left untouched), so re-read config for exactly those. A removed
       // task gets no artifact, and a reactivated one (live execution handle, so its checkout is
       // changing again) is left to the continuation refresh that runs when that execution settles.
-      const existing = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
-      if (existing == null || existing.status === "pending") {
+      if (existingArtifact == null || existingArtifact.status === "pending") {
         const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
         if (live == null || isActiveWorkspaceTurnTaskStatus(live.workspace.taskExecutionStatus)) {
           return;

@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import { createServer } from "http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -32,6 +41,7 @@ import { Config } from "@/node/config";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import type { TelemetryService } from "./telemetryService";
 import type { Runtime } from "@/node/runtime/Runtime";
+import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -139,6 +149,15 @@ function startResult(
   };
 }
 
+/**
+ * A timed-out server backs off one startup timeout before its first retry.
+ * Bun freezes the clock under setSystemTime, so jump relative to the current
+ * reading; afterEach restores real time.
+ */
+function elapseTimedOutRetryBackoff(): void {
+  setSystemTime(new Date(Date.now() + 60_000));
+}
+
 function cachedStats(overrides: Record<string, unknown> = {}) {
   return {
     enabledServerCount: 1,
@@ -157,6 +176,7 @@ function cachedStats(overrides: Record<string, unknown> = {}) {
 describe("MCPServerManager", () => {
   let configService: {
     listServers: ReturnType<typeof mock>;
+    acquireGlobalPluginEnablementFence: MCPConfigService["acquireGlobalPluginEnablementFence"];
     configGeneration: number;
   };
 
@@ -166,6 +186,7 @@ describe("MCPServerManager", () => {
   beforeEach(() => {
     configService = {
       listServers: mock(() => Promise.resolve({})),
+      acquireGlobalPluginEnablementFence: () => Promise.resolve(() => Promise.resolve()),
       configGeneration: 0,
     };
 
@@ -175,6 +196,7 @@ describe("MCPServerManager", () => {
 
   afterEach(() => {
     manager.dispose();
+    setSystemTime();
   });
   test("testForApi resolves global defaults and emits categorized telemetry", async () => {
     using tmp = new DisposableTempDir("mcp-api-test");
@@ -1321,6 +1343,7 @@ describe("MCPServerManager", () => {
         };
         await manager.getToolsForWorkspace(request);
         access.startServers = startServers;
+        elapseTimedOutRetryBackoff();
       } else if (mode === "restart") {
         await manager.getToolsForWorkspace(request);
         f.started.find((client) => client.name === key)!.isClosed = true;
@@ -2180,6 +2203,7 @@ describe("MCPServerManager", () => {
     access.startServers = () =>
       Promise.resolve({ instances: retried, failedServerNames: [], timedOutServerNames: [] });
 
+    elapseTimedOutRetryBackoff();
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(stopPromise).toBeDefined();
     await stopPromise;
@@ -3247,6 +3271,223 @@ describe("MCPServerManager", () => {
     expect(next.toolServerNames).toEqual({});
   });
 
+  test("getToolsForWorkspace serves the cached tool catalog and refreshes it in the background", async () => {
+    const workspaceId = "ws-tools-stale-while-revalidate";
+    configService.listServers = mock(() => Promise.resolve({ modern: stdioConfig("cmd") }));
+    const instance = testInstance("modern", { tools: { alpha: testTool() } });
+    const heldRefresh = Promise.withResolvers<void>();
+    let refreshCalls = 0;
+    const refreshTools = mock(() => {
+      refreshCalls += 1;
+      if (refreshCalls !== 1) return Promise.resolve();
+      return heldRefresh.promise.then(() => {
+        instance.tools = { alpha: testTool(), beta: testTool() };
+      });
+    });
+    (instance as { refreshTools?: typeof refreshTools }).refreshTools = refreshTools;
+    access.startServers = mock(() =>
+      Promise.resolve({
+        instances: new Map([["modern", instance]]),
+        failedServerNames: [],
+        timedOutServerNames: [],
+      })
+    );
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(0);
+
+    // The refresh is held open: an awaited tools/list would hang this send.
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(second.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(1);
+
+    // Deduped per instance while the first refresh is still in flight.
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(third.tools)).toEqual(["modern_alpha"]);
+    expect(refreshTools).toHaveBeenCalledTimes(1);
+
+    heldRefresh.resolve();
+    await Bun.sleep(0);
+
+    const fourth = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(fourth.tools).sort()).toEqual(["modern_alpha", "modern_beta"]);
+    expect(refreshTools).toHaveBeenCalledTimes(2);
+  });
+
+  test("timed-out server retries back off exponentially and reset on a config change", async () => {
+    const workspaceId = "ws-timeout-retry-backoff";
+    let command = "cmd-1";
+    configService.listServers = mock(() =>
+      Promise.resolve({ flaky: { transport: "stdio" as const, command, disabled: false } })
+    );
+    const startServersMock = mock(() =>
+      Promise.resolve(
+        startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] })
+      )
+    );
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const base = Date.now();
+    setSystemTime(new Date(base));
+    try {
+      // The initial startup timeout is the first failure: serves inside the
+      // base window (one startup timeout) do not pay a second timeout.
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      setSystemTime(new Date(base + 59_999));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      setSystemTime(new Date(base + 60_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(2);
+
+      // One retry timeout: the window doubles.
+      setSystemTime(new Date(base + 60_000 + 119_999));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(2);
+      setSystemTime(new Date(base + 60_000 + 120_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(3);
+
+      // A config change restarts the server and clears its backoff, so the
+      // schedule restarts from the base window.
+      command = "cmd-2";
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(4);
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(4);
+      setSystemTime(new Date(base + 60_000 + 120_000 + 60_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(5);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("timed-out retry backoff is measured from the attempt's own completion, not the batch's", async () => {
+    const workspaceId = "ws-timeout-retry-attempt-time";
+    configService.listServers = mock(() => Promise.resolve({ flaky: stdioConfig("cmd") }));
+    const base = Date.now();
+    // A first-wave timeout finished 45 s before the batch settled (later
+    // waves were still running), so its window is already 45 s in.
+    const startServersMock = mock(() =>
+      Promise.resolve({
+        ...startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }),
+        timedOutAtMs: new Map([["flaky", base - 45_000]]),
+      })
+    );
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    setSystemTime(new Date(base));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    setSystemTime(new Date(base + 14_999));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+    setSystemTime(new Date(base + 15_000));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("a closed companion's full restart keeps a backed-off server on its schedule", async () => {
+    const workspaceId = "ws-timeout-backoff-closed-companion";
+    configService.listServers = mock(() =>
+      Promise.resolve({ healthy: stdioConfig("cmd-h"), flaky: stdioConfig("cmd-f") })
+    );
+    const startServersMock = mock((servers: unknown) => {
+      const names = Object.keys(servers as Record<string, unknown>);
+      return Promise.resolve(
+        startResult(
+          names.filter((name) => name === "healthy").map((name) => [name] as [string]),
+          names.includes("flaky")
+            ? { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }
+            : {}
+        )
+      );
+    });
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const entryOf = () =>
+      access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, { isClosed: boolean }>;
+        timedOutServerNames: string[];
+        stats: { failedServerNames: string[] };
+      };
+
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    // The healthy client dies with no lease held, forcing a full restart of
+    // the entry. The backed-off server must not be started again with it.
+    entryOf().instances.get("healthy")!.isClosed = true;
+    const restarted = await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(Object.keys(startServersMock.mock.calls[1][0] as object)).toEqual(["healthy"]);
+    expect(entryOf().timedOutServerNames).toEqual(["flaky"]);
+    expect(restarted.stats.failedServerNames).toEqual(["flaky"]);
+    expect(restarted.stats.startedServerCount).toBe(1);
+
+    // Its window continues from the original timeout rather than restarting.
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    elapseTimedOutRetryBackoff();
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(startServersMock.mock.calls[2][0] as object)).toEqual(["flaky"]);
+  });
+
+  test("a closed companion's restart after the window elapsed continues the schedule", async () => {
+    const workspaceId = "ws-timeout-backoff-closed-companion-elapsed";
+    configService.listServers = mock(() =>
+      Promise.resolve({ healthy: stdioConfig("cmd-h"), flaky: stdioConfig("cmd-f") })
+    );
+    const startServersMock = mock((servers: unknown) => {
+      const names = Object.keys(servers as Record<string, unknown>);
+      return Promise.resolve(
+        startResult(
+          names.filter((name) => name === "healthy").map((name) => [name] as [string]),
+          names.includes("flaky")
+            ? { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }
+            : {}
+        )
+      );
+    });
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const base = Date.now();
+    setSystemTime(new Date(base));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    // The window has elapsed when the companion dies, so the full restart
+    // includes the flaky server; its second timeout is failure number two.
+    setSystemTime(new Date(base + 60_000));
+    (
+      access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, { isClosed: boolean }>;
+      }
+    ).instances.get("healthy")!.isClosed = true;
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(Object.keys(startServersMock.mock.calls[1][0] as object).sort()).toEqual([
+      "flaky",
+      "healthy",
+    ]);
+
+    // Second window is 120 s, not the 60 s base again.
+    setSystemTime(new Date(base + 60_000 + 119_999));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    setSystemTime(new Date(base + 60_000 + 120_000));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(startServersMock.mock.calls[2][0] as object)).toEqual(["flaky"]);
+  });
+
   test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {
     const workspaceId = "ws-prompt-freshness";
     configService.listServers = mock(() =>
@@ -3396,6 +3637,7 @@ describe("MCPServerManager", () => {
     expect(initial.stats.startedServerCount).toBe(1);
     expect(Object.keys(initial.tools)).toEqual(["servera_toola"]);
 
+    elapseTimedOutRetryBackoff();
     const retried = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(startServersMock).toHaveBeenCalledTimes(2);
@@ -3655,6 +3897,7 @@ describe("MCPServerManager", () => {
       );
     access.startServers = startup;
     await manager.getToolsForWorkspace(request);
+    elapseTimedOutRetryBackoff();
     const retry = manager.getToolsForWorkspace(request);
     await retryStarted.promise;
     Object.assign(configs, {
@@ -3673,6 +3916,7 @@ describe("MCPServerManager", () => {
       ["addedBroken", "addedSlow"],
     ]);
     startup.mockResolvedValueOnce(startResult([["addedSlow"]]));
+    elapseTimedOutRetryBackoff();
     await manager.getToolsForWorkspace(request);
     expect(Object.keys(startup.mock.calls.at(-1)![0] as object)).toEqual(["addedSlow"]);
   });
@@ -4853,32 +5097,16 @@ describe("MCPServerManager", () => {
     expect(Object.keys(toolsResult.tools)).not.toContain("serverb_tool");
   });
 
-  test("a publication landing during the leased tool refresh is honored before the serve returns", async () => {
-    // Leased (deferred-restart) path: an authoritative parent publication
-    // replaces the recorded overrides while `refreshModernInstanceTools` is
-    // awaiting, but its own listServers is still pending — so
-    // `enabledServerNames` is stale unless the repair runs AFTER the refresh.
-    const workspaceId = "ws-publish-during-leased-refresh";
-    const servers = {
-      serverA: stdioConfig("cmd-a"),
-      serverB: stdioConfig("cmd-b"),
-      serverC: stdioConfig("cmd-c"),
-    };
-    let gateListServers = false;
-    const gatedListServers: Array<() => void> = [];
-    configService.listServers = mock(() => {
-      if (!gateListServers) return Promise.resolve(servers);
-      return new Promise<typeof servers>((resolve) => {
-        gatedListServers.push(() => resolve(servers));
-      });
-    });
-    let releaseRefresh: () => void = () => undefined;
-    const refreshB = mock(
-      () =>
-        new Promise<void>((resolve) => {
-          releaseRefresh = resolve;
-        })
+  test("the leased deferred-restart path serves without waiting on a hung tool refresh", async () => {
+    const workspaceId = "ws-leased-hung-tool-refresh";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        serverA: stdioConfig("cmd-a"),
+        serverB: stdioConfig("cmd-b"),
+        serverC: stdioConfig("cmd-c"),
+      })
     );
+    const refreshB = mock(() => new Promise<void>(() => undefined));
     access.startServers = mock(() =>
       Promise.resolve(
         startResult([
@@ -4891,38 +5119,14 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     manager.acquireLease(workspaceId);
 
-    // Signature change while leased → deferred restart path, which awaits the
-    // modern tool refresh (B blocks).
-    const inFlight = manager.getToolsForWorkspace(
+    // Signature change while leased → deferred restart path. B's refresh
+    // never settles; the serve must still return the held catalogs, filtered
+    // to the newly enabled set.
+    const served = await manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { overrides: { disabledServers: ["serverC"] } })
     );
-    while (refreshB.mock.calls.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    // Parent publication revokes B; its listServers stays pending.
-    gateListServers = true;
-    const publication = manager.applyWorkspaceOverrides(workspaceId, {
-      disabledServers: ["serverC", "serverB"],
-    });
-    releaseRefresh();
-    // Keep the publication's listServers pending until the serve's repair
-    // re-derives too (a second gated call) — or the serve returns without one.
-    let settled = false;
-    const servedPromise = inFlight.finally(() => {
-      settled = true;
-    });
-    while (!settled) {
-      if (gatedListServers.length >= 2) {
-        for (const release of gatedListServers.splice(0)) release();
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    for (const release of gatedListServers.splice(0)) release();
-    await publication;
-
-    const served = await servedPromise;
-    expect(Object.keys(served.tools)).toContain("servera_tool");
-    expect(Object.keys(served.tools)).not.toContain("serverb_tool");
+    expect(refreshB).toHaveBeenCalledTimes(1);
+    expect(Object.keys(served.tools).sort()).toEqual(["servera_tool", "serverb_tool"]);
   });
 
   test("getToolsForWorkspace filters disabled-server failures from leased stats", async () => {
@@ -5096,6 +5300,7 @@ describe("MCPServerManager", () => {
       })
     );
     access.workspaceServers.set("workspace", {
+      enabledServers: { coder: stdioConfig("cmd") },
       enabledServerNames: new Set(["coder"]),
       instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
     });
@@ -5114,6 +5319,7 @@ describe("MCPServerManager", () => {
       })
     );
     access.workspaceServers.set("workspace", {
+      enabledServers: { coder: stdioConfig("cmd") },
       enabledServerNames: new Set(["coder"]),
       instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
     });
@@ -5177,6 +5383,7 @@ describe("MCPServerManager", () => {
       enablementDerivedFrom: workspaceRequest("workspace"),
     });
     access.workspaceServers.set("workspace", {
+      enabledServers: { enabled: stdioConfig("cmd"), disabled: stdioConfig("cmd", true) },
       enabledServerNames: new Set(["enabled"]),
       instances: new Map([
         ["enabled", testInstance("enabled", { prompts: [{ name: "status" }] })],
@@ -5197,6 +5404,7 @@ describe("MCPServerManager", () => {
     const request = workspaceRequest("workspace");
     const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation(() => {
       access.workspaceServers.set("workspace", {
+        enabledServers: { coder: stdioConfig("cmd") },
         enabledServerNames: new Set(["coder"]),
         // Mirrors a real serve: the inventory is as new as the current config.
         enabledServersGeneration: configService.configGeneration,
@@ -5404,6 +5612,7 @@ describe("MCPServerManager", () => {
     const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
       const workspaceId = (options as { workspaceId: string }).workspaceId;
       access.workspaceServers.set(workspaceId, {
+        enabledServers: { coder: stdioConfig("cmd") },
         enabledServerNames: new Set(["coder"]),
         // Mirrors a real serve: the inventory is as new as the current config.
         enabledServersGeneration: configService.configGeneration,
@@ -5439,6 +5648,7 @@ describe("MCPServerManager", () => {
     const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
       const workspaceId = (options as { workspaceId: string }).workspaceId;
       access.workspaceServers.set(workspaceId, {
+        enabledServers: { coder: stdioConfig("cmd") },
         enabledServerNames: new Set(["coder"]),
         // Mirrors a real serve: the inventory is as new as the current config.
         enabledServersGeneration: configService.configGeneration,
@@ -5473,6 +5683,7 @@ describe("MCPServerManager", () => {
     const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
       const workspaceId = (options as { workspaceId: string }).workspaceId;
       access.workspaceServers.set(workspaceId, {
+        enabledServers: { coder: stdioConfig("cmd") },
         enabledServerNames: new Set(["coder"]),
         // Mirrors a real serve: the inventory is as new as the current config.
         enabledServersGeneration: configService.configGeneration,
@@ -8190,6 +8401,594 @@ describe("MCPServerManager", () => {
 
       expect(result.stats.enabledServerCount).toBe(0);
     }
+  });
+
+  for (const scenario of [
+    {
+      name: "workspace disable overrides a globally enabled plugin",
+      globallyEnabled: true,
+      overrides: { disabledServers: [PLUGIN_KEY] },
+      expectedServers: [],
+    },
+    {
+      name: "workspace enable overrides a globally disabled plugin",
+      globallyEnabled: false,
+      overrides: { enabledServers: [PLUGIN_KEY] },
+      expectedServers: [PLUGIN_KEY],
+    },
+    {
+      name: "globally enabled plugin starts without a workspace override",
+      globallyEnabled: true,
+      overrides: undefined,
+      expectedServers: [PLUGIN_KEY],
+    },
+  ]) {
+    test(scenario.name, async () => {
+      using tmp = new DisposableTempDir("mcp-plugin-global-overrides");
+      await fs.writeFile(
+        path.join(tmp.path, "mcp.jsonc"),
+        JSON.stringify({
+          servers: {},
+          enabledPluginServers: scenario.globallyEnabled ? [PLUGIN_KEY] : [],
+        })
+      );
+      const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+        agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+      });
+      manager.dispose();
+      manager = new MCPServerManager(pluginConfigService);
+      access = manager as unknown as MCPServerManagerTestAccess;
+      const startServers = spyOn(access, "startServers").mockImplementation(
+        (...args: unknown[]) => {
+          const servers = args[0] as Record<string, unknown>;
+          return Promise.resolve(
+            startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
+          );
+        }
+      );
+
+      // Establish the persisted default before testing workspace precedence.
+      expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(
+        !scenario.globallyEnabled
+      );
+      const result = await manager.getToolsForWorkspace(
+        workspaceRequest("ws-plugin-global-overrides", { overrides: scenario.overrides })
+      );
+      expect(result.stats.enabledServerCount).toBe(scenario.expectedServers.length);
+      expect(result.stats.startedServerCount).toBe(scenario.expectedServers.length);
+      expect(Object.values(result.toolServerNames)).toEqual(scenario.expectedServers);
+      expect(Object.keys(startServers.mock.calls.at(-1)?.[0] as Record<string, unknown>)).toEqual(
+        scenario.expectedServers
+      );
+    });
+  }
+
+  for (const transport of ["stdio", "http", "sse", "auto"] as const) {
+    for (const workspaceConsent of [false, true]) {
+      for (const trackOverrides of [false, true]) {
+        test(`cold ${transport} startup gates sibling revocation (workspace consent: ${workspaceConsent}, override fence: ${trackOverrides})`, async () => {
+          using tmp = new DisposableTempDir("mcp-plugin-global-startup-revocation");
+          const plugin = pluginStdioConfig()[PLUGIN_KEY].plugin;
+          const definition: MCPServerInfo =
+            transport === "stdio"
+              ? {
+                  ...pluginStdioConfig()[PLUGIN_KEY],
+                  env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+                  cwd: tmp.path,
+                }
+              : { transport, url: "http://127.0.0.1:1", disabled: true, plugin };
+          const deps = {
+            agentPluginsMcpProvider: () => Promise.resolve({ [PLUGIN_KEY]: definition }),
+          };
+          const writer = new MCPConfigService(new Config(tmp.path), deps);
+          const reader = new MCPConfigService(new Config(tmp.path), deps);
+          expect((await writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+          const list = reader.listServers.bind(reader);
+          const discovery = spyOn(reader, "listServers").mockImplementationOnce(async (...args) => {
+            const snapshot = await list(...args);
+            expect(snapshot[PLUGIN_KEY]?.disabled).toBe(false);
+            expect((await writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+            return snapshot;
+          });
+          const exec = mock(() => Promise.reject(new Error("Reached exec")));
+          const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+            Promise.reject(new Error("Reached connection"))
+          );
+          const overrides = workspaceConsent ? { enabledServers: [PLUGIN_KEY] } : {};
+          manager.dispose();
+          manager = new MCPServerManager(reader, {
+            ...(trackOverrides
+              ? {
+                  pluginInvalidation: {
+                    keyPrefix: "plugin:",
+                    readToken: () => Promise.resolve("stable"),
+                    readOverridesEpoch: () => Promise.resolve("stable"),
+                    readWorkspaceOverrides: () => Promise.resolve(overrides),
+                    acquireOverridesLock: () => Promise.resolve(() => Promise.resolve()),
+                  },
+                }
+              : {}),
+          });
+          try {
+            await manager.getToolsForWorkspace(
+              workspaceRequest("global-startup", {
+                runtime: { exec } as unknown as Runtime,
+                overrides,
+              })
+            );
+            expect(transport === "stdio" ? exec : client).toHaveBeenCalledTimes(
+              workspaceConsent ? 1 : 0
+            );
+          } finally {
+            discovery.mockRestore();
+            client.mockRestore();
+          }
+        });
+      }
+    }
+  }
+
+  test("auto startup rechecks global consent before its SSE fallback", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-fallback-revocation");
+    const deps = {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve({
+          [PLUGIN_KEY]: {
+            transport: "auto" as const,
+            url: "http://127.0.0.1:1",
+            disabled: true,
+            plugin: pluginStdioConfig()[PLUGIN_KEY].plugin,
+          },
+        }),
+    };
+    const writer = new MCPConfigService(new Config(tmp.path), deps);
+    const reader = new MCPConfigService(new Config(tmp.path), deps);
+    expect((await writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    const acquire = reader.acquireGlobalPluginEnablementFence.bind(reader);
+    let admissions = 0;
+    const admission = spyOn(reader, "acquireGlobalPluginEnablementFence").mockImplementation(
+      async (...args) => {
+        if (++admissions === 2) {
+          expect((await writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+        }
+        return acquire(...args);
+      }
+    );
+    const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("HTTP not supported"), { status: 404 }))
+    );
+    manager.dispose();
+    manager = new MCPServerManager(reader);
+    try {
+      await manager.getToolsForWorkspace(workspaceRequest("global-fallback"));
+      expect(admissions).toBe(2);
+      expect(client).toHaveBeenCalledTimes(1);
+    } finally {
+      admission.mockRestore();
+      client.mockRestore();
+    }
+  });
+
+  test("global consent stays locked through exec and releases on startup failure", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-exec-lock");
+    const deps = {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve(
+          pluginStdioConfig({
+            env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+            cwd: tmp.path,
+          })
+        ),
+    };
+    const config = new MCPConfigService(new Config(tmp.path), deps);
+    expect((await config.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    let writerBlocked = false;
+    const exec = mock(async () => {
+      // Probe the real writer lock at the execution boundary, rather than
+      // assuming a prior discovery read still authorizes process creation.
+      const release = await crossProcessLock
+        .acquireCrossProcessLock({
+          lockPath: path.join(tmp.path, "mcp-config.lock"),
+          acquireTimeoutMs: 0,
+          staleMs: 5 * 60_000,
+          timeoutMessage: "writer blocked by startup",
+        })
+        .catch((error: unknown) => {
+          writerBlocked = error instanceof Error && error.message === "writer blocked by startup";
+          return undefined;
+        });
+      await release?.();
+      throw new Error("Startup failed at exec");
+    });
+    manager.dispose();
+    manager = new MCPServerManager(config);
+    await manager.getToolsForWorkspace(
+      workspaceRequest("global-exec-lock", { runtime: { exec } as unknown as Runtime })
+    );
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(writerBlocked).toBe(true);
+    expect((await config.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+  });
+
+  async function globalPluginInvocationFixture(
+    rootDir: string,
+    overrides?: MCPWorkspaceRequestOptions["overrides"],
+    tool = testTool(),
+    options?: MCPServerManagerOptions
+  ) {
+    const deps = { agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()) };
+    const writer = new MCPConfigService(new Config(rootDir), deps);
+    const reader = new MCPConfigService(new Config(rootDir), deps);
+    expect(await writer.setServerEnabled(PLUGIN_KEY, true)).toEqual({
+      success: true,
+      data: undefined,
+    });
+    manager.dispose();
+    manager = new MCPServerManager(reader, options);
+    access = manager as unknown as MCPServerManagerTestAccess;
+    const getPrompt = mock(() =>
+      Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "review" } }] })
+    );
+    spyOn(access, "startServers").mockImplementation(() =>
+      Promise.resolve(
+        startResult([
+          [PLUGIN_KEY, { tools: { echo: tool }, prompts: [{ name: "review" }], getPrompt }],
+        ])
+      )
+    );
+    const served = await manager.getToolsForWorkspace(
+      workspaceRequest("ws-global-revocation", { overrides })
+    );
+    const execute = Object.values(served.tools)[0]?.execute;
+    if (!execute) throw new Error("Expected a globally enabled plugin tool");
+    return {
+      writer,
+      reader,
+      tool,
+      getPrompt,
+      invoke: (abortSignal?: AbortSignal) =>
+        Promise.resolve(
+          execute({}, { toolCallId: "held", messages: [], context: {}, abortSignal })
+        ),
+    };
+  }
+
+  test("a sibling backend's global plugin disable revokes an already served tool", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-revocation");
+    const f = await globalPluginInvocationFixture(tmp.path);
+    await f.invoke();
+    expect(f.tool.execute).toHaveBeenCalledTimes(1);
+
+    // The other service publishes no in-process notification to this manager,
+    // and there is no new serve to refresh the tool already held by the request.
+    expect(await f.writer.setServerEnabled(PLUGIN_KEY, false)).toEqual({
+      success: true,
+      data: undefined,
+    });
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(f.invoke()).rejects.toThrow(/disabled|unavailable/);
+    expect(f.tool.execute).toHaveBeenCalledTimes(1);
+    expect((await f.writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    await f.invoke();
+    expect(f.tool.execute).toHaveBeenCalledTimes(2);
+  });
+
+  test("explicit workspace consent survives a sibling global plugin disable", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-override-consent");
+    const f = await globalPluginInvocationFixture(tmp.path, { enabledServers: [PLUGIN_KEY] });
+    expect((await f.writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+    await f.invoke();
+    expect(f.tool.execute).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ["malformed", "{"],
+    ["invalid field", '{ "enabledPluginServers": true }'],
+    ["duplicate field", `{"enabledPluginServers":[],"enabledPluginServers":["${PLUGIN_KEY}"]}`],
+    ["missing", undefined],
+    ["unreadable", null],
+  ] as const)("held plugin tools fail closed on %s global consent", async (_name, document) => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-invalid-consent");
+    const f = await globalPluginInvocationFixture(tmp.path);
+    const configPath = path.join(tmp.path, "mcp.jsonc");
+    if (document == null) {
+      await fs.unlink(configPath);
+      if (document === null) await fs.mkdir(configPath);
+    } else {
+      await fs.writeFile(configPath, document);
+    }
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(f.invoke()).rejects.toThrow();
+    expect(f.tool.execute).not.toHaveBeenCalled();
+    if (document === null) await fs.rmdir(configPath);
+    await fs.writeFile(configPath, JSON.stringify({ enabledPluginServers: [PLUGIN_KEY] }));
+    await f.invoke();
+    expect(f.tool.execute).toHaveBeenCalledTimes(1);
+  });
+
+  test("a held plugin invocation waits for the sibling global consent writer", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-consent-writer");
+    const f = await globalPluginInvocationFixture(tmp.path);
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const list = f.writer.listServers.bind(f.writer);
+    const discovery = spyOn(f.writer, "listServers").mockImplementation(async (...args) => {
+      entered.resolve();
+      await finish.promise;
+      return list(...args);
+    });
+    const disabling = f.writer.setServerEnabled(PLUGIN_KEY, false);
+    try {
+      // Discovery runs inside the real writer transaction. The tool must not
+      // admit using the pre-transaction consent while this writer owns the lock.
+      await Promise.race([
+        entered.promise,
+        disabling.then(() => Promise.reject(new Error("No writer barrier"))),
+      ]);
+      const invocation = f.invoke();
+      invocation.catch(() => undefined);
+      finish.resolve();
+      expect((await disabling).success).toBe(true);
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(invocation).rejects.toThrow(/disabled/);
+      expect(f.tool.execute).not.toHaveBeenCalled();
+    } finally {
+      finish.resolve();
+      await disabling;
+      discovery.mockRestore();
+    }
+  });
+
+  test("aborting a held plugin invocation cancels its wait for the global consent writer", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-consent-abort");
+    const f = await globalPluginInvocationFixture(tmp.path);
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const attempted = Promise.withResolvers<void>();
+    const list = f.writer.listServers.bind(f.writer);
+    const discovery = spyOn(f.writer, "listServers").mockImplementation(async (...args) => {
+      entered.resolve();
+      await finish.promise;
+      return list(...args);
+    });
+    const acquire = f.reader.acquireGlobalPluginEnablementFence.bind(f.reader);
+    const admission = spyOn(f.reader, "acquireGlobalPluginEnablementFence").mockImplementation(
+      (...args) => {
+        const pending = acquire(...args);
+        attempted.resolve();
+        return pending;
+      }
+    );
+    const disabling = f.writer.setServerEnabled(PLUGIN_KEY, false);
+    const controller = new AbortController();
+    try {
+      await Promise.race([
+        entered.promise,
+        disabling.then(() => Promise.reject(new Error("No writer barrier"))),
+      ]);
+      const invocation = f.invoke(controller.signal);
+      invocation.catch(() => undefined);
+      await Promise.race([
+        attempted.promise,
+        invocation.then(() => Promise.reject(new Error("No admission barrier"))),
+      ]);
+      controller.abort();
+      // Rejection must not wait for the writer to release its lock.
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(invocation).rejects.toThrow(/aborted/);
+      expect(f.tool.execute).not.toHaveBeenCalled();
+      finish.resolve();
+      expect((await disabling).success).toBe(true);
+      expect((await f.writer.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+      await f.invoke();
+      expect(f.tool.execute).toHaveBeenCalledTimes(1);
+    } finally {
+      controller.abort();
+      finish.resolve();
+      await disabling;
+      admission.mockRestore();
+      discovery.mockRestore();
+    }
+  });
+
+  test("a late global consent acquisition releases after the held invocation is aborted", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-consent-late-acquire");
+    const f = await globalPluginInvocationFixture(tmp.path);
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    const acquire = crossProcessLock.acquireCrossProcessLock;
+    const acquisition = spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation(
+      async (options) => {
+        const release = await acquire(options);
+        if (options.lockPath !== path.join(tmp.path, "mcp-config.lock")) return release;
+        entered.resolve();
+        await finish.promise;
+        return async () => {
+          await release();
+          released.resolve();
+        };
+      }
+    );
+    const controller = new AbortController();
+    const invocation = f.invoke(controller.signal);
+    invocation.catch(() => undefined);
+    try {
+      await Promise.race([
+        entered.promise,
+        invocation.then(() => Promise.reject(new Error("No acquisition barrier"))),
+      ]);
+      controller.abort();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(invocation).rejects.toThrow(/aborted/);
+      finish.resolve();
+      await released.promise;
+      expect(f.tool.execute).not.toHaveBeenCalled();
+      expect((await f.writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+    } finally {
+      controller.abort();
+      finish.resolve();
+      await invocation.catch(() => undefined);
+      acquisition.mockRestore();
+    }
+  });
+
+  test("global consent locks release after admission without waiting for tool completion", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-consent-admitted");
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<string>();
+    const tool = {
+      ...testTool(),
+      execute: mock(() => {
+        entered.resolve();
+        return finish.promise;
+      }),
+    };
+    const f = await globalPluginInvocationFixture(tmp.path, undefined, tool);
+    const invocation = f.invoke();
+    try {
+      await Promise.race([
+        entered.promise,
+        invocation.then(() => Promise.reject(new Error("No invocation barrier"))),
+      ]);
+      // The disable completes while the already-admitted call is still running.
+      expect((await f.writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+      finish.resolve("completed");
+      expect(await invocation).toBe("completed");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(f.invoke()).rejects.toThrow(/disabled/);
+      expect(tool.execute).toHaveBeenCalledTimes(1);
+    } finally {
+      finish.resolve("cleanup");
+      await invocation;
+    }
+  });
+
+  test.each([false, true])(
+    "prompt admission rechecks sibling global consent after refresh (workspace fence: %s)",
+    async (workspaceFence) => {
+      using tmp = new DisposableTempDir("mcp-plugin-global-prompt-consent");
+      const f = await globalPluginInvocationFixture(tmp.path, undefined, undefined, {
+        ...(workspaceFence
+          ? {
+              pluginInvalidation: {
+                keyPrefix: "plugin:",
+                readToken: () => Promise.resolve("stable"),
+                readOverridesEpoch: () => Promise.resolve("stable"),
+                readWorkspaceOverrides: () => Promise.resolve({}),
+                acquireOverridesLock: () => Promise.resolve(() => Promise.resolve()),
+              },
+            }
+          : {}),
+      });
+      expect(await manager.getPrompt("ws-global-revocation", PLUGIN_KEY, "review", {})).toEqual({
+        text: "review",
+      });
+      const acquire = f.reader.acquireGlobalPluginEnablementFence.bind(f.reader);
+      const admission = spyOn(f.reader, "acquireGlobalPluginEnablementFence").mockImplementation(
+        async (...args) => {
+          // The prompt refreshed its catalog, but the sibling disables before
+          // admission opens the consent document. The catalog is not authority.
+          expect((await f.writer.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+          return acquire(...args);
+        }
+      );
+      try {
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          manager.getPrompt("ws-global-revocation", PLUGIN_KEY, "review", {})
+        ).rejects.toThrow(/disabled/);
+        expect(f.getPrompt).toHaveBeenCalledTimes(1);
+      } finally {
+        admission.mockRestore();
+      }
+    }
+  );
+
+  test("globally enabled plugins remain excluded on remote and devcontainer runtimes", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-off-host");
+    await fs.writeFile(
+      path.join(tmp.path, "mcp.jsonc"),
+      JSON.stringify({ servers: {}, enabledPluginServers: [PLUGIN_KEY] })
+    );
+    const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+    });
+    manager.dispose();
+    manager = new MCPServerManager(pluginConfigService);
+    access = manager as unknown as MCPServerManagerTestAccess;
+    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
+      );
+    });
+
+    expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(false);
+    const runtimes = [
+      Object.create(RemoteRuntime.prototype) as Runtime,
+      Object.create(DevcontainerRuntime.prototype) as Runtime,
+    ];
+    for (const [index, runtime] of runtimes.entries()) {
+      // Omit the discovery hint so this exercises the runtime's own host-path gate.
+      const result = await manager.getToolsForWorkspace(
+        workspaceRequest(`ws-plugin-global-off-host-${index}`, { runtime })
+      );
+      expect(result.stats.enabledServerCount).toBe(0);
+      expect(result.stats.startedServerCount).toBe(0);
+      expect(result.tools).toEqual({});
+      expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    }
+  });
+
+  test("global plugin toggles start and retire instances on the next warm-manager serve", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-global-toggle");
+    const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
+      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+    });
+    manager.dispose();
+    manager = new MCPServerManager(pluginConfigService);
+    access = manager as unknown as MCPServerManagerTestAccess;
+    const close = mock(() => Promise.resolve(undefined));
+    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        startResult(
+          Object.keys(servers).map((name) => [name, { tools: { echo: testTool() }, close }])
+        )
+      );
+    });
+    const request = workspaceRequest("ws-plugin-global-toggle");
+
+    const initiallyDisabled = await manager.getToolsForWorkspace(request);
+    expect(initiallyDisabled.stats.enabledServerCount).toBe(0);
+    expect(initiallyDisabled.tools).toEqual({});
+    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+
+    // Changing only the global default must invalidate a warmed startup signature;
+    // no workspace overrides or explicit stop/refresh calls should be necessary.
+    expect((await pluginConfigService.setServerEnabled(PLUGIN_KEY, true)).success).toBe(true);
+    const enabled = await manager.getToolsForWorkspace(request);
+    expect(enabled.stats.enabledServerCount).toBe(1);
+    expect(enabled.stats.startedServerCount).toBe(1);
+    expect(Object.keys(enabled.tools)).toHaveLength(1);
+    expect(Object.values(enabled.toolServerNames)).toEqual([PLUGIN_KEY]);
+    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+
+    const cached = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(cached.tools)).toEqual(Object.keys(enabled.tools));
+    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+
+    expect((await pluginConfigService.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
+    const disabled = await manager.getToolsForWorkspace(request);
+    expect(disabled.stats.enabledServerCount).toBe(0);
+    expect(disabled.stats.startedServerCount).toBe(0);
+    expect(disabled.tools).toEqual({});
+    expect(disabled.toolServerNames).toEqual({});
+    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   test("threads the agentPlugins context through to config listing", async () => {

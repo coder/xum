@@ -1,5 +1,7 @@
 import { Duration, Effect, Exit, Schedule, Scope } from "effect";
 import assert from "@/common/utils/assert";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "./taskUtils";
 import type { Config } from "@/node/config";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
@@ -152,6 +154,7 @@ export class IdleCompactionService {
       const thresholdMs = idleHours * HOURS_TO_MS;
 
       for (const workspace of projectConfig.workspaces) {
+        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
         const workspaceId = workspace.id ?? workspace.name;
         if (!workspaceId) continue;
 
@@ -272,6 +275,12 @@ export class IdleCompactionService {
     thresholdMs: number,
     now: number
   ): Promise<{ eligible: boolean; reason?: string }> {
+    // Recheck queued work too: a workspace can be archived while waiting for compaction.
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+      return { eligible: false, reason: "archived" };
+    }
+
     // 0. Has the loop been stopped for this workspace after repeated/non-recoverable
     // failures? Skip before touching history so a failing workspace stops re-queuing.
     if (this.suppressedWorkspaceIds.has(workspaceId)) {

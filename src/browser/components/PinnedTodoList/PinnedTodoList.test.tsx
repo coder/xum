@@ -38,6 +38,7 @@ function buildWorkspaceState(workspaceId: string, state: MockWorkspaceState): Wo
     loading: false,
     isTranscriptCaughtUp: true,
     isHydratingTranscript: false,
+    isTranscriptStale: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],

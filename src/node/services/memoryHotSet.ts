@@ -313,7 +313,7 @@ function formatHotMemoryFileBlock(
   if (item.truncated) {
     lines.push(
       options?.flushPreload
-        ? "[truncated to the notes cap: rewrite the file within it in your single call (create replaces it)]"
+        ? "[truncated preload excerpt; remaining storage space is unknown. Use create for a compact checkpoint of essential known state within the step's output budget; it replaces the entire file, including unshown content]"
         : `[truncated: view ${item.path} with the memory tool for the full content]`
     );
   }

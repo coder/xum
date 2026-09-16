@@ -8,8 +8,17 @@ import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
-import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import {
+  STARTUP_RECOVERY_CONCURRENCY,
+  WorkspaceService,
+  generateForkBranchName,
+  generateForkTitle,
+} from "./workspaceService";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
+import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
+import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
@@ -62,6 +71,10 @@ import type {
   WorkspaceMetadata,
 } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
+import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
+import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
+import { MemoryService } from "./memoryService";
+import { MemoryMetaService } from "./memoryMeta";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -2544,6 +2557,189 @@ describe("WorkspaceService.setActiveTurnThinkingLevel", () => {
 });
 
 describe("WorkspaceService workflow activity", () => {
+  test("defers archived workflow stores until unarchive but retains live events", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      for (const id of ["active", "archived", "unarchived"]) {
+        await config.addWorkspace(projectPath, {
+          id,
+          name: id,
+          projectPath,
+          projectName: "project",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          archivedAt: id === "active" ? undefined : "2026-01-02T00:00:00.000Z",
+          unarchivedAt: id === "unarchived" ? "2026-01-03T00:00:00.000Z" : undefined,
+        });
+        const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, id) });
+        await runStore.createRun({
+          id: "wfr_" + id,
+          workspaceId: id,
+          workflow: { name: "demo", description: "Demo", scope: "global", executable: true },
+          source: "export default function workflow() { return {}; }",
+          args: {},
+          now: "2026-01-01T00:00:00.000Z",
+        });
+      }
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+      const internals = workspaceService as unknown as {
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
+      const activity = await workspaceService.getActivityList();
+      expect(activity?.active?.activeWorkflowRunIds).toEqual(["wfr_active"]);
+      expect(activity?.unarchived?.activeWorkflowRunIds).toEqual(["wfr_unarchived"]);
+      expect(activity?.archived).toBeUndefined();
+      expect(scanSpy).toHaveBeenCalledTimes(2);
+      expect(metadataSpy.mock.calls.every(([options]) => options?.probeCheckouts === false)).toBe(
+        true
+      );
+      // The list walk installs caches only for the stores it actually bootstrapped; a dormant
+      // archived workspace gets no placeholder entry.
+      expect([...internals.activeWorkflowRunIdsByWorkspace.keys()].sort()).toEqual([
+        "active",
+        "unarchived",
+      ]);
+
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "running",
+      });
+      expect(internals.activeWorkflowRunIdsByWorkspace.has("archived")).toBe(true);
+      expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
+        "wfr_live",
+      ]);
+      expect(scanSpy).toHaveBeenCalledTimes(2);
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "completed",
+      });
+
+      expect(await workspaceService.unarchive("archived")).toEqual(Ok(undefined));
+      expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
+        "wfr_archived",
+      ]);
+      expect(scanSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("activity list reports an archived run installed by an event during its later awaits", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // The list reads snapshots once before the per-id probes and again afterwards; gate
+      // the second read so the event lands after the archived probe resolved its detached
+      // empty set but before the response is assembled.
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      const secondReadReached = Promise.withResolvers<void>();
+      const secondReadGate = Promise.withResolvers<void>();
+      let snapshotReads = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotReads += 1;
+          if (snapshotReads === 2) {
+            secondReadReached.resolve();
+            await secondReadGate.promise;
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const list = workspaceService.getActivityList();
+        await secondReadReached.promise;
+        await workspaceService.emitWorkflowRunActivity({
+          workspaceId: "archived",
+          runId: "wfr_live",
+          status: "running",
+        });
+        secondReadGate.resolve();
+        expect((await list)?.archived?.activeWorkflowRunIds).toEqual(["wfr_live"]);
+        expect(scanSpy).not.toHaveBeenCalled();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("archived reads converge on a set a workflow event installs during the await", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scanSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: "archived",
+        name: "archived",
+        projectPath,
+        projectName: "project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        archivedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const internals = workspaceService as unknown as {
+        getActiveWorkflowRunIds: (workspaceId: string) => Promise<ReadonlySet<string>>;
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
+
+      // The list-style read resolves its (dormant, detached) answer synchronously; the event
+      // lands in the microtask gap before the read's continuation runs.
+      const read = internals.getActiveWorkflowRunIds("archived");
+      const event = workspaceService.emitWorkflowRunActivity({
+        workspaceId: "archived",
+        runId: "wfr_live",
+        status: "running",
+      });
+      await event;
+      expect([...(await read)]).toEqual(["wfr_live"]);
+      expect(internals.activeWorkflowRunIdsByWorkspace.get("archived")).toBe(await read);
+      // Dormant stores are never scanned on either path.
+      expect(scanSpy).not.toHaveBeenCalled();
+    } finally {
+      scanSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("caches active workflow run counts and updates emitted activity from status events", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
@@ -10724,10 +10920,57 @@ describe("WorkspaceService initialize", () => {
     };
     spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
 
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
     await workspaceService.initialize();
+    expect(removeWorkspaceData).not.toHaveBeenCalled();
+    expect(metadataSpy).toHaveBeenCalledWith({ probeCheckouts: false });
+
+    await workspaceService.cleanupArchivedDevToolsLogs();
 
     expect(removeWorkspaceData).toHaveBeenCalledTimes(1);
     expect(removeWorkspaceData).toHaveBeenCalledWith("archived-ws");
+  });
+
+  test("bounds archived DevTools cleanup and stops admitting work on shutdown", async () => {
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(
+        Array.from({ length: 40 }, (_, i) =>
+          createFrontendWorkspaceMetadata({
+            id: "archived-" + i,
+            name: "Archived",
+            archivedAt: "2026-01-01T00:00:00.000Z",
+          })
+        )
+      )
+    );
+    const started = createDeferred<void>();
+    const release = createDeferred<void>();
+    const abort = new AbortController();
+    let active = 0;
+    let peak = 0;
+    const hasWorkspaceData = mock(async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      if (active === 16) started.resolve();
+      await release.promise;
+      active -= 1;
+      return false;
+    });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData,
+      removeWorkspaceData: mock(() => Promise.resolve()),
+    });
+    const cleanup = workspaceService.cleanupArchivedDevToolsLogs({ signal: abort.signal });
+    try {
+      await started.promise;
+      expect(peak).toBe(16);
+      expect(hasWorkspaceData).toHaveBeenCalledTimes(16);
+      abort.abort();
+    } finally {
+      release.resolve();
+      await cleanup;
+    }
+    expect(hasWorkspaceData).toHaveBeenCalledTimes(16);
   });
 
   test("initialize schedules no recovery once shutdown has aborted it", async () => {
@@ -10791,6 +11034,210 @@ describe("WorkspaceService initialize", () => {
     startupAccess.sessions.delete("ws-promoted");
   });
 
+  test("bounds concurrent transient startup-recovery sessions while recovering every chat", async () => {
+    const ids = Array.from({ length: 30 }, (_, index) => `ws-${index}`);
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const gates: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
+    let live = 0;
+    let peakLive = 0;
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(() => {
+      live += 1;
+      peakLive = Math.max(peakLive, live);
+      const gate = Promise.withResolvers<void>();
+      gates.push(gate);
+      return {
+        ...createCompactionAdmissionMocks(),
+        runStartupRecovery: mock(() => gate.promise),
+        shouldRetainAfterStartupRecovery: mock(() => false),
+        scheduleStartupRecovery: mock(() => undefined),
+        dispose: mock(() => {
+          live -= 1;
+        }),
+      } as unknown as AgentSession;
+    });
+
+    await workspaceService.initialize();
+    await flush();
+    // Only a permit's worth of sessions exist while every recovery is still in flight.
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY);
+
+    // Finishing one recovery admits exactly one queued workspace.
+    gates[0].resolve();
+    await flush();
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY + 1);
+
+    for (let released = 1; released < ids.length; released++) {
+      gates[released].resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+    expect(peakLive).toBe(STARTUP_RECOVERY_CONCURRENCY);
+    expect(createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId).sort()).toEqual(
+      [...ids].sort()
+    );
+  });
+
+  test("holds a startup-recovery slot until the transient session's disposal settles", async () => {
+    const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 2 }, (_, i) => `ws-${i}`);
+    // The first admitted session is promoted (recovery left activity alive); the rest are
+    // transient and must be disposed before their slot is reusable.
+    const promoted = ids[0];
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+      sessions: Map<string, AgentSession>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const recoveries = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const disposals = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
+      (workspaceId) => {
+        const recovery = Promise.withResolvers<void>();
+        recoveries.set(workspaceId, recovery);
+        return {
+          ...createCompactionAdmissionMocks(),
+          runStartupRecovery: mock(() => recovery.promise),
+          shouldRetainAfterStartupRecovery: mock(() => workspaceId === promoted),
+          scheduleStartupRecovery: mock(() => undefined),
+          onChatEvent: mock(() => () => undefined),
+          onMetadataEvent: mock(() => () => undefined),
+          dispose: mock(() => {
+            const disposal = Promise.withResolvers<void>();
+            disposals.set(workspaceId, disposal);
+            return disposal.promise;
+          }),
+        } as unknown as AgentSession;
+      }
+    );
+    const created = () => createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId);
+
+    await workspaceService.initialize();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+    const [, transient] = created();
+
+    // A transient session whose recovery finished but whose dispose is still pending keeps
+    // its slot: listeners and heap are only released when dispose settles.
+    recoveries.get(transient)!.resolve();
+    await flush();
+    expect(disposals.has(transient)).toBe(true);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY);
+
+    disposals.get(transient)!.resolve();
+    await flush();
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 1);
+
+    // A promoted session is live by design and releases its slot as soon as recovery ends.
+    recoveries.get(promoted)!.resolve();
+    await flush();
+    expect(startupAccess.sessions.get(promoted)).toBeDefined();
+    expect(disposals.has(promoted)).toBe(false);
+    expect(created()).toHaveLength(STARTUP_RECOVERY_CONCURRENCY + 2);
+
+    // Drain in rounds: each disposal admits another session whose gates appear late.
+    for (const _round of ids) {
+      for (const recovery of recoveries.values()) recovery.resolve();
+      await flush();
+      for (const disposal of disposals.values()) disposal.resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+    expect(created().sort()).toEqual([...ids].sort());
+    startupAccess.sessions.delete(promoted);
+  });
+
+  test("skips queued startup recoveries whose workspace was archived or removed while waiting", async () => {
+    const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 4 }, (_, i) => `ws-${i}`);
+    const archivedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 1];
+    const removedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 2];
+    // Mutable registry: the mock re-reads it on every call, standing in for the memo refresh
+    // that a real archive/remove edit triggers via the config snapshot change.
+    const registry = ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id }));
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve(registry.map((entry) => ({ ...entry })))
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+
+    const startupAccess = workspaceService as unknown as {
+      createSession: (workspaceId: string) => AgentSession;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+    };
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const gates: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
+    const recoveredWith = new Map<string, WorkspaceMetadata | undefined>();
+    const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
+      (workspaceId) => {
+        const gate = Promise.withResolvers<void>();
+        gates.push(gate);
+        return {
+          ...createCompactionAdmissionMocks(),
+          runStartupRecovery: mock((metadata?: WorkspaceMetadata) => {
+            recoveredWith.set(workspaceId, metadata);
+            return gate.promise;
+          }),
+          shouldRetainAfterStartupRecovery: mock(() => false),
+          scheduleStartupRecovery: mock(() => undefined),
+          dispose: mock(() => undefined),
+        } as unknown as AgentSession;
+      }
+    );
+
+    await workspaceService.initialize();
+    await flush();
+    expect(createSessionSpy).toHaveBeenCalledTimes(STARTUP_RECOVERY_CONCURRENCY);
+
+    // While the tail is still waiting on a permit, the user archives one workspace, removes
+    // another, and retitles a third.
+    const archivedEntry = registry.find((entry) => entry.id === archivedWhileQueued)!;
+    archivedEntry.archivedAt = "2026-03-20T00:00:00.000Z";
+    registry.splice(
+      registry.findIndex((entry) => entry.id === removedWhileQueued),
+      1
+    );
+    const retitled = ids[STARTUP_RECOVERY_CONCURRENCY + 3];
+    registry.find((entry) => entry.id === retitled)!.title = "Renamed while queued";
+
+    // Array iteration is live: gates pushed by newly admitted sessions are released too.
+    for (const gate of gates) {
+      gate.resolve();
+      await flush();
+    }
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
+
+    const recovered = createSessionSpy.mock.calls.map(([workspaceId]) => workspaceId).sort();
+    expect(recovered).toEqual(
+      ids.filter((id) => id !== archivedWhileQueued && id !== removedWhileQueued).sort()
+    );
+    // Recovery sees the registry as it is after the wait, not the scheduling-time snapshot.
+    expect(recoveredWith.get(retitled)?.title).toBe("Renamed while queued");
+  });
+
   test("disposes transient startup-recovery sessions that go idle", async () => {
     const dispose = mock(() => undefined);
     const fakeSession = {
@@ -10809,10 +11256,12 @@ describe("WorkspaceService initialize", () => {
     const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
       () => fakeSession
     );
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
 
     startupAccess.startStartupRecovery("live-ws");
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(createSessionSpy).toHaveBeenCalledWith("live-ws");
     expect(dispose).toHaveBeenCalledTimes(1);
@@ -10839,10 +11288,12 @@ describe("WorkspaceService initialize", () => {
       sessions: Map<string, AgentSession>;
     };
     spyOn(startupAccess, "createSession").mockImplementation(() => fakeSession);
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
 
     startupAccess.startStartupRecovery("live-ws");
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(dispose).not.toHaveBeenCalled();
     expect(startupAccess.sessions.get("live-ws")).toBe(fakeSession);
@@ -11913,6 +12364,47 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test.each([false, true])(
+    "task rescue follows the dispatched continuation correlation (downgraded: %s)",
+    async (downgraded) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(downgraded);
+      fakeSession.sendMessage.mockResolvedValue(
+        Err({ type: "unknown" as const, raw: "admission refused" })
+      );
+      const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
+      const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          markInterruptedTaskRunning,
+          restoreInterruptedTaskAfterResumeFailure,
+        })
+      );
+      const muxMetadata = {
+        type: "workspace-turn-task" as const,
+        taskHandleId: "wst_reactivation",
+        ownerWorkspaceId: "parent-workspace",
+        turnId: "reactivation-turn",
+      };
+      const result = await workspaceService.sendMessage(
+        "test-workspace",
+        "Continue",
+        { model: "openai:gpt-4o-mini", agentId: "exec", muxMetadata },
+        { workspaceTurnContinuation: true }
+      );
+      expect(result.success).toBe(false);
+      expect(fakeSession.sendMessage).toHaveBeenCalledWith(
+        "Continue",
+        downgraded
+          ? expect.not.objectContaining({ muxMetadata })
+          : expect.objectContaining({ muxMetadata }),
+        expect.anything()
+      );
+      expect(markInterruptedTaskRunning).toHaveBeenCalledTimes(downgraded ? 1 : 0);
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledTimes(downgraded ? 1 : 0);
+    }
+  );
+
   test("sendMessage restores interrupted status when accepted edit startup fails later", async () => {
     fakeSession.isBusy.mockReturnValue(false);
 
@@ -12701,6 +13193,13 @@ describe("WorkspaceService pending auto-title", () => {
   });
 
   test("completing a pending auto-title replaces the fallback title and clears the state", async () => {
+    // Fork auto-titles honor the configured naming agent (model + thinking) first.
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: {
+        name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+      },
+    }));
     const generateIdentitySpy = spyOn(
       workspaceTitleGenerator,
       "generateWorkspaceIdentity"
@@ -12728,6 +13227,10 @@ describe("WorkspaceService pending auto-title", () => {
       expect(metadata?.title).toBe("Harden auth flow");
       expect(metadata?.pendingAutoTitle).toBeUndefined();
       expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+      expect(generateIdentitySpy.mock.calls[0]?.[1][0]).toEqual({
+        model: "google:gemini-3.8-flash",
+        thinkingLevel: "medium",
+      });
     } finally {
       generateIdentitySpy.mockRestore();
     }
@@ -12807,6 +13310,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     workspaceService = createWorkspaceServiceForTest({
@@ -13341,6 +13845,7 @@ describe("WorkspaceService streaming generation guard", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     workspaceService = createWorkspaceServiceForTest({
@@ -15539,6 +16044,250 @@ describe("WorkspaceService remove timing rollup", () => {
   });
 });
 
+describe("WorkspaceService remove sub-agent handover ordering", () => {
+  // A sub-agent's final shared-memory handover + removal tombstone are sealed
+  // under the removal locks BEFORE the checkout is deleted: a handover the
+  // owner store cannot take aborts with the checkout intact, and a refused
+  // checkout deletion rolls the tombstone back.
+  const projectPath = "/tmp/proj-handover";
+  const workspaceId = "child-handover";
+  const ownerId = "owner-handover";
+  const workspacePath = path.join(projectPath, "child-ws");
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  let rootDir: string;
+
+  beforeEach(async () => {
+    rootDir = path.join(tmpdir(), "mux-handover-order", `root-${crypto.randomUUID()}`);
+    await fsPromises.mkdir(path.join(rootDir, "sessions", workspaceId), { recursive: true });
+  });
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  function buildConfig(): Partial<Config> {
+    const topology = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: ownerId,
+                name: "owner",
+                path: path.join(projectPath, "owner-ws"),
+                runtimeConfig,
+              },
+              {
+                id: workspaceId,
+                name: "child",
+                path: workspacePath,
+                runtimeConfig,
+                parentWorkspaceId: ownerId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    return {
+      rootDir,
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(rootDir, "sessions"),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      editConfig: mock((edit: (cfg: typeof topology) => typeof topology) =>
+        Promise.resolve(edit(topology))
+      ),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildAiService(): AIService {
+    return {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: "child",
+            projectPath,
+            projectName: "proj",
+            runtimeConfig,
+            parentWorkspaceId: ownerId,
+          })
+        )
+      ),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+  }
+
+  test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let adoptions = 0;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
+          adoptions++;
+          // The unlocked pre-pass succeeds; the late note appears for the
+          // locked pass, which cannot place it.
+          return options?.locksHeld
+            ? Promise.reject(new Error("1 legacy note could not be folded"))
+            : Promise.resolve();
+        },
+      });
+      const result = await workspaceService.remove(workspaceId);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("could not be folded");
+      expect(adoptions).toBe(2);
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      // force accepts the loss and completes the removal.
+      expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a teardown step failing after the seal rolls the tombstone back and releases the gate", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const config = buildConfig();
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      // The consolidation drain runs once before the seal and again after the
+      // checkout deletion; the second call stands in for any teardown step
+      // that rejects once the child is durably tombstoned.
+      const calls: string[] = [];
+      let cancels = 0;
+      let failSecondCancel = true;
+      workspaceService.setMemoryConsolidationService({
+        triggerInBackground: () => undefined,
+        triggerHarvestThenSweepInBackground: () => undefined,
+        cancelInFlightConsolidation: () => {
+          calls.push("cancel");
+          cancels++;
+          return cancels === 2 && failSecondCancel
+            ? Promise.reject(new Error("sandbox teardown failed"))
+            : Promise.resolve();
+        },
+        releaseRemovalCancellation: () => {
+          calls.push("release");
+        },
+        finalizeHarvestsForRemoval: () => {
+          calls.push("finalize");
+          return Promise.resolve();
+        },
+      });
+      const failed = await workspaceService.remove(workspaceId);
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("sandbox teardown failed");
+      // Still registered: the sealed marker is gone, the gate lifted, and
+      // nothing was finalized.
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(calls).toContain("release");
+      expect(calls).not.toContain("finalize");
+      // The child's memory works again: its shared-store write is not
+      // refused by a stale tombstone.
+      const memoryService = new MemoryService(
+        {
+          rootDir,
+          sessionsDir: path.join(rootDir, "sessions"),
+          loadConfigOrDefault: config.loadConfigOrDefault,
+          configFileStamp: () => "stable",
+          onConfigChanged: () => undefined,
+        } as unknown as Config,
+        new MemoryMetaService(rootDir)
+      );
+      const created = await memoryService.create(
+        { runtime: null, checkoutCwd: "", workspaceId, projectPath: "" },
+        "/memories/workspace/after-abort.md",
+        "still usable",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      // A retried removal completes: cancelled, tombstoned, finalized, not released.
+      failSecondCancel = false;
+      calls.length = 0;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+      expect(calls).toContain("finalize");
+      expect(calls).not.toContain("release");
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a refused checkout deletion rolls the sealed tombstone back", async () => {
+    let refuse = true;
+    const deleteWorkspace = mock(() =>
+      Promise.resolve(
+        refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath }
+      )
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let sealedTombstone = false;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      deleteWorkspace.mockImplementation(async () => {
+        // Runtime deletion runs with the tombstone already sealed.
+        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
+        return refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath };
+      });
+      const refused = await workspaceService.remove(workspaceId);
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("uncommitted changes");
+      expect(sealedTombstone).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      refuse = false;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+});
+
 describe("WorkspaceService remove shared-workspace guard", () => {
   const projectPath = "/tmp/proj-shared";
   const workspaceId = "child-shared";
@@ -15762,6 +16511,220 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 });
 
+describe("WorkspaceService remove shared memory owner pinning", () => {
+  const projectPath = "/tmp/proj-memory-pin";
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  interface Entry {
+    id: string;
+    name: string;
+    path: string;
+    runtimeConfig: typeof runtimeConfig;
+    parentWorkspaceId?: string;
+    memoryOwnerWorkspaceId?: string;
+  }
+
+  /** owner → mid → grand: removing `mid` must keep `grand` on the owner's notebook. */
+  function buildTopology(): { projects: Map<string, { trusted: boolean; workspaces: Entry[] }> } {
+    return {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: "ws-owner", name: "owner", path: `${projectPath}/owner`, runtimeConfig },
+              {
+                id: "ws-mid",
+                name: "mid",
+                path: `${projectPath}/mid`,
+                runtimeConfig,
+                parentWorkspaceId: "ws-owner",
+              },
+              {
+                id: "ws-grand",
+                name: "grand",
+                path: `${projectPath}/grand`,
+                runtimeConfig,
+                parentWorkspaceId: "ws-mid",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+  }
+
+  function buildConfig(options: { persistPins: boolean }): {
+    config: Partial<Config>;
+    topology: ReturnType<typeof buildTopology>;
+  } {
+    const topology = buildTopology();
+    const config = {
+      rootDir: path.join(tmpdir(), "mux-memory-pin", `root-${crypto.randomUUID()}`),
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(tmpdir(), "mux-memory-pin", `sessions-${crypto.randomUUID()}`),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath: `${projectPath}/mid`, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      // Config swallows write failures: a pin that does not land must be
+      // caught by the removal's verified read-back, so the no-persist variant
+      // applies the edit to a throwaway copy.
+      editConfig: mock((edit: (cfg: ReturnType<typeof buildTopology>) => unknown) => {
+        edit(options.persistPins ? topology : buildTopology());
+        return Promise.resolve();
+      }),
+    } as unknown as Partial<Config>;
+    return { config, topology };
+  }
+
+  function buildAiService(): AIService {
+    class FakeAIService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({
+          success: true as const,
+          data: { id: "ws-mid", name: "mid", projectPath, runtimeConfig },
+        })
+      );
+    }
+    return new FakeAIService() as unknown as AIService;
+  }
+
+  test("pins surviving descendants to the root owner before tearing the middle node down", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config, topology } = buildConfig({ persistPins: true });
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const result = await workspaceService.remove("ws-mid");
+      expect(result.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      const grand = topology.projects
+        .get(projectPath)!
+        .workspaces.find((ws) => ws.id === "ws-grand");
+      expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+      // Once ws-mid is gone the pin keeps ws-grand on the root's notebook.
+      topology.projects.get(projectPath)!.workspaces = topology.projects
+        .get(projectPath)!
+        .workspaces.filter((ws) => ws.id !== "ws-mid");
+      expect(resolveWorkspaceMemoryOwnerId(topology as never, "ws-grand")).toBe("ws-owner");
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("aborts a non-forced removal (workspace intact) when the descendant pin does not persist", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config } = buildConfig({ persistPins: false });
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const refused = await workspaceService.remove("ws-mid");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("retry the removal");
+      // Nothing destructive ran: no checkout deletion, no deregistration.
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+
+      // Forced removal accepts the loss and proceeds.
+      const forced = await workspaceService.remove("ws-mid", true);
+      expect(forced.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("aborts a non-forced removal when the owner cannot be resolved from a readable config", async () => {
+    // An unreadable config.json: the lenient read yields an empty topology
+    // (this workspace would look like its own owner — no pins, no handover),
+    // the strict one throws. The removal must decide from the strict read.
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config } = buildConfig({ persistPins: true });
+    const loadConfigOrDefault = mock((options?: { throwOnError?: boolean }) => {
+      if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
+      return { projects: new Map() };
+    });
+    (config as { loadConfigOrDefault: unknown }).loadConfigOrDefault = loadConfigOrDefault;
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const refused = await workspaceService.remove("ws-mid");
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("config.json unreadable");
+        expect(refused.error).toContain("retry the removal");
+      }
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      expect(config.editConfig).not.toHaveBeenCalled();
+
+      // Forced removal accepts the loss and proceeds.
+      const forced = await workspaceService.remove("ws-mid", true);
+      expect(forced.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("pins surviving descendants even when the removed node's metadata cannot be built", async () => {
+    // The phantom-cleanup path: no metadata, yet the config entry is removed
+    // all the same — the pin is a config-only edit and must still land, or a
+    // surviving child silently falls back to a private notebook.
+    class PhantomAiService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({ success: false as const, error: "metadata unavailable" })
+      );
+    }
+    const { config, topology } = buildConfig({ persistPins: true });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const result = await workspaceService.remove("ws-mid");
+    expect(result.success).toBe(true);
+    expect(config.removeWorkspace).toHaveBeenCalledTimes(1);
+    const grand = topology.projects.get(projectPath)!.workspaces.find((ws) => ws.id === "ws-grand");
+    expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+
+    // ...and a pin that does not persist still aborts the non-forced removal
+    // on that path, before the config entry is dropped.
+    const unpersisted = buildConfig({ persistPins: false });
+    const refusing = createWorkspaceServiceForTest({
+      config: unpersisted.config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const refused = await refusing.remove("ws-mid");
+    expect(refused.success).toBe(false);
+    expect(unpersisted.config.removeWorkspace).not.toHaveBeenCalled();
+  });
+});
+
 describe("WorkspaceService remove desktop session cleanup", () => {
   const workspaceId = "ws-remove-desktop";
 
@@ -15796,6 +16759,11 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      // The descendant pin pass edits whatever topology a test installed.
+      editConfig: mock((edit: (cfg: unknown) => unknown) => {
+        edit(mockConfig.loadConfigOrDefault!());
+        return Promise.resolve();
+      }) as unknown as MockWorkspaceConfig["editConfig"],
     };
 
     workspaceService = createWorkspaceServiceForTest({
@@ -15853,6 +16821,108 @@ describe("WorkspaceService remove desktop session cleanup", () => {
 
     expect(result.success).toBe(false);
     expect(reopened).toEqual([workspaceId]);
+  });
+
+  test("remove() lifts the consolidation teardown gate only when it aborts before committing", async () => {
+    const calls: string[] = [];
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => {
+        calls.push("cancel");
+        return Promise.resolve();
+      },
+      releaseRemovalCancellation: () => {
+        calls.push("release");
+      },
+      finalizeHarvestsForRemoval: () => {
+        calls.push("finalize");
+        return Promise.resolve();
+      },
+    });
+    // Aborted before the point of no return (live descendant tasks): the
+    // workspace stays intact, so any teardown gate is lifted again and no
+    // harvest state is finalized.
+    let descendants = true;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => descendants })
+    );
+    const aborted = await workspaceService.remove(workspaceId);
+    expect(aborted.success).toBe(false);
+    expect(calls).toEqual(["release"]);
+    // Aborted inside the locked handover (a late legacy note the owner store
+    // cannot take), i.e. after the drain but BEFORE the tombstone: the session
+    // directory survives, so the gate is lifted too.
+    descendants = false;
+    calls.length = 0;
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const topology = {
+      projects: new Map([
+        [
+          "/tmp/src/project",
+          {
+            workspaces: [
+              { path: "/tmp/src/project/owner", id: "ws-owner" },
+              { path: "/tmp/src/project/child", id: workspaceId, parentWorkspaceId: "ws-owner" },
+            ],
+          },
+        ],
+      ]),
+    };
+    // The service holds its own copy of the mock config (createWorkspaceServiceForTest).
+    const config = (workspaceService as unknown as { config: MockWorkspaceConfig }).config;
+    const previousLoad = config.loadConfigOrDefault;
+    config.loadConfigOrDefault = (() => topology) as MockWorkspaceConfig["loadConfigOrDefault"];
+    workspaceService.setSharedWorkspaceMemoryStore({
+      adoptLegacyPrivateStoreForRemoval: () =>
+        Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
+    });
+    try {
+      const lockedAbort = await workspaceService.remove(workspaceId);
+      expect(lockedAbort.success).toBe(false);
+      if (!lockedAbort.success) expect(lockedAbort.error).toContain("tombstone could be published");
+      expect(existsSync(sessionDir)).toBe(true);
+      expect(calls).toContain("cancel");
+      expect(calls).toContain("release");
+      expect(calls).not.toContain("finalize");
+    } finally {
+      config.loadConfigOrDefault = previousLoad;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+    }
+    // Committed removal: cancelled (drained), harvest records finalized once
+    // the session directory is gone, and never released.
+    calls.length = 0;
+    const removed = await workspaceService.remove(workspaceId);
+    expect(removed.success).toBe(true);
+    expect(existsSync(sessionDir)).toBe(false);
+    expect(calls.filter((call) => call === "cancel").length).toBeGreaterThan(0);
+    expect(calls).toContain("finalize");
+    expect(calls).not.toContain("release");
+  });
+
+  test("remove() succeeds and emits its removal event when finalizing harvest records fails", async () => {
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => Promise.resolve(),
+      releaseRemovalCancellation: () => undefined,
+      finalizeHarvestsForRemoval: () => Promise.reject(new Error("sidecar unwritable")),
+    });
+    const removed: string[] = [];
+    workspaceService.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.metadata === null) removed.push(event.workspaceId);
+    });
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    // Deregistration already committed: harvest bookkeeping is best-effort.
+    const result = await workspaceService.remove(workspaceId);
+    expect(result.success).toBe(true);
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
+    expect(removed).toEqual([workspaceId]);
+    expect(existsSync(sessionDir)).toBe(false);
   });
 
   test("remove() flushes the timeline before deleting the session directory", async () => {
@@ -20366,6 +21436,223 @@ describe("WorkspaceService init cancellation", () => {
   });
 });
 
+describe("WorkspaceService naming model candidates", () => {
+  const NAMING_DEFAULTS = {
+    name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" as const },
+  };
+
+  function createNamingService(options: {
+    agentAiDefaults?: AgentAiDefaults;
+    defaultModel?: string;
+    minThinkingLevelByModel?: Record<string, ThinkingLevel>;
+    metadata?: Partial<FrontendWorkspaceMetadata>;
+  }): WorkspaceService {
+    const metadata = options.metadata
+      ? Ok({
+          id: "ws-naming",
+          name: "ws-naming",
+          projectName: "proj",
+          projectPath: "/tmp/proj",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" as const },
+          ...options.metadata,
+        })
+      : { success: false as const, error: "workspace metadata unavailable" };
+    return createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/test",
+        sessionsDir: "/tmp/test/sessions",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map(),
+          agentAiDefaults: options.agentAiDefaults,
+          defaultModel: options.defaultModel,
+          minThinkingLevelByModel: options.minThinkingLevelByModel,
+        })),
+      },
+      aiService: createMockAIService({
+        getWorkspaceMetadata: mock(() => Promise.resolve(metadata)),
+      }),
+    });
+  }
+
+  test("configured naming model + thinking leads, hardcoded small models follow", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates[0]).toEqual({ model: "google:gemini-3.8-flash", thinkingLevel: "medium" });
+    expect(candidates.slice(1)).toEqual(NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })));
+  });
+
+  test.each(["medium", "off"] as const)(
+    "honors thinking-only naming settings with an inherited model (thinking=%s)",
+    async (thinkingLevel) => {
+      const service = createNamingService({
+        agentAiDefaults: { name_workspace: { thinkingLevel } },
+      });
+
+      const candidates = await service.getWorkspaceNamingCandidates(undefined);
+
+      expect(candidates[0]).toEqual({ model: DEFAULT_MODEL, thinkingLevel });
+    }
+  );
+
+  test("thinking-only naming settings inherit the workspace's active model, not the app default", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+      metadata: {
+        agentId: "ask",
+        aiSettingsByAgent: {
+          exec: { model: "openai:gpt-5.4", thinkingLevel: "off" },
+          ask: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+        },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual([
+      "openai:gpt-5.6-sol",
+      ...NAME_GEN_PREFERRED_MODELS,
+      "openai:gpt-5.4",
+    ]);
+    expect(candidates[0]).toEqual({ model: "openai:gpt-5.6-sol", thinkingLevel: "medium" });
+  });
+
+  test("thinking-only naming settings inherit the caller's model for a workspace that does not exist yet", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined, [
+      "openai:gpt-5.6-sol",
+    ]);
+
+    expect(candidates).toEqual([
+      { model: "openai:gpt-5.6-sol", thinkingLevel: "medium" },
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+    ]);
+  });
+
+  test("thinking-only naming settings fall back to the configured default model", async () => {
+    const service = createNamingService({
+      agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
+      defaultModel: "openai:gpt-5.6-terra",
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined);
+
+    expect(candidates[0]).toEqual({ model: "openai:gpt-5.6-terra", thinkingLevel: "medium" });
+  });
+
+  test("an active model without naming settings does not displace the hardcoded small models", async () => {
+    const service = createNamingService({
+      defaultModel: "openai:gpt-5.6-terra",
+      metadata: {
+        agentId: "exec",
+        aiSettingsByAgent: { exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" } },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual([
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+      { model: "openai:gpt-5.6-sol" },
+    ]);
+  });
+
+  test("carries each candidate's per-model thinking floor override", async () => {
+    const service = createNamingService({
+      agentAiDefaults: NAMING_DEFAULTS,
+      minThinkingLevelByModel: {
+        "google:gemini-3.8-flash": "high",
+        [NAME_GEN_PREFERRED_MODELS[0]]: "low",
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual([
+      { model: "google:gemini-3.8-flash", thinkingLevel: "medium", minThinkingLevel: "high" },
+      { model: NAME_GEN_PREFERRED_MODELS[0], minThinkingLevel: "low" },
+      { model: NAME_GEN_PREFERRED_MODELS[1] },
+    ]);
+  });
+
+  test("keeps legacy model fallback for workspaces without per-agent settings", async () => {
+    const service = createNamingService({
+      metadata: { aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" } },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual([
+      ...NAME_GEN_PREFERRED_MODELS,
+      "openai:gpt-5.6-sol",
+    ]);
+  });
+
+  test("unset naming config keeps the hardcoded small models first, thinking off", async () => {
+    const service = createNamingService({});
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates).toEqual(NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })));
+    expect(candidates.every((candidate) => candidate.thinkingLevel === undefined)).toBe(true);
+  });
+
+  test("the active per-agent model leads workspace fallbacks without stale legacy models or duplicates", async () => {
+    const service = createNamingService({
+      agentAiDefaults: NAMING_DEFAULTS,
+      metadata: {
+        agentId: "ask",
+        aiSettings: { model: "openai:gpt-5.1-codex-mini", thinkingLevel: "off" },
+        aiSettingsByAgent: {
+          exec: { model: NAME_GEN_PREFERRED_MODELS[0], thinkingLevel: "off" },
+          plan: { model: "openai:gpt-5.4", thinkingLevel: "off" },
+          ask: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+        },
+      },
+    });
+
+    const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual([
+      "google:gemini-3.8-flash",
+      ...NAME_GEN_PREFERRED_MODELS,
+      "openai:gpt-5.6-sol",
+      "openai:gpt-5.4",
+    ]);
+  });
+
+  test("pre-creation naming (no workspace) puts caller fallbacks after the configured and built-in models", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    const candidates = await service.getWorkspaceNamingCandidates(undefined, [
+      "openai:gpt-5.6-sol",
+      NAME_GEN_PREFERRED_MODELS[0],
+    ]);
+
+    expect(candidates).toEqual([
+      { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+      ...NAME_GEN_PREFERRED_MODELS.map((model) => ({ model })),
+      { model: "openai:gpt-5.6-sol" },
+    ]);
+  });
+
+  test("small-model string candidates share the same precedence", async () => {
+    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+
+    expect(await service.getWorkspaceTitleModelCandidates("ws-naming")).toEqual([
+      "google:gemini-3.8-flash",
+      ...NAME_GEN_PREFERRED_MODELS,
+    ]);
+  });
+});
+
 describe("WorkspaceService regenerateTitle", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
@@ -20391,6 +21678,15 @@ describe("WorkspaceService regenerateTitle", () => {
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map(),
+        agentAiDefaults: {
+          name_workspace: {
+            modelString: "google:gemini-3.8-flash",
+            thinkingLevel: "medium" as const,
+          },
+        },
+      })),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
       on: mock(() => undefined as unknown as InitStateManager),
@@ -20437,6 +21733,8 @@ describe("WorkspaceService regenerateTitle", () => {
       }
       expect(generateIdentitySpy).toHaveBeenCalledTimes(1);
       const call = generateIdentitySpy.mock.calls[0];
+      // Regeneration honors the configured naming agent (model + thinking) first.
+      expect(call?.[1][0]).toEqual({ model: "google:gemini-3.8-flash", thinkingLevel: "medium" });
       expect(call?.[3]).toBeUndefined();
       expect(call?.[4]).toBe("Fix CI");
       expect(updateTitleSpy).toHaveBeenCalledWith(workspaceId, "Fix CI");

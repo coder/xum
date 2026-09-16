@@ -4712,6 +4712,7 @@ export class WorkspaceTurnManager {
   captureQueueCutAttributionSnapshot(workspaceId: string): QueueCutAttributionSnapshot {
     const activeStream = this.streamManager?.getStreamInfo(workspaceId);
     return {
+      turnGeneration: this.workspaceService.getTurnGeneration(workspaceId),
       activeStream:
         activeStream != null
           ? { messageId: activeStream.messageId, muxMetadata: activeStream.muxMetadata }

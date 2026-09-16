@@ -246,9 +246,10 @@ export const tokenizer = {
     output: z.array(z.number()),
   },
   calculateStats: {
+    // Backend reads the history itself; shipping the renderer's copy here cost ~36 KB/s per
+    // tab during streaming (see TokenizerService.calculateWorkspaceStats).
     input: z.object({
       workspaceId: z.string(),
-      messages: z.array(MuxMessageSchema),
       model: z.string(),
     }),
     output: ChatStatsSchema,
@@ -2333,7 +2334,11 @@ export const nameGeneration = {
   generate: {
     input: z.object({
       message: z.string(),
-      /** Ordered list of model candidates to try (backend resolves gateway routing in createModel) */
+      /**
+       * Caller fallback models (e.g. the model selected for the new workspace). The backend
+       * tries the configured `name_workspace` model and its built-in small-model fallbacks
+       * first, then these; gateway routing is resolved in createModel.
+       */
       candidates: z.array(z.string()),
     }),
     output: ResultSchema(
@@ -2827,6 +2832,10 @@ const DevToolsEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("step-updated"),
     step: DevToolsStepSchema,
+  }),
+  z.object({
+    type: z.literal("runs-evicted"),
+    runIds: z.array(z.string()),
   }),
   z.object({
     type: z.literal("cleared"),

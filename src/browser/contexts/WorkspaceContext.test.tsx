@@ -695,6 +695,40 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace?.workspaceId).toBe(parentId);
   });
 
+  test.each([true, false])(
+    "seeds settings only for non-archived metadata events (archived=%s)",
+    async (archived) => {
+      const workspaceId = "metadata-settings";
+      const metadata = createWorkspaceMetadata({
+        id: workspaceId,
+        archivedAt: "2025-02-01T00:00:00.000Z",
+        ...(archived ? {} : { unarchivedAt: "2025-03-01T00:00:00.000Z" }),
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
+      });
+      let processed = false;
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([]),
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                yield await Promise.resolve({ workspaceId, metadata });
+                processed = true;
+              })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+            ),
+        },
+      });
+      await setup();
+      await waitFor(() => expect(processed).toBe(true));
+      expect(readPersistedState<string | null>(getModelKey(workspaceId), null)).toBe(
+        archived ? null : "openai:gpt-5.2"
+      );
+      expect(readPersistedState<string | null>(getThinkingLevelKey(workspaceId), null)).toBe(
+        archived ? null : "xhigh"
+      );
+    }
+  );
+
   test("seeds model + thinking localStorage from backend metadata", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
       createWorkspaceMetadata({

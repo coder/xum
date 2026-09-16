@@ -1,8 +1,5 @@
 import { describe, it, expect } from "@jest/globals";
-import {
-  renderAttachmentToContent,
-  renderAttachmentsToContentWithBudget,
-} from "./attachmentRenderer";
+import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
 import type {
   TodoListAttachment,
   PlanFileReferenceAttachment,
@@ -23,7 +20,7 @@ describe("attachmentRenderer", () => {
       ],
     };
 
-    const content = renderAttachmentToContent(attachment);
+    const content = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
 
     expect(content).toContain("todo_read");
     expect(content).toContain("[x]");
@@ -51,7 +48,7 @@ describe("attachmentRenderer", () => {
       ],
     };
 
-    const content = renderAttachmentToContent(attachment);
+    const content = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
 
     expect(content).toContain("The following skills were loaded in this session");
     expect(content).toContain('<agent-skill name="react-effects" scope="project">');
@@ -144,19 +141,15 @@ describe("attachmentRenderer", () => {
       ],
     };
 
-    const content = renderAttachmentToContent(attachment);
+    const content = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
 
-    expect(content).not.toContain("</system-update>");
+    expect(content.match(/<\/system-update>/g)).toHaveLength(1);
     expect(content).not.toContain("IGNORE");
     expect(content).not.toContain("evil");
     expect(content).not.toContain("ok.ts");
-    expect(content.split("\n")).toHaveLength(1);
     // The count is the only path-derived signal.
     expect(content).toContain("3 previously read files");
 
-    // Budget path: fits => included whole; too small => dropped whole.
-    const budgeted = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
-    expect(budgeted).toContain("3 previously read files");
     const dropped = renderAttachmentsToContentWithBudget([attachment], { maxChars: 30 });
     expect(dropped).not.toContain("previously read");
   });
@@ -176,7 +169,7 @@ describe("attachmentRenderer", () => {
       ],
     };
 
-    const content = renderAttachmentToContent(attachment);
+    const content = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
 
     expect(content).toContain("wfr_research");
     expect(content).toContain("task-explore");
@@ -197,7 +190,7 @@ describe("attachmentRenderer", () => {
       ],
     };
 
-    const content = renderAttachmentToContent(attachment);
+    const content = renderAttachmentsToContentWithBudget([attachment], { maxChars: 10_000 });
 
     expect(content).toContain("wfr_research");
     expect(content).not.toContain(longTitle);

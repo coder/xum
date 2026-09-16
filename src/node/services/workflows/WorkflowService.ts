@@ -44,6 +44,7 @@ import { ORPCError } from "@orpc/server";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
+  isWorkflowRunAlreadyActiveError,
   type WorkflowNestedWorkflowSpec,
   type WorkflowRunnerClock,
   type WorkflowRunnerRunOptions,
@@ -1383,10 +1384,6 @@ function getWorkflowScriptDefinitionName(
     .slice(0, 64)
     .replace(/-+$/u, "");
   return normalized.length > 0 ? normalized : "workflow";
-}
-
-function isWorkflowRunAlreadyActiveError(error: unknown, runId: string): boolean {
-  return error instanceof Error && error.message === `Workflow run is already active: ${runId}`;
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {

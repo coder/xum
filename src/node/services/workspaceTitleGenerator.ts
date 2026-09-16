@@ -4,8 +4,13 @@ import { log } from "./log";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { NameGenerationError, SendMessageError } from "@/common/types/errors";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { NAME_GEN_MAX_OUTPUT_TOKENS } from "@/common/constants/nameGeneration";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { TOOL_DEFINITIONS, ProposeNameToolArgsSchema } from "@/common/utils/tools/toolDefinitions";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import crypto from "crypto";
@@ -15,6 +20,21 @@ export interface WorkspaceIdentity {
   name: string;
   /** Human-readable title (e.g., "Fix plan mode over SSH") */
   title: string;
+}
+
+/** One model to try for naming, in precedence order. */
+export interface NameGenerationCandidate {
+  model: string;
+  /**
+   * Thinking level from the user's `name_workspace` agent settings. Hardcoded
+   * fallbacks omit it and run with thinking off; the policy floor still applies.
+   */
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * The user's explicit per-model floor for this model
+   * (config.minThinkingLevelByModel), enforced before the model is created.
+   */
+  minThinkingLevel?: ThinkingLevel;
 }
 
 // Crockford Base32 alphabet (excludes I, L, O, U to avoid confusion)
@@ -138,7 +158,8 @@ export function mapModelCreationError(
 
 /**
  * Generate workspace identity (name + title) using AI.
- * Tries candidates in order, retrying on API errors (invalid keys, quota, etc.).
+ * Tries candidates in order (configured `name_workspace` settings first, then
+ * hardcoded fallbacks), retrying on API errors (invalid keys, quota, etc.).
  *
  * - name: Codebase area with 4-char suffix (e.g., "sidebar-a1b2")
  * - title: Human-readable description (e.g., "Fix plan mode over SSH")
@@ -180,7 +201,7 @@ export function buildWorkspaceIdentityPrompt(
 
 export async function generateWorkspaceIdentity(
   message: string,
-  candidates: string[],
+  candidates: NameGenerationCandidate[],
   aiService: AIService,
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
@@ -191,16 +212,32 @@ export async function generateWorkspaceIdentity(
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
   }
 
-  // Try up to 3 candidates
-  const maxAttempts = Math.min(candidates.length, 3);
+  // Leave room for the configured naming model, both defaults, and the selected
+  // chat model so honoring naming settings does not displace the last fallback.
+  const maxAttempts = Math.min(candidates.length, 4);
 
   // Track the last classified error to return if all candidates fail
   let lastError: NameGenerationError | null = null;
 
   for (let i = 0; i < maxAttempts; i++) {
-    const modelString = candidates[i];
+    const candidate = candidates[i];
+    const modelString = candidate.model;
 
-    const modelResult = await aiService.createModel(modelString, undefined, {
+    // Clamp BEFORE creation, through the same policy + per-model floor as chat
+    // requests: the creation-time level selects provider variants (xAI picks
+    // its non-reasoning variant only for an explicit "off"), so an unset level
+    // must reach the factory as "off", not undefined.
+    const creationThinking = resolveCandidateThinking(
+      candidate,
+      modelString,
+      aiService.getProvidersConfig()
+    );
+
+    // Pinned options: the same creation-time route/config receipt every other
+    // headless streamText caller uses, so the configured thinking level is
+    // serialized for the wire the model was actually created on.
+    const modelResult = await aiService.createModelWithPinnedOptions(modelString, {
+      thinkingLevel: creationThinking,
       agentInitiated: true,
     });
     if (!modelResult.success) {
@@ -208,8 +245,48 @@ export async function generateWorkspaceIdentity(
       log.debug(`Name generation: skipping ${modelString} (${modelResult.error.type})`);
       continue;
     }
+    const pinned = modelResult.data;
 
     try {
+      // The request must carry exactly the level the model was created for. If the
+      // pinned route/config receipt resolves a different level (a re-mapped alias or
+      // a config change between the two reads), abandon this candidate instead of
+      // sending options that disagree with the created model.
+      const thinkingLevel = resolveCandidateThinking(
+        candidate,
+        pinned.optionsModelString,
+        pinned.optionsProvidersConfig
+      );
+      if (thinkingLevel !== creationThinking) {
+        lastError = {
+          type: "configuration",
+          raw: `Thinking level for ${modelString} changed after model creation (${creationThinking} -> ${thinkingLevel})`,
+        };
+        log.warn("Name generation: pinned route changed the thinking level, skipping candidate", {
+          modelString,
+          optionsModelString: pinned.optionsModelString,
+          creationThinking,
+          thinkingLevel,
+        });
+        continue;
+      }
+
+      const providerOptions = buildProviderOptions(
+        pinned.optionsModelString,
+        thinkingLevel,
+        undefined,
+        undefined,
+        pinned.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        pinned.optionsProvidersConfig,
+        pinned.optionsRouteProvider
+      );
+      // Anthropic requires max_tokens > thinking.budget_tokens. Derive the headroom
+      // from the budget that was actually serialized; other providers (and Anthropic
+      // requests without a budget) keep the SDK default.
+      const anthropicBudget = anthropicThinkingBudget(providerOptions);
+
       // Use streamText with a propose_name tool instead of Output.object().
       // Tool calls are universally supported across LLM APIs and far more
       // reliable than structured JSON output, eliminating all the fragile
@@ -226,8 +303,14 @@ export async function generateWorkspaceIdentity(
       // For this direct streamText path, the candidate retry loop handles the
       // (rare) case where the model ignores the instruction.
       const currentStream = streamText({
-        model: modelResult.data,
+        model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
+        // Same route/wire receipt as model creation; also pins thinking off
+        // explicitly for fallbacks (some providers default to medium otherwise).
+        providerOptions: providerOptions as Parameters<typeof streamText>[0]["providerOptions"],
+        ...(anthropicBudget !== undefined && {
+          maxOutputTokens: anthropicBudget + NAME_GEN_MAX_OUTPUT_TOKENS,
+        }),
         tools: {
           // Defined inline so TypeScript preserves full schema inference on
           // toolResult.output (the propose_name tool is only used here).
@@ -274,7 +357,7 @@ export async function generateWorkspaceIdentity(
       log.warn("Name generation failed, trying next candidate", { modelString, error: lastError });
       continue;
     } finally {
-      runLanguageModelCleanup(modelResult.data);
+      runLanguageModelCleanup(pinned.model);
     }
   }
 
@@ -284,6 +367,38 @@ export async function generateWorkspaceIdentity(
       raw: "No working model candidates were available for name generation.",
     }
   );
+}
+
+/**
+ * Effective thinking level for a naming candidate on a given model string/config
+ * view: the candidate's configured level (fallbacks: off) clamped to the model's
+ * policy and the user's explicit per-model floor. Only an explicit floor applies:
+ * the default "medium" floor exists to hide off/low in the interactive slider,
+ * and headless naming fallbacks must stay cheap (thinking off) like every other
+ * headless caller.
+ */
+function resolveCandidateThinking(
+  candidate: NameGenerationCandidate,
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): ThinkingLevel {
+  return enforceThinkingPolicy(
+    modelString,
+    candidate.thinkingLevel ?? "off",
+    candidate.minThinkingLevel,
+    providersConfig
+  );
+}
+
+/** Budget serialized as Anthropic `thinking: { type: "enabled", budgetTokens }`, if any. */
+function anthropicThinkingBudget(
+  providerOptions: ReturnType<typeof buildProviderOptions>
+): number | undefined {
+  if (!("anthropic" in providerOptions)) {
+    return undefined;
+  }
+  const thinking = providerOptions.anthropic.thinking;
+  return thinking?.type === "enabled" ? thinking.budgetTokens : undefined;
 }
 
 /**

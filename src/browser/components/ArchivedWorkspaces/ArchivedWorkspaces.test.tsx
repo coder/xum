@@ -2,7 +2,13 @@ import "../../../../tests/ui/dom";
 
 import { type ComponentProps, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  waitForElementToBeRemoved,
+} from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
@@ -14,6 +20,19 @@ import * as RuntimeBadgeModule from "@/browser/components/RuntimeBadge/RuntimeBa
 import * as SkeletonModule from "@/browser/components/Skeleton/Skeleton";
 import * as OptimisticBatchLRUModule from "@/browser/hooks/useOptimisticBatchLRU";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
+
+import * as AgentContextModule from "@/browser/contexts/AgentContext";
+import * as ThinkingContextModule from "@/browser/contexts/ThinkingContext";
+import * as ChatInputModule from "@/browser/features/ChatInput";
+import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ProjectMCPOverviewModule from "@/browser/components/ProjectMCPOverview/ProjectMCPOverview";
+import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
+import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
+import {
+  getArchivedWorkspacesExpandedKey,
+  getArchivedWorkspacesKey,
+} from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
 
@@ -28,6 +47,50 @@ function installTestDoubles() {
     ...actualWorkspaceStore,
   }));
 }
+
+function stubPageChrome() {
+  spyOn(AgentContextModule, "AgentProvider").mockImplementation((props) => <>{props.children}</>);
+  spyOn(ThinkingContextModule, "ThinkingProvider").mockImplementation((props) => (
+    <>{props.children}</>
+  ));
+  spyOn(ChatInputModule, "ChatInput").mockImplementation(
+    (() => null) as unknown as typeof ChatInputModule.ChatInput
+  );
+  spyOn(ProjectMCPOverviewModule, "ProjectMCPOverview").mockImplementation(() => null);
+  spyOn(ProvidersConfigModule, "useProvidersConfig").mockImplementation(() => ({
+    config: null,
+    loading: true,
+    refresh: () => Promise.resolve(),
+    updateOptimistically: () => undefined,
+    updateModelsOptimistically: () => [],
+  }));
+}
+
+function stubPageApi(list: APIClient["workspace"]["list"], getSessionUsageBatch: unknown) {
+  const api = {
+    workspace: {
+      list,
+      getSessionUsageBatch,
+      onMetadata: async function* () {
+        yield* await Promise.resolve([]);
+      },
+    },
+    projects: { listBranches: () => Promise.resolve({ branches: ["main"] }) },
+  } as unknown as APIClient;
+  spyOn(APIModule, "useAPI").mockImplementation(() => ({
+    api,
+    status: "connected",
+    error: null,
+    authenticate: () => undefined,
+    retry: () => undefined,
+  }));
+}
+
+const pageProps = {
+  leftSidebarCollapsed: false,
+  onToggleLeftSidebarCollapsed: () => undefined,
+  onWorkspaceCreated: () => undefined,
+};
 
 function createWorkspace(overrides: Partial<FrontendWorkspaceMetadata>): FrontendWorkspaceMetadata {
   return {
@@ -124,6 +187,179 @@ describe("ArchivedWorkspaces", () => {
     cleanupDom?.();
     cleanupDom = null;
   });
+
+  test("fetches costs only while expanded, including when metadata is already cached", async () => {
+    spyOn(OptimisticBatchLRUModule, "useOptimisticBatchLRU").mockRestore();
+    const workspace = createWorkspace({ id: "lazy-cost" });
+    const readWorkspaceId = mock(() => "lazy-cost");
+    Object.defineProperty(workspace, "id", { get: readWorkspaceId });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+      />
+    );
+    expect(getSessionUsageBatchMock).not.toHaveBeenCalled();
+    expect(view.queryByRole("region", { name: "Archived workspaces" })).toBeNull();
+    expect(readWorkspaceId).not.toHaveBeenCalled();
+    // A collapsed header must not advertise a count it cannot keep fresh.
+    expect(view.getByText("Archived Workspaces").textContent).toBe("Archived Workspaces");
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    expect(view.getByText("Archived Workspaces (1)")).toBeTruthy();
+    await waitFor(() => expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1));
+    expect(getSessionUsageBatchMock).toHaveBeenCalledWith({ workspaceIds: [workspace.id] });
+    fireEvent.click(view.getByLabelText("Collapse archived workspaces"));
+    view.rerender(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace, createWorkspace({ id: "new-archive" })]}
+      />
+    );
+    expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["project", "cached-project", "scratch"])(
+    "defers archived metadata and usage on the %s page until expansion",
+    async (page) => {
+      spyOn(OptimisticBatchLRUModule, "useOptimisticBatchLRU").mockRestore();
+      stubPageChrome();
+      const workspace = createWorkspace({
+        id: "lazy-page-" + page,
+        ...(page === "scratch" ? { kind: "scratch" as const } : {}),
+      });
+      const allArchived = [
+        workspace,
+        ...Array.from({ length: 1254 }, (_, i) =>
+          createWorkspace({ id: "other-" + i, projectPath: "/other-project" })
+        ),
+      ];
+      const list = mock(() => Promise.resolve(allArchived));
+      stubPageApi(list, getSessionUsageBatchMock);
+      if (page === "cached-project")
+        updatePersistedState(getArchivedWorkspacesKey(workspace.projectPath), []);
+      const view = render(
+        page === "scratch" ? (
+          <ScratchPage {...pageProps} />
+        ) : (
+          <ProjectPage
+            {...pageProps}
+            projectPath={workspace.projectPath}
+            projectName={workspace.projectName}
+          />
+        )
+      );
+      expect(list).not.toHaveBeenCalled();
+      expect(getSessionUsageBatchMock).not.toHaveBeenCalled();
+      fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+      await waitFor(() => expect(getSessionUsageBatchMock).toHaveBeenCalledTimes(1));
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledWith({ archived: true });
+      expect(getSessionUsageBatchMock).toHaveBeenCalledWith({ workspaceIds: [workspace.id] });
+      expect(view.getByLabelText("Restore workspace " + workspace.name)).toBeTruthy();
+    }
+  );
+
+  test("resets archived state when the project page switches projects", () => {
+    stubPageChrome();
+    stubPageApi(
+      mock(() => new Promise<FrontendWorkspaceMetadata[]>(() => undefined)),
+      getSessionUsageBatchMock
+    );
+    const cached = createWorkspace({ id: "a-1", name: "from-a", projectPath: "/project-a" });
+    updatePersistedState(getArchivedWorkspacesKey("/project-a"), [cached]);
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/project-a"), true);
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/project-b"), true);
+    const view = render(<ProjectPage {...pageProps} projectPath="/project-a" projectName="a" />);
+    expect(view.getByLabelText("Restore workspace from-a")).toBeTruthy();
+    view.rerender(<ProjectPage {...pageProps} projectPath="/project-b" projectName="b" />);
+    expect(view.queryByLabelText("Restore workspace from-a")).toBeNull();
+    expect(view.getByRole("region", { name: "Archived workspaces" }).textContent).toContain(
+      "Loading archived workspaces"
+    );
+  });
+
+  test("shows a refresh failure above cached rows without hiding them", () => {
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const workspace = createWorkspace({ id: "cached-1", name: "cached" });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath="/tmp/project"
+        projectName="project"
+        workspaces={[workspace]}
+        loadError="disk on fire"
+      />
+    );
+    const region = view.getByRole("region", { name: "Archived workspaces" });
+    expect(region.textContent).toContain("Failed to load archived workspaces: disk on fire");
+    expect(view.getByLabelText("Restore workspace cached")).toBeTruthy();
+  });
+
+  test("persists the refreshed archive list after a restore", async () => {
+    stubPageChrome();
+    const workspace = createWorkspace({ id: "restore-me", name: "restore-me" });
+    const list = mock(() => Promise.resolve([workspace]));
+    stubPageApi(list, getSessionUsageBatchMock);
+    updatePersistedState(getArchivedWorkspacesExpandedKey(workspace.projectPath), true);
+    const view = render(
+      <ProjectPage
+        {...pageProps}
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+      />
+    );
+    const restore = await waitFor(() => view.getByLabelText("Restore workspace restore-me"));
+    list.mockImplementation(() => Promise.resolve<FrontendWorkspaceMetadata[]>([]));
+    fireEvent.click(restore);
+    await waitForElementToBeRemoved(() => view.queryByLabelText("Restore workspace restore-me"));
+    expect(
+      readPersistedState<FrontendWorkspaceMetadata[] | undefined>(
+        getArchivedWorkspacesKey(workspace.projectPath),
+        undefined
+      )
+    ).toEqual([]);
+  });
+
+  test("distinguishes a pending archive load from an empty archive", () => {
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const props = { projectPath: "/tmp/project", projectName: "project" };
+    const view = render(<ArchivedWorkspaces {...props} workspaces={undefined} />);
+    const regionText = () => view.getByRole("region", { name: "Archived workspaces" }).textContent;
+    expect(regionText()).toContain("Loading archived workspaces");
+    expect(regionText()).not.toContain("No workspaces match");
+    view.rerender(
+      <ArchivedWorkspaces {...props} workspaces={undefined} loadError="disk on fire" />
+    );
+    expect(regionText()).toContain("Failed to load archived workspaces");
+    expect(regionText()).toContain("disk on fire");
+    view.rerender(<ArchivedWorkspaces {...props} workspaces={[]} />);
+    expect(regionText()).toContain("No archived workspaces");
+    expect(regionText()).not.toContain("No workspaces match");
+  });
+
+  test.each(["project", "scratch"])(
+    "surfaces an archived list load failure on the %s page",
+    async (page) => {
+      stubPageChrome();
+      const list = mock(() => Promise.reject(new Error("list exploded")));
+      stubPageApi(list, getSessionUsageBatchMock);
+      const view = render(
+        page === "scratch" ? (
+          <ScratchPage {...pageProps} />
+        ) : (
+          <ProjectPage {...pageProps} projectPath="/tmp/project" projectName="project" />
+        )
+      );
+      fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+      await waitFor(() =>
+        expect(view.getByRole("region", { name: "Archived workspaces" }).textContent).toContain(
+          "list exploded"
+        )
+      );
+      expect(view.queryByText(/No workspaces match/)).toBeNull();
+    }
+  );
 
   test("shows an error when restoring an archived workspace fails", async () => {
     unarchiveWorkspaceMock.mockImplementationOnce(() =>

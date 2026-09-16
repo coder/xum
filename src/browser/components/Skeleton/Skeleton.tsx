@@ -21,13 +21,14 @@ export function Skeleton({ className, variant = "pulse" }: SkeletonProps) {
     return (
       <span
         aria-hidden
-        className={cn("relative inline-block overflow-hidden rounded bg-white/5", className)}
+        // Theme-aware contrast keeps loading blocks visible on light surfaces, too.
+        className={cn("relative inline-block overflow-hidden rounded bg-muted/20", className)}
       >
         {/* Shimmer sweep layer using existing shimmer-slide keyframes */}
         <span
           className={cn(
             "pointer-events-none absolute inset-0",
-            "bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.06),transparent)]",
+            "bg-[linear-gradient(90deg,transparent,var(--color-white-overlay),transparent)]",
             "animate-[shimmer-slide_1.5s_infinite_linear]"
           )}
         />

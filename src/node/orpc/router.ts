@@ -1351,9 +1351,16 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(({ context, input }) =>
-          generateWorkspaceIdentity(input.message, input.candidates, context.aiService)
-        ),
+        .handler(async ({ context, input }) => {
+          // Pre-creation naming has no workspace yet: the configured naming
+          // agent (model + thinking) still leads; the caller's models only fill
+          // in after the built-in fallbacks.
+          const candidates = await context.workspaceService.getWorkspaceNamingCandidates(
+            undefined,
+            input.candidates
+          );
+          return generateWorkspaceIdentity(input.message, candidates, context.aiService);
+        }),
     },
     coder: {
       getInfo: t

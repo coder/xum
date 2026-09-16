@@ -14,14 +14,6 @@ import {
   renderAgentSkillSnapshotText,
 } from "@/common/utils/agentSkills/skillSnapshot";
 
-export interface PersistedLoadedSkillSnapshotInput {
-  name?: unknown;
-  scope?: unknown;
-  body?: unknown;
-  frontmatterYaml?: unknown;
-  truncated?: unknown;
-}
-
 interface CreateLoadedSkillSnapshotArgs {
   name: string;
   scope: unknown;

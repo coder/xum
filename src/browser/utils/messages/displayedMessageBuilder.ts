@@ -169,6 +169,7 @@ function createCompactionBoundaryRow(
     type: "compaction-boundary",
     id: `${message.id}-compaction-boundary`,
     historySequence,
+    timestamp: message.metadata?.timestamp,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
     contextWindowRollover: isRolloverBoundary(message) ? true : undefined,

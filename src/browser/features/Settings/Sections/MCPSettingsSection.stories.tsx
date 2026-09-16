@@ -6,7 +6,7 @@ import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -172,6 +172,82 @@ export const ProjectSettingsEmpty: Story = {
 
     await canvas.findByText("MCP Servers");
     await canvas.findByText("No MCP servers configured yet.");
+  },
+};
+
+const PLUGIN_SERVER_KEY = "plugin:0123456789abcdef:echo";
+const setPluginEnabled = fn<APIClient["mcp"]["setEnabled"]>();
+
+export const AgentPluginServer: Story = {
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => {
+        const client = setupMCPSettingsSectionStory({
+          servers: {
+            [PLUGIN_SERVER_KEY]: {
+              transport: "stdio",
+              command: "bun echo-mcp.ts",
+              disabled: true,
+              plugin: {
+                pluginName: "hello-plugin",
+                serverName: "echo",
+                sourceScope: "global",
+                sourceLocation: ".xum/plugins/hello-plugin",
+              },
+            },
+          },
+        });
+        setPluginEnabled.mockReset().mockImplementation(client.mcp.setEnabled);
+        client.mcp.setEnabled = setPluginEnabled;
+        return client;
+      }}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    await expect(toggle).toBeEnabled();
+    await expect(toggle).not.toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    await expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenLastCalledWith({
+      name: PLUGIN_SERVER_KEY,
+      enabled: false,
+    });
+    await expect(toggle).not.toBeChecked();
+  },
+};
+
+export const AgentPluginServerEnableError: Story = {
+  ...AgentPluginServer,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    const error = "Unable to save global MCP settings";
+    let failToggle: () => void = () => {
+      throw new Error("The toggle request has not started");
+    };
+    setPluginEnabled.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          failToggle = () => resolve({ success: false, error });
+        })
+    );
+
+    await expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    // Hold the backend response to prove both the optimistic state and its rollback.
+    await expect(toggle).toBeChecked();
+    failToggle();
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    await expect(canvas.findByText(error)).resolves.toBeVisible();
   },
 };
 

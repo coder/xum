@@ -93,8 +93,8 @@ export interface ChatViewRevealInputs {
   chatViewDataReady: boolean;
   /** Cached/replayed rows already renderable (revisits skip the skeleton). */
   hasRenderableMessages: boolean;
-  /** Active stream start/interrupt barrier is visible (trumps the skeleton). */
-  shouldShowStreamingBarrier: boolean;
+  /** Cached rows are known to be missing backend content (WorkspaceState.isTranscriptStale). */
+  isTranscriptStale: boolean;
 }
 
 export interface ChatViewRevealState {
@@ -110,17 +110,19 @@ export interface ChatViewRevealState {
  *
  * - First visit: skeleton holds until history is caught up AND decoration
  *   data is known, then everything mounts together.
- * - Revisit: cached rows paint immediately (no skeleton) and the latched
- *   known-flags make decorations renderable in that same first commit.
- * - Active stream states keep their barrier visible instead of a skeleton
- *   (reconnect-with-active-stream); decorations then mount when known —
- *   the rare case where data genuinely arrives after paint.
+ * - Revisit with trustworthy cached rows: they paint immediately (no skeleton)
+ *   and the latched known-flags make decorations renderable in that same
+ *   first commit.
+ * - Stale cached rows or an empty transcript hold the skeleton until caught-up,
+ *   even with an active stream/monitor barrier: an active turn does not mean
+ *   history has loaded, and painting rows that are known to be incomplete would
+ *   jump when the missing content lands. The barrier keeps rendering in the tail
+ *   lane below the skeleton so Stop stays reachable.
  */
 export function computeChatViewReveal(inputs: ChatViewRevealInputs): ChatViewRevealState {
   const showHydrationPlaceholder =
     (inputs.isHydratingTranscript || !inputs.chatViewDataReady) &&
-    !inputs.hasRenderableMessages &&
-    !inputs.shouldShowStreamingBarrier;
+    (!inputs.hasRenderableMessages || inputs.isTranscriptStale);
 
   return {
     showHydrationPlaceholder,

@@ -167,7 +167,7 @@ function createMockAiService(args: {
 
 export interface AgentSessionHarnessOptions extends Pick<
   ConstructorParameters<typeof AgentSession>[0],
-  "effectRunner" | "appFiberScope"
+  "effectRunner" | "appFiberScope" | "isStopInProgress" | "getStopEpoch" | "onTurnSettled"
 > {
   workspaceId: string;
   config?: Config;
@@ -183,6 +183,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   workspaceGoalService?: WorkspaceGoalService;
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  onIdleCompactionOutcome?: (success: boolean) => void;
   captureEvents?: boolean;
 }
 
@@ -231,6 +232,10 @@ export async function createAgentSessionHarness(
     workspaceGoalService: options.workspaceGoalService,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
+    onIdleCompactionOutcome: options.onIdleCompactionOutcome,
+    isStopInProgress: options.isStopInProgress,
+    getStopEpoch: options.getStopEpoch,
+    onTurnSettled: options.onTurnSettled,
   });
 
   const events: WorkspaceChatMessage[] = [];

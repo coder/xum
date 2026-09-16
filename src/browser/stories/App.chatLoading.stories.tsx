@@ -1,12 +1,14 @@
 import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
+import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
 import {
+  clearWorkspaceSelection,
   collapseLeftSidebar,
   collapseRightSidebar,
   expandLeftSidebar,
@@ -113,6 +115,50 @@ async function finishReplayWithoutLayoutShift(
   await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
 }
 
+type ActivitySubscribe = ReturnType<
+  typeof createMockORPCClient
+>["workspace"]["activity"]["subscribe"];
+interface ActivityEvent {
+  type: "activity";
+  workspaceId: string;
+  activity: WorkspaceActivitySnapshot | null;
+}
+
+// Background activity snapshots (the always-on per-workspace subscription) queue through
+// `emit` and stay deliverable until the store aborts; client swaps between stories must
+// release the previous subscription, so the iterator also ends on abort.
+function createActivityFeed(): {
+  subscribe: ActivitySubscribe;
+  emit: (workspaceId: string, activity: WorkspaceActivitySnapshot) => void;
+} {
+  const queued: ActivityEvent[] = [];
+  let wake: (() => void) | null = null;
+  const subscribe: ActivitySubscribe = (_input, options) => {
+    async function* iterate() {
+      while (!options?.signal?.aborted) {
+        const next = queued.shift();
+        if (next) {
+          yield next;
+          continue;
+        }
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        wake = null;
+      }
+    }
+    return Promise.resolve(wrapAsyncIterator(iterate(), {}));
+  };
+  return {
+    subscribe,
+    emit: (workspaceId, activity) => {
+      queued.push({ type: "activity", workspaceId, activity });
+      wake?.();
+    },
+  };
+}
+
 function createHydrationStory(workspaceId: string): AppStory {
   const workspace = createWorkspace({
     id: workspaceId,
@@ -147,6 +193,7 @@ function createHydrationStory(workspaceId: string): AppStory {
   // A compact tail must remain clear of the dock without a permanent loading gutter.
   history.parts.push({ type: "reasoning", text: "Compact tail reasoning." });
   let emitChat: (event: WorkspaceChatMessage) => void;
+  let emitActivity: ReturnType<typeof createActivityFeed>["emit"];
   let subscriptions = 0;
   let transcriptSubscriptions = 0;
   let emitTranscript: (event: WorkspaceChatMessage) => void;
@@ -154,6 +201,8 @@ function createHydrationStory(workspaceId: string): AppStory {
   function setup() {
     subscriptions = 0;
     transcriptSubscriptions = 0;
+    const activityFeed = createActivityFeed();
+    emitActivity = activityFeed.emit;
     selectWorkspace(workspace);
     collapseLeftSidebar();
     collapseRightSidebar();
@@ -197,17 +246,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         }
       },
     });
-    // Client swaps between stories must release the previous activity snapshot subscription.
-    client.workspace.activity.subscribe = (_input, options) => {
-      async function* iterate() {
-        yield* [];
-        await new Promise<void>((resolve) => {
-          if (options?.signal?.aborted) resolve();
-          else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-      }
-      return Promise.resolve(wrapAsyncIterator(iterate(), {}));
-    };
+    client.workspace.activity.subscribe = activityFeed.subscribe;
     return client;
   }
   const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
@@ -222,6 +261,41 @@ function createHydrationStory(workspaceId: string): AppStory {
         canvas.getByTestId("transcript-hydration-placeholder")
       );
       await expect(canvas.getByRole("textbox")).toBeEnabled();
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "preparing",
+        hadAnyOutput: false,
+      });
+      // An active turn does not mean history has loaded: the skeleton keeps holding the
+      // empty transcript while the barrier renders below it, and the dock shimmer only
+      // appears when the skeleton is absent.
+      await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+      await checkTranscriptLayout(canvasElement);
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "idle",
+        hadAnyOutput: false,
+      });
+      await expect(await canvas.findByTestId("transcript-hydration-placeholder")).toBeVisible();
+      // Cold open of an existing workspace: replayed init events land before history. A
+      // running init card is the transcript (live init bypasses hydration), but once it
+      // finishes the lone card must not release the skeleton ahead of the history rows.
+      emitChat({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: STABLE_TIMESTAMP,
+        replay: true,
+      });
+      await expect((await canvas.findAllByText(/Creating workspace/))[0]).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      emitChat({ type: "init-end", exitCode: 0, timestamp: STABLE_TIMESTAMP, replay: true });
+      await expect(await canvas.findByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.queryByText(/Workspace created/)).toBeNull();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       emitChat(history);
       emitChat({
         type: "caught-up",
@@ -232,6 +306,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       await expect(
         await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
       ).toBeVisible();
+      await expect(await canvas.findByText(/Workspace created/)).toBeVisible();
       await expect(exposedStatuses()).toHaveLength(0);
     });
 
@@ -278,7 +353,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       }
     );
 
-    await step("Running init and stream preparation retain their active feedback", async () => {
+    await step("Active turns retain replay shimmer alongside their controls", async () => {
       emitChat({
         type: "init-start",
         hookPath: "/project/.xum/init",
@@ -306,7 +381,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         hadAnyOutput: false,
       });
       await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
-      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-start",
@@ -317,7 +392,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         startTime: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
-      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
       emitChat({
@@ -336,6 +411,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
       await expect(await canvas.findByText("Live response.")).toBeVisible();
       await expect(canvas.getByRole("log")).toHaveAttribute("aria-busy", "true");
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-end",
@@ -352,13 +428,15 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier takes priority over the hydration skeleton", async () => {
+    await step("A monitor barrier renders below the replay skeleton", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
+      await checkTranscriptLayout(canvasElement);
+      // History rows are buffered until caught-up, so the transcript is still empty here.
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
       await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
-      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
     });
 
     await step("Read-only cached transcripts stay stable during replay", async () => {
@@ -389,6 +467,51 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
+      "Switching back to a workspace that streamed in the background shows the skeleton, not cached rows",
+      async () => {
+        await switchWorkspace(canvasElement, otherWorkspace.id);
+        await expect(
+          await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
+        ).toBeVisible();
+        // A new turn started while this workspace was unsubscribed from onChat: the cached
+        // rows are missing that content, so they must not paint and then jump on caught-up.
+        emitActivity(workspace.id, {
+          recency: STABLE_TIMESTAMP + 1,
+          streaming: true,
+          streamingGeneration: 2,
+          lastModel: DEFAULT_MODEL,
+          lastThinkingLevel: null,
+        });
+        await switchWorkspace(canvasElement, workspace.id);
+        await waitFor(() => expect(subscriptions).toBe(4));
+        await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+        await checkTranscriptLayout(canvasElement);
+        await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+        await expect(canvas.queryByText("Previously loaded response.")).toBeNull();
+        await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+        emitChat(history);
+        emitChat({
+          type: "caught-up",
+          replay: "since",
+          hasOlderHistory: false,
+          cursor: { history: { messageId: history.id, historySequence: 1 } },
+        });
+        await checkTranscriptLayout(canvasElement, false);
+        await expect(await canvas.findByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        // The background turn is over before the next step leaves this workspace, so its
+        // cached rows stay trustworthy there.
+        emitActivity(workspace.id, {
+          recency: STABLE_TIMESTAMP + 2,
+          streaming: false,
+          streamingGeneration: 2,
+          lastModel: DEFAULT_MODEL,
+          lastThinkingLevel: null,
+        });
+      }
+    );
+
+    await step(
       "A later replay remains busy without shifting or clearing previously cached messages",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
@@ -396,9 +519,21 @@ function createHydrationStory(workspaceId: string): AppStory {
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         await switchWorkspace(canvasElement, workspace.id);
-        await waitFor(() => expect(subscriptions).toBe(4));
+        await waitFor(() => expect(subscriptions).toBe(5));
         await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        // Freeze active replay so desktop and phone snapshots cover the shimmer with turn controls.
+        emitChat({
+          type: "stream-lifecycle",
+          workspaceId: workspace.id,
+          phase: "preparing",
+          hadAnyOutput: false,
+        });
+        await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+        await checkTranscriptLayout(canvasElement);
+        // Trustworthy cached rows keep painting under an active turn; only the dock shimmer shows.
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       }
     );
   };
@@ -429,14 +564,26 @@ export const Phone: AppStory = {
       </div>
     ),
   ],
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone", isRotated: false } },
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+    viewport: {
+      options: {
+        phone: { name: "Phone", styles: { width: "390px", height: "844px" }, type: "mobile" },
+      },
+    },
+  },
 };
 
 // Keep the first-load shimmer frozen so Pixel also captures the empty-history state.
 export const InitialLoadingPhone: AppStory = {
   ...Phone,
   ...createHydrationStory("ws-loading-initial-phone"),
+  globals: { ...Phone.globals, theme: "light" },
+  parameters: {
+    ...Phone.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
   play: async (context) => {
     await checkPhoneViewport(context);
     await checkTranscriptLayout(context.canvasElement);
@@ -445,4 +592,156 @@ export const InitialLoadingPhone: AppStory = {
     // A fixed-height phone canvas can autofocus-scroll the initial shimmer out of view.
     await expect(skeleton.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
   },
+};
+
+// Sending the first message shows nothing on the project page beyond a locked composer; the new
+// workspace opens with the message and the creation card and keeps both until the backend
+// persists them.
+function createCreationPendingStory(): AppStory {
+  const projectPath = "/home/user/projects/xum";
+  const typed = "Add a dark mode toggle";
+  const workspaceName = "dark-mode-toggle";
+  let releaseName: () => void = () => undefined;
+  let releaseCreate: () => void = () => undefined;
+
+  function setup() {
+    clearWorkspaceSelection();
+    collapseLeftSidebar();
+    collapseRightSidebar();
+    expandProjects([projectPath]);
+    const nameGate = new Promise<void>((resolve) => {
+      releaseName = resolve;
+    });
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const client = createMockORPCClient({
+      projects: new Map<string, ProjectConfig>([[projectPath, { workspaces: [], trusted: true }]]),
+      workspaces: [],
+      onChat: (workspaceId, emit) => {
+        if (!workspaceId.startsWith("ws-created-")) {
+          return;
+        }
+        // Live init for the just-created workspace; the first message is never persisted here,
+        // so the pending row stays in place for the snapshot.
+        emit({
+          type: "init-start",
+          hookPath: projectPath + "/.xum/init",
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({
+          type: "init-output",
+          line: "Preparing checkout",
+          step: true,
+          isError: false,
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({
+          type: "init-output",
+          line: "Running .xum/init",
+          step: true,
+          isError: false,
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({ type: "caught-up", replay: "full", hasOlderHistory: false });
+      },
+    });
+    client.nameGeneration.generate = async () => {
+      await nameGate;
+      return {
+        success: true as const,
+        data: { name: workspaceName, title: "Dark mode toggle", modelUsed: "mock" },
+      };
+    };
+    const originalCreate = client.workspace.create;
+    client.workspace.create = async (input) => {
+      await createGate;
+      return originalCreate(input);
+    };
+    client.workspace.activity.subscribe = createActivityFeed().subscribe;
+    return client;
+  }
+
+  const play: AppStory["play"] = async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    const textarea = () => canvasElement.querySelector<HTMLTextAreaElement>("textarea");
+
+    await step("Open the project creation view", async () => {
+      expandLeftSidebar();
+      const projectRow = await waitFor(async () => {
+        const element = canvasElement.querySelector<HTMLElement>(
+          '[data-project-path="' + projectPath + '"][aria-controls]'
+        );
+        await expect(element).not.toBeNull();
+        return element!;
+      });
+      await userEvent.click(projectRow);
+      collapseLeftSidebar();
+      await waitFor(async () => {
+        await expect(textarea()).not.toBeNull();
+        await expect(textarea()).toBeEnabled();
+      });
+    });
+
+    await step(
+      "Sending only locks the composer; the project page shows no transcript",
+      async () => {
+        await userEvent.click(textarea()!);
+        await userEvent.type(textarea()!, typed);
+        await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
+        await waitFor(async () => {
+          await expect(textarea()).toBeDisabled();
+        });
+        releaseName();
+        // Name generation is done and creation is still pending: no rows, no creation card.
+        await expect(canvasElement.querySelector('[data-testid="chat-message"]')).toBeNull();
+        await expect(canvas.queryByText(/Creating workspace/)).toBeNull();
+        await expect(canvas.queryByTestId("message-window")).toBeNull();
+      }
+    );
+
+    await step(
+      "The new workspace opens with the message above the live creation card",
+      async () => {
+        releaseCreate();
+        const messageWindow = await canvas.findByTestId("message-window", {}, { timeout: 5000 });
+        await waitFor(async () => {
+          const rows = Array.from(messageWindow.querySelectorAll('[data-testid="chat-message"]'));
+          await expect(rows.length).toBeGreaterThanOrEqual(2);
+          await expect(rows[0].textContent).toContain(typed);
+          await expect(rows[1].textContent).toContain("Creating workspace");
+        });
+        await expect(await canvas.findByText("Running .xum/init")).toBeVisible();
+      }
+    );
+  };
+
+  return { render: () => <AppWithMocks setup={setup} />, play };
+}
+
+export const CreationPending: AppStory = {
+  ...createCreationPendingStory(),
+  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+};
+
+const creationPendingPhone = createCreationPendingStory();
+
+export const CreationPendingPhone: AppStory = {
+  ...creationPendingPhone,
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await creationPendingPhone.play!(context);
+  },
+  decorators: [
+    (Story) => (
+      <div
+        data-testid="chat-loading-phone"
+        style={{ width: 390, maxWidth: "100%", height: "100vh", overflow: "hidden" }}
+      >
+        <Story />
+      </div>
+    ),
+  ],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
 };

@@ -5,6 +5,7 @@ import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // For now, the commandProcessor tests demonstrate our testing approach
 
 import * as fs from "node:fs/promises";
+import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
@@ -440,6 +441,41 @@ describe("AIService", () => {
   it("should create an AIService instance", () => {
     expect(service).toBeDefined();
     expect(service).toBeInstanceOf(AIService);
+  });
+});
+
+describe("AIService workspace metadata lookup", () => {
+  it("reads one workspace without enumerating or probing its archived peers", async () => {
+    using root = new DisposableTempDir("ai-service-metadata-lookup");
+    const { config, service } = createBasicAIService(root.path);
+    await config.editConfig((snapshot) => {
+      snapshot.projects.set(root.path, {
+        workspaces: ["active", "archived"].map((id) => ({
+          id,
+          name: id,
+          path: path.join(root.path, id),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          archivedAt: id === "archived" ? "2026-02-01T00:00:00.000Z" : undefined,
+          runtimeConfig: { type: "local" },
+        })),
+      });
+      return snapshot;
+    });
+    const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() => {
+      throw new Error("Unexpected enumeration");
+    });
+    const access = spyOn(fsPromises, "access");
+    try {
+      const result = await service.getWorkspaceMetadata("active");
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.id).toBe("active");
+      expect(access.mock.calls.map(([file]) => file)).toEqual([path.join(root.path, "active")]);
+      expect((await service.getWorkspaceMetadata("missing")).success).toBe(false);
+      expect(access).toHaveBeenCalledTimes(1);
+    } finally {
+      enumerate.mockRestore();
+      access.mockRestore();
+    }
   });
 });
 
@@ -1271,6 +1307,29 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   afterEach(() => {
     mock.restore();
+  });
+
+  it("aborts a fenced start before the engine constructs a provider request", async () => {
+    using xumHome = new DisposableTempDir("ai-service-stop-fence");
+    const metadata = createLocalWorkspaceMetadata("stop-fence", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    // The session's fence closes over its admission epoch; a stop bumped it meanwhile.
+    const stopFence = mock(() => false);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [createMuxMessage("admitted-user", "user", "continue")],
+      modelString: "openai:gpt-5.2",
+      stopFence,
+    });
+    expect(result.success).toBe(true);
+    expect(stopFence).toHaveBeenCalled();
+    // The engine receives an already-aborted start (startup reason) and the same fence, so it
+    // settles the turn as a startup abort instead of invoking the provider.
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const engineOptions = harness.startStreamCalls[0];
+    expect(engineOptions.abortSignal?.aborted).toBe(true);
+    expect(engineOptions.abortSignal?.reason).toBe("startup");
+    expect(engineOptions.stopFence).toBe(stopFence);
   });
 
   it.each([false, true])(

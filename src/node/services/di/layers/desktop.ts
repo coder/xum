@@ -247,9 +247,7 @@ export const BrowserLive: Layer.Layer<BrowserTags, never, ConfigTag> = Layer.eff
     const browserBridgeTokenManager = new BrowserBridgeTokenManager();
     const browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
       resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
-        const allWorkspaceMetadata = await config.getAllWorkspaceMetadata();
-        const workspaceMetadata =
-          allWorkspaceMetadata.find((candidate) => candidate.id === workspaceId) ?? null;
+        const workspaceMetadata = await config.getWorkspaceMetadataById(workspaceId);
         if (workspaceMetadata == null) {
           return [];
         }
@@ -316,7 +314,7 @@ export const DesktopBridgeLive: Layer.Layer<
 export const TerminalEditorLive: Layer.Layer<
   TerminalEditorTags,
   never,
-  ConfigTag | SecretsStoreTag | Workspace | SessionUsage | AI | Provider
+  ConfigTag | SecretsStoreTag | Workspace | SessionUsage | AI | Provider | History
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -326,7 +324,12 @@ export const TerminalEditorLive: Layer.Layer<
     const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag);
     // Editor service for opening workspaces in code editors
     const editorService = new EditorService(config, yield* Workspace);
-    const tokenizerService = new TokenizerService(yield* SessionUsage, aiService, yield* Provider);
+    const tokenizerService = new TokenizerService(
+      yield* SessionUsage,
+      aiService,
+      yield* Provider,
+      yield* History
+    );
     const instructionsService = new InstructionsService(config, aiService, tokenizerService);
     return Context.empty().pipe(
       Context.add(PTY, ptyService),
@@ -351,6 +354,7 @@ export const MiscDesktopLive: Layer.Layer<
   | Experiments
   | Policy
   | Provider
+  | MCPConfig
   | MCPServerManagerTag
   | WorkspaceMcpOverrides
 > = Layer.effectContext(
@@ -376,6 +380,7 @@ export const MiscDesktopLive: Layer.Layer<
     const agentPluginInstallService = new AgentPluginInstallService(config, {
       isEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
       mcpServerManager: yield* MCPServerManagerTag,
+      mcpConfigService: yield* MCPConfig,
       workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
     });
     const projectService = new ProjectService(config, sshPromptService, yield* SecretsStoreTag);

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
 
 // Typed as bare `Meta` (not `Meta<typeof TranscriptHydrationSkeleton>`): the
@@ -30,4 +30,6 @@ type Story = StoryObj<typeof meta>;
  * the bottom, so the loading state reads as "messages are arriving" rather than a
  * generic centered spinner.
  */
-export const Default: Story = {};
+export const Default: Story = {
+  parameters: { pixel: { matrix: PIXEL_DUAL_THEME } },
+};

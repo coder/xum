@@ -1,4 +1,5 @@
 import * as path from "path";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import * as fs from "fs";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
@@ -884,6 +885,11 @@ interface ConfigLoadFailureState {
 // re-log the same corrupt-config error once per instance.
 const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 
+/** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
+export function configFilePath(rootDir: string): string {
+  return path.join(rootDir, "config.json");
+}
+
 function configLoadFailureState(configFile: string): ConfigLoadFailureState {
   let state = configLoadFailureStates.get(configFile);
   if (!state) {
@@ -929,11 +935,93 @@ class ProjectRegistrationLockContended extends Error {
   }
 }
 
+export interface WorkspaceMetadataOptions {
+  /**
+   * Throw on config read/parse failure instead of silently resolving with
+   * the empty default. Callers that make destructive decisions based on
+   * "workspace is not in config" (e.g. extension-metadata pruning) must use
+   * this: the swallowed-failure default is indistinguishable from a truly
+   * empty config. A missing config file still resolves as empty (healthy
+   * fresh install), matching loadConfigOrDefault.
+   */
+  throwOnError?: boolean;
+  /**
+   * Out-parameter collecting ADDITIONAL stable ids that findWorkspace()
+   * can resolve for id-less legacy entries but that are not the returned
+   * entry's primary id: when both compatibility files
+   * (sessions/<basename>/metadata.json and
+   * sessions/<generated-legacy-id>/metadata.json) exist with different
+   * ids, only the first becomes the metadata entry, yet the second
+   * identity remains registered for targeted lookups. Destructive callers
+   * building "known id" sets must include these aliases or they would
+   * delete activity data findWorkspace still vouches for.
+   */
+  legacyAliasIds?: Set<string>;
+  /**
+   * Probe each worktree checkout's existence (fs.access) to classify
+   * transcript-only workspaces. Default true. Callers that only need the
+   * registry (ids, paths, runtime, parent links) pass false: one stalled
+   * mount would otherwise block the whole enumeration, and per-request
+   * callers (workspace MCP override resolution) would pay one probe per
+   * registered workspace on every request.
+   *
+   * CONTRACT: `false` results are memoized per config snapshot and the
+   * returned entries are shared between callers. Treat them as read-only;
+   * copy before mutating.
+   */
+  probeCheckouts?: boolean;
+
+  archived?: "all" | "active" | "archived";
+  /**
+   * Persist read-time workspace migrations (missing id/name/createdAt/runtimeConfig) through the
+   * editConfig queue. Default true. Callers that must stay read-only — e.g. a cancellable
+   * preparation whose result may be discarded, or a read under a lock that must not wait on the
+   * config queue — pass false: defaults are still filled in the returned metadata, nothing is
+   * written, and the next default build persists them.
+   */
+  persistMigrations?: boolean;
+}
+
+/**
+ * Memoized registry-only enumeration for one loaded config snapshot. The
+ * build's own alias collection is retained so later callers passing their
+ * own `legacyAliasIds` out-parameter still receive every alias.
+ */
+interface WorkspaceMetadataMemoEntry {
+  result: Promise<FrontendWorkspaceMetadata[]>;
+  legacyAliasIds: Set<string>;
+}
+
+/**
+ * Build-internal options: `degraded` is set when a lenient build swallowed a
+ * legacy metadata.json read/parse failure and substituted fallback identity
+ * for an entry. Such a build reflects a transient or repairable disk state,
+ * not the config snapshot, so the memo must not retain it.
+ */
+interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
+  degraded?: { value: boolean };
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
+  /**
+   * Cheap durable change signal for config.json: one stat, no parse. Any
+   * backend's rewrite changes size/mtime (atomic replace also changes the
+   * inode), so a memo built against a previous stamp knows to rebuild —
+   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * missing/unreadable file yields a distinct stamp.
+   */
+  configFileStamp(): string {
+    try {
+      const st = fs.statSync(this.configFile, { bigint: true });
+      return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    } catch {
+      return "missing";
+    }
+  }
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly emitter = new EventEmitter();
   /**
@@ -969,7 +1057,7 @@ export class Config {
     this.rootDir = sessionLocator.rootDir;
     this.sessionsDir = sessionLocator.sessionsDir;
     this.srcDir = sessionLocator.srcDir;
-    this.configFile = path.join(this.rootDir, "config.json");
+    this.configFile = configFilePath(this.rootDir);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(this.rootDir);
   }
 
@@ -1310,11 +1398,69 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  private configSnapshot?: {
+    key: string;
+    config: ProjectsConfig;
+    writeId: string;
+  };
+  private workspaceIndexConfig?: ProjectsConfig;
+  /**
+   * Registry-only (probeCheckouts: false) enumerations keyed on the loaded
+   * ProjectsConfig snapshot, then on the filter/strictness options. Every
+   * caller of that variant (startup recovery, activity list scoping, MCP
+   * override resolution, ...) used to rebuild ~40 fields per registered
+   * workspace; with thousands of archived entries a heap walk found ten
+   * live copies of the same list. Snapshot identity is the natural change
+   * signal: loadConfigOrDefault hands out the same object until config.json's
+   * stat key changes, and saveConfig drops the snapshot, so both this
+   * process's edits and other backends' rewrites invalidate the memo. The
+   * WeakMap lets a superseded snapshot's memo die with it.
+   */
+  private readonly workspaceMetadataMemo = new WeakMap<
+    ProjectsConfig,
+    Map<string, WorkspaceMetadataMemoEntry>
+  >();
+  private workspaceIndex = new Map<
+    string,
+    {
+      projectPath: string;
+      project: ProjectConfig;
+      workspace: Workspace;
+    }
+  >();
+  private legacyWorkspaceEntries: Array<{
+    projectPath: string;
+    project: ProjectConfig;
+    workspace: Workspace;
+  }> = [];
+
+  private configStatKey(stat: fs.Stats): string {
+    return [stat.ino, stat.mtimeMs, stat.size].join(":");
+  }
+
+  private readConfigStatKey(): string | undefined {
+    try {
+      return this.configStatKey(fs.statSync(this.configFile));
+    } catch {
+      return undefined;
+    }
+  }
+
+  // File-backed snapshots are shared and read-only; mutations must use editConfig's fresh read.
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
+    const key = this.readConfigStatKey();
+    if (key !== undefined && this.configSnapshot?.key === key) {
+      return this.configSnapshot.config;
+    }
+    return this.readConfigOrDefault(options, key);
+  }
+
+  private readConfigOrDefault(options?: { throwOnError?: boolean }, key?: string): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
+    this.configSnapshot = undefined;
     try {
       try {
         rawBytes = fs.readFileSync(this.configFile);
@@ -1325,9 +1471,7 @@ export class Config {
         // empty view feeds destructive "not in config" decisions. Route
         // non-ENOENT failures through the shared failure path below
         // (throwOnError callers rethrow); only ENOENT means missing.
-        if (!isEnoentError(readError)) {
-          throw readError;
-        }
+        if (!isEnoentError(readError)) throw readError;
       }
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
@@ -1335,557 +1479,29 @@ export class Config {
           throw new Error("Config root must be a JSON object");
         }
         const parsed = parsedValue as Partial<AppConfigOnDisk> & Record<string, unknown>;
-        let configModified = false;
-        let shouldInvalidateSessionUsageCaches = false;
-
-        const normalizeNestedModelStrings = (value: unknown): boolean => {
-          if (!value || typeof value !== "object" || Array.isArray(value)) {
-            return false;
-          }
-
-          let modified = false;
-          for (const entry of Object.values(value as Record<string, unknown>)) {
-            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-              continue;
-            }
-
-            const modelString = (entry as { modelString?: unknown }).modelString;
-            if (typeof modelString !== "string") {
-              continue;
-            }
-
-            const normalized = normalizeSelectedModel(modelString.trim());
-            if (normalized !== modelString) {
-              (entry as { modelString?: string }).modelString = normalized;
-              modified = true;
-            }
-          }
-
-          return modified;
-        };
-
-        const normalizeLegacyGatewayModel = (value: string): string | undefined => {
-          const trimmed = value.trim();
-          if (!trimmed) {
-            return undefined;
-          }
-
-          const legacyModelString = trimmed.includes(":") ? trimmed : trimmed.replace("/", ":");
-          const canonicalModel = normalizeToCanonical(legacyModelString);
-          return isValidModelFormat(canonicalModel) ? canonicalModel : undefined;
-        };
-
-        // Migrate legacy gateway settings to the new route-based system.
-        // Legacy keys are intentionally preserved on disk for downgrade compatibility —
-        // older versions still read muxGatewayEnabled / muxGatewayModels directly.
-        if (
-          (parsed.muxGatewayModels != null || parsed.muxGatewayEnabled != null) &&
-          !Array.isArray(parsed.routePriority)
-        ) {
-          let nextPriority = this.seedRoutePriorityFromProviders() ?? ["direct"];
-          if (parsed.muxGatewayEnabled === false) {
-            nextPriority = nextPriority.filter((route) => route !== "mux-gateway");
-            if (nextPriority.length === 0) {
-              nextPriority = ["direct"];
-            }
-          }
-          parsed.routePriority = nextPriority;
-          configModified = true;
-
-          if (parsed.muxGatewayEnabled !== false) {
-            const legacyModels = parseOptionalStringArray(parsed.muxGatewayModels) ?? [];
-            if (legacyModels.length > 0) {
-              const mergedRouteOverrides =
-                normalizeRouteOverridesRecord(parsed.routeOverrides) ?? {};
-              let routeOverridesModified = false;
-
-              for (const legacyModel of legacyModels) {
-                const canonicalModel = normalizeLegacyGatewayModel(legacyModel);
-                if (!canonicalModel || Object.hasOwn(mergedRouteOverrides, canonicalModel)) {
-                  continue;
-                }
-
-                mergedRouteOverrides[canonicalModel] = "mux-gateway";
-                routeOverridesModified = true;
-              }
-
-              if (routeOverridesModified) {
-                parsed.routeOverrides = mergedRouteOverrides;
-                shouldInvalidateSessionUsageCaches = true;
-              }
-            }
-          }
+        // A lossy lenient load must never satisfy a later destructive, strict read.
+        let cacheable = true;
+        try {
+          this.validateConfigStructure(parsed);
+        } catch (error) {
+          if (options?.throwOnError) throw error;
+          cacheable = false;
         }
-
-        // Seed routePriority only when the field does not exist yet.
-        // Once routePriority is an array, it becomes user-owned state, so
-        // read-time backfill is intentionally skipped here. Credential-driven
-        // gateway additions/removals are handled at write time by
-        // providerService.syncGatewayLifecycle().
-        if (!Array.isArray(parsed.routePriority)) {
-          const seeded = this.seedRoutePriorityFromProviders();
-          if (seeded) {
-            parsed.routePriority = seeded;
-            configModified = true;
-          }
-        }
-
-        if (
-          Array.isArray(parsed.routePriority) &&
-          parsed.routePriority.includes("mux-gateway") &&
-          parsed.muxGatewayEnabled === false
-        ) {
-          // Once routePriority exists, it is the authoritative routing signal. Clear a stale
-          // legacy disable flag so downgrade-compat data cannot veto an explicitly enabled gateway.
-          delete parsed.muxGatewayEnabled;
-          configModified = true;
-        }
-
-        // Normalize persisted model preferences while preserving explicit gateway selections.
-        if (typeof parsed.defaultModel === "string") {
-          const normalized = normalizeSelectedModel(parsed.defaultModel.trim());
-          if (normalized !== parsed.defaultModel) {
-            parsed.defaultModel = normalized;
-            configModified = true;
-            shouldInvalidateSessionUsageCaches = true;
-          }
-        }
-
-        if (Array.isArray(parsed.hiddenModels)) {
-          const normalizedHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
-          if (
-            normalizedHiddenModels === undefined ||
-            !areStringArraysEqual(parsed.hiddenModels, normalizedHiddenModels)
-          ) {
-            parsed.hiddenModels = normalizedHiddenModels;
-            configModified = true;
-            shouldInvalidateSessionUsageCaches = true;
-          }
-        }
-
-        if (normalizeNestedModelStrings(parsed.agentAiDefaults)) {
-          configModified = true;
-          shouldInvalidateSessionUsageCaches = true;
-        }
-        if (normalizeNestedModelStrings(parsed.subagentAiDefaults)) {
-          configModified = true;
-          shouldInvalidateSessionUsageCaches = true;
-        }
-
-        // Config is stored as array of [path, config] pairs.
-        // Older/newer files may omit `projects`; treat missing/invalid values as an empty map
-        // so top-level settings (provider/runtime/server preferences) still load.
-        //
-        // Strict mode must NOT accept that lenient normalization: callers that
-        // make destructive "id is not in config" decisions (extension-metadata
-        // pruning, orphan session-dir cleanup) would interpret a structurally
-        // invalid-but-parseable file (e.g. `projects: {}` or a non-array
-        // `workspaces`) as an empty/partial workspace set and delete live
-        // data. A genuinely ABSENT `projects` key stays valid in strict mode:
-        // it is how older/newer builds persist a config with no projects.
-        if (options?.throwOnError && parsed.projects !== undefined) {
-          if (!Array.isArray(parsed.projects)) {
-            throw new Error("Config projects must be an array of [path, config] pairs");
-          }
-          for (const pair of parsed.projects) {
-            if (!Array.isArray(pair)) {
-              throw new Error("Config projects entries must be [path, config] pairs");
-            }
-            const projectKey: unknown = pair[0];
-            // The lenient normalization below silently drops the WHOLE
-            // project when its key is empty or non-string ("Filtering out
-            // project with invalid path"), and an id-less legacy workspace
-            // inside it is raw-invisible too (its stable id lives only in
-            // session metadata.json, which only the normalized enumeration
-            // resolves). Accepting the pair here would hand destructive
-            // strict callers an authoritative id set missing every one of
-            // that project's workspaces — the startup prune would then
-            // permanently delete their recency/goal/status snapshots.
-            if (typeof projectKey !== "string" || projectKey.length === 0) {
-              throw new Error("Config project entries must have a non-empty string path");
-            }
-            const projectConfig: unknown = pair[1];
-            // Arrays pass typeof "object": lenient normalization would turn
-            // an array-valued project config into a project with no
-            // workspaces, and destructive strict callers would then classify
-            // every one of its workspaces as removed.
-            if (
-              projectConfig === null ||
-              typeof projectConfig !== "object" ||
-              Array.isArray(projectConfig)
-            ) {
-              throw new Error("Config project entries must be objects");
-            }
-            const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
-            // ProjectConfigSchema persists `workspaces` as a REQUIRED array,
-            // so a present project entry without the key is mangled state
-            // (readPersistedWorkspaceIdEvidence flags it incomplete too).
-            // Accepting it here would hand destructive callers an
-            // authoritatively-empty workspace set for that project.
-            if (!Array.isArray(workspaces)) {
-              throw new Error("Config project workspaces must be an array");
-            }
-            for (const workspaceEntry of workspaces) {
-              // WorkspaceSchema persists workspace entries as objects; a
-              // non-object entry is mangled state whose identity cannot be
-              // established.
-              if (
-                workspaceEntry === null ||
-                typeof workspaceEntry !== "object" ||
-                Array.isArray(workspaceEntry)
-              ) {
-                throw new Error("Config workspace entries must be objects");
-              }
-              const workspaceId = (workspaceEntry as { id?: unknown }).id;
-              // A truthy non-string id (42, {}) would ride the modern-entry
-              // branch of getAllWorkspaceMetadata as the authoritative id,
-              // so the prune's known set would omit the workspace's REAL
-              // string identity and delete its activity snapshot. Nullish
-              // ids stay valid: legacy entries resolve their stable id
-              // through session metadata.json, and the strict guard there
-              // fails closed when that resolution yields no usable id.
-              if (
-                workspaceId != null &&
-                !(typeof workspaceId === "string" && workspaceId.length > 0)
-              ) {
-                throw new Error("Config workspace ids must be non-empty strings");
-              }
-            }
-          }
-        }
-        const rawPairs = Array.isArray(parsed.projects) ? parsed.projects : [];
-        // Migrate: normalize project paths by stripping trailing slashes
-        // This fixes configs created with paths like "/home/user/project/"
-        // Also filter out any malformed entries (null/undefined paths)
-        // Rebuild config-backed entries from the current on-disk snapshot. Metadata-only entries
-        // survive until the legacy metadata migration writes them into config.json below.
-        for (const workspaceId of this.legacyTaskVariantGroups.keys()) {
-          if (!this.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
-            this.legacyTaskVariantGroups.delete(workspaceId);
-          }
-        }
-        const normalizedPairs = rawPairs
-          .filter(([projectPath]) => {
-            if (!projectPath || typeof projectPath !== "string") {
-              log.warn("Filtering out project with invalid path", { projectPath });
-              return false;
-            }
-            return true;
-          })
-          .map(([projectPath, projectConfig]) => {
-            if (Array.isArray(projectConfig?.workspaces)) {
-              for (const workspace of projectConfig.workspaces) {
-                this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
-              }
-            }
-            const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-            return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
-              string,
-              ProjectConfig,
-            ];
-          });
-        const projectsMap = deriveProjectHierarchy(new Map<string, ProjectConfig>(normalizedPairs));
-
-        // Run before the subproject merge below so a hierarchy edge case
-        // cannot relocate a legacy workspace into a parent project first.
-        if (removeLegacyMuxChatEntries(projectsMap)) {
-          configModified = true;
-        }
-
-        for (const [projectPath, projectConfig] of projectsMap) {
-          const parentProjectPath = projectConfig.parentProjectPath;
-          if (!parentProjectPath || projectConfig.workspaces.length === 0) {
-            continue;
-          }
-          const parentProject = projectsMap.get(parentProjectPath);
-          if (!parentProject) {
-            continue;
-          }
-          parentProject.workspaces.push(
-            ...projectConfig.workspaces.map((workspace) => ({
-              ...workspace,
-              subProjectPath: workspace.subProjectPath ?? projectPath,
-            }))
-          );
-          projectConfig.workspaces = [];
-          configModified = true;
-        }
-
-        // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
-        // rewrite the previous false/missing default before TaskService startup can create durable
-        // children; older builds will then keep their reported histories. The migration marker
-        // makes this a one-time default change rather than permanently overriding explicit config.
-        const retentionMigrations = normalizeConfigMigrations(parsed.migrations);
-        if (retentionMigrations.persistentSubagentsDefaulted !== true) {
-          parsed.taskSettings = {
-            ...(parsed.taskSettings ?? {}),
-            preserveSubagentsUntilArchive: true,
+        const config = this.normalizeParsedConfig(parsed);
+        if (key !== undefined && cacheable) {
+          this.configSnapshot = {
+            key,
+            config,
+            writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
           };
-          parsed.migrations = {
-            ...retentionMigrations,
-            persistentSubagentsDefaulted: true,
-          };
-          configModified = true;
         }
-        if (parsed.taskSettings?.preserveSubagentsUntilArchive !== true) {
-          parsed.taskSettings = {
-            ...(parsed.taskSettings ?? {}),
-            preserveSubagentsUntilArchive: true,
-          };
-          configModified = true;
-        }
-        const taskSettings = normalizeTaskSettings(parsed.taskSettings);
-
-        const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
-        const muxGatewayModels = parseOptionalStringArray(parsed.muxGatewayModels);
-        const routePriority = parseOptionalStringArray(parsed.routePriority);
-        const routeOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides);
-        const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
-          parsed.minThinkingLevelByModel
-        );
-        // One-time seed of the default refusal-fallback chains (e.g. Fable →
-        // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
-        // seed is applied exactly once: users who later edit or delete the
-        // default chains are not overridden on subsequent loads/updates.
-        // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
-        // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
-        // chain for the old source key, and the new key is a new default that
-        // deserves one seed of its own (still never overwriting an existing
-        // 5.1 chain).
-        const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
-        if (
-          migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
-          migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
-        ) {
-          // Gap-check against the RAW on-disk map with canonicalized keys, not
-          // the sanitized map: a hand-edited entry whose chain sanitizes away
-          // (e.g. {enabled:false, models:[]}) is still user intent and must not
-          // be overwritten. Merging into the raw map also keeps unrelated
-          // chains byte-identical on disk (lenient-on-read preserved).
-          const rawFallbacks =
-            typeof parsed.modelFallbacks === "object" &&
-            parsed.modelFallbacks !== null &&
-            !Array.isArray(parsed.modelFallbacks)
-              ? (parsed.modelFallbacks as Record<string, unknown>)
-              : {};
-          const existingCanonicalKeys = new Set(
-            Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
-          );
-          // Completing the original seed pass claims defaultModelFallbacksSeeded,
-          // which downgraded builds trust for their own (pre-5.1) default keys;
-          // seed those legacy chains too so a downgrade keeps refusal fallback.
-          const seedDefaults =
-            migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-              ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS }
-              : DEFAULT_MODEL_FALLBACKS;
-          const missingDefaults = Object.fromEntries(
-            Object.entries(seedDefaults).filter(
-              ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
-            )
-          );
-          if (Object.keys(missingDefaults).length > 0) {
-            // Write through the raw-record view: user entries are deliberately
-            // kept unvalidated on disk (normalizeModelFallbacks sanitizes on
-            // every read), so the merged map is not a ModelFallbacks yet.
-            const rawParsed: Record<string, unknown> = parsed;
-            rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
-          }
-          parsed.migrations = {
-            ...migrationsBeforeSeed,
-            defaultModelFallbacksSeeded: true,
-            defaultModelFallbacksSeededFable51: true,
-          };
-          configModified = true;
-        }
-
-        const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
-
-        const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
-        const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
-        const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
-        const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
-        const advisorMaxUsesPerTurn =
-          parsed.advisorMaxUsesPerTurn === null
-            ? null
-            : parseOptionalPositiveInteger(parsed.advisorMaxUsesPerTurn);
-        const advisorMaxOutputTokens =
-          parsed.advisorMaxOutputTokens === null
-            ? null
-            : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
-        const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
-        const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
-        if (
-          existingHiddenModels === undefined &&
-          hiddenMigrations.hiddenModelsInitialized === true
-        ) {
-          hiddenMigrations.hiddenModelsInitialized = false;
-          parsed.migrations = hiddenMigrations;
-          configModified = true;
-        }
-        if (hiddenMigrations.daybreakModelsHidden !== true) {
-          // Seed once, without losing unrelated hides or re-hiding models users later enable.
-          parsed.migrations = {
-            ...hiddenMigrations,
-            daybreakModelsHidden: true,
-            hiddenModelsInitialized:
-              hiddenMigrations.hiddenModelsInitialized === true ||
-              existingHiddenModels !== undefined,
-          };
-          parsed.hiddenModels = [
-            ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
-          ];
-          configModified = true;
-        }
-        const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
-        // Legacy root subagentAiDefaults (written by older builds and by the
-        // save-time downgrade projection) folds into the canonical nested
-        // `subagent` profile here; nothing outside this load and the save
-        // projection may read or write the legacy root map.
-        const agentAiDefaults = mergeLegacySubagentAiDefaults(
-          normalizeAgentAiDefaults(parsed.agentAiDefaults),
-          parsed.subagentAiDefaults
-        );
-
-        if (shouldInvalidateSessionUsageCaches) {
-          // Invalidate stale usage caches only when model id formats changed.
-          try {
-            if (fs.existsSync(this.sessionsDir)) {
-              for (const sessionEntry of fs.readdirSync(this.sessionsDir, {
-                withFileTypes: true,
-              })) {
-                if (!sessionEntry.isDirectory()) {
-                  continue;
-                }
-
-                const usagePath = path.join(
-                  path.join(this.sessionsDir, sessionEntry.name),
-                  "session-usage.json"
-                );
-                if (fs.existsSync(usagePath)) {
-                  fs.rmSync(usagePath, { force: true });
-                }
-              }
-            }
-          } catch (error) {
-            // Best-effort cleanup; never fail startup on cache invalidation issues.
-            log.warn("Failed to invalidate session usage cache during config migration", { error });
-          }
-        }
-
-        if (configModified && this.migrationPersist == null) {
-          // Persist load-time migrations through the serialized editConfig queue instead of
-          // writing `parsed` synchronously here: a sync write bypasses the queue, so a
-          // concurrent editConfig write landing between this load's read and the write-back
-          // would be clobbered with stale data (same lost-update class that resurrected
-          // removed workspaces via the old public saveConfig). Migrations are idempotent and
-          // re-applied on every load, so the identity transform re-reads disk, re-runs them,
-          // and persists the migrated form under the queue. One-shot guard: while a persist
-          // is in flight, the loads it performs internally must not re-schedule.
-          this.migrationPersist = this.enqueueGatedConfigEdit((migratedConfig) => migratedConfig)
-            .catch((error: unknown) => {
-              // Keep startup resilient even if persisting migration fails.
-              log.warn("Failed to persist migrated config", { error });
-            })
-            .finally(() => {
-              this.migrationPersist = null;
-            });
-        }
-
-        const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehavior(
-          parsed.coderWorkspaceArchiveBehavior,
-          parsed.stopCoderWorkspaceOnArchive
-        );
-        const worktreeArchiveBehavior = resolveWorktreeArchiveBehavior(
-          parsed.worktreeArchiveBehavior,
-          parsed.deleteWorktreeOnArchive
-        );
-        const deleteWorktreeOnArchive =
-          getLegacyDeleteWorktreeOnArchiveValue(worktreeArchiveBehavior);
-        const stopCoderWorkspaceOnArchive = getLegacyStopCoderWorkspaceOnArchiveValue(
-          coderWorkspaceArchiveBehavior
-        );
-        const updateChannel = parseUpdateChannel(parsed.updateChannel);
-
-        const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
-        const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
-
-        const userPreferences = normalizeUserPreferences(parsed.userPreferences);
-        const migrations = normalizeConfigMigrations(parsed.migrations);
-        if (parsed.userPreferences !== undefined) {
-          migrations.userPreferencesInitialized = true;
-        }
-
-        const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
-        const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
-          ? undefined
-          : layoutPresetsRaw;
-
-        // Also forget the confirmed backup: after a healthy load the user may prune sidecars,
-        // so a later re-corruption must re-verify the backup on disk.
         configLoadFailureStates.delete(this.configFile);
-        return {
-          projects: projectsMap,
-          apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
-          apiServerServeWebUi: parseOptionalBoolean(parsed.apiServerServeWebUi) ? true : undefined,
-          apiServerPort: parseOptionalPort(parsed.apiServerPort),
-          mdnsAdvertisementEnabled: parseOptionalBoolean(parsed.mdnsAdvertisementEnabled),
-          mdnsServiceName: parseOptionalNonEmptyString(parsed.mdnsServiceName),
-          serverSshHost: parsed.serverSshHost,
-          serverAuthGithubOwner: parseOptionalNonEmptyString(parsed.serverAuthGithubOwner),
-          defaultProjectDir: parseOptionalNonEmptyString(parsed.defaultProjectDir),
-          viewedSplashScreens: parsed.viewedSplashScreens,
-          userPreferences,
-          layoutPresets,
-          taskSettings,
-          chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
-          muxGatewayEnabled,
-          llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
-          heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
-          heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
-            parsed.heartbeatDefaultIntervalMs
-          ),
-          goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
-          muxGatewayModels,
-          routePriority,
-          routeOverrides,
-          minThinkingLevelByModel,
-          modelFallbacks,
-          defaultModel,
-          advisorModelString,
-          advisorThinkingLevel,
-          advisorReasoningMode,
-          advisorMaxUsesPerTurn,
-          advisorMaxOutputTokens,
-          hiddenModels,
-          agentAiDefaults,
-          migrations,
-          useSSH2Transport: parseOptionalBoolean(parsed.useSSH2Transport),
-          muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
-          muxGovernorToken: parseOptionalNonEmptyString(parsed.muxGovernorToken),
-          coderWorkspaceArchiveBehavior,
-          worktreeArchiveBehavior,
-          deleteWorktreeOnArchive,
-          stopCoderWorkspaceOnArchive,
-          terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
-          updateChannel,
-          defaultRuntime,
-          runtimeEnablement,
-          // Validated here rather than trusted: a hand-edited or older-build value that fails the
-          // schema would otherwise reach the IPC output validator and fail the whole settings
-          // read, so one bad field would report a load failure for every setting on the screen.
-          settingsBackup: SettingsBackupSchema.optional()
-            .catch(undefined)
-            .parse(parsed.settingsBackup),
-          legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
-        };
-      } else {
-        configLoadFailureStates.delete(this.configFile);
+        return config;
       }
+      configLoadFailureStates.delete(this.configFile);
     } catch (error) {
       this.handleConfigLoadFailure(rawBytes, error);
-      if (options?.throwOnError) {
-        throw error;
-      }
+      if (options?.throwOnError) throw error;
     }
 
     // Return default config
@@ -1908,6 +1524,549 @@ export class Config {
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
       },
+    };
+  }
+
+  private validateConfigStructure(parsed: Partial<AppConfigOnDisk>): void {
+    // Config is stored as array of [path, config] pairs.
+    // Older/newer files may omit `projects`; treat missing/invalid values as an empty map
+    // so top-level settings (provider/runtime/server preferences) still load.
+    //
+    // Strict mode must NOT accept that lenient normalization: callers that
+    // make destructive "id is not in config" decisions (extension-metadata
+    // pruning, orphan session-dir cleanup) would interpret a structurally
+    // invalid-but-parseable file (e.g. `projects: {}` or a non-array
+    // `workspaces`) as an empty/partial workspace set and delete live
+    // data. A genuinely ABSENT `projects` key stays valid in strict mode:
+    // it is how older/newer builds persist a config with no projects.
+    if (parsed.projects !== undefined) {
+      if (!Array.isArray(parsed.projects)) {
+        throw new Error("Config projects must be an array of [path, config] pairs");
+      }
+      for (const pair of parsed.projects) {
+        if (!Array.isArray(pair)) {
+          throw new Error("Config projects entries must be [path, config] pairs");
+        }
+        const projectKey: unknown = pair[0];
+        // The lenient normalization below silently drops the WHOLE
+        // project when its key is empty or non-string ("Filtering out
+        // project with invalid path"), and an id-less legacy workspace
+        // inside it is raw-invisible too (its stable id lives only in
+        // session metadata.json, which only the normalized enumeration
+        // resolves). Accepting the pair here would hand destructive
+        // strict callers an authoritative id set missing every one of
+        // that project's workspaces — the startup prune would then
+        // permanently delete their recency/goal/status snapshots.
+        if (typeof projectKey !== "string" || projectKey.length === 0) {
+          throw new Error("Config project entries must have a non-empty string path");
+        }
+        const projectConfig: unknown = pair[1];
+        // Arrays pass typeof "object": lenient normalization would turn
+        // an array-valued project config into a project with no
+        // workspaces, and destructive strict callers would then classify
+        // every one of its workspaces as removed.
+        if (
+          projectConfig === null ||
+          typeof projectConfig !== "object" ||
+          Array.isArray(projectConfig)
+        ) {
+          throw new Error("Config project entries must be objects");
+        }
+        const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+        // ProjectConfigSchema persists `workspaces` as a REQUIRED array,
+        // so a present project entry without the key is mangled state
+        // (readPersistedWorkspaceIdEvidence flags it incomplete too).
+        // Accepting it here would hand destructive callers an
+        // authoritatively-empty workspace set for that project.
+        if (!Array.isArray(workspaces)) {
+          throw new Error("Config project workspaces must be an array");
+        }
+        for (const workspaceEntry of workspaces) {
+          // WorkspaceSchema persists workspace entries as objects; a
+          // non-object entry is mangled state whose identity cannot be
+          // established.
+          if (
+            workspaceEntry === null ||
+            typeof workspaceEntry !== "object" ||
+            Array.isArray(workspaceEntry)
+          ) {
+            throw new Error("Config workspace entries must be objects");
+          }
+          const workspaceId = (workspaceEntry as { id?: unknown }).id;
+          // A truthy non-string id (42, {}) would ride the modern-entry
+          // branch of getAllWorkspaceMetadata as the authoritative id,
+          // so the prune's known set would omit the workspace's REAL
+          // string identity and delete its activity snapshot. Nullish
+          // ids stay valid: legacy entries resolve their stable id
+          // through session metadata.json, and the strict guard there
+          // fails closed when that resolution yields no usable id.
+          if (workspaceId != null && !(typeof workspaceId === "string" && workspaceId.length > 0)) {
+            throw new Error("Config workspace ids must be non-empty strings");
+          }
+        }
+      }
+    }
+  }
+
+  private normalizeConfigProjects(
+    projects: AppConfigOnDisk["projects"] | undefined
+  ): Map<string, ProjectConfig> {
+    const rawPairs = Array.isArray(projects) ? projects : [];
+    // Migrate: normalize project paths by stripping trailing slashes
+    // This fixes configs created with paths like "/home/user/project/"
+    // Also filter out any malformed entries (null/undefined paths)
+    // Rebuild config-backed entries from the current on-disk snapshot. Metadata-only entries
+    // survive until the legacy metadata migration writes them into config.json below.
+    for (const workspaceId of this.legacyTaskVariantGroups.keys()) {
+      if (!this.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
+        this.legacyTaskVariantGroups.delete(workspaceId);
+      }
+    }
+    const normalizedPairs = rawPairs
+      .filter(([projectPath]) => {
+        if (!projectPath || typeof projectPath !== "string") {
+          log.warn("Filtering out project with invalid path", { projectPath });
+          return false;
+        }
+        return true;
+      })
+      .map(([projectPath, projectConfig]) => {
+        if (Array.isArray(projectConfig?.workspaces)) {
+          for (const workspace of projectConfig.workspaces) {
+            this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
+          }
+        }
+        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
+        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
+          string,
+          ProjectConfig,
+        ];
+      });
+    return new Map(normalizedPairs);
+  }
+
+  private normalizeParsedConfig(
+    parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
+  ): ProjectsConfig {
+    let configModified = false;
+    let shouldInvalidateSessionUsageCaches = false;
+
+    const normalizeNestedModelStrings = (value: unknown): boolean => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+      }
+
+      let modified = false;
+      for (const entry of Object.values(value as Record<string, unknown>)) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          continue;
+        }
+
+        const modelString = (entry as { modelString?: unknown }).modelString;
+        if (typeof modelString !== "string") {
+          continue;
+        }
+
+        const normalized = normalizeSelectedModel(modelString.trim());
+        if (normalized !== modelString) {
+          (entry as { modelString?: string }).modelString = normalized;
+          modified = true;
+        }
+      }
+
+      return modified;
+    };
+
+    const normalizeLegacyGatewayModel = (value: string): string | undefined => {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return undefined;
+      }
+
+      const legacyModelString = trimmed.includes(":") ? trimmed : trimmed.replace("/", ":");
+      const canonicalModel = normalizeToCanonical(legacyModelString);
+      return isValidModelFormat(canonicalModel) ? canonicalModel : undefined;
+    };
+
+    // Migrate legacy gateway settings to the new route-based system.
+    // Legacy keys are intentionally preserved on disk for downgrade compatibility —
+    // older versions still read muxGatewayEnabled / muxGatewayModels directly.
+    if (
+      (parsed.muxGatewayModels != null || parsed.muxGatewayEnabled != null) &&
+      !Array.isArray(parsed.routePriority)
+    ) {
+      let nextPriority = this.seedRoutePriorityFromProviders() ?? ["direct"];
+      if (parsed.muxGatewayEnabled === false) {
+        nextPriority = nextPriority.filter((route) => route !== "mux-gateway");
+        if (nextPriority.length === 0) {
+          nextPriority = ["direct"];
+        }
+      }
+      parsed.routePriority = nextPriority;
+      configModified = true;
+
+      if (parsed.muxGatewayEnabled !== false) {
+        const legacyModels = parseOptionalStringArray(parsed.muxGatewayModels) ?? [];
+        if (legacyModels.length > 0) {
+          const mergedRouteOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides) ?? {};
+          let routeOverridesModified = false;
+
+          for (const legacyModel of legacyModels) {
+            const canonicalModel = normalizeLegacyGatewayModel(legacyModel);
+            if (!canonicalModel || Object.hasOwn(mergedRouteOverrides, canonicalModel)) {
+              continue;
+            }
+
+            mergedRouteOverrides[canonicalModel] = "mux-gateway";
+            routeOverridesModified = true;
+          }
+
+          if (routeOverridesModified) {
+            parsed.routeOverrides = mergedRouteOverrides;
+            shouldInvalidateSessionUsageCaches = true;
+          }
+        }
+      }
+    }
+
+    // Seed routePriority only when the field does not exist yet.
+    // Once routePriority is an array, it becomes user-owned state, so
+    // read-time backfill is intentionally skipped here. Credential-driven
+    // gateway additions/removals are handled at write time by
+    // providerService.syncGatewayLifecycle().
+    if (!Array.isArray(parsed.routePriority)) {
+      const seeded = this.seedRoutePriorityFromProviders();
+      if (seeded) {
+        parsed.routePriority = seeded;
+        configModified = true;
+      }
+    }
+
+    if (
+      Array.isArray(parsed.routePriority) &&
+      parsed.routePriority.includes("mux-gateway") &&
+      parsed.muxGatewayEnabled === false
+    ) {
+      // Once routePriority exists, it is the authoritative routing signal. Clear a stale
+      // legacy disable flag so downgrade-compat data cannot veto an explicitly enabled gateway.
+      delete parsed.muxGatewayEnabled;
+      configModified = true;
+    }
+
+    // Normalize persisted model preferences while preserving explicit gateway selections.
+    if (typeof parsed.defaultModel === "string") {
+      const normalized = normalizeSelectedModel(parsed.defaultModel.trim());
+      if (normalized !== parsed.defaultModel) {
+        parsed.defaultModel = normalized;
+        configModified = true;
+        shouldInvalidateSessionUsageCaches = true;
+      }
+    }
+
+    if (Array.isArray(parsed.hiddenModels)) {
+      const normalizedHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
+      if (
+        normalizedHiddenModels === undefined ||
+        !areStringArraysEqual(parsed.hiddenModels, normalizedHiddenModels)
+      ) {
+        parsed.hiddenModels = normalizedHiddenModels;
+        configModified = true;
+        shouldInvalidateSessionUsageCaches = true;
+      }
+    }
+
+    if (normalizeNestedModelStrings(parsed.agentAiDefaults)) {
+      configModified = true;
+      shouldInvalidateSessionUsageCaches = true;
+    }
+    if (normalizeNestedModelStrings(parsed.subagentAiDefaults)) {
+      configModified = true;
+      shouldInvalidateSessionUsageCaches = true;
+    }
+
+    const projectsMap = deriveProjectHierarchy(this.normalizeConfigProjects(parsed.projects));
+
+    // Run before the subproject merge below so a hierarchy edge case
+    // cannot relocate a legacy workspace into a parent project first.
+    if (removeLegacyMuxChatEntries(projectsMap)) {
+      configModified = true;
+    }
+
+    for (const [projectPath, projectConfig] of projectsMap) {
+      const parentProjectPath = projectConfig.parentProjectPath;
+      if (!parentProjectPath || projectConfig.workspaces.length === 0) {
+        continue;
+      }
+      const parentProject = projectsMap.get(parentProjectPath);
+      if (!parentProject) {
+        continue;
+      }
+      parentProject.workspaces.push(
+        ...projectConfig.workspaces.map((workspace) => ({
+          ...workspace,
+          subProjectPath: workspace.subProjectPath ?? projectPath,
+        }))
+      );
+      projectConfig.workspaces = [];
+      configModified = true;
+    }
+
+    // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
+    // rewrite the previous false/missing default before TaskService startup can create durable
+    // children; older builds will then keep their reported histories. The migration marker
+    // makes this a one-time default change rather than permanently overriding explicit config.
+    const retentionMigrations = normalizeConfigMigrations(parsed.migrations);
+    if (retentionMigrations.persistentSubagentsDefaulted !== true) {
+      parsed.taskSettings = {
+        ...(parsed.taskSettings ?? {}),
+        preserveSubagentsUntilArchive: true,
+      };
+      parsed.migrations = {
+        ...retentionMigrations,
+        persistentSubagentsDefaulted: true,
+      };
+      configModified = true;
+    }
+    if (parsed.taskSettings?.preserveSubagentsUntilArchive !== true) {
+      parsed.taskSettings = {
+        ...(parsed.taskSettings ?? {}),
+        preserveSubagentsUntilArchive: true,
+      };
+      configModified = true;
+    }
+    const taskSettings = normalizeTaskSettings(parsed.taskSettings);
+
+    const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
+    const muxGatewayModels = parseOptionalStringArray(parsed.muxGatewayModels);
+    const routePriority = parseOptionalStringArray(parsed.routePriority);
+    const routeOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides);
+    const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
+      parsed.minThinkingLevelByModel
+    );
+    // One-time seed of the default refusal-fallback chains (e.g. Fable →
+    // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
+    // seed is applied exactly once: users who later edit or delete the
+    // default chains are not overridden on subsequent loads/updates.
+    // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
+    // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
+    // chain for the old source key, and the new key is a new default that
+    // deserves one seed of its own (still never overwriting an existing
+    // 5.1 chain).
+    const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
+    if (
+      migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
+      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+    ) {
+      // Gap-check against the RAW on-disk map with canonicalized keys, not
+      // the sanitized map: a hand-edited entry whose chain sanitizes away
+      // (e.g. {enabled:false, models:[]}) is still user intent and must not
+      // be overwritten. Merging into the raw map also keeps unrelated
+      // chains byte-identical on disk (lenient-on-read preserved).
+      const rawFallbacks =
+        typeof parsed.modelFallbacks === "object" &&
+        parsed.modelFallbacks !== null &&
+        !Array.isArray(parsed.modelFallbacks)
+          ? (parsed.modelFallbacks as Record<string, unknown>)
+          : {};
+      const existingCanonicalKeys = new Set(
+        Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
+      );
+      // Completing the original seed pass claims defaultModelFallbacksSeeded,
+      // which downgraded builds trust for their own (pre-5.1) default keys;
+      // seed those legacy chains too so a downgrade keeps refusal fallback.
+      const seedDefaults =
+        migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
+          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS }
+          : DEFAULT_MODEL_FALLBACKS;
+      const missingDefaults = Object.fromEntries(
+        Object.entries(seedDefaults).filter(
+          ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
+        )
+      );
+      if (Object.keys(missingDefaults).length > 0) {
+        // Write through the raw-record view: user entries are deliberately
+        // kept unvalidated on disk (normalizeModelFallbacks sanitizes on
+        // every read), so the merged map is not a ModelFallbacks yet.
+        const rawParsed: Record<string, unknown> = parsed;
+        rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
+      }
+      parsed.migrations = {
+        ...migrationsBeforeSeed,
+        defaultModelFallbacksSeeded: true,
+        defaultModelFallbacksSeededFable51: true,
+      };
+      configModified = true;
+    }
+
+    const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
+
+    const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
+    const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
+    const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
+    const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
+    const advisorMaxUsesPerTurn =
+      parsed.advisorMaxUsesPerTurn === null
+        ? null
+        : parseOptionalPositiveInteger(parsed.advisorMaxUsesPerTurn);
+    const advisorMaxOutputTokens =
+      parsed.advisorMaxOutputTokens === null
+        ? null
+        : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
+    const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
+    const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
+    if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
+      hiddenMigrations.hiddenModelsInitialized = false;
+      parsed.migrations = hiddenMigrations;
+      configModified = true;
+    }
+    if (hiddenMigrations.daybreakModelsHidden !== true) {
+      // Seed once, without losing unrelated hides or re-hiding models users later enable.
+      parsed.migrations = {
+        ...hiddenMigrations,
+        daybreakModelsHidden: true,
+        hiddenModelsInitialized:
+          hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
+      };
+      parsed.hiddenModels = [
+        ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
+      ];
+      configModified = true;
+    }
+    const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
+    // Legacy root subagentAiDefaults (written by older builds and by the
+    // save-time downgrade projection) folds into the canonical nested
+    // `subagent` profile here; nothing outside this load and the save
+    // projection may read or write the legacy root map.
+    const agentAiDefaults = mergeLegacySubagentAiDefaults(
+      normalizeAgentAiDefaults(parsed.agentAiDefaults),
+      parsed.subagentAiDefaults
+    );
+
+    if (shouldInvalidateSessionUsageCaches) {
+      // Invalidate stale usage caches only when model id formats changed.
+      try {
+        if (fs.existsSync(this.sessionsDir)) {
+          for (const sessionEntry of fs.readdirSync(this.sessionsDir, {
+            withFileTypes: true,
+          })) {
+            if (!sessionEntry.isDirectory()) {
+              continue;
+            }
+
+            const usagePath = path.join(
+              path.join(this.sessionsDir, sessionEntry.name),
+              "session-usage.json"
+            );
+            if (fs.existsSync(usagePath)) {
+              fs.rmSync(usagePath, { force: true });
+            }
+          }
+        }
+      } catch (error) {
+        // Best-effort cleanup; never fail startup on cache invalidation issues.
+        log.warn("Failed to invalidate session usage cache during config migration", { error });
+      }
+    }
+
+    if (configModified && this.migrationPersist == null) {
+      // Persist load-time migrations through the serialized editConfig queue instead of
+      // writing `parsed` synchronously here: a sync write bypasses the queue, so a
+      // concurrent editConfig write landing between this load's read and the write-back
+      // would be clobbered with stale data (same lost-update class that resurrected
+      // removed workspaces via the old public saveConfig). Migrations are idempotent and
+      // re-applied on every load, so the identity transform re-reads disk, re-runs them,
+      // and persists the migrated form under the queue. One-shot guard: while a persist
+      // is in flight, the loads it performs internally must not re-schedule.
+      this.migrationPersist = this.enqueueGatedConfigEdit((migratedConfig) => migratedConfig)
+        .catch((error: unknown) => {
+          // Keep startup resilient even if persisting migration fails.
+          log.warn("Failed to persist migrated config", { error });
+        })
+        .finally(() => {
+          this.migrationPersist = null;
+        });
+    }
+
+    const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehavior(
+      parsed.coderWorkspaceArchiveBehavior,
+      parsed.stopCoderWorkspaceOnArchive
+    );
+    const worktreeArchiveBehavior = resolveWorktreeArchiveBehavior(
+      parsed.worktreeArchiveBehavior,
+      parsed.deleteWorktreeOnArchive
+    );
+    const deleteWorktreeOnArchive = getLegacyDeleteWorktreeOnArchiveValue(worktreeArchiveBehavior);
+    const stopCoderWorkspaceOnArchive = getLegacyStopCoderWorkspaceOnArchiveValue(
+      coderWorkspaceArchiveBehavior
+    );
+    const updateChannel = parseUpdateChannel(parsed.updateChannel);
+
+    const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
+    const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
+
+    const userPreferences = normalizeUserPreferences(parsed.userPreferences);
+    const migrations = normalizeConfigMigrations(parsed.migrations);
+    if (parsed.userPreferences !== undefined) {
+      migrations.userPreferencesInitialized = true;
+    }
+
+    const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
+    const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
+      ? undefined
+      : layoutPresetsRaw;
+
+    return {
+      projects: projectsMap,
+      apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
+      apiServerServeWebUi: parseOptionalBoolean(parsed.apiServerServeWebUi) ? true : undefined,
+      apiServerPort: parseOptionalPort(parsed.apiServerPort),
+      mdnsAdvertisementEnabled: parseOptionalBoolean(parsed.mdnsAdvertisementEnabled),
+      mdnsServiceName: parseOptionalNonEmptyString(parsed.mdnsServiceName),
+      serverSshHost: parsed.serverSshHost,
+      serverAuthGithubOwner: parseOptionalNonEmptyString(parsed.serverAuthGithubOwner),
+      defaultProjectDir: parseOptionalNonEmptyString(parsed.defaultProjectDir),
+      viewedSplashScreens: parsed.viewedSplashScreens,
+      userPreferences,
+      layoutPresets,
+      taskSettings,
+      chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
+      muxGatewayEnabled,
+      llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+      heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
+      heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
+        parsed.heartbeatDefaultIntervalMs
+      ),
+      goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
+      muxGatewayModels,
+      routePriority,
+      routeOverrides,
+      minThinkingLevelByModel,
+      modelFallbacks,
+      defaultModel,
+      advisorModelString,
+      advisorThinkingLevel,
+      advisorReasoningMode,
+      advisorMaxUsesPerTurn,
+      advisorMaxOutputTokens,
+      hiddenModels,
+      agentAiDefaults,
+      migrations,
+      useSSH2Transport: parseOptionalBoolean(parsed.useSSH2Transport),
+      muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
+      muxGovernorToken: parseOptionalNonEmptyString(parsed.muxGovernorToken),
+      coderWorkspaceArchiveBehavior,
+      worktreeArchiveBehavior,
+      deleteWorktreeOnArchive,
+      stopCoderWorkspaceOnArchive,
+      terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
+      updateChannel,
+      defaultRuntime,
+      runtimeEnablement,
+      // Validated here rather than trusted: a hand-edited or older-build value that fails the
+      // schema would otherwise reach the IPC output validator and fail the whole settings
+      // read, so one bad field would report a load failure for every setting on the screen.
+      settingsBackup: SettingsBackupSchema.optional().catch(undefined).parse(parsed.settingsBackup),
+      legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
     };
   }
 
@@ -2222,6 +2381,8 @@ export class Config {
         try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
         catch: (error) => error,
       });
+      // A competing rename may already have replaced our write; only a fresh read can publish it.
+      self.configSnapshot = undefined;
       for (const workspaceId of self.legacyTaskVariantGroups.keys()) {
         if (!persistedWorkspaceIds.has(workspaceId)) {
           // A load-time settings migration can save before getAllWorkspaceMetadata's queued
@@ -2261,6 +2422,10 @@ export class Config {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
       throw error;
+    }
+    const key = this.configStatKey(stat);
+    if (this.configSnapshot?.key === key) {
+      return this.configSnapshot.writeId + ":" + key;
     }
     let writeId = "-";
     try {
@@ -2669,8 +2834,8 @@ export class Config {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
     // synchronously on the caller's stack until the first async boundary, but the old
     // promise-chain queue always ran edit bodies on a later microtask.
-    // loadConfigOrDefault's one-shot migrationPersist guard depends on that ordering:
-    // the edit body's own loadConfigOrDefault must observe the `this.migrationPersist`
+    // normalizeParsedConfig's one-shot migrationPersist guard depends on that ordering:
+    // the edit body's own readConfigOrDefault must observe the `this.migrationPersist`
     // assignment, or a load-time migration would schedule its persist twice.
     // Effect failures reject this promise with the raw error (v4 runPromise does not
     // wrap causes), so callers observe the same rejections as before.
@@ -2698,7 +2863,7 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.loadConfigOrDefault());
+    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault());
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -2921,12 +3086,10 @@ export class Config {
    * Add paths to WorkspaceMetadata to create FrontendWorkspaceMetadata.
    * Helper to avoid duplicating path computation logic.
    */
-  private async addPathsToMetadata(
+  private addPathsToMetadata(
     metadata: WorkspaceMetadata,
-    workspacePath: string,
-    _projectPath: string,
-    probeCheckout = true
-  ): Promise<FrontendWorkspaceMetadata> {
+    workspacePath: string
+  ): FrontendWorkspaceMetadata {
     const result: FrontendWorkspaceMetadata = {
       ...metadata,
       namedWorkspacePath: workspacePath,
@@ -2939,6 +3102,12 @@ export class Config {
         `Please upgrade ${XUM_PRODUCT_NAME} to use this workspace.`;
     }
 
+    return result;
+  }
+
+  private async probeWorkspaceCheckout(
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<FrontendWorkspaceMetadata> {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
@@ -2946,22 +3115,37 @@ export class Config {
     // blocks it indefinitely); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
     // transcriptOnly classification.
-    const workspacePathExists = probeCheckout
-      ? await fs.promises
-          .access(workspacePath)
-          .then(() => true)
-          .catch(() => false)
-      : true;
+    const workspacePathExists = await fs.promises
+      .access(metadata.namedWorkspacePath)
+      .then(() => true)
+      .catch(() => false);
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
       metadata.taskStatus !== "starting" &&
       !workspacePathExists
     ) {
-      result.transcriptOnly = true;
+      metadata.transcriptOnly = true;
     }
 
-    return result;
+    return metadata;
+  }
+
+  private ensureWorkspaceIndex(config: ProjectsConfig): void {
+    if (this.workspaceIndexConfig === config) return;
+    this.workspaceIndexConfig = config;
+    this.workspaceIndex = new Map();
+    this.legacyWorkspaceEntries = [];
+    for (const [projectPath, project] of config.projects) {
+      for (const workspace of project.workspaces) {
+        const entry = { projectPath, project, workspace };
+        if (!workspace.id) {
+          this.legacyWorkspaceEntries.push(entry);
+        } else if (!this.workspaceIndex.has(workspace.id)) {
+          this.workspaceIndex.set(workspace.id, entry);
+        }
+      }
+    }
   }
 
   /**
@@ -2991,133 +3175,135 @@ export class Config {
   } | null {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
 
-    for (const [projectPath, project] of config.projects) {
-      for (const workspace of project.workspaces) {
-        const attributionProjectPath = workspace.projects?.[0]?.projectPath ?? projectPath;
+    this.ensureWorkspaceIndex(config);
+    const indexed = this.workspaceIndex.get(workspaceId);
+    if (indexed) {
+      const { projectPath, workspace } = indexed;
+      const attributionProjectPath = workspace.projects?.[0]?.projectPath ?? projectPath;
 
-        // NEW FORMAT: Check config first (primary source of truth after migration)
-        if (workspace.id === workspaceId) {
-          return {
-            workspacePath: workspace.path,
-            // Keep the stored config bucket key so mutation callers can round-trip into
-            // config.projects.get(projectPath), even for multi-project workspaces under _multi.
-            projectPath,
-            attributionProjectPath,
-            projects: workspace.projects,
-            workspaceName: workspace.name,
-            parentWorkspaceId: workspace.parentWorkspaceId,
-            pendingAutoTitle: workspace.pendingAutoTitle,
-          };
-        }
+      // NEW FORMAT: Check config first (primary source of truth after migration)
+      return {
+        workspacePath: workspace.path,
+        // Keep the stored config bucket key so mutation callers can round-trip into
+        // config.projects.get(projectPath), even for multi-project workspaces under _multi.
+        projectPath,
+        attributionProjectPath,
+        projects: workspace.projects,
+        workspaceName: workspace.name,
+        parentWorkspaceId: workspace.parentWorkspaceId,
+        pendingAutoTitle: workspace.pendingAutoTitle,
+      };
+    }
 
-        // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
-        if (!workspace.id) {
-          // Extract workspace basename (could be stable ID or legacy name)
-          const workspaceBasename =
-            workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    for (const { projectPath, workspace } of this.legacyWorkspaceEntries) {
+      const attributionProjectPath = workspace.projects?.[0]?.projectPath ?? projectPath;
+      // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
+      if (!workspace.id) {
+        // Extract workspace basename (could be stable ID or legacy name)
+        const workspaceBasename =
+          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
 
-          // Try loading metadata with basename as ID (works for old workspaces)
-          const metadataPath = path.join(
-            path.join(this.sessionsDir, workspaceBasename),
-            "metadata.json"
-          );
-          try {
-            const data = fs.readFileSync(metadataPath, "utf-8");
-            const metadata = JSON.parse(data) as WorkspaceMetadata;
-            this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
-            // Parseable-but-id-less metadata (e.g. `{}`) leaves this entry's
-            // identity unknowable: strict callers (the extension-metadata
-            // discard) must not conclude "not registered" from it, or a live
-            // workspace whose stable id lived only here gets its activity
-            // deleted and write-tombstoned. Mirrors the strict enumeration
-            // guard in getAllWorkspaceMetadata. The catch below rethrows this
-            // for strict callers and keeps ignoring it for lenient ones.
-            if (
-              options?.throwOnError &&
-              !(typeof metadata.id === "string" && metadata.id.length > 0)
-            ) {
-              throw new Error(
-                `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
-              );
-            }
-            if (metadata.id === workspaceId) {
-              return {
-                workspacePath: workspace.path,
-                projectPath,
-                attributionProjectPath,
-                projects: metadata.projects ?? workspace.projects,
-                workspaceName: undefined,
-                parentWorkspaceId: undefined,
-              };
-            }
-          } catch (error) {
-            // A genuinely missing file is the common case (most entries have
-            // no legacy metadata.json). The entry's identity may live in an
-            // unreadable/unparseable one though, so strict callers must not
-            // conclude "absent" from a failed lookup.
-            if (!isEnoentError(error) && options?.throwOnError) {
-              throw error;
-            }
-            // Ignore errors, try legacy ID
+        // Try loading metadata with basename as ID (works for old workspaces)
+        const metadataPath = path.join(
+          path.join(this.sessionsDir, workspaceBasename),
+          "metadata.json"
+        );
+        try {
+          const data = fs.readFileSync(metadataPath, "utf-8");
+          const metadata = JSON.parse(data) as WorkspaceMetadata;
+          this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
+          // Parseable-but-id-less metadata (e.g. `{}`) leaves this entry's
+          // identity unknowable: strict callers (the extension-metadata
+          // discard) must not conclude "not registered" from it, or a live
+          // workspace whose stable id lived only here gets its activity
+          // deleted and write-tombstoned. Mirrors the strict enumeration
+          // guard in getAllWorkspaceMetadata. The catch below rethrows this
+          // for strict callers and keeps ignoring it for lenient ones.
+          if (
+            options?.throwOnError &&
+            !(typeof metadata.id === "string" && metadata.id.length > 0)
+          ) {
+            throw new Error(
+              `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
+            );
           }
-
-          // Authoritative legacy path: getAllWorkspaceMetadata resolves an
-          // id-less entry's stable id from sessions/<generated-legacy-id>/
-          // metadata.json (NOT the basename path above). Callers verifying
-          // "is this id still registered" (e.g. the extension-metadata
-          // discard) must see the same identity, or a stable id that lives
-          // only in that file would be reported absent while its workspace
-          // remains registered.
-          const legacyId = this.generateLegacyId(projectPath, workspace.path);
-          const legacyMetadataPath = path.join(
-            path.join(this.sessionsDir, legacyId),
-            "metadata.json"
-          );
-          try {
-            const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
-            const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
-            this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
-            // Same unknowable-identity guard as the basename lookup above:
-            // this is the authoritative file getAllWorkspaceMetadata resolves
-            // stable ids from, so an id-less parse here must fail closed in
-            // strict mode rather than fall through to "not registered".
-            if (
-              options?.throwOnError &&
-              !(typeof legacyMetadata.id === "string" && legacyMetadata.id.length > 0)
-            ) {
-              throw new Error(
-                `Legacy workspace metadata at ${legacyMetadataPath} resolved without a usable id`
-              );
-            }
-            if (legacyMetadata.id === workspaceId) {
-              return {
-                workspacePath: workspace.path,
-                projectPath,
-                attributionProjectPath,
-                projects: legacyMetadata.projects ?? workspace.projects,
-                workspaceName: undefined,
-                parentWorkspaceId: undefined,
-              };
-            }
-          } catch (error) {
-            // Same strict-mode contract as the basename lookup above.
-            if (!isEnoentError(error) && options?.throwOnError) {
-              throw error;
-            }
-            // Ignore errors, try legacy ID
-          }
-
-          // Try legacy ID format as last resort
-          if (legacyId === workspaceId) {
+          if (metadata.id === workspaceId) {
             return {
               workspacePath: workspace.path,
               projectPath,
               attributionProjectPath,
-              projects: workspace.projects,
+              projects: metadata.projects ?? workspace.projects,
               workspaceName: undefined,
               parentWorkspaceId: undefined,
             };
           }
+        } catch (error) {
+          // A genuinely missing file is the common case (most entries have
+          // no legacy metadata.json). The entry's identity may live in an
+          // unreadable/unparseable one though, so strict callers must not
+          // conclude "absent" from a failed lookup.
+          if (!isEnoentError(error) && options?.throwOnError) {
+            throw error;
+          }
+          // Ignore errors, try legacy ID
+        }
+
+        // Authoritative legacy path: getAllWorkspaceMetadata resolves an
+        // id-less entry's stable id from sessions/<generated-legacy-id>/
+        // metadata.json (NOT the basename path above). Callers verifying
+        // "is this id still registered" (e.g. the extension-metadata
+        // discard) must see the same identity, or a stable id that lives
+        // only in that file would be reported absent while its workspace
+        // remains registered.
+        const legacyId = this.generateLegacyId(projectPath, workspace.path);
+        const legacyMetadataPath = path.join(
+          path.join(this.sessionsDir, legacyId),
+          "metadata.json"
+        );
+        try {
+          const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
+          const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
+          this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
+          // Same unknowable-identity guard as the basename lookup above:
+          // this is the authoritative file getAllWorkspaceMetadata resolves
+          // stable ids from, so an id-less parse here must fail closed in
+          // strict mode rather than fall through to "not registered".
+          if (
+            options?.throwOnError &&
+            !(typeof legacyMetadata.id === "string" && legacyMetadata.id.length > 0)
+          ) {
+            throw new Error(
+              `Legacy workspace metadata at ${legacyMetadataPath} resolved without a usable id`
+            );
+          }
+          if (legacyMetadata.id === workspaceId) {
+            return {
+              workspacePath: workspace.path,
+              projectPath,
+              attributionProjectPath,
+              projects: legacyMetadata.projects ?? workspace.projects,
+              workspaceName: undefined,
+              parentWorkspaceId: undefined,
+            };
+          }
+        } catch (error) {
+          // Same strict-mode contract as the basename lookup above.
+          if (!isEnoentError(error) && options?.throwOnError) {
+            throw error;
+          }
+          // Ignore errors, try legacy ID
+        }
+
+        // Try legacy ID format as last resort
+        if (legacyId === workspaceId) {
+          return {
+            workspacePath: workspace.path,
+            projectPath,
+            attributionProjectPath,
+            projects: workspace.projects,
+            workspaceName: undefined,
+            parentWorkspaceId: undefined,
+          };
         }
       }
     }
@@ -3160,40 +3346,93 @@ export class Config {
    * If missing from config or legacy metadata, a new timestamp is assigned and
    * saved to config for subsequent loads.
    */
-  async getAllWorkspaceMetadata(options?: {
-    /**
-     * Throw on config read/parse failure instead of silently resolving with
-     * the empty default. Callers that make destructive decisions based on
-     * "workspace is not in config" (e.g. extension-metadata pruning) must use
-     * this: the swallowed-failure default is indistinguishable from a truly
-     * empty config. A missing config file still resolves as empty (healthy
-     * fresh install), matching loadConfigOrDefault.
-     */
-    throwOnError?: boolean;
-    /**
-     * Out-parameter collecting ADDITIONAL stable ids that findWorkspace()
-     * can resolve for id-less legacy entries but that are not the returned
-     * entry's primary id: when both compatibility files
-     * (sessions/<basename>/metadata.json and
-     * sessions/<generated-legacy-id>/metadata.json) exist with different
-     * ids, only the first becomes the metadata entry, yet the second
-     * identity remains registered for targeted lookups. Destructive callers
-     * building "known id" sets must include these aliases or they would
-     * delete activity data findWorkspace still vouches for.
-     */
-    legacyAliasIds?: Set<string>;
-    /**
-     * Probe each worktree checkout's existence (fs.access) to classify
-     * transcript-only workspaces. Default true. Callers that only need the
-     * registry (ids, paths, runtime, parent links) pass false: one stalled
-     * mount would otherwise block the whole enumeration, and per-request
-     * callers (workspace MCP override resolution) would pay one probe per
-     * registered workspace on every request.
-     */
-    probeCheckouts?: boolean;
-  }): Promise<FrontendWorkspaceMetadata[]> {
-    const probeCheckouts = options?.probeCheckouts ?? true;
+  async getAllWorkspaceMetadata(
+    options?: WorkspaceMetadataOptions
+  ): Promise<FrontendWorkspaceMetadata[]> {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
+    // The probing variant mutates each entry (transcriptOnly) and does per-workspace I/O, so
+    // only the registry-only variant is memoized; see workspaceMetadataMemo.
+    if (options?.probeCheckouts !== false) {
+      return this.buildWorkspaceMetadata(config, config.projects, options);
+    }
+    // Strict and lenient builds differ in outcome only when a legacy entry is unreadable
+    // (strict throws, lenient degrades), so they must not serve each other's slot.
+    const memoKey = `${options.archived ?? "all"}:${options.throwOnError ? "strict" : "lenient"}`;
+    const memo =
+      this.workspaceMetadataMemo.get(config) ?? new Map<string, WorkspaceMetadataMemoEntry>();
+    this.workspaceMetadataMemo.set(config, memo);
+    let entry = memo.get(memoKey);
+    if (entry === undefined) {
+      // Memoize the in-flight promise: the startup burst issues several
+      // enumerations before the first one resolves.
+      const legacyAliasIds = new Set<string>();
+      const degraded = { value: false };
+      const result = this.buildWorkspaceMetadata(config, config.projects, {
+        ...options,
+        legacyAliasIds,
+        degraded,
+      });
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      entry = created;
+      memo.set(memoKey, created);
+      const forget = () => {
+        if (memo.get(memoKey) === created) memo.delete(memoKey);
+      };
+      result.then(() => {
+        // A degraded lenient build substituted fallback identity for a legacy entry whose
+        // metadata.json was unreadable or malformed, and it records no migration, so the
+        // snapshot identity would never change. Retaining it would hide the real stable id
+        // from registry-only callers until an unrelated write or restart even after the
+        // file is repaired. Callers already joined on the in-flight promise still share the
+        // one build; only the retention is skipped.
+        if (!degraded.value) return;
+        log.debug("Not memoizing degraded workspace metadata build", { memoKey });
+        forget();
+      }, forget);
+    }
+    const metadata = await entry.result;
+    if (options.legacyAliasIds !== undefined) {
+      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
+    }
+    // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
+    // caller's in-place filter/sort from leaking into another.
+    return metadata.slice();
+  }
+
+  async getWorkspaceMetadataById(
+    workspaceId: string,
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+  ): Promise<FrontendWorkspaceMetadata | null> {
+    const config = this.loadConfigOrDefault();
+    this.ensureWorkspaceIndex(config);
+    let entry = this.workspaceIndex.get(workspaceId);
+    if (!entry && this.legacyWorkspaceEntries.length > 0) {
+      const found = this.findWorkspace(workspaceId);
+      entry = this.legacyWorkspaceEntries.find(
+        (candidate) =>
+          candidate.projectPath === found?.projectPath &&
+          candidate.workspace.path === found.workspacePath
+      );
+    }
+    if (!entry) return null;
+    const { projectPath, project, workspace } = entry;
+    const metadata = await this.buildWorkspaceMetadata(
+      config,
+      [[projectPath, { ...project, workspaces: [workspace] }]],
+      options
+    );
+    return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
+  }
+
+  private async buildWorkspaceMetadata(
+    config: ProjectsConfig,
+    projects: Iterable<[string, ProjectConfig]>,
+    options?: WorkspaceMetadataBuildOptions
+  ): Promise<FrontendWorkspaceMetadata[]> {
+    const probeCheckouts = options?.probeCheckouts ?? true;
+    const markDegraded = () => {
+      if (options?.degraded) options.degraded.value = true;
+    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -3208,7 +3447,7 @@ export class Config {
       apply: (entry: Workspace) => void;
     }> = [];
 
-    for (const [projectPath, projectConfig] of config.projects) {
+    for (const [projectPath, projectConfig] of projects) {
       // Validate project path is not empty (defensive check for corrupted config)
       if (!projectPath) {
         log.warn("Skipping project with empty path in config", {
@@ -3219,7 +3458,23 @@ export class Config {
 
       const projectName = this.getProjectName(projectPath);
 
-      for (const workspace of projectConfig.workspaces) {
+      for (const storedWorkspace of projectConfig.workspaces) {
+        const archived = isWorkspaceArchived(
+          storedWorkspace.archivedAt,
+          storedWorkspace.unarchivedAt
+        );
+        if (
+          storedWorkspace.id &&
+          storedWorkspace.name &&
+          ((options?.archived === "active" && archived) ||
+            (options?.archived === "archived" && !archived))
+        )
+          continue;
+        // Read-time identity migrations must not mutate the shared config snapshot.
+        const workspace = {
+          ...storedWorkspace,
+          tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
+        };
         // Extract workspace basename from path (could be stable ID or legacy name)
         const workspaceBasename =
           workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
@@ -3342,9 +3597,7 @@ export class Config {
               };
             }
 
-            workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
-            );
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
             continue; // Skip metadata file lookup
           }
 
@@ -3394,6 +3647,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
+                  markDegraded();
                   continue;
                 }
                 throw readError;
@@ -3423,6 +3677,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
+              markDegraded();
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -3549,9 +3804,7 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
-            );
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
             metadataFound = true;
           }
 
@@ -3621,9 +3874,7 @@ export class Config {
               entry.runtimeConfig ??= metadata.runtimeConfig;
             });
 
-            workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
-            );
+            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
           }
         } catch (error) {
           // Strict callers make destructive "id is not known" decisions (the
@@ -3634,6 +3885,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
+          markDegraded();
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
@@ -3683,9 +3935,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
-          workspaceMetadata.push(
-            await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
-          );
+          workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }
     }
@@ -3696,7 +3946,7 @@ export class Config {
     // an id must match by id, and only id-less legacy entries may match by path — a
     // path match with a different id is a replacement workspace that must not inherit
     // the removed workspace's migrated settings.
-    if (pendingWorkspaceMigrations.length > 0) {
+    if (pendingWorkspaceMigrations.length > 0 && options?.persistMigrations !== false) {
       await this.editConfig((freshConfig) => {
         for (const migration of pendingWorkspaceMigrations) {
           const project = freshConfig.projects.get(migration.projectPath);
@@ -3714,20 +3964,39 @@ export class Config {
       });
     }
 
-    // Derive family identity before archived rows are filtered out for the renderer.
+    // Filtered rows still inherit family identity from archived ancestors in the registry.
+    this.ensureWorkspaceIndex(config);
     const parentById = new Map(workspaceMetadata.map((meta) => [meta.id, meta.parentWorkspaceId]));
+    const parentOf = (id: string) =>
+      parentById.has(id)
+        ? parentById.get(id)
+        : this.workspaceIndex.get(id)?.workspace.parentWorkspaceId;
     for (const metadata of workspaceMetadata) {
       const chain: string[] = [];
       let root = metadata.id;
-      while (parentById.get(root) && !chain.includes(root)) {
+      while (parentOf(root) && !chain.includes(root)) {
         chain.push(root);
-        root = parentById.get(root)!;
+        root = parentOf(root)!;
       }
       // A malformed cycle gets one representative, even for descendants entering it.
       const cycle = chain.indexOf(root);
       metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
     }
-    return workspaceMetadata;
+    const filtered = workspaceMetadata.filter((metadata) => {
+      if (options?.archived == null || options.archived === "all") return true;
+      return (
+        isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt) ===
+        (options.archived === "archived")
+      );
+    });
+    if (!probeCheckouts) return filtered;
+    return Effect.runPromise(
+      Effect.forEach(
+        filtered,
+        (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata)),
+        { concurrency: 32 }
+      )
+    );
   }
 
   /**

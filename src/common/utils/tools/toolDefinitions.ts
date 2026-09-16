@@ -60,7 +60,7 @@ import {
   BASH_MAX_TOTAL_BYTES,
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
-import { ADVISOR_TOOL_DESCRIPTION } from "@/common/constants/advisor";
+import { ADVISOR_QUESTION_MAX_CHARS, ADVISOR_TOOL_DESCRIPTION } from "@/common/constants/advisor";
 import {
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
@@ -246,7 +246,7 @@ export const HeartbeatToolArgsSchema = z
 export const AdvisorToolInputSchema = z
   .object({
     // Advisor prompts often need tradeoff context; keep bounded while allowing a compact brief.
-    question: z.string().min(1).max(2000).nullish(),
+    question: z.string().min(1).max(ADVISOR_QUESTION_MAX_CHARS).nullish(),
   })
   .strict();
 
@@ -2513,7 +2513,7 @@ export const TOOL_DEFINITIONS = {
       "Scopes (all paths are virtual):\n" +
       "- /memories/global/... — personal, permanent, shared across all projects\n" +
       "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
-      "- /memories/workspace/... — scratch state for this workspace; deleted with the workspace\n" +
+      "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
       "Commands:\n" +
       "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
       "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +

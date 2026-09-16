@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as jsonc from "jsonc-parser";
 
 import { Config } from "@/node/config";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -3199,6 +3200,62 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(stagingDir(), "update-demo-plugin.json"))).toBe(false);
   });
 
+  test("a fresh install revokes global MCP consent left by a manually removed plugin", async () => {
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    await fsPromises.mkdir(targetPath, { recursive: true });
+    await writePluginFixture(targetPath);
+    const mcpConfigService = new MCPConfigService(config, {
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+        xumHome: muxRoot,
+        isEnabled: () => true,
+      }),
+    });
+    const key = buildPluginServerKey(computePluginInstanceId(targetPath), "echo");
+    expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+      success: true,
+      data: undefined,
+    });
+    const siblingKey = "plugin:0123456789abcdef:other";
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    await fsPromises.writeFile(
+      configPath,
+      JSON.stringify({ enabledPluginServers: [key, siblingKey] })
+    );
+    await fsPromises.rm(targetPath, { recursive: true });
+
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
+    expect(jsonc.parse(await fsPromises.readFile(configPath, "utf8"))).toEqual({
+      enabledPluginServers: [siblingKey],
+    });
+  });
+
+  test("a fresh install aborts before promotion when global MCP consent cannot be pruned", async () => {
+    const configPath = path.join(muxRoot, "mcp.jsonc");
+    const malformed = '{ "enabledPluginServers": "invalid" }';
+    await fsPromises.writeFile(configPath, malformed);
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService: new MCPConfigService(config),
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+
+    await expect(
+      serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/enabledPluginServers must be an array/);
+
+    expect(await pathExists(preview.targetPath)).toBe(false);
+    expect(await registry()).toEqual([]);
+    expect(await stagingLeftovers()).toEqual([]);
+    expect(await fsPromises.readFile(configPath, "utf8")).toBe(malformed);
+  });
+
   test("a fresh install sweeps stale overrides left by a manually removed unmanaged plugin", async () => {
     // An unmanaged plugin the user enabled and then deleted BY HAND was
     // never uninstalled, so no tombstone exists — yet a same-name managed
@@ -4439,6 +4496,123 @@ describe("AgentPluginInstallService", () => {
     } finally {
       metadataSpy.mockRestore();
     }
+  });
+
+  test("uninstall prunes global MCP enablement after staging the tree but before data or registry changes", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const targetPath = path.join(pluginsDir(), "demo-plugin");
+    const instanceId = computePluginInstanceId(targetPath);
+    const dataPath = getPluginDataPath(muxRoot, instanceId);
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    await fsPromises.writeFile(path.join(dataPath, "state.txt"), "original");
+    const originalRegistry = await fsPromises.readFile(registryFile(), "utf8");
+    const prunedPrefixes: string[] = [];
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService: {
+        pruneEnabledPluginServers: async (prefix: string) => {
+          prunedPrefixes.push(prefix);
+          expect(await pathExists(targetPath)).toBe(false);
+          expect(await fsPromises.readFile(path.join(dataPath, "state.txt"), "utf8")).toBe(
+            "original"
+          );
+          expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(originalRegistry);
+        },
+      },
+    });
+
+    await serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    expect(prunedPrefixes).toEqual([buildPluginServerKey(instanceId, "")]);
+    expect(await registry()).toEqual([]);
+    expect(await pathExists(targetPath)).toBe(false);
+    expect(await pathExists(dataPath)).toBe(false);
+    expect(await stagingLeftovers()).toEqual([]);
+  });
+
+  test.each([false, true])(
+    "failed global MCP enablement prune preserves the install and recovers a blocked rollback (%s)",
+    async (blockRestore) => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const targetPath = path.join(pluginsDir(), "demo-plugin");
+      const manifestPath = path.join(targetPath, "plugin.json");
+      const originalManifest = await fsPromises.readFile(manifestPath, "utf8");
+      const dataPath = getPluginDataPath(muxRoot, computePluginInstanceId(targetPath));
+      await fsPromises.mkdir(dataPath, { recursive: true });
+      await fsPromises.writeFile(path.join(dataPath, "state.txt"), "original");
+      const originalRegistry = await fsPromises.readFile(registryFile(), "utf8");
+      const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
+      const serviceWithMcp = new AgentPluginInstallService(config, {
+        isEnabled: () => true,
+        mcpConfigService: {
+          pruneEnabledPluginServers: async () => {
+            if (blockRestore) {
+              // Occupy the destination so rollback cannot overwrite it.
+              await fsPromises.writeFile(targetPath, "restore blocker");
+            }
+            throw new Error("global consent write failed");
+          },
+        },
+      });
+
+      await expect(
+        serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: true })
+      ).rejects.toThrow(/global consent write failed/);
+
+      expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(originalRegistry);
+      expect(await fsPromises.readFile(path.join(dataPath, "state.txt"), "utf8")).toBe("original");
+      expect(await pathExists(journalPath)).toBe(blockRestore);
+      if (blockRestore) {
+        expect(await pathExists(manifestPath)).toBe(false);
+        expect(await fsPromises.readFile(targetPath, "utf8")).toBe("restore blocker");
+        await fsPromises.unlink(targetPath);
+        // Opening the section runs reconcileJournals against the retained journal.
+        expect(
+          (await serviceWithMcp.list()).find((item) => item.name === "demo-plugin")?.present
+        ).toBe(true);
+      }
+      expect(await fsPromises.readFile(manifestPath, "utf8")).toBe(originalManifest);
+      expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(originalRegistry);
+      expect(await stagingLeftovers()).toEqual([]);
+    }
+  );
+
+  test("uninstall clears global MCP enablement without workspaces and reinstall is default-disabled", async () => {
+    const readGlobalConfig = async (): Promise<unknown> =>
+      jsonc.parse(await fsPromises.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8"));
+    const mcpConfigService = new MCPConfigService(config, {
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+        xumHome: muxRoot,
+        isEnabled: () => true,
+      }),
+    });
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpConfigService,
+    });
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const key = buildPluginServerKey(computePluginInstanceId(preview.targetPath), "echo");
+    expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
+    expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+      success: true,
+      data: undefined,
+    });
+    expect((await mcpConfigService.listServers())[key]?.disabled).toBe(false);
+    expect(await readGlobalConfig()).toHaveProperty("enabledPluginServers", [key]);
+    expect(await config.getAllWorkspaceMetadata()).toEqual([]);
+
+    await serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    expect(await readGlobalConfig()).not.toHaveProperty(
+      "enabledPluginServers",
+      expect.arrayContaining([key])
+    );
+    expect((await mcpConfigService.listServers())[key]).toBeUndefined();
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
   });
 
   test("uninstall stages plugin-data before committing when deletion is requested", async () => {

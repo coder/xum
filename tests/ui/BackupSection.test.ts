@@ -6,6 +6,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
@@ -99,6 +100,82 @@ describe("BackupSection", () => {
     expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
   });
 
+  test("saves the content selection and gates the MCP sub-options on their parent", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+    const headers = canvas.getByRole("checkbox", { name: "HTTP header values" });
+    const commands = canvas.getByRole("checkbox", { name: "stdio commands" });
+    // Defaults: everything selected except projects.
+    expect(headers.getAttribute("aria-checked")).toBe("true");
+    expect(
+      canvas
+        .getByRole("checkbox", { name: "Project list & project memories" })
+        .getAttribute("aria-checked")
+    ).toBe("false");
+
+    fireEvent.click(headers);
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+    expect(canvas.getByText("Unsaved changes")).toBeTruthy();
+
+    // Deselecting the parent disables both sub-options without forgetting their values.
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    fireEvent.click(mcp);
+    expect(commands.hasAttribute("disabled")).toBe(true);
+    expect(commands.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(mcp);
+    expect(commands.hasAttribute("disabled")).toBe(false);
+    expect(commands.getAttribute("aria-checked")).toBe("true");
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+
+    await act(async () => {
+      fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    });
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith({
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
+        includeMcpHeaders: false,
+      })
+    );
+    await waitFor(() => expect(canvas.queryByText("Unsaved changes")).toBeNull());
+  });
+
+  test("toggles the content selection from the keyboard under the parent gate", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const headers = canvas.getByRole("checkbox", { name: "HTTP header values" });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+    // A sub-option shortcut is inert while its parent is off, like the disabled checkbox.
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, altKey: true });
+
+    fireEvent.keyDown(window, { key: "s", code: "KeyS", ctrlKey: true, altKey: true });
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith({
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
+        includeMcpHeaders: false,
+        includeProjects: true,
+      })
+    );
+  });
+
   test("refreshes backup settings changed by another window", async () => {
     const { client, view } = renderBackupSection();
     const canvas = within(view.container);
@@ -125,7 +202,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/other.git",
         branch: "release",
         path: "shared/",
-        includeProjects: false,
+        ...BACKUP_CONTENT_DEFAULTS,
       })
     );
     await canvas.findByText("Backup to repository");
@@ -353,7 +430,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/new.git",
         branch: "main",
         path: "mux/",
-        includeProjects: false,
+        ...BACKUP_CONTENT_DEFAULTS,
         approvedSecretDigest: undefined,
       })
     );
@@ -963,6 +1040,29 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
     await canvas.findByText(/Backed up settings at/);
     expect(canvas.queryByText("Projects to reimport")).toBeNull();
+  });
+
+  test("makes no MCP coverage claim when the export preview failed", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        unsupportedSettings: [],
+        pushError: "mcp.jsonc is not valid JSONC",
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Kept on this device");
+    expect(canvas.queryByText("Every MCP value is in the backup.")).toBeNull();
+    expect(canvas.getByText("Not computed because the export preview failed.")).toBeTruthy();
   });
 
   test("reports a skipped project bundle after a preview", async () => {
