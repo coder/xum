@@ -4459,7 +4459,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| **Ollama**         | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |",
       "| **Bedrock**        | Claude via AWS              | AWS Console                                             |",
       "| **GitHub Copilot** | GPT-4o, Claude Sonnet, etc. | [GitHub Copilot](https://github.com/features/copilot)   |",
-      "| **Coder**          | Models via AI Bridge        | Your Coder deployment (Login with Coder, no key needed) |",
+      "| **Coder**          | Models via AI Gateway       | Your Coder deployment (Login with Coder, no key needed) |",
       "",
       "## Environment Variables",
       "",
