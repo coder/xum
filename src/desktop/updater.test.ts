@@ -178,6 +178,20 @@ describe("UpdaterService", () => {
       expect(() => channelService.setChannel("nightly")).toThrow("ready to install");
     });
 
+    it("setChannel throws while an install is restarting", () => {
+      mockAutoUpdater.setFeedURL.mockClear();
+      const channelService = new UpdaterService();
+      const statuses: string[] = [];
+      channelService.subscribe((status) => statuses.push(status.type));
+
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+      channelService.installUpdate();
+
+      expect(() => channelService.setChannel("nightly")).toThrow("installing");
+      expect(channelService.getStatus().type).toBe("restarting");
+      expect(statuses).not.toContain("idle");
+    });
+
     it("setChannel notifies subscribers on switch", () => {
       mockAutoUpdater.setFeedURL.mockClear();
       const channelService = new UpdaterService();
@@ -609,6 +623,21 @@ describe("UpdaterService", () => {
       });
     });
 
+    it("should map updater errors reported while restarting to install phase", () => {
+      mockAutoUpdater.emit("update-available", { version: "2.0.0" });
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+      service.installUpdate();
+      expect(service.getStatus().type).toBe("restarting");
+
+      mockAutoUpdater.emit("error", new Error("Could not launch the installer"));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "install",
+        message: "Could not launch the installer",
+      });
+    });
+
     it("should preserve existing error phase on follow-up updater errors", () => {
       mockAutoUpdater.emit("update-available", { version: "2.0.0" });
       mockAutoUpdater.emit("download-progress", { percent: 30 });
@@ -774,6 +803,49 @@ describe("UpdaterService", () => {
       service.installUpdate();
 
       expect(mockUpdateInstallInProgress).toBe(false);
+    });
+
+    it("should notify subscribers of restarting before quitAndInstall runs", () => {
+      mockAutoUpdater.emit("update-available", { version: "2.0.0" });
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+
+      const order: string[] = [];
+      service.subscribe((status) => order.push(status.type));
+      mockAutoUpdater.quitAndInstall.mockImplementationOnce(() => {
+        order.push("quitAndInstall");
+      });
+
+      service.installUpdate();
+
+      expect(order).toEqual(["restarting", "quitAndInstall"]);
+      expect(service.getStatus()).toMatchObject({ type: "restarting", info: { version: "2.0.0" } });
+    });
+
+    it("should report the downloaded version when retrying after an install error", () => {
+      mockAutoUpdater.emit("update-downloaded", { version: "2.0.0" });
+      mockAutoUpdater.quitAndInstall.mockImplementationOnce(() => {
+        throw new Error("Install failed due to permission error");
+      });
+      service.installUpdate();
+      expect(service.getStatus()).toMatchObject({ type: "error", phase: "install" });
+
+      service.installUpdate();
+
+      expect(service.getStatus()).toMatchObject({ type: "restarting", info: { version: "2.0.0" } });
+    });
+
+    it("should not emit restarting from the DEBUG_UPDATER fake install path", async () => {
+      process.env.DEBUG_UPDATER = "2.0.0";
+      const debugService = new UpdaterService();
+      const statuses: UpdateStatus[] = [];
+      debugService.subscribe((status) => statuses.push(status));
+      await debugService.downloadUpdate();
+
+      debugService.installUpdate();
+
+      expect(statuses.some((status) => status.type === "restarting")).toBe(false);
+      expect(debugService.getStatus().type).toBe("downloaded");
+      expect(mockAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
     });
   });
 

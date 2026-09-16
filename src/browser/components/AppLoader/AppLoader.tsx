@@ -24,6 +24,7 @@ import {
   UserPreferencesProvider,
 } from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
+import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
@@ -271,6 +272,7 @@ function AppLoaderInner() {
         >
           <TerminalRouterProvider>
             <App />
+            <UpdateRestartOverlay />
           </TerminalRouterProvider>
         </motion.div>
       )}
