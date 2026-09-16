@@ -12,9 +12,13 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 
 const SERVER = "notion-work";
 const INFO_BUTTON = `Server information: ${SERVER}`;
+// Actual one-pixel PNG: the host-decoded icon shape the renderer accepts.
+const PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFOcAAAAASUVORK5CYII=";
 const BRANDED: MCPTestResult = {
   success: true,
   tools: ["notion_ai_search", "notion_fetch"],
+  icon: PNG,
   serverInfo: {
     name: "Notion MCP",
     version: "1.2.0",
@@ -112,15 +116,22 @@ describeIntegration("MCP settings server identity", () => {
     expect(within(row).getByText("2 tools")).toBeTruthy();
     // Configured label stays the primary identifier.
     expect(within(row).getByText(SERVER, { exact: true })).toBeTruthy();
+    // The host-decoded PNG renders as a decorative image inside the badge trigger.
+    const badge = within(row).getByRole("button", { name: INFO_BUTTON });
+    const icon = badge.querySelector("img");
+    if (!icon) throw new Error("PNG icon not rendered");
+    expect(icon.getAttribute("src")).toBe(PNG);
+    expect(icon.getAttribute("alt")).toBe("");
 
-    // The localStorage cache keeps tools/testedAt exactly as before and no identity.
+    // The localStorage cache keeps tools/testedAt exactly as before: no identity, no icon.
     const cached = persistedCache()[SERVER];
     expect(cached.result).toEqual({ success: true, tools: BRANDED.tools });
     expect(typeof cached.testedAt).toBe("number");
 
-    // Popover: display name, version, configured connection, website and disclaimer.
-    fireEvent.click(within(row).getByRole("button", { name: INFO_BUTTON }));
+    // Popover: icon, display name, version, configured connection, website and disclaimer.
+    fireEvent.click(badge);
     const popover = await within(document.body).findByRole("dialog", { name: `About ${SERVER}` });
+    expect(popover.querySelector("img")?.getAttribute("src")).toBe(PNG);
     expect(within(popover).getByText("Notion MCP")).toBeTruthy();
     expect(within(popover).getByText("v1.2.0")).toBeTruthy();
     expect(within(popover).getByText(SERVER, { exact: true })).toBeTruthy();
@@ -138,6 +149,14 @@ describeIntegration("MCP settings server identity", () => {
       if (within(document.body).queryByRole("dialog", { name: `About ${SERVER}` }))
         throw new Error("Popover still open");
     });
+
+    // An icon the renderer cannot decode falls back to the generic icon; identity stays.
+    fireEvent.error(icon);
+    await waitFor(() => {
+      if (badge.querySelector("img")) throw new Error("Broken icon still rendered");
+    });
+    expect(badge.querySelector("svg")).not.toBeNull();
+    expect(within(row).getByRole("button", { name: INFO_BUTTON })).toBe(badge);
 
     // A configuration reload (adding another server) hides branding but keeps the count.
     await addStdioServer(app, canvas, "local-docs");

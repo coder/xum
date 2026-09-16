@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ExternalLink, Plug } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
 import { HttpsUrlSchema } from "@/common/orpc/schemas/mcp";
@@ -8,6 +9,7 @@ import type {
   MCPTestResult,
 } from "@/common/types/mcp";
 import { httpsOriginOf } from "@/common/utils/mcp/httpsUrl";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { serverDisplayName } from "@/common/utils/mcp/serverDisplayName";
 
 // Settings knows the configured mode, not the transport negotiated by the test.
@@ -29,31 +31,57 @@ export function describeConfiguredConnection(key: string, entry: MCPServerInfo):
 }
 
 /**
- * Identity is display-only and session-scoped; the localStorage test cache
- * must keep its pre-identity shape (tools/testedAt) so branding never survives
- * a reload or restart without a fresh test.
+ * Identity and icon are display-only and session-scoped; the localStorage test
+ * cache must keep its pre-identity shape (tools/testedAt) so branding never
+ * survives a reload or restart without a fresh test, and no image bytes are
+ * ever persisted.
  */
-export function stripServerInfo(result: MCPTestResult): MCPTestResult {
-  if (!result.success || result.serverInfo === undefined) return result;
-  const { serverInfo: _serverInfo, ...rest } = result;
+export function stripBranding(result: MCPTestResult): MCPTestResult {
+  if (!result.success || (result.serverInfo === undefined && result.icon === undefined))
+    return result;
+  const { serverInfo: _serverInfo, icon: _icon, ...rest } = result;
   return rest;
 }
+
+/** Trigger and popover header keep the generic icon's geometry when an image is shown. */
+const ICON_SIZES = { trigger: 14, header: 24 } as const;
 
 interface MCPServerIdentityBadgeProps {
   connection: DisplayConnection;
   identity: MCPServerIdentity;
+  /** Host-decoded PNG data URL (slice 2); anything else renders the generic icon. */
+  icon?: string | null;
   /** Show the short display name next to the icon (chat headers). */
   compact?: boolean;
 }
 
 export function MCPServerIdentityBadge(props: MCPServerIdentityBadgeProps) {
-  const { connection, identity } = props;
+  const { connection, identity, icon } = props;
   const displayName = serverDisplayName(identity);
   // Re-validated at render: cached or historical values may predate the schema.
   const website =
     identity.websiteUrl !== undefined && HttpsUrlSchema.safeParse(identity.websiteUrl).success
       ? identity.websiteUrl
       : undefined;
+  // A PNG that passes the boundary check can still fail to decode; remember the
+  // exact failing value so a different icon is tried again without an effect.
+  const [brokenIcon, setBrokenIcon] = useState<string | null>(null);
+  const iconSrc = isPngDataUrl(icon) && icon !== brokenIcon ? icon : undefined;
+  const renderIcon = (size: number, className: string) =>
+    iconSrc ? (
+      // Decorative: the trigger's aria-label already names the configured key.
+      <img
+        src={iconSrc}
+        alt=""
+        width={size}
+        height={size}
+        draggable={false}
+        onError={() => setBrokenIcon(iconSrc)}
+        className={`${className} shrink-0 object-contain`}
+      />
+    ) : (
+      <Plug aria-hidden className={`${className} shrink-0`} />
+    );
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -64,7 +92,7 @@ export function MCPServerIdentityBadge(props: MCPServerIdentityBadgeProps) {
           onClick={(event) => event.stopPropagation()}
           className="text-muted hover:text-foreground focus-visible:ring-accent inline-flex shrink-0 items-center gap-1 rounded px-0.5 align-middle font-sans text-[10px] focus-visible:ring-1"
         >
-          <Plug aria-hidden className="size-3.5" />
+          {renderIcon(ICON_SIZES.trigger, "size-3.5")}
           {props.compact && <span className="truncate">{displayName}</span>}
         </button>
       </PopoverTrigger>
@@ -76,7 +104,7 @@ export function MCPServerIdentityBadge(props: MCPServerIdentityBadgeProps) {
         onClick={(event) => event.stopPropagation()}
       >
         <div className="mb-2 flex items-center gap-2">
-          <Plug aria-hidden className="size-6 shrink-0" />
+          {renderIcon(ICON_SIZES.header, "size-6")}
           <div className="min-w-0">
             <div className="font-medium wrap-anywhere">{displayName}</div>
             <div className="text-muted text-[10px] wrap-anywhere">v{identity.version}</div>

@@ -45,7 +45,7 @@ import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeade
 import {
   MCPServerIdentityBadge,
   describeConfiguredConnection,
-  stripServerInfo,
+  stripBranding,
 } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 import {
   mcpHeaderRowsToRecord,
@@ -786,7 +786,9 @@ export const MCPSettingsSection: React.FC = () => {
   // to the current load. Persisting it would need a backend-produced binding to
   // the tested configuration (follow-up); users re-test to see it again.
   const loadGeneration = useRef(0);
-  const [branding, setBranding] = useState<Record<string, MCPServerIdentity>>({});
+  const [branding, setBranding] = useState<
+    Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
+  >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
 
   interface EditableServer {
@@ -970,10 +972,11 @@ export const MCPSettingsSection: React.FC = () => {
       });
       try {
         const result = await api.mcp.test({ name });
-        cacheTestResult(name, stripServerInfo(result));
+        cacheTestResult(name, stripBranding(result));
         const serverInfo = result.success ? result.serverInfo : undefined;
         if (serverInfo && generation === loadGeneration.current) {
-          setBranding((prev) => ({ ...prev, [name]: serverInfo }));
+          const icon = result.success ? result.icon : undefined;
+          setBranding((prev) => ({ ...prev, [name]: { serverInfo, icon } }));
         }
       } catch (err) {
         cacheTestResult(name, {
@@ -1202,7 +1205,7 @@ export const MCPSettingsSection: React.FC = () => {
 
       // Adding reloads configuration, so only cacheable test data crosses that
       // boundary. The saved row needs its own test before it can show branding.
-      setNewTestResult({ result: stripServerInfo(result), testedAt: Date.now() });
+      setNewTestResult({ result: stripBranding(result), testedAt: Date.now() });
     } catch (err) {
       setNewTestResult({
         result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
@@ -1321,7 +1324,8 @@ export const MCPSettingsSection: React.FC = () => {
                             {branding[name] && !isEditing && (
                               <MCPServerIdentityBadge
                                 connection={describeConfiguredConnection(name, entry)}
-                                identity={branding[name]}
+                                identity={branding[name].serverInfo}
+                                icon={branding[name].icon}
                               />
                             )}
                             <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">

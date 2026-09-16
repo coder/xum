@@ -23,6 +23,11 @@ export default {
 const NOTION = "notion-work";
 const LOCAL = "local-docs";
 const INFO_BUTTON = `Server information: ${NOTION}`;
+// Deterministic 64×64 RGBA PNG (dark tile, light glyph) standing in for a
+// host-decoded server icon. Generated locally, not copied from any server.
+const NOTION_ICON =
+  "data:image/png;base64," +
+  "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAA3klEQVR42u3ZQQ6DMAxE0Zwk979g1mXbVRslZuSx/0gsgfCkALbHIISQr8w5PzvHWuvnsXsd9f0AAAAAAAAAAAAAADgB+LcIADpsgfYAuwi8BAFoDhCNYAkQiWALEIVgDRCBAIA7wC1CCYAbhDIApwgAVAI4QbD8FY5EsK0FohZuXQxFLB4A93L49gFK9ANuHqJMQ0R9HgAZW2Lq7ZOyJ6h+iaZsiqo/pSm7wuo/SgAyzgWUhVXawYiqvE49GQKgO4Ci2WoxHG0P8ObghfE4AAAAAAAAAAAAAACEEDLGA62rWdcX21dQAAAAAElFTkSuQmCC";
 
 function setupIdentityStory(transport: "http" | "auto" = "http") {
   expandLeftSidebar();
@@ -52,6 +57,7 @@ function setupIdentityStory(transport: "http" | "auto" = "http") {
         {
           success: true,
           tools: ["notion_ai_search", "notion_fetch", "notion_create_pages"],
+          icon: NOTION_ICON,
           serverInfo: {
             name: "Notion MCP",
             version: "1.2.0",
@@ -101,7 +107,10 @@ async function testBothServers(root: HTMLElement) {
       within(serverRow(root, name)).getByRole("button", { name: "Test connection" })
     );
   }
-  await within(serverRow(root, NOTION)).findByRole("button", { name: INFO_BUTTON });
+  const badge = await within(serverRow(root, NOTION)).findByRole("button", {
+    name: INFO_BUTTON,
+  });
+  await expect(badge.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
   await within(serverRow(root, NOTION)).findByText("3 tools");
   await within(serverRow(root, LOCAL)).findByText("2 tools");
   await expect(
@@ -134,6 +143,7 @@ export const SettingsServerDetails: AppStory = {
     await testBothServers(canvasElement);
     await userEvent.click(within(canvasElement).getByRole("button", { name: INFO_BUTTON }));
     const popover = await within(document.body).findByRole("dialog", { name: `About ${NOTION}` });
+    await expect(popover.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     await expect(popover).toHaveTextContent("Notion MCP");
     await expect(popover).toHaveTextContent("v1.2.0");
     await expect(popover).toHaveTextContent("http · https://mcp.notion.com");
@@ -188,7 +198,8 @@ export const WorkspaceModalAfterFetch: AppStory = {
     );
     await expect(within(row).queryByRole("button", { name: INFO_BUTTON })).not.toBeInTheDocument();
     await userEvent.click(within(row).getByRole("button", { name: "Fetch Tools" }));
-    await within(row).findByRole("button", { name: INFO_BUTTON });
+    const badge = await within(row).findByRole("button", { name: INFO_BUTTON });
+    await expect(badge.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     await waitFor(() =>
       expect(within(row).getByRole("button", { name: "Refresh Tools" })).toBeVisible()
     );

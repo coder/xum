@@ -17,7 +17,7 @@ import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
   describeConfiguredConnection,
-  stripServerInfo,
+  stripBranding,
 } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 
 interface WorkspaceMCPModalProps {
@@ -50,7 +50,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // its tools but never brands the row. See MCPSettingsSection for the same
   // contract; branding is never persisted with the test cache.
   const loadGeneration = useRef(0);
-  const [branding, setBranding] = useState<Record<string, MCPServerIdentity>>({});
+  const [branding, setBranding] = useState<
+    Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
+  >({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -109,10 +111,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       });
       try {
         const result = await api.mcp.test({ projectPath, name: serverName, workspaceId });
-        setResult(serverName, stripServerInfo(result));
+        setResult(serverName, stripBranding(result));
         const serverInfo = result.success ? result.serverInfo : undefined;
         if (serverInfo && generation === loadGeneration.current) {
-          setBranding((prev) => ({ ...prev, [serverName]: serverInfo }));
+          const icon = result.success ? result.icon : undefined;
+          setBranding((prev) => ({ ...prev, [serverName]: { serverInfo, icon } }));
         }
         if (!result.success) {
           setError(`Failed to fetch tools for ${serverName}: ${result.error}`);
@@ -389,7 +392,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             {branding[name] && (
                               <MCPServerIdentityBadge
                                 connection={describeConfiguredConnection(name, info)}
-                                identity={branding[name]}
+                                identity={branding[name].serverInfo}
+                                icon={branding[name].icon}
                               />
                             )}
                             <div className="min-w-0 font-medium wrap-anywhere">{displayName}</div>

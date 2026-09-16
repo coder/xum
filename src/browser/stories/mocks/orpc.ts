@@ -358,7 +358,7 @@ interface MockMcpOverrides {
 }
 
 type MockMcpTestResult =
-  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity }
+  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
   | { success: false; error: string };
 
 /**
