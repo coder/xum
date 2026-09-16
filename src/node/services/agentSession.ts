@@ -27,7 +27,7 @@ import {
   evaluateStepBudget,
   type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
-  getContextBudgetRolloverPoint,
+  getContextBudgetHandoffPoint,
   resolveContextBudgetFlushThinking,
 } from "@/common/utils/compaction/contextBudget";
 import {
@@ -1009,9 +1009,10 @@ export class AgentSession {
   /** Request-assembly snapshot admitted when a final flush was promised; pins the sealing reset. */
   private pendingRolloverSnapshot?: RequestAssemblySnapshot;
   private contextBudgetWarningClaimed = false;
+  private contextBudgetHandoffClaimed = false;
   /** One final pre-rollover notes flush per window; derived from history on restart. */
   private contextBudgetFlushClaimed = false;
-  private pendingBudgetWarning?: true;
+  private pendingBudgetPrompt?: "warn" | "handoff";
   private contextBudgetGeneration = 0;
   // Unknown after restart: do not spend the window's warning on guessed permissions.
   private contextBudgetMemoryWritable: boolean | undefined;
@@ -4577,15 +4578,23 @@ export class AgentSession {
       (internal?.onContextWindowRollover ?? this.onContextWindowRollover)?.();
       await clearPendingBranchSummary(this.workspaceId);
     } else if (tokenBudgetActive) {
-      this.contextBudgetWarningClaimed ||=
-        contextBudgetPrefix.length > 0 ||
-        userMessage.metadata?.muxMetadata?.type === "context-budget-warning";
+      const published = [...contextBudgetPrefix, userMessage];
+      this.contextBudgetWarningClaimed ||= published.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+          row.metadata.muxMetadata.handoff !== true
+      );
+      this.contextBudgetHandoffClaimed ||= published.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+          row.metadata.muxMetadata.handoff === true
+      );
       this.contextBudgetFlushClaimed ||= contextBudgetPrefix.some(
         (row) =>
           row.metadata?.muxMetadata?.type === "context-budget-warning" &&
           row.metadata.muxMetadata.final === true
       );
-      this.pendingBudgetWarning = undefined;
+      this.pendingBudgetPrompt = undefined;
     }
 
     // Rollover clears old tracking before append; register only the snapshot that
@@ -5214,8 +5223,9 @@ export class AgentSession {
     this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
     this.pendingRolloverSnapshot = undefined;
-    this.pendingBudgetWarning = undefined;
+    this.pendingBudgetPrompt = undefined;
     this.contextBudgetWarningClaimed = false;
+    this.contextBudgetHandoffClaimed = false;
     this.contextBudgetFlushClaimed = false;
     this.contextBudgetMemoryWritable = undefined;
     this.contextBudgetHistoryAvailable = false;
@@ -5352,6 +5362,21 @@ export class AgentSession {
     const resolved = await this.resolveAgentForBudgetChecks(options);
     if (!resolved.success) return resolved;
     return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
+  }
+
+  private async checkContextBudgetNewContextAccess(
+    options: SendMessageOptions
+  ): Promise<boolean | "unknown"> {
+    if (
+      !this.isTokenBudgetActive(options) ||
+      this.contextController.autoCompactionThreshold >= 1 ||
+      applyToolPolicyToNames(["new_context"], options.toolPolicy).length === 0
+    )
+      return false;
+    const resolved = await this.resolveAgentForBudgetChecks(options);
+    return resolved.success
+      ? applyToolPolicyToNames(["new_context"], resolved.data.effectiveToolPolicy).length > 0
+      : "unknown";
   }
 
   private async resolveAgentForBudgetChecks(
@@ -5882,10 +5907,16 @@ export class AgentSession {
       this.clearContextBudgetState();
     }
     this.contextBudgetWarningClaimed = history.data.some(
-      (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.handoff !== true
     );
-    // `||=`: the in-memory claim set at offer time must survive a read that runs before the
-    // final row is durable.
+    this.contextBudgetHandoffClaimed = history.data.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.handoff === true
+    );
+    // Retain legacy flush recovery; new windows no longer offer a final flush.
     this.contextBudgetFlushClaimed ||= history.data.some(
       (row) =>
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
@@ -5957,21 +5988,24 @@ export class AgentSession {
           budgetModel
         )
       : 0;
-    const decision: StepBudgetEvaluation = knownLimit
-      ? evaluateStepBudget({
-          contextTokens: contextTokens + newRequestTokens,
-          outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
-          ...estimateLastStepToolResults(lastAssistant),
-          modelContextLimit: maxTokens,
-          threshold: this.contextController.autoCompactionThreshold,
-          warningEmitted: this.contextBudgetWarningClaimed,
-        })
-      : {
-          decision: "continue",
-          flushOpportunity: true,
-          projected: contextTokens + newRequestTokens,
-          hardCeiling: undefined,
-        };
+    const evaluateBudget = (): StepBudgetEvaluation =>
+      knownLimit
+        ? evaluateStepBudget({
+            contextTokens: contextTokens + newRequestTokens,
+            outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
+            ...estimateLastStepToolResults(lastAssistant),
+            modelContextLimit: maxTokens,
+            threshold: this.contextController.autoCompactionThreshold,
+            warningEmitted: this.contextBudgetWarningClaimed,
+            handoffRequested: this.contextBudgetHandoffClaimed,
+          })
+        : {
+            decision: "continue",
+            flushOpportunity: true,
+            projected: contextTokens + newRequestTokens,
+            hardCeiling: undefined,
+          };
+    const decision = evaluateBudget();
     // The queued flush entry must be recognized before the rollover logic below, which
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
@@ -6087,10 +6121,7 @@ export class AgentSession {
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
             maxTokens: recordedLimit,
-            budgetTokens: getContextBudgetRolloverPoint(
-              recordedLimit,
-              this.contextController.autoCompactionThreshold
-            ),
+            budgetTokens: getContextBudgetHardCeiling(recordedLimit),
           })
         : undefined;
     // Recovery access is required only when sealing old context, not for a
@@ -6114,6 +6145,7 @@ export class AgentSession {
       const captured = pinned ? Ok(pinned) : await this.captureRolloverRequestAssembly();
       if (!captured.success) return captured;
       this.pendingRollover = rollover;
+      this.pendingBudgetPrompt = undefined;
       userMessage.metadata = {
         ...userMessage.metadata,
         muxMetadata: {
@@ -6135,30 +6167,40 @@ export class AgentSession {
       this.pendingRollover = undefined;
     }
     if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
-      this.pendingBudgetWarning = undefined;
+      this.pendingBudgetPrompt = undefined;
       return Ok({ prefix: [] });
     }
     if (
-      !this.contextBudgetWarningClaimed &&
+      knownLimit &&
       this.contextBudgetMemoryWritable !== undefined &&
-      this.contextController.autoCompactionThreshold < 1 &&
-      (this.pendingBudgetWarning != null || decision.decision === "warn")
+      this.isTokenBudgetActive(options)
     ) {
-      return Ok({
-        prefix: [
-          createContextBudgetWarning({
-            contextTokens: decision.projected,
-            maxTokens: recordedLimit,
-            budgetTokens: getContextBudgetRolloverPoint(
-              recordedLimit,
-              this.contextController.autoCompactionThreshold
-            ),
-            memoryWritable: this.contextBudgetMemoryWritable,
-            sessionHistoryAvailable:
-              this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy),
-          }),
-        ],
-      });
+      const newContextAvailable = await this.checkContextBudgetNewContextAccess(options);
+      const sessionHistoryAvailable =
+        this.contextBudgetHistoryAvailable &&
+        (await this.checkContextBudgetHistoryAccess(options)).success;
+      // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
+      // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
+      const advisory = evaluateBudget();
+      if (advisory.decision === "warn" || advisory.decision === "handoff") {
+        return Ok({
+          prefix: [
+            createContextBudgetWarning({
+              contextTokens: advisory.projected,
+              maxTokens: recordedLimit,
+              budgetTokens: getContextBudgetHardCeiling(recordedLimit),
+              handoffTokens: getContextBudgetHandoffPoint(
+                recordedLimit,
+                this.contextController.autoCompactionThreshold
+              ),
+              handoff: advisory.decision === "handoff",
+              memoryWritable: this.contextBudgetMemoryWritable,
+              sessionHistoryAvailable,
+              newContextAvailable,
+            }),
+          ],
+        });
+      }
     }
     return Ok({ prefix: [] });
   }
@@ -6263,6 +6305,7 @@ export class AgentSession {
           modelContextLimit: maxTokens,
           threshold,
           warningEmitted: this.contextBudgetWarningClaimed,
+          handoffRequested: this.contextBudgetHandoffClaimed,
         })
       : {
           decision: "continue",
@@ -6288,30 +6331,19 @@ export class AgentSession {
       // A flush turn is bounded to one provider step even when the step no longer crosses the
       // threshold (larger model after a restart): stopping here lets the queued rollover
       // continuation seal the window.
-      if (decision.decision === "continue") return this.flushTurnRolloverOutcome();
+      if (decision.decision !== "rollover") return this.flushTurnRolloverOutcome();
     }
     // A model request is honored like a budget rollover (continuation queued after every sibling
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
     if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
-    let offerFlush = false;
     if (decision.decision === "rollover" || modelRequested) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
         return { decision: "continue" };
-      // Offer one final notes flush before sealing when a writing step still fits and the
-      // reset that follows can actually be admitted (session_history available). A model that
-      // asked for the reset itself has already had its chance to write notes.
-      offerFlush =
-        !modelRequested &&
-        decision.decision === "rollover" &&
-        this.pendingRollover == null &&
-        !this.contextBudgetFlushClaimed &&
-        decision.flushOpportunity &&
-        step.memoryWritable &&
-        step.sessionHistoryAvailable &&
-        this.messageQueue.isEmpty();
+      // The usable ceiling is the only forced boundary; there is no new final-flush offer.
+      this.pendingBudgetPrompt = undefined;
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -6321,11 +6353,14 @@ export class AgentSession {
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
         maxTokens: recordedLimit,
-        budgetTokens: getContextBudgetRolloverPoint(recordedLimit, threshold),
+        budgetTokens: getContextBudgetHardCeiling(recordedLimit),
       };
     } else {
-      this.contextBudgetWarningClaimed = true;
-      this.pendingBudgetWarning = true;
+      assert(
+        decision.decision === "warn" || decision.decision === "handoff",
+        "Expected a budget advisory"
+      );
+      this.pendingBudgetPrompt = decision.decision;
     }
     // Keep the continuation's delegated-turn/goal attribution; the warning
     // itself is a separate durable prefix row when this entry dispatches.
@@ -6334,55 +6369,36 @@ export class AgentSession {
     const { fileParts: _fileParts, ...streamOptions } = context.options as SendMessageOptions & {
       fileParts?: unknown;
     };
-    // SECURITY: the flush turn is a hidden, automatically dispatched step running on a
-    // transcript that may already contain injected tool output. The request builder derives
-    // its memory-only tool ceiling, pinned notes path, and disabled hooks/PTC from the
-    // `contextBudgetFlush` flag, independent of these send options.
-    const enqueue = (text: string, dedupeKey: string, flush: boolean): string | undefined =>
-      this.enqueueContextBudgetContinuation({
+    // Capture the exact successor before publishing the queue so handoff stops retain
+    // upstream queue-cut attribution without creating a final-flush pair.
+    let continuationEntryId: string | undefined;
+    if (this.messageQueue.isEmpty()) {
+      continuationEntryId = this.enqueueContextBudgetContinuation({
         admissionCapture: context.admissionCapture,
-        text,
-        dedupeKey,
+        text: "Continue",
+        dedupeKey:
+          this.pendingBudgetPrompt != null
+            ? CONTEXT_WARNING_DEDUPE_KEY
+            : CONTEXT_CONTINUE_DEDUPE_KEY,
         options: streamOptions,
         model: step.model,
         muxMetadata: {
           ...(context.workspaceTurnMetadata ?? { type: "normal" }),
           contextBudgetContinuation: true,
-          ...(flush ? { contextBudgetFlush: true as const } : {}),
         },
         goalKind: context.goalKind,
         goalId: context.goalId,
       });
-    // The exact entry this stop hands the turn to. Captured here, before the queue is published
-    // or this decision yields, so a later head reorder or removal cannot change the attribution.
-    let continuationEntryId: string | undefined;
-    if (offerFlush) {
-      assert(
-        !this.messageQueue.hasDedupeKey(CONTEXT_WARNING_DEDUPE_KEY) &&
-          !this.messageQueue.hasDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY),
-        "flush offer requires no pending budget continuation"
-      );
-      this.contextBudgetFlushClaimed = true;
-      // Entry 1 is the flush turn (hidden trigger text; the visible prefix carries the prompt).
-      // Entry 2 is the unconditional rollover; its tool-end dispatch also bounds the flush
-      // turn to a single provider step. Only entry 1 continues THIS turn; entry 2 earns its
-      // receipt when it cuts the flush turn (flushTurnRolloverOutcome).
-      continuationEntryId = enqueue("Flush context notes now.", CONTEXT_WARNING_DEDUPE_KEY, true);
-      enqueue("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false);
-      this.registerQueueCutReceipt(continuationEntryId);
-      this.emitQueuedMessageChanged();
-    } else if (this.messageQueue.isEmpty()) {
-      continuationEntryId = enqueue(
-        "Continue",
-        decision.decision === "warn" ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
-        false
-      );
       this.registerQueueCutReceipt(continuationEntryId);
       this.emitQueuedMessageChanged();
     }
     // Nothing enqueued (unrelated input already queued): the stop designates no successor.
     return {
-      decision: modelRequested ? "rollover" : decision.decision,
+      decision: modelRequested
+        ? "rollover"
+        : decision.decision === "handoff"
+          ? "warn"
+          : decision.decision,
       ...(continuationEntryId != null ? { continuationEntryId } : {}),
     };
   }
@@ -7390,8 +7406,15 @@ export class AgentSession {
       // prepareContextBudgetSend), never the live registry.
       let resumedFlushSnapshot: RequestAssemblySnapshot | undefined;
       if (this.isTokenBudgetActive(options)) {
-        this.contextBudgetWarningClaimed ||= historyResult.data.some(
-          (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+        this.contextBudgetWarningClaimed = historyResult.data.some(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.handoff !== true
+        );
+        this.contextBudgetHandoffClaimed = historyResult.data.some(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.handoff === true
         );
         // A resumed final-flush turn must not offer a second flush in the same window.
         this.contextBudgetFlushClaimed ||= historyResult.data.some(

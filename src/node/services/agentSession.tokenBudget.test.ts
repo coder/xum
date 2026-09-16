@@ -1758,6 +1758,42 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toHaveLength(1);
   });
 
+  test.each([0.7, 0.9, 1])(
+    "a pending handoff is reclassified at dispatch with threshold %s",
+    async (threshold) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect(await h.requests[0].onStepSettled?.(step(90_000))).toBe("warn");
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      const state = h.session as unknown as { contextBudgetHandoffClaimed: boolean };
+      expect(state.contextBudgetHandoffClaimed).toBe(false);
+      h.session.setAutoCompactionThreshold(threshold);
+      h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(warningRows(rows)).toHaveLength(threshold === 0.7 ? 1 : 0);
+      expect(state.contextBudgetHandoffClaimed).toBe(threshold === 0.7);
+      if (threshold !== 0.7) return;
+      expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+        handoff: true,
+        budgetTokens: 119_808,
+        handoffTokens: 89_600,
+      });
+      for (const usage of [95_000, 105_000, 115_000]) {
+        expect(await h.requests[1].onStepSettled?.(step(usage))).toBe("continue");
+      }
+      expect(await h.requests[1].onStepSettled?.(step(120_000))).toBe("rollover");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+      h.settleStream(1, { contextUsage: { inputTokens: 120_000 } });
+      await h.waitForRequest(3);
+      const sealed = await allRows(h);
+      expect(rolloverRows(sealed)).toHaveLength(1);
+      expect(warningRows(sealed).some(isFinalFlushRow)).toBe(false);
+    }
+  );
+
   test("settled warning is durable once per window and retains delegated continuation attribution", async () => {
     const h = await setup();
     expect(
