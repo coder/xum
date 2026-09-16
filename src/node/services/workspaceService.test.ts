@@ -15288,6 +15288,95 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
   });
 });
 
+describe("WorkspaceService sendMessage AI settings persistence", () => {
+  // Backend-initiated turns (peer messages, task wakes, heartbeats) carry the recipient's
+  // resolved agent/model/thinking as send options. The remembered selection must survive such a
+  // send unchanged while an otherwise identical user-authored send still updates it. The status
+  // clearing suite above only proves the persistence hook is skipped; this reads the real config.
+  test.each([true, false])(
+    "persists agent and AI settings only for non-synthetic sends (synthetic=%s)",
+    async (synthetic) => {
+      const { config, historyService, cleanup } = await createTestHistoryService();
+      try {
+        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}`;
+        const projectPath = "/tmp/settings-persistence-project";
+        const remembered = {
+          agentId: "exec",
+          aiSettings: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+          aiSettingsByAgent: {
+            exec: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+          },
+        };
+        await config.addWorkspace(projectPath, {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "settings-persistence-project",
+          projectPath,
+          runtimeConfig: { type: "local" },
+          ...remembered,
+        });
+
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          aiService: createMockAIService({ isStreaming: mock(() => false) }),
+        });
+        const fakeSession = {
+          ...createCompactionAdmissionMocks(),
+          isBusy: mock(() => false),
+          hasQueuedMessages: mock(() => false),
+          hasQueuedOrDispatchingEntry: mock(() => false),
+          dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
+          queueMessage: mock(() => "tool-end" as const),
+          sendMessage: mock(() => Promise.resolve(Ok(undefined))),
+          drainQueuedMessagesIfIdle: mock(() => undefined),
+        };
+        (
+          workspaceService as unknown as {
+            getOrCreateSession: (workspaceId: string) => AgentSession;
+          }
+        ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+
+        const result = await workspaceService.sendMessage(
+          workspaceId,
+          "hello",
+          { agentId: "plan", model: "openai:gpt-5.2", thinkingLevel: "high" },
+          synthetic ? { synthetic: true } : undefined
+        );
+
+        expect(result.success).toBe(true);
+        expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+        const entry = config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === workspaceId);
+        expect(entry).toBeDefined();
+        const persisted = {
+          agentId: entry?.agentId,
+          aiSettings: entry?.aiSettings,
+          aiSettingsByAgent: entry?.aiSettingsByAgent,
+        };
+        expect(persisted).toEqual(
+          synthetic
+            ? remembered
+            : {
+                agentId: "plan",
+                // The legacy root bucket is never rewritten by a send; only the per-agent
+                // bucket of the selected agent changes.
+                aiSettings: remembered.aiSettings,
+                aiSettingsByAgent: {
+                  ...remembered.aiSettingsByAgent,
+                  plan: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+                },
+              }
+        );
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});
+
 describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
