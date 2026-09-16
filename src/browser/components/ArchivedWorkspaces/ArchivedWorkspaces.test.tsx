@@ -429,9 +429,12 @@ describe("ArchivedWorkspaces", () => {
     expect(removeWorkspaceMock.mock.calls.every((call) => call[1]?.force === true)).toBe(true);
   });
 
-  test("Shift-click requires descendant confirmation and forwards retry results", async () => {
+  test("Shift-click acknowledges reported descendants without a confirmation", async () => {
     const workspace = createWorkspace({ id: "parent", name: "parent" });
-    const descendants = [{ workspaceId: "child", title: "Child", active: false }];
+    const descendants = [
+      { workspaceId: "grandchild", title: "Grandchild", active: false },
+      { workspaceId: "child", title: "Child", active: false },
+    ];
     removeWorkspaceMock.mockResolvedValueOnce({
       success: false,
       error: "Confirm children",
@@ -449,24 +452,56 @@ describe("ArchivedWorkspaces", () => {
     fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
       shiftKey: true,
     });
-    await waitFor(() => expect(modalProps?.descendants).toEqual(descendants));
-    expect(removeWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id);
-    expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
-    if (!modalProps) throw new Error("Expected deletion confirmation");
+    await waitFor(() => expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1));
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(2);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(1, workspace.id);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, {
+      force: true,
+      acknowledgedDescendantIds: ["grandchild", "child"],
+    });
+    expect(modalProps).toBeUndefined();
+  });
+
+  test("Shift-click falls back to the modal when the acknowledged retry fails", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    const descendants = [{ workspaceId: "child", title: "Child", active: false }];
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Confirm children",
+      descendants,
+    });
     const retryFailure = {
       success: false,
       error: "Child starts running",
       descendants: [{ ...descendants[0], active: true }],
     };
     removeWorkspaceMock.mockResolvedValueOnce(retryFailure);
-    expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual(retryFailure);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+    await waitFor(() => expect(modalProps?.descendants).toEqual(retryFailure.descendants));
+    expect(modalProps?.error).toBe(retryFailure.error);
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(2);
     expect(removeWorkspaceMock).toHaveBeenLastCalledWith(workspace.id, {
       force: true,
       acknowledgedDescendantIds: ["child"],
     });
     expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
+    if (!modalProps) throw new Error("Expected deletion confirmation");
     expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual({ success: true });
+    expect(removeWorkspaceMock).toHaveBeenLastCalledWith(workspace.id, {
+      force: true,
+      acknowledgedDescendantIds: ["child"],
+    });
     expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
   });
 

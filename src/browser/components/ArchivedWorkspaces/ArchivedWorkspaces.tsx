@@ -719,10 +719,21 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return;
       }
 
-      // Shift-click: skip force-delete confirmation, auto-force immediately.
-      // Descendant deletion always requires an explicit scope confirmation, including Shift-click.
-      if (options?.bypassForceConfirm && !result.descendants?.length) {
-        const forced = await removeWorkspace(workspaceId, { force: true });
+      // Shift-click: skip every confirmation, auto-force immediately. Shift stands in for the
+      // descendant acknowledgment the modal would otherwise collect, so pass the scope the
+      // backend just reported. The backend still rejects the retry if any descendant is active
+      // or the scope changed, and that failure falls through to the modal below.
+      if (options?.bypassForceConfirm) {
+        const forced = await removeWorkspace(workspaceId, {
+          force: true,
+          ...(result.descendants?.length
+            ? {
+                acknowledgedDescendantIds: result.descendants.map(
+                  (descendant) => descendant.workspaceId
+                ),
+              }
+            : {}),
+        });
         if (forced.success) {
           onWorkspacesChanged?.();
           return;
