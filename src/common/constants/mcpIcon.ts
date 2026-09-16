@@ -14,6 +14,7 @@ export const MCP_ICON_LIMITS = {
   svgMaxDepth: 16,
   svgMaxNodes: 1_000,
   svgAttributeMaxChars: 32_768,
+  svgCoordinateMaxExclusive: 1_000_000,
   registryMaxEntries: 200,
   registryMaxBytes: 2 * 1024 * 1024,
   successTtlMs: 24 * 60 * 60 * 1000,

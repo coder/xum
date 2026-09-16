@@ -134,6 +134,7 @@
     "rehype-harden": "^1.1.5",
     "rehype-sanitize": "^6.0.0",
     "remark-breaks": "^4.0.0",
+    "saxes": "6.0.0",
     "sharp": "^0.34.5",
     "shescape": "^2.1.6",
     "source-map-support": "^0.5.21",
