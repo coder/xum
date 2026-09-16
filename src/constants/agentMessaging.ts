@@ -1,6 +1,6 @@
 /**
- * Loop protection for intra-tree agent peer messaging: task_send_message sends whose target is
- * NOT the sender's descendant (siblings/cousins and ancestors, including the root workspace).
+ * Loop protection for instance-wide agent peer messaging: task_send_message sends whose target is
+ * NOT the sender's descendant (siblings/cousins, ancestors, or unrelated workspaces).
  * Parent→descendant guidance is unthrottled and unaffected by these constants.
  *
  * All counters live in-memory on TaskService (mirroring consecutiveAutoResumes): a restart clears
@@ -87,3 +87,7 @@ export const MAX_CONSECUTIVE_PEER_WAKES = 3;
  */
 export const WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE =
   "A stop is in progress for this workspace; retry once it has settled.";
+
+/** Bound on-demand instance discovery without growing the default task list. */
+export const INSTANCE_DISCOVERY_DEFAULT_LIMIT = 20;
+export const INSTANCE_DISCOVERY_MAX_LIMIT = 100;
