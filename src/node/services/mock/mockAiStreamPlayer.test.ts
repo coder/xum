@@ -5,7 +5,8 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
-import type { StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
 
 function readWorkspaceId(payload: unknown): string | undefined {
@@ -853,4 +854,92 @@ describe("MockAiStreamPlayer", () => {
       }
     }
   );
+  test("dispatches text deltas in schedule order when a later timer fires before an earlier one", async () => {
+    // Regression (tests/ui bottomLayoutShift under 4-worker load): each scheduled event has an
+    // independent setTimeout, and when several are overdue the runtime may fire the later-delay
+    // timer first. processQueue serializes handlers in *enqueue* order, so the deltas were emitted
+    // reversed; buildCompletedParts later replaced the accumulated text with the adapter's full
+    // text, hiding the wrong live order from persisted history. Drive the timers directly so the
+    // inversion is deterministic instead of load-dependent.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-timer-order";
+    const userText = "Seed idle target transcript";
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+
+    // Derive the expected schedule from the adapter so the test follows chunking/delay constants.
+    const expectedEvents = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    );
+    const expectedDeltas = expectedEvents.flatMap((event) =>
+      event.kind === "stream-delta" ? [event.text] : []
+    );
+    expect(expectedDeltas.length).toBeGreaterThanOrEqual(2);
+    const scheduledDelays = new Set(expectedEvents.map((event) => event.delay));
+
+    const emittedDeltas: string[] = [];
+    let deltasSeenAtStreamEnd = -1;
+    aiServiceStub.on("stream-delta", (event: StreamDeltaEvent) => {
+      emittedDeltas.push(event.delta);
+    });
+    aiServiceStub.on("stream-end", () => {
+      deltasSeenAtStreamEnd = emittedDeltas.length;
+    });
+
+    // Capture only the player's event timers (delays taken from the adapter schedule); every
+    // other timer (stream-start watchdog, lock retries, tokenizer fallback) keeps the real clock.
+    const captured: Array<{ delay: number; fire: () => void }> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const capturingSetTimeout = ((callback: (...args: unknown[]) => void, delay?: number) => {
+      if (scheduledDelays.has(delay ?? 0)) {
+        captured.push({ delay: delay ?? 0, fire: () => callback() });
+        return { ref: () => undefined, unref: () => undefined } as unknown as ReturnType<
+          typeof setTimeout
+        >;
+      }
+      return realSetTimeout(callback, delay);
+    }) as typeof setTimeout;
+
+    globalThis.setTimeout = capturingSetTimeout;
+    let playResult: Awaited<ReturnType<MockAiStreamPlayer["play"]>>;
+    try {
+      const playPromise = player.play([user], workspaceId);
+      // play() resolves only after stream-start fires, so wait for the schedule without timers.
+      for (let ticks = 0; captured.length < expectedEvents.length; ticks++) {
+        if (ticks > 10_000) throw new Error("Mock player never scheduled its event timers");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      globalThis.setTimeout = realSetTimeout;
+
+      const byDelay = [...captured].sort((a, b) => a.delay - b.delay);
+      const [streamStart, ...rest] = byDelay;
+      const terminal = rest.pop();
+      if (!terminal) throw new Error("expected a terminal mock event");
+      // All deadlines are overdue by now; fire the deltas latest-first, as the loaded runtime did.
+      await new Promise<void>((resolve) => realSetTimeout(resolve, terminal.delay + 5));
+      streamStart.fire();
+      for (const timer of [...rest].reverse()) timer.fire();
+      terminal.fire();
+      playResult = await playPromise;
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+
+    expect(playResult.success).toBe(true);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+
+    // Live emission must follow the adapter schedule with no duplicates, and the terminal event
+    // must not overtake the deltas.
+    expect(emittedDeltas).toEqual(expectedDeltas);
+    expect(deltasSeenAtStreamEnd).toBe(expectedDeltas.length);
+
+    await player.stop(workspaceId);
+  });
 });
