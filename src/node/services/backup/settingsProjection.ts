@@ -36,6 +36,8 @@ import {
  *   (with their legacy deleteWorktreeOnArchive and stopCoderWorkspaceOnArchive spellings). A
  *   repository-controlled "delete" would make every later archive remove worktrees and Coder
  *   workspaces, and unpushed work with them, with no prompt naming the policy;
+ * - agent-executed text: heartbeatDefaultPrompt. A repository-controlled prompt would run
+ *   unattended in every workspace whose heartbeat has no message of its own;
  * - save-time projections and internal state: subagentAiDefaults, preferredCompactionModel
  *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
  *   settingsBackup, onePasswordAccountName.
@@ -53,7 +55,6 @@ const BACKED_UP_SETTINGS_KEYS = [
   "advisorMaxUsesPerTurn",
   "advisorMaxOutputTokens",
   "taskSettings",
-  "heartbeatDefaultPrompt",
   "heartbeatDefaultIntervalMs",
   "goalDefaults",
   "chatTranscriptFullWidth",
@@ -110,7 +111,6 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   advisorMaxUsesPerTurn: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
   advisorMaxOutputTokens: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
   taskSettings: normalizeTaskSettings,
-  heartbeatDefaultPrompt: parseOptionalNonEmptyString,
   heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs,
   goalDefaults: (value) => normalizeGoalDefaults(GoalDefaultsSchema.safeParse(value).data),
   chatTranscriptFullWidth: (value) => value === true,

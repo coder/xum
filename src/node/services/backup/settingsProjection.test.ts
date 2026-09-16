@@ -24,7 +24,6 @@ const UNSET_EXPORT = {
   advisorMaxUsesPerTurn: ADVISOR_DEFAULT_MAX_USES_PER_TURN,
   advisorMaxOutputTokens: null,
   taskSettings: DEFAULT_TASK_SETTINGS,
-  heartbeatDefaultPrompt: null,
   heartbeatDefaultIntervalMs: null,
   goalDefaults: DEFAULT_GOAL_DEFAULTS,
   chatTranscriptFullWidth: false,
@@ -61,7 +60,6 @@ describe("settingsProjection", () => {
         maxTaskNestingDepth: 2,
         preserveSubagentsUntilArchive: true,
       },
-      heartbeatDefaultPrompt: "Check in",
       heartbeatDefaultIntervalMs: 15 * 60 * 1000,
       goalDefaults: {
         defaultBudgetCents: 500,
@@ -84,6 +82,7 @@ describe("settingsProjection", () => {
       updateChannel: "nightly",
       muxGovernorUrl: "https://governor.example.com",
       muxGovernorToken: "governor-secret",
+      heartbeatDefaultPrompt: "Check in",
       routePriority: ["anthropic"],
       routeOverrides: { "anthropic:claude-exec": "direct" },
       viewedSplashScreens: ["welcome"],
@@ -223,7 +222,6 @@ describe("settingsProjection", () => {
         modelFallbacks: {
           "anthropic:claude-exec": { models: ["anthropic:claude-exec", "openai:gpt-plan"] },
         },
-        heartbeatDefaultPrompt: "  Check in  ",
         agentAiDefaults: { exec: { modelString: " openai:gpt-exec " } },
       },
     });
@@ -232,9 +230,26 @@ describe("settingsProjection", () => {
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-a"],
       modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
-      heartbeatDefaultPrompt: "Check in",
       agentAiDefaults: { exec: { modelString: "openai:gpt-exec" } },
     });
+  });
+
+  it("never carries the heartbeat prompt, which agents execute unattended", () => {
+    const local: ProjectsConfig = { projects: new Map(), heartbeatDefaultPrompt: "Local prompt" };
+    expect(projectBackupSettings(local)).not.toHaveProperty("heartbeatDefaultPrompt");
+
+    // A backup written while the prompt was still portable is read like any block with a key
+    // this build does not project: silently, so the local prompt stays.
+    const read = readBackupSettings({
+      settings: {
+        heartbeatDefaultPrompt: "Run the release script",
+        heartbeatDefaultIntervalMs: 600_000,
+      },
+    });
+    expect(read).toEqual({ settings: { heartbeatDefaultIntervalMs: 600_000 }, unsupported: [] });
+    const merged = mergeBackupSettings(local, read.settings!);
+    expect(merged.heartbeatDefaultPrompt).toBe("Local prompt");
+    expect(merged.heartbeatDefaultIntervalMs).toBe(600_000);
   });
 
   it("reads only the portable settings block", () => {

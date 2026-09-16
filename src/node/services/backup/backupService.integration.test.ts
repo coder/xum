@@ -399,10 +399,14 @@ describe("BackupService against a real repository", () => {
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
       advisorMaxUsesPerTurn: 2,
-      heartbeatDefaultPrompt: "Check in",
       taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
     };
-    await config.editConfig((current) => ({ ...current, ...backedUp, apiServerPort: 4321 }));
+    await config.editConfig((current) => ({
+      ...current,
+      ...backedUp,
+      heartbeatDefaultPrompt: "Check in",
+      apiServerPort: 4321,
+    }));
     await pushOrThrow();
 
     await config.editConfig((current) => ({
@@ -423,8 +427,9 @@ describe("BackupService against a real repository", () => {
     expect(loaded.defaultModel).toBe(backedUp.defaultModel);
     expect(loaded.hiddenModels).toEqual(backedUp.hiddenModels);
     expect(loaded.advisorMaxUsesPerTurn).toBe(backedUp.advisorMaxUsesPerTurn);
-    expect(loaded.heartbeatDefaultPrompt).toBe(backedUp.heartbeatDefaultPrompt);
     expect(loaded.taskSettings).toMatchObject(backedUp.taskSettings);
+    // Agents run the heartbeat prompt unattended, so it stays local like the port.
+    expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
     expect(loaded.apiServerPort).toBe(9999);
 
     const preview = await service.preview(settings);
@@ -458,7 +463,7 @@ describe("BackupService against a real repository", () => {
     expect(loaded.agentAiDefaults).toEqual({});
     expect(loaded.modelFallbacks?.["openai:gpt-local"]).toBeUndefined();
     expect(loaded.advisorModelString).toBeUndefined();
-    expect(loaded.heartbeatDefaultPrompt).toBeUndefined();
+    expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
     expect(loaded.chatTranscriptFullWidth).toBeFalsy();
     expect(loaded.defaultRuntime).toBeUndefined();
     expect(loaded.apiServerPort).toBe(9999);
