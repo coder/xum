@@ -1343,6 +1343,7 @@ describe("MCPServerManager", () => {
         };
         await manager.getToolsForWorkspace(request);
         access.startServers = startServers;
+        elapseTimedOutRetryBackoff();
       } else if (mode === "restart") {
         await manager.getToolsForWorkspace(request);
         f.started.find((client) => client.name === key)!.isClosed = true;
@@ -3364,6 +3365,79 @@ describe("MCPServerManager", () => {
     } finally {
       setSystemTime();
     }
+  });
+
+  test("timed-out retry backoff is measured from the attempt's own completion, not the batch's", async () => {
+    const workspaceId = "ws-timeout-retry-attempt-time";
+    configService.listServers = mock(() => Promise.resolve({ flaky: stdioConfig("cmd") }));
+    const base = Date.now();
+    // A first-wave timeout finished 45 s before the batch settled (later
+    // waves were still running), so its window is already 45 s in.
+    const startServersMock = mock(() =>
+      Promise.resolve({
+        ...startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }),
+        timedOutAtMs: new Map([["flaky", base - 45_000]]),
+      })
+    );
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    setSystemTime(new Date(base));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    setSystemTime(new Date(base + 14_999));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+    setSystemTime(new Date(base + 15_000));
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("a closed companion's full restart keeps a backed-off server on its schedule", async () => {
+    const workspaceId = "ws-timeout-backoff-closed-companion";
+    configService.listServers = mock(() =>
+      Promise.resolve({ healthy: stdioConfig("cmd-h"), flaky: stdioConfig("cmd-f") })
+    );
+    const startServersMock = mock((servers: unknown) => {
+      const names = Object.keys(servers as Record<string, unknown>);
+      return Promise.resolve(
+        startResult(
+          names.filter((name) => name === "healthy").map((name) => [name] as [string]),
+          names.includes("flaky")
+            ? { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }
+            : {}
+        )
+      );
+    });
+    access.startServers = startServersMock;
+    const request = workspaceRequest(workspaceId);
+    const entryOf = () =>
+      access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, { isClosed: boolean }>;
+        timedOutServerNames: string[];
+        stats: { failedServerNames: string[] };
+      };
+
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(1);
+
+    // The healthy client dies with no lease held, forcing a full restart of
+    // the entry. The backed-off server must not be started again with it.
+    entryOf().instances.get("healthy")!.isClosed = true;
+    const restarted = await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(Object.keys(startServersMock.mock.calls[1][0] as object)).toEqual(["healthy"]);
+    expect(entryOf().timedOutServerNames).toEqual(["flaky"]);
+    expect(restarted.stats.failedServerNames).toEqual(["flaky"]);
+    expect(restarted.stats.startedServerCount).toBe(1);
+
+    // Its window continues from the original timeout rather than restarting.
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(2);
+    elapseTimedOutRetryBackoff();
+    await manager.getToolsForWorkspace(request);
+    expect(startServersMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(startServersMock.mock.calls[2][0] as object)).toEqual(["flaky"]);
   });
 
   test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {

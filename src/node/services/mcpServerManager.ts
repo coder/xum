@@ -108,6 +108,12 @@ const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error
 const TIMED_OUT_RETRY_BACKOFF_BASE_MS = MCP_STARTUP_TIMEOUT_MS;
 const TIMED_OUT_RETRY_BACKOFF_MAX_MS = 5 * 60_000;
 
+interface TimedOutRetryBackoff {
+  retryTimeouts: number;
+  /** When the latest timed-out attempt finished, not when its batch settled. */
+  lastAttemptAtMs: number;
+}
+
 /** Wait required after `retryTimeouts` consecutive failed retries before the next attempt. */
 function timedOutRetryBackoffMs(retryTimeouts: number): number {
   if (retryTimeouts <= 0) return 0;
@@ -1197,7 +1203,7 @@ interface WorkspaceServers {
    * TIMED_OUT_RETRY_BACKOFF_BASE_MS). No record (plugin re-queue) means the
    * next serve retries immediately.
    */
-  timedOutRetryBackoff?: Map<string, { retryTimeouts: number; lastAttemptAtMs: number }>;
+  timedOutRetryBackoff?: Map<string, TimedOutRetryBackoff>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
   stalePromptServerNames?: Set<string>;
   /** Dedupes send-path background prompt refreshes so streams never stack them. */
@@ -2264,32 +2270,63 @@ export class MCPServerManager {
       ) {
         return false;
       }
-      const backoff = entry.timedOutRetryBackoff?.get(serverName);
-      if (backoff === undefined) return true;
-      const retryAfterMs =
-        backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now;
+      const retryAfterMs = this.timedOutRetryWaitMs(entry, serverName, now);
       if (retryAfterMs <= 0) return true;
       // Info, not debug: this is the only evidence that a turn ran without
       // the server on purpose rather than the server silently vanishing.
       log.info("[MCP] Skipping timed-out server retry during backoff", {
         serverName,
-        retryTimeouts: backoff.retryTimeouts,
+        retryTimeouts: entry.timedOutRetryBackoff?.get(serverName)?.retryTimeouts,
         retryAfterMs,
       });
       return false;
     });
   }
 
+  /** Milliseconds until `serverName` may be retried; 0 when no backoff is pending. */
+  private timedOutRetryWaitMs(entry: WorkspaceServers, serverName: string, now: number): number {
+    const backoff = entry.timedOutRetryBackoff?.get(serverName);
+    if (backoff === undefined) return 0;
+    return Math.max(
+      0,
+      backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now
+    );
+  }
+
   /**
-   * Record startup outcomes for backoff, from the initial start and from
-   * cached-path retries alike. A timeout lengthens the wait; any other
-   * outcome (started, hard failure that leaves the retry list, plugin-tree
-   * invalidation) clears it.
+   * Backoff records to carry into a same-signature full restart forced by a
+   * closed companion instance. That restart replaces the cache entry, so
+   * without this the backed-off server would be started again at once and
+   * charge another startup timeout every time a companion dies. Only servers
+   * still enabled and still inside their window carry over.
+   */
+  private backedOffServersToCarry(
+    entry: WorkspaceServers,
+    enabledServers: MCPServerMap
+  ): Map<string, TimedOutRetryBackoff> {
+    const carried = new Map<string, TimedOutRetryBackoff>();
+    const now = Date.now();
+    for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
+      if (enabledServers[serverName] === undefined || entry.instances.has(serverName)) continue;
+      if (this.timedOutRetryWaitMs(entry, serverName, now) <= 0) continue;
+      carried.set(serverName, backoff);
+    }
+    return carried;
+  }
+
+  /**
+   * Record startup outcomes for backoff, from the initial start, cached-path
+   * retries, and closed-client restarts alike. A timeout lengthens the wait,
+   * measured from when that server's attempt finished (startups run four at a
+   * time, so a batch can settle long after its first wave timed out); any
+   * other outcome (started, hard failure that leaves the retry list,
+   * plugin-tree invalidation) clears it.
    */
   private recordStartupTimeoutOutcomes(
     entry: WorkspaceServers,
     attempted: Iterable<string>,
-    timedOutNames: Iterable<string>
+    timedOutNames: Iterable<string>,
+    timedOutAtMs?: ReadonlyMap<string, number>
   ): void {
     const timedOut = new Set(timedOutNames);
     const now = Date.now();
@@ -2302,7 +2339,7 @@ export class MCPServerManager {
       const previous = entry.timedOutRetryBackoff.get(serverName);
       entry.timedOutRetryBackoff.set(serverName, {
         retryTimeouts: (previous?.retryTimeouts ?? 0) + 1,
-        lastAttemptAtMs: now,
+        lastAttemptAtMs: timedOutAtMs?.get(serverName) ?? now,
       });
     }
   }
@@ -2896,6 +2933,7 @@ export class MCPServerManager {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
             timedOutServerNames: retryTimedOutNames = [],
+            timedOutAtMs: retryTimedOutAtMs,
           } = await this.startServers(
             serversToRetry,
             runtime,
@@ -2971,7 +3009,12 @@ export class MCPServerManager {
                 ...retryTimedOutNames,
                 ...invalidatedRetryKeys,
               ];
-              this.recordStartupTimeoutOutcomes(existing, retryingServerNames, retryTimedOutNames);
+              this.recordStartupTimeoutOutcomes(
+                existing,
+                retryingServerNames,
+                retryTimedOutNames,
+                retryTimedOutAtMs
+              );
             }
           );
           if (retryOwnershipLost) {
@@ -3108,6 +3151,7 @@ export class MCPServerManager {
           instances: restartedInstances,
           failedServerNames: failedNames,
           timedOutServerNames: timedOutNames = [],
+          timedOutAtMs: restartTimedOutAtMs,
         } = await this.startServers(
           serversToRestart,
           runtime,
@@ -3150,7 +3194,8 @@ export class MCPServerManager {
             this.recordStartupTimeoutOutcomes(
               existing,
               Object.keys(serversToRestart),
-              timedOutNames
+              timedOutNames,
+              restartTimedOutAtMs
             );
             existing.stats = this.createWorkspaceStats(
               existing.stats.enabledServerCount,
@@ -3317,9 +3362,20 @@ export class MCPServerManager {
         return undefined;
       }
       const retained = addedServerNames !== undefined ? current : undefined;
+      // Reaching here with the same signature means a closed companion forced
+      // a full restart; backed-off servers keep their schedule across it. A
+      // changed signature is a config change and starts everything afresh.
+      const carriedBackoff =
+        retained === undefined && current?.configSignature === signature
+          ? this.backedOffServersToCarry(current, enabledServers)
+          : new Map<string, TimedOutRetryBackoff>();
       const serversToStart = addedServerNames
         ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
-        : enabledServers;
+        : carriedBackoff.size === 0
+          ? enabledServers
+          : Object.fromEntries(
+              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.has(name))
+            );
       if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
           workspaceId,
@@ -3341,8 +3397,9 @@ export class MCPServerManager {
       await this.assertOverridesEpochUnmovedBeforeStart();
       const {
         instances,
-        failedServerNames: startFailedNames,
+        failedServerNames: startedFailedNames,
         timedOutServerNames: startTimedOutNames = [],
+        timedOutAtMs: startTimedOutAtMs,
       } = await this.startServers(
         serversToStart,
         runtime,
@@ -3352,6 +3409,8 @@ export class MCPServerManager {
         () => this.markActivity(workspaceId),
         workspaceId
       );
+      // Carried servers were not attempted this time but are still down.
+      const startFailedNames = [...startedFailedNames, ...carriedBackoff.keys()];
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -3408,7 +3467,12 @@ export class MCPServerManager {
             // Config signature moved: give every pending retry a fresh start,
             // then count this start's timeouts as their first failure.
             delete retained.timedOutRetryBackoff;
-            this.recordStartupTimeoutOutcomes(retained, startTimedOutNames, startTimedOutNames);
+            this.recordStartupTimeoutOutcomes(
+              retained,
+              startTimedOutNames,
+              startTimedOutNames,
+              startTimedOutAtMs
+            );
             retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
               ...retained.stats.failedServerNames,
               ...startFailedNames,
@@ -3426,11 +3490,21 @@ export class MCPServerManager {
             enabledServers,
             enabledServersGeneration: configGenerationUsed,
             stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
-            timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
+            timedOutServerNames: [
+              ...carriedBackoff.keys(),
+              ...startTimedOutNames,
+              ...invalidatedKeys,
+            ],
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
+            ...(carriedBackoff.size > 0 ? { timedOutRetryBackoff: new Map(carriedBackoff) } : {}),
           };
-          this.recordStartupTimeoutOutcomes(entry, startTimedOutNames, startTimedOutNames);
+          this.recordStartupTimeoutOutcomes(
+            entry,
+            startTimedOutNames,
+            startTimedOutNames,
+            startTimedOutAtMs
+          );
           this.workspaceServers.set(workspaceId, entry);
         }
       );
@@ -5331,10 +5405,13 @@ export class MCPServerManager {
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
     timedOutServerNames: string[];
+    /** When each timed-out attempt finished; the batch itself settles later. */
+    timedOutAtMs: Map<string, number>;
   }> {
     const instances = new Map<string, MCPServerInstance>();
     const failedServerNames: string[] = [];
     const timedOutServerNames: string[] = [];
+    const timedOutAtMs = new Map<string, number>();
     const entries = Object.entries(servers);
 
     // Bounded concurrency so one unresponsive server's 60s startup deadline
@@ -5360,6 +5437,7 @@ export class MCPServerManager {
           failedServerNames.push(name);
           if (isMCPStartupTimeoutError(error)) {
             timedOutServerNames.push(name);
+            timedOutAtMs.set(name, Date.now());
           }
           return null;
         } finally {
@@ -5376,7 +5454,7 @@ export class MCPServerManager {
       }
     }
 
-    return { instances, failedServerNames, timedOutServerNames };
+    return { instances, failedServerNames, timedOutServerNames, timedOutAtMs };
   }
 
   private async startSingleServer(
