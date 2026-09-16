@@ -18,6 +18,9 @@ const WORKSPACE_ID = "ws-token-budget";
 const MODEL = "google:gemini-3.1-flash-lite";
 const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
+const HANDOFF =
+  "The context handoff target has been reached. Finish the current small unit of work, checkpoint notes, then call new_context.";
+// Legacy fixture: new windows no longer offer a final flush, but persisted rows still render.
 const FINAL_FLUSH =
   "Last step in this context window: write workspace/context-notes.md in a single memory call.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
@@ -43,11 +46,27 @@ function setupTokenBudgetStory(inputTokens = 2400) {
         type: "context-budget-warning",
         contextTokens: 650_000,
         maxTokens: 1_000_000,
-        budgetTokens: 750_000,
+        // budgetTokens is the forced point: the usable hard ceiling, not the slider.
+        budgetTokens: 991_808,
+        handoffTokens: 700_000,
+      },
+    }),
+    createMuxMessage("handoff", "user", HANDOFF, {
+      historySequence: 3,
+      timestamp: STABLE_TIMESTAMP - 27_000,
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: {
+        type: "context-budget-warning",
+        contextTokens: 700_000,
+        maxTokens: 1_000_000,
+        budgetTokens: 991_808,
+        handoff: true,
+        handoffTokens: 700_000,
       },
     }),
     createMuxMessage("final-flush", "user", FINAL_FLUSH, {
-      historySequence: 3,
+      historySequence: 4,
       timestamp: STABLE_TIMESTAMP - 25_000,
       synthetic: true,
       uiVisible: true,
@@ -60,7 +79,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       },
     }),
     createMuxMessage("rollover", "assistant", "", {
-      historySequence: 4,
+      historySequence: 5,
       timestamp: STABLE_TIMESTAMP - 20_000,
       contextBoundaryKind: "reset",
       muxMetadata: {
@@ -74,17 +93,17 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       },
     }),
     createMuxMessage("lead-in", "user", LEAD_IN, {
-      historySequence: 5,
+      historySequence: 6,
       timestamp: STABLE_TIMESTAMP - 10_000,
       synthetic: true,
       muxMetadata: { type: "context-window-lead-in", rolloverId: "rollover" },
     }),
     createMuxMessage("next", "user", "Continue with the regression tests.", {
-      historySequence: 6,
+      historySequence: 7,
       timestamp: STABLE_TIMESTAMP,
     }),
     createMuxMessage("budget-continue", "user", "Continue", {
-      historySequence: 7,
+      historySequence: 8,
       timestamp: STABLE_TIMESTAMP,
       synthetic: true,
       uiVisible: false,
@@ -97,7 +116,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {
-        historySequence: 8,
+        historySequence: 9,
         timestamp: STABLE_TIMESTAMP,
         model: MODEL,
         contextUsage: { inputTokens, outputTokens: 100 },
@@ -155,6 +174,17 @@ export const Rollover: AppStory = {
     await userEvent.click(warning);
     await waitFor(() => expect(canvas.getByText(WARNING)).toBeVisible());
     await userEvent.click(warning);
+    await expect(canvas.queryByText(HANDOFF)).not.toBeInTheDocument();
+    const handoff = await canvas.findByRole("button", { name: /Context handoff requested/ });
+    await expect(
+      warning.compareDocumentPosition(handoff) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).not.toBe(0);
+    await expect(
+      handoff.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).not.toBe(0);
+    await userEvent.click(handoff);
+    await waitFor(() => expect(canvas.getByText(HANDOFF)).toBeVisible());
+    await userEvent.click(handoff);
     await expect(canvas.queryByText(FINAL_FLUSH)).not.toBeInTheDocument();
     const finalFlush = await canvas.findByRole("button", {
       name: /Context window ending: notes flush/,
@@ -184,6 +214,9 @@ export const Rollover: AppStory = {
         await expect(warning.getBoundingClientRect().right).toBeLessThanOrEqual(
           frame.getBoundingClientRect().right
         );
+        await expect(handoff.getBoundingClientRect().right).toBeLessThanOrEqual(
+          frame.getBoundingClientRect().right
+        );
       }
     }
   },
@@ -191,6 +224,9 @@ export const Rollover: AppStory = {
 
 export const Phone375: AppStory = {
   ...Rollover,
+  // Spread-only play is treated as smoke coverage by the test-runner; declare it so the
+  // handoff row assertions (and the pinned-frame overflow guard) run at phone width.
+  play: Rollover.play,
   globals: { viewport: { value: "mobile1", isRotated: false } },
   decorators: [
     (Story) => (
@@ -266,7 +302,9 @@ export const ContextSettings: AppStory = {
     await userEvent.click(button);
     const page = within(canvasElement.ownerDocument.body);
     const dialog = await page.findByRole("dialog");
-    await expect(within(dialog).getByText(/Rolls over by 75%/)).toBeVisible();
+    // The slider is the handoff target itself; no force buffer is advertised.
+    await expect(within(dialog).getByText(/Handoff target: 70%/)).toBeVisible();
+    await expect(within(dialog).queryByText(/Rolls over by/)).not.toBeInTheDocument();
     await expect(within(dialog).getByText("Idle compaction", { exact: true })).toBeVisible();
     await expect(within(dialog).getByText("/compact", { exact: true })).toBeVisible();
   },

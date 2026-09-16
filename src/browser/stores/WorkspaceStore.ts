@@ -101,7 +101,10 @@ import {
   getAutoRetryKey,
   getPinnedTodoExpandedKey,
 } from "@/common/constants/storage";
-import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
+import {
+  AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT,
+  DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT,
+} from "@/common/constants/ui";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
@@ -3940,7 +3943,10 @@ export class WorkspaceStore {
       updatePersistedState<number>(thresholdKey, DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT);
     }
 
-    return Math.max(0.1, Math.min(1, thresholdPercent / 100));
+    return Math.max(
+      AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT / 100,
+      Math.min(1, thresholdPercent / 100)
+    );
   }
 
   /**

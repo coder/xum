@@ -34,7 +34,7 @@ describe("MessageRenderer goal continuation rows", () => {
       historySequence: 1,
       content,
       isSynthetic: true,
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false, handoff: false },
     };
     const view = render(
       <TooltipProvider>
@@ -65,9 +65,30 @@ describe("MessageRenderer goal continuation rows", () => {
     const finalToggle = view.container.querySelector("[data-context-budget-warning] button")!;
     // The final flush must be distinguishable from an ordinary warning without expanding it,
     // and must keep hiding the machine prompt.
-    expect(finalToggle.textContent).not.toBe("");
-    expect(finalToggle.textContent).not.toBe(warningSummary);
+    const finalSummary = finalToggle.textContent;
+    expect(finalSummary).not.toBe("");
+    expect(finalSummary).not.toBe(warningSummary);
     expect(view.queryByText(content)).toBeNull();
+
+    // A persisted handoff request is a real event: its collapsed summary must differ from
+    // both the advance warning and the legacy final flush while still hiding the prompt.
+    view.rerender(
+      <TooltipProvider>
+        <MessageRenderer
+          message={{
+            ...message,
+            contextBudgetWarning: { ...message.contextBudgetWarning!, handoff: true },
+          }}
+        />
+      </TooltipProvider>
+    );
+    const handoffToggle = view.container.querySelector("[data-context-budget-warning] button")!;
+    expect(handoffToggle.textContent).not.toBe("");
+    expect(handoffToggle.textContent).not.toBe(warningSummary);
+    expect(handoffToggle.textContent).not.toBe(finalSummary);
+    expect(view.queryByText(content)).toBeNull();
+    fireEvent.click(handoffToggle);
+    expect(view.getByText(content)).toBeDefined();
 
     view.rerender(
       <TooltipProvider>

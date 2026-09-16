@@ -105,7 +105,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               summary={
                 message.contextBudgetWarning.final
                   ? "Context window ending: notes flush"
-                  : "Context budget warning"
+                  : message.contextBudgetWarning.handoff
+                    ? "Context handoff requested"
+                    : "Context budget warning"
               }
               icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="context-budget-warning"

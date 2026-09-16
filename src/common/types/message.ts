@@ -1287,6 +1287,8 @@ export type DisplayedMessage =
         maxTokens: number;
         /** Final pre-rollover flush prompt rather than the advance warning. */
         final: boolean;
+        /** Agent-led handoff request rather than the advance warning. */
+        handoff: boolean;
       };
     }
   | {

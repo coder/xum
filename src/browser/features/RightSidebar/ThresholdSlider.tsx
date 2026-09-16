@@ -2,7 +2,7 @@ import React, { useRef } from "react";
 import {
   AUTO_COMPACTION_THRESHOLD_MIN,
   AUTO_COMPACTION_THRESHOLD_MAX,
-  FORCE_COMPACTION_BUFFER_PERCENT,
+  AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT,
 } from "@/common/constants/ui";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 
@@ -59,12 +59,25 @@ const applyThreshold = (pct: number, setThreshold: (v: number) => void): void =>
   setThreshold(pct >= DISABLE_THRESHOLD ? 100 : Math.min(pct, AUTO_COMPACTION_THRESHOLD_MAX));
 };
 
+/**
+ * Threshold the display should advertise. In rollover mode the backend clamps the stored
+ * value to the effective minimum, so a stored 0% or 5% is evaluated (and shown) as 10%.
+ * Summarize mode keeps the stored value.
+ */
+export function getEffectiveThreshold(
+  config: Pick<AutoCompactionConfig, "threshold" | "rolloverEnabled">
+): number {
+  return config.rolloverEnabled
+    ? Math.max(AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT, config.threshold)
+    : config.threshold;
+}
+
 /** Share the effective automatic policy label between the meter and its settings. */
 export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
   if (config.rolloverEnabled) {
-    // Match the evaluator's force threshold; "by" allows the hard ceiling to win earlier.
+    // The slider is the agent handoff target; only the usable hard ceiling forces a rollover.
     return config.threshold < DISABLE_THRESHOLD
-      ? `Rolls over by ${config.threshold + FORCE_COMPACTION_BUFFER_PERCENT}%`
+      ? `Handoff target: ${getEffectiveThreshold(config)}%`
       : "Automatic rollover disabled";
   }
   return config.threshold < DISABLE_THRESHOLD
@@ -124,6 +137,8 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
   };
 
   const isEnabled = config.threshold < DISABLE_THRESHOLD;
+  // Mark the value the backend evaluates, not a stored value below the effective minimum.
+  const markerPercent = getEffectiveThreshold(config);
   const color = isEnabled ? "var(--color-plan-mode)" : "var(--color-muted)";
   const tooltipText = `${getAutoCompactionLabel(config)} · ${isEnabled ? "Drag to adjust" : "Drag left to enable"} (per-model)`;
 
@@ -148,7 +163,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     pointerEvents: "auto",
     // Prevent page scrolling while dragging the slider on touch devices.
     touchAction: "none",
-    left: `calc(${config.threshold}% - ${DRAG_ZONE_SIZE}px)`,
+    left: `calc(${markerPercent}% - ${DRAG_ZONE_SIZE}px)`,
     width: DRAG_ZONE_SIZE * 2,
     top: 0,
     bottom: 0,
@@ -161,7 +176,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     display: "flex",
     alignItems: "center",
     flexDirection: "column",
-    left: `${config.threshold}%`,
+    left: `${markerPercent}%`,
     top: "50%",
     transform: "translate(-50%, -50%)",
   };

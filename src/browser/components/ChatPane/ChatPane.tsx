@@ -75,6 +75,8 @@ import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSw
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
+import { AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT } from "@/common/constants/ui";
+import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -385,7 +387,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     // Keep backend session threshold in sync with the persisted per-model slider value.
-    const normalizedThreshold = Math.max(0.1, Math.min(1, autoCompactionThreshold / 100));
+    const normalizedThreshold = Math.max(
+      AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT / 100,
+      Math.min(1, autoCompactionThreshold / 100)
+    );
     void api.workspace.setAutoCompactionThreshold({
       workspaceId,
       threshold: normalizedThreshold,
@@ -560,17 +565,23 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? null
       : (operationalBundleInfos?.[tailProposePlanIndex]?.key ?? null);
 
+  // Rollover mode evaluates the clamped threshold, so the chat-input bar's visibility and
+  // text must use the same effective value the slider label advertises.
+  const effectiveAutoCompactionThreshold = getEffectiveThreshold({
+    threshold: autoCompactionThreshold,
+    rolloverEnabled,
+  });
   const autoCompactionResult = useMemo(
     () =>
       checkAutoCompaction(
         workspaceUsage,
         pendingModel,
         use1M,
-        autoCompactionThreshold / 100,
+        effectiveAutoCompactionThreshold / 100,
         undefined,
         providersConfig
       ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, autoCompactionThreshold]
+    [workspaceUsage, pendingModel, use1M, providersConfig, effectiveAutoCompactionThreshold]
   );
 
   // Show warning when: shouldShowWarning flag is true AND not currently compacting.

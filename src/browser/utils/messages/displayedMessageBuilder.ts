@@ -406,6 +406,7 @@ function buildUserDisplayedMessages(options: {
               contextTokens: muxMeta.contextTokens,
               maxTokens: muxMeta.maxTokens,
               final: muxMeta.final === true,
+              handoff: muxMeta.handoff === true,
             }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt

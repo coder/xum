@@ -16,6 +16,13 @@ export const AUTO_COMPACTION_THRESHOLD_MAX = 90;
 export const AUTO_COMPACTION_THRESHOLD_STORAGE_MAX = 100;
 
 /**
+ * Lowest threshold the backend evaluates. Callers clamp the stored slider value to this
+ * floor before syncing it, so token-budget displays (label, marker, chat-input bar) must
+ * use the same effective value or they would advertise a target the backend never uses.
+ */
+export const AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT = 10;
+
+/**
  * Default auto-compaction threshold percentage (50-90 range)
  * Applied when creating new workspaces
  */

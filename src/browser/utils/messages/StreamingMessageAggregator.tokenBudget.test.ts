@@ -24,11 +24,31 @@ describe("token-budget replay", () => {
           type: "context-budget-warning",
           contextTokens: 800,
           maxTokens: 1000,
-          budgetTokens: 750,
+          budgetTokens: 991,
+          handoffTokens: 900,
         },
       }),
+      createMuxMessage(
+        "handoff",
+        "user",
+        "Finish the current unit, checkpoint, then new_context.",
+        {
+          historySequence: 3,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 900,
+            maxTokens: 1000,
+            budgetTokens: 991,
+            handoff: true,
+            handoffTokens: 900,
+          },
+        }
+      ),
+      // Legacy final-flush row: no longer produced, but persisted histories still replay it.
       createMuxMessage("final-flush", "user", "Write workspace notes now; the window is ending.", {
-        historySequence: 3,
+        historySequence: 4,
         synthetic: true,
         uiVisible: true,
         muxMetadata: {
@@ -40,7 +60,7 @@ describe("token-budget replay", () => {
         },
       }),
       createMuxMessage("reset", "assistant", "", {
-        historySequence: 4,
+        historySequence: 5,
         contextBoundaryKind: "reset",
         muxMetadata: {
           type: "context-window-rollover",
@@ -53,17 +73,17 @@ describe("token-budget replay", () => {
         },
       }),
       createMuxMessage("lead-in", "user", "Model-only retrieval instructions", {
-        historySequence: 5,
+        historySequence: 6,
         synthetic: true,
         muxMetadata: { type: "context-window-lead-in", rolloverId: "reset" },
       }),
-      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 6 }),
+      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 7 }),
       createMuxMessage("manual-reset", "assistant", "", {
-        historySequence: 7,
+        historySequence: 8,
         contextBoundaryKind: "reset",
       }),
       createMuxMessage("budget-continue", "user", "Continue", {
-        historySequence: 8,
+        historySequence: 9,
         synthetic: true,
         uiVisible: false,
         muxMetadata: { type: "normal", contextBudgetContinuation: true },
@@ -79,18 +99,22 @@ describe("token-budget replay", () => {
       "user",
       "user",
       "user",
+      "user",
       "compaction-boundary",
       "user",
       "compaction-boundary",
     ]);
     expect(displayed[1]).toMatchObject({
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false, handoff: false },
     });
     expect(displayed[2]).toMatchObject({
-      contextBudgetWarning: { contextTokens: 850, maxTokens: 1000, final: true },
+      contextBudgetWarning: { contextTokens: 900, maxTokens: 1000, final: false, handoff: true },
     });
-    expect(displayed[3]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
-    expect(displayed[5]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
+    expect(displayed[3]).toMatchObject({
+      contextBudgetWarning: { contextTokens: 850, maxTokens: 1000, final: true, handoff: false },
+    });
+    expect(displayed[4]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
+    expect(displayed[6]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
   });
 
