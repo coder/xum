@@ -107,22 +107,25 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     //
     // This prevents stale in-memory state (captured by closures) from accidentally overwriting a
     // newer config when multiple writes happen in sequence (e.g., delete layout → clear hotkey).
-    const generation = ++generationRef.current;
-    try {
-      const remote = await api.uiLayouts.getAll();
-      const normalized = getLayoutsConfigOrDefault(remote);
-
+    // A fetch that a restore or refresh overtook may predate the presets now in config, so it is
+    // repeated (bounded) rather than becoming the base the write derives from.
+    let latest = layoutPresets;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const generation = ++generationRef.current;
+      try {
+        latest = getLayoutsConfigOrDefault(await api.uiLayouts.getAll());
+      } catch {
+        // Best-effort fallback: don't block writes if the config fetch fails.
+        break;
+      }
       if (generation === generationRef.current) {
-        setLayoutPresets(normalized);
+        setLayoutPresets(latest);
         setLoaded(true);
         setLoadFailed(false);
+        break;
       }
-
-      return normalized;
-    } catch {
-      // Best-effort fallback: don't block writes if the config fetch fails.
-      return layoutPresets;
     }
+    return latest;
   }, [api, layoutPresets]);
 
   const saveAll = useCallback(

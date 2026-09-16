@@ -20,7 +20,7 @@ function presetsWithSlot(slot: LayoutSlotNumber): LayoutPresetsConfig {
   return { version: 2, slots: [{ slot, keybindOverride: { key: String(slot), ctrl: true } }] };
 }
 
-function slotNumbers(config: LayoutPresetsConfig): number[] {
+function slotNumbers(config: { slots: Array<{ slot: number }> }): number[] {
   return config.slots.map((slot) => slot.slot);
 }
 
@@ -34,6 +34,7 @@ describe("UILayoutsProvider", () => {
   let cleanupDom: (() => void) | null = null;
   let getAllCalls: Array<Deferred<LayoutPresetsConfig>> = [];
   let saveAllCalls: Array<Deferred<void>> = [];
+  let saveAllInputs: Array<Parameters<APIClient["uiLayouts"]["saveAll"]>[0]["layoutPresets"]> = [];
   let configChanges: ControllableAsyncIterable<void>;
   let latest: ReturnType<typeof useUILayouts> | null = null;
 
@@ -54,10 +55,12 @@ describe("UILayoutsProvider", () => {
           new Promise<LayoutPresetsConfig>((resolve, reject) => {
             getAllCalls.push({ resolve, reject });
           }),
-        saveAll: () =>
-          new Promise<void>((resolve, reject) => {
+        saveAll: (input) => {
+          saveAllInputs.push(input.layoutPresets);
+          return new Promise<void>((resolve, reject) => {
             saveAllCalls.push({ resolve, reject });
-          }),
+          });
+        },
       },
       config: {
         onConfigChanged: (() =>
@@ -90,6 +93,7 @@ describe("UILayoutsProvider", () => {
     cleanupDom = installDom();
     getAllCalls = [];
     saveAllCalls = [];
+    saveAllInputs = [];
     configChanges = createControllableAsyncIterable<void>();
     latest = null;
   });
@@ -133,6 +137,62 @@ describe("UILayoutsProvider", () => {
     act(() => getAllCalls[1].resolve(presetsWithSlot(1)));
     await flushMicrotasks();
     expect(slotNumbers(current().layoutPresets)).toEqual([2]);
+  });
+
+  test("a write re-reads presets when a refresh overtook its pre-write read", async () => {
+    renderProvider();
+    await loadInitialPresets(1);
+
+    let writePromise: Promise<void> | undefined;
+    act(() => {
+      writePromise = current().setSlotKeybindOverride(3, { key: "3", ctrl: true });
+    });
+    await waitFor(() => expect(getAllCalls.length).toBe(2));
+
+    // A restore lands while the pre-write read is in flight: the refresh installs the restored
+    // presets first, then the older read answers with the pre-restore ones.
+    await emitConfigChange(3);
+    act(() => getAllCalls[2].resolve(presetsWithSlot(2)));
+    await waitFor(() => expect(slotNumbers(current().layoutPresets)).toEqual([2]));
+    act(() => getAllCalls[1].resolve(presetsWithSlot(1)));
+    await flushMicrotasks();
+
+    // The overtaken read is read again instead of becoming the write's base.
+    expect(saveAllCalls.length).toBe(0);
+    expect(getAllCalls.length).toBe(4);
+    act(() => getAllCalls[3].resolve(presetsWithSlot(2)));
+    await waitFor(() => expect(saveAllCalls.length).toBe(1));
+    expect(slotNumbers(saveAllInputs[0])).toEqual([2, 3]);
+
+    act(() => saveAllCalls[0].resolve());
+    await writePromise;
+    await waitFor(() => expect(slotNumbers(current().layoutPresets)).toEqual([2, 3]));
+  });
+
+  test("a write settles for the latest re-read once the retry bound is reached", async () => {
+    renderProvider();
+    await loadInitialPresets(1);
+
+    let writePromise: Promise<void> | undefined;
+    act(() => {
+      writePromise = current().setSlotKeybindOverride(3, { key: "3", ctrl: true });
+    });
+    // Every pre-write read is overtaken by a refresh before it answers; only the last one
+    // answers with the presets the refreshes installed.
+    for (let read = 1; read <= 3; read++) {
+      const pending = 2 * read - 1;
+      await waitFor(() => expect(getAllCalls.length).toBe(pending + 1));
+      await emitConfigChange(pending + 2);
+      act(() => getAllCalls[pending + 1].resolve(presetsWithSlot(2)));
+      await waitFor(() => expect(slotNumbers(current().layoutPresets)).toEqual([2]));
+      act(() => getAllCalls[pending].resolve(presetsWithSlot(read === 3 ? 2 : 1)));
+    }
+
+    await waitFor(() => expect(saveAllCalls.length).toBe(1));
+    expect(getAllCalls.length).toBe(7);
+    expect(slotNumbers(saveAllInputs[0])).toEqual([2, 3]);
+    act(() => saveAllCalls[0].resolve());
+    await writePromise;
   });
 
   test("keeps the loaded presets when a later refresh fails", async () => {
