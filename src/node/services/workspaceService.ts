@@ -4765,6 +4765,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
+      onBeforeTurnCompletion: async () => {
+        await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
+      },
       onTurnSettled: (turnGeneration) =>
         this.emit("workspace-turn-settled", { workspaceId, turnGeneration }),
     });

@@ -615,6 +615,7 @@ export type WorkspaceHost = WorkspaceTurnHost &
   WorkspaceMetadataHost;
 
 export interface AgentTaskIntegration {
+  acknowledgeAgentReports(workspaceId: string): Promise<ReadonlySet<string>>;
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[];

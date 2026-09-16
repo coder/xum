@@ -721,6 +721,8 @@ interface AgentSessionOptions {
    */
   hasExternalSendPreflight?: () => boolean;
   onContextWindowRollover?: () => void;
+  /** Await durable response bookkeeping before compaction, queued input, or idle. */
+  onBeforeTurnCompletion?: () => Promise<void>;
   /**
    * Stop-cascade admission barrier and generation for this workspace (TaskService via
    * WorkspaceService). Consulted at every turn admission and by the provider-start fence; an
@@ -900,6 +902,7 @@ export class AgentSession {
   private readonly isStopInProgress: () => boolean;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
+  private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -1214,6 +1217,7 @@ export class AgentSession {
       isStopInProgress,
       getStopEpoch,
       onTurnSettled,
+      onBeforeTurnCompletion,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1248,6 +1252,7 @@ export class AgentSession {
     this.isStopInProgress = isStopInProgress ?? (() => false);
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
+    this.onBeforeTurnCompletion = onBeforeTurnCompletion;
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Accessors must read live session state, not the host object's receiver.
     const session = this;
@@ -8839,6 +8844,12 @@ export class AgentSession {
         live: false,
       });
       this.clearLiveUsageState();
+
+      // Report consumption belongs to the owned completion phase, not an async stream-end
+      // listener. Keep the session busy until it is durable, before compaction loses receipts.
+      await this.onBeforeTurnCompletion?.();
+      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+        return;
 
       const handled = await this.contextController.compaction.handleCompletion(
         streamEndPayload,

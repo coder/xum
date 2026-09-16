@@ -564,12 +564,10 @@ describe("TaskService", () => {
       createMuxMessage("stale-assistant", "assistant", "Response to the earlier request", {
         timestamp: Date.now(),
         requestHistorySequence: reportSequence - 1,
+        finishReason: "stop",
       })
     );
-    const internal = taskService as unknown as {
-      consumeRespondedAgentTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
-    await internal.consumeRespondedAgentTerminalAttention(parentId);
+    await taskService.acknowledgeAgentReports(parentId);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
 
     await historyService.appendToHistory(
@@ -577,9 +575,10 @@ describe("TaskService", () => {
       createMuxMessage("informed-assistant", "assistant", "Response including the report", {
         timestamp: Date.now(),
         requestHistorySequence: reportSequence,
+        finishReason: "stop",
       })
     );
-    await internal.consumeRespondedAgentTerminalAttention(parentId);
+    await taskService.acknowledgeAgentReports(parentId);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
@@ -637,6 +636,7 @@ describe("TaskService", () => {
         ...options,
       });
       assert(notification);
+      assistant.metadata = { ...assistant.metadata, finishReason: "stop" };
       const internal = taskService as unknown as {
         drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
       };
@@ -646,6 +646,7 @@ describe("TaskService", () => {
         aiService,
         historyService,
         taskService,
+        workspaceService,
         terminalAttentionStore,
         resumeStream,
         assistant,
@@ -724,6 +725,98 @@ describe("TaskService", () => {
       expect(await fixture.terminalAttentionStore.listPending(fixture.parentId)).toHaveLength(0);
     });
 
+    test("acknowledges before compaction while the owned completion phase is still busy", async () => {
+      const fixture = await setup();
+      const busy = spyOn(fixture.workspaceService, "isBusyForMessage").mockReturnValue(true);
+      const readHistory = spyOn(fixture.historyService, "getHistoryFromLatestBoundary");
+      fixture.assistant.parts = [toolPart("task_await", awaitOutput)];
+      await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+      // Provider streaming is already over, but completion still owns the workspace.
+      await fixture.drain();
+      expect(readHistory).not.toHaveBeenCalled();
+      expect(fixture.resumeStream).not.toHaveBeenCalled();
+      await fixture.taskService.acknowledgeAgentReports(fixture.parentId);
+      await fixture.historyService.appendToHistory(
+        fixture.parentId,
+        createMuxMessage("compaction", "assistant", "Summary", {
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+          agentId: "compact",
+          finishReason: "stop",
+        })
+      );
+      const afterCompaction = await fixture.historyService.getHistoryFromLatestBoundary(
+        fixture.parentId
+      );
+      assert(afterCompaction.success);
+      expect(afterCompaction.data.some((message) => message.id === fixture.assistant.id)).toBe(
+        false
+      );
+      busy.mockReturnValue(false);
+      await fixture.drain();
+      expect(fixture.resumeStream).not.toHaveBeenCalled();
+      expect(await fixture.terminalAttentionStore.listPending(fixture.parentId)).toHaveLength(0);
+    });
+
+    for (const finishReason of [
+      "length",
+      "content-filter",
+      "tool-calls",
+      "error",
+      "other",
+      undefined,
+    ] as const) {
+      test("retains unincorporated receipts after finishReason=" + finishReason, async () => {
+        const fixture = await setup();
+        fixture.assistant.parts = [toolPart("task_await", awaitOutput)];
+        fixture.assistant.metadata = { ...fixture.assistant.metadata, finishReason };
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.taskService.acknowledgeAgentReports(fixture.parentId);
+        expect(await fixture.terminalAttentionStore.listPending(fixture.parentId)).toHaveLength(1);
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(1);
+      });
+    }
+
+    for (const toolName of ["task", "task_await"]) {
+      for (const handleMatches of [true, false]) {
+        test(
+          "normalizes workspace-turn identity in " +
+            toolName +
+            " (handleMatches=" +
+            handleMatches +
+            ")",
+          async () => {
+            const record = workspaceTurnRecord("owner", taskId, "wst_receipt", "completed", {
+              messageId: "workspace-final",
+              reportMarkdown,
+            });
+            const fixture = await setup({
+              generationId: [record.handleId, record.status, record.updatedAt].join(":"),
+            });
+            await new TaskHandleStore(fixture.config).upsertWorkspaceTurn({
+              ...record,
+              ownerWorkspaceId: fixture.parentId,
+            });
+            const receipt = {
+              ...completed,
+              taskId: handleMatches ? record.handleId : "wst_other",
+              handleKind: "workspace_turn",
+              workspaceId: taskId,
+              finalMessageRef: { messageId: record.messageId },
+            };
+            fixture.assistant.parts = [
+              toolPart(toolName, toolName === "task" ? receipt : { results: [receipt] }),
+            ];
+            await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+            await fixture.drain();
+            expect(fixture.resumeStream).toHaveBeenCalledTimes(handleMatches ? 0 : 1);
+          }
+        );
+      }
+    }
+
     test("reconciles a covered response in the drain without a stream-end callback", async () => {
       const fixture = await setup();
       await fixture.historyService.appendToHistory(
@@ -731,6 +824,7 @@ describe("TaskService", () => {
         createMuxMessage("informed-response", "assistant", "Already incorporated.", {
           timestamp: Date.now(),
           requestHistorySequence: fixture.report.metadata?.historySequence,
+          finishReason: "stop",
         })
       );
       await fixture.drain();

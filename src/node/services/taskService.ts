@@ -1105,11 +1105,15 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
   }
 }
 
-interface CompletedTaskReportReceipt {
-  taskId: string;
-  reportMarkdown: string;
-  messageId?: string;
-}
+type CompletedTaskReportReceipt =
+  | { kind: "initial"; taskId: string }
+  | {
+      kind: "continuation";
+      taskId: string;
+      handleId?: string;
+      messageId: string;
+      reportMarkdown: string;
+    };
 
 /** Only canonical successful tool results prove consumption, never task IDs in prose or inputs. */
 function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskReportReceipt[] {
@@ -1124,11 +1128,22 @@ function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskR
     const messageId =
       row.messageId ??
       (isPlainObject(row.finalMessageRef) ? row.finalMessageRef.messageId : undefined);
-    reports.push({
-      taskId: row.taskId,
-      reportMarkdown: row.reportMarkdown,
-      ...(typeof messageId === "string" ? { messageId } : {}),
-    });
+    // Workspace-turn tools expose a handle as taskId; stable-child awaits expose the
+    // child itself. Normalize once, retaining an explicit handle as matching evidence.
+    const handleId = isWorkspaceTurnTaskId(row.taskId) ? row.taskId : undefined;
+    const taskId = handleId != null ? coerceNonEmptyString(row.workspaceId) : row.taskId;
+    if (taskId == null) return;
+    if (typeof messageId === "string") {
+      reports.push({
+        kind: "continuation",
+        taskId,
+        handleId,
+        messageId,
+        reportMarkdown: row.reportMarkdown,
+      });
+    } else if (handleId == null) {
+      reports.push({ kind: "initial", taskId });
+    }
   };
   const visit = (call: unknown, depth: number): void => {
     if (
@@ -8813,9 +8828,8 @@ export class TaskService implements AgentTaskIntegration {
     return { deliverableNotificationIds, latestMessageTimestampByTaskId };
   }
 
-  private async consumeRespondedAgentTerminalAttention(
-    ownerWorkspaceId: string
-  ): Promise<Set<string>> {
+  /** Acknowledge only durably completed answers, before their receipts can be compacted away. */
+  async acknowledgeAgentReports(ownerWorkspaceId: string): Promise<ReadonlySet<string>> {
     const consumedIds = new Set<string>();
     const pending = (await this.terminalAttentionStore.listPending(ownerWorkspaceId)).filter(
       (notification) => notification.sourceKind === "agent_task"
@@ -8824,7 +8838,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const pendingIds = new Set(pending.map((notification) => notification.sourceId));
     const terminalSequenceByTaskId = new Map<string, number>();
-    const responded = new Set<string>();
+    let coveredHistorySequence = -1;
     const toolReportsByTaskId = new Map<string, CompletedTaskReportReceipt[]>();
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(ownerWorkspaceId);
     if (!historyResult.success) {
@@ -8845,7 +8859,6 @@ export class TaskService implements AgentTaskIntegration {
         const historySequence = message.metadata?.historySequence;
         if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
           terminalSequenceByTaskId.set(taskId, historySequence);
-          responded.delete(taskId);
         }
         continue;
       }
@@ -8853,6 +8866,7 @@ export class TaskService implements AgentTaskIntegration {
       if (
         message.role === "assistant" &&
         message.metadata?.partial !== true &&
+        message.metadata?.finishReason === "stop" &&
         message.metadata?.agentId !== "compact" &&
         message.metadata?.mode !== "compact"
       ) {
@@ -8867,30 +8881,29 @@ export class TaskService implements AgentTaskIntegration {
         }
         const requestHistorySequence = message.metadata?.requestHistorySequence;
         if (typeof requestHistorySequence !== "number") continue;
-        for (const [taskId, terminalSequence] of terminalSequenceByTaskId) {
-          if (requestHistorySequence >= terminalSequence) responded.add(taskId);
-        }
+        coveredHistorySequence = Math.max(coveredHistorySequence, requestHistorySequence);
       }
     }
 
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const owners = [
+      ownerWorkspaceId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, ownerWorkspaceId),
+    ];
     for (const notification of pending) {
-      let consumed = responded.has(notification.sourceId);
+      const terminalSequence = terminalSequenceByTaskId.get(notification.sourceId);
+      let consumed = terminalSequence != null && coveredHistorySequence >= terminalSequence;
       const reports = toolReportsByTaskId.get(notification.sourceId) ?? [];
       if (!consumed && notification.terminalOutcome === "completed" && reports.length > 0) {
         if (notification.generationId == null) {
           // Initial assignments have no execution identity; continuations do. Never let
           // a stable child ID's older receipt consume a later assignment's notification.
-          consumed = reports.some((report) => report.messageId == null);
+          consumed = reports.some((report) => report.kind === "initial");
         } else {
           // Resolve the notification's assignment, not the child's latest execution: the
           // parent may already have reawakened that child before this drain gets its turn.
           const [handleId] = notification.generationId.split(":");
           if (!isWorkspaceTurnTaskId(handleId)) continue;
-          const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
-          const owners = [
-            ownerWorkspaceId,
-            ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, ownerWorkspaceId),
-          ];
           let record: WorkspaceTurnTaskHandleRecord | null = null;
           for (const ownerId of owners) {
             record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(ownerId, handleId);
@@ -8904,7 +8917,8 @@ export class TaskService implements AgentTaskIntegration {
                 notification.generationId === record.handleId) &&
               reports.some(
                 (report) =>
-                  report.messageId != null &&
+                  report.kind === "continuation" &&
+                  (report.handleId == null || report.handleId === record.handleId) &&
                   report.messageId === record.messageId &&
                   report.reportMarkdown === record.reportMarkdown
               );
@@ -8992,7 +9006,7 @@ export class TaskService implements AgentTaskIntegration {
       ownerHasPendingQueuedPreparingOrRetry;
     if (
       this.aiService.isStreaming(ownerWorkspaceId) ||
-      ownerHasPendingQueuedPreparingOrRetry ||
+      ownerHasBusyQueuedOrRetry ||
       this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)
     ) {
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
@@ -9008,8 +9022,9 @@ export class TaskService implements AgentTaskIntegration {
 
     // Reconcile only after observing idle: an earlier history snapshot can still contain
     // the streaming placeholder, then race the final answer and start a duplicate turn.
-    // All wake paths (including startup/idle recovery) pass this consumption boundary.
-    const consumedIds = await this.consumeRespondedAgentTerminalAttention(ownerWorkspaceId);
+    // Normal completion acknowledges before compaction; this is recovery for missed
+    // callbacks or reports whose notification was published after the answer committed.
+    const consumedIds = await this.acknowledgeAgentReports(ownerWorkspaceId);
     pending = pending.filter((notification) => !consumedIds.has(notification.id));
 
     const agentNotifications = pending.filter(

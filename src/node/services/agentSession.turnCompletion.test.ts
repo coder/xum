@@ -15,6 +15,7 @@ import type { StreamMessageOptions } from "./turnRequestBuilder";
 import type { TurnCompletion } from "./streamManager";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { AgentSession } from "./agentSession";
+import type { CompactionHandler } from "./compactionHandler";
 import { createStartedTurnHandle, createAgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "session-completion";
@@ -22,6 +23,7 @@ const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
 
 interface InternalSession {
+  compactionHandler: CompactionHandler;
   lastSystemMessageTokens?: number;
   activeCompactionRequest?: { id: string; modelString: string };
   clearStartupAutoRetryAbandon(): Promise<void>;
@@ -441,6 +443,73 @@ describe("AgentSession turn completion", () => {
       await edit;
       await closing;
       errorLog.mockRestore();
+      await h.cleanup();
+    }
+  });
+
+  test("awaits durable response bookkeeping before compaction and queued input", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const nextStarted = Promise.withResolvers<void>();
+    const emitter = new EventEmitter();
+    let calls = 0;
+    const acknowledge = mock(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      onBeforeTurnCompletion: acknowledge,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = "assistant-" + ++calls;
+          start(emitter, messageId);
+          if (calls === 2) nextStarted.resolve();
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                calls === 1
+                  ? completion.promise
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
+            })
+          );
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const compact = spyOn(internal(h.session).compactionHandler, "handleCompletion");
+    const observeCompaction = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
+    try {
+      expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
+      const policy = policyPromise(consumer);
+      h.session.queueMessage("follow-up", sendOptions);
+      emitter.emit("stream-end", end());
+      expect(acknowledge).not.toHaveBeenCalled();
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await entered.promise;
+      expect(h.session.isBusy()).toBe(true);
+      expect(h.session.hasQueuedMessages()).toBe(true);
+      expect(compact).not.toHaveBeenCalled();
+      expect(observeCompaction).not.toHaveBeenCalled();
+      expect(calls).toBe(1);
+      release.resolve();
+      await policy;
+      await nextStarted.promise;
+      expect(acknowledge).toHaveBeenCalledTimes(1);
+      expect(compact).toHaveBeenCalledTimes(1);
+      expect(observeCompaction).toHaveBeenCalledTimes(1);
+      expect(calls).toBe(2);
+    } finally {
+      release.resolve();
+      completion.resolve({ status: "completed", streamEnd: end() });
+      compact.mockRestore();
+      observeCompaction.mockRestore();
+      consumer.mockRestore();
+      await h.session.dispose();
       await h.cleanup();
     }
   });

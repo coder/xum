@@ -188,7 +188,12 @@ export function createTestAgentSession(
 
 export interface AgentSessionHarnessOptions extends Pick<
   ConstructorParameters<typeof AgentSession>[0],
-  "effectRunner" | "appFiberScope" | "isStopInProgress" | "getStopEpoch" | "onTurnSettled"
+  | "effectRunner"
+  | "appFiberScope"
+  | "isStopInProgress"
+  | "getStopEpoch"
+  | "onTurnSettled"
+  | "onBeforeTurnCompletion"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -267,6 +272,7 @@ export async function createAgentSessionHarness(
     isStopInProgress: options.isStopInProgress,
     getStopEpoch: options.getStopEpoch,
     onTurnSettled: options.onTurnSettled,
+    onBeforeTurnCompletion: options.onBeforeTurnCompletion,
   });
 
   const events: WorkspaceChatMessage[] = [];
