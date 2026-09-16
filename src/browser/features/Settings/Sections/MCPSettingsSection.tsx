@@ -1630,7 +1630,15 @@ export const MCPSettingsSection: React.FC = () => {
                         })()}
                         onLoginSuccess={async () => {
                           setMcpOauthRefreshNonce((prev) => prev + 1);
-                          await handleTestNewServer();
+                          // If the name collides with an existing server, only re-test: auto-adding
+                          // here would silently overwrite that server's config.
+                          if (servers[newServer.name.trim()]) {
+                            await handleTestNewServer();
+                            return;
+                          }
+                          // The user already named the server and authorized it in the browser.
+                          // Add it now so they don't have to remember to click "Add" afterwards.
+                          await handleAddServer();
                         }}
                       />
                     </div>
