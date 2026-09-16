@@ -15,7 +15,7 @@ import type { MessageQueue } from "./messageQueue";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
-/** Known 128k context limit; threshold 0.7 warns at 85k and rolls over at 110k. */
+/** Known context limit for exercising advisory and hard-ceiling queue cuts. */
 const BUDGET_MODEL = "openai:gpt-4o";
 const workspaceId = "queue-cut-receipts";
 
@@ -178,27 +178,31 @@ describe("AgentSession queue-cut receipts", () => {
     }
   });
 
-  test("a budget stop designates exactly the entry it enqueued: the flush first, the paired rollover only once the flush turn ends for it", async () => {
+  test.each([
+    { usage: 85_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
+    { usage: 90_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
+    { usage: 120_000, decision: "rollover", dedupeKey: CONTEXT_CONTINUE_DEDUPE_KEY },
+  ])("a budget stop at $usage designates only its single continuation", async (fixture) => {
     const h = await setup();
     try {
       await h.startBudgetTurn();
-      const first = await h.requests[0].onStepSettled!(step(110_000));
-      const flushEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
-      const rolloverEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY);
-      expect(flushEntryId).toBeDefined();
-      expect(rolloverEntryId).toBeDefined();
-      expect(first).toEqual({ decision: "rollover", continuationEntryId: flushEntryId });
-      expect(h.session.getQueueCutReceipt(flushEntryId!)?.successor).toBe("pending");
-      // B has cut nothing yet: no receipt is invented for it.
-      expect(h.session.getQueueCutReceipt(rolloverEntryId!)).toBeUndefined();
+      const outcome = await h.requests[0].onStepSettled!(step(fixture.usage));
+      const entryId = queueOf(h).getEntryIdByDedupeKey(fixture.dedupeKey);
+      expect(entryId).toBeDefined();
+      expect(outcome).toEqual({ decision: fixture.decision, continuationEntryId: entryId });
+      expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("pending");
+      // New windows never create a flush pair; the unused key must not invent a successor.
+      const unusedKey =
+        fixture.dedupeKey === CONTEXT_WARNING_DEDUPE_KEY
+          ? CONTEXT_CONTINUE_DEDUPE_KEY
+          : CONTEXT_WARNING_DEDUPE_KEY;
+      expect(queueOf(h).getEntryIdByDedupeKey(unusedKey)).toBeUndefined();
 
-      // The flush turn (A) dispatches and ends after one step for B.
       h.settleStream(0);
       await h.secondRequest;
-      expect(h.session.getQueueCutReceipt(flushEntryId!)?.successor).toBe("streaming");
-      const second = await h.requests[1].onStepSettled!(step(5_000));
-      expect(second).toEqual({ decision: "rollover", continuationEntryId: rolloverEntryId });
-      expect(h.session.getQueueCutReceipt(rolloverEntryId!)?.successor).toBe("pending");
+      expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("streaming");
+      expect(h.requests[1].muxMetadata?.contextBudgetFlush).not.toBe(true);
+      expect(await h.requests[1].onStepSettled!(step(5_000))).toEqual({ decision: "continue" });
     } finally {
       await teardown(h);
     }

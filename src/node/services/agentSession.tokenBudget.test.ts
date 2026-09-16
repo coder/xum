@@ -1394,7 +1394,8 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     // Budget evaluation alone still cannot run without a limit: no advisory at any usage.
     expect(
-      (await h.requests[0].onStepSettled?.(step(90_000, { model: "custom:unknown-limit-model" })))?.decision
+      (await h.requests[0].onStepSettled?.(step(90_000, { model: "custom:unknown-limit-model" })))
+        ?.decision
     ).toBe("continue");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     // The queued continuation seals the window even though no limit is known.
@@ -1408,9 +1409,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     // Handoff target crossed AND requested: seal directly (no advisory), attributed to the model.
-    expect((await h.requests[0].onStepSettled?.(step(110_000, { newContextRequested: true })))?.decision).toBe(
-      "rollover"
-    );
+    expect(
+      (await h.requests[0].onStepSettled?.(step(110_000, { newContextRequested: true })))?.decision
+    ).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     await h.finishAndDispatch();
@@ -2212,12 +2213,14 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.session.sendMessage("Start work", previousOptions)).success).toBe(true);
       expect(h.session.queueMessage("Next request", dispatchOptions)).not.toBeNull();
       expect(
-        (await h.requests[0].onStepSettled?.(
-          step(90_000, {
-            memoryWritable: previousEnabled,
-            sessionHistoryAvailable: previousEnabled,
-          })
-        ))?.decision
+        (
+          await h.requests[0].onStepSettled?.(
+            step(90_000, {
+              memoryWritable: previousEnabled,
+              sessionHistoryAvailable: previousEnabled,
+            })
+          )
+        )?.decision
       ).toBe("warn");
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
       await h.waitForRequest(2);
@@ -2561,12 +2564,17 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
     // Bounded to one step although the resumed step crosses nothing; its memory-only toolset
     // reports session_history as unavailable, which must not queue a second flush either.
-    expect(
-      (await h.requests[0].onStepSettled?.(step(50_000, { sessionHistoryAvailable: false })))?.decision
-    ).toBe("rollover");
+    const outcome = await h.requests[0].onStepSettled!(
+      step(50_000, { sessionHistoryAvailable: false })
+    );
+    expect(outcome.decision).toBe("rollover");
+    expect(outcome.continuationEntryId).toBeDefined();
+    // Legacy flush recovery must still identify the paired rollover as its exact successor.
+    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("pending");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     h.settleStream(0);
     await h.waitForRequest(2);
+    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("streaming");
     const rows = await allRows(h);
     expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
     expect(warningRows(rows)).toHaveLength(1);
@@ -3510,7 +3518,8 @@ describe("AgentSession token-budget lifecycle", () => {
     };
     expect((await h.session.sendMessage("Start", disabled)).success).toBe(true);
     expect(
-      (await h.requests[0].onStepSettled?.(step(120_000, { sessionHistoryAvailable: false })))?.decision
+      (await h.requests[0].onStepSettled?.(step(120_000, { sessionHistoryAvailable: false })))
+        ?.decision
     ).toBe("rollover");
     const blocked = Promise.withResolvers<void>();
     const unsubscribe = h.session.onChatEvent(({ message }) => {

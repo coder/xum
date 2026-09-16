@@ -459,7 +459,7 @@ describe("settled context hard ceiling", () => {
         },
         onStepSettled: (step) => {
           settled.push(step);
-          return Promise.resolve("rollover");
+          return Promise.resolve({ decision: "rollover" });
         },
       });
       expect(started.success).toBe(true);
