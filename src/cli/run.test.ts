@@ -171,7 +171,7 @@ describe("xum CLI", () => {
     test("shows default model as opus", async () => {
       const result = await runCli(["run", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("anthropic:claude-opus-5");
+      expect(result.stdout).toContain("anthropic:claude-opus-5-1");
     });
 
     test("--service-tier has no default auto", async () => {
