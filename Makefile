@@ -75,6 +75,7 @@ ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
+ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
 
 # Include formatting rules
 include fmt.mk
@@ -310,11 +311,12 @@ build-static: ## Copy static assets to dist
 		cp "$$f" "dist/typescript-lib/$$(basename $$f).txt"; \
 	done
 
-build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/static/.copied ## Build Docker runtime artifacts
+build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
+	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -333,6 +335,13 @@ dist/runtime/tokenizer.worker.js: build-main
 	@test -f dist/node/utils/main/tokenizer.worker.js
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
+
+# The disposable icon decoder must remain a separate process in bundled runtimes.
+dist/runtime/mcpIconDecode.js: build-main
+	@echo "Bundling MCP icon decoder for Docker..."
+	@test -f dist/node/workers/mcpIconDecode.js
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
