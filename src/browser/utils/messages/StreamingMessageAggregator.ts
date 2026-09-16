@@ -2765,7 +2765,12 @@ export class StreamingMessageAggregator {
             // Create new objects to trigger React re-render (immutable update pattern)
             const updatedNestedCalls = parentPart.nestedCalls.map((nc, i) =>
               i === nestedIndex
-                ? { ...nc, state: "output-available" as const, output: data.result }
+                ? {
+                    ...nc,
+                    state: "output-available" as const,
+                    output: data.result,
+                    ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
+                  }
                 : nc
             );
             message.parts[parentIndex] = { ...parentPart, nestedCalls: updatedNestedCalls };
@@ -2786,6 +2791,7 @@ export class StreamingMessageAggregator {
           ...toolPart,
           state: "output-available",
           output: data.result,
+          ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
         };
 
         // Process tool result to update derived state (todos, agentStatus, etc.)

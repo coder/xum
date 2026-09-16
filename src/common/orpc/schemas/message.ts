@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MCPToolCallDisplaySchema } from "./mcp";
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { ThinkingLevelSchema } from "../../types/thinking";
@@ -46,6 +47,8 @@ const MuxToolPartBase = z.object({
   // this so queued-but-not-yet-executing tools don't appear to run.
   executionStartedAt: z.number().optional(),
   workflowRun: WorkflowRunToolAttachmentSchema.optional(),
+  // Host-authored display data must not enter the model-visible output.
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
 });
 
 /**
@@ -76,6 +79,8 @@ export const NestedToolCallSchema = z.object({
   // call. Kernel bounding can replace the nested args/result with a marker,
   // so without this the transcript card loses the run after reload.
   workflowRun: WorkflowRunToolAttachmentSchema.optional(),
+  // Host-authored display data must not enter the model-visible output.
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
 });
 
 export type NestedToolCall = z.infer<typeof NestedToolCallSchema>;

@@ -95,6 +95,7 @@ import {
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -317,6 +318,7 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   abortSignal?: AbortSignal;
   initialMetadata?: Partial<MuxMetadata>;
   providedStreamToken?: StreamToken;
+  executionScope?: ExecutionScope;
   workspaceName?: string;
   thinkingLevel?: string;
   providedRuntimeTempDir?: string;
@@ -698,6 +700,7 @@ interface WorkspaceStreamInfo {
   workspaceName?: string;
   messageId: string;
   token: StreamToken;
+  executionScope?: ExecutionScope;
   startTime: number;
 
   // Used to ensure part timestamps are strictly monotonic, even when multiple deltas land in the
@@ -937,7 +940,8 @@ export class StreamManager {
     getProvidersConfig?: () => ProvidersConfigMap | null,
     eventSink: TurnEngineEventSink = () => undefined,
     runner: EffectRunner = defaultEffectRunner,
-    engineScope?: Scope.Closeable
+    engineScope?: Scope.Closeable,
+    private readonly toolCallDisplayRegistry = new ToolCallDisplayRegistry()
   ) {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
@@ -1758,6 +1762,7 @@ export class StreamManager {
           toolCallId: part.toolCallId,
           toolName: part.toolName,
           result: part.output,
+          ...(part.mcpServer ? { mcpServer: part.mcpServer } : {}),
           timestamp: Date.now(),
         });
       }
@@ -1813,6 +1818,7 @@ export class StreamManager {
           toolCallId: nested.toolCallId,
           toolName: nested.toolName,
           result: nested.output,
+          ...(nested.mcpServer ? { mcpServer: nested.mcpServer } : {}),
           timestamp: Date.now(),
           parentToolCallId,
         });
@@ -1989,6 +1995,7 @@ export class StreamManager {
   }
 
   private closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
+    if (streamInfo.executionScope) this.toolCallDisplayRegistry.close(streamInfo.executionScope);
     if (streamInfo.resourceCleanup) return streamInfo.resourceCleanup;
     const closed = Promise.withResolvers<void>();
     streamInfo.resourceCleanup = closed.promise;
@@ -2026,6 +2033,8 @@ export class StreamManager {
     abortReason: StreamAbortReason,
     abandonPartial?: boolean
   ): Promise<void> {
+    // Close before waiting: late or queued invocations cannot publish after abort.
+    if (streamInfo.executionScope) this.toolCallDisplayRegistry.close(streamInfo.executionScope);
     // CRITICAL: Wait for processing to fully complete before cleanup
     // This prevents race conditions where the old stream is still running
     // while a new stream starts (e.g., old stream writing to partial.json)
@@ -2880,12 +2889,25 @@ export class StreamManager {
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
     });
 
+    const executionScope = options.executionScope ?? {
+      workspaceId: options.workspaceId,
+      messageId,
+      token: ctx.streamToken,
+    };
+    assert(
+      executionScope.workspaceId === options.workspaceId &&
+        executionScope.messageId === messageId &&
+        executionScope.token === ctx.streamToken,
+      "MCP execution scope must belong to the stream being registered"
+    );
+    this.toolCallDisplayRegistry.open(executionScope);
     // Start streaming - this can throw immediately if API key is missing
     let streamResult;
     try {
       streamResult = this.createStreamResult(request, ctx.abortController, stepTracker);
     } catch (error) {
       // Clean up abort controller if stream creation fails
+      this.toolCallDisplayRegistry.close(executionScope);
       ctx.abortController.abort();
       // Re-throw the error to be caught by startStream
       throw error;
@@ -2899,6 +2921,7 @@ export class StreamManager {
       abortController: ctx.abortController,
       messageId,
       token: ctx.streamToken,
+      executionScope,
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
@@ -2982,6 +3005,9 @@ export class StreamManager {
       (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
     );
     const pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, toolCallId);
+    const mcpServer = streamInfo.executionScope
+      ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
+      : undefined;
 
     if (existingPartIndex !== -1) {
       const existingPart = streamInfo.parts[existingPartIndex];
@@ -2989,6 +3015,7 @@ export class StreamManager {
         streamInfo.parts[existingPartIndex] = {
           ...existingPart,
           ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+          ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
         };
@@ -3004,6 +3031,7 @@ export class StreamManager {
         state: "output-available" as const,
         input: toolCall?.input ?? null,
         output,
+        ...(mcpServer ? { mcpServer } : {}),
         timestamp: nextPartTimestamp(streamInfo),
         ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
       });
@@ -3034,6 +3062,7 @@ export class StreamManager {
       toolCallId,
       toolName,
       result: output,
+      ...(mcpServer ? { mcpServer } : {}),
       ...(providerExecuted === true ? { providerExecuted: true } : {}),
       timestamp: completionTimestamp,
     } as ToolCallEndEvent);
@@ -3106,8 +3135,7 @@ export class StreamManager {
    * Also persists nested calls to streamInfo.parts so they survive interruption/reload.
    */
   emitNestedToolEvent(
-    workspaceId: string,
-    messageId: string,
+    scope: ExecutionScope,
     event: {
       type: "tool-call-start" | "tool-call-end";
       callId: string;
@@ -3120,6 +3148,7 @@ export class StreamManager {
       error?: string;
     }
   ): void {
+    const { workspaceId, messageId } = scope;
     // Kernel guests can call capabilities with zero arguments. JSON.stringify
     // drops an `args: undefined` key, and the wire schema requires args on
     // tool-call-start, so an unnormalized event would fail oRPC output
@@ -3127,8 +3156,13 @@ export class StreamManager {
     // the same shape a provider zero-arg tool call carries.
     const args = event.args === undefined ? {} : event.args;
 
-    // Persist nested calls to streamInfo.parts for crash/interrupt resilience
+    // Persist nested calls to streamInfo.parts for crash/interrupt resilience.
+    // A stale producer may still emit, but must never consume another turn's branding.
     const streamInfo = this.workspaceStreams.get(workspaceId as WorkspaceId);
+    const mcpServer =
+      event.type === "tool-call-end" && streamInfo?.executionScope === scope
+        ? this.toolCallDisplayRegistry.take(scope, event.callId)
+        : undefined;
     if (streamInfo) {
       if (event.type === "tool-call-end") {
         // Nested records never store an end time, so incremental replay needs
@@ -3159,6 +3193,7 @@ export class StreamManager {
             nestedCalls[idx] = {
               ...nestedCalls[idx],
               output: event.result ?? (event.error ? { error: event.error } : undefined),
+              ...(mcpServer ? { mcpServer } : {}),
               state: "output-available",
             };
           }
@@ -3188,6 +3223,7 @@ export class StreamManager {
             buffered[idx] = {
               ...buffered[idx],
               output: event.result ?? (event.error ? { error: event.error } : undefined),
+              ...(mcpServer ? { mcpServer } : {}),
               state: "output-available",
             };
           }
@@ -3217,6 +3253,7 @@ export class StreamManager {
         toolCallId: event.callId,
         toolName: event.toolName,
         result: event.result ?? (event.error ? { error: event.error } : undefined),
+        ...(mcpServer ? { mcpServer } : {}),
         timestamp: event.endTime!,
         parentToolCallId: event.parentToolCallId,
       });

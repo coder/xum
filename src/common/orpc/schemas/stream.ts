@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
@@ -499,6 +500,7 @@ export const ToolCallEndEventSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
   result: z.unknown(),
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
   providerExecuted: z
     .boolean()
     .optional()

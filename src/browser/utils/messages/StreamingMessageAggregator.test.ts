@@ -1,3 +1,4 @@
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
@@ -139,6 +140,7 @@ function endToolCall(
     toolCallId: string;
     toolName: string;
     result: unknown;
+    mcpServer?: MCPToolCallDisplay;
     timestamp?: number;
     parentToolCallId?: string;
     replay?: boolean;
@@ -151,6 +153,7 @@ function endToolCall(
     toolCallId: options.toolCallId,
     toolName: options.toolName,
     result: options.result,
+    mcpServer: options.mcpServer,
     timestamp: options.timestamp ?? Date.now(),
     parentToolCallId: options.parentToolCallId,
     replay: options.replay,
@@ -4122,6 +4125,43 @@ describe("StreamingMessageAggregator", () => {
       }
       expect(toolMsg.nestedCalls).toHaveLength(1);
     });
+
+    test.each([undefined, "parent-tool-1"])(
+      "retains host-authored MCP display metadata from live completion (parent: %s)",
+      (parentToolCallId) => {
+        const aggregator = createTestAggregator();
+        startParentTool(aggregator);
+        const mcpServer = {
+          connection: { key: "configured", transport: "stdio" as const },
+          identity: { name: "display-server", version: "1" },
+          source: "response" as const,
+        };
+        startToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          args: {},
+          timestamp: 1100,
+          parentToolCallId,
+        });
+        endToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          result: { content: [{ type: "text", text: "answer" }] },
+          timestamp: 1200,
+          parentToolCallId,
+          mcpServer,
+        });
+        const parts = aggregator.getAllMessages().flatMap((message) => message.parts);
+        const parent = parts.find(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "parent-tool-1"
+        );
+        const call =
+          parentToolCallId && parent?.type === "dynamic-tool"
+            ? parent.nestedCalls?.find((nested) => nested.toolCallId === "mcp-call")
+            : parts.find((part) => part.type === "dynamic-tool" && part.toolCallId === "mcp-call");
+        expect(call).toMatchObject({ mcpServer });
+      }
+    );
 
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();

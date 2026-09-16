@@ -3,6 +3,14 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
 import type { Tool } from "ai";
+import { getExecutionScope } from "./tools/withExecutionScope";
+import {
+  buildToolCallDisplay,
+  describeConnection,
+  normalizeServerIdentity,
+  takeStandardDisplayMeta,
+} from "./mcpServerIdentity";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createMCPClient,
   isModernEra,
@@ -16,6 +24,8 @@ import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
 import type {
   BearerChallenge,
   MCPHeaderValue,
+  MCPConnectionRef,
+  MCPServerIdentity,
   MCPServerInfo,
   MCPServerMap,
   MCPServerTransport,
@@ -308,7 +318,15 @@ function rawInputSchema(inputSchema: unknown): unknown {
  */
 export function wrapMCPTools(
   tools: Record<string, Tool>,
-  options?: { onActivity?: () => void; onClosed?: () => void }
+  options?: {
+    onActivity?: () => void;
+    onClosed?: () => void;
+    display?: {
+      connection: MCPConnectionRef;
+      identity?: MCPServerIdentity;
+      registry: ToolCallDisplayRegistry;
+    };
+  }
 ): Record<string, Tool> {
   const { onActivity, onClosed } = options ?? {};
   const wrapped: Record<string, Tool> = {};
@@ -338,7 +356,21 @@ export function wrapMCPTools(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
-          return transformMCPResult(result as MCPCallToolResult);
+          // The standard key is UI-only for newly produced results. Keeping it
+          // in output would also expose it to the model when history is replayed.
+          const { rest, displayKeyValue } = takeStandardDisplayMeta(result);
+          const response = normalizeServerIdentity(displayKeyValue);
+          const identity = response?.identity ?? options?.display?.identity;
+          const scope = getExecutionScope(context);
+          if (scope && identity && options?.display) {
+            const snapshot = buildToolCallDisplay({
+              connection: options.display.connection,
+              identity,
+              source: response ? "response" : "connection",
+            });
+            if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+          }
+          return transformMCPResult(rest as MCPCallToolResult);
         } catch (error) {
           if (shouldRecycleClientAfterToolError(error)) {
             try {
@@ -889,6 +921,7 @@ async function runServerTest(
       const tools = await client.tools();
       const toolNames = Object.keys(tools);
       const protocolVersion = client.negotiatedProtocolVersion();
+      const serverInfo = normalizeServerIdentity(client.serverInfo())?.identity;
 
       await client.close();
       client = null;
@@ -906,6 +939,7 @@ async function runServerTest(
         success: true,
         tools: toolNames,
         ...(protocolVersion !== undefined ? { protocolVersion } : {}),
+        ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
       const message = getErrorMessage(error);
@@ -1068,6 +1102,8 @@ export function normalizePromptCatalog(prompts: MCPPrompt[], serverName: string)
 
 interface MCPServerInstance {
   name: string;
+  identity?: MCPServerIdentity;
+  connectionRef: MCPConnectionRef;
   /** Resolved transport actually used (auto may fall back to sse). */
   resolvedTransport: ResolvedTransport;
   autoFallbackUsed: boolean;
@@ -1216,6 +1252,7 @@ interface WorkspaceServers {
 }
 
 export interface MCPServerManagerOptions {
+  toolCallDisplayRegistry?: ToolCallDisplayRegistry;
   config?: Config;
   telemetryService?: Pick<TelemetryService, "capture">;
   /** Inline stdio servers to use (merged with config file servers by default) */
@@ -1306,6 +1343,7 @@ function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_st
 }
 
 export class MCPServerManager {
+  private readonly toolCallDisplayRegistry: ToolCallDisplayRegistry;
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   // Survives idle cleanup so an explicit prompt invocation can revive reaped
   // servers at send time; forgotten only on workspace removal.
@@ -1396,6 +1434,8 @@ export class MCPServerManager {
     policyService?: PolicyService
   ) {
     this.policyService = policyService ?? null;
+    this.toolCallDisplayRegistry =
+      options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
     this.config = options?.config ?? null;
     this.telemetryService = options?.telemetryService ?? null;
     this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
@@ -6005,8 +6045,15 @@ export class MCPServerManager {
           return null;
         }
 
+        const identity = normalizeServerIdentity(readyClient.serverInfo())?.identity;
+        const connectionRef = describeConnection(name, info, "stdio");
         const wrapRawTools = (raw: Record<string, Tool>) =>
           wrapMCPTools(raw, {
+            display: {
+              connection: connectionRef,
+              identity,
+              registry: this.toolCallDisplayRegistry,
+            },
             onActivity,
             onClosed: () => {
               if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -6026,6 +6073,8 @@ export class MCPServerManager {
 
         const instance: MCPServerInstance = {
           name,
+          identity,
+          connectionRef,
           resolvedTransport: "stdio",
           autoFallbackUsed: false,
           tools,
@@ -6282,8 +6331,11 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
+      const identity = normalizeServerIdentity(activeClient.serverInfo())?.identity;
+      const connectionRef = describeConnection(name, info, resolvedTransport);
       const wrapRawTools = (raw: Record<string, Tool>) =>
         wrapMCPTools(raw, {
+          display: { connection: connectionRef, identity, registry: this.toolCallDisplayRegistry },
           onActivity,
           onClosed: () => {
             if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -6306,6 +6358,8 @@ export class MCPServerManager {
       let unsubscribeDesign: (() => void) | undefined;
       const instance: MCPServerInstance = {
         name,
+        identity,
+        connectionRef,
         resolvedTransport,
         autoFallbackUsed,
         tools,

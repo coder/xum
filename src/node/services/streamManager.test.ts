@@ -532,14 +532,17 @@ describe("StreamManager - nested kernel call race and replay", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     // execute() wins the race: nested start arrives before the parent part exists.
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-start",
-      callId: "nested-race-workflow",
-      toolName: "workflow_run",
-      args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
-      parentToolCallId: "code-exec-race",
-      startTime: timestamp,
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-start",
+        callId: "nested-race-workflow",
+        toolName: "workflow_run",
+        args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+        parentToolCallId: "code-exec-race",
+        startTime: timestamp,
+      }
+    );
 
     // The workflow attachment lands while the nested record is still buffered.
     const attached = await streamManager.attachWorkflowRunToToolCall({
@@ -733,16 +736,19 @@ describe("StreamManager - nested kernel call race and replay", () => {
     });
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-end",
-      callId: "nested-ts",
-      toolName: "bash",
-      args: {},
-      parentToolCallId: "code-exec-ts",
-      startTime: timestamp,
-      endTime: timestamp + 5,
-      result: { ok: true },
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-end",
+        callId: "nested-ts",
+        toolName: "bash",
+        args: {},
+        parentToolCallId: "code-exec-ts",
+        startTime: timestamp,
+        endTime: timestamp + 5,
+        result: { ok: true },
+      }
+    );
 
     expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
       timestamp + 5
@@ -812,16 +818,19 @@ describe("StreamManager - nested tool call normalization", () => {
     const events: unknown[] = [];
     onTurnEngineEvent(streamManager, "tool-call-start", (event: unknown) => events.push(event));
 
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-start",
-      callId: "nested-1",
-      toolName: "linear_list_teams",
-      // Zero-argument guest call: JSON cannot represent undefined, so both the
-      // persisted record and the wire event must carry {} instead.
-      args: undefined,
-      parentToolCallId: "parent-1",
-      startTime: timestamp,
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-start",
+        callId: "nested-1",
+        toolName: "linear_list_teams",
+        // Zero-argument guest call: JSON cannot represent undefined, so both the
+        // persisted record and the wire event must carry {} instead.
+        args: undefined,
+        parentToolCallId: "parent-1",
+        startTime: timestamp,
+      }
+    );
 
     const parentPart = parts[0] as { nestedCalls?: Array<{ input?: unknown }> };
     expect(parentPart.nestedCalls).toHaveLength(1);
