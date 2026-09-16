@@ -1,12 +1,16 @@
 /**
- * Envelope for intra-tree agent peer messages (sibling/cousin and descendant→ancestor sends via
+ * Envelope for agent peer messages (sibling/cousin, descendant→ancestor, and cross-tree sends via
  * task_send_message). Unlike parent→descendant guidance, these messages cross a trust boundary:
  * the recipient must be able to attribute the text to a specific sender without letting the
  * sender's raw text forge or terminate the envelope structure.
  */
 
-/** The sender's relationship to the recipient (what the receiving model reads). */
-export type AgentMessageRelationship = "sibling" | "descendant";
+/**
+ * The sender's relationship to the recipient (what the receiving model reads). "unrelated" means
+ * the sender shares no task-tree ancestry with the recipient (another root, or a sub-agent under
+ * another root); it describes ancestry only and grants no authority beyond a sibling's.
+ */
+export type AgentMessageRelationship = "sibling" | "descendant" | "unrelated";
 
 export interface AgentMessageEnvelope {
   /** Sender's tree target id — doubles as the reply address for task_send_message. */
@@ -24,7 +28,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isRelationship(value: unknown): value is AgentMessageRelationship {
-  return value === "sibling" || value === "descendant";
+  return value === "sibling" || value === "descendant" || value === "unrelated";
 }
 
 /**
