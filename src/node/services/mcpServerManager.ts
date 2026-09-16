@@ -95,14 +95,17 @@ const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
  * backoff a server that never comes up costs every turn a full startup
- * timeout. The first retry runs on the next serve (the initial timeout may
- * have been transient); each further consecutive retry timeout doubles the
- * wait from the base, capped so a server that does recover is picked up
+ * timeout. Every timeout, the initial startup included, counts as a failure:
+ * a UAT with an immediate first retry and a 5 s base measured the full
+ * timeout on 4 of 8 turns at human cadence, because a wait shorter than the
+ * timeout it gates is no wait at all. The base equals the startup timeout so
+ * a retry is never spent sooner than it would cost, each further consecutive
+ * timeout doubles it, capped so a server that does recover is picked up
  * within a few minutes. Reset when the retry succeeds, when the entry is
  * replaced by a config change, or when a plugin invalidation re-queues the
  * server (markServersForRetry).
  */
-const TIMED_OUT_RETRY_BACKOFF_BASE_MS = 5_000;
+const TIMED_OUT_RETRY_BACKOFF_BASE_MS = MCP_STARTUP_TIMEOUT_MS;
 const TIMED_OUT_RETRY_BACKOFF_MAX_MS = 5 * 60_000;
 
 /** Wait required after `retryTimeouts` consecutive failed retries before the next attempt. */
@@ -1189,9 +1192,10 @@ interface WorkspaceServers {
   /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
   retryingTimedOutServerNames: Set<string>;
   /**
-   * Consecutive retry timeouts per server still in `timedOutServerNames`,
-   * gating getTimedOutServerNamesToRetry (see TIMED_OUT_RETRY_BACKOFF_BASE_MS).
-   * No record means the next serve retries immediately.
+   * Consecutive startup timeouts (initial start included) per server still in
+   * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
+   * TIMED_OUT_RETRY_BACKOFF_BASE_MS). No record (plugin re-queue) means the
+   * next serve retries immediately.
    */
   timedOutRetryBackoff?: Map<string, { retryTimeouts: number; lastAttemptAtMs: number }>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
@@ -2265,7 +2269,9 @@ export class MCPServerManager {
       const retryAfterMs =
         backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now;
       if (retryAfterMs <= 0) return true;
-      log.debug("[MCP] Skipping timed-out server retry during backoff", {
+      // Info, not debug: this is the only evidence that a turn ran without
+      // the server on purpose rather than the server silently vanishing.
+      log.info("[MCP] Skipping timed-out server retry during backoff", {
         serverName,
         retryTimeouts: backoff.retryTimeouts,
         retryAfterMs,
@@ -2275,16 +2281,17 @@ export class MCPServerManager {
   }
 
   /**
-   * Record the outcome of a cached-path retry for backoff. A retry that timed
-   * out again lengthens the wait; any other outcome (started, hard failure
-   * that leaves the retry list, plugin-tree invalidation) clears it.
+   * Record startup outcomes for backoff, from the initial start and from
+   * cached-path retries alike. A timeout lengthens the wait; any other
+   * outcome (started, hard failure that leaves the retry list, plugin-tree
+   * invalidation) clears it.
    */
-  private recordTimedOutRetryOutcomes(
+  private recordStartupTimeoutOutcomes(
     entry: WorkspaceServers,
     attempted: Iterable<string>,
-    timedOutAgain: Iterable<string>
+    timedOutNames: Iterable<string>
   ): void {
-    const timedOut = new Set(timedOutAgain);
+    const timedOut = new Set(timedOutNames);
     const now = Date.now();
     for (const serverName of attempted) {
       if (!timedOut.has(serverName)) {
@@ -2964,7 +2971,7 @@ export class MCPServerManager {
                 ...retryTimedOutNames,
                 ...invalidatedRetryKeys,
               ];
-              this.recordTimedOutRetryOutcomes(existing, retryingServerNames, retryTimedOutNames);
+              this.recordStartupTimeoutOutcomes(existing, retryingServerNames, retryTimedOutNames);
             }
           );
           if (retryOwnershipLost) {
@@ -3140,6 +3147,11 @@ export class MCPServerManager {
               ...timedOutNames,
               ...invalidatedRestartKeys,
             ];
+            this.recordStartupTimeoutOutcomes(
+              existing,
+              Object.keys(serversToRestart),
+              timedOutNames
+            );
             existing.stats = this.createWorkspaceStats(
               existing.stats.enabledServerCount,
               existing.instances,
@@ -3393,8 +3405,10 @@ export class MCPServerManager {
             retained.enabledServers = enabledServers;
             retained.enabledServersGeneration = configGenerationUsed;
             retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
-            // Config signature moved: give every pending retry a fresh start.
+            // Config signature moved: give every pending retry a fresh start,
+            // then count this start's timeouts as their first failure.
             delete retained.timedOutRetryBackoff;
+            this.recordStartupTimeoutOutcomes(retained, startTimedOutNames, startTimedOutNames);
             retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
               ...retained.stats.failedServerNames,
               ...startFailedNames,
@@ -3416,6 +3430,7 @@ export class MCPServerManager {
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
           };
+          this.recordStartupTimeoutOutcomes(entry, startTimedOutNames, startTimedOutNames);
           this.workspaceServers.set(workspaceId, entry);
         }
       );

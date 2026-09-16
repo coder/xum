@@ -149,6 +149,15 @@ function startResult(
   };
 }
 
+/**
+ * A timed-out server backs off one startup timeout before its first retry.
+ * Bun freezes the clock under setSystemTime, so jump relative to the current
+ * reading; afterEach restores real time.
+ */
+function elapseTimedOutRetryBackoff(): void {
+  setSystemTime(new Date(Date.now() + 60_000));
+}
+
 function cachedStats(overrides: Record<string, unknown> = {}) {
   return {
     enabledServerCount: 1,
@@ -187,6 +196,7 @@ describe("MCPServerManager", () => {
 
   afterEach(() => {
     manager.dispose();
+    setSystemTime();
   });
   test("testForApi resolves global defaults and emits categorized telemetry", async () => {
     using tmp = new DisposableTempDir("mcp-api-test");
@@ -2192,6 +2202,7 @@ describe("MCPServerManager", () => {
     access.startServers = () =>
       Promise.resolve({ instances: retried, failedServerNames: [], timedOutServerNames: [] });
 
+    elapseTimedOutRetryBackoff();
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(stopPromise).toBeDefined();
     await stopPromise;
@@ -3319,37 +3330,37 @@ describe("MCPServerManager", () => {
     const base = Date.now();
     setSystemTime(new Date(base));
     try {
-      // Initial start times out; the first cached-path retry runs at once.
+      // The initial startup timeout is the first failure: serves inside the
+      // base window (one startup timeout) do not pay a second timeout.
       await manager.getToolsForWorkspace(request);
       expect(startServersMock).toHaveBeenCalledTimes(1);
       await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      setSystemTime(new Date(base + 59_999));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(1);
+      setSystemTime(new Date(base + 60_000));
+      await manager.getToolsForWorkspace(request);
       expect(startServersMock).toHaveBeenCalledTimes(2);
 
-      // One retry timeout: the next serve inside the base window skips it.
+      // One retry timeout: the window doubles.
+      setSystemTime(new Date(base + 60_000 + 119_999));
       await manager.getToolsForWorkspace(request);
       expect(startServersMock).toHaveBeenCalledTimes(2);
-      setSystemTime(new Date(base + 4_999));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(2);
-      setSystemTime(new Date(base + 5_000));
+      setSystemTime(new Date(base + 60_000 + 120_000));
       await manager.getToolsForWorkspace(request);
       expect(startServersMock).toHaveBeenCalledTimes(3);
-
-      // Two retry timeouts: the window doubles.
-      setSystemTime(new Date(base + 5_000 + 9_999));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(3);
-      setSystemTime(new Date(base + 5_000 + 10_000));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(4);
 
       // A config change restarts the server and clears its backoff, so the
-      // following serve retries immediately again.
+      // schedule restarts from the base window.
       command = "cmd-2";
       await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(5);
+      expect(startServersMock).toHaveBeenCalledTimes(4);
       await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(6);
+      expect(startServersMock).toHaveBeenCalledTimes(4);
+      setSystemTime(new Date(base + 60_000 + 120_000 + 60_000));
+      await manager.getToolsForWorkspace(request);
+      expect(startServersMock).toHaveBeenCalledTimes(5);
     } finally {
       setSystemTime();
     }
@@ -3504,6 +3515,7 @@ describe("MCPServerManager", () => {
     expect(initial.stats.startedServerCount).toBe(1);
     expect(Object.keys(initial.tools)).toEqual(["servera_toola"]);
 
+    elapseTimedOutRetryBackoff();
     const retried = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(startServersMock).toHaveBeenCalledTimes(2);
@@ -3763,6 +3775,7 @@ describe("MCPServerManager", () => {
       );
     access.startServers = startup;
     await manager.getToolsForWorkspace(request);
+    elapseTimedOutRetryBackoff();
     const retry = manager.getToolsForWorkspace(request);
     await retryStarted.promise;
     Object.assign(configs, {
@@ -3781,6 +3794,7 @@ describe("MCPServerManager", () => {
       ["addedBroken", "addedSlow"],
     ]);
     startup.mockResolvedValueOnce(startResult([["addedSlow"]]));
+    elapseTimedOutRetryBackoff();
     await manager.getToolsForWorkspace(request);
     expect(Object.keys(startup.mock.calls.at(-1)![0] as object)).toEqual(["addedSlow"]);
   });
