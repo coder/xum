@@ -231,12 +231,18 @@ export function buildToolCallDisplay(input: {
   connection: MCPConnectionRef;
   identity: MCPServerIdentity | undefined;
   source: MCPToolCallDisplaySource;
+  iconRef?: string;
 }): MCPToolCallDisplay | undefined {
   if (!input.identity) {
     return undefined;
   }
   const identity: MCPServerIdentity = { ...input.identity };
-  const candidate = { connection: input.connection, identity, source: input.source };
+  const candidate = {
+    connection: input.connection,
+    identity,
+    source: input.source,
+    iconRef: input.iconRef,
+  };
   for (let attempt = 0; ; attempt++) {
     const parsed = MCPToolCallDisplaySchema.safeParse(candidate);
     if (parsed.success) {
@@ -244,6 +250,7 @@ export function buildToolCallDisplay(input: {
         connection: withoutUndefinedValues(parsed.data.connection),
         identity: withoutUndefinedValues(parsed.data.identity),
         source: parsed.data.source,
+        ...(parsed.data.iconRef ? { iconRef: parsed.data.iconRef } : {}),
       };
     }
     const field = DISPLAY_TRIM_ORDER[attempt];

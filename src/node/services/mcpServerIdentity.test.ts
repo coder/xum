@@ -373,6 +373,19 @@ describe("buildToolCallDisplay", () => {
     expect(snapshot!.connection).toStrictEqual(maxConnection);
   });
 
+  test("preserves an immutable icon ref within the same snapshot budget", () => {
+    const iconRef = "1234567890abcdef".repeat(2);
+    const input = {
+      connection: maxConnection,
+      identity: maxIdentity,
+      source: "connection" as const,
+    };
+    const snapshot = buildToolCallDisplay({ ...input, iconRef });
+    expect(snapshot?.iconRef).toBe(iconRef);
+    expect(utf8Bytes(snapshot)).toBeLessThanOrEqual(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes);
+    expect(buildToolCallDisplay({ ...input, iconRef: "not-a-ref" })?.iconRef).toBeUndefined();
+  });
+
   test("trims websiteUrl before title and title last", () => {
     // JSON-escaped control characters cost 6 bytes per UTF-16 unit, so an
     // un-normalized identity can exceed the budget even without description.

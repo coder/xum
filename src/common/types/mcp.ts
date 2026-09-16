@@ -114,6 +114,8 @@ export type MCPTestResult =
       protocolVersion?: string;
       /** Identity the server reported during the handshake, when it did. */
       serverInfo?: MCPServerIdentity;
+      /** Host-decoded PNG, kept in renderer memory only. */
+      icon?: string;
     }
   | { success: false; error: string; oauthChallenge?: BearerChallenge };
 

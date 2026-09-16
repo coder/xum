@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { isHttpsOrigin, isHttpsUrlWithoutUserinfo } from "@/common/utils/mcp/httpsUrl";
 import { enforceUtf8ByteBudget } from "@/common/utils/mcp/utf8ByteBudget";
 
@@ -294,6 +296,12 @@ export const MCPConnectionRefSchema = z.object({
   origin: HttpsOriginSchema.optional().catch(undefined),
 });
 
+export const MCPIconRefSchema = z.string().regex(/^[a-f0-9]{32}$/);
+export const PngDataUrlSchema = z
+  .string()
+  .max(MCP_ICON_LIMITS.pngDataUrlMaxChars)
+  .refine(isPngDataUrl);
+
 /**
  * Per-tool-call identity snapshot authored by the host and frozen on the
  * tool part. `source` records whether the identity came from this result's
@@ -305,6 +313,8 @@ export const MCPToolCallDisplaySchema = z
     connection: MCPConnectionRefSchema,
     identity: MCPServerIdentitySchema,
     source: z.enum(["response", "connection"]),
+    /** Immutable session-local ref, never an icon URL or persisted image bytes. */
+    iconRef: MCPIconRefSchema.optional().catch(undefined),
   })
   .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
 
@@ -315,6 +325,7 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
     protocolVersion: z.string().optional(),
     /** Handshake identity; optional so cached results from older builds still parse. */
     serverInfo: MCPServerIdentitySchema.optional().catch(undefined),
+    icon: PngDataUrlSchema.optional().catch(undefined),
   }),
   z.object({
     success: z.literal(false),
