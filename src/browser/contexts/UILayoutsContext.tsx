@@ -146,31 +146,47 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     [api]
   );
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
   // Presets change behind this provider when a settings restore rewrites config, so hotkeys
-  // and palette entries would keep applying the old slots until the app reloaded.
+  // and palette entries would keep applying the old slots until the app reloaded. The first
+  // snapshot is taken only once the subscription is armed: a change landing while it starts
+  // would otherwise go unseen, and the older snapshot would stand until the next change.
   useEffect(() => {
     const onConfigChanged = api?.config?.onConfigChanged;
-    if (!onConfigChanged) return;
+    if (!onConfigChanged) {
+      void refresh();
+      return;
+    }
 
     const abortController = new AbortController();
     const { signal } = abortController;
     let iterator: AsyncIterator<unknown> | null = null;
 
     const runSubscription = async () => {
+      let subscribed: AsyncIterator<unknown>;
+      let nextEvent: Promise<IteratorResult<unknown>>;
       try {
-        const subscribedIterator = await onConfigChanged(undefined, { signal });
+        subscribed = await onConfigChanged(undefined, { signal });
         if (signal.aborted) {
-          void subscribedIterator.return?.();
+          void subscribed.return?.();
           return;
         }
+        iterator = subscribed;
+        // A generator-backed subscription registers its listener on the first pull.
+        nextEvent = subscribed.next();
+      } catch {
+        // Without a listener later changes go unseen, but the presets still load once.
+        if (!signal.aborted) void refresh();
+        return;
+      }
 
-        iterator = subscribedIterator;
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) break;
+      // Not awaited: a change arriving during this snapshot refreshes concurrently, and the
+      // generation guard keeps the older response from landing last.
+      void refresh();
+      try {
+        while (!signal.aborted) {
+          const event = await nextEvent;
+          if (event.done || signal.aborted) break;
+          nextEvent = subscribed.next();
           await refresh();
         }
       } catch {

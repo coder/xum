@@ -48,7 +48,10 @@ describe("UILayoutsProvider", () => {
     return latest;
   }
 
-  function renderProvider() {
+  function renderProvider(
+    onConfigChanged: () => Promise<AsyncIterable<void>> = () =>
+      Promise.resolve(configChanges.iterable)
+  ) {
     const client: RecursivePartial<APIClient> = {
       uiLayouts: {
         getAll: () =>
@@ -63,10 +66,7 @@ describe("UILayoutsProvider", () => {
         },
       },
       config: {
-        onConfigChanged: (() =>
-          Promise.resolve(
-            configChanges.iterable
-          )) as unknown as APIClient["config"]["onConfigChanged"],
+        onConfigChanged: onConfigChanged as unknown as APIClient["config"]["onConfigChanged"],
       },
     };
     render(
@@ -198,6 +198,41 @@ describe("UILayoutsProvider", () => {
     expect((outcome as Error).message).toBe("Layout presets changed while saving; try again");
     expect(getAllCalls.length).toBe(7);
     expect(slotNumbers(current().layoutPresets)).toEqual([2]);
+  });
+
+  test("takes the first snapshot only once the config subscription is armed", async () => {
+    let subscribe: Deferred<AsyncIterable<void>> | undefined;
+    renderProvider(
+      () =>
+        new Promise<AsyncIterable<void>>((resolve, reject) => {
+          subscribe = { resolve, reject };
+        })
+    );
+    await waitFor(() => expect(subscribe).toBeDefined());
+    await flushMicrotasks();
+
+    // A restore rewrites the presets while the subscription is still starting, so no event
+    // announces it; any read issued before then was served by the pre-restore config.
+    const readsBeforeArmed = getAllCalls.length;
+    act(() => {
+      for (const read of getAllCalls) read.resolve(presetsWithSlot(1));
+    });
+    act(() => subscribe!.resolve(configChanges.iterable));
+    await waitFor(() => expect(getAllCalls.length).toBeGreaterThan(readsBeforeArmed));
+    act(() => {
+      for (const read of getAllCalls.slice(readsBeforeArmed)) read.resolve(presetsWithSlot(2));
+    });
+
+    await waitFor(() => expect(slotNumbers(current().layoutPresets)).toEqual([2]));
+    expect(current().loaded).toBe(true);
+    expect(readsBeforeArmed).toBe(0);
+  });
+
+  test("loads the presets once when the config subscription fails", async () => {
+    renderProvider(() => Promise.reject(new Error("ipc failure")));
+    await loadInitialPresets(1);
+    await flushMicrotasks();
+    expect(getAllCalls.length).toBe(1);
   });
 
   test("keeps the loaded presets when a later refresh fails", async () => {
