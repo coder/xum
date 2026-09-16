@@ -12037,6 +12037,47 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test.each([false, true])(
+    "task rescue follows the dispatched continuation correlation (downgraded: %s)",
+    async (downgraded) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(downgraded);
+      fakeSession.sendMessage.mockResolvedValue(
+        Err({ type: "unknown" as const, raw: "admission refused" })
+      );
+      const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
+      const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          markInterruptedTaskRunning,
+          restoreInterruptedTaskAfterResumeFailure,
+        })
+      );
+      const muxMetadata = {
+        type: "workspace-turn-task" as const,
+        taskHandleId: "wst_reactivation",
+        ownerWorkspaceId: "parent-workspace",
+        turnId: "reactivation-turn",
+      };
+      const result = await workspaceService.sendMessage(
+        "test-workspace",
+        "Continue",
+        { model: "openai:gpt-4o-mini", agentId: "exec", muxMetadata },
+        { workspaceTurnContinuation: true }
+      );
+      expect(result.success).toBe(false);
+      expect(fakeSession.sendMessage).toHaveBeenCalledWith(
+        "Continue",
+        downgraded
+          ? expect.not.objectContaining({ muxMetadata })
+          : expect.objectContaining({ muxMetadata }),
+        expect.anything()
+      );
+      expect(markInterruptedTaskRunning).toHaveBeenCalledTimes(downgraded ? 1 : 0);
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledTimes(downgraded ? 1 : 0);
+    }
+  );
+
   test("sendMessage restores interrupted status when accepted edit startup fails later", async () => {
     fakeSession.isBusy.mockReturnValue(false);
 

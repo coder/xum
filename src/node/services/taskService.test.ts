@@ -32769,6 +32769,104 @@ describe("TaskService", () => {
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
 
+    test("failed reactivation preserves the prior owned settlement", async () => {
+      const taskId = "task-outcome-reactivation-failed";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, aiService } = createTaskServiceHarness(config, { workspaceService });
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+
+      // Exercise a real createWorkspaceTurn pre-admission failure. It must not erase the
+      // already-retired attempt's evidence and strand a workflow checkpoint on this child.
+      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
+        Err("owner metadata unavailable")
+      );
+      try {
+        const result = await taskService.sendMessageToDescendantAgentTask(
+          rootId,
+          taskId,
+          "Try again",
+          "tool-end"
+        );
+        expect(result).toMatchObject({ success: false, error: { code: "send_failed" } });
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+      } finally {
+        metadata.mockRestore();
+      }
+    });
+
+    test("failed reactivation does not manufacture retirement for a legacy owner", async () => {
+      const taskId = "task-outcome-reactivation-legacy";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService, aiService } = createTaskServiceHarness(config);
+      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
+        Err("owner metadata unavailable")
+      );
+      try {
+        expect(
+          await taskService.sendMessageToDescendantAgentTask(
+            rootId,
+            taskId,
+            "Try again",
+            "tool-end"
+          )
+        ).toMatchObject({ success: false, error: { code: "send_failed" } });
+        // A later Stop must not turn the rejected speculative attempt into evidence that the
+        // unknown prior-process owner retired. No new turn was ever admitted here.
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe(
+          "indeterminate"
+        );
+      } finally {
+        metadata.mockRestore();
+      }
+    });
+
+    test("failed reactivation leaves a concurrently reawakened attempt owned", async () => {
+      const taskId = "task-outcome-reactivation-superseded";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService, aiService } = createTaskServiceHarness(config);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(async () => {
+        // Direct input can reawaken while the rejected task send is awaiting metadata.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        return Err("owner metadata unavailable");
+      });
+      try {
+        expect(
+          await taskService.sendMessageToDescendantAgentTask(
+            rootId,
+            taskId,
+            "Try again",
+            "tool-end"
+          )
+        ).toMatchObject({ success: false, error: { code: "send_failed" } });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "live",
+          executionId: taskId,
+        });
+      } finally {
+        metadata.mockRestore();
+      }
+    });
+
     test("a launch that fails in this process settles its owned attempt", async () => {
       const spawnedId = "failedchild01";
       const { config } = await setupTree([]);

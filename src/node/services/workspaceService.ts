@@ -12002,13 +12002,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           Promise.resolve(undefined)
         );
       }
-      if (internal?.admissionStale == null) {
+      const continuationSendState = getContinuationSendState();
+      // WTM-correlated sends already own their attempt and execution mirror. A second manual
+      // rescue would replace that ownership, defeating rollback when admission is refused.
+      // Use the dispatched correlation: a downgraded continuation still needs ordinary rescue.
+      if (
+        internal?.admissionStale == null &&
+        parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
+      ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         resumedInterruptedTask =
           (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       }
 
-      const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {

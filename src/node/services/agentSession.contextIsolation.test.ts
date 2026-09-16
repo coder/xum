@@ -86,7 +86,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
       sessionHistoryAvailable: true,
       memoryWritable: true,
     })
-  ).toBe("warn");
+  ).toMatchObject({ decision: "warn" });
   expect(budgetState.contextBudgetWarningClaimed).toBe(true);
 
   const budgetGeneration = budgetState.contextBudgetGeneration;

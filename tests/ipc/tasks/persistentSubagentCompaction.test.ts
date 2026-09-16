@@ -13,6 +13,7 @@ import { buildMockStreamStartGateMessage } from "@/node/services/mock/mockAiRout
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import type { MuxMessage } from "@/common/types/message";
+import { Err } from "@/common/types/result";
 
 function extractText(message: MuxMessage): string {
   return message.parts
@@ -60,6 +61,94 @@ describe("Persistent sub-agent compaction", () => {
       repoPath = undefined;
     }
   });
+
+  test.each([false, true])(
+    "rejected reactivation preserves settlement (busy at creation: %s)",
+    async (busyAtCreation) => {
+      if (!env || !repoPath) throw new Error("Test environment not initialized");
+      const parent = await createWorkspace(
+        env,
+        repoPath,
+        generateBranchName("reactivation-parent")
+      );
+      if (!parent.success) throw new Error(parent.error);
+      const parentId = parent.metadata.id;
+      workspaceIds.push(parentId);
+      const child = await createWorkspace(env, repoPath, generateBranchName("reactivation-child"));
+      if (!child.success) throw new Error(child.error);
+      const childId = child.metadata.id;
+      workspaceIds.push(childId);
+      await env.config.addWorkspace(repoPath, {
+        ...child.metadata,
+        parentWorkspaceId: parentId,
+        agentId: "explore",
+        agentType: "explore",
+        taskStatus: "interrupted",
+        taskModelString: HAIKU_MODEL,
+        title: "Reviewer",
+      });
+      const { taskService, workspaceService, workspaceTurnManager } = env.services;
+      const requesting = { requestingWorkspaceId: parentId };
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(parentId);
+      expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+
+      // Keep TaskService, WorkspaceTurnManager and WorkspaceService real. The latter used to
+      // create a second owned attempt before this refusal, defeating outer ownership rollback.
+      const session = workspaceService.getOrCreateSession(childId);
+      // The WTM busy snapshot may become idle before WorkspaceService reaches admission.
+      const busy = jest
+        .spyOn(workspaceService, "isBusyForMessage")
+        .mockReturnValueOnce(busyAtCreation);
+      const send = jest
+        .spyOn(session, "sendMessage")
+        .mockResolvedValueOnce(Err({ type: "unknown", raw: "session admission refused" }));
+      try {
+        expect(
+          await taskService.sendMessageToDescendantAgentTask(
+            parentId,
+            childId,
+            "Rejected follow-up",
+            "tool-end"
+          )
+        ).toMatchObject({ success: false, error: { code: "send_failed" } });
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+      } finally {
+        send.mockRestore();
+        busy.mockRestore();
+      }
+
+      // A real accepted follow-up must still complete under WTM ownership, without the manual
+      // interrupted-task rescue. This guards against fixing refusal by breaking successful sends.
+      const acceptedBusy = jest
+        .spyOn(workspaceService, "isBusyForMessage")
+        .mockReturnValueOnce(busyAtCreation);
+      try {
+        const reactivated = await taskService.sendMessageToDescendantAgentTask(
+          parentId,
+          childId,
+          "Accepted follow-up",
+          "tool-end"
+        );
+        if (!reactivated.success || reactivated.data.executionTaskId == null) {
+          throw new Error("Expected a reactivated execution");
+        }
+        const result = await workspaceTurnManager.waitForWorkspaceTurn(
+          reactivated.data.executionTaskId,
+          { ...requesting, backgroundOnMessageQueued: false, timeoutMs: 10_000 }
+        );
+        expect(result.reportMarkdown).toContain("Accepted follow-up");
+      } finally {
+        acceptedBusy.mockRestore();
+      }
+    },
+    25_000
+  );
 
   test.each(["tool-end", "turn-end"] as const)(
     "parent guidance stays attached to a reawakened execution with %s dispatch",

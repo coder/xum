@@ -5887,7 +5887,9 @@ export class TaskService implements AgentTaskIntegration {
             }
           }
           const preservedQueuedPrompt = coerceNonEmptyString(refreshedEntry.workspace.taskPrompt);
-          this.beginOwnedTaskAttempt(taskId, "reactivation");
+          const previousAttempt = this.ownedAttemptByTaskId.get(taskId);
+          const previousSettlement = this.attemptSettlementByTaskId.get(taskId);
+          const reactivationAttempt = this.beginOwnedTaskAttempt(taskId, "reactivation");
           const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
             ownerWorkspaceId: ancestorWorkspaceId,
             prompt: preservedQueuedPrompt
@@ -5902,6 +5904,26 @@ export class TaskService implements AgentTaskIntegration {
             attentionPolicy: "notify_on_terminal",
           });
           if (!execution.success) {
+            // A rejected reactivation must not erase the retired attempt's receipt and strand
+            // workflow recovery. Restore only our speculative ownership, never a newer attempt
+            // or its authoritative settlement. Restoring absence keeps legacy owners unknown.
+            // Do not apply this to throws: createWorkspaceTurn can throw after a successful send.
+            if (
+              this.ownedAttemptByTaskId.get(taskId) === reactivationAttempt &&
+              this.attemptSettlementByTaskId.get(taskId)?.attempt !== reactivationAttempt
+            ) {
+              if (previousAttempt != null) {
+                this.ownedAttemptByTaskId.set(taskId, previousAttempt);
+              } else {
+                this.ownedAttemptByTaskId.delete(taskId);
+              }
+              if (previousSettlement != null && previousSettlement.attempt === previousAttempt) {
+                this.attemptSettlementByTaskId.set(taskId, previousSettlement);
+              } else {
+                this.attemptSettlementByTaskId.delete(taskId);
+              }
+              this.notifyAttemptSettlementListeners(taskId);
+            }
             return Err({ code: "send_failed" as const, message: execution.error });
           }
           return Ok({
