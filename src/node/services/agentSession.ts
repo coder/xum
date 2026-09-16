@@ -8845,9 +8845,17 @@ export class AgentSession {
       });
       this.clearLiveUsageState();
 
-      // Report consumption belongs to the owned completion phase, not an async stream-end
-      // listener. Keep the session busy until it is durable, before compaction loses receipts.
-      await this.onBeforeTurnCompletion?.();
+      // Await report bookkeeping before compaction can remove its receipts. A storage
+      // failure must not discard successful-turn accounting or strand queued input; the
+      // pending wake remains retryable, even if recovery must conservatively deliver it.
+      try {
+        await this.onBeforeTurnCompletion?.();
+      } catch (error) {
+        log.warn("Response bookkeeping failed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
 

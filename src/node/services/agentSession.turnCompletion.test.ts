@@ -447,72 +447,82 @@ describe("AgentSession turn completion", () => {
     }
   });
 
-  test("awaits durable response bookkeeping before compaction and queued input", async () => {
-    const completion = Promise.withResolvers<TurnCompletion>();
-    const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const nextStarted = Promise.withResolvers<void>();
-    const emitter = new EventEmitter();
-    let calls = 0;
-    const acknowledge = mock(async () => {
-      entered.resolve();
-      await release.promise;
-    });
-    const h = await createAgentSessionHarness({
-      workspaceId,
-      aiEmitter: emitter,
-      captureEvents: true,
-      onBeforeTurnCompletion: acknowledge,
-      aiServiceOverrides: {
-        streamMessage: mock(() => {
-          const messageId = "assistant-" + ++calls;
-          start(emitter, messageId);
-          if (calls === 2) nextStarted.resolve();
-          return Promise.resolve(
-            Ok({
-              messageId,
-              completion:
-                calls === 1
-                  ? completion.promise
-                  : createStartedTurnHandle(h.session.closingSignal).completion,
-            })
-          );
-        }),
-      },
-    });
-    const consumer = observePolicy(h.session);
-    const compact = spyOn(internal(h.session).compactionHandler, "handleCompletion");
-    const observeCompaction = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
-    try {
-      expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
-      const policy = policyPromise(consumer);
-      h.session.queueMessage("follow-up", sendOptions);
-      emitter.emit("stream-end", end());
-      expect(acknowledge).not.toHaveBeenCalled();
-      completion.resolve({ status: "completed", streamEnd: end() });
-      await entered.promise;
-      expect(h.session.isBusy()).toBe(true);
-      expect(h.session.hasQueuedMessages()).toBe(true);
-      expect(compact).not.toHaveBeenCalled();
-      expect(observeCompaction).not.toHaveBeenCalled();
-      expect(calls).toBe(1);
-      release.resolve();
-      await policy;
-      await nextStarted.promise;
-      expect(acknowledge).toHaveBeenCalledTimes(1);
-      expect(compact).toHaveBeenCalledTimes(1);
-      expect(observeCompaction).toHaveBeenCalledTimes(1);
-      expect(calls).toBe(2);
-    } finally {
-      release.resolve();
-      completion.resolve({ status: "completed", streamEnd: end() });
-      compact.mockRestore();
-      observeCompaction.mockRestore();
-      consumer.mockRestore();
-      await h.session.dispose();
-      await h.cleanup();
+  test.each([false, true])(
+    "awaits response bookkeeping without losing accounting or queued input (failure=%s)",
+    async (fails) => {
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const nextStarted = Promise.withResolvers<void>();
+      const emitter = new EventEmitter();
+      let calls = 0;
+      const acknowledge = mock(async () => {
+        entered.resolve();
+        await release.promise;
+        if (fails) throw new Error("temporary acknowledgment storage failure");
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        onBeforeTurnCompletion: acknowledge,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            const messageId = "assistant-" + ++calls;
+            start(emitter, messageId);
+            if (calls === 2) nextStarted.resolve();
+            return Promise.resolve(
+              Ok({
+                messageId,
+                completion:
+                  calls === 1
+                    ? completion.promise
+                    : createStartedTurnHandle(h.session.closingSignal).completion,
+              })
+            );
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+      const compact = spyOn(internal(h.session).compactionHandler, "handleCompletion");
+      const observeCompaction = spyOn(
+        internal(h.session),
+        "observeContinuousCompactionAtStreamEnd"
+      );
+      try {
+        expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
+        const policy = policyPromise(consumer);
+        h.session.queueMessage("follow-up", sendOptions);
+        emitter.emit("stream-end", end());
+        expect(acknowledge).not.toHaveBeenCalled();
+        completion.resolve({ status: "completed", streamEnd: end() });
+        await entered.promise;
+        expect(h.session.isBusy()).toBe(true);
+        expect(h.session.hasQueuedMessages()).toBe(true);
+        expect(compact).not.toHaveBeenCalled();
+        expect(observeCompaction).not.toHaveBeenCalled();
+        expect(calls).toBe(1);
+        release.resolve();
+        await policy;
+        await nextStarted.promise;
+        expect(acknowledge).toHaveBeenCalledTimes(1);
+        expect(accounting).toHaveBeenCalledTimes(1);
+        expect(compact).toHaveBeenCalledTimes(1);
+        expect(observeCompaction).toHaveBeenCalledTimes(1);
+        expect(calls).toBe(2);
+      } finally {
+        release.resolve();
+        completion.resolve({ status: "completed", streamEnd: end() });
+        accounting.mockRestore();
+        compact.mockRestore();
+        observeCompaction.mockRestore();
+        consumer.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
     }
-  });
+  );
 
   test("raw success defers policy; completion uses handle identity and runs policy once", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
