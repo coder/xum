@@ -11786,6 +11786,163 @@ describe("TaskService", () => {
   );
 
   describe("sendAgentTreeMessage unrelated targets", () => {
+    test("refuses unrelated messaging while legacy runtime identity is unresolved", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          { ...projectWorkspace(projectPath, "target", "target"), name: undefined },
+        ],
+        testTaskSettings()
+      );
+      // A partly migrated entry may still get its runtime from legacy session metadata.
+      const legacyDir = path.join(config.sessionsDir, "target");
+      await fsPromises.mkdir(legacyDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacyDir, "metadata.json"),
+        JSON.stringify({
+          id: "target",
+          name: "target",
+          projectPath,
+          runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" },
+        })
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "target", "Unresolved runtime")
+      ).toMatchObject(Err({ code: "refused" }));
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    test.each(
+      (
+        [
+          { type: "ssh", host: "remote.example", srcBaseDir: "~/src" },
+          { type: "docker", image: "node:22" },
+          { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+        ] as const
+      ).flatMap((runtimeConfig) =>
+        (["sender", "target"] as const).flatMap((endpoint) =>
+          [false, true].map((isChild) => ({
+            endpoint,
+            runtime: runtimeConfig.type,
+            runtimeConfig,
+            isChild,
+          }))
+        )
+      )
+    )(
+      "refuses unrelated messaging when $endpoint uses $runtime (child=$isChild)",
+      async ({ endpoint, runtimeConfig, isChild }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "local-parent", "local-parent"),
+            projectWorkspace(projectPath, "sender", "sender", {
+              runtimeConfig: endpoint === "sender" ? runtimeConfig : { type: "local" },
+              ...(endpoint === "sender" && isChild
+                ? { parentWorkspaceId: "local-parent", taskStatus: "running" }
+                : {}),
+            }),
+            projectWorkspace(projectPath, "target", "target", {
+              runtimeConfig: endpoint === "target" ? runtimeConfig : { type: "local" },
+              ...(endpoint === "target" && isChild
+                ? { parentWorkspaceId: "local-parent", taskStatus: "running" }
+                : {}),
+            }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+
+        expect(
+          await taskService.sendAgentTreeMessage("sender", "target", "Cross-runtime input")
+        ).toMatchObject(Err({ code: "refused" }));
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+      }
+    );
+
+    test.each([
+      { label: "default worktree", runtimeConfig: undefined },
+      { label: "project local", runtimeConfig: { type: "local" } },
+      { label: "legacy local worktree", runtimeConfig: { type: "local", srcBaseDir: "~/src" } },
+      { label: "explicit worktree", runtimeConfig: { type: "worktree", srcBaseDir: "~/src" } },
+    ] as const)(
+      "keeps named $label endpoints addressable in both directions",
+      async ({ runtimeConfig }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender", { runtimeConfig }),
+            projectWorkspace(projectPath, "target", "target", {
+              runtimeConfig: { type: "worktree", srcBaseDir: "~/src" },
+            }),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "Forward")).toMatchObject(
+          Ok({ relation: "target_unrelated" })
+        );
+        expect(await taskService.sendAgentTreeMessage("target", "sender", "Reply")).toMatchObject(
+          Ok({ relation: "target_unrelated" })
+        );
+      }
+    );
+
+    test.each([
+      { type: "ssh", host: "remote.example", srcBaseDir: "~/src" },
+      { type: "docker", image: "node:22" },
+      { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    ] as const)("preserves same-tree messaging for $type runtimes", async (runtimeConfig) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "root", "root", { runtimeConfig }),
+          projectWorkspace(projectPath, "sender", "sender", {
+            runtimeConfig,
+            parentWorkspaceId: "root",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "target", "target", {
+            runtimeConfig,
+            parentWorkspaceId: "root",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "target", "Existing sibling path")
+      ).toMatchObject(Ok({ relation: "peer" }));
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "root", "Existing ancestor path")
+      ).toMatchObject(Ok({ relation: "target_ancestor" }));
+    });
+
     test.each([
       { selected: "plan", history: ["exec"], expected: "plan" },
       { selected: "plan", history: [], expected: "plan" },
@@ -12037,6 +12194,10 @@ describe("TaskService", () => {
       { endpoint: "target", state: "archived", code: "not_active" },
       { endpoint: "sender", state: "stopped", code: "refused" },
       { endpoint: "target", state: "stopped", code: "refused" },
+      { endpoint: "sender", state: "remote", code: "refused" },
+      { endpoint: "target", state: "remote", code: "refused" },
+      { endpoint: "sender", state: "unresolved", code: "refused" },
+      { endpoint: "target", state: "unresolved", code: "refused" },
     ])(
       "refunds when $endpoint becomes $state during identity resolution",
       async ({ endpoint, state, code }) => {
@@ -12071,7 +12232,18 @@ describe("TaskService", () => {
               await config.editConfig((cfg) => {
                 const entry = findWorkspaceEntry(cfg, endpoint);
                 assert(entry);
-                entry.workspace.archivedAt = "2026-09-16T12:00:00.000Z";
+                if (state === "remote") {
+                  entry.workspace.runtimeConfig = {
+                    type: "ssh",
+                    host: "remote.example",
+                    srcBaseDir: "~/src",
+                  };
+                } else if (state === "unresolved") {
+                  delete entry.workspace.runtimeConfig;
+                  delete entry.workspace.name;
+                } else {
+                  entry.workspace.archivedAt = "2026-09-16T12:00:00.000Z";
+                }
                 return cfg;
               });
             return { model: defaultModel, agentId: "plan" };
@@ -12090,7 +12262,12 @@ describe("TaskService", () => {
             await config.editConfig((cfg) => {
               const entry = findWorkspaceEntry(cfg, endpoint);
               assert(entry);
-              entry.workspace.unarchivedAt = "2026-09-16T13:00:00.000Z";
+              if (state === "remote" || state === "unresolved") {
+                entry.workspace.runtimeConfig = { type: "local" };
+                entry.workspace.name = endpoint;
+              } else {
+                entry.workspace.unarchivedAt = "2026-09-16T13:00:00.000Z";
+              }
               return cfg;
             });
           expect(
@@ -12100,6 +12277,61 @@ describe("TaskService", () => {
         } finally {
           resolve.mockRestore();
         }
+      }
+    );
+
+    test.each(["sender", "target"] as const)(
+      "withdraws queued unrelated input when %s changes to a container runtime",
+      async (endpoint) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target"),
+          ],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+        reserveFamilyMessageTargetSlots(
+          taskService,
+          "target",
+          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+        );
+        expect(
+          await taskService.sendAgentTreeMessage("sender", "target", "Queued peer input")
+        ).toMatchObject(Ok({ delivery: "queued" }));
+        const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+          WorkspaceHost["sendMessage"]
+        >;
+        expect(internal?.admissionStale?.()).toBe(false);
+
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, endpoint);
+          assert(entry);
+          entry.workspace.runtimeConfig = { type: "docker", image: "node:22" };
+          return cfg;
+        });
+        expect(internal?.admissionStale?.()).toBe(true);
+        await internal?.onCanceled?.("Endpoint runtime changed before dispatch");
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, endpoint);
+          assert(entry);
+          entry.workspace.runtimeConfig = { type: "local" };
+          return cfg;
+        });
+        // The sole available target slot must have been returned by queue cancellation.
+        expect(
+          (await taskService.sendAgentTreeMessage("sender", "target", "After local restore"))
+            .success
+        ).toBe(true);
       }
     );
 
