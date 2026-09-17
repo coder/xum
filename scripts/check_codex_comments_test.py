@@ -29,11 +29,11 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False):
+def thread(body, author=BOT, resolved=False, created_at=AFTER):
     return {
         "id": "thread",
         "isResolved": resolved,
-        "comments": {"nodes": [comment(body, author)]},
+        "comments": {"nodes": [comment(body, author, created_at)]},
     }
 
 
@@ -202,8 +202,8 @@ else:
             ") · **Medium**", ") · **Medium** · **Resolved**"
         )
         for body, expected in (
-            (completed.replace('"status":"completed"', '"status":"running"'), 1),
-            (completed.replace("✅ **Completed**", "🔄 **Running** since", 1), 1),
+            (completed.replace('"status":"completed"', '"status":"running"'), 10),
+            (completed.replace("✅ **Completed**", "🔄 **Running** since", 1), 10),
             (completed_pr_opened, 0),
             (completed_findings, 1),
             (resolved_findings, 0),
@@ -233,8 +233,8 @@ else:
         with self.subTest("cache is refreshed before waiting"):
             self.assert_gate(0, [running, completed], cache=running, wait=60)
             self.assertEqual(self.comment_rounds, 2)
-        with self.subTest("without a budget the in-progress summary fails at once"):
-            result = self.assert_gate(1, [running, completed])
+        with self.subTest("without a budget the in-progress summary exits 10 at once"):
+            result = self.assert_gate(10, [running, completed])
             self.assertEqual(self.comment_rounds, 1)
             self.assertIn("has not finished reviewing", result.stdout)
 
@@ -242,7 +242,7 @@ else:
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
         completed = snapshot([comment(FIXTURES["summary"]["body"])])
         with self.subTest("still running at the deadline"):
-            result = self.assert_gate(1, [running, running], wait=1)
+            result = self.assert_gate(10, [running, running], wait=1)
             self.assertGreater(self.comment_rounds, 1)
             self.assertIn("still running after 1s", result.stdout)
         finding = thread("[P1] Validate the caller before reading credentials")
@@ -380,9 +380,22 @@ else:
                 )
                 # Completed informational envelopes and in-progress summaries keep
                 # polling for approval; unknown reports remain failures under the CI policy.
-                waiting = fixture["expected_exit_code"] == 0 or fixture.get("in_progress")
-                expected = 10 if waiting else 1
+                expected = 10 if fixture["expected_exit_code"] in (0, 10) else 1
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_in_progress_review_fails_fast_on_older_blockers(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        running = comment(FIXTURES["running_summary"]["body"])
+        older = thread("[P1] Fix authorization", created_at=BEFORE)
+        with self.subTest("an unresolved thread from before the request blocks now"):
+            result = self.assert_gate(1, snapshot([request, running], [older]), "wait_pr_codex.sh")
+            self.assertIn("1 unresolved review thread", result.stdout)
+        with self.subTest("a resolved older thread keeps polling"):
+            resolved = thread("[P1] Fixed", resolved=True, created_at=BEFORE)
+            self.assert_gate(10, snapshot([request, running], [resolved]), "wait_pr_codex.sh")
+        with self.subTest("a resolved thread after the request keeps polling"):
+            resolved = thread("[P1] Fixed", resolved=True)
+            self.assert_gate(10, snapshot([request, running], [resolved]), "wait_pr_codex.sh")
 
     def test_informational_comments_do_not_hide_findings_or_account_errors(self):
         request = comment("@codex review", "maintainer", REQUEST)

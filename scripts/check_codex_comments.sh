@@ -3,6 +3,10 @@ set -euo pipefail
 
 USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>]"
 
+# Exit codes: 0 no unresolved Codex comments; 1 unresolved comments or threads;
+# 10 Codex is still reviewing and nothing else blocks (wait_pr_codex.sh keeps
+# polling on 10 instead of reporting a failure).
+
 if [ $# -eq 0 ]; then
   echo "$USAGE"
   exit 1
@@ -138,10 +142,10 @@ compute_codex_sets_from_arrays() {
     [.[] | select(codex_review_in_progress($bot))] | length')
 }
 
-# Waiting only helps while the in-progress summary is the sole blocker. A review
-# thread or any other Codex comment already fixes the verdict at "unresolved", so
-# waiting for the review to finish would only hold the runner.
-codex_wait_can_change_verdict() {
+# True while the in-progress summary is the sole blocker. Waiting only helps in
+# that state: a review thread or any other Codex comment already fixes the verdict
+# at "unresolved", so waiting for the review to finish would only hold the runner.
+codex_only_in_progress_blocks() {
   [ "$IN_PROGRESS_COUNT" -gt 0 ] && [ "$((REGULAR_COUNT - IN_PROGRESS_COUNT + UNRESOLVED_COUNT))" -eq 0 ]
 }
 
@@ -367,9 +371,9 @@ if [ "$loaded_from_cache" -eq 1 ]; then
   fetch_result_via_api
 fi
 
-if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && codex_wait_can_change_verdict; then
+if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && codex_only_in_progress_blocks; then
   wait_deadline=$(($(date +%s) + WAIT_FOR_REVIEW_SECS))
-  while codex_wait_can_change_verdict; do
+  while codex_only_in_progress_blocks; do
     now=$(date +%s)
     if [ "$now" -ge "$wait_deadline" ]; then
       echo "⚠️ Codex review is still running after ${WAIT_FOR_REVIEW_SECS}s; reporting it as unresolved."
@@ -405,6 +409,9 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   echo ""
   if [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
     echo "⏳ Codex has not finished reviewing this PR. Re-run this check after the review completes."
+  fi
+  if codex_only_in_progress_blocks; then
+    exit 10
   fi
   echo "Please address or resolve all Codex comments before merging."
   exit 1
