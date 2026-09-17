@@ -10,10 +10,12 @@ import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type {
   FilePart,
+  HistoryEditPrecondition,
   ProviderModelEntry,
   ProvidersConfigMap,
   SendMessageOptions,
 } from "@/common/orpc/types";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import {
   type MuxMessageMetadata,
   type CompactionRequestData,
@@ -95,7 +97,10 @@ import {
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
-import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import {
+  EDIT_NOT_HELD_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
 
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
 
@@ -208,6 +213,8 @@ export interface SlashCommandEnv {
   fileParts?: FilePart[];
   reviews?: ReviewNoteData[];
   editMessageId?: string;
+  /** Edit fence captured when editing began; required by the RPC alongside editMessageId. */
+  historyEditPrecondition?: HistoryEditPrecondition;
   attachedReviewIds?: string[];
   resetContext?: () => Promise<"reset" | "noop">;
   truncateHistory?: (percentage?: number) => Promise<void>;
@@ -1463,6 +1470,8 @@ export interface CompactionOptions {
   model?: string;
   sendMessageOptions: SendMessageOptions;
   editMessageId?: string;
+  /** Edit fence for an editing compaction (see SendMessageOptions.historyEditPrecondition). */
+  historyEditPrecondition?: HistoryEditPrecondition;
   /** Source of compaction request (e.g., "idle-compaction" for auto-triggered) */
   source?: "idle-compaction";
 }
@@ -1568,6 +1577,11 @@ export async function executeCompaction(
   if (options.editMessageId && !isTranscriptMutationAllowed(options.workspaceId)) {
     return { success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE };
   }
+  // Every UI edit is fenced; a caller that could not capture evidence (the edited row is not
+  // held) is refused here with a readable reason instead of by the RPC schema.
+  if (options.editMessageId && !options.historyEditPrecondition) {
+    return { success: false, error: EDIT_NOT_HELD_MESSAGE };
+  }
 
   const { messageText, metadata, sendOptions } = prepareCompactionMessage(options);
 
@@ -1578,16 +1592,18 @@ export async function executeCompaction(
       ...sendOptions,
       muxMetadata: metadata,
       editMessageId: options.editMessageId,
+      historyEditPrecondition: options.historyEditPrecondition,
     },
   });
 
   if (!result.success) {
-    // Convert SendMessageError to string for error display
+    // Convert SendMessageError to string for error display. Typed errors get their user-facing
+    // text so a `history-changed` refusal reads as guidance rather than an error code.
     const errorString = result.error
       ? typeof result.error === "string"
         ? result.error
         : "type" in result.error
-          ? result.error.type
+          ? formatSendMessageError(result.error).message
           : "Failed to compact"
       : undefined;
     return { success: false, error: errorString };
@@ -1693,6 +1709,7 @@ function handleCompactCommand(
           model: normalizedModel.model ?? undefined,
           sendMessageOptions: env.sendMessageOptions,
           editMessageId: env.editMessageId,
+          historyEditPrecondition: env.historyEditPrecondition,
         });
         if (!result.success) {
           console.error("Failed to initiate compaction:", result.error);

@@ -285,6 +285,8 @@ import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
+import { isHistoryEditPreconditionMismatch } from "./historyService";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 
 /**
@@ -2040,34 +2042,10 @@ export class AgentSession {
     );
   }
 
-  private getEditTruncateTargetFromMessages(
-    messages: readonly MuxMessage[],
-    editMessageId: string
-  ): string | undefined {
-    const editIndex = messages.findIndex((message) => message.id === editMessageId);
-    if (editIndex === -1) {
-      return undefined;
-    }
-
-    let truncateTargetId = editMessageId;
-    for (let i = editIndex - 1; i >= 0; i -= 1) {
-      const message = messages[i];
-      if (!isSyntheticSnapshotUserMessage(message)) {
-        break;
-      }
-      truncateTargetId = message.id;
-    }
-
-    return truncateTargetId;
-  }
-
   private async getEditTruncateTargetId(editMessageId: string): Promise<string> {
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (historyResult.success) {
-      const truncateTargetId = this.getEditTruncateTargetFromMessages(
-        historyResult.data,
-        editMessageId
-      );
+      const truncateTargetId = getEditTruncateTargetFromMessages(historyResult.data, editMessageId);
       if (truncateTargetId !== undefined) {
         return truncateTargetId;
       }
@@ -2085,7 +2063,7 @@ export class AgentSession {
       return editMessageId;
     }
 
-    return this.getEditTruncateTargetFromMessages(fullHistory, editMessageId) ?? editMessageId;
+    return getEditTruncateTargetFromMessages(fullHistory, editMessageId) ?? editMessageId;
   }
 
   private getLastNonSystemHistoryMessage(historyTail: MuxMessage[]): MuxMessage | undefined {
@@ -3982,6 +3960,12 @@ export class AgentSession {
       // so the user can re-evaluate, and start the edit stream with an empty queue.
       this.restoreQueueToInput();
 
+      // A fenced edit is verified against persisted rows as they are: the client's view of an
+      // unfinished turn (placeholder overlaid with partial.json) is fenced by identity only
+      // (see computeHistoryRangeFingerprint), so partial.json is NOT committed here. Committing
+      // would delete an errored empty placeholder the client still displays and turn the
+      // fence's "newest row" check into a spurious conflict.
+
       // Find the truncation target: the edited message or any immediately-preceding snapshots.
       // (snapshots are persisted immediately before their corresponding user message)
       // Pre-boundary edits are user-confirmed by the composer, so fall back to full-history lookup
@@ -3993,21 +3977,39 @@ export class AgentSession {
       const truncateResult = await this.historyService.truncateAfterMessage(
         this.workspaceId,
         truncateTargetId,
-        editCapture
-          ? {
-              replacement: {
-                capture: editCapture,
-                isCurrent: () => !isAdmissionStale(),
-                // Only this edit's held-lock fence can refresh its original capture.
-                onGenerationAdvanced: (generation) => {
-                  replacementCapture = { ...editCapture, generation };
-                  attempt.admissionCapture = replacementCapture;
+        {
+          ...(editCapture
+            ? {
+                replacement: {
+                  capture: editCapture,
+                  isCurrent: () => !isAdmissionStale(),
+                  // Only this edit's held-lock fence can refresh its original capture.
+                  onGenerationAdvanced: (generation) => {
+                    replacementCapture = { ...editCapture, generation };
+                    attempt.admissionCapture = replacementCapture;
+                  },
                 },
-              },
-            }
-          : undefined
+              }
+            : {}),
+          // UI edits fence the range they delete with the evidence captured when editing
+          // began; the service verifies it atomically with the truncation.
+          ...(options.historyEditPrecondition
+            ? { precondition: options.historyEditPrecondition }
+            : {}),
+        }
       );
       if (!truncateResult.success) {
+        // A stale fence is a typed, expected refusal: the composer keeps the draft and asks
+        // for an explicit review + re-send. Checked before the missing-target leniency so a
+        // conflict can never be downgraded to a no-op truncation.
+        if (isHistoryEditPreconditionMismatch(truncateResult.error)) {
+          log.info("Edit refused: history changed since the client captured its evidence", {
+            workspaceId: this.workspaceId,
+            editMessageId,
+            error: truncateResult.error,
+          });
+          return refuseBeforeAcceptance({ type: "history-changed" });
+        }
         const isMissingEditTarget =
           truncateResult.error.includes("Message with ID") &&
           truncateResult.error.includes("not found in history");

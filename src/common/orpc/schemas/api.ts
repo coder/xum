@@ -64,6 +64,8 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  hasExactlyOneEditFence,
+  EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
   ToolPolicySchema,
   UpdateStatusSchema,
@@ -1651,6 +1653,9 @@ export const workspace = {
       message: z.string(),
       options: SendMessageOptionsSchema.extend({
         fileParts: z.array(FilePartSchema).optional(),
+      }).refine(hasExactlyOneEditFence, {
+        message: EDIT_FENCE_REQUIRED_MESSAGE,
+        path: ["historyEditPrecondition"],
       }),
     }),
     output: ResultSchema(z.object({}), SendMessageErrorSchema),

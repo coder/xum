@@ -26,6 +26,9 @@ import {
   type HistoryReplacementRow,
 } from "./historyReplacementRows";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import type { HistoryEditPrecondition } from "@/common/orpc/types";
+import { computeHistoryRangeFingerprint } from "@/common/orpc/onChatCursorFingerprint";
+import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -405,6 +408,93 @@ export function mergeTranscriptPartial(
   const next = [...messages];
   next.splice(insertIndex, 0, partial);
   return next;
+}
+
+/**
+ * Error prefix for an edit refused because its history precondition no longer matched under
+ * the write lock. The session maps it to the typed `history-changed` send error.
+ */
+export const HISTORY_EDIT_PRECONDITION_MISMATCH = "History edit precondition mismatch";
+
+export function isHistoryEditPreconditionMismatch(error: string): boolean {
+  return error.startsWith(HISTORY_EDIT_PRECONDITION_MISMATCH);
+}
+
+/**
+ * The projection of a persisted row the client actually receives: oRPC validates every replayed
+ * row against the wire schema, which drops keys it does not know (a persisted user text part
+ * carries `state: "done"`, the wire part does not) and skips rows that fail it entirely.
+ * Evidence is compared over this projection so it matches what the client can compute.
+ */
+function toWireProjection(rows: readonly MuxMessage[]): MuxMessage[] {
+  return rows.flatMap((row) => {
+    const parsed = MuxMessageSchema.safeParse(row);
+    return parsed.success ? [parsed.data as MuxMessage] : [];
+  });
+}
+
+/**
+ * Verifies an edit's content evidence against the rows a truncation is about to delete. Runs
+ * under the history write lock, over the wire projection of the readable rows (the view the
+ * client fenced against). `messagesInScope` are every readable row the truncation can see
+ * (archive + active epoch for a pre-boundary target); `removed` are the rows about to be
+ * deleted, in order.
+ */
+function verifyHistoryEditPrecondition(
+  precondition: HistoryEditPrecondition,
+  messagesInScope: readonly MuxMessage[],
+  removedReadable: readonly MuxMessage[],
+  truncateTargetId: string
+): Result<void> {
+  const removed = toWireProjection(removedReadable);
+  assert(precondition.rangeStartHistorySequence >= 0, "range start sequence must be >= 0");
+  assert(
+    precondition.newestHistorySequence >= precondition.rangeStartHistorySequence,
+    "range start must not be newer than the newest row"
+  );
+  const mismatch = (detail: string) => Err(`${HISTORY_EDIT_PRECONDITION_MISMATCH}: ${detail}`);
+
+  // Same truncation rule on both sides: the client fenced the range it believes the edit
+  // deletes; refuse if the server would start the cut elsewhere.
+  const actualTarget = getEditTruncateTargetFromMessages(
+    messagesInScope,
+    precondition.editMessageId
+  );
+  if (actualTarget === undefined) return mismatch("edited message is no longer in history");
+  if (actualTarget !== precondition.rangeStartMessageId || actualTarget !== truncateTargetId) {
+    return mismatch("truncation target differs");
+  }
+  // Row identities in the detail make a refusal diagnosable from the log alone.
+  const describe = (row: MuxMessage | undefined) =>
+    row === undefined ? "none" : `${row.id}@${row.metadata?.historySequence ?? "?"}`;
+  const first = removed[0];
+  if (
+    first === undefined ||
+    first.id !== precondition.rangeStartMessageId ||
+    first.metadata?.historySequence !== precondition.rangeStartHistorySequence
+  ) {
+    return mismatch(
+      `range start differs (client ${precondition.rangeStartMessageId}@${precondition.rangeStartHistorySequence}, history ${describe(first)})`
+    );
+  }
+  const newest = removed.findLast((row) => row.metadata?.historySequence !== undefined);
+  if (
+    newest === undefined ||
+    newest.id !== precondition.newestMessageId ||
+    newest.metadata?.historySequence !== precondition.newestHistorySequence
+  ) {
+    return mismatch(
+      `newest row differs (client ${precondition.newestMessageId}@${precondition.newestHistorySequence}, history ${describe(newest)})`
+    );
+  }
+  const range = computeHistoryRangeFingerprint(
+    removed,
+    precondition.rangeStartHistorySequence,
+    precondition.newestHistorySequence
+  );
+  if (range.rowCount !== precondition.rangeRowCount) return mismatch("row count differs");
+  if (range.fingerprint !== precondition.rangeFingerprint) return mismatch("row content differs");
+  return Ok(undefined);
 }
 
 export class HistoryService {
@@ -4883,7 +4973,16 @@ export class HistoryService {
   async truncateAfterMessage(
     workspaceId: string,
     messageId: string,
-    options?: { keepTargetMessage?: boolean; replacement?: CompactionReplacementEdit }
+    options?: {
+      keepTargetMessage?: boolean;
+      replacement?: CompactionReplacementEdit;
+      /**
+       * Content evidence for the deleted range, verified under the write lock before any
+       * write (see `verifyHistoryEditPrecondition`). A mismatch returns an
+       * `HISTORY_EDIT_PRECONDITION_MISMATCH` error and leaves history untouched.
+       */
+      precondition?: HistoryEditPrecondition;
+    }
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -4932,7 +5031,8 @@ export class HistoryService {
               messages,
               rows,
               replacement,
-              publication
+              publication,
+              options?.precondition
             );
           }
 
@@ -4941,6 +5041,16 @@ export class HistoryService {
           const cutIndex = keepTargetMessage ? messageIndex + 1 : messageIndex;
           const truncatedMessages = messages.slice(0, cutIndex);
           const removedMessages = messages.slice(cutIndex);
+          if (options?.precondition) {
+            assert(!keepTargetMessage, "an edit precondition fences a cut at the target");
+            const verified = verifyHistoryEditPrecondition(
+              options.precondition,
+              messages,
+              removedMessages,
+              messageId
+            );
+            if (!verified.success) return verified;
+          }
 
           // Rewrite the history file with truncated messages
           const historyPath = this.getChatHistoryPath(workspaceId);
@@ -4998,6 +5108,12 @@ export class HistoryService {
           );
           this.sequenceCounters.set(workspaceId, nextSeq);
 
+          const retired = await this.retirePartialOfRemovedRowsUnlocked(
+            workspaceId,
+            removedMessages
+          );
+          if (!retired.success) return retired;
+
           return Ok({ removedMessages });
         } catch (error) {
           const message = getErrorMessage(error);
@@ -5021,7 +5137,8 @@ export class HistoryService {
     activeEpochMessages: MuxMessage[],
     activeEpochRows: HistoryRewriteRow[],
     replacement?: CompactionReplacementEdit,
-    publication?: HistoryPublicationObserver
+    publication?: HistoryPublicationObserver,
+    precondition?: HistoryEditPrecondition
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     try {
       const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
@@ -5037,6 +5154,16 @@ export class HistoryService {
       const truncatedMessages = archiveMessages.slice(0, cutIndex);
       // The removed tail spans the archive remainder plus the whole active epoch.
       const removedMessages = [...archiveMessages.slice(cutIndex), ...activeEpochMessages];
+      if (precondition) {
+        assert(!keepTargetMessage, "an edit precondition fences a cut at the target");
+        const verified = verifyHistoryEditPrecondition(
+          precondition,
+          [...archiveMessages, ...activeEpochMessages],
+          removedMessages,
+          messageId
+        );
+        if (!verified.success) return verified;
+      }
 
       // The files were separate JSONL streams. Do not glue an unterminated kept
       // archive row to a preserved active reset fragment when collapsing them.
@@ -5097,11 +5224,30 @@ export class HistoryService {
       );
       this.sequenceCounters.set(workspaceId, nextSeq);
 
+      const retired = await this.retirePartialOfRemovedRowsUnlocked(workspaceId, removedMessages);
+      if (!retired.success) return retired;
+
       return Ok({ removedMessages });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to truncate history: ${message}`);
     }
+  }
+
+  /**
+   * A partial.json overlaying a row a truncation removed belongs to a turn that no longer
+   * exists; left behind, the next stream start would commit it as a ghost tail row after the
+   * rows that replaced it. Retire it together with its row (history write lock held).
+   */
+  private async retirePartialOfRemovedRowsUnlocked(
+    workspaceId: string,
+    removedMessages: readonly MuxMessage[]
+  ): Promise<Result<void>> {
+    const partial = await this.readPartial(workspaceId);
+    if (partial === null || !removedMessages.some((row) => row.id === partial.id)) {
+      return Ok(undefined);
+    }
+    return this.deletePartialUnlocked(workspaceId);
   }
 
   /**

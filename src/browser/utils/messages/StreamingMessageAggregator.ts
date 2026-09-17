@@ -559,6 +559,14 @@ export class StreamingMessageAggregator {
   private lastResponseCompletedAt: number | null = null;
   private historyEpoch = 0;
 
+  /**
+   * Rows this aggregator created without a server row behind them (a pre-stream error's
+   * synthetic assistant row carries a locally assigned historySequence for ordering). They are
+   * not evidence for an edit fence; a server row with the same id replaces the object, so the
+   * membership expires with the fabricated row itself.
+   */
+  private readonly locallyFabricatedRows = new WeakSet<MuxMessage>();
+
   /** Oldest historySequence from the server's last replay window.
    *  Used for reconnect cursors instead of the absolute minimum (which
    *  includes user-loaded older pages via loadOlderHistory). */
@@ -1410,6 +1418,35 @@ export class StreamingMessageAggregator {
     this.establishedOldestHistorySequence = sequence;
   }
 
+  /** Oldest sequence of the server's replay window; rows below it are paginated older pages. */
+  getEstablishedOldestHistorySequence(): number | null {
+    return this.establishedOldestHistorySequence;
+  }
+
+  /**
+   * Drop the paginated rows below the server replay window. A since replay never re-sends
+   * or verifies them, so a caller that needs a fresh copy of older history (an edit whose
+   * range starts in an earlier compaction epoch) discards them and re-pages from the floor.
+   * Returns the number of rows removed.
+   */
+  discardMessagesBelowSequence(sequence: number): number {
+    assert(Number.isInteger(sequence), `discardMessagesBelowSequence requires an integer floor`);
+    let removed = 0;
+    for (const [messageId, message] of Array.from(this.messages.entries())) {
+      const historySequence = message.metadata?.historySequence;
+      if (historySequence !== undefined && historySequence < sequence) {
+        this.deleteMessage(messageId);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
+      this.historyEpoch++;
+      this.invalidateCache();
+    }
+    return removed;
+  }
+
   getHistoryEpoch(): number {
     return this.historyEpoch;
   }
@@ -1769,6 +1806,15 @@ export class StreamingMessageAggregator {
 
   getActiveStreamMessageId(): string | undefined {
     return this.getActiveStreamEntry()?.[0];
+  }
+
+  /** Committed rows a server-side history check can be asked about: no active stream row and
+   *  no locally fabricated row (see `locallyFabricatedRows`). */
+  getHistoryEvidenceMessages(): MuxMessage[] {
+    const activeStreamMessageId = this.getActiveStreamMessageId();
+    return this.getAllMessages().filter(
+      (message) => message.id !== activeStreamMessageId && !this.locallyFabricatedRows.has(message)
+    );
   }
 
   isStreamActive(messageId: string): boolean {
@@ -2323,6 +2369,7 @@ export class StreamingMessageAggregator {
         },
       };
       this.messages.set(data.messageId, errorMessage);
+      this.locallyFabricatedRows.add(errorMessage);
       this.markMessageDirty(data.messageId);
     }
   }

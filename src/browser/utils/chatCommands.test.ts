@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   executeCompaction,
@@ -17,7 +17,11 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
-import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import {
+  EDIT_HISTORY_CHANGED_MESSAGE,
+  EDIT_NOT_HELD_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
 
 // Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
@@ -998,12 +1002,24 @@ describe("compact and plan command results", () => {
       },
     ];
     const sentMessages: Array<{
-      options?: { muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } } };
+      options?: {
+        historyEditPrecondition?: HistoryEditPrecondition;
+        muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } };
+      };
     }> = [];
     const sendMessage = mock((input: (typeof sentMessages)[number]) => {
       sentMessages.push(input);
       return Promise.resolve({ success: true });
     });
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "edit-id",
+      rangeStartMessageId: "edit-id",
+      rangeStartHistorySequence: 1,
+      newestMessageId: "newest-id",
+      newestHistorySequence: 2,
+      rangeRowCount: 2,
+      rangeFingerprint: "feedface",
+    };
     // Editing compaction rewrites history, so it only dispatches through an open barrier.
     const complete = await withTranscriptBarrier(true, async () => {
       const initial = await processSlashCommand(
@@ -1012,6 +1028,7 @@ describe("compact and plan command results", () => {
           api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
           reviews,
           editMessageId: "edit-id",
+          historyEditPrecondition,
           attachedReviewIds: ["review-1"],
           sendMessageOptions: { ...sendMessageOptions, queueDispatchMode: "turn-end" },
         })
@@ -1034,6 +1051,8 @@ describe("compact and plan command results", () => {
     expect(sentMessages[0]?.options?.muxMetadata?.parsed?.followUpContent?.reviews).toEqual(
       reviews
     );
+    // The composer's edit fence rides the compaction send unchanged.
+    expect(sentMessages[0]?.options?.historyEditPrecondition).toEqual(historyEditPrecondition);
   });
 
   test("compact edit refuses through the slash error path while the transcript is not caught up", async () => {
@@ -1219,7 +1238,19 @@ describe("compact and plan command results", () => {
 });
 
 describe("executeCompaction transcript barrier", () => {
-  const runCompaction = (editMessageId: string | undefined) => {
+  const editFence: HistoryEditPrecondition = {
+    editMessageId: "edit-id",
+    rangeStartMessageId: "edit-id",
+    rangeStartHistorySequence: 3,
+    newestMessageId: "newest-id",
+    newestHistorySequence: 5,
+    rangeRowCount: 3,
+    rangeFingerprint: "0badf00d",
+  };
+  const runCompaction = (
+    editMessageId: string | undefined,
+    historyEditPrecondition?: HistoryEditPrecondition
+  ) => {
     const sendMessage = mock(
       (_input: { workspaceId: string; options?: { editMessageId?: string } }) =>
         Promise.resolve({ success: true })
@@ -1231,30 +1262,59 @@ describe("executeCompaction transcript barrier", () => {
       workspaceId: "test-ws",
       sendMessageOptions,
       editMessageId,
+      historyEditPrecondition,
     });
     return { sendMessage, result };
   };
 
   test("refuses an editing compaction while the transcript is not caught up", async () => {
     const { sendMessage, result } = await withTranscriptBarrier(false, async () => {
-      const run = runCompaction("edit-id");
+      const run = runCompaction("edit-id", editFence);
       return { sendMessage: run.sendMessage, result: await run.result };
     });
     expect(result).toEqual({ success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("dispatches an editing compaction once the transcript is caught up", async () => {
+  test("dispatches a fenced editing compaction once the transcript is caught up", async () => {
     const { sendMessage, result } = await withTranscriptBarrier(true, async () => {
-      const run = runCompaction("edit-id");
+      const run = runCompaction("edit-id", editFence);
       return { sendMessage: run.sendMessage, result: await run.result };
     });
     expect(result).toEqual({ success: true });
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[0]).toMatchObject({
       workspaceId: "test-ws",
-      options: { editMessageId: "edit-id" },
+      options: { editMessageId: "edit-id", historyEditPrecondition: editFence },
     });
+  });
+
+  test("refuses an editing compaction whose edited row could not be fenced", async () => {
+    // The caller could not capture evidence (row not held): refuse before the RPC does.
+    const { sendMessage, result } = await withTranscriptBarrier(true, async () => {
+      const run = runCompaction("edit-id");
+      return { sendMessage: run.sendMessage, result: await run.result };
+    });
+    expect(result).toEqual({ success: false, error: EDIT_NOT_HELD_MESSAGE });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("surfaces a history-changed refusal as its user-facing message", async () => {
+    const sendMessage = mock(() =>
+      Promise.resolve({ success: false as const, error: { type: "history-changed" as const } })
+    );
+    const result = await withTranscriptBarrier(true, () =>
+      executeCompaction({
+        api: { workspace: { sendMessage } } as unknown as Parameters<
+          typeof executeCompaction
+        >[0]["api"],
+        workspaceId: "test-ws",
+        sendMessageOptions,
+        editMessageId: "edit-id",
+        historyEditPrecondition: editFence,
+      })
+    );
+    expect(result).toEqual({ success: false, error: EDIT_HISTORY_CHANGED_MESSAGE });
   });
 
   test("append-only compaction is not gated by the transcript barrier", async () => {
