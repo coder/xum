@@ -1,14 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>]"
+
 if [ $# -eq 0 ]; then
-  echo "Usage: $0 <pr_number>"
+  echo "$USAGE"
   exit 1
 fi
 
 PR_NUMBER=$1
+shift
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "❌ PR number must be numeric. Got: '$PR_NUMBER'" >&2
+  exit 1
+fi
+
+# CI runs this gate on every push, at the same moment Codex starts reviewing that
+# push. Without a wait budget the gate fails on the in-progress summary and nobody
+# re-runs it. The budget only delays the verdict; an unfinished review still fails.
+WAIT_FOR_REVIEW_SECS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wait-for-review)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        echo "❌ --wait-for-review requires a non-negative integer number of seconds" >&2
+        echo "$USAGE" >&2
+        exit 1
+      fi
+      WAIT_FOR_REVIEW_SECS=$2
+      shift 2
+      ;;
+    *)
+      echo "❌ Unknown argument: '$1'" >&2
+      echo "$USAGE" >&2
+      exit 1
+      ;;
+  esac
+done
+
+WAIT_POLL_SECS="${MUX_CODEX_WAIT_POLL_SECS:-30}"
+if ! [[ "$WAIT_POLL_SECS" =~ ^[0-9]+$ ]]; then
+  echo "❌ assertion failed: MUX_CODEX_WAIT_POLL_SECS must be a non-negative integer (got '$WAIT_POLL_SECS')" >&2
   exit 1
 fi
 
@@ -17,6 +49,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
+IN_PROGRESS_COUNT=0
 
 resolve_repo_context() {
   if [[ -n "${MUX_GH_OWNER:-}" || -n "${MUX_GH_REPO:-}" ]]; then
@@ -93,6 +126,11 @@ compute_codex_sets_from_arrays() {
     .[]
     | select(.isResolved == false and .comments.nodes[0].author.login == $bot)
   ]')
+
+  # In-progress summaries are a subset of REGULAR_COMMENTS: they block, but the
+  # wait loop below may give Codex time to finish before the verdict.
+  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments";
+    [.[] | select(codex_review_in_progress($bot))] | length')
 }
 
 load_result_from_cache() {
@@ -317,6 +355,20 @@ if [ "$loaded_from_cache" -eq 1 ]; then
   fetch_result_via_api
 fi
 
+if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
+  wait_deadline=$(($(date +%s) + WAIT_FOR_REVIEW_SECS))
+  while [ "$IN_PROGRESS_COUNT" -gt 0 ]; do
+    now=$(date +%s)
+    if [ "$now" -ge "$wait_deadline" ]; then
+      echo "⚠️ Codex review is still running after ${WAIT_FOR_REVIEW_SECS}s; reporting it as unresolved."
+      break
+    fi
+    echo "⏳ Codex review is still running; re-checking in ${WAIT_POLL_SECS}s (gives up in $((wait_deadline - now))s)..."
+    sleep "$WAIT_POLL_SECS"
+    fetch_result_via_api
+  done
+fi
+
 REGULAR_COUNT=$(echo "$REGULAR_COMMENTS" | jq 'length')
 UNRESOLVED_COUNT=$(echo "$UNRESOLVED_THREADS" | jq 'length')
 TOTAL_UNRESOLVED=$((REGULAR_COUNT + UNRESOLVED_COUNT))
@@ -341,6 +393,9 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   fi
 
   echo ""
+  if [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
+    echo "⏳ Codex has not finished reviewing this PR. Re-run this check after the review completes."
+  fi
   echo "Please address or resolve all Codex comments before merging."
   exit 1
 fi

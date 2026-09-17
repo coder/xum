@@ -672,7 +672,9 @@ jobs:
         run: make test-codex-comments test-pr-checks
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }}
+        # Codex starts reviewing the same push that started this job, so give it
+        # time to finish. Reviews take a few minutes; the slowest test jobs take longer.
+        run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }} --wait-for-review 900
 
   # Single required check - configure branch protection to require only this job
   required:

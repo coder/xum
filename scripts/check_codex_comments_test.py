@@ -72,17 +72,29 @@ import json, os, pathlib, sys
 args = sys.argv[1:]
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
-fixture = json.loads(pathlib.Path(os.environ['CODEX_GATE_FIXTURE']).read_text())
+cursor = next((arg[7:] for arg in args if arg.startswith('cursor=')), 'null')
+fixture_path = pathlib.Path(os.environ['CODEX_GATE_FIXTURE'])
+fixture = json.loads(fixture_path.read_text())
 with open(os.environ['CODEX_GATE_CALLS'], 'a') as calls:
     calls.write(query + '\\n')
+if 'snapshots' in fixture:
+    # Sequenced fixtures model Codex editing its summary between polls. Each
+    # first-page comments fetch starts a new round; the last snapshot then repeats.
+    round_path = fixture_path.with_suffix('.round')
+    round_index = int(round_path.read_text()) if round_path.exists() else 0
+    if 'comments(first: 100' in query and cursor == 'null':
+        round_index += 1
+        round_path.write_text(str(round_index))
+    snapshot = fixture['snapshots'][min(max(round_index, 1), len(fixture['snapshots'])) - 1]
+else:
+    snapshot = fixture['snapshot']
 if 'comments(last: 100)' in query:
-    print(json.dumps(fixture['snapshot']))
+    print(json.dumps(snapshot))
 else:
     field = next(field for field in ['comments', 'reviewThreads', 'reactions']
                  if field + '(first: 100' in query)
-    cursor = next(arg[7:] for arg in args if arg.startswith('cursor='))
     index = 0 if cursor == 'null' else int(cursor)
-    nodes = fixture['snapshot']['data']['repository']['pullRequest'][field]['nodes']
+    nodes = snapshot['data']['repository']['pullRequest'][field]['nodes']
     more = index + 1 < len(nodes)
     print(json.dumps({'data': {'repository': {'pullRequest': {field: {
         'nodes': nodes[index:index + 1],
@@ -91,9 +103,14 @@ else:
 """)
         gh.chmod(0o755)
 
-    def run_gate(self, data, script="check_codex_comments.sh", cache=None):
+    def run_gate(self, data, script="check_codex_comments.sh", cache=None, wait=None):
+        """`data` is one snapshot, or a list of snapshots served round by round."""
         fixture = self.directory / "fixture.json"
-        fixture.write_text(json.dumps({"snapshot": data}))
+        key = "snapshots" if isinstance(data, list) else "snapshot"
+        fixture.write_text(json.dumps({key: data}))
+        round_marker = fixture.with_suffix(".round")
+        if round_marker.exists():
+            round_marker.unlink()
         calls = self.directory / "calls"
         calls.write_text("")
         cache_file = self.directory / "cache.json"
@@ -113,22 +130,31 @@ else:
                 "MUX_GH_REPO": "fixture",
                 "MUX_SKIP_FETCH_SYNC": "1",
                 "MUX_PR_DATA_FILE": str(cache_file) if cache is not None else "",
+                # Wait loops re-poll immediately so tests never sleep.
+                "MUX_CODEX_WAIT_POLL_SECS": "0",
             }
         )
         args = ["bash", str(SCRIPTS / script), "4145"]
         if script == "wait_pr_codex.sh":
             args.append("--once")
+        if wait is not None:
+            args += ["--wait-for-review", str(wait)]
         result = subprocess.run(
             args, env=env, text=True, capture_output=True, timeout=15, check=False
         )
         self.assertTrue(
             calls.read_text(), "a cached verdict must still re-query GitHub"
         )
+        # One-comment snapshots make every comments query a new polling round.
+        self.comment_fetches = calls.read_text().count("comments(first: 100")
         return result
 
-    def assert_gate(self, expected, data, script="check_codex_comments.sh", cache=None):
-        result = self.run_gate(data, script, cache)
+    def assert_gate(
+        self, expected, data, script="check_codex_comments.sh", cache=None, wait=None
+    ):
+        result = self.run_gate(data, script, cache, wait)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
 
     def test_observed_comments_only_exempt_completed_informational_reviews(self):
         for name, fixture in FIXTURES.items():
@@ -188,6 +214,54 @@ else:
                 with self.subTest(body=body, cached=cached):
                     data = snapshot([comment(body)])
                     self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_wait_for_review_polls_until_codex_finishes(self):
+        running = snapshot([comment(FIXTURES["running_summary"]["body"])])
+        completed = snapshot([comment(FIXTURES["summary"]["body"])])
+        for name in ("running_summary", "pr_opened_summary", "mixed_summary"):
+            with self.subTest(name=name):
+                data = [snapshot([comment(FIXTURES[name]["body"])]), completed]
+                self.assert_gate(0, data, wait=60)
+                self.assertEqual(self.comment_fetches, 2)
+        with self.subTest("cache is refreshed before waiting"):
+            self.assert_gate(0, [running, completed], cache=running, wait=60)
+            self.assertEqual(self.comment_fetches, 2)
+        with self.subTest("without a budget the in-progress summary fails at once"):
+            result = self.assert_gate(1, [running, completed])
+            self.assertEqual(self.comment_fetches, 1)
+            self.assertIn("has not finished reviewing", result.stdout)
+
+    def test_wait_for_review_gives_up_and_never_hides_findings(self):
+        running = snapshot([comment(FIXTURES["running_summary"]["body"])])
+        with self.subTest("still running at the deadline"):
+            result = self.assert_gate(1, [running, running], wait=1)
+            self.assertGreater(self.comment_fetches, 1)
+            self.assertIn("still running after 1s", result.stdout)
+        finding = thread("[P1] Validate the caller before reading credentials")
+        completed_with_finding = snapshot(
+            [comment(FIXTURES["summary"]["body"])], [finding]
+        )
+        with self.subTest("a finding posted during the wait blocks"):
+            self.assert_gate(1, [running, completed_with_finding], wait=60)
+        unknown = snapshot(
+            [comment(FIXTURES["summary"]["body"].replace(
+                '"status":"completed"', '"status":"findings_found"'
+            ))]
+        )
+        with self.subTest("unknown statuses fail without waiting"):
+            self.assert_gate(1, [unknown, completed_with_finding], wait=60)
+            self.assertEqual(self.comment_fetches, 1)
+        for extra in (["--wait-for-review"], ["--wait-for-review", "-5"], ["--wait-for-review", "soon"]):
+            with self.subTest(extra=extra):
+                # Argument errors exit before any GitHub query, so bypass run_gate.
+                result = subprocess.run(
+                    ["bash", str(SCRIPTS / "check_codex_comments.sh"), "4145", *extra],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("--wait-for-review requires", result.stderr)
 
     def test_real_findings_survive_metadata_and_pagination(self):
         summary = comment(FIXTURES["summary"]["body"])
@@ -276,9 +350,10 @@ else:
                 result = self.run_gate(
                     snapshot([request, comment(fixture["body"])]), "wait_pr_codex.sh"
                 )
-                # Completed informational envelopes keep polling for approval;
-                # unfinished/unknown reports remain failures under the CI policy.
-                expected = 10 if fixture["expected_exit_code"] == 0 else 1
+                # Completed informational envelopes and in-progress summaries keep
+                # polling for approval; unknown reports remain failures under the CI policy.
+                waiting = fixture["expected_exit_code"] == 0 or fixture.get("in_progress")
+                expected = 10 if waiting else 1
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_informational_comments_do_not_hide_findings_or_account_errors(self):
