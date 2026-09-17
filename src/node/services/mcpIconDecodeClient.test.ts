@@ -9,6 +9,18 @@ import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 const deadline = () => AbortSignal.timeout(3_000);
 const notion = readFileSync(path.resolve(__dirname, "../../../tests/fixtures/mcp/notion-icon.svg"));
 
+// The same behavior suite also runs against emitted/packaged workers using the
+// target executable, not system Node. Both paths must be supplied together.
+function decode(bytes: Buffer, mimeTypes: string[], signal: AbortSignal): Promise<string | null> {
+  const execPath = process.env.MCP_ICON_TEST_EXEC_PATH;
+  const entry = process.env.MCP_ICON_TEST_WORKER_PATH;
+  if (!execPath && !entry) return decodeMcpIcon(bytes, mimeTypes, signal);
+  if (!execPath || !entry) throw new Error("Both MCP icon runtime test paths are required");
+  return decodeMcpIcon(bytes, mimeTypes, signal, (_entry, options) =>
+    fork(entry, { ...options, execPath })
+  );
+}
+
 describe("killable MCP icon decoder", () => {
   test("decodes supported raster types and the unchanged Notion SVG into bounded PNG", async () => {
     const source = sharp({ create: { width: 100, height: 80, channels: 4, background: "red" } });
@@ -20,7 +32,7 @@ describe("killable MCP icon decoder", () => {
       [notion, "image/svg+xml"],
     ];
     for (const [input, mime] of inputs) {
-      const result = await decodeMcpIcon(input, [mime], deadline());
+      const result = await decode(input, [mime], deadline());
       expect(isPngDataUrl(result)).toBe(true);
       const data = Buffer.from(result!.split(",")[1], "base64");
       expect(data.length).toBeLessThanOrEqual(32 * 1024);
@@ -54,8 +66,8 @@ describe("killable MCP icon decoder", () => {
       ],
       [Buffer.alloc(512 * 1024 + 1), []],
     ] satisfies Array<[Buffer, string[]]>)
-      expect(await decodeMcpIcon(bytes, types, deadline())).toBeNull();
-    expect(await decodeMcpIcon(notion, ["application/octet-stream"], deadline())).not.toBeNull();
+      expect(await decode(bytes, types, deadline())).toBeNull();
+    expect(await decode(notion, ["application/octet-stream"], deadline())).not.toBeNull();
   });
 
   test("does not spawn for expired jobs", async () => {

@@ -134,7 +134,7 @@ function escapeXml(value: string): string {
 }
 
 /**
- * SECURITY AUDIT: librsvg receives only re-serialized, allowlisted geometry,
+ * SECURITY AUDIT: the SVG renderer receives only re-serialized, allowlisted geometry,
  * never server XML. CSS, references, foreign namespaces, and external entities
  * cannot reach its resource loaders. This filter itself runs in the killable
  * decode child: parser limits do not replace the parent's absolute deadline.

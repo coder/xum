@@ -116,6 +116,9 @@ COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
 
+# - resvg-wasm: public JS and wasm asset stay together for the isolated SVG decoder.
+COPY --from=builder /app/node_modules/@resvg/resvg-wasm ./node_modules/@resvg/resvg-wasm
+
 # Copy frontend/static assets from least to most volatile for better cache reuse.
 # Vite outputs JS/CSS/HTML directly to dist/ (assetsDir: ".").
 COPY --from=builder /app/dist/static ./dist/static

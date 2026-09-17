@@ -343,6 +343,11 @@ dist/runtime/mcpIconDecode.js: build-main
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
 
+.PHONY: test-mcp-icon-electron
+test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
 	@mkdir -p dist/static

@@ -90,6 +90,7 @@
     "@radix-ui/react-toggle-group": "^1.1.11",
     "@radix-ui/react-tooltip": "^1.2.8",
     "@radix-ui/react-visually-hidden": "^1.2.4",
+    "@resvg/resvg-wasm": "2.6.2",
     "@vercel/ai-sdk-openai-websocket-fetch": "^1.0.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",

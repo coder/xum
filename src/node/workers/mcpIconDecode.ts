@@ -1,4 +1,6 @@
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import type * as ResvgModule from "@resvg/resvg-wasm";
 import type sharp from "sharp";
 import {
   MCP_ICON_LIMITS,
@@ -22,6 +24,58 @@ function sniff(bytes: Buffer): string | null {
   return null;
 }
 
+async function renderSvg(bytes: Buffer): Promise<Buffer | null> {
+  const svg = sanitizeMcpIconSvg(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  if (svg === null) return null;
+  // Linux Electron exposes GLib symbols that conflict with native sharp's SVG
+  // decoder. Use the public wasm API only for SVG; keep raster/attachment sharp
+  // unchanged. The package and its exported wasm asset ship together, including
+  // inside app.asar. No private loader patches or system Node are needed.
+  const load = createRequire(__filename);
+  const { initWasm, Resvg } = load("@resvg/resvg-wasm") as typeof ResvgModule;
+  await initWasm(readFileSync(load.resolve("@resvg/resvg-wasm/index_bg.wasm")));
+  const original = new Resvg(svg, { font: { loadSystemFonts: false } });
+  let width: number;
+  let height: number;
+  try {
+    width = original.width;
+    height = original.height;
+  } finally {
+    original.free();
+  }
+  // Inspect intrinsic dimensions before allocating any render surface. The SVG
+  // parser and both constructors are also inside the parent's killable deadline.
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    width * height > MCP_ICON_LIMITS.inputMaxPixels
+  )
+    return null;
+  const renderer = new Resvg(svg, {
+    font: { loadSystemFonts: false },
+    fitTo: { mode: width >= height ? "width" : "height", value: MCP_ICON_LIMITS.outputSize },
+  });
+  try {
+    const image = renderer.render();
+    try {
+      if (
+        image.width <= 0 ||
+        image.height <= 0 ||
+        image.width > MCP_ICON_LIMITS.outputSize ||
+        image.height > MCP_ICON_LIMITS.outputSize
+      )
+        return null;
+      return Buffer.from(image.asPng());
+    } finally {
+      image.free();
+    }
+  } finally {
+    renderer.free();
+  }
+}
+
 async function decode(message: unknown): Promise<string | null> {
   if (
     typeof message !== "object" ||
@@ -38,7 +92,7 @@ async function decode(message: unknown): Promise<string | null> {
     )
   )
     return null;
-  let bytes = Buffer.from(message.base64, "base64");
+  const bytes = Buffer.from(message.base64, "base64");
   if (bytes.length === 0 || bytes.length > MCP_ICON_LIMITS.bodyMaxBytes) return null;
   const mime = sniff(bytes);
   if (
@@ -49,25 +103,24 @@ async function decode(message: unknown): Promise<string | null> {
     })
   )
     return null;
+  let png: Buffer | null;
   if (mime === "image/svg+xml") {
-    const svg = sanitizeMcpIconSvg(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-    if (svg === null) return null;
-    bytes = Buffer.from(svg, "utf8");
+    png = await renderSvg(bytes);
+  } else {
+    // The worker is disposable; native loading and all filtering stay inside its
+    // parent-enforced lifetime. createRequire keeps sharp external in bundles.
+    const image = createRequire(__filename)("sharp") as typeof sharp;
+    png = await image(bytes, {
+      limitInputPixels: MCP_ICON_LIMITS.inputMaxPixels,
+      pages: 1,
+      failOn: "error",
+    })
+      .timeout({ seconds: MCP_ICON_LIMITS.decodeTimeoutSeconds })
+      .resize(MCP_ICON_LIMITS.outputSize, MCP_ICON_LIMITS.outputSize, { fit: "inside" })
+      .png()
+      .toBuffer();
   }
-  // The worker is disposable; native loading and all filtering stay inside its
-  // parent-enforced lifetime. createRequire keeps sharp external in bundles.
-  const image = createRequire(__filename)("sharp") as typeof sharp;
-  const pipeline = image(bytes, {
-    limitInputPixels: MCP_ICON_LIMITS.inputMaxPixels,
-    pages: 1,
-    failOn: "error",
-  });
-  const png = await pipeline
-    .timeout({ seconds: MCP_ICON_LIMITS.decodeTimeoutSeconds })
-    .resize(MCP_ICON_LIMITS.outputSize, MCP_ICON_LIMITS.outputSize, { fit: "inside" })
-    .png()
-    .toBuffer();
-  if (png.length > MCP_ICON_LIMITS.pngMaxBytes) return null;
+  if (png === null || png.length > MCP_ICON_LIMITS.pngMaxBytes) return null;
   const dataUrl = MCP_ICON_PNG_PREFIX + png.toString("base64");
   return isPngDataUrl(dataUrl) ? dataUrl : null;
 }
