@@ -15,7 +15,7 @@ export default {
     docs: {
       description: {
         component:
-          "Server-reported identity (text only) in MCP settings rows and the workspace MCP dialog. Branding appears after a connection test and lives in memory for the current configuration load; the configured key stays the primary label.",
+          "Server-reported identity and host-decoded icons in MCP settings rows and the workspace MCP dialog. Branding appears after a connection test and lives in memory for the current configuration load; the configured key stays the primary label.",
       },
     },
   },
@@ -39,6 +39,7 @@ function setupIdentityStory(transport: "http" | "auto" = "http") {
   selectWorkspace(workspace);
   // Branding is never persisted; start every story from an empty test cache.
   updatePersistedState(getMCPTestResultsKey("__global__"), {});
+  updatePersistedState(getMCPTestResultsKey(workspace.projectPath, workspace.id), {});
   return createMockORPCClient({
     projects: groupWorkspacesByProject([workspace]),
     workspaces: [workspace],
@@ -203,5 +204,18 @@ export const WorkspaceModalAfterFetch: AppStory = {
     await waitFor(() =>
       expect(within(row).getByRole("button", { name: "Refresh Tools" })).toBeVisible()
     );
+  },
+};
+
+export const WorkspaceModalPhone: AppStory = {
+  ...WorkspaceModalAfterFetch,
+  globals: phoneGlobals,
+  parameters: phoneParameters,
+  play: async (context) => {
+    await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
+    await WorkspaceModalAfterFetch.play?.(context);
+    if (window.innerWidth < 768) {
+      await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
   },
 };
