@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fork, type ForkOptions } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
@@ -6,6 +7,7 @@ import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
 import type { MCPConnectionRef } from "@/common/types/mcp";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import type { PinnedHttpsFetchResult } from "@/node/utils/network/pinnedHttpsFetch";
+import { decodeMcpIcon } from "./mcpIconDecodeClient";
 import { createIconResolver, resolveServerIcon, selectIconCandidate } from "./mcpServerIcon";
 import type { IconCandidate } from "./mcpServerIdentity";
 
@@ -172,9 +174,9 @@ describe("selectIconCandidate", () => {
     });
   });
 
-  test("carries the candidate MIME hint alongside the data MIME without duplicates", () => {
+  test("canonicalizes MIME hints to their essence, dedupes, and fails closed on overlong image claims", () => {
     expect(
-      selectIconCandidate([{ src: notionDataUrl, mimeType: "image/svg+xml" }], stdio)
+      selectIconCandidate([{ src: notionDataUrl, mimeType: "Image/SVG+XML; charset=utf-8" }], stdio)
     ).toMatchObject({ mimeTypes: ["image/svg+xml"] });
     expect(
       selectIconCandidate([{ src: notionDataUrl, mimeType: "image/png" }], stdio)
@@ -184,6 +186,24 @@ describe("selectIconCandidate", () => {
     expect(
       selectIconCandidate([{ src: "https://mcp.notion.com/icon", mimeType: "image/webp" }], http)
     ).toMatchObject({ mimeTypes: ["image/webp"] });
+    // Parameters never push a specific claim past the bound…
+    expect(
+      selectIconCandidate(
+        [{ src: notionDataUrl, mimeType: `image/jpeg; padding=${"x".repeat(200)}` }],
+        stdio
+      )
+    ).toMatchObject({ mimeTypes: ["image/jpeg", "image/svg+xml"] });
+    // …an overlong specific image essence cannot be relayed, so the candidate is ineligible…
+    expect(
+      selectIconCandidate([{ src: notionDataUrl, mimeType: `image/${"x".repeat(200)}` }], stdio)
+    ).toBeNull();
+    // …while an overlong generic type is advisory noise and is simply dropped.
+    expect(
+      selectIconCandidate(
+        [{ src: notionDataUrl, mimeType: `application/${"x".repeat(200)}` }],
+        stdio
+      )
+    ).toMatchObject({ mimeTypes: ["image/svg+xml"] });
   });
 });
 
@@ -239,13 +259,43 @@ describe("resolveServerIcon", () => {
     expect(fetchCalls.map(String)).toEqual(["https://mcp.notion.com/icon.svg"]);
     expect(decodeCalls).toHaveLength(1);
     expect(decodeCalls[0].bytes.equals(notionSvg)).toBe(true);
-    expect(decodeCalls[0].mimeTypes).toEqual(["image/svg+xml", "image/svg+xml; charset=utf-8"]);
+    expect(decodeCalls[0].mimeTypes).toEqual(["image/svg+xml"]);
 
     // A data candidate decodes its own bytes with the data MIME as the hint.
     expect(await resolver.resolve([{ src: notionDataUrl }], stdio)).toBe(pngDataUrl);
     expect(fetchCalls).toHaveLength(1);
     expect(decodeCalls[1].bytes.equals(notionSvg)).toBe(true);
     expect(decodeCalls[1].mimeTypes).toEqual(["image/svg+xml"]);
+  });
+
+  test("a fetched content-type is judged by its essence through the real decoder", async () => {
+    const withContentType = (contentType: string) =>
+      createIconResolver({
+        fetch: () => Promise.resolve({ bytes: notionSvg, contentType }),
+      }).resolve([{ src: "https://mcp.notion.com/icon.svg" }], http);
+    // A conflicting specific claim hidden behind long parameters still rejects…
+    expect(await withContentType(`image/jpeg; padding=${"x".repeat(200)}`)).toBeNull();
+    // …a matching claim with long parameters still renders…
+    expect(
+      isPngDataUrl(
+        await withContentType(`image/svg+xml; charset=utf-8; padding=${"x".repeat(200)}`)
+      )
+    ).toBe(true);
+    // …and an unrelated generic type stays advisory.
+    expect(isPngDataUrl(await withContentType(`application/${"x".repeat(200)}`))).toBe(true);
+  }, 15_000);
+
+  test("an overlong specific image content-type fails closed before decoding", async () => {
+    let decodes = 0;
+    const resolver = createIconResolver({
+      fetch: () => Promise.resolve({ bytes: notionSvg, contentType: `image/${"x".repeat(200)}` }),
+      decode: () => {
+        decodes++;
+        return Promise.resolve(pngDataUrl);
+      },
+    });
+    expect(await resolver.resolve([{ src: "https://mcp.notion.com/icon.svg" }], http)).toBeNull();
+    expect(decodes).toBe(0);
   });
 
   test("absent or failing fetches yield null and never reach the decoder", async () => {
@@ -424,4 +474,79 @@ describe("resolveServerIcon", () => {
     held.releases[2].resolve(pngDataUrl);
     expect(await Promise.all([second, third])).toEqual([pngDataUrl, pngDataUrl]);
   });
+  test("five jobs through the real killable decoder keep at most two live children and reap them all", async () => {
+    interface ObservedChild {
+      pid: number;
+      /** Resolves once the fixture reports it entered its (stalled) filtering phase. */
+      filtering: Promise<void>;
+      /** Resolves with the exit signal and how many children had been born by then. */
+      exited: Promise<{ signal: NodeJS.Signals | null; birthsAtExit: number }>;
+    }
+    const children: ObservedChild[] = [];
+    let live = 0;
+    let maxLive = 0;
+    const spawnStalled = (_entry: string, options: ForkOptions) => {
+      const child = fork(
+        path.resolve(__dirname, "../../../tests/fixtures/mcp/stalled-icon-worker.ts"),
+        options
+      );
+      live++;
+      maxLive = Math.max(maxLive, live);
+      const filtering = new Promise<void>((resolve) =>
+        child.on("message", (message) => {
+          if (message === "filtering") resolve();
+        })
+      );
+      const exited = new Promise<{ signal: NodeJS.Signals | null; birthsAtExit: number }>(
+        (resolve) =>
+          child.once("exit", (_code, signal) => {
+            live--;
+            resolve({ signal, birthsAtExit: children.length });
+          })
+      );
+      if (child.pid === undefined) throw new Error("fixture child did not start");
+      children.push({ pid: child.pid, filtering, exited });
+      return child;
+    };
+    const controllers: AbortController[] = [];
+    const resolver = createIconResolver({
+      decode: (bytes, mimeTypes, signal) => decodeMcpIcon(bytes, mimeTypes, signal, spawnStalled),
+      createDeadline: () => {
+        const controller = new AbortController();
+        controllers.push(controller);
+        return controller.signal;
+      },
+    });
+
+    const jobs = Array.from({ length: 5 }, () => resolver.resolve([{ src: notionDataUrl }], stdio));
+    // Admission and spawning complete within the current microtask turn.
+    await tick();
+    expect(children).toHaveLength(2);
+    await Promise.all([children[0].filtering, children[1].filtering]);
+    expect(live).toBe(2);
+
+    // Each admitted job is aborted in turn; the next queued job may only be
+    // born after the killed child's exit was observed.
+    for (let index = 0; index < 5; index++) {
+      controllers[index].abort();
+      const exit = await children[index].exited;
+      expect(exit.signal).toBe("SIGKILL");
+      expect(exit.birthsAtExit).toBe(Math.min(index + 2, 5));
+      await tick();
+      if (index + 2 < 5) {
+        expect(children).toHaveLength(index + 3);
+        await children[index + 2].filtering;
+      } else {
+        expect(children).toHaveLength(5);
+      }
+    }
+
+    expect(await Promise.all(jobs)).toEqual([null, null, null, null, null]);
+    expect(children).toHaveLength(5);
+    expect(maxLive).toBe(2);
+    expect(live).toBe(0);
+    for (const child of children) {
+      expect(() => process.kill(child.pid, 0)).toThrow();
+    }
+  }, 20_000);
 });

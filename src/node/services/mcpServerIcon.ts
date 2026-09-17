@@ -51,11 +51,32 @@ function sizeRank(sizes: readonly string[] | undefined): number {
   return 2;
 }
 
-function mimeHints(...hints: Array<string | undefined>): string[] {
+/**
+ * Canonical MIME hints for the decoder: the essence (type/subtype, lowercase,
+ * parameters stripped) of every advisory label, deduplicated. The decoder
+ * rejects a specific `image/*` claim that contradicts the sniffed type, so
+ * that claim must survive canonicalization intact: an image essence too long
+ * to relay fails closed (null) instead of silently disappearing, while an
+ * overlong generic type is noise and is dropped.
+ */
+function mimeHints(...hints: Array<string | undefined>): string[] | null {
   const kept: string[] = [];
   for (const hint of hints) {
-    if (hint && hint.length <= MIME_HINT_MAX_CHARS && !kept.includes(hint)) {
-      kept.push(hint);
+    if (hint === undefined) {
+      continue;
+    }
+    const essence = hint.split(";")[0].trim().toLowerCase();
+    if (essence.length === 0) {
+      continue;
+    }
+    if (essence.length > MIME_HINT_MAX_CHARS) {
+      if (essence.startsWith("image/")) {
+        return null;
+      }
+      continue;
+    }
+    if (!kept.includes(essence)) {
+      kept.push(essence);
     }
   }
   return kept;
@@ -86,7 +107,8 @@ function eligibleIcon(candidate: IconCandidate, binding: MCPConnectionRef): Sele
     if (url.origin !== binding.origin) {
       return null;
     }
-    return { kind: "https", url, mimeTypes: mimeHints(candidate.mimeType) };
+    const mimeTypes = mimeHints(candidate.mimeType);
+    return mimeTypes ? { kind: "https", url, mimeTypes } : null;
   }
   // Length is checked before any regex or base64 work touches the payload.
   if (src.length > MCP_IDENTITY_LIMITS.iconDataSrcMaxChars) {
@@ -105,7 +127,8 @@ function eligibleIcon(candidate: IconCandidate, binding: MCPConnectionRef): Sele
   if (decodedBytes <= 0 || decodedBytes > MCP_ICON_LIMITS.bodyMaxBytes) {
     return null;
   }
-  return { kind: "data", base64, mimeTypes: mimeHints(candidate.mimeType, match[1]) };
+  const mimeTypes = mimeHints(candidate.mimeType, match[1]);
+  return mimeTypes ? { kind: "data", base64, mimeTypes } : null;
 }
 
 /**
@@ -231,11 +254,12 @@ export function createIconResolver(dependencies: IconResolverDependencies = {}):
 
   return {
     async resolve(candidates, binding) {
+      // One budget for the whole attempt: selection, queueing, fetch, decode.
+      const signal = createDeadline();
       const selected = selectIconCandidate(candidates, binding);
       if (!selected) {
         return null;
       }
-      const signal = createDeadline();
       if (!(await gate.acquire(signal))) {
         return null;
       }
@@ -244,7 +268,7 @@ export function createIconResolver(dependencies: IconResolverDependencies = {}):
           return null;
         }
         let bytes: Buffer;
-        let mimeTypes: string[];
+        let mimeTypes: string[] | null;
         if (selected.kind === "https") {
           const fetched = await fetch(selected.url, signal);
           if (!fetched) {
@@ -252,6 +276,9 @@ export function createIconResolver(dependencies: IconResolverDependencies = {}):
           }
           bytes = fetched.bytes;
           mimeTypes = mimeHints(...selected.mimeTypes, fetched.contentType);
+          if (!mimeTypes) {
+            return null;
+          }
         } else {
           bytes = Buffer.from(selected.base64, "base64");
           mimeTypes = selected.mimeTypes;
