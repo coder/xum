@@ -181,6 +181,12 @@ describe("real MCP identity negotiation", () => {
       expect(await manager.getIcon(reconnected)).toBe(icon);
       // Lookup only: an unknown ref is null, never a fetch or decode.
       expect(await manager.getIcon("0".repeat(32))).toBeNull();
+      // The bulk lookup answers every requested ref once, unknown refs included.
+      expect(await manager.getIcons([first, reconnected, "0".repeat(32), first])).toEqual({
+        [first]: icon,
+        [reconnected]: icon,
+        ["0".repeat(32)]: null,
+      });
     } finally {
       await manager.stopServers(request.workspaceId);
       manager.dispose();

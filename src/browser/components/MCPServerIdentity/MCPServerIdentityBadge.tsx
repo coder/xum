@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ExternalLink, Plug } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
+import { cn } from "@/common/lib/utils";
 import { HttpsUrlSchema } from "@/common/orpc/schemas/mcp";
 import type {
   MCPConnectionRef,
@@ -90,10 +91,16 @@ export function MCPServerIdentityBadge(props: MCPServerIdentityBadgeProps) {
           aria-label={`Server information: ${connection.key}`}
           // A server-info click must not also expand the surrounding tool header.
           onClick={(event) => event.stopPropagation()}
-          className="text-muted hover:text-foreground focus-visible:ring-accent inline-flex shrink-0 items-center gap-1 rounded px-0.5 align-middle font-sans text-[10px] focus-visible:ring-1"
+          className={cn(
+            "text-muted hover:text-foreground focus-visible:ring-accent inline-flex items-center gap-1 rounded px-0.5 align-middle font-sans text-[10px] focus-visible:ring-1",
+            // Compact (chat header): the badge is the shrinkable flex item so an
+            // allowed long or unbroken title truncates instead of pushing the tool
+            // name and status off a narrow card. Icon-only triggers keep their size.
+            props.compact ? "min-w-0" : "shrink-0"
+          )}
         >
           {renderIcon(ICON_SIZES.trigger, "size-3.5")}
-          {props.compact && <span className="truncate">{displayName}</span>}
+          {props.compact && <span className="max-w-[10rem] min-w-0 truncate">{displayName}</span>}
         </button>
       </PopoverTrigger>
       <PopoverContent

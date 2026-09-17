@@ -31,13 +31,16 @@ const INFO_BUTTON = "Server information: notion-work";
 const REF_LIVE = "1".repeat(32);
 const REF_GONE = "2".repeat(32);
 const NOTION_ICON: string = notionIcon;
+/** Longest title the identity schema admits (80 chars), unbroken so it cannot wrap. */
+const LONG_TITLE =
+  "NotionEnterpriseKnowledgeWorkspaceConnectorForSpecsPRDsAndTaskTracking0000000000";
 
-function notionSnapshot(iconRef: string, version: string): MCPToolCallDisplay {
+function notionSnapshot(iconRef: string, version: string, title = "Notion"): MCPToolCallDisplay {
   return {
     connection: { key: "notion-work", transport: "http", origin: "https://mcp.notion.com" },
     identity: {
       name: "Notion MCP",
-      title: "Notion",
+      title,
       version,
       description: "Search your workspace, fetch specs and PRDs, and track tasks with your team.",
       websiteUrl: "https://developers.notion.com/docs/mcp",
@@ -49,7 +52,12 @@ function notionSnapshot(iconRef: string, version: string): MCPToolCallDisplay {
 
 const text = (value: string) => ({ content: [{ type: "text", text: value }] });
 
-function toolCalls(options: { branded: boolean; historical?: boolean; nested?: boolean }) {
+function toolCalls(options: {
+  branded: boolean;
+  historical?: boolean;
+  nested?: boolean;
+  longTitle?: boolean;
+}) {
   const search: MuxToolPart = {
     type: "dynamic-tool",
     toolCallId: "notion-search",
@@ -57,7 +65,11 @@ function toolCalls(options: { branded: boolean; historical?: boolean; nested?: b
     state: "output-available",
     input: { query: "workspace setup guide" },
     output: text("Found: Workspace setup guide; Development environment; Team onboarding."),
-    ...(options.branded ? { mcpServer: notionSnapshot(REF_LIVE, "1.2.0") } : {}),
+    ...(options.branded
+      ? {
+          mcpServer: notionSnapshot(REF_LIVE, "1.2.0", options.longTitle ? LONG_TITLE : "Notion"),
+        }
+      : {}),
   };
   const fetch: MuxToolPart = {
     type: "dynamic-tool",
@@ -113,21 +125,24 @@ function setupChat(options: {
   historical?: boolean;
   nested?: boolean;
   phone?: boolean;
+  longTitle?: boolean;
 }) {
   if (options.phone) collapseLeftSidebar();
   else expandLeftSidebar();
   expandProjects(["/home/user/projects/xum"]);
   // The app's singleton WorkspaceStore retains history by workspace ID across
   // story switches. Distinct fixture histories need distinct workspace IDs.
-  const variant = options.phone
-    ? "phone"
-    : options.nested
-      ? "nested"
-      : options.historical
-        ? "historical"
-        : options.branded
-          ? "branded"
-          : "plain";
+  const variant = options.longTitle
+    ? "long-title"
+    : options.phone
+      ? "phone"
+      : options.nested
+        ? "nested"
+        : options.historical
+          ? "historical"
+          : options.branded
+            ? "branded"
+            : "plain";
   return setupSimpleChatStory({
     workspaceId: `ws-mcp-tool-identity-${variant}`,
     workspaceName: "mcp-server-identity",
@@ -165,10 +180,10 @@ async function prepareChat(canvasElement: HTMLElement) {
   await within(canvasElement).findByText(NOTION_FETCH, { exact: true });
 }
 
-async function expectBranded(canvasElement: HTMLElement) {
+async function expectBranded(canvasElement: HTMLElement, title = "Notion") {
   const search = toolCard(canvasElement, NOTION_SEARCH);
   const badge = within(search.header).getByRole("button", { name: INFO_BUTTON });
-  await expect(badge).toHaveTextContent("Notion");
+  await expect(badge).toHaveTextContent(title);
   await waitFor(() => expect(badge.querySelector("img")).toHaveAttribute("src", NOTION_ICON));
   await expect(
     within(toolCard(canvasElement, LOCAL_SEARCH).header).queryByRole("button", {
@@ -277,6 +292,34 @@ export const Phone: AppStory = {
         const header = badge.parentElement!;
         await expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
       }
+      await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
+  },
+};
+
+/**
+ * An allowed 80-char unbroken title must not push the tool name or status off
+ * the card: the compact label is bounded and shrinkable, so it truncates at
+ * every width while the icon, tool name and status stay visible.
+ */
+export const LongTitlePhone: AppStory = {
+  ...Branded,
+  render: () => (
+    <AppWithMocks setup={() => setupChat({ branded: true, phone: true, longTitle: true })} />
+  ),
+  globals: phoneGlobals,
+  parameters: phoneParameters,
+  play: async (context) => {
+    await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
+    await prepareChat(context.canvasElement);
+    const { search, badge } = await expectBranded(context.canvasElement, LONG_TITLE);
+    const label = badge.querySelector("span");
+    if (!label) throw new Error("Compact label not rendered");
+    // Holds at the runner's desktop width as well as the pinned phone width.
+    await expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
+    await expect(search.header.scrollWidth).toBeLessThanOrEqual(search.header.clientWidth);
+    await expect(search.name).toBeVisible();
+    if (window.innerWidth < 768) {
       await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
     }
   },

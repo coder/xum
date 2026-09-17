@@ -1021,6 +1021,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcp.icon.input)
         .output(schemas.mcp.icon.output)
         .handler(({ context, input }) => context.mcpServerManager.getIcon(input.iconRef)),
+      icons: t
+        .input(schemas.mcp.icons.input)
+        .output(schemas.mcp.icons.output)
+        .handler(({ context, input }) => context.mcpServerManager.getIcons(input.iconRefs)),
 
       setEnabled: t
         .input(schemas.mcp.setEnabled.input)

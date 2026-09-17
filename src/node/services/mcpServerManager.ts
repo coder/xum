@@ -4749,6 +4749,13 @@ export class MCPServerManager {
     return this.iconRegistry.get(iconRef);
   }
 
+  /** Bulk form of getIcon: one registry lookup per distinct ref, still never a fetch. */
+  async getIcons(iconRefs: readonly string[]): Promise<Record<string, string | null>> {
+    const distinct = [...new Set(iconRefs)];
+    const icons = await Promise.all(distinct.map((iconRef) => this.iconRegistry.get(iconRef)));
+    return Object.fromEntries(distinct.map((iconRef, index) => [iconRef, icons[index]]));
+  }
+
   async testForApi(
     input: {
       projectPath?: string;

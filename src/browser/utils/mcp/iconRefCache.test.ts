@@ -3,6 +3,7 @@ import { McpIconRefCache } from "./iconRefCache";
 
 const PNG = "data:image/png;base64,iVBORw0KGgo=";
 const ref = (n: number) => n.toString(16).padStart(32, "0");
+type Icons = Record<string, string | null>;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -14,97 +15,157 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+/** A fake API client that records every bulk lookup so tests can assert batching and coalescing. */
+function client(answer: (refs: readonly string[]) => Promise<Icons>) {
+  const calls: string[][] = [];
+  return {
+    calls,
+    mcp: {
+      icons: (input: { iconRefs: string[] }) => {
+        calls.push([...input.iconRefs]);
+        return answer(input.iconRefs);
+      },
+    },
+  };
+}
+const icons = (refs: readonly string[], value: string | null = PNG): Icons =>
+  Object.fromEntries(refs.map((r) => [r, value]));
+
 describe("McpIconRefCache", () => {
-  test("coalesces concurrent lookups into one request and caches the result", async () => {
+  test("distinct misses in one tick become one bulk lookup; duplicates coalesce; results cache", async () => {
     const cache = new McpIconRefCache(200);
-    const pending = deferred<string | null>();
-    let calls = 0;
-    const fetch = () => {
-      calls += 1;
-      return pending.promise;
-    };
-    const first = cache.resolve(ref(1), fetch);
-    const second = cache.resolve(ref(1), fetch);
-    expect(calls).toBe(1);
+    const pending = deferred<Icons>();
+    const api = client(() => pending.promise);
+    const { calls } = api;
+    const results = [ref(1), ref(2), ref(1), ref(3), ref(2)].map((r) => cache.resolve(r, api));
+    expect(calls).toEqual([]);
+    await Promise.resolve();
+    expect(calls).toEqual([[ref(1), ref(2), ref(3)]]);
     expect(cache.peek(ref(1))).toBeUndefined();
-    pending.resolve(PNG);
-    expect(await first).toBe(PNG);
-    expect(await second).toBe(PNG);
+    pending.resolve({ [ref(1)]: PNG, [ref(2)]: null, [ref(3)]: PNG });
+    expect(await Promise.all(results)).toEqual([PNG, null, PNG, PNG, null]);
     expect(cache.peek(ref(1))).toBe(PNG);
-    expect(await cache.resolve(ref(1), fetch)).toBe(PNG);
-    expect(calls).toBe(1);
+    expect(cache.peek(ref(2))).toBeNull();
+    // Resolved refs (including null) never go back to the host.
+    expect(await cache.resolve(ref(2), api)).toBeNull();
+    expect(calls).toHaveLength(1);
   });
 
-  test("caches a resolved null (unknown ref) but never a rejected request", async () => {
+  test("a rejected bulk lookup caches nothing and the next mount retries", async () => {
     const cache = new McpIconRefCache(200);
-    let calls = 0;
-    expect(await cache.resolve(ref(2), () => (calls++, Promise.resolve(null)))).toBeNull();
-    expect(cache.peek(ref(2))).toBeNull();
-    expect(await cache.resolve(ref(2), () => (calls++, Promise.resolve(PNG)))).toBeNull();
-    expect(calls).toBe(1);
-
+    const failing = client(() => Promise.reject(new Error("ipc down")));
     let rejection: unknown;
     try {
-      await cache.resolve(ref(3), () => (calls++, Promise.reject(new Error("ipc down"))));
+      await cache.resolve(ref(1), failing);
     } catch (error) {
       rejection = error;
     }
     expect(rejection).toBeInstanceOf(Error);
-    expect(cache.peek(ref(3))).toBeUndefined();
-    // A later mount retries and the fresh answer is stored.
-    expect(await cache.resolve(ref(3), () => (calls++, Promise.resolve(PNG)))).toBe(PNG);
-    expect(calls).toBe(3);
+    expect(cache.peek(ref(1))).toBeUndefined();
+    const ok = client((refs) => Promise.resolve(icons(refs)));
+    expect(await cache.resolve(ref(1), ok)).toBe(PNG);
+    expect(ok.calls).toEqual([[ref(1)]]);
   });
 
   test("evicts the least recently used entry beyond the capacity", async () => {
     const cache = new McpIconRefCache(2);
-    await cache.resolve(ref(1), () => Promise.resolve(PNG));
-    await cache.resolve(ref(2), () => Promise.resolve(null));
+    const ok = client((refs) => Promise.resolve(icons(refs)));
+    await cache.resolve(ref(1), ok);
+    await cache.resolve(ref(2), ok);
     // Touch ref 1 so ref 2 becomes the oldest.
-    expect(await cache.resolve(ref(1), () => Promise.reject(new Error("unused")))).toBe(PNG);
-    await cache.resolve(ref(3), () => Promise.resolve(PNG));
+    expect(await cache.resolve(ref(1), ok)).toBe(PNG);
+    await cache.resolve(ref(3), ok);
     expect(cache.peek(ref(2))).toBeUndefined();
     expect(cache.peek(ref(1))).toBe(PNG);
     expect(cache.peek(ref(3))).toBe(PNG);
   });
 
-  test("bounds entries including pending lookups; evicted refs restart and stale completions are ignored", async () => {
+  test("bounds entries and batch sizes including pending lookups; evicted refs restart later", async () => {
     const cache = new McpIconRefCache(2);
-    const first = deferred<string | null>();
-    const second = deferred<string | null>();
-    const third = deferred<string | null>();
-    const p1 = cache.resolve(ref(1), () => first.promise);
-    const p2 = cache.resolve(ref(2), () => second.promise);
-    const p3 = cache.resolve(ref(3), () => third.promise);
+    const batches: Array<ReturnType<typeof deferred<Icons>>> = [];
+    const api = client(() => {
+      const batch = deferred<Icons>();
+      batches.push(batch);
+      return batch.promise;
+    });
+    const { calls } = api;
+    const p1 = cache.resolve(ref(1), api);
+    const p2 = cache.resolve(ref(2), api);
+    const p3 = cache.resolve(ref(3), api);
+    await Promise.resolve();
+    // Never more refs per IPC call than the capacity; never more entries either.
+    expect(calls).toEqual([[ref(1), ref(2)], [ref(3)]]);
     expect(cache.size).toBe(2);
     expect(cache.peek(ref(1))).toBeUndefined();
 
     // The evicted ref is looked up again instead of joining the evicted request.
-    let calls = 0;
-    const firstAgain = deferred<string | null>();
-    const p1b = cache.resolve(ref(1), () => (calls++, firstAgain.promise));
-    expect(calls).toBe(1);
+    const p1b = cache.resolve(ref(1), api);
+    await Promise.resolve();
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).toEqual([ref(1)]);
     expect(cache.size).toBe(2);
 
-    // The evicted request's completion neither caches nor disturbs the replacement.
-    first.resolve("data:image/png;base64,old=");
+    // The evicted request still answers its callers but cannot cache or evict.
+    batches[0].resolve({ [ref(1)]: "data:image/png;base64,old=", [ref(2)]: null });
     expect(await p1).toBe("data:image/png;base64,old=");
+    expect(await p2).toBeNull();
     expect(cache.peek(ref(1))).toBeUndefined();
-    firstAgain.resolve(PNG);
+    batches[2].resolve(icons([ref(1)]));
     expect(await p1b).toBe(PNG);
     expect(cache.peek(ref(1))).toBe(PNG);
+    batches[1].resolve(icons([ref(3)]));
+    expect(await p3).toBe(PNG);
+    expect(cache.size).toBe(2);
+  });
 
-    // An evicted request's rejection must not delete a newer resolved entry.
-    expect(await cache.resolve(ref(2), () => Promise.resolve(null))).toBeNull();
-    second.reject(new Error("late failure"));
-    await p2.catch(() => undefined);
+  test("a replacement client owns pending refs; the old client's late outcome cannot touch them", async () => {
+    const cache = new McpIconRefCache(200);
+    const oldBatch = deferred<Icons>();
+    const old = client(() => oldBatch.promise);
+    const stale = cache.resolve(ref(1), old);
+    const staleToo = cache.resolve(ref(2), old);
+    await Promise.resolve();
+    expect(old.calls).toEqual([[ref(1), ref(2)]]);
+
+    // Reconnect: the same refs are requested through the new client.
+    const newBatch = deferred<Icons>();
+    const fresh = client(() => newBatch.promise);
+    const current = cache.resolve(ref(1), fresh);
+    const currentToo = cache.resolve(ref(2), fresh);
+    await Promise.resolve();
+    expect(fresh.calls).toEqual([[ref(1), ref(2)]]);
+    expect(cache.size).toBe(2);
+
+    // Old rejection: nothing deleted, the new lookup still succeeds.
+    oldBatch.reject(new Error("socket closed"));
+    await stale.catch(() => undefined);
+    await staleToo.catch(() => undefined);
+    expect(cache.size).toBe(2);
+    newBatch.resolve({ [ref(1)]: PNG, [ref(2)]: null });
+    expect(await current).toBe(PNG);
+    expect(await currentToo).toBeNull();
+    expect(cache.peek(ref(1))).toBe(PNG);
     expect(cache.peek(ref(2))).toBeNull();
 
-    // An evicted request's late success does not reinsert itself.
-    third.resolve(PNG);
-    expect(await p3).toBe(PNG);
-    expect(cache.peek(ref(3))).toBeUndefined();
-    expect(cache.size).toBe(2);
+    // Old success arriving late cannot overwrite the new generation either.
+    const other = deferred<Icons>();
+    const lateOld = cache.resolve(
+      ref(3),
+      client(() => other.promise)
+    );
+    const replaced = cache.resolve(
+      ref(3),
+      client(() => Promise.resolve(icons([ref(3)], null)))
+    );
+    await Promise.resolve();
+    expect(await replaced).toBeNull();
+    other.resolve(icons([ref(3)]));
+    expect(await lateOld).toBe(PNG);
+    expect(cache.peek(ref(3))).toBeNull();
+    // Immutable answers survive client changes without another lookup.
+    const untouched = client(() => Promise.reject(new Error("unused")));
+    expect(await cache.resolve(ref(1), untouched)).toBe(PNG);
+    expect(untouched.calls).toEqual([]);
   });
 
   test("rejects a non-positive capacity", () => {

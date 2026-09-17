@@ -7,6 +7,7 @@ import {
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -1045,6 +1046,16 @@ export const mcp = {
   icon: {
     input: z.object({ iconRef: MCPIconRefSchema }),
     output: PngDataUrlSchema.nullable(),
+  },
+  /**
+   * Bulk form of `icon` for a visible transcript: one answer per requested ref.
+   * Lookup only, bounded by the renderer cache size so one call covers a screen.
+   */
+  icons: {
+    input: z.object({
+      iconRefs: z.array(MCPIconRefSchema).max(MCP_ICON_LIMITS.registryMaxEntries),
+    }),
+    output: z.record(MCPIconRefSchema, PngDataUrlSchema.nullable()),
   },
   setEnabled: {
     input: MCPSetEnabledGlobalParamsSchema,

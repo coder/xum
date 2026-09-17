@@ -1225,6 +1225,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ success: true, tools: [] });
       },
       icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
+      icons: (input: { iconRefs: string[] }) =>
+        Promise.resolve(
+          Object.fromEntries(
+            input.iconRefs.map((iconRef) => [iconRef, mcpIcons.get(iconRef) ?? null])
+          )
+        ),
       setEnabled: (input: { name: string; enabled: boolean }) => {
         const server = globalMcpServersState[input.name];
         if (server) {

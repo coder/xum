@@ -5,9 +5,11 @@ import { mcpIconRefCache } from "@/browser/utils/mcp/iconRefCache";
 /**
  * Resolves a tool-call snapshot's immutable `iconRef` to the host-decoded PNG
  * data URL, or null when there is no ref or the host no longer knows it
- * (restart, eviction). Lookups go through the renderer-session cache, so every
- * row sharing a ref costs one `mcp.icon` call; a rejected call is not cached
- * and a later mount retries. Without a ref no IPC happens at all.
+ * (restart, eviction). Lookups go through the renderer-session cache, which
+ * batches every distinct ref mounted in one render pass into a single
+ * `mcp.icons` call owned by the current API client; a reconnected client asks
+ * again for refs still pending from its predecessor. A rejected call is not
+ * cached and a later mount retries. Without a ref no IPC happens at all.
  */
 export function useMcpIcon(iconRef: string | undefined): string | null {
   const { api } = useAPI();
@@ -18,16 +20,14 @@ export function useMcpIcon(iconRef: string | undefined): string | null {
   useEffect(() => {
     if (!api || iconRef === undefined || mcpIconRefCache.peek(iconRef) !== undefined) return;
     let ignore = false;
-    mcpIconRefCache
-      .resolve(iconRef, (ref) => api.mcp.icon({ iconRef: ref }))
-      .then(
-        (icon) => {
-          if (!ignore) setResolved({ iconRef, icon });
-        },
-        () => {
-          // Not cached: the next mount of any row with this ref retries.
-        }
-      );
+    mcpIconRefCache.resolve(iconRef, api).then(
+      (icon) => {
+        if (!ignore) setResolved({ iconRef, icon });
+      },
+      () => {
+        // Not cached: the next mount of any row with this ref retries.
+      }
+    );
     return () => {
       ignore = true;
     };

@@ -133,9 +133,12 @@ describeIntegration("MCP tool call identity in chat", () => {
     const env = await createTestEnvironment();
     const repoPath = await createTempGitRepo();
     await trustProject(env, repoPath);
-    const getIcon = jest
-      .spyOn(env.services.mcpServerManager, "getIcon")
-      .mockImplementation((iconRef: string) => Promise.resolve(ICONS[iconRef] ?? null));
+    const getIcon = jest.spyOn(env.services.mcpServerManager, "getIcon");
+    const getIcons = jest
+      .spyOn(env.services.mcpServerManager, "getIcons")
+      .mockImplementation((iconRefs: readonly string[]) =>
+        Promise.resolve(Object.fromEntries(iconRefs.map((ref) => [ref, ICONS[ref] ?? null])))
+      );
     const cleanupDom = installDom();
     let view: ReturnType<typeof renderApp> | undefined;
     let workspaceId: string | undefined;
@@ -178,7 +181,7 @@ describeIntegration("MCP tool call identity in chat", () => {
       const pages = toolCard(root, NOTION_PAGES);
       const pagesBadge = within(pages.header).getByRole("button", { name: INFO_BUTTON });
       await waitFor(() => {
-        if (!getIcon.mock.calls.some(([ref]) => ref === REF_GONE))
+        if (!getIcons.mock.calls.some(([refs]) => refs.includes(REF_GONE)))
           throw new Error("Unknown ref not looked up");
       });
       expect(pagesBadge.querySelector("img")).toBeNull();
@@ -194,8 +197,11 @@ describeIntegration("MCP tool call identity in chat", () => {
       expect(
         within(toolCard(root, "bash").header).queryByRole("button", { name: /Server information/ })
       ).toBeNull();
-      // One IPC lookup per ref, shared by every row using it.
-      expect(getIcon.mock.calls.filter(([ref]) => ref === REF_A)).toHaveLength(1);
+      // Every distinct ref on screen travels in ONE bulk lookup; rows sharing a
+      // ref (top-level + nested A) coalesce, and the singular lookup is unused.
+      expect(getIcons).toHaveBeenCalledTimes(1);
+      expect([...getIcons.mock.calls[0][0]].sort()).toEqual([REF_A, REF_B, REF_GONE].sort());
+      expect(getIcon).not.toHaveBeenCalled();
 
       // Badge click opens details without expanding the tool; Escape closes; header click expands.
       fireEvent.click(searchBadge);
