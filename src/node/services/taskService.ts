@@ -119,7 +119,12 @@ import { defaultModel, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  runtimeModeSupportsSharedTaskWorkspace,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import type {
   ProjectRef,
   WorkspaceMetadata,
@@ -6602,6 +6607,19 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "invalid_scope" as const });
       }
 
+      const unrelatedRuntimeRefusal = {
+        code: "refused" as const,
+        reason: "Unrelated messages require local or worktree runtimes on both endpoints.",
+      };
+      // Preserve remote/container isolation without changing the existing same-tree policy.
+      if (
+        relation === "target_unrelated" &&
+        (!this.isLocalUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+          !this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace))
+      ) {
+        return Err(unrelatedRuntimeRefusal);
+      }
+
       // Terminal and archived senders cannot wake peers. A reawakened child may send only while
       // its mirrored workspace-turn execution is running and backed by an accepted live handle;
       // queued/starting reservations still belong to the previous terminal execution.
@@ -6987,6 +7005,15 @@ export class TaskService implements AgentTaskIntegration {
           const freshEntry = findWorkspaceEntry(freshCfg, targetId);
           if (freshEntry == null) {
             admissionRefusal = { code: "not_found" as const };
+            return true;
+          }
+          // Runtime can change during preparation or while queued; recheck both ends at dispatch.
+          if (
+            relation === "target_unrelated" &&
+            (!this.isLocalUnrelatedMessagingEndpoint(freshSender.workspace) ||
+              !this.isLocalUnrelatedMessagingEndpoint(freshEntry.workspace))
+          ) {
+            admissionRefusal = unrelatedRuntimeRefusal;
             return true;
           }
           // Archive is reversible-only but stops delivery: a target archived after the initial
@@ -11299,6 +11326,22 @@ export class TaskService implements AgentTaskIntegration {
     throw new Error(
       `resolveRootWorkspaceIdUsingParentById: possible parentWorkspaceId cycle starting at ${workspaceId}`
     );
+  }
+
+  private isLocalUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
+    let runtimeConfig = workspace.runtimeConfig;
+    if (runtimeConfig === undefined) {
+      // Only complete inline metadata owns the default. A partly migrated entry can still
+      // resolve to SSH from metadata.json; wait for that migration rather than guessing local.
+      if (
+        coerceNonEmptyString(workspace.id) == null ||
+        coerceNonEmptyString(workspace.name) == null
+      ) {
+        return false;
+      }
+      runtimeConfig = DEFAULT_RUNTIME_CONFIG;
+    }
+    return isLocalProjectRuntime(runtimeConfig) || isWorktreeRuntime(runtimeConfig);
   }
 
   /**
