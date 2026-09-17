@@ -3258,7 +3258,7 @@ describe("session_history descendant task history", () => {
     await appendChild("child-two", "child two");
     expect(
       (await completeAs({ action: "list_items", task_id: childId, role: "user" })).warnings
-    ).toEqual(expect.arrayContaining(["oversized_rows_skipped"]) as string[]);
+    ).toContain("oversized_rows_skipped");
   });
 
   test("a receipt found in a chunk with an unfinished caller scan authorizes that same chunk", async () => {
