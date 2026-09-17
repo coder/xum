@@ -37,12 +37,12 @@ interface GenericToolCallProps {
  * Own component so only branded rows subscribe to the API context and the
  * icon lookup; plain rows keep their exact previous render tree.
  */
-const McpServerBadge: React.FC<{ mcpServer: MCPToolCallDisplay }> = ({ mcpServer }) => (
+const McpServerBadge: React.FC<{ mcpServer: MCPToolCallDisplay }> = (props) => (
   <MCPServerIdentityBadge
     compact
-    connection={mcpServer.connection}
-    identity={mcpServer.identity}
-    icon={useMcpIcon(mcpServer.iconRef)}
+    connection={props.mcpServer.connection}
+    identity={props.mcpServer.identity}
+    icon={useMcpIcon(props.mcpServer.iconRef)}
   />
 );
 

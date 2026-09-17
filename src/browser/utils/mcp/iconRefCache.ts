@@ -1,67 +1,77 @@
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { assert } from "@/common/utils/assert";
 
 type IconLookup = (iconRef: string) => Promise<string | null>;
 
+type Entry =
+  | { state: "pending"; request: Promise<string | null> }
+  | { state: "resolved"; value: string | null };
+
 /**
- * Renderer-session memo for `mcp.icon` lookups keyed by immutable iconRef:
- * one in-flight request per ref, resolved values (including null for refs the
- * host no longer knows) kept in a bounded LRU, rejected requests never stored
- * so a later mount retries. Refs are immutable, so a cached answer never
- * needs invalidation; eviction only bounds memory.
+ * Renderer-session memo for `mcp.icon` lookups keyed by immutable iconRef.
+ * One bounded LRU map holds pending and resolved entries alike: one in-flight
+ * request per ref, resolved values (including null for refs the host no longer
+ * knows) kept, rejected requests dropped so a later mount retries. Refs are
+ * immutable, so a cached answer never needs invalidation; eviction only bounds
+ * memory, and a request evicted while pending may complete later without
+ * touching whatever entry the ref has by then.
  */
 export class McpIconRefCache {
-  private readonly resolved = new Map<string, string | null>();
-  private readonly inflight = new Map<string, Promise<string | null>>();
+  private readonly entries = new Map<string, Entry>();
 
-  constructor(private readonly capacity: number) {}
+  constructor(private readonly capacity: number) {
+    assert(Number.isInteger(capacity) && capacity > 0, "icon cache capacity must be positive");
+  }
+
+  /** Number of pending + resolved entries (test seam for the bound). */
+  get size(): number {
+    return this.entries.size;
+  }
 
   /** Cached answer without touching recency (safe to call while rendering). */
   peek(iconRef: string): string | null | undefined {
-    return this.resolved.get(iconRef);
+    const entry = this.entries.get(iconRef);
+    return entry?.state === "resolved" ? entry.value : undefined;
   }
 
   resolve(iconRef: string, lookup: IconLookup): Promise<string | null> {
-    const cached = this.resolved.get(iconRef);
-    if (cached !== undefined) {
-      // Refresh recency on hit.
-      this.resolved.delete(iconRef);
-      this.resolved.set(iconRef, cached);
-      return Promise.resolve(cached);
+    const existing = this.entries.get(iconRef);
+    if (existing) {
+      // Refresh recency on hit (pending or resolved).
+      this.entries.delete(iconRef);
+      this.entries.set(iconRef, existing);
+      return existing.state === "resolved" ? Promise.resolve(existing.value) : existing.request;
     }
-    const pending = this.inflight.get(iconRef);
-    if (pending) return pending;
     // new Promise(resolve => resolve(lookup(...))) turns a synchronous throw
     // (e.g. an API surface without mcp.icon) into an ordinary rejection.
     const request: Promise<string | null> = new Promise<string | null>((resolve) =>
       resolve(lookup(iconRef))
     ).then(
       (icon) => {
-        // Only the request still registered for this ref may write; a
-        // superseded completion (after reset) must not resurrect an entry.
-        if (this.inflight.get(iconRef) === request) {
-          this.inflight.delete(iconRef);
-          this.resolved.set(iconRef, icon);
-          while (this.resolved.size > this.capacity) {
-            const oldest = this.resolved.keys().next().value;
-            if (oldest === undefined) break;
-            this.resolved.delete(oldest);
-          }
+        // Only the request this ref still owns may write; an evicted or
+        // superseded request must neither reinsert nor overwrite.
+        if (this.owns(iconRef, request)) {
+          this.entries.set(iconRef, { state: "resolved", value: icon });
         }
         return icon;
       },
       (error: unknown) => {
-        if (this.inflight.get(iconRef) === request) this.inflight.delete(iconRef);
+        if (this.owns(iconRef, request)) this.entries.delete(iconRef);
         throw error;
       }
     );
-    this.inflight.set(iconRef, request);
+    this.entries.set(iconRef, { state: "pending", request });
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
     return request;
   }
 
-  /** Forget everything; completions of older requests are ignored afterwards. */
-  reset(): void {
-    this.resolved.clear();
-    this.inflight.clear();
+  private owns(iconRef: string, request: Promise<string | null>): boolean {
+    const entry = this.entries.get(iconRef);
+    return entry?.state === "pending" && entry.request === request;
   }
 }
 
