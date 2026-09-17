@@ -1590,7 +1590,8 @@ export const TaskListToolArgsSchema = z
       .array(TaskListStatusSchema)
       .nullish()
       .describe(
-        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus the root row under scope:"tree"). ' +
+        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus workspace rows under scope:"tree" or scope:"instance"). ' +
+          'Instance rows all have status "workspace"; an explicit statuses list must include "workspace" to return them. ' +
           "Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. " +
           "Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. " +
           "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow."
