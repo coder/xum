@@ -3622,6 +3622,7 @@ describe("session_history descendant task history", () => {
 
   test("a caller reset appended between chunks denies the read after the restart", async () => {
     await spawn([childId]);
+    await appendChild("child-one", "child one");
     await seedChildFiller("child-filler");
     const seam = mutateBetweenChunks(() =>
       append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true })
@@ -4083,7 +4084,11 @@ describe("session_history complete results", () => {
     const result = await complete({ action: "search", query: "facts" });
     expect(result.items?.map((item) => item.text)).toEqual(["opening facts", "later facts"]);
     expect(result.warnings?.toSorted()).toEqual(["malformed_rows_skipped", "oversized_rows_skipped"]);
-    expect((await complete({ action: "list_windows" })).warnings).toEqual(["malformed_rows_skipped"]);
+    // The scan skips those rows whatever the action asks for.
+    expect((await complete({ action: "list_windows" })).warnings?.toSorted()).toEqual([
+      "malformed_rows_skipped",
+      "oversized_rows_skipped",
+    ]);
   });
 
   test("a read spanning several chunks returns its rows in one call", async () => {

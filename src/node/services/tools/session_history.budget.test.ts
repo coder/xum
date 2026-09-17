@@ -15,6 +15,9 @@ import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 
 /** Production chunk budgets apply here; record every scan the tool issues, in order. */
 let scanned: string[];
+// Runs under both history locks after each scan; never mutates history (Bun's spyOn returns
+// the same mock for an already-spied method, so tests hook here instead of nesting spies).
+let afterScan: ((workspace: string) => void) | undefined;
 
 let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
 const workspaceId = "budget-history";
@@ -24,11 +27,14 @@ const serialize = (messages: MuxMessage[]) =>
 beforeEach(async () => {
   fixture = await createTestHistoryService();
   scanned = [];
+  afterScan = undefined;
   const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
   spyOn(fixture.historyService, "scanHistoryBoundedUnderLocks").mockImplementation(
-    (workspace, options) => {
+    async (workspace, options) => {
       scanned.push(workspace);
-      return scan(workspace, options);
+      const page = await scan(workspace, options);
+      afterScan?.(workspace);
+      return page;
     }
   );
 });
@@ -179,7 +185,12 @@ test.each([false, true])(
       createMuxMessage(`row-${index}`, index % 1000 === 0 ? "user" : "assistant", `row ${index}`)
     );
     await seed(rows);
-    const result = await call({ action: "list_items", role: "user", recent_first: recentFirst });
+    const result = await call({
+      action: "list_items",
+      role: "user",
+      recent_first: recentFirst,
+      limit: 25,
+    });
     expect(result).toMatchObject({ success: true, has_more: false });
     // 10,040 rows exceed one chunk's row allowance twice over (floor pass, then browse).
     expect(scanned.length).toBeGreaterThanOrEqual(2);
@@ -312,20 +323,13 @@ test.each(["deadline", "caller abort", "target abort"] as const)(
     let now = 0;
     let validations = 0;
     const clock = spyOn(performance, "now").mockImplementation(() => now);
-    const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
-    const validate = spyOn(
-      fixture.historyService,
-      "scanHistoryBoundedUnderLocks"
-    ).mockImplementation(async (...args) => {
-      scanned.push(args[0]);
-      const result = await scan(...args);
+    afterScan = () => {
       validations++;
       // The first authorization scan consumes the chunk's 2 s allowance ...
       if (mode === "deadline") {
         if (validations === 1) now = 2_001;
       } else if (validations === (mode === "caller abort" ? 1 : 2)) controller.abort(reason);
-      return result;
-    });
+    };
     try {
       const operation = call({ action: "list_items", task_id: "child" }, controller.signal);
       if (mode === "deadline") {
@@ -336,7 +340,7 @@ test.each(["deadline", "caller abort", "target abort"] as const)(
         expect(scanned).toEqual([workspaceId, workspaceId, "child"]);
       } else expect(await operation.catch((error: unknown) => error)).toBe(reason);
     } finally {
-      validate.mockRestore();
+      afterScan = undefined;
       clock.mockRestore();
     }
     // Neither authorization nor target cancellation may leak either lock.
