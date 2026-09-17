@@ -45,6 +45,8 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
 export type BackgroundProcessFixture = BackgroundProcessInfo;
 
 export interface SimpleChatSetupOptions {
+  /** Session icon registry for mcp.icon (iconRef -> PNG data URL). */
+  mcpIcons?: Map<string, string>;
   workspaceId?: string;
   workspaceName?: string;
   projectName?: string;
@@ -188,6 +190,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
     timelineEvents: opts.timelineEvents,
+    mcpIcons: opts.mcpIcons,
   });
 }
 

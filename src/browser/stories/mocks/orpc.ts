@@ -270,6 +270,8 @@ export interface MockORPCClientOptions {
   >;
   /** MCP test results - maps server name to tools list (optionally with serverInfo) or error */
   mcpTestResults?: Map<string, MockMcpTestResult>;
+  /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
+  mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
   listBranches?: (input: {
     projectPath: string;
@@ -408,6 +410,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
     mcpTestResults = new Map<string, MockMcpTestResult>(),
+    mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
@@ -1221,6 +1224,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         // Default: return empty tools.
         return Promise.resolve({ success: true, tools: [] });
       },
+      icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
       setEnabled: (input: { name: string; enabled: boolean }) => {
         const server = globalMcpServersState[input.name];
         if (server) {

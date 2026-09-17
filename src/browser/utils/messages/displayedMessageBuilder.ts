@@ -641,6 +641,7 @@ function appendToolRows(
     historySequence: options.historySequence,
     isLastPartOfMessage: options.isLastPartOfMessage,
     ...(part.workflowRun != null ? { workflowRun: part.workflowRun } : {}),
+    ...(part.mcpServer != null ? { mcpServer: part.mcpServer } : {}),
     timestamp: part.timestamp ?? options.baseTimestamp,
     ...(part.executionStartedAt != null ? { executionStartedAt: part.executionStartedAt } : {}),
     nestedCalls,

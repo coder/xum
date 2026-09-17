@@ -1349,6 +1349,8 @@ export type DisplayedMessage =
       executionStartedAt?: number;
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
+      /** Host-authored MCP identity frozen for this call (display only, never relabeled). */
+      mcpServer?: MuxToolPart["mcpServer"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
       // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
       // persist without an input key.
@@ -1362,6 +1364,8 @@ export type DisplayedMessage =
         timestamp?: number;
         /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
         workflowRun?: MuxToolPart["workflowRun"];
+        /** Frozen MCP identity captured for this nested call (see NestedToolCallSchema). */
+        mcpServer?: MuxToolPart["mcpServer"];
       }>;
     }
   | {

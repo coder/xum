@@ -17,19 +17,41 @@ import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/to
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import { redactToolResultAttachmentsForDisplay } from "./Shared/toolResultDisplay";
 import { ToolResultImages, extractImagesFromToolResult } from "./Shared/ToolResultImages";
+import { MCPServerIdentityBadge } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
+import { useMcpIcon } from "@/browser/hooks/useMcpIcon";
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 
 interface GenericToolCallProps {
   toolName: string;
   args?: unknown;
   result?: unknown;
   status?: ToolStatus;
+  /**
+   * Host-authored MCP identity frozen on the tool part for this call. Rows
+   * without a snapshot (non-MCP tools, older history) render exactly as before.
+   */
+  mcpServer?: MCPToolCallDisplay;
 }
+
+/**
+ * Own component so only branded rows subscribe to the API context and the
+ * icon lookup; plain rows keep their exact previous render tree.
+ */
+const McpServerBadge: React.FC<{ mcpServer: MCPToolCallDisplay }> = ({ mcpServer }) => (
+  <MCPServerIdentityBadge
+    compact
+    connection={mcpServer.connection}
+    identity={mcpServer.identity}
+    icon={useMcpIcon(mcpServer.iconRef)}
+  />
+);
 
 export const GenericToolCall: React.FC<GenericToolCallProps> = ({
   toolName,
   args,
   result,
   status = "pending",
+  mcpServer,
 }) => {
   const { expanded, toggleExpanded } = useToolExpansion();
 
@@ -44,6 +66,7 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
         {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
+        {mcpServer && <McpServerBadge mcpServer={mcpServer} />}
         {TOOL_NAME_TO_ICON[toolName] && <ToolIcon toolName={toolName} />}
         <ToolName>{toolName}</ToolName>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
