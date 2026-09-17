@@ -117,8 +117,19 @@ function setupChat(options: {
   if (options.phone) collapseLeftSidebar();
   else expandLeftSidebar();
   expandProjects(["/home/user/projects/xum"]);
+  // The app's singleton WorkspaceStore retains history by workspace ID across
+  // story switches. Distinct fixture histories need distinct workspace IDs.
+  const variant = options.phone
+    ? "phone"
+    : options.nested
+      ? "nested"
+      : options.historical
+        ? "historical"
+        : options.branded
+          ? "branded"
+          : "plain";
   return setupSimpleChatStory({
-    workspaceId: "ws-mcp-tool-identity",
+    workspaceId: `ws-mcp-tool-identity-${variant}`,
     workspaceName: "mcp-server-identity",
     projectName: "xum",
     mcpIcons: new Map([[REF_LIVE, NOTION_ICON]]),
