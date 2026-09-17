@@ -18,7 +18,10 @@ export function useMcpIcon(iconRef: string | undefined): string | null {
   const [resolved, setResolved] = useState<{ iconRef: string; icon: string | null } | null>(null);
 
   useEffect(() => {
-    if (!api || iconRef === undefined || mcpIconRefCache.peek(iconRef) !== undefined) return;
+    if (!api || iconRef === undefined) return;
+    // No cache-hit short-circuit here: the entry can settle between this row's
+    // render (which saw it pending) and this passive effect; resolve() answers a
+    // hit from memory without IPC, and the state update repaints the icon.
     let ignore = false;
     mcpIconRefCache.resolve(iconRef, api).then(
       (icon) => {

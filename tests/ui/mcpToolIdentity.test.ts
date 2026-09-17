@@ -10,7 +10,6 @@ import {
 } from "../ipc/helpers";
 import type { TestEnvironment } from "../ipc/setup";
 import { detectDefaultTrunkBranch } from "@/node/git";
-import { HistoryService } from "@/node/services/historyService";
 import { createMuxMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { installDom } from "./dom";
@@ -44,7 +43,8 @@ function snapshot(iconRef: string | undefined, version = "1.2.0"): MCPToolCallDi
 }
 
 async function seedHistory(env: TestEnvironment, workspaceId: string) {
-  const history = new HistoryService(env.config);
+  // Seed through the environment's own history service, not a second instance.
+  const history = env.services.toORPCContext().historyService;
   const text = { content: [{ type: "text", text: "ok" }] };
   for (const message of [
     createMuxMessage("u1", "user", "Find the setup guide."),
