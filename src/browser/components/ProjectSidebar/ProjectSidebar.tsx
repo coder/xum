@@ -52,7 +52,6 @@ import {
   partitionWorkspacesByAge,
   buildSortedWorkspacesFlat,
   findMostRecentlyCreatedWorkspace,
-  parseTimestampMs,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
@@ -137,11 +136,7 @@ import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceS
 import { WorkspaceDragLayer } from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { Separator } from "../Separator/Separator";
 import { ScrollArea } from "../ScrollArea/ScrollArea";
-import {
-  getProjectDisplayName,
-  getSubProjectsForParent,
-  resolveWorkspaceCreationScope,
-} from "@/common/utils/subProjects";
+import { getProjectDisplayName, getSubProjectsForParent } from "@/common/utils/subProjects";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
@@ -2592,36 +2587,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     );
   };
 
-  // Default the flat-mode "New chat" to the project of the most recently
-  // created chat, including unsent drafts (flatDrafts is newest-first); only
-  // fall back to Scratch when that chat is a scratch chat or there are no
-  // chats at all. Candidates are the rows that actually render, so hidden
-  // sub-agents (SIDEBAR_HIDE_SUBAGENTS_KEY) and empty drafts do not count.
+  // Default the flat-mode "New chat" to the project of the chat the user
+  // created most recently; fall back to Scratch only when that chat is a
+  // scratch chat or there are no chats. The target is defined by creation
+  // time alone, not by what currently renders: unsent drafts and sub-agent
+  // children are not user-created chats, and render-time filters (hidden
+  // sub-agents, collapsed age tiers, draft promotion) do not change the answer.
   const handleAddFlatWorkspace = () => {
     const recentWorkspace = findMostRecentlyCreatedWorkspace(
-      visibleFlatWorkspaces,
+      excludeSubAgentRows(flatWorkspaces),
       workspaceRecency
     );
-    // Same draft visibility predicate as the grouped renderer.
-    const recentDraft = flatDrafts.find(
-      ({ projectPath, draft }) =>
-        draftVisibilityByProject[projectPath]?.[draft.draftId] ??
-        isDraftVisible(projectPath, draft.draftId)
-    );
-    if (
-      recentDraft &&
-      (!recentWorkspace ||
-        recentDraft.draft.createdAt > parseTimestampMs(recentWorkspace.createdAt))
-    ) {
-      // Drop a sub-project that was deleted since the draft was created, like
-      // handleAddSiblingWorkspace does for persisted chats.
-      const scope = resolveWorkspaceCreationScope(
-        recentDraft.projectPath,
-        userProjects,
-        recentDraft.draft.subProjectPath
-      );
-      handleAddWorkspace(scope.projectPath, scope.subProjectPath ?? undefined);
-    } else if (recentWorkspace) {
+    if (recentWorkspace) {
       handleAddSiblingWorkspace(recentWorkspace);
     } else {
       handleAddScratchWorkspace();
