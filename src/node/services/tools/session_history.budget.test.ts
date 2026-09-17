@@ -149,7 +149,7 @@ test("a target window behind 40 MiB of earlier rows is listed in one call across
     row.id = `prefix-${offset}`;
     row.metadata = { ...row.metadata, timestamp: 1, historySequence: 5_000 + offset };
   });
-  const targetWindow = `w:${prefix[0].metadata!.historySequence}`;
+  const targetWindow = `w:${String(prefix[0].metadata!.historySequence)}`;
   const requests = ["first request after rollover", "second request after rollover"];
   await seed(
     [
@@ -160,7 +160,10 @@ test("a target window behind 40 MiB of earlier rows is listed in one call across
           historySequence: 6_000 + index,
         })
       ),
-      createMuxMessage("reply", "assistant", "assistant reply", { timestamp: 1, historySequence: 7_000 }),
+      createMuxMessage("reply", "assistant", "assistant reply", {
+        timestamp: 1,
+        historySequence: 7_000,
+      }),
     ],
     bulk
   );
@@ -371,11 +374,13 @@ test("a read that never completes a chunk before the tool deadline is history_ti
     expect(await call({ action: "list_items" })).toEqual({
       success: false,
       error: "history_timeout",
-      notice: expect.stringContaining("narrow"),
+      notice: expect.stringContaining("narrow") as string,
     });
   } finally {
     clock.mockRestore();
   }
   expect(scanned.length).toBeGreaterThan(1);
-  expect((await call({ action: "list_items" })).items?.map((item) => item.text)).toEqual(["visible"]);
+  expect((await call({ action: "list_items" })).items?.map((item) => item.text)).toEqual([
+    "visible",
+  ]);
 });

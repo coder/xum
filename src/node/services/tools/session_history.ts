@@ -176,7 +176,11 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
   const history = config.historyService;
   assert(history, "session_history requires a persistent HistoryService");
   const taskService = config.taskService;
-  type Authorization = { branchRoot: string; scan: HistoryScanState; proven: boolean };
+  interface Authorization {
+    branchRoot: string;
+    scan: HistoryScanState;
+    proven: boolean;
+  }
   // Why the visitor stopped: "limit" and "payload" prove a further match exists beyond the
   // response; "found" is read_item's row. A finished scan that never stopped is "exhausted".
   type Stop = "found" | "limit" | "payload" | "exhausted";
@@ -196,7 +200,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // provenance reads and handle cleanup run to completion, so it is not a wall-clock bound.
       const deadline = performance.now() + SESSION_HISTORY_TOOL_DEADLINE_MS;
       const args = TOOL_DEFINITIONS.session_history.schema.parse(input);
-      if (args.action === "search" && !args.query) return { success: false, error: "query_required" };
+      if (args.action === "search" && !args.query)
+        return { success: false, error: "query_required" };
       if (args.action === "read_item" && !args.item_id)
         return { success: false, error: "item_id_required" };
       // Reject rather than silently ignore filters on actions that cannot honor them.

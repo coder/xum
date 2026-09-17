@@ -9,7 +9,6 @@ import {
 } from "@/node/services/workspaceRemoval";
 import type { TaskService } from "@/node/services/taskService";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
-import { HistoryService } from "@/node/services/historyService";
 import { hasRawResetMarker, type BoundedHistoryScanResult } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -41,7 +40,7 @@ let restoreScanBudget: () => void;
 const workspaceId = "history-browser";
 let chatPath: string;
 let archivePath: string;
-let call: (input: SessionHistoryArgs, workspace?: string) => Promise<SessionHistoryResult>;
+let call: (input: SessionHistoryArgs, abortSignal?: AbortSignal) => Promise<SessionHistoryResult>;
 async function append(
   id: string,
   text: string,
@@ -71,9 +70,9 @@ async function appendTrackedHistory(filePath: string, data: string | Buffer): Pr
  */
 async function complete(
   input: SessionHistoryArgs,
-  options?: { hasMore?: boolean; workspace?: string }
+  options?: { hasMore?: boolean }
 ): Promise<SessionHistoryResult> {
-  const result = await call(input, options?.workspace);
+  const result = await call(input);
   if (input.action === "read_item") {
     expect(result.has_more).toBeUndefined();
     if (result.error === "item_not_found")
@@ -103,7 +102,8 @@ const windowsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolea
   (await complete(input, options)).windows ?? [];
 const windowIdsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolean }) =>
   (await windowsOf(input, options)).map((window) => window.windowId);
-const readError = async (item_id: string) => (await complete({ action: "read_item", item_id })).error;
+const readError = async (item_id: string) =>
+  (await complete({ action: "read_item", item_id })).error;
 /** A tracked (cooperatively receipted) raw append, as another local writer would produce. */
 const appendRawRows = (rows: Array<MuxMessage | string>) =>
   appendTrackedHistory(
@@ -152,17 +152,44 @@ function mutateBetweenChunks(
   options?: { chunk?: number; caller?: string }
 ) {
   const target = options?.chunk ?? 1;
+  let runs = 0;
   const seam = afterChunks(async (chunk) => {
     if (chunk !== target) return;
-    seam.runs++;
+    runs++;
     await mutate();
   }, options?.caller);
-  return Object.assign(seam, { runs: 0, target });
+  return {
+    target,
+    restore: seam.restore,
+    get runs() {
+      return runs;
+    },
+    get chunks() {
+      return seam.chunks;
+    },
+  };
 }
 /** The hook ran exactly once, and a later chunk followed it (it was not the final chunk). */
 function expectIntermediate(seam: ReturnType<typeof mutateBetweenChunks>) {
   expect(seam.runs).toBe(1);
   expect(seam.chunks).toBeGreaterThan(seam.target);
+}
+/**
+ * "Direct and between-chunk" privacy checks: seed filler so the search needs several
+ * chunks, run `mutate` after its first (intermediate) chunk, and return the single call's
+ * texts. The restarted read must honor whatever `mutate` appended.
+ */
+async function searchInterleaved(query: string, mutate: () => Promise<unknown>) {
+  await seedFiller(undefined, `interleaved-${query.length}`);
+  const seam = mutateBetweenChunks(mutate);
+  let texts: string[];
+  try {
+    texts = await textsOf({ action: "search", query });
+  } finally {
+    seam.restore();
+  }
+  expectIntermediate(seam);
+  return texts;
 }
 /** Controllable performance.now() shared by the tool and the scanner. Restore in finally. */
 function fakeClock(start = 0) {
@@ -175,15 +202,16 @@ function fakeClock(start = 0) {
     restore: () => spy.mockRestore(),
   };
 }
+// Data-free error results: the notice tells the model how to recover, nothing else is present.
 const TIMEOUT_RESULT = {
   success: false,
   error: "history_timeout",
-  notice: expect.stringContaining("narrow"),
+  notice: expect.stringContaining("narrow") as string,
 };
 const CHANGED_RESULT = {
   success: false,
   error: "history_changed",
-  notice: expect.stringContaining("retry"),
+  notice: expect.stringContaining("retry") as string,
 };
 const rollover: MuxMetadata = {
   contextBoundaryKind: "reset",
@@ -225,12 +253,12 @@ beforeEach(async () => {
   restoreScanBudget = () => budgetSpy.mockRestore();
   chatPath = path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl");
   archivePath = path.join(fixture.config.sessionsDir, workspaceId, "chat-archive.jsonl");
-  call = async (input, workspace = workspaceId) => {
-    const config = createTestToolConfig(fixture.tempDir, { workspaceId: workspace });
+  call = async (input, abortSignal) => {
+    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
     config.historyService = fixture.historyService;
     const tool = createSessionHistoryTool(config);
     return TOOL_DEFINITIONS.session_history.resultSchema.parse(
-      await tool.execute!(input, mockToolCallOptions)
+      await tool.execute!(input, { ...mockToolCallOptions, abortSignal })
     );
   };
   await append("first", "opening facts");
@@ -240,57 +268,7 @@ afterEach(async () => {
   await fixture.cleanup();
 });
 
-describe("session_history continuations", () => {
-  test("short handles survive tool recreation and concurrent retries without advancing the source", async () => {
-    await append("second", "second facts");
-    await append("third", "third facts");
-    const args = { action: "list_items", limit: 1 } as const;
-    const first = await call(args);
-    expect(first.status).toBe("partial");
-    expect(first.nextCursor).toBeString();
-    expect(first.nextCursor!.length).toBeLessThanOrEqual(64);
-    const retries = await Promise.all([
-      call({ ...args, cursor: first.nextCursor }),
-      call({ ...args, cursor: first.nextCursor }),
-    ]);
-    expect(retries[0].items?.map((item) => item.text)).toEqual(["second facts"]);
-    expect(retries[1].items).toEqual(retries[0].items);
-    expect((await call({ ...args, cursor: retries[0].nextCursor })).status).toBe("complete");
-    expect((await call({ ...args, cursor: first.nextCursor })).items).toEqual(retries[0].items);
-  });
-
-  test("handles cannot cross service roots or survive a backend restart", async () => {
-    await append("second", "second facts");
-    const args = { action: "list_items", limit: 1 } as const;
-    const first = await call(args);
-    const other = await createTestHistoryService();
-    try {
-      const config = createTestToolConfig(other.tempDir, { workspaceId });
-      config.historyService = other.historyService;
-      const result: unknown = await createSessionHistoryTool(config).execute!(
-        { ...args, cursor: first.nextCursor },
-        mockToolCallOptions
-      );
-      expect(result).toMatchObject({ success: false, error: "invalid_cursor" });
-    } finally {
-      await other.cleanup();
-    }
-    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
-    config.historyService = new HistoryService(fixture.config);
-    expect(
-      await createSessionHistoryTool(config).execute!(
-        { ...args, cursor: first.nextCursor },
-        mockToolCallOptions
-      )
-    ).toMatchObject({ success: false, error: "invalid_cursor" });
-    expect(
-      await createSessionHistoryTool(config).execute!(args, mockToolCallOptions)
-    ).toMatchObject({
-      success: true,
-      items: first.items,
-    });
-  });
-
+describe("session_history tool wiring", () => {
   test("the tool requires the persistent HistoryService", () => {
     const config = createTestToolConfig(fixture.tempDir, { workspaceId });
     config.historyService = undefined;
@@ -299,7 +277,7 @@ describe("session_history continuations", () => {
 });
 
 describe("session_history real disk recovery", () => {
-  test("an interior same-length rewrite followed by append cannot retain cursor trust", async () => {
+  test("an interior same-length rewrite between chunks restarts once; a repeat is history_changed", async () => {
     const victim = JSON.stringify(createMuxMessage("rewrite-victim", "assistant", "x".repeat(600)));
     const offset = (await fs.stat(chatPath)).size;
     await fs.appendFile(
@@ -314,24 +292,38 @@ describe("session_history real disk recovery", () => {
           .join("\n") +
         "\n"
     );
-    const first = await call({ action: "search", query: "facts", limit: 1 });
-    expect(first.nextCursor).toBeString();
-    const reset = JSON.stringify(
-      createMuxMessage("new-manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
-    );
-    const handle = await fs.open(chatPath, "r+");
+    await seedFiller();
+    const reset = JSON.stringify(manualReset("new-manual-reset"));
+    // An untracked writer turns the victim into a reset in place and appends a row.
+    const rewriteAndAppend = async (id: string) => {
+      const handle = await fs.open(chatPath, "r+");
+      try {
+        await handle.write(Buffer.from(reset.padEnd(victim.length)), 0, victim.length, offset);
+      } finally {
+        await handle.close();
+      }
+      await fs.appendFile(
+        chatPath,
+        JSON.stringify(createMuxMessage(id, "assistant", "new row")) + "\n"
+      );
+    };
+    const once = mutateBetweenChunks(() => rewriteAndAppend("untracked-append"));
     try {
-      await handle.write(Buffer.from(reset.padEnd(victim.length)), 0, victim.length, offset);
+      // The fresh baseline honors the rewritten reset: rows before it are gone.
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["private facts"]);
     } finally {
-      await handle.close();
+      once.restore();
     }
-    await fs.appendFile(
-      chatPath,
-      JSON.stringify(createMuxMessage("untracked-append", "assistant", "new row")) + "\n"
-    );
-    expect((await call({ action: "search", query: "facts", cursor: first.nextCursor })).error).toBe(
-      "stale_cursor"
-    );
+    expectIntermediate(once);
+    const twice = afterChunks(async (chunk) => {
+      if (chunk <= 2) await rewriteAndAppend(`untracked-${chunk}`);
+    });
+    try {
+      expect(await call({ action: "search", query: "facts" })).toEqual(CHANGED_RESULT);
+    } finally {
+      twice.restore();
+    }
+    expect(twice.chunks).toBe(2);
   });
 
   for (const targetArtifact of ["active", "archive"] as const) {
@@ -385,21 +377,15 @@ describe("session_history real disk recovery", () => {
           ]);
           expect(retained.includes(reset)).toBe(true);
           expect(retained.includes(Buffer.from("opening facts"))).toBe(true);
-          expect(
-            (await pages({ action: "search", query: "opening facts" })).flatMap(
-              (page) => page.items ?? []
-            )
-          ).toEqual([]);
-          expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+          expect(await itemsOf({ action: "search", query: "opening facts" })).toEqual([]);
+          expect((await complete({ action: "read_item", item_id: "0" })).error).toBe(
             "item_not_found"
           );
           expect(
-            (await pages({ action: "list_windows" }))
-              .flatMap((page) => page.windows ?? [])
-              .some(
-                (window) =>
-                  window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
-              )
+            (await windowsOf({ action: "list_windows" })).some(
+              (window) =>
+                window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
+            )
           ).toBe(false);
         }
       );
@@ -426,9 +412,7 @@ describe("session_history real disk recovery", () => {
       expect(retained.includes(reset)).toBe(true);
       expect(retained.includes(Buffer.from("opening facts"))).toBe(true);
       expect(retained.includes(Buffer.from("discarded-active"))).toBe(false);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     }
   );
 
@@ -454,9 +438,7 @@ describe("session_history real disk recovery", () => {
     expect(retained.success).toBe(true);
     if (!retained.success) throw new Error(retained.error);
     expect(retained.data.map((row) => row.id)).toContain(target.id);
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   test.each([
@@ -474,11 +456,7 @@ describe("session_history real disk recovery", () => {
       if (!result.success) throw new Error(result.error);
       expect(result.data.length).toBeGreaterThan(0);
       expect((await fs.readFile(chatPath)).includes(invalid)).toBe(true);
-      expect(
-        (await pages({ action: "search", query: "retained facts" })).flatMap(
-          (page) => page.items ?? []
-        ).length
-      ).toBe(1);
+      expect((await itemsOf({ action: "search", query: "retained facts" })).length).toBe(1);
     }
   );
 
@@ -518,15 +496,14 @@ describe("session_history real disk recovery", () => {
           true
         );
       }
+      expect((await itemsOf({ action: "search", query: "accepted facts" })).length).toBe(1);
       expect(
-        (await pages({ action: "search", query: "accepted facts" })).flatMap(
-          (page) => page.items ?? []
-        ).length
-      ).toBe(1);
-      expect(
-        (await pages({ action: "read_item", item_id: String(accepted.metadata!.historySequence) }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (
+          await itemsOf({
+            action: "read_item",
+            item_id: String(accepted.metadata!.historySequence),
+          })
+        ).map((item) => item.text)
       ).toEqual(["accepted facts"]);
     }
   );
@@ -545,10 +522,7 @@ describe("session_history real disk recovery", () => {
     const result = await fixture.historyService.truncateHistory(workspaceId, 0.5);
     expect(result.success).toBe(true);
     expect(await fs.readFile(archivePath)).toEqual(reset);
-    expect(
-      (await pages({ action: "search", query: "public" })).flatMap((page) => page.items ?? [])
-        .length
-    ).toBeGreaterThan(0);
+    expect((await itemsOf({ action: "search", query: "public" })).length).toBeGreaterThan(0);
   });
 
   test("truncation recovery hashes preserved invalid UTF-8 as bytes before retiring its tombstone", async () => {
@@ -580,11 +554,7 @@ describe("session_history real disk recovery", () => {
     );
     expect((await fixture.historyService.getLastMessages(workspaceId, 1)).success).toBe(true);
     expect(await fs.readFile(archivePath)).toEqual(reset);
-    expect(
-      (await pages({ action: "search", query: "private facts" })).flatMap(
-        (page) => page.items ?? []
-      )
-    ).toEqual([]);
+    expect(await itemsOf({ action: "search", query: "private facts" })).toEqual([]);
     expect(
       await fs.stat(`${archivePath}.truncate`).then(
         () => true,
@@ -622,25 +592,16 @@ describe("session_history real disk recovery", () => {
       const retained = Buffer.concat([await fs.readFile(archivePath), await fs.readFile(chatPath)]);
       expect(retained.includes(reset)).toBe(true);
       expect(retained.includes(Buffer.from("private facts"))).toBe(true);
+      expect(await itemsOf({ action: "search", query: "private facts" })).toEqual([]);
       expect(
-        (await pages({ action: "search", query: "private facts" })).flatMap(
-          (page) => page.items ?? []
-        )
-      ).toEqual([]);
-      expect(
-        (
-          await pages({ action: "read_item", item_id: String(secret.metadata!.historySequence) })
-        ).at(-1)?.error
+        (await complete({ action: "read_item", item_id: String(secret.metadata!.historySequence) }))
+          .error
       ).toBe("item_not_found");
-      expect(
-        (await pages({ action: "search", query: "public facts" })).flatMap(
-          (page) => page.items ?? []
-        ).length
-      ).toBeGreaterThan(0);
+      expect((await itemsOf({ action: "search", query: "public facts" })).length).toBeGreaterThan(
+        0
+      );
       expect((await fixture.historyService.clearHistory(workspaceId)).success).toBe(true);
-      expect(
-        (await pages({ action: "search", query: "facts" })).flatMap((page) => page.items ?? [])
-      ).toEqual([]);
+      expect(await itemsOf({ action: "search", query: "facts" })).toEqual([]);
     }
   );
 
@@ -729,25 +690,14 @@ describe("session_history real disk recovery", () => {
     }
     const retained = Buffer.concat([await fs.readFile(archivePath), await fs.readFile(chatPath)]);
     expect(retained.includes(malformed)).toBe(true);
+    expect(await itemsOf({ action: "search", query: "opening facts" })).toEqual([]);
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     expect(
-      (await pages({ action: "search", query: "opening facts" })).flatMap(
-        (page) => page.items ?? []
+      (await windowsOf({ action: "list_windows" })).every(
+        (window) => window.windowId !== `w:${String(privateBoundary.metadata!.historySequence)}`
       )
-    ).toEqual([]);
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
-    expect(
-      (await pages({ action: "list_windows" }))
-        .flatMap((page) => page.windows ?? [])
-        .every(
-          (window) => window.windowId !== `w:${String(privateBoundary.metadata!.historySequence)}`
-        )
     ).toBe(true);
-    expect(
-      (await pages({ action: "search", query: "public" })).flatMap((page) => page.items ?? [])
-        .length
-    ).toBeGreaterThan(0);
+    expect((await itemsOf({ action: "search", query: "public" })).length).toBeGreaterThan(0);
   });
 
   test.each([
@@ -793,9 +743,7 @@ describe("session_history real disk recovery", () => {
               : await fixture.historyService.rejectContextBudgetRequest(workspaceId, trigger);
     expect(result.success).toBe(false);
     expect(await fs.readFile(chatPath)).toEqual(raw);
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   test("budget rejection preserves unreadable reset floors and unrelated raw bytes", async () => {
@@ -818,25 +766,15 @@ describe("session_history real disk recovery", () => {
       Buffer.from("\n\n"),
     ]);
     await fs.writeFile(chatPath, Buffer.concat([malformed, raw.subarray(boundaryEnd)]));
-    expect(
-      (await pages({ action: "search", query: "opening facts" })).flatMap(
-        (page) => page.items ?? []
-      )
-    ).toEqual([]);
+    expect(await itemsOf({ action: "search", query: "opening facts" })).toEqual([]);
     expect(
       (await fixture.historyService.rejectContextBudgetRequest(workspaceId, trigger)).success
     ).toBe(true);
     const after = await fs.readFile(chatPath);
     expect(after.subarray(0, malformed.length)).toEqual(malformed);
-    expect(
-      (await pages({ action: "search", query: "opening facts" })).flatMap(
-        (page) => page.items ?? []
-      )
-    ).toEqual([]);
-    expect(
-      (await pages({ action: "search", query: "Rejected" })).flatMap((page) => page.items ?? [])
-    ).toEqual([]);
-    const read = (await pages({ action: "read_item", item_id: "0" })).at(-1)!;
+    expect(await itemsOf({ action: "search", query: "opening facts" })).toEqual([]);
+    expect(await itemsOf({ action: "search", query: "Rejected" })).toEqual([]);
+    const read = await complete({ action: "read_item", item_id: "0" });
     expect(read.error).toBe("item_not_found");
   });
 
@@ -863,34 +801,26 @@ describe("session_history real disk recovery", () => {
           .map((message) => JSON.stringify(message))
           .join("\n") + "\n"
       );
-      const result = (await pages({ action: "search", query: "match", limit: 1 })).flatMap(
-        (page) => page.items ?? []
-      );
+      const result = await itemsOf({ action: "search", query: "match" });
       expect(result.map((item) => item.text)).toEqual([
         "match unaddressable",
         "match addressable prefix",
         "match later",
       ]);
       expect(
-        (
-          await pages({
-            action: "read_item",
-            item_id: result[0].itemId,
-            window_id: result[0].windowId,
-          })
-        )
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await textsOf({
+          action: "read_item",
+          item_id: result[0].itemId,
+          window_id: result[0].windowId,
+        })
       ).toEqual(["match unaddressable"]);
       expect(
-        (await pages({ action: "read_item", item_id: `m:${addressablePrefix}` }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "read_item", item_id: `m:${addressablePrefix}` })).map(
+          (item) => item.text
+        )
       ).toEqual(["match addressable prefix"]);
       expect(
-        (await pages({ action: "read_item", item_id: "0" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)
       ).toEqual(["opening facts"]);
     });
   }
@@ -901,7 +831,7 @@ describe("session_history real disk recovery", () => {
     { manualReset: false, id: "\u0000".repeat(1000) },
     { manualReset: true, id: "\u0000".repeat(1000) },
   ])(
-    "unaddressable legacy window IDs allow cursor progress without crossing a reset",
+    "unaddressable legacy window IDs are consumed without crossing a reset",
     async ({ manualReset, id }) => {
       const boundary = createMuxMessage(
         id,
@@ -927,27 +857,21 @@ describe("session_history real disk recovery", () => {
         chatPath,
         rows.map((message) => JSON.stringify(message)).join("\n") + "\n"
       );
-      const windows = await pages({ action: "list_windows", limit: 1 });
-      expect(windows.length).toBeGreaterThan(2);
-      expect(
-        windows.flatMap((page) => page.windows ?? []).map((window) => window.windowId)
-      ).toEqual(manualReset ? ["w:m:addressable-boundary"] : ["w:0", "w:m:addressable-boundary"]);
-      const matches = await pages({ action: "search", query: "facts", limit: 1 });
-      expect(matches.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual(
+      expect(await windowIdsOf({ action: "list_windows" })).toEqual(
+        manualReset ? ["w:m:addressable-boundary"] : ["w:0", "w:m:addressable-boundary"]
+      );
+      // 650 unaddressable rows exceed one chunk's row allowance.
+      expect(scanned.length).toBeGreaterThan(1);
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(
         manualReset ? ["public facts"] : ["opening facts", "public facts"]
       );
-      const older = await pages({ action: "read_item", item_id: "0" });
-      if (manualReset) {
-        expect(older.at(-1)?.error).toBe("item_not_found");
-      } else {
-        expect(older.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-          "opening facts",
-        ]);
-      }
+      const older = await complete({ action: "read_item", item_id: "0" });
+      if (manualReset) expect(older.error).toBe("item_not_found");
+      else expect(older.items?.map((item) => item.text)).toEqual(["opening facts"]);
     }
   );
 
-  test("negative persisted sequences use legacy IDs without invalidating the next cursor", async () => {
+  test("negative persisted sequences use legacy IDs with distinct row references", async () => {
     await appendTrackedHistory(
       chatPath,
       [
@@ -959,9 +883,7 @@ describe("session_history real disk recovery", () => {
         .map((message) => JSON.stringify(message))
         .join("\n") + "\n"
     );
-    const found = (await pages({ action: "search", query: "match", limit: 1 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: "match" });
     expect(found.map((item) => item.text)).toEqual(["match negative", "match after"]);
     expect(found[0].itemId).not.toBe(found[1].itemId);
     for (const [id, text] of [
@@ -988,14 +910,13 @@ describe("session_history real disk recovery", () => {
         .map((message) => JSON.stringify(message))
         .join("\n") + "\n"
     );
-    expect(
-      (await pages({ action: "list_windows", limit: 1 }))
-        .flatMap((page) => page.windows ?? [])
-        .map((window) => window.windowId)
-    ).toEqual(["w:0", "w:42"]);
-    expect(
-      (await pages({ action: "read_item", item_id: "43" })).flatMap((page) => page.items ?? [])
-    ).toMatchObject([{ windowId: "w:42", role: "assistant", text: "sequenced facts" }]);
+    expect((await windowsOf({ action: "list_windows" })).map((window) => window.windowId)).toEqual([
+      "w:0",
+      "w:42",
+    ]);
+    expect(await itemsOf({ action: "read_item", item_id: "43" })).toMatchObject([
+      { windowId: "w:42", role: "assistant", text: "sequenced facts" },
+    ]);
   });
 
   test("scanner fails closed when a reset races a page or a truncate is unresolved", async () => {
@@ -1017,36 +938,37 @@ describe("session_history real disk recovery", () => {
           (error: unknown) => error
         )
     ).toMatchObject({ message: "stale_cursor" });
+    // The tool restarts once, then reports the unresolved recovery without data.
     await fs.writeFile(`${archivePath}.truncate`, "pending transaction");
-    expect((await call({ action: "search", query: "opening facts" })).error).toBe("stale_cursor");
+    expect(await call({ action: "search", query: "opening facts" })).toEqual(CHANGED_RESULT);
   });
 
-  test("bounded append validation advances across pages without exposing newly appended rows", async () => {
+  test("a large append between chunks is validated in-process without exposing its rows", async () => {
     await append("one", "match one");
+    await seedFiller();
     await append("two", "match two");
-    const first = await call({ action: "search", query: "match", limit: 1 });
-    const tail = Array.from({ length: 650 }, (_, i) =>
-      createMuxMessage(`append-${i}`, "assistant", "match" + "z".repeat(4096))
+    // 2.6 MiB of appended rows: the append check itself spans several chunks.
+    const seam = mutateBetweenChunks(() =>
+      appendRawRows(
+        Array.from({ length: 650 }, (_, i) =>
+          createMuxMessage(`append-${i}`, "assistant", "match" + "z".repeat(4096))
+        )
+      )
     );
-    await appendTrackedHistory(
-      chatPath,
-      tail.map((message) => JSON.stringify(message)).join("\n") + "\n"
-    );
-    let cursor = first.nextCursor;
-    const results: SessionHistoryResult[] = [];
-    do {
-      const page = await call({ action: "search", query: "match", limit: 1, cursor });
-      expect(page.success).toBe(true);
-      expect(page.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-      expect(page.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-      results.push(page);
-      cursor = page.nextCursor;
-      expect(results.length).toBeLessThan(10);
-    } while (cursor);
-    expect(results[0].items).toEqual([]);
-    expect(results.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-      "match two",
-    ]);
+    try {
+      expect(await textsOf({ action: "search", query: "match" })).toEqual([
+        "match one",
+        "match two",
+      ]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(seam.chunks).toBeGreaterThan(3);
+    // A fresh read sees the appended rows.
+    expect(
+      await textsOf({ action: "search", query: "match", limit: 3 }, { hasMore: true })
+    ).toEqual(["match one", "match two", expect.stringMatching(/^matchz+$/) as string]);
   });
 
   test("malformed lines do not hide surviving rows and a legacy reset still protects older IDs", async () => {
@@ -1070,7 +992,7 @@ describe("session_history real disk recovery", () => {
     expect(
       (await call({ action: "read_item", item_id: "m:after-legacy-reset" })).items?.[0]?.text
     ).toBe("recoverable");
-    expect(result.malformedLines).toBeGreaterThan(0);
+    expect(result.warnings).toEqual(["malformed_rows_skipped"]);
     expect((await call({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
@@ -1099,25 +1021,20 @@ describe("session_history real disk recovery", () => {
         ),
       ].join("\n") + "\n"
     );
-    const windows = (await pages({ action: "list_windows" })).flatMap((page) => page.windows ?? []);
+    const windows = await windowsOf({ action: "list_windows" });
     expect(windows.map((window) => window.windowId)).toEqual(["w:100"]);
     expect(
       windows.some(
         (window) => window.windowId === `w:${String(olderWindow.metadata!.historySequence)}`
       )
     ).toBe(false);
+    expect(await itemsOf({ action: "search", query: "private" })).toEqual([]);
     expect(
-      (await pages({ action: "search", query: "private" })).flatMap((page) => page.items ?? [])
-    ).toEqual([]);
-    expect(
-      (await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })).at(
-        -1
-      )?.error
+      (await complete({ action: "read_item", item_id: String(hidden.metadata!.historySequence) }))
+        .error
     ).toBe("item_not_found");
     expect(
-      (await pages({ action: "search", query: "public facts" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
+      (await itemsOf({ action: "search", query: "public facts" })).map((item) => item.text)
     ).toEqual(["public facts"]);
   });
 
@@ -1183,47 +1100,36 @@ describe("session_history real disk recovery", () => {
     })),
   ];
   for (const candidate of resetCandidates) {
-    test(`${candidate.name} remains a privacy floor for direct and resumed scans`, async () => {
+    test(`${candidate.name} remains a privacy floor for direct and between-chunk scans`, async () => {
       const privateBoundary = await append("private-boundary", "summary", {
         compacted: true,
         compactionBoundary: true,
         compactionEpoch: 1,
       });
       const hidden = await append("private-item", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
-      expect(first.nextCursor).toBeString();
       // Decoded JSON keys/values must agree with compact raw-marker detection,
       // including when malformed message/metadata shape makes the row unreadable.
       const resetLine = JSON.stringify({ id: "candidate-reset", parts: [], ...candidate }).replace(
         '"contextBoundaryKind":"reset"',
         '"contextBoundary\\u004bind" \t: "r\\u0065set"'
       );
-      await appendTrackedHistory(
-        chatPath,
-        resetLine +
-          "\n" +
-          JSON.stringify(createMuxMessage("after-candidate", "assistant", "public facts")) +
-          "\n"
-      );
       expect(
-        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
-      ).toBe("stale_cursor");
-      expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            resetLine,
+            createMuxMessage("after-candidate", "assistant", "public facts"),
+          ])
+        )
       ).toEqual(["public facts"]);
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["public facts"]);
       expect(
-        (
-          await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })
-        ).at(-1)?.error
+        (await complete({ action: "read_item", item_id: String(hidden.metadata!.historySequence) }))
+          .error
       ).toBe("item_not_found");
       expect(
-        (await pages({ action: "list_windows" }))
-          .flatMap((page) => page.windows ?? [])
-          .some(
-            (window) => window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
-          )
+        (await windowsOf({ action: "list_windows" })).some(
+          (window) => window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
+        )
       ).toBe(false);
     });
   }
@@ -1242,9 +1148,7 @@ describe("session_history real disk recovery", () => {
     ).toBe(true);
     expect((await fs.readFile(chatPath, "utf8")).includes('"workspaceId":')).toBe(true);
     expect(boundary.metadata?.historySequence).toBeNumber();
-    const found = (await pages({ action: "search", query: "facts" })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: "facts" });
     expect(found.map((item) => item.text)).toEqual(["opening facts", "earlier facts"]);
   });
 
@@ -1256,9 +1160,7 @@ describe("session_history real disk recovery", () => {
       "]".repeat(10000) +
       "}";
     await appendTrackedHistory(chatPath, resetLine + "\n");
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   test("a populated reset row cannot impersonate a complete rollover boundary", async () => {
@@ -1271,40 +1173,41 @@ describe("session_history real disk recovery", () => {
         })
       ) + "\n"
     );
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   test("complete production rollover boundaries remain traversable in initial and appended scans", async () => {
     await append("private-item", "older facts");
-    const first = await call({ action: "search", query: "facts", limit: 1 });
     const [boundary, leadIn] = createRolloverPrefix(validRollover);
-    await appendTrackedHistory(
-      chatPath,
-      [boundary, leadIn, createMuxMessage("after-rollover", "assistant", "newer facts")]
-        .map((message) => JSON.stringify(message))
-        .join("\n") + "\n"
-    );
-    const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
-    expect(resumed.success).toBe(true);
-    expect(resumed.items?.map((item) => item.text)).toEqual(["older facts"]);
+    // A tracked rollover appended between chunks is an ordinary append: the pinned snapshot
+    // is kept, so the in-flight read excludes the newer rows without restarting.
     expect(
-      (await pages({ action: "search", query: "facts" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["opening facts", "older facts", "newer facts"]);
+      await searchInterleaved("facts", () =>
+        appendRawRows([
+          boundary,
+          leadIn,
+          createMuxMessage("after-rollover", "assistant", "newer facts"),
+        ])
+      )
+    ).toEqual(["opening facts", "older facts"]);
+    expect(await textsOf({ action: "search", query: "facts" })).toEqual([
+      "opening facts",
+      "older facts",
+      "newer facts",
+    ]);
   });
 
-  test("an appended malformed reset invalidates an existing cursor", async () => {
+  test("a malformed reset appended between chunks restarts the read behind it", async () => {
     await append("one", "match one");
     await append("two", "match two");
-    const first = await call({ action: "search", query: "match", limit: 1 });
-    expect(first.nextCursor).toBeString();
-    await appendTrackedHistory(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},"parts":[\n');
-    expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
-      "stale_cursor"
-    );
+    expect(
+      await searchInterleaved("match", () =>
+        appendRawRows([
+          '{"metadata":{"contextBoundaryKind":"reset"},"parts":[',
+          createMuxMessage("after", "assistant", "match after"),
+        ])
+      )
+    ).toEqual(["match after"]);
   });
 
   test("lists root, sequenced compactions, heartbeat/rollover windows and legacy IDs", async () => {
@@ -1334,9 +1237,7 @@ describe("session_history real disk recovery", () => {
         JSON.stringify(createMuxMessage("legacy-item", "assistant", "legacy facts")) +
         "\n"
     );
-    const windows = (await pages({ action: "list_windows", limit: 1 })).flatMap(
-      (page) => page.windows ?? []
-    );
+    const windows = await windowsOf({ action: "list_windows" });
     expect(windows).toEqual([
       { windowId: "w:0", boundaryKind: "root" },
       { windowId: `w:${String(compact.metadata!.historySequence)}`, boundaryKind: "compaction" },
@@ -1387,64 +1288,35 @@ describe("session_history real disk recovery", () => {
             ),
           ].join("\n") + "\n"
         );
-        const listed = await pages({ action: "list_windows", limit: 1 });
-        if (tailLength > 1) {
-          // The reverse scan reaches its row cap at the floor; its boundary
-          // metadata must survive the continuation before any browse row runs.
-          expect(listed[0].windows).toEqual([]);
-          expect(listed[0].nextCursor).toBeString();
-        }
-        expect(listed.flatMap((page) => page.windows ?? [])).toEqual([
+        const listed = await windowsOf({ action: "list_windows" });
+        // The reverse scan reaches its row cap at the floor; its boundary metadata must
+        // survive the chunk boundary before any browse row runs.
+        if (tailLength > 1) expect(scanned.length).toBeGreaterThan(1);
+        expect(listed).toEqual([
           { windowId: readable ? "w:42" : "w:0", boundaryKind: readable ? "reset" : "root" },
           { windowId: "w:1000", boundaryKind: "compaction" },
         ]);
-        expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        expect((await complete({ action: "read_item", item_id: "0" })).error).toBe(
           "item_not_found"
         );
-        expect(
-          (await pages({ action: "search", query: "opening facts" })).flatMap(
-            (page) => page.items ?? []
-          )
-        ).toEqual([]);
+        expect(await itemsOf({ action: "search", query: "opening facts" })).toEqual([]);
       }
     );
   }
 
-  test("plain manual reset is a privacy floor even for arbitrary IDs and multi-page floor discovery", async () => {
+  test("plain manual reset is a privacy floor even for arbitrary IDs and multi-chunk floor discovery", async () => {
     const hidden = await append("hidden", "private-before-reset");
     await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
     const tail = Array.from({ length: 650 }, (_, i) =>
       createMuxMessage(`tail-${i}`, "assistant", `public-${i}`, { historySequence: 1000 + i })
     );
-    await appendTrackedHistory(
-      chatPath,
-      tail.map((message) => JSON.stringify(message)).join("\n") + "\n"
-    );
-    const first = await call({
-      action: "read_item",
-      item_id: String(hidden.metadata!.historySequence),
-    });
-    expect(first.items).toEqual([]);
-    expect(first.nextCursor).toBeString();
-    expect(first.exhausted).toBe(false);
-    expect(first.status).toBe("scanning");
-    const all = await pages({ action: "search", query: "private-before-reset", window_id: "w:0" });
-    expect(all.flatMap((page) => page.items ?? [])).toEqual([]);
-    expect(all.at(-1)?.exhausted).toBe(true);
+    await appendRawRows(tail);
+    // Floor discovery alone needs more than one chunk; the answer is still one clean miss.
+    expect(await readError(String(hidden.metadata!.historySequence))).toBe("item_not_found");
+    expect(scanned.length).toBeGreaterThan(1);
     expect(
-      (await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })).at(
-        -1
-      )?.error
-    ).toBe("item_not_found");
-    expect(
-      (
-        await call({
-          action: "read_item",
-          item_id: String(hidden.metadata!.historySequence),
-          cursor: `${first.nextCursor!}forged`,
-        })
-      ).error
-    ).toBe("invalid_cursor");
+      await itemsOf({ action: "search", query: "private-before-reset", window_id: "w:0" })
+    ).toEqual([]);
   });
 
   test("search and read retain media-shaped ordinary tool JSON and literal data URLs", async () => {
@@ -1479,7 +1351,7 @@ describe("session_history real disk recovery", () => {
       input.example.data,
       output.file.url,
     ]) {
-      const found = (await pages({ action: "search", query })).flatMap((page) => page.items ?? []);
+      const found = await itemsOf({ action: "search", query });
       expect(found).toHaveLength(1);
       expect(found[0].text).toContain(query);
     }
@@ -1493,8 +1365,7 @@ describe("session_history real disk recovery", () => {
         limit_chars: 37,
       });
       expect(read.success).toBe(true);
-      expect(read.exhausted).toBe(true);
-      expect(read.nextCursor).toBeUndefined();
+      expect(read.has_more).toBeUndefined();
       const item = read.items![0];
       expect(Buffer.from(item.text).toString("utf8")).toBe(item.text);
       chunks.push(item.text);
@@ -1522,26 +1393,9 @@ describe("session_history real disk recovery", () => {
           JSON.stringify(createMuxMessage(`padding-${index}`, "assistant", "padding"))
         ).join("\n") + "\n"
       );
-      const results: SessionHistoryResult[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await call({ action: "read_item", item_id: itemId, cursor });
-        results.push(page);
-        cursor = page.nextCursor;
-        expect(page.items).toEqual([]);
-        expect(results.length).toBeLessThan(10);
-        if (cursor) {
-          expect(page.success).toBe(true);
-          expect(page.exhausted).toBe(false);
-          expect(page.error).toBeUndefined();
-        }
-      } while (cursor);
-      expect(results.length).toBeGreaterThan(1);
-      expect(results.at(-1)).toMatchObject({
-        success: false,
-        exhausted: true,
-        error: "item_not_found",
-      });
+      // The miss is reported once, after the whole (multi-chunk) history was scanned.
+      expect(await readError(itemId)).toBe("item_not_found");
+      expect(scanned.length).toBeGreaterThan(1);
     }
   );
 
@@ -1600,13 +1454,11 @@ describe("session_history real disk recovery", () => {
     expect(read.items?.[0]?.text).not.toContain("private needle");
   });
 
-  test("search is literal, pages matches without duplicates, and read_item pages characters", async () => {
+  test("search is literal, lists matches without duplicates, and read_item pages characters", async () => {
     const first = await append("literal", "A [x].* literal");
     await append("other", "another [X].* value");
     await append("regex-decoy", "xZZZ value");
-    const all = (await pages({ action: "search", query: "[x].*", limit: 1 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const all = await itemsOf({ action: "search", query: "[x].*" });
     expect(all.map((item) => item.text)).toEqual(["A [x].* literal", "another [X].* value"]);
     const read = await call({
       action: "read_item",
@@ -1632,9 +1484,7 @@ describe("session_history real disk recovery", () => {
         chatPath,
         [first, second].map((row) => JSON.stringify(row)).join("\n") + "\n"
       );
-      const found = (await pages({ action: "search", query: "needle", limit: 1 })).flatMap(
-        (page) => page.items ?? []
-      );
+      const found = await itemsOf({ action: "search", query: "needle" });
       expect(found).toHaveLength(2);
       expect(found[0].windowId).toBe(found[1].windowId);
       expect(found[0].itemId).not.toBe(found[1].itemId);
@@ -1672,24 +1522,20 @@ describe("session_history real disk recovery", () => {
       historySequence: 8,
     });
     await appendTrackedHistory(chatPath, JSON.stringify(original) + "\n");
-    const found = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    )[0];
+    const found = (await itemsOf({ action: "search", query: "needle" }))[0];
     const raw = await fs.readFile(chatPath, "utf8");
     await fs.writeFile(chatPath, raw.replace("needle before rewrite", "needle after rewriting"));
-    expect((await pages({ action: "read_item", item_id: found.itemId })).at(-1)?.error).toBe(
+    expect((await complete({ action: "read_item", item_id: found.itemId })).error).toBe(
       "item_not_found"
     );
-    const current = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    )[0];
+    const current = (await itemsOf({ action: "search", query: "needle" }))[0];
     await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
       ) + "\n"
     );
-    expect((await pages({ action: "read_item", item_id: current.itemId })).at(-1)?.error).toBe(
+    expect((await complete({ action: "read_item", item_id: current.itemId })).error).toBe(
       "item_not_found"
     );
   });
@@ -1702,9 +1548,7 @@ describe("session_history real disk recovery", () => {
         })
       ) + "\n";
     await fs.writeFile(chatPath, row + row);
-    const found = (await pages({ action: "search", query: "needle", limit: 1 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: "needle" });
     expect(found).toHaveLength(2);
     expect(found[0].itemId).not.toBe(found[1].itemId);
     for (const item of found) {
@@ -1715,13 +1559,11 @@ describe("session_history real disk recovery", () => {
     // Removing the first physical copy moves identical bytes onto its old offset.
     await fs.writeFile(chatPath, row);
     for (const item of found) {
-      expect((await pages({ action: "read_item", item_id: item.itemId })).at(-1)?.error).toBe(
+      expect((await complete({ action: "read_item", item_id: item.itemId })).error).toBe(
         "item_not_found"
       );
     }
-    const current = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    )[0];
+    const current = (await itemsOf({ action: "search", query: "needle" }))[0];
     expect((await call({ action: "read_item", item_id: current.itemId })).items?.[0]?.text).toBe(
       "needle identical payload"
     );
@@ -1729,20 +1571,16 @@ describe("session_history real disk recovery", () => {
 
   test("rotation expires exact references without hiding the relocated row from a new search", async () => {
     await append("relocated", "needle archived payload");
-    const previous = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    )[0];
+    const previous = (await itemsOf({ action: "search", query: "needle" }))[0];
     await append("rotate", "summary", {
       compacted: true,
       compactionBoundary: true,
       compactionEpoch: 1,
     });
-    expect((await pages({ action: "read_item", item_id: previous.itemId })).at(-1)?.error).toBe(
+    expect((await complete({ action: "read_item", item_id: previous.itemId })).error).toBe(
       "item_not_found"
     );
-    const current = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    )[0];
+    const current = (await itemsOf({ action: "search", query: "needle" }))[0];
     expect((await call({ action: "read_item", item_id: current.itemId })).items?.[0]?.text).toBe(
       "needle archived payload"
     );
@@ -1753,11 +1591,9 @@ describe("session_history real disk recovery", () => {
     await append("literal-zero-width", "literal ^ $ (?=x) \\b markers");
     await append("zero-width-decoy", "x ordinary text");
     for (const query of ["^", "$", "(?=x)", "\\b"]) {
-      expect(
-        (await pages({ action: "search", query }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
-      ).toEqual(["literal ^ $ (?=x) \\b markers"]);
+      expect((await itemsOf({ action: "search", query })).map((item) => item.text)).toEqual([
+        "literal ^ $ (?=x) \\b markers",
+      ]);
     }
   });
 
@@ -1766,9 +1602,7 @@ describe("session_history real disk recovery", () => {
     const text = "İ".repeat(300) + query + " trailing context";
     await append("unicode-prefix", text);
     await append("regex-decoy", "İ".repeat(300) + "needleZZZx");
-    const found = (await pages({ action: "search", query: query.toLowerCase() })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: query.toLowerCase() });
     expect(found).toHaveLength(1);
     expect(found[0].text).toContain(query);
     expect(found[0].text).toBe(text.slice(180));
@@ -1825,8 +1659,7 @@ describe("session_history real disk recovery", () => {
       });
       expect(end.items?.[0]?.text).toBe("");
       expect(end.items?.[0]?.nextCharOffset).toBeUndefined();
-      expect(end.nextCursor).toBeUndefined();
-      expect(end.exhausted).toBe(true);
+      expect(end.has_more).toBeUndefined();
     }
     const empty = await append("empty-page", "");
     const end = await call({
@@ -1834,8 +1667,7 @@ describe("session_history real disk recovery", () => {
       item_id: String(empty.metadata!.historySequence),
       limit_chars: 1,
     });
-    expect(end.nextCursor).toBeUndefined();
-    expect(end.exhausted).toBe(true);
+    expect(end).toEqual({ success: false, error: "item_not_found" });
   });
 
   test("JSON-budget shrinking preserves emoji pairs and exact continuation offsets", async () => {
@@ -1874,9 +1706,7 @@ describe("session_history real disk recovery", () => {
     const ends = "needle" + "x".repeat(493) + "😀tail";
     await append("astral-snippet-start", starts);
     await append("astral-snippet-end", ends);
-    const found = (await pages({ action: "search", query: "needle" })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: "needle" });
     expect(found).toHaveLength(2);
     for (const item of found) {
       expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
@@ -1918,13 +1748,12 @@ describe("session_history real disk recovery", () => {
       window_id: null,
       offset_chars: null,
       limit_chars: null,
-      cursor: null,
       limit: null,
     });
     expect(first.items?.[0]?.text).toBe(text.slice(0, 8000));
     expect(first.items?.[0]?.nextCharOffset).toBe(8000);
-    expect(first.exhausted).toBe(true);
-    expect(first.skipped_oversized_rows).toBe(0);
+    expect(first.has_more).toBeUndefined();
+    expect(first.warnings).toBeUndefined();
     const second = await call({
       action: "read_item",
       item_id: first.items![0].itemId,
@@ -1933,7 +1762,7 @@ describe("session_history real disk recovery", () => {
     });
     expect(second.items?.[0]?.text).toBe(text.slice(8000));
     expect(second.items?.[0]?.nextCharOffset).toBeUndefined();
-    expect(second.exhausted).toBe(true);
+    expect(second.has_more).toBeUndefined();
     expect(
       (
         await call({
@@ -1968,20 +1797,13 @@ describe("session_history real disk recovery", () => {
       chatPath,
       JSON.stringify(createMuxMessage("after", "assistant", "recover me")) + "\n"
     );
-    const all = await pages({ action: "search", query: "recover me" });
-    expect(all.length).toBeGreaterThanOrEqual(3);
-    expect(all.reduce((sum, page) => sum + page.skipped_oversized_rows, 0)).toBe(2);
-    expect(all.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-      "recover me",
-    ]);
-    const size = (await fs.stat(chatPath)).size;
-    expect(all.reduce((sum, page) => sum + (page.bytesRead ?? 0), 0)).toBeLessThan(
-      size * 2 + 1024 * 1024 + 128 * 1024
-    );
+    const all = await complete({ action: "search", query: "recover me" });
+    // The 5 MiB row is skipped mid-line across several 2 MiB chunks, once per direction.
+    expect(scanned.length).toBeGreaterThanOrEqual(3);
+    expect(all.warnings).toEqual(["oversized_rows_skipped"]);
+    expect(all.items?.map((item) => item.text)).toEqual(["recover me"]);
     expect(
-      (await pages({ action: "search", query: "opening facts" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
+      (await itemsOf({ action: "search", query: "opening facts" })).map((item) => item.text)
     ).toEqual(["opening facts"]);
   });
 
@@ -1995,41 +1817,21 @@ describe("session_history real disk recovery", () => {
   ]) {
     test(`malformed separator ${junk.slice(0, 24)} preserves initial and appended reset privacy`, async () => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
       const key =
         junk.length > 1000 ? unicodeEscapes("contextBoundaryKind") : "contextBoundaryKind";
       const value = junk.length > 1000 ? unicodeEscapes("reset") : "reset";
-      await appendTrackedHistory(
-        chatPath,
-        `{"id":"junk-reset","role":"assistant","metadata":{"${key}"${junk}:${junk}"${value}"},"parts":[]}\n` +
-          JSON.stringify(createMuxMessage("after-junk-reset", "assistant", "public facts")) +
-          "\n"
-      );
-      let cursor = first.nextCursor;
-      let result: SessionHistoryResult;
-      let pageCount = 0;
-      do {
-        result = await call({ action: "search", query: "facts", cursor });
-        if (result.success) {
-          expect(result.items).toEqual([]);
-          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-        }
-        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
-          SESSION_HISTORY_MAX_RESULT_BYTES
-        );
-        cursor = result.nextCursor;
-        expect(++pageCount).toBeLessThan(12);
-      } while (cursor);
-      expect(result.error).toBe("stale_cursor");
+      // Appended between chunks (a multi-megabyte junk row needs several append-check
+      // chunks of its own), the malformed reset restarts the read behind itself.
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            `{"id":"junk-reset","role":"assistant","metadata":{"${key}"${junk}:${junk}"${value}"},"parts":[]}`,
+            createMuxMessage("after-junk-reset", "assistant", "public facts"),
+          ])
+        )
       ).toEqual(["public facts"]);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["public facts"]);
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     });
   }
 
@@ -2043,11 +1845,9 @@ describe("session_history real disk recovery", () => {
       ).replace('"metadata":{}', '"metadata":{"contextBoundaryKind":"normal","other":"reset"}') +
         "\n"
     );
-    expect(
-      (await pages({ action: "read_item", item_id: "0" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["opening facts"]);
+    expect((await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)).toEqual(
+      ["opening facts"]
+    );
   });
 
   test.each([
@@ -2056,11 +1856,9 @@ describe("session_history real disk recovery", () => {
     '"contextBoundaryKind" junk : junk "resume"',
   ])("unrelated malformed tokens do not create a reset: %s", async (fragment) => {
     await appendTrackedHistory(chatPath, fragment + "\n");
-    expect(
-      (await pages({ action: "read_item", item_id: "0" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["opening facts"]);
+    expect((await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)).toEqual(
+      ["opening facts"]
+    );
   });
 
   for (const separator of [
@@ -2073,60 +1871,40 @@ describe("session_history real disk recovery", () => {
   ]) {
     test(`control separator ${separator.charCodeAt(0)} cannot hide a reset in initial or appended scans`, async () => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
       const marker = `"contextBoundaryKind"${separator}:${separator}"reset"`;
-      await appendTrackedHistory(
-        chatPath,
-        `{"id":"control-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n` +
-          JSON.stringify(createMuxMessage("public", "assistant", "public facts")) +
-          "\n"
-      );
       expect(
-        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
-      ).toBe("stale_cursor");
-      expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            `{"id":"control-reset","role":"assistant","parts":[],"metadata":{${marker}}}`,
+            createMuxMessage("public", "assistant", "public facts"),
+          ])
+        )
       ).toEqual(["public facts"]);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["public facts"]);
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     });
   }
 
   test.each([String.fromCharCode(0), "\\u0000"])(
-    "oversized control separators retain a bounded reset probe across pages",
+    "oversized control separators retain a bounded reset probe across chunks",
     async (separator) => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
       const marker =
         '"contextBoundaryKind"' +
         separator.repeat(Math.ceil(SESSION_HISTORY_MAX_SCAN_BYTES / separator.length)) +
         ':"' +
         unicodeEscapes("reset") +
         '"';
-      await appendTrackedHistory(
-        chatPath,
-        `{"id":"giant-control-reset","role":"assistant","parts":[],"metadata":{${marker}},"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`
-      );
-      let cursor = first.nextCursor;
-      let result: SessionHistoryResult;
-      let pageCount = 0;
-      do {
-        result = await call({ action: "search", query: "facts", cursor });
-        if (result.success) {
-          expect(result.items).toEqual([]);
-          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-        }
-        cursor = result.nextCursor;
-        expect(++pageCount).toBeLessThan(10);
-      } while (cursor);
-      expect(result.error).toBe("stale_cursor");
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      // The 4 MiB reset row spans several append-check chunks; its probe state must
+      // survive each chunk boundary so the read restarts behind it.
+      expect(
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            `{"id":"giant-control-reset","role":"assistant","parts":[],"metadata":{${marker}},"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}`,
+          ])
+        )
+      ).toEqual([]);
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     }
   );
 
@@ -2143,16 +1921,12 @@ describe("session_history real disk recovery", () => {
       '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
     );
     await appendTrackedHistory(chatPath, repaired + "\n");
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     await fixture.historyService.appendToHistory(
       workspaceId,
       createRolloverPrefix(validRollover)[0]
     );
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   for (const mode of ["append", "batch", "lazy", "update"] as const) {
@@ -2173,9 +1947,7 @@ describe("session_history real disk recovery", () => {
         }
       );
       await appendTrackedHistory(chatPath, JSON.stringify(reset) + "\n");
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
       const [boundary, leadIn] = createRolloverPrefix(validRollover);
       if (mode === "append") await fixture.historyService.appendToHistory(workspaceId, boundary);
       else if (mode === "batch")
@@ -2212,13 +1984,9 @@ describe("session_history real disk recovery", () => {
         )
       ).toMatchObject(reset);
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
       ).toEqual(["public facts"]);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
     });
   }
 
@@ -2230,37 +1998,30 @@ describe("session_history real disk recovery", () => {
     ["mixed escapes", '\\x22context\\u0042oundaryKind\\x22\\x3A"res\\x65t"'],
     ["whitespace", '"contextBoundaryKind"\\x20:\\x09"res\\x65t"'],
   ]) {
-    test(`hex-escaped reset ${name} protects direct/resumed retrieval and raw rewrites`, async () => {
+    test(`hex-escaped reset ${name} protects direct/between-chunk retrieval and raw rewrites`, async () => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
-      expect(first.nextCursor).toBeString();
       const raw = Buffer.from(
         `{"id":"hex-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n`
       );
-      await appendTrackedHistory(chatPath, raw);
-      const current = await append("public", "public facts");
-      const cut = await append("cut", "discarded tail");
+      let current!: MuxMessage;
+      let cut!: MuxMessage;
       expect(
-        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
-      ).toBe("stale_cursor");
-      expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", async () => {
+          await appendTrackedHistory(chatPath, raw);
+          current = await append("public", "public facts");
+          cut = await append("cut", "discarded tail");
+        })
       ).toEqual(["public facts"]);
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["public facts"]);
       expect(hasRawResetMarker(raw.toString("utf8"))).toBe(true);
       expect((await fixture.historyService.updateHistory(workspaceId, current)).success).toBe(true);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
       expect((await fixture.historyService.truncateAfterMessage(workspaceId, cut.id)).success).toBe(
         true
       );
       expect((await fs.readFile(chatPath)).includes(raw)).toBe(true);
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
       ).toEqual(["public facts"]);
     });
   }
@@ -2273,11 +2034,9 @@ describe("session_history real disk recovery", () => {
     const row = `{"id":"not-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n`;
     await appendTrackedHistory(chatPath, row);
     expect(hasRawResetMarker(row)).toBe(false);
-    expect(
-      (await pages({ action: "read_item", item_id: "0" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["opening facts"]);
+    expect((await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)).toEqual(
+      ["opening facts"]
+    );
   });
 
   const fragmentedResetMarkers = [
@@ -2306,41 +2065,22 @@ describe("session_history real disk recovery", () => {
     },
   ];
   for (const fragment of fragmentedResetMarkers) {
-    test(`reset fragmented ${fragment.name} blocks initial and resumed recovery`, async () => {
+    test(`reset fragmented ${fragment.name} blocks initial and between-chunk recovery`, async () => {
       const hidden = await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
-      await appendTrackedHistory(
-        chatPath,
-        `{"id":"fragmented-reset","role":"assistant","parts":[],"metadata":{${fragment.marker}}}\n` +
-          JSON.stringify(createMuxMessage("public-after-fragments", "assistant", "public facts")) +
-          "\n"
-      );
-      let cursor = first.nextCursor;
-      let result: SessionHistoryResult;
-      let pageCount = 0;
-      do {
-        result = await call({ action: "search", query: "facts", cursor });
-        if (result.success) {
-          expect(result.items).toEqual([]);
-          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-        }
-        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
-          SESSION_HISTORY_MAX_RESULT_BYTES
-        );
-        cursor = result.nextCursor;
-        expect(++pageCount).toBeLessThan(12);
-      } while (cursor);
-      expect(result.error).toBe("stale_cursor");
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            `{"id":"fragmented-reset","role":"assistant","parts":[],"metadata":{${fragment.marker}}}`,
+            createMuxMessage("public-after-fragments", "assistant", "public facts"),
+          ])
+        )
       ).toEqual(["public facts"]);
       expect(
-        (
-          await pages({ action: "read_item", item_id: String(hidden.metadata!.historySequence) })
-        ).at(-1)?.error
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect(
+        (await complete({ action: "read_item", item_id: String(hidden.metadata!.historySequence) }))
+          .error
       ).toBe("item_not_found");
     });
   }
@@ -2350,9 +2090,7 @@ describe("session_history real disk recovery", () => {
       chatPath,
       '{"id":"duplicate-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset","contextBoundaryKind":"normal"}}\n'
     );
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
   const rolloverJson = JSON.stringify(rollover);
@@ -2379,65 +2117,53 @@ describe("session_history real disk recovery", () => {
       `"metadata":${rolloverJson.replace('"reason":"on-send"', `"reason":"manual","${unicodeEscapes("reason")}":"on-send"`)}`,
     ],
   ]) {
-    test(`${name} cannot disguise a manual reset as a rollover in direct or resumed recovery`, async () => {
+    test(`${name} cannot disguise a manual reset as a rollover in direct or between-chunk recovery`, async () => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
-      expect(first.nextCursor).toBeString();
       const ambiguousRow = `{"id":"ambiguous-reset","role":"assistant","parts":[],${metadataFields}}\n`;
-      await appendTrackedHistory(
-        chatPath,
-        ambiguousRow +
-          JSON.stringify(createMuxMessage("public-after-ambiguous", "assistant", "public facts")) +
-          "\n"
-      );
       expect(
-        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
-      ).toBe("stale_cursor");
-      const direct = await pages({ action: "search", query: "facts" });
-      expect(direct.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-        "public facts",
-      ]);
-      expect(direct.reduce((sum, page) => sum + (page.malformedLines ?? 0), 0)).toBeGreaterThan(0);
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+        await searchInterleaved("facts", () =>
+          appendRawRows([
+            ambiguousRow.trimEnd(),
+            createMuxMessage("public-after-ambiguous", "assistant", "public facts"),
+          ])
+        )
+      ).toEqual(["public facts"]);
+      const direct = await complete({ action: "search", query: "facts" });
+      expect(direct.items?.map((item) => item.text)).toEqual(["public facts"]);
+      expect(direct.warnings).toEqual(["malformed_rows_skipped"]);
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
       // Rewriting metadata must not turn the same raw floor into a valid rollover.
       expect((await fixture.historyService.migrateWorkspaceId("old-id", workspaceId)).success).toBe(
         true
       );
       expect((await fs.readFile(chatPath)).includes(Buffer.from(ambiguousRow))).toBe(true);
-      expect(
-        (await pages({ action: "search", query: "private facts" })).flatMap(
-          (page) => page.items ?? []
-        )
-      ).toEqual([]);
+      expect(await itemsOf({ action: "search", query: "private facts" })).toEqual([]);
     });
   }
 
   test("valid rollovers allow repeated key names in distinct objects and string values", async () => {
     await append("private", "private facts");
-    const first = await call({ action: "search", query: "facts", limit: 1 });
-    await appendTrackedHistory(
-      chatPath,
-      JSON.stringify({
-        id: "unambiguous-rollover",
-        role: "assistant",
-        parts: [],
-        metadata: {
-          ...rollover,
-          probes: [{ metadata: 1, "\\u006detadata": 2 }, { metadata: 2 }],
-          quoted: '"metadata":0,"metadata":1',
-        },
-      }) + "\n"
-    );
-    const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
-    expect(resumed.success).toBe(true);
-    expect(resumed.items?.map((item) => item.text)).toEqual(["private facts"]);
+    // A tracked rollover appended between chunks is no privacy floor: no restart, the
+    // pinned snapshot is delivered.
     expect(
-      (await pages({ action: "read_item", item_id: "0" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["opening facts"]);
+      await searchInterleaved("facts", () =>
+        appendRawRows([
+          JSON.stringify({
+            id: "unambiguous-rollover",
+            role: "assistant",
+            parts: [],
+            metadata: {
+              ...rollover,
+              probes: [{ metadata: 1, "\\u006detadata": 2 }, { metadata: 2 }],
+              quoted: '"metadata":0,"metadata":1',
+            },
+          }),
+        ])
+      )
+    ).toEqual(["opening facts", "private facts"]);
+    expect((await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)).toEqual(
+      ["opening facts"]
+    );
   });
 
   test("a fully pretty-printed reset still protects the earlier transcript", async () => {
@@ -2452,48 +2178,47 @@ describe("session_history real disk recovery", () => {
         JSON.stringify(createMuxMessage("after-pretty-reset", "assistant", "public facts")) +
         "\n"
     );
-    expect(
-      (await pages({ action: "search", query: "facts" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["public facts"]);
-    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-      "item_not_found"
-    );
+    expect((await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)).toEqual([
+      "public facts",
+    ]);
+    expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
 
-  test("a new append cannot finish an older malformed reset without expiring the cursor", async () => {
+  test("an append that completes an older malformed reset restarts the read behind it", async () => {
     await append("private", "private facts");
+    await seedFiller();
     await appendTrackedHistory(
       chatPath,
       '{"id":"cross-snapshot-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind"\n'
     );
-    const first = await call({ action: "search", query: "facts", limit: 1 });
-    await appendTrackedHistory(chatPath, ':"reset"}}\n');
-    expect((await call({ action: "search", query: "facts", cursor: first.nextCursor })).error).toBe(
-      "stale_cursor"
+    // The append check continues through the pinned snapshot's malformed tail, so the
+    // fragment completed by this append is recognized and the read restarts behind it.
+    const seam = mutateBetweenChunks(() =>
+      appendRawRows([':"reset"}}', createMuxMessage("public", "assistant", "public facts")])
     );
+    try {
+      expect(await textsOf({ action: "search", query: "facts" })).toEqual(["public facts"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(await readError("0")).toBe("item_not_found");
   });
 
   test.each([false, true])(
     "valid rows break malformed-fragment continuity (rollover: %s)",
     async (useRollover) => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
       const separatingRow = useRollover
         ? createRolloverPrefix(validRollover)[0]
         : createMuxMessage("separator", "assistant", "ordinary data");
-      await appendTrackedHistory(
-        chatPath,
-        '"contextBoundaryKind"\n' + JSON.stringify(separatingRow) + '\n:"reset"\n'
-      );
-      const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
-      expect(resumed.success).toBe(true);
-      expect(resumed.items?.map((item) => item.text)).toEqual(["private facts"]);
       expect(
-        (await pages({ action: "read_item", item_id: "0" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows(['"contextBoundaryKind"', separatingRow, ':"reset"'])
+        )
+      ).toEqual(["opening facts", "private facts"]);
+      expect(
+        (await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)
       ).toEqual(["opening facts"]);
     }
   );
@@ -2514,42 +2239,18 @@ describe("session_history real disk recovery", () => {
       unicodeEscapes("reset"),
     ],
   ]) {
-    test(`oversized ${name} preserves privacy across whitespace and appended pages`, async () => {
+    test(`oversized ${name} preserves privacy across whitespace and appended chunks`, async () => {
       await append("private", "private facts");
-      const first = await call({ action: "search", query: "facts", limit: 1 });
       const marker = `"${key}"` + " \t".repeat(SESSION_HISTORY_MAX_SCAN_BYTES) + ` : "${value}"`;
-      const row = `{"id":"escaped-reset","role":"assistant","metadata":{${marker}},"parts":[],"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`;
-      await appendTrackedHistory(
-        chatPath,
-        row +
-          JSON.stringify(createMuxMessage("after-escaped-reset", "assistant", "public facts")) +
-          "\n"
-      );
-      let cursor = first.nextCursor;
-      let result: SessionHistoryResult;
-      let pageCount = 0;
-      do {
-        result = await call({ action: "search", query: "facts", cursor });
-        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
-          SESSION_HISTORY_MAX_RESULT_BYTES
-        );
-        if (result.success) {
-          expect(result.items).toEqual([]);
-          expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-          expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-        }
-        cursor = result.nextCursor;
-        expect(++pageCount).toBeLessThan(10);
-      } while (cursor);
-      expect(pageCount).toBeGreaterThan(1);
-      expect(result.error).toBe("stale_cursor");
-      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
-        "item_not_found"
-      );
+      const row = `{"id":"escaped-reset","role":"assistant","metadata":{${marker}},"parts":[],"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}`;
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await searchInterleaved("facts", () =>
+          appendRawRows([row, createMuxMessage("after-escaped-reset", "assistant", "public facts")])
+        )
+      ).toEqual(["public facts"]);
+      expect((await complete({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
+      expect(
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
       ).toEqual(["public facts"]);
     });
   }
@@ -2577,9 +2278,7 @@ describe("session_history real disk recovery", () => {
         `{"id":"not-reset","role":"assistant","metadata":{${key}:${value}},"parts":[],"padding":"${"x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES)}"}\n`
       );
       expect(
-        (await pages({ action: "read_item", item_id: "0" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "read_item", item_id: "0" })).map((item) => item.text)
       ).toEqual(["opening facts"]);
     });
   }
@@ -2723,85 +2422,108 @@ describe("session_history real disk recovery", () => {
         JSON.stringify(createMuxMessage("new", "assistant", "public after oversized reset")) +
         "\n"
     );
-    const hidden = await pages({ action: "read_item", item_id: "0" });
-    expect(hidden.flatMap((page) => page.items ?? [])).toEqual([]);
-    expect(hidden.at(-1)?.error).toBe("item_not_found");
-    expect(
-      (await pages({ action: "search", query: "public" }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.text)
-    ).toEqual(["public after oversized reset"]);
-  });
-
-  test("appending the tool's own result preserves a fixed cursor snapshot; rotation expires it", async () => {
-    await append("one", "match one");
-    await append("two", "match two");
-    const first = await call({ action: "search", query: "match", limit: 1 });
-    expect(first.nextCursor).toBeString();
-    await append("tool-result", "", undefined, [
-      {
-        type: "dynamic-tool",
-        toolCallId: "history",
-        toolName: "session_history",
-        state: "output-available",
-        input: { action: "search" },
-        output: first,
-      },
-    ]);
-    const second = await call({
-      action: "search",
-      query: "match",
-      limit: 1,
-      cursor: first.nextCursor,
-    });
-    expect(second.success).toBe(true);
-    expect(second.items?.[0]?.text).toBe("match two");
-    expect(second.nextCursor).toBeUndefined();
-    expect(second.exhausted).toBe(true);
-    await append("roll", "", rollover);
-    expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
-      "stale_cursor"
+    expect(await readError("0")).toBe("item_not_found");
+    expect((await itemsOf({ action: "search", query: "public" })).map((item) => item.text)).toEqual(
+      ["public after oversized reset"]
     );
   });
 
-  test("cursor binds workspace, action and query and detects in-place anchor mutation", async () => {
+  test("the tool's own result appended between chunks keeps the pinned snapshot; rotation restarts", async () => {
     await append("one", "match one");
+    await seedFiller();
     await append("two", "match two");
-    const first = await call({ action: "search", query: "match", limit: 1 });
-    const cursor = first.nextCursor;
-    expect(
-      (await call({ action: "search", query: "match", cursor }, "other-workspace")).error
-    ).toBe("invalid_cursor");
-    expect((await call({ action: "list_windows", query: "match", cursor })).error).toBe(
-      "invalid_cursor"
+    const previous = await complete({ action: "search", query: "match" });
+    expect(previous.items?.map((item) => item.text)).toEqual(["match one", "match two"]);
+    // Persisting a previous history result mid-read is an ordinary tracked append: no
+    // restart, and the appended row (which contains "match") is past the pinned snapshot.
+    const ownResult = mutateBetweenChunks(() =>
+      append("tool-result", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "history",
+          toolName: "session_history",
+          state: "output-available",
+          input: { action: "search" },
+          output: previous,
+        },
+      ])
     );
-    expect((await call({ action: "search", query: "other", cursor })).error).toBe("invalid_cursor");
-    const handle = await fs.open(chatPath, "r+");
     try {
-      await handle.write(Buffer.from("!"), 0, 1, 0);
+      expect(await textsOf({ action: "search", query: "match" })).toEqual([
+        "match one",
+        "match two",
+      ]);
     } finally {
-      await handle.close();
+      ownResult.restore();
     }
-    expect((await call({ action: "search", query: "match", cursor })).error).toBe("stale_cursor");
+    expectIntermediate(ownResult);
+    // A rollover boundary rotates chat into the archive: one restart from the fresh
+    // baseline still answers; only a repeat during the restarted read is history_changed.
+    const rotate = mutateBetweenChunks(() => append("roll", "", rollover));
+    try {
+      expect(await textsOf({ action: "search", query: "match" })).toEqual([
+        "match one",
+        "match two",
+      ]);
+    } finally {
+      rotate.restore();
+    }
+    expectIntermediate(rotate);
+    const twice = afterChunks(async (chunk) => {
+      if (chunk <= 2) {
+        await append(`roll-${chunk}`, "", rollover);
+        await seedFiller(undefined, `after-roll-${chunk}`);
+      }
+    });
+    try {
+      expect(await call({ action: "search", query: "match" })).toEqual(CHANGED_RESULT);
+    } finally {
+      twice.restore();
+    }
+    expect(twice.chunks).toBe(2);
   });
 
-  test("appended manual reset invalidates an otherwise append-stable cursor", async () => {
+  test("an in-place anchor mutation between chunks restarts once from the fresh baseline", async () => {
     await append("one", "match one");
+    await seedFiller();
     await append("two", "match two");
-    const first = await call({ action: "search", query: "match", limit: 1 });
+    const seam = mutateBetweenChunks(async () => {
+      const handle = await fs.open(chatPath, "r+");
+      try {
+        await handle.write(Buffer.from("!"), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    try {
+      // The first row ("opening facts") is malformed now; the rest is read from the new baseline.
+      const result = await complete({ action: "search", query: "match" });
+      expect(result.items?.map((item) => item.text)).toEqual(["match one", "match two"]);
+      expect(result.warnings).toEqual(["malformed_rows_skipped"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+  });
+
+  test("a manual reset appended between chunks without rotation restarts behind it", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    await append("two", "match two");
     // Simulate a cross-process append without rotation: the reset must still
     // invalidate privacy, rather than relying on inode replacement as the gate.
-    await appendTrackedHistory(
-      chatPath,
-      JSON.stringify(createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" })) +
-        "\n"
+    const seam = mutateBetweenChunks(() =>
+      appendRawRows([manualReset("reset"), createMuxMessage("after", "assistant", "match after")])
     );
-    expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
-      "stale_cursor"
-    );
+    try {
+      expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
   });
 
-  test("below-watermark repaired and imported active rows survive bounded recovery pages", async () => {
+  test("below-watermark repaired and imported active rows survive bounded recovery chunks", async () => {
     const archived = await append("repaired-id", "archived facts");
     await append("archive-high", "higher archived facts");
     const boundary = await append("active-boundary", "summary", {
@@ -2819,9 +2541,7 @@ describe("session_history real disk recovery", () => {
       chatPath,
       [repaired, imported].map((row) => JSON.stringify(row)).join("\n") + "\n"
     );
-    const recovered = await pages({ action: "search", query: "facts", limit: 1 });
-    expect(recovered.length).toBeGreaterThan(1);
-    expect(recovered.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+    expect(await textsOf({ action: "search", query: "facts" })).toEqual([
       "opening facts",
       "archived facts",
       "higher archived facts",
@@ -2834,15 +2554,11 @@ describe("session_history real disk recovery", () => {
       [imported, "imported facts"],
     ] as const) {
       expect(
-        (
-          await pages({
-            action: "read_item",
-            item_id: String(message.metadata!.historySequence),
-            window_id: activeWindow,
-          })
-        )
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        await textsOf({
+          action: "read_item",
+          item_id: String(message.metadata!.historySequence),
+          window_id: activeWindow,
+        })
       ).toEqual([expected]);
     }
   });
@@ -2908,9 +2624,7 @@ describe("session_history real disk recovery", () => {
       expect(archived.subarray(0, tornArchive.length)).toEqual(tornArchive);
       expect((await fs.readFile(chatPath, "utf8")).includes('"id":"first"')).toBe(false);
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
       ).toEqual(["opening facts", "sealed facts"]);
       const full: MuxMessage[] = [];
       expect(
@@ -2937,9 +2651,7 @@ describe("session_history real disk recovery", () => {
       },
     ]);
     await append("after-tool", "later facts");
-    const found = (await pages({ action: "search", query: "facts" })).flatMap(
-      (page) => page.items ?? []
-    );
+    const found = await itemsOf({ action: "search", query: "facts" });
     expect(found.map((item) => item.text)).toContain("opening facts");
     expect(found.some((item) => item.text.includes("tool facts"))).toBe(true);
     expect(found.map((item) => item.text)).toContain("later facts");
@@ -2988,9 +2700,7 @@ describe("session_history real disk recovery", () => {
           : ["first", "earlier", "accepted", "accepted-result"]
       );
       expect(
-        (await pages({ action: "search", query: "facts" }))
-          .flatMap((page) => page.items ?? [])
-          .map((item) => item.text)
+        (await itemsOf({ action: "search", query: "facts" })).map((item) => item.text)
       ).toEqual(
         reset
           ? ["accepted facts", "result facts"]
@@ -3012,12 +2722,10 @@ describe("session_history real disk recovery", () => {
     expect((await fs.stat(archivePath)).size).toBeGreaterThan(0);
     // A sequence watermark cannot prove these are exact replays. Conservatively
     // return both physical copies rather than hiding repaired/imported rows.
-    const recovered = await pages({ action: "search", query: "identical content", limit: 1 });
-    expect(recovered.length).toBeGreaterThan(1);
-    expect(recovered.flatMap((page) => page.items ?? []).length).toBe(4);
+    expect(await itemsOf({ action: "search", query: "identical content" })).toHaveLength(4);
   });
 
-  test("aggregate encoded result, cursor, Unicode, and markers fit the output budget", async () => {
+  test("aggregate encoded result, Unicode, and markers fit the output budget", async () => {
     const text = '"\\\n\t界'.repeat(6000);
     const message = await append("big", text);
     const read = await call({
@@ -3031,8 +2739,25 @@ describe("session_history real disk recovery", () => {
       SESSION_HISTORY_MAX_RESULT_BYTES
     );
     for (let i = 0; i < 30; i++) await append(`result-${i}`, `needle${text.slice(0, 600)}`);
-    const all = await pages({ action: "search", query: "needle", limit: 25 });
-    expect(all.flatMap((page) => page.items ?? []).length).toBe(30);
+    // 25 escaped 500-character snippets exceed 16 KiB: the response fills before the limit.
+    const capped = await complete(
+      { action: "search", query: "needle", limit: 25 },
+      { hasMore: true }
+    );
+    expect(capped.items!.length).toBeGreaterThan(1);
+    expect(capped.items!.length).toBeLessThan(25);
+    expect(
+      await itemsOf(
+        { action: "search", query: "needle", limit: 25, max_chars_per_item: 20 },
+        { hasMore: true }
+      )
+    ).toHaveLength(25);
+    expect(
+      await itemsOf(
+        { action: "search", query: "needle", limit: 5, max_chars_per_item: 20, recent_first: true },
+        { hasMore: true }
+      )
+    ).toHaveLength(5);
   });
 });
 
@@ -3057,20 +2782,16 @@ describe("session_history item listing and filters", () => {
     return part;
   };
 
-  test("unfiltered listing pages rows in persisted order and every ID round-trips", async () => {
+  test("unfiltered listing returns rows in persisted order and every ID round-trips", async () => {
     const user = createMuxMessage("ask", "user", "please list");
     expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
     await append("reply", "listed");
     await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
     await append("after", "post reset");
-    const all = (await pages({ action: "list_items", limit: 1 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const all = await itemsOf({ action: "list_items" });
     // "first" is seeded by beforeEach; the manual reset hides everything before it.
     expect(all.map((item) => item.text)).toEqual(["post reset"]);
-    const rooted = (await pages({ action: "list_items", window_id: "w:0", limit: 1 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const rooted = await itemsOf({ action: "list_items", window_id: "w:0" });
     expect(rooted).toEqual([]);
     for (const item of all) {
       const read = await call({ action: "read_item", item_id: item.itemId });
@@ -3082,9 +2803,7 @@ describe("session_history item listing and filters", () => {
     const user = createMuxMessage("ask", "user", "please list");
     expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
     await append("reply", "listed");
-    const all = (await pages({ action: "list_items", limit: 2 })).flatMap(
-      (page) => page.items ?? []
-    );
+    const all = await itemsOf({ action: "list_items" });
     expect(all.map((item) => [item.role, item.text])).toEqual([
       ["assistant", "opening facts"],
       ["user", "please list"],
@@ -3114,7 +2833,7 @@ describe("session_history item listing and filters", () => {
     await append("history-row", "", undefined, [toolPart("session_history")]);
     await append("hidden-row", "", { synthetic: true }, [toolPart("bash")]);
     const texts = async (input: SessionHistoryArgs) =>
-      (await pages(input)).flatMap((page) => page.items ?? []).map((item) => item.text);
+      (await itemsOf(input)).map((item) => item.text);
     expect(await texts({ action: "list_items", role: "user" })).toEqual(["run bash now"]);
     expect(await texts({ action: "list_items", role: "system" })).toEqual([]);
     const bashRows = await texts({ action: "list_items", tool_name: "bash" });
@@ -3177,55 +2896,36 @@ describe("session_history item listing and filters", () => {
     ).toThrow();
   });
 
-  test("cursors bind filters and snippet size; sparse filters page without materializing", async () => {
+  test("sparse filtered matches complete within one call without materializing the rest", async () => {
     const rows = Array.from({ length: 1200 }, (_, i) =>
       createMuxMessage(`row-${i}`, i === 1150 ? "user" : "assistant", `row ${i}`, {
         historySequence: 100 + i,
       })
     );
-    await appendTrackedHistory(
-      chatPath,
-      rows.map((message) => JSON.stringify(message)).join("\n") + "\n"
-    );
-    const results = await pages({ action: "list_items", role: "user" });
-    expect(results.length).toBeGreaterThan(1);
-    expect(results.slice(0, -1).some((page) => page.items?.length === 0)).toBe(true);
-    expect(results.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-      "row 1150",
-    ]);
-    expect(results.at(-1)?.exhausted).toBe(true);
-    const first = await call({ action: "list_items", role: "assistant", limit: 1 });
-    const cursor = first.nextCursor;
-    expect(cursor).toBeString();
-    expect((await call({ action: "list_items", role: "user", cursor })).error).toBe(
-      "invalid_cursor"
-    );
-    expect((await call({ action: "list_items", tool_name: "bash", cursor })).error).toBe(
-      "invalid_cursor"
-    );
+    await appendRawRows(rows);
+    // Floor discovery plus browsing 1200 rows spans several chunks; the single filtered
+    // match is delivered once, exhaustively.
+    expect(await textsOf({ action: "list_items", role: "user" })).toEqual(["row 1150"]);
+    expect(scanned.length).toBeGreaterThan(2);
+    // has_more is exact: a further match beyond the limit exists here, not in the sparse case.
     expect(
-      (await call({ action: "list_items", role: "assistant", max_chars_per_item: 5, cursor })).error
-    ).toBe("invalid_cursor");
-    expect((await call({ action: "search", query: "row", cursor })).error).toBe("invalid_cursor");
-    // Resuming with the identical binding delivers rows in order; bounded pages
-    // (floor discovery over 1200 rows) may be empty progress pages in between.
-    const nextItem = async (from: string | undefined) => {
-      let page = await call({ action: "list_items", role: "assistant", limit: 1, cursor: from });
-      for (let hops = 0; page.items?.length === 0 && page.nextCursor; hops++) {
-        expect(hops).toBeLessThan(10);
-        page = await call({
-          action: "list_items",
-          role: "assistant",
-          limit: 1,
-          cursor: page.nextCursor,
-        });
-      }
-      expect(page.success).toBe(true);
-      return { text: page.items?.[0]?.text, cursor: page.nextCursor };
-    };
-    const opening = await nextItem(cursor);
-    const second = await nextItem(opening.cursor);
-    expect([opening.text, second.text]).toEqual(["opening facts", "row 0"]);
+      await textsOf({ action: "list_items", role: "assistant", limit: 2 }, { hasMore: true })
+    ).toEqual(["opening facts", "row 0"]);
+    expect(
+      await textsOf(
+        { action: "list_items", role: "assistant", limit: 2, recent_first: true },
+        { hasMore: true }
+      )
+    ).toEqual(["row 1199", "row 1198"]);
+    expect(await textsOf({ action: "list_items", tool_name: "bash" })).toEqual([]);
+    expect(
+      (
+        await complete(
+          { action: "list_items", role: "assistant", max_chars_per_item: 5, limit: 1 },
+          { hasMore: true }
+        )
+      ).items?.[0]?.text
+    ).toBe("openi");
   });
 });
 
@@ -3282,17 +2982,13 @@ describe("session_history newest-first browsing", () => {
     );
   }
   const collect = async (input: SessionHistoryArgs) => {
-    const results = await pages(input);
-    return {
-      pages: results,
-      items: results.flatMap((page) => page.items ?? []),
-      windows: results.flatMap((page) => page.windows ?? []),
-    };
+    const result = await complete(input);
+    return { items: result.items ?? [], windows: result.windows ?? [] };
   };
 
   test("reverse listing, search and windows equal the reversed forward walk on a mixed fixture", async () => {
     await writeMixedFixture();
-    const forward = await collect({ action: "list_items", limit: 3 });
+    const forward = await collect({ action: "list_items" });
     expect(forward.items.map((item) => item.text)).toEqual([
       "alpha one",
       "alpha two",
@@ -3313,13 +3009,12 @@ describe("session_history newest-first browsing", () => {
       "w:50",
       "w:50",
     ]);
-    const reverse = await collect({ action: "list_items", limit: 3, recent_first: true });
+    const reverse = await collect({ action: "list_items", recent_first: true });
     expect(reverse.items).toEqual([...forward.items].reverse());
     // Floor discovery, span discovery and delivery each re-read the oversized row.
-    expect(reverse.pages.length).toBeGreaterThan(1);
-    expect(reverse.pages.at(-1)?.exhausted).toBe(true);
-    const forwardWindows = await collect({ action: "list_windows", limit: 2 });
-    const reverseWindows = await collect({ action: "list_windows", limit: 2, recent_first: true });
+    expect(scanned.length).toBeGreaterThan(1);
+    const forwardWindows = await collect({ action: "list_windows" });
+    const reverseWindows = await collect({ action: "list_windows", recent_first: true });
     expect(forwardWindows.windows).toEqual([
       { windowId: "w:10", boundaryKind: "reset" },
       { windowId: "w:20", boundaryKind: "reset" },
@@ -3327,12 +3022,11 @@ describe("session_history newest-first browsing", () => {
       { windowId: "w:50", boundaryKind: "compaction" },
     ]);
     expect(reverseWindows.windows).toEqual([...forwardWindows.windows].reverse());
-    const forwardSearch = await collect({ action: "search", query: "a", role: "user", limit: 1 });
+    const forwardSearch = await collect({ action: "search", query: "a", role: "user" });
     const reverseSearch = await collect({
       action: "search",
       query: "a",
       role: "user",
-      limit: 1,
       recent_first: true,
     });
     expect(reverseSearch.items).toEqual([...forwardSearch.items].reverse());
@@ -3352,7 +3046,7 @@ describe("session_history newest-first browsing", () => {
     ).toEqual([]);
   });
 
-  test("a window larger than one scan page is discovered before any of its rows are delivered", async () => {
+  test("a window larger than one scan chunk is discovered before any of its rows are delivered", async () => {
     const boundary = createMuxMessage("big-window", "assistant", "big summary", compaction(1, 100));
     const tail = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 100 }, (_, i) =>
       createMuxMessage(`tail-${i}`, "assistant", `public-${i}`, { historySequence: 101 + i })
@@ -3361,105 +3055,79 @@ describe("session_history newest-first browsing", () => {
       chatPath,
       [boundary, ...tail].map((message) => JSON.stringify(message)).join("\n") + "\n"
     );
-    const results = await pages({ action: "list_items", limit: 25, recent_first: true });
-    const items = results.flatMap((page) => page.items ?? []);
-    // Floor discovery and span discovery each need more than one page before delivery starts.
-    expect(results.slice(0, 2).every((page) => page.items?.length === 0 && page.nextCursor)).toBe(
-      true
+    const items = await itemsOf(
+      { action: "list_items", limit: 25, recent_first: true },
+      { hasMore: true }
     );
-    expect(items).toHaveLength(tail.length + 2);
+    // Floor discovery and span discovery each need more than one chunk before delivery starts;
+    // every delivered row is attributed to the fully discovered window.
+    expect(scanned.length).toBeGreaterThan(2);
+    expect(items).toHaveLength(25);
     expect(items[0]).toMatchObject({ text: `public-${tail.length - 1}`, windowId: "w:100" });
-    expect(items.at(-2)).toMatchObject({ text: "big summary", windowId: "w:100" });
-    expect(items.at(-1)).toMatchObject({ text: "opening facts", windowId: "w:0" });
-    for (let i = 0; i < items.length - 1; i++)
-      expect(
-        items[i].windowId === items[i + 1].windowId || items[i + 1].text === "opening facts"
-      ).toBe(true);
-    const windows = (await pages({ action: "list_windows", recent_first: true })).flatMap(
-      (page) => page.windows ?? []
-    );
+    expect(items.every((item) => item.windowId === "w:100")).toBe(true);
+    expect(await textsOf({ action: "list_items", window_id: "w:0", recent_first: true })).toEqual([
+      "opening facts",
+    ]);
+    expect(
+      await itemsOf({ action: "search", query: "big summary", recent_first: true })
+    ).toMatchObject([{ text: "big summary", windowId: "w:100" }]);
+    const windows = await windowsOf({ action: "list_windows", recent_first: true });
     expect(windows).toEqual([
       { windowId: "w:100", boundaryKind: "compaction" },
       { windowId: "w:0", boundaryKind: "root" },
     ]);
   });
 
-  test("reverse cursors bind direction, freeze the snapshot, and expire on resets, rewrites and rotation", async () => {
-    await append("two", "second");
-    await append("three", "third");
-    const first = await call({ action: "list_items", limit: 1, recent_first: true });
-    expect(first.items?.map((item) => item.text)).toEqual(["third"]);
-    const cursor = first.nextCursor!;
-    expect(cursor).toBeString();
-    expect((await call({ action: "list_items", limit: 1, cursor })).error).toBe("invalid_cursor");
-    expect((await call({ action: "list_items", recent_first: false, cursor })).error).toBe(
-      "invalid_cursor"
-    );
+  test("reverse reads keep the pinned snapshot across appends and restart on resets, rewrites and rotation", async () => {
+    await append("two", "ordinal second");
+    await append("three", "ordinal third");
+    await seedFiller();
+    const reverse = { action: "search", query: "ordinal", recent_first: true } as const;
     // Ordinary appends keep the retrieval snapshot fixed: the new row is not exposed.
-    await append("four", "fourth");
-    const second = await call({ action: "list_items", limit: 1, recent_first: true, cursor });
-    expect(second.items?.map((item) => item.text)).toEqual(["second"]);
-    const third = await call({
-      action: "list_items",
-      limit: 1,
-      recent_first: true,
-      cursor: second.nextCursor,
-    });
-    expect(third.items?.map((item) => item.text)).toEqual(["opening facts"]);
-    expect(third.exhausted).toBe(true);
-    expect(third.nextCursor).toBeUndefined();
-    // A fresh newest-first scan sees the appended row first.
-    expect(
-      (await call({ action: "list_items", limit: 1, recent_first: true })).items?.[0]?.text
-    ).toBe("fourth");
-    const paused = await call({ action: "list_items", limit: 1, recent_first: true });
-    await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
-    expect(
-      (
-        await call({
-          action: "list_items",
-          limit: 1,
-          recent_first: true,
-          cursor: paused.nextCursor,
-        })
-      ).error
-    ).toBe("stale_cursor");
-    const afterReset = await call({ action: "list_items", limit: 1, recent_first: true });
-    expect(afterReset.items).toEqual([]);
-    expect(afterReset.exhausted).toBe(true);
-    await append("five", "fifth");
-    await append("six", "sixth");
-    const rotated = await call({ action: "list_items", limit: 1, recent_first: true });
-    expect(rotated.items?.map((item) => item.text)).toEqual(["sixth"]);
-    expect(rotated.nextCursor).toBeString();
-    await append("rotate", "summary", compaction(1));
-    expect(
-      (
-        await call({
-          action: "list_items",
-          limit: 1,
-          recent_first: true,
-          cursor: rotated.nextCursor,
-        })
-      ).error
-    ).toBe("stale_cursor");
-    const rewound = await call({ action: "list_items", limit: 1, recent_first: true });
-    const handle = await fs.open(chatPath, "r+");
+    const appended = mutateBetweenChunks(() => append("four", "ordinal fourth"));
     try {
-      await handle.write(Buffer.from("!"), 0, 1, 0);
+      expect(await textsOf(reverse)).toEqual(["ordinal third", "ordinal second"]);
     } finally {
-      await handle.close();
+      appended.restore();
     }
-    expect(
-      (
-        await call({
-          action: "list_items",
-          limit: 1,
-          recent_first: true,
-          cursor: rewound.nextCursor,
-        })
-      ).error
-    ).toBe("stale_cursor");
+    expectIntermediate(appended);
+    // A fresh newest-first scan sees the appended row first.
+    expect(await textsOf(reverse)).toEqual(["ordinal fourth", "ordinal third", "ordinal second"]);
+    const reset = mutateBetweenChunks(async () => {
+      await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+      await append("five", "ordinal fifth");
+      await seedFiller(undefined, "after-reset");
+    });
+    try {
+      expect(await textsOf(reverse)).toEqual(["ordinal fifth"]);
+    } finally {
+      reset.restore();
+    }
+    expectIntermediate(reset);
+    const rotated = mutateBetweenChunks(async () => {
+      await append("six", "ordinal sixth");
+      await append("rotate", "summary", compaction(1));
+    });
+    try {
+      expect(await textsOf(reverse)).toEqual(["ordinal sixth", "ordinal fifth"]);
+    } finally {
+      rotated.restore();
+    }
+    expectIntermediate(rotated);
+    const rewritten = mutateBetweenChunks(async () => {
+      const handle = await fs.open(chatPath, "r+");
+      try {
+        await handle.write(Buffer.from("!"), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    try {
+      expect(await textsOf(reverse)).toEqual(["ordinal sixth", "ordinal fifth"]);
+    } finally {
+      rewritten.restore();
+    }
+    expectIntermediate(rewritten);
     expect(await call({ action: "read_item", item_id: "1", recent_first: true })).toMatchObject({
       success: false,
       error: "filters_unsupported",
@@ -3498,25 +3166,6 @@ describe("session_history descendant task history", () => {
     return TOOL_DEFINITIONS.session_history.resultSchema.parse(
       await tool.execute!(input, mockToolCallOptions)
     );
-  };
-  const pagesAs = async (input: SessionHistoryArgs) => {
-    const results: SessionHistoryResult[] = [];
-    let cursor: string | undefined;
-    do {
-      const result = await callAs({ ...input, cursor });
-      expect(result.success).toBe(true);
-      expect(result.bytesRead ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-      expect(result.rowsScanned ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-      if (result.nextCursor)
-        expect(result.nextCursor.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_CURSOR_CHARS);
-      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
-        SESSION_HISTORY_MAX_RESULT_BYTES
-      );
-      results.push(result);
-      cursor = result.nextCursor;
-      expect(results.length).toBeLessThan(40);
-    } while (cursor);
-    return results;
   };
   const appendTo = async (workspace: string, id: string, text: string, metadata?: MuxMetadata) => {
     const message = createMuxMessage(id, "assistant", text, metadata);
@@ -3604,12 +3253,15 @@ describe("session_history descendant task history", () => {
   test("a proven authorization whose append check is unfinished reads no target rows that chunk", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
-    await seedChildFiller("child-filler");
+    await seedChildFiller("bulk");
     await appendChild("child-two", "child two");
     const seam = mutateBetweenChunks(largeCallerAppend);
     let result: SessionHistoryResult;
     try {
-      result = await completeAs({ action: "list_items", task_id: childId, role: "assistant", limit: 25 }, true);
+      result = await completeAs(
+        { action: "list_items", task_id: childId, role: "assistant", limit: 25 },
+        true
+      );
     } finally {
       seam.restore();
     }
@@ -3623,7 +3275,7 @@ describe("session_history descendant task history", () => {
   test("a caller reset appended between chunks denies the read after the restart", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
-    await seedChildFiller("child-filler");
+    await seedChildFiller("bulk");
     const seam = mutateBetweenChunks(() =>
       append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true })
     );
@@ -3642,7 +3294,7 @@ describe("session_history descendant task history", () => {
   test("target rotation between chunks restarts once, then reports history_changed", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
-    await seedChildFiller("child-filler");
+    await seedChildFiller("bulk");
     const rotate = (id: string) => appendChild(id, "", rollover);
     const once = mutateBetweenChunks(() => rotate("roll-once"));
     try {
@@ -3655,12 +3307,12 @@ describe("session_history descendant task history", () => {
       once.restore();
     }
     expectIntermediate(once);
-    await seedChildFiller("child-more");
+    await seedChildFiller("bulk-more");
     const twice = afterChunks(async (chunk) => {
       if (chunk > 2) return;
       await rotate(`roll-${chunk}`);
       // Keep the restarted read multi-chunk so the second rotation lands between its chunks.
-      await seedChildFiller(`child-after-${chunk}`);
+      await seedChildFiller(`bulk-after-${chunk}`);
     });
     try {
       expect(await callAs({ action: "search", query: "child one", task_id: childId })).toEqual(
@@ -3675,7 +3327,7 @@ describe("session_history descendant task history", () => {
   test("a caller append check unfinished at the deadline is history_timeout", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
-    await seedChildFiller("child-filler");
+    await seedChildFiller("bulk");
     const clock = fakeClock();
     const seam = afterChunks(async (chunk) => {
       if (chunk === 1) await largeCallerAppend();
@@ -3761,45 +3413,45 @@ describe("session_history descendant task history", () => {
     ).toEqual(["child facts from the old segment"]);
   });
 
-  test("authorization is proven in bounded pages and revalidated before later target pages", async () => {
-    const filler = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 50 }, (_, i) =>
-      createMuxMessage(`filler-${i}`, "assistant", `filler ${i}`, { historySequence: 100 + i })
-    );
-    await appendTrackedHistory(
-      chatPath,
-      filler.map((message) => JSON.stringify(message)).join("\n") + "\n"
-    );
+  test("authorization is proven across chunks and revalidated before later target chunks", async () => {
+    await seedFiller(SESSION_HISTORY_MAX_SCAN_ROWS + 50);
     await spawn([childId]);
     await appendChild("child-one", "child one");
+    await seedChildFiller("bulk");
     await appendChild("child-two", "child two");
-    const results = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
-    // The caller's floor discovery and receipt search need more than one page.
-    expect(results[0]).toMatchObject({ success: true, exhausted: false, items: [] });
-    expect(results[0].nextCursor).toBeString();
-    expect(results.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
-      "child one",
-      "child two",
-    ]);
-    // A proven cursor keeps working across ordinary caller appends, but a caller reset
-    // appended between pages expires it, and a fresh call is denied.
-    const first = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
-    const partial = first.find((page) => page.items?.length === 1 && page.nextCursor)!;
-    expect(partial).toBeDefined();
-    await append("caller-later", "later caller row");
-    const continued = await callAs({
-      action: "list_items",
-      task_id: childId,
-      limit: 1,
-      cursor: partial.nextCursor,
-    });
-    expect(continued.items?.map((item) => item.text)).toEqual(["child two"]);
-    const paused = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
-    const cursor = paused.find((page) => page.items?.length === 1 && page.nextCursor)!.nextCursor;
-    await append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true });
-    expect((await callAs({ action: "list_items", task_id: childId, limit: 1, cursor })).error).toBe(
-      "stale_cursor"
+    // The caller's floor discovery and receipt search need more than one chunk, and the
+    // target read spans chunks too; the call still answers completely.
+    const listed = await completeAs({ action: "search", query: "child", task_id: childId });
+    expect(listed.items?.map((item) => item.text)).toEqual(["child one", "child two"]);
+    expect(scanned.slice(0, 2)).toEqual([workspaceId, workspaceId]);
+    expect(childReads()).toBeGreaterThan(1);
+    // A proven authorization keeps working across ordinary caller appends between chunks
+    // (re-checked before every later target chunk), but a caller reset appended between
+    // chunks restarts the read, which is then denied; so is a fresh call.
+    const later = mutateBetweenChunks(() => append("caller-later", "later caller row"));
+    try {
+      expect(
+        (await completeAs({ action: "search", query: "child", task_id: childId })).items?.map(
+          (item) => item.text
+        )
+      ).toEqual(["child one", "child two"]);
+    } finally {
+      later.restore();
+    }
+    expectIntermediate(later);
+    const reset = mutateBetweenChunks(() =>
+      append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true })
     );
-    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+    try {
+      expect(await callAs({ action: "search", query: "child", task_id: childId })).toEqual({
+        success: false,
+        error: "task_not_found",
+      });
+    } finally {
+      reset.restore();
+    }
+    expectIntermediate(reset);
+    expect(await callAs({ action: "list_items", task_id: childId })).toEqual({
       success: false,
       error: "task_not_found",
     });
@@ -3853,7 +3505,7 @@ describe("session_history descendant task history", () => {
     expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
   });
 
-  test("foreign toolCalls never authorize and a racing caller reset waits for the page", async () => {
+  test("foreign toolCalls never authorize and a racing caller reset waits for the chunk", async () => {
     await appendChild("child-row", "child facts");
     // Legacy toolCalls only count inside code_execution results; other tools' output is data.
     await appendSpawnPart(
@@ -3869,27 +3521,24 @@ describe("session_history descendant task history", () => {
     // scan and the target scan: the caller's history locks are held across both, so the reset
     // is serialized after the page and the NEXT call is denied.
     await spawn([childId]);
-    const original = fixture.historyService.scanHistoryBounded.bind(fixture.historyService);
     let resetSettled = false;
     let pendingReset: Promise<unknown> | undefined;
-    const spy = spyOn(fixture.historyService, "scanHistoryBounded").mockImplementation(
-      (workspace, options) => {
-        if (workspace === childId && !pendingReset)
-          pendingReset = append("foreign-reset", "", {
-            contextBoundaryKind: "reset",
-            synthetic: true,
-          }).then(() => {
-            resetSettled = true;
-          });
-        return original(workspace, options);
-      }
-    );
+    beforeScan = (workspace) => {
+      // Started while the caller's locks are held: the writer must wait for the chunk.
+      if (workspace === childId && !pendingReset)
+        pendingReset = append("foreign-reset", "", {
+          contextBoundaryKind: "reset",
+          synthetic: true,
+        }).then(() => {
+          resetSettled = true;
+        });
+    };
     try {
       const raced = await callAs({ action: "list_items", task_id: childId });
       expect(resetSettled).toBe(false);
       expect(raced.items?.map((item) => item.text)).toEqual(["child facts"]);
     } finally {
-      spy.mockRestore();
+      beforeScan = undefined;
     }
     await pendingReset;
     expect(resetSettled).toBe(true);
@@ -3899,31 +3548,31 @@ describe("session_history descendant task history", () => {
     });
   });
 
-  test("large caller appends between proven pages resume the append check as progress pages", async () => {
+  test("large caller appends between proven chunks are re-checked in-process before publication", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
+    await seedChildFiller("bulk");
     await appendChild("child-two", "child two");
-    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
-    expect(first.items?.map((item) => item.text)).toEqual(["child one"]);
-    const rows = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 100 }, (_, i) =>
-      createMuxMessage(`later-${i}`, "assistant", `later ${i}`, { historySequence: 5000 + i })
+    // SESSION_HISTORY_MAX_SCAN_ROWS + 100 appended caller rows: the append check needs more
+    // than one chunk (by rows), none of which reads the target.
+    const seam = mutateBetweenChunks(() =>
+      appendRawRows(
+        Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 100 }, (_, i) =>
+          createMuxMessage(`later-${i}`, "assistant", `later ${i}`, { historySequence: 5000 + i })
+        )
+      )
     );
-    await appendTrackedHistory(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
-    const checking = await callAs({
-      action: "list_items",
-      task_id: childId,
-      limit: 1,
-      cursor: first.nextCursor,
-    });
-    expect(checking).toMatchObject({ success: true, exhausted: false, items: [] });
-    expect(checking.nextCursor).toBeString();
-    const resumed = await callAs({
-      action: "list_items",
-      task_id: childId,
-      limit: 1,
-      cursor: checking.nextCursor,
-    });
-    expect(resumed.items?.map((item) => item.text)).toEqual(["child two"]);
+    try {
+      expect(
+        (await completeAs({ action: "search", query: "child", task_id: childId })).items?.map(
+          (item) => item.text
+        )
+      ).toEqual(["child one", "child two"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(scanned.slice(0, 5)).toEqual([workspaceId, childId, workspaceId, workspaceId, childId]);
   });
 
   test("unauthorized, unknown and unavailable targets fail closed without creating sessions", async () => {
@@ -3964,49 +3613,42 @@ describe("session_history descendant task history", () => {
     await expectNoSession(grandchildId);
   });
 
-  test("cursors bind caller and target, and removal during pagination fails closed", async () => {
+  test("removal between chunks fails closed without data or a created session", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
+    await seedChildFiller("bulk");
     await appendChild("child-two", "child two");
-    await append("own-two", "own second");
-    const own = await callAs({ action: "list_items", limit: 1 });
-    expect(own.nextCursor).toBeString();
-    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
-    expect(first.items?.map((item) => item.text)).toEqual(["child one"]);
-    const cursor = first.nextCursor!;
-    expect(cursor).toBeString();
-    expect((await callAs({ action: "list_items", limit: 1, cursor })).error).toBe("invalid_cursor");
     expect(
-      (await callAs({ action: "list_items", task_id: childId, limit: 1, cursor: own.nextCursor }))
-        .error
-    ).toBe("invalid_cursor");
-    // Another caller with its own receipt for the same child still cannot replay this cursor.
-    const otherParent = {
-      resolveDescendantAgentTaskBranchRoot: () =>
-        Promise.resolve({ status: "live", branchRootTaskId: childId }),
-    } as unknown as TaskService;
-    await spawn([childId], false, "other-parent");
-    expect(
-      (
-        await callAs(
-          { action: "list_items", task_id: childId, limit: 1, cursor },
-          { caller: "other-parent", taskService: otherParent }
-        )
-      ).error
-    ).toBe("invalid_cursor");
-    // Removal publishes its tombstone under the history lock before deleting files.
-    await fs.mkdir(path.dirname(workspaceRemovalTombstonePath(fixture.config.rootDir, childId)), {
-      recursive: true,
+      (await completeAs({ action: "search", query: "child", task_id: childId })).items?.map(
+        (item) => item.text
+      )
+    ).toEqual(["child one", "child two"]);
+    // Removal publishes its tombstone under the history lock before deleting files; a read
+    // that already delivered rows internally discards them.
+    const readsBefore = childReads();
+    const seam = mutateBetweenChunks(async () => {
+      await fs.mkdir(path.dirname(workspaceRemovalTombstonePath(fixture.config.rootDir, childId)), {
+        recursive: true,
+      });
+      await fs.writeFile(
+        workspaceRemovalTombstonePath(fixture.config.rootDir, childId),
+        JSON.stringify({ workspaceId: childId, removedAt: Date.now(), attemptId: "test" })
+      );
     });
-    await fs.writeFile(
-      workspaceRemovalTombstonePath(fixture.config.rootDir, childId),
-      JSON.stringify({ workspaceId: childId, removedAt: Date.now(), attemptId: "test" })
-    );
-    expect(
-      await callAs({ action: "list_items", task_id: childId, limit: 1, cursor })
-    ).toMatchObject({ success: false, error: "session_unavailable" });
+    try {
+      expect(await callAs({ action: "search", query: "child", task_id: childId })).toEqual({
+        success: false,
+        error: "session_unavailable",
+      });
+    } finally {
+      seam.restore();
+    }
+    // The chunk after the tombstone failed (a failed chunk is not counted), so the second
+    // target read is the one that observed the removal.
+    expect(seam.runs).toBe(1);
+    expect(childReads() - readsBefore).toBe(2);
     await fs.rm(sessionDir(childId), { recursive: true, force: true });
-    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+    expect(await callAs({ action: "list_items", task_id: childId })).toEqual({
       success: false,
       error: "session_unavailable",
     });
@@ -4020,7 +3662,10 @@ describe("session_history complete results", () => {
   test("has_more reports a proven further match beyond limit, not an exactly-limit result", async () => {
     await append("second", "second facts");
     await append("third", "third facts");
-    const capped = await complete({ action: "search", query: "facts", limit: 2 }, { hasMore: true });
+    const capped = await complete(
+      { action: "search", query: "facts", limit: 2 },
+      { hasMore: true }
+    );
     expect(capped.items?.map((item) => item.text)).toEqual(["opening facts", "second facts"]);
     expect(await textsOf({ action: "search", query: "facts", limit: 3 })).toEqual([
       "opening facts",
@@ -4043,9 +3688,9 @@ describe("session_history complete results", () => {
     expect(popped.items?.map((item) => item.text.length)).toEqual([13, 7_000, 7_000]);
     expect(popped.truncated).toBeUndefined();
     expect(
-      (await complete({ action: "list_items", role: "assistant", max_chars_per_item: 100 })).items?.map(
-        (item) => item.text.length
-      )
+      (
+        await complete({ action: "list_items", role: "assistant", max_chars_per_item: 100 })
+      ).items?.map((item) => item.text.length)
     ).toEqual([13, 100, 100, 100]);
   });
 
@@ -4057,7 +3702,7 @@ describe("session_history complete results", () => {
     });
     const one = await append("compact-one", "summary", compaction(1));
     const two = await append("compact-two", "summary", compaction(2));
-    const ids = ["w:0", `w:${one.metadata!.historySequence}`, `w:${two.metadata!.historySequence}`];
+    const ids = ["w:0", ...[one, two].map((row) => `w:${String(row.metadata!.historySequence)}`)];
     expect(await windowIdsOf({ action: "list_windows", limit: 2 }, { hasMore: true })).toEqual(
       ids.slice(0, 2)
     );
@@ -4065,12 +3710,14 @@ describe("session_history complete results", () => {
     // Legacy boundary rows (no sequence) carry their long IDs into the window list.
     const legacy = Array.from({ length: 20 }, (_, index) => `legacy-${index}-${"x".repeat(900)}`);
     await appendRawRows(legacy.map((id) => createMuxMessage(id, "assistant", "", compaction(3))));
-    const popped = await complete({ action: "list_windows" }, { hasMore: true });
-    expect(popped.windows!.length).toBeGreaterThan(3);
+    // 23 windows with ~1 KiB IDs exceed the 16 KiB response before the 50-window limit.
+    const popped = await complete({ action: "list_windows", limit: 50 }, { hasMore: true });
+    expect(popped.windows!.length).toBeGreaterThan(10);
     expect(popped.windows!.length).toBeLessThan(23);
-    expect(await windowIdsOf({ action: "list_windows", recent_first: true, limit: 2 }, { hasMore: true })).toEqual(
-      [`w:m:${legacy[19]}`, `w:m:${legacy[18]}`]
-    );
+    expect(Buffer.byteLength(JSON.stringify(popped))).toBeGreaterThan(14 * 1024);
+    expect(
+      await windowIdsOf({ action: "list_windows", recent_first: true, limit: 2 }, { hasMore: true })
+    ).toEqual([`w:m:${legacy[19]}`, `w:m:${legacy[18]}`]);
   });
 
   test("warnings name skipped oversized and malformed rows once each, and are absent otherwise", async () => {
@@ -4083,7 +3730,10 @@ describe("session_history complete results", () => {
     ]);
     const result = await complete({ action: "search", query: "facts" });
     expect(result.items?.map((item) => item.text)).toEqual(["opening facts", "later facts"]);
-    expect(result.warnings?.toSorted()).toEqual(["malformed_rows_skipped", "oversized_rows_skipped"]);
+    expect(result.warnings?.toSorted()).toEqual([
+      "malformed_rows_skipped",
+      "oversized_rows_skipped",
+    ]);
     // The scan skips those rows whatever the action asks for.
     expect((await complete({ action: "list_windows" })).warnings?.toSorted()).toEqual([
       "malformed_rows_skipped",
@@ -4158,10 +3808,9 @@ describe("session_history complete results", () => {
     expect(seam.chunks).toBe(3);
     expect(accumulatedChunks).toBe(3);
     // The pinned snapshot excludes the appended rows; the rows before it are still readable.
-    expect(await textsOf({ action: "search", query: "match", limit: 2 }, { hasMore: true })).toEqual([
-      "match one",
-      "match two",
-    ]);
+    expect(
+      await textsOf({ action: "search", query: "match", limit: 2 }, { hasMore: true })
+    ).toEqual(["match one", "match two"]);
   });
 
   test("a history mutex held past the deadline yields history_timeout after acquisition, without a read", async () => {
@@ -4215,12 +3864,10 @@ describe("session_history complete results", () => {
           controller.abort(reason);
         }
       };
-      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
-      config.historyService = fixture.historyService;
       expect(
-        await createSessionHistoryTool(config)
-          .execute!({ action: "search", query: "match" }, { ...mockToolCallOptions, abortSignal: controller.signal })
-          .catch((error: unknown) => error)
+        await call({ action: "search", query: "match" }, controller.signal).catch(
+          (error: unknown) => error
+        )
       ).toBe(reason);
     } finally {
       clock.restore();
