@@ -5,6 +5,7 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
+import notionIcon from "./assets/notion-mcp.png?inline";
 
 export default {
   ...appMeta,
@@ -23,11 +24,10 @@ export default {
 const NOTION = "notion-work";
 const LOCAL = "local-docs";
 const INFO_BUTTON = `Server information: ${NOTION}`;
-// Deterministic 64×64 RGBA PNG (dark tile, light glyph) standing in for a
-// host-decoded server icon. Generated locally, not copied from any server.
-const NOTION_ICON =
-  "data:image/png;base64," +
-  "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAA3klEQVR42u3ZQQ6DMAxE0Zwk979g1mXbVRslZuSx/0gsgfCkALbHIISQr8w5PzvHWuvnsXsd9f0AAAAAAAAAAAAAADgB+LcIADpsgfYAuwi8BAFoDhCNYAkQiWALEIVgDRCBAIA7wC1CCYAbhDIApwgAVAI4QbD8FY5EsK0FohZuXQxFLB4A93L49gFK9ANuHqJMQ0R9HgAZW2Lq7ZOyJ6h+iaZsiqo/pSm7wuo/SgAyzgWUhVXawYiqvE49GQKgO4Ci2WoxHG0P8ObghfE4AAAAAAAAAAAAAACEEDLGA62rWdcX21dQAAAAAElFTkSuQmCC";
+// Notion's SVG logo rasterized by the host's strict icon pipeline (62×64 PNG).
+// ?inline yields the data URL shape the badge accepts (isPngDataUrl), so the
+// story exercises the real render path without a story-only production API.
+const NOTION_ICON: string = notionIcon;
 
 function setupIdentityStory(transport: "http" | "auto" = "http") {
   expandLeftSidebar();
