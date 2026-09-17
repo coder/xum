@@ -1116,19 +1116,17 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   });
 
-  test("on-send usage in the handoff band preserves history while advisory permissions are unknown", async () => {
+  test("on-send usage in the handoff band preserves history and publishes the handoff", async () => {
     const h = await setup();
-    // Past the handoff target but below the usable ceiling: nothing is forced, and no advisory
-    // is spent before a settled step reports what the agent can actually do.
+    // Past the handoff target but below the usable ceiling: nothing is forced; the advisory
+    // rides the send itself, with capabilities resolved from the dispatching permissions.
     await seedHistory(h, 95_000);
     expect(
       (await h.session.sendMessage("Keep working below the usable ceiling", options)).success
     ).toBe(true);
     const rows = await allRows(h);
     expect(rolloverRows(rows)).toHaveLength(0);
-    expect(
-      rows.filter((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
-    ).toHaveLength(0);
+    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
   });
@@ -1810,25 +1808,61 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("restart defers its first warning until settled memory availability is known", async () => {
-    const h = await setup();
-    await seedHistory(h, 85_000);
-    expect((await h.session.sendMessage("Resume work", options)).success).toBe(true);
-    expect(
-      (await allRows(h)).filter(
-        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
-      )
-    ).toHaveLength(0);
-    expect(
-      (await h.requests[0].onStepSettled?.(step(85_000, { memoryWritable: true })))?.decision
-    ).toBe("warn");
-    await h.finishAndDispatch();
-    expect(
-      (await allRows(h)).filter(
-        (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
-      )
-    ).toHaveLength(1);
-  });
+  test.each([
+    {
+      label: "warning with full capabilities",
+      usage: 85_000,
+      sendOptions: resumeOptions,
+      expected: {
+        handoff: false,
+        memoryWritable: true,
+        sessionHistoryAvailable: true,
+        newContextAvailable: true,
+      },
+    },
+    {
+      label: "handoff with degraded capabilities",
+      usage: 90_000,
+      sendOptions: {
+        ...resumeOptions,
+        toolPolicy: [{ regex_match: "memory|session_.*", action: "disable" }],
+      } satisfies SendMessageOptions,
+      expected: {
+        handoff: true,
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+        newContextAvailable: true,
+      },
+    },
+  ])(
+    "the first send after a restart publishes the $label through the dispatching permissions",
+    async ({ usage, sendOptions, expected }) => {
+      const first = await setup();
+      await seedHistory(first, usage);
+      await first.session.dispose();
+      // No step has settled in this process, so nothing cached says what the agent can do; the
+      // dispatching agent, policy and experiments are the capability source.
+      const h = await setup({ previous: first });
+      const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
+      expect((await h.session.sendMessage("Resume work", sendOptions)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(1);
+      expect(isHandoffRow(warningRows(rows)[0])).toBe(expected.handoff);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(
+        expect.objectContaining({ maxTokens: 128_000, budgetTokens: 119_808, ...expected })
+      );
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
+      expect(budgetClaims(h)).toEqual({ warning: !expected.handoff, handoff: expected.handoff });
+      // A text-only reply never runs the settled-step callback; the next send repeats nothing.
+      h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: usage } });
+      await h.session.waitForIdle();
+      expect((await h.session.sendMessage("Keep going", sendOptions)).success).toBe(true);
+      expect(warningRows(await allRows(h))).toHaveLength(1);
+      expect(h.requests).toHaveLength(2);
+    }
+  );
 
   test.each([0.7, 0.9, 1])(
     "a pending handoff is reclassified at dispatch with threshold %s",
@@ -2376,14 +2410,9 @@ describe("AgentSession token-budget lifecycle", () => {
         }
       }
       if (interruption !== "restart-after") expect(warningRows(await allRows(h))).toHaveLength(0);
+      // Without a durable row the next send publishes the handoff from persisted usage and the
+      // dispatching permissions; with one, it publishes nothing more.
       expect((await h.session.sendMessage("Resume the work", options)).success).toBe(true);
-      if (interruption === "stop" || interruption === "restart-before") {
-        // Tool availability is re-learned from a settled step before anything is published.
-        expect(warningRows(await allRows(h))).toHaveLength(0);
-        expect((await h.requests.at(-1)!.onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-        h.settleStream(h.requests.length - 1, { contextUsage: { inputTokens: 90_000 } });
-        await h.waitForRequest(h.requests.length + 1);
-      }
       const rows = await allRows(h);
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
@@ -2431,18 +2460,24 @@ describe("AgentSession token-budget lifecycle", () => {
       const counted = spyOn(budgetCounting, "estimateToolResultTokensForModel").mockResolvedValue(
         toolResultTokens
       );
+      // The send itself is screened against the persisted outputs first.
       expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
-      expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("warn");
-      h.settleStream(0, { contextUsage: { inputTokens: 100_000 } });
-      await h.waitForRequest(2);
       expect(counted).toHaveBeenCalledWith([settled], expect.anything());
       expect(
         counted.mock.calls.some(([outputs]) => Array.isArray(outputs) && outputs.includes(stale))
       ).toBe(false);
-      const rows = await allRows(h);
+      let rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(advisory ? 1 : 0);
+      if (!advisory) {
+        // Settlement sees no persisted outputs and asks for the handoff; dispatch screens again.
+        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("warn");
+        h.settleStream(0, { contextUsage: { inputTokens: 100_000 } });
+        await h.waitForRequest(2);
+        rows = await allRows(h);
+        expect(warningRows(rows)).toHaveLength(0);
+        expect(text(rows.at(-1)!)).toBe("Continue");
+      }
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(text(rows.at(-1)!)).toBe("Continue");
       expect(budgetClaims(h).handoff).toBe(advisory);
     }
   );
@@ -2752,7 +2787,8 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
       rows = await allRows(h);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(warningRows(rows)).toHaveLength(1);
+      // The window's handoff advisory may still ride this send; no second legacy flush does.
+      expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
     }
   );
 

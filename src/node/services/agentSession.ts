@@ -1018,7 +1018,8 @@ export class AgentSession {
   private contextBudgetFlushClaimed = false;
   private pendingBudgetPrompt?: "warn" | "handoff";
   private contextBudgetGeneration = 0;
-  // Unknown after restart: do not spend the window's warning on guessed permissions.
+  // Settled-step capability, used only to admit a legacy persisted final flush; advisories
+  // resolve the dispatching permissions instead (unknown after restart until a step settles).
   private contextBudgetMemoryWritable: boolean | undefined;
   private contextBudgetHistoryAvailable = false;
   private readonly onContextWindowRollover?: () => void;
@@ -6198,11 +6199,10 @@ export class AgentSession {
       this.pendingBudgetPrompt = undefined;
       return Ok({ prefix: [] });
     }
-    if (
-      knownLimit &&
-      this.contextBudgetMemoryWritable !== undefined &&
-      this.isTokenBudgetActive(options)
-    ) {
+    // Advisory capabilities come from the dispatching agent, policy and experiments, so the first
+    // send after a restart (where no step has settled yet, and a text-only reply never settles
+    // one) still publishes its single advisory instead of staying silent until the ceiling.
+    if (knownLimit && this.isTokenBudgetActive(options)) {
       const generation = this.contextBudgetGeneration;
       const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
       // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
