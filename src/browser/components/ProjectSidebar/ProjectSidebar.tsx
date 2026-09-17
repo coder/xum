@@ -51,6 +51,7 @@ import { PlatformPaths } from "@/common/utils/paths";
 import {
   partitionWorkspacesByAge,
   buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
@@ -1039,6 +1040,32 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     });
     handleAddWorkspace(SCRATCH_PROJECT_CONFIG_KEY);
   }, [handleAddWorkspace, setExpandedProjectsArray]);
+
+  // Open a sibling draft in the same project and section as `meta`. Shared by
+  // Ctrl+N and the flat-mode "New chat" button.
+  // Resolve the effective section ID exactly the way the renderer does:
+  // honor the workspace's own subProjectPath when it still exists, otherwise
+  // inherit from the parent workspace. This keeps the draft in lockstep with
+  // the visible section and avoids forwarding deleted sub-project paths that
+  // workspace.create would reject.
+  // Scratch chats are bucketed under the scratch config key while their
+  // projectPath is the app-managed workdir, so the bucket lookup below misses
+  // them; check kind first.
+  const handleAddSiblingWorkspace = useCallback(
+    (meta: FrontendWorkspaceMetadata) => {
+      if (meta.kind === "scratch") {
+        handleAddScratchWorkspace();
+        return;
+      }
+      const projectWorkspaces = sortedWorkspacesByProject.get(meta.projectPath) ?? [];
+      const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
+      const validSectionIds = new Set(
+        getSubProjectsForParent(meta.projectPath, userProjects).map(([subPath]) => subPath)
+      );
+      handleAddWorkspace(meta.projectPath, resolveEffectiveSectionId(meta, byId, validSectionIds));
+    },
+    [handleAddScratchWorkspace, handleAddWorkspace, sortedWorkspacesByProject, userProjects]
+  );
 
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
@@ -2093,33 +2120,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // target from the live sidebar metadata before opening a sibling draft.
       if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
-        // Resolve the effective section ID exactly the way the renderer does:
-        // honor the workspace's own subProjectPath when it still exists,
-        // otherwise inherit from the parent workspace. This keeps Ctrl+N in
-        // lockstep with the visible section and avoids forwarding deleted
-        // sub-project paths that workspace.create would reject.
-        // Scratch chats are bucketed under the scratch config key while their
-        // selection projectPath is the app-managed workdir, so the bucket
-        // lookup below misses them; check kind via the store by ID first.
-        if (
-          workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId)?.kind === "scratch"
-        ) {
-          handleAddScratchWorkspace();
-          return;
+        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
+        if (meta) {
+          handleAddSiblingWorkspace(meta);
+        } else {
+          handleAddWorkspace(selectedWorkspace.projectPath);
         }
-        const projectWorkspaces =
-          sortedWorkspacesByProject.get(selectedWorkspace.projectPath) ?? [];
-        const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
-        const meta = byId.get(selectedWorkspace.workspaceId);
-        const validSectionIds = new Set(
-          getSubProjectsForParent(selectedWorkspace.projectPath, userProjects).map(
-            ([subPath]) => subPath
-          )
-        );
-        const subProjectPath = meta
-          ? resolveEffectiveSectionId(meta, byId, validSectionIds)
-          : undefined;
-        handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -2151,13 +2157,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
-    handleAddScratchWorkspace,
+    handleAddSiblingWorkspace,
     handleAddWorkspace,
     handleArchiveWorkspace,
     setWorkspacePinned,
     movePinnedWorkspace,
-    sortedWorkspacesByProject,
-    userProjects,
     workspaceStore,
   ]);
 
@@ -2580,10 +2584,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     );
   };
 
+  // Default the flat-mode "New chat" to the project of the most recently
+  // created chat; only fall back to Scratch when that chat is a scratch chat
+  // or there are no chats at all.
+  const handleAddFlatWorkspace = () => {
+    const recent = findMostRecentlyCreatedWorkspace(flatWorkspaces, workspaceRecency);
+    if (recent) {
+      handleAddSiblingWorkspace(recent);
+    } else {
+      handleAddScratchWorkspace();
+    }
+  };
+
   const flatSidebarContent = (
     <div className="py-1">
       <button
-        onClick={handleAddScratchWorkspace}
+        onClick={handleAddFlatWorkspace}
         className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
       >
         <Plus className="h-3.5 w-3.5" />

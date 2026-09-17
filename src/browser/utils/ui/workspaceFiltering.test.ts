@@ -5,6 +5,7 @@ import {
   AGE_THRESHOLDS_DAYS,
   buildSortedWorkspacesByProject,
   buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   orderMultiProjectSectionRows,
   computeWorkspaceDepthMap,
   computeAgentRowRenderMeta,
@@ -677,6 +678,29 @@ describe("buildSortedWorkspacesFlat", () => {
       "scratch",
       "recent",
     ]);
+  });
+});
+
+describe("findMostRecentlyCreatedWorkspace", () => {
+  it("prefers the newest createdAt over higher recency", () => {
+    const active = { ...createWorkspace("active"), createdAt: "2026-01-01T00:00:00.000Z" };
+    const newest = { ...createWorkspace("newest"), createdAt: "2026-01-02T00:00:00.000Z" };
+
+    expect(findMostRecentlyCreatedWorkspace([newest, active], { active: 500, newest: 1 })?.id).toBe(
+      "newest"
+    );
+  });
+
+  it("breaks createdAt ties by recency", () => {
+    // Legacy rows share one default createdAt, so the tiebreak decides.
+    const createdAt = "2025-01-01T00:00:00.000Z";
+    const quiet = { ...createWorkspace("quiet"), createdAt };
+    const active = { ...createWorkspace("active"), createdAt };
+
+    expect(findMostRecentlyCreatedWorkspace([quiet, active], { quiet: 1, active: 2 })?.id).toBe(
+      "active"
+    );
+    expect(findMostRecentlyCreatedWorkspace([], {})).toBeUndefined();
   });
 });
 describe("buildSortedWorkspacesByProject pinning", () => {
