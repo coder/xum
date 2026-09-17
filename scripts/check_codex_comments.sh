@@ -49,6 +49,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
+REGULAR_COUNT=0
+UNRESOLVED_COUNT=0
 IN_PROGRESS_COUNT=0
 
 resolve_repo_context() {
@@ -127,10 +129,20 @@ compute_codex_sets_from_arrays() {
     | select(.isResolved == false and .comments.nodes[0].author.login == $bot)
   ]')
 
+  REGULAR_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq 'length')
+  UNRESOLVED_COUNT=$(printf '%s' "$UNRESOLVED_THREADS" | jq 'length')
+
   # In-progress summaries are a subset of REGULAR_COMMENTS: they block, but the
   # wait loop below may give Codex time to finish before the verdict.
   IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments";
     [.[] | select(codex_review_in_progress($bot))] | length')
+}
+
+# Waiting only helps while the in-progress summary is the sole blocker. A review
+# thread or any other Codex comment already fixes the verdict at "unresolved", so
+# waiting for the review to finish would only hold the runner.
+codex_wait_can_change_verdict() {
+  [ "$IN_PROGRESS_COUNT" -gt 0 ] && [ "$((REGULAR_COUNT - IN_PROGRESS_COUNT + UNRESOLVED_COUNT))" -eq 0 ]
 }
 
 load_result_from_cache() {
@@ -355,9 +367,9 @@ if [ "$loaded_from_cache" -eq 1 ]; then
   fetch_result_via_api
 fi
 
-if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
+if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && codex_wait_can_change_verdict; then
   wait_deadline=$(($(date +%s) + WAIT_FOR_REVIEW_SECS))
-  while [ "$IN_PROGRESS_COUNT" -gt 0 ]; do
+  while codex_wait_can_change_verdict; do
     now=$(date +%s)
     if [ "$now" -ge "$wait_deadline" ]; then
       echo "⚠️ Codex review is still running after ${WAIT_FOR_REVIEW_SECS}s; reporting it as unresolved."
@@ -369,8 +381,6 @@ if [ "$WAIT_FOR_REVIEW_SECS" -gt 0 ] && [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
   done
 fi
 
-REGULAR_COUNT=$(echo "$REGULAR_COMMENTS" | jq 'length')
-UNRESOLVED_COUNT=$(echo "$UNRESOLVED_THREADS" | jq 'length')
 TOTAL_UNRESOLVED=$((REGULAR_COUNT + UNRESOLVED_COUNT))
 
 echo "Found ${REGULAR_COUNT} unminimized regular comment(s) from bot"

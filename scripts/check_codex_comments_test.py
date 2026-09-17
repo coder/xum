@@ -77,14 +77,15 @@ fixture_path = pathlib.Path(os.environ['CODEX_GATE_FIXTURE'])
 fixture = json.loads(fixture_path.read_text())
 with open(os.environ['CODEX_GATE_CALLS'], 'a') as calls:
     calls.write(query + '\\n')
+# Each first-page comments fetch starts a new polling round.
+round_path = fixture_path.with_suffix('.round')
+round_index = int(round_path.read_text()) if round_path.exists() else 0
+if 'comments(first: 100' in query and cursor == 'null':
+    round_index += 1
+    round_path.write_text(str(round_index))
 if 'snapshots' in fixture:
-    # Sequenced fixtures model Codex editing its summary between polls. Each
-    # first-page comments fetch starts a new round; the last snapshot then repeats.
-    round_path = fixture_path.with_suffix('.round')
-    round_index = int(round_path.read_text()) if round_path.exists() else 0
-    if 'comments(first: 100' in query and cursor == 'null':
-        round_index += 1
-        round_path.write_text(str(round_index))
+    # Sequenced fixtures model Codex editing its summary between polls; the
+    # last snapshot repeats once the sequence runs out.
     snapshot = fixture['snapshots'][min(max(round_index, 1), len(fixture['snapshots'])) - 1]
 else:
     snapshot = fixture['snapshot']
@@ -145,8 +146,8 @@ else:
         self.assertTrue(
             calls.read_text(), "a cached verdict must still re-query GitHub"
         )
-        # One-comment snapshots make every comments query a new polling round.
-        self.comment_fetches = calls.read_text().count("comments(first: 100")
+        # Polling rounds, not pages: the double serves one node per page.
+        self.comment_rounds = int(round_marker.read_text()) if round_marker.exists() else 0
         return result
 
     def assert_gate(
@@ -224,24 +225,25 @@ else:
             with self.subTest(name=name):
                 data = [snapshot([comment(FIXTURES[name]["body"])]), completed]
                 self.assert_gate(0, data, wait=60)
-                self.assertEqual(self.comment_fetches, 2)
+                self.assertEqual(self.comment_rounds, 2)
         with self.subTest("security-first board keeps waiting through a later poll"):
             security_first = snapshot([comment(FIXTURES["security_first_summary"]["body"])])
             self.assert_gate(0, [running, security_first, completed], wait=60)
-            self.assertEqual(self.comment_fetches, 3)
+            self.assertEqual(self.comment_rounds, 3)
         with self.subTest("cache is refreshed before waiting"):
             self.assert_gate(0, [running, completed], cache=running, wait=60)
-            self.assertEqual(self.comment_fetches, 2)
+            self.assertEqual(self.comment_rounds, 2)
         with self.subTest("without a budget the in-progress summary fails at once"):
             result = self.assert_gate(1, [running, completed])
-            self.assertEqual(self.comment_fetches, 1)
+            self.assertEqual(self.comment_rounds, 1)
             self.assertIn("has not finished reviewing", result.stdout)
 
     def test_wait_for_review_gives_up_and_never_hides_findings(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
+        completed = snapshot([comment(FIXTURES["summary"]["body"])])
         with self.subTest("still running at the deadline"):
             result = self.assert_gate(1, [running, running], wait=1)
-            self.assertGreater(self.comment_fetches, 1)
+            self.assertGreater(self.comment_rounds, 1)
             self.assertIn("still running after 1s", result.stdout)
         finding = thread("[P1] Validate the caller before reading credentials")
         completed_with_finding = snapshot(
@@ -249,6 +251,26 @@ else:
         )
         with self.subTest("a finding posted during the wait blocks"):
             self.assert_gate(1, [running, completed_with_finding], wait=60)
+        # Waiting cannot resolve a thread or clear another Codex comment, so the
+        # gate must not hold the runner once either one exists.
+        running_with_finding = snapshot(
+            [comment(FIXTURES["running_summary"]["body"])], [finding]
+        )
+        with self.subTest("an unresolved thread skips the wait"):
+            self.assert_gate(1, [running_with_finding, completed], wait=60)
+            self.assertEqual(self.comment_rounds, 1)
+        running_with_error = snapshot(
+            [
+                comment(FIXTURES["running_summary"]["body"]),
+                comment("Codex Review: Something went wrong. Try again later by commenting “@codex review”."),
+            ]
+        )
+        with self.subTest("another blocking comment skips the wait"):
+            self.assert_gate(1, [running_with_error, completed], wait=60)
+            self.assertEqual(self.comment_rounds, 1)
+        with self.subTest("a finding posted during the wait ends it at once"):
+            self.assert_gate(1, [running, running_with_finding, completed], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
         unknown = snapshot(
             [comment(FIXTURES["summary"]["body"].replace(
                 '"status":"completed"', '"status":"findings_found"'
@@ -256,7 +278,7 @@ else:
         )
         with self.subTest("unknown statuses fail without waiting"):
             self.assert_gate(1, [unknown, completed_with_finding], wait=60)
-            self.assertEqual(self.comment_fetches, 1)
+            self.assertEqual(self.comment_rounds, 1)
         for extra in (["--wait-for-review"], ["--wait-for-review", "-5"], ["--wait-for-review", "soon"]):
             with self.subTest(extra=extra):
                 # Argument errors exit before any GitHub query, so bypass run_gate.
