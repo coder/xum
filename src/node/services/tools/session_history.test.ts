@@ -1238,12 +1238,26 @@ describe("session_history real disk recovery", () => {
         "\n"
     );
     const windows = await windowsOf({ action: "list_windows" });
+    // Visible boundary rows (compaction summaries) count toward their own window; the empty
+    // rollover row does not.
     expect(windows).toEqual([
-      { windowId: "w:0", boundaryKind: "root" },
-      { windowId: `w:${String(compact.metadata!.historySequence)}`, boundaryKind: "compaction" },
-      { windowId: `w:${String(heartbeat.metadata!.historySequence)}`, boundaryKind: "compaction" },
-      { windowId: `w:${String(roll.metadata!.historySequence)}`, boundaryKind: "reset" },
-      { windowId: "w:m:legacy-boundary", boundaryKind: "compaction" },
+      { windowId: "w:0", boundaryKind: "root", itemCount: 1 },
+      {
+        windowId: `w:${String(compact.metadata!.historySequence)}`,
+        boundaryKind: "compaction",
+        itemCount: 1,
+      },
+      {
+        windowId: `w:${String(heartbeat.metadata!.historySequence)}`,
+        boundaryKind: "compaction",
+        itemCount: 1,
+      },
+      {
+        windowId: `w:${String(roll.metadata!.historySequence)}`,
+        boundaryKind: "reset",
+        itemCount: 1,
+      },
+      { windowId: "w:m:legacy-boundary", boundaryKind: "compaction", itemCount: 2 },
     ]);
     expect((await call({ action: "read_item", item_id: "m:legacy-item" })).items?.[0]?.text).toBe(
       "legacy facts"
@@ -1293,8 +1307,12 @@ describe("session_history real disk recovery", () => {
         // survive the chunk boundary before any browse row runs.
         if (tailLength > 1) expect(scanned.length).toBeGreaterThan(1);
         expect(listed).toEqual([
-          { windowId: readable ? "w:42" : "w:0", boundaryKind: readable ? "reset" : "root" },
-          { windowId: "w:1000", boundaryKind: "compaction" },
+          {
+            windowId: readable ? "w:42" : "w:0",
+            boundaryKind: readable ? "reset" : "root",
+            itemCount: tailLength,
+          },
+          { windowId: "w:1000", boundaryKind: "compaction", itemCount: 1 },
         ]);
         expect((await complete({ action: "read_item", item_id: "0" })).error).toBe(
           "item_not_found"
@@ -3015,11 +3033,13 @@ describe("session_history newest-first browsing", () => {
     expect(scanned.length).toBeGreaterThan(1);
     const forwardWindows = await collect({ action: "list_windows" });
     const reverseWindows = await collect({ action: "list_windows", recent_first: true });
+    // Counts skip the hidden reset/rollover rows, the malformed and oversized rows, and the
+    // unaddressable window; w:30 spans the archive/chat seam as one run.
     expect(forwardWindows.windows).toEqual([
-      { windowId: "w:10", boundaryKind: "reset" },
-      { windowId: "w:20", boundaryKind: "reset" },
-      { windowId: "w:30", boundaryKind: "compaction" },
-      { windowId: "w:50", boundaryKind: "compaction" },
+      { windowId: "w:10", boundaryKind: "reset", itemCount: 1 },
+      { windowId: "w:20", boundaryKind: "reset", itemCount: 1 },
+      { windowId: "w:30", boundaryKind: "compaction", itemCount: 3 },
+      { windowId: "w:50", boundaryKind: "compaction", itemCount: 3 },
     ]);
     expect(reverseWindows.windows).toEqual([...forwardWindows.windows].reverse());
     const forwardSearch = await collect({ action: "search", query: "a", role: "user" });
@@ -3073,8 +3093,8 @@ describe("session_history newest-first browsing", () => {
     ).toMatchObject([{ text: "big summary", windowId: "w:100" }]);
     const windows = await windowsOf({ action: "list_windows", recent_first: true });
     expect(windows).toEqual([
-      { windowId: "w:100", boundaryKind: "compaction" },
-      { windowId: "w:0", boundaryKind: "root" },
+      { windowId: "w:100", boundaryKind: "compaction", itemCount: tail.length + 1 },
+      { windowId: "w:0", boundaryKind: "root", itemCount: 1 },
     ]);
   });
 
@@ -3987,8 +4007,8 @@ describe("session_history window counts", () => {
     compactionEpoch: epoch,
     ...(sequence === undefined ? {} : { historySequence: sequence }),
   });
-  const counts = async (input: SessionHistoryArgs, hasMore = false) =>
-    (await windowsOf({ action: "list_windows", ...input }, { hasMore })).map((window) => [
+  const counts = async (input: Omit<SessionHistoryArgs, "action">, hasMore = false) =>
+    (await windowsOf({ ...input, action: "list_windows" }, { hasMore })).map((window) => [
       window.windowId,
       window.itemCount,
     ]);
@@ -4099,13 +4119,14 @@ describe("session_history window counts", () => {
   });
 
   test("a window that does not fit is popped, also when it is finalized at the end of history", async () => {
-    // Entries of ~1 KiB: 15 fit the 16 KiB response, the 16th does not.
+    // Entries of ~1 KiB: w:0 plus 15 of these fit the 16 KiB response; the last one, which is
+    // only finalized at the end of history, does not.
     const ids = Array.from({ length: 16 }, (_, index) => `legacy-${index}-${"x".repeat(950)}`);
     await appendRawRows(ids.map((id) => createMuxMessage(id, "assistant", "", compaction(1))));
     const atEof = await complete({ action: "list_windows", limit: 50 }, { hasMore: true });
     expect(atEof.windows!.map((window) => window.windowId)).toEqual([
       "w:0",
-      ...ids.slice(0, 14).map((id) => `w:m:${id}`),
+      ...ids.slice(0, 15).map((id) => `w:m:${id}`),
     ]);
     expect(
       atEof.windows!.every((window) => window.itemCount === (window.windowId === "w:0" ? 1 : 0))

@@ -287,6 +287,25 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           if (page.malformedLines > 0) warnings.add("malformed_rows_skipped");
         };
         const byteLength = () => Buffer.byteLength(JSON.stringify(result));
+        // list_windows: the contiguous run of one window ID currently being visited, in visit
+        // order (persisted order oldest-first; span by span newest-first). Every row drives the
+        // run transitions and is counted when an unfiltered list_items would return it. Only a
+        // finished run enters the response, so a published count is never partial. A window ID
+        // that recurs in repaired history yields one entry per run; no map of every window.
+        type WindowRun = NonNullable<SessionHistoryResult["windows"]>[number];
+        let pending: WindowRun | null = null;
+        const matchesWindowFilter = (windowId: string) =>
+          args.window_id == null || args.window_id === windowId;
+        // Close the pending run: a matching run is published unless it no longer fits.
+        const finishPendingRun = (): Stop | null => {
+          const run = pending;
+          pending = null;
+          if (run === null || !matchesWindowFilter(run.windowId)) return null;
+          windows.push(run);
+          if (byteLength() <= payloadBudget) return null;
+          windows.pop();
+          return "payload";
+        };
         // One protected chunk. Descendant reads hold the caller's history locks across BOTH
         // scans so no backend can append a caller reset between proving the floor and
         // disclosing target rows; a caller-side append (including its own tool-result
@@ -366,21 +385,24 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                 deadline: chunkDeadline,
                 requireExistingHistory: foreign,
                 budget,
-                visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
+                visit: ({ message, itemId, windowId, windowBoundaryKind }) => {
                   if (args.action === "list_windows") {
-                    if (!startsWindow) return true;
-                    if (args.window_id != null && args.window_id !== windowId) return true;
-                    if (windows.at(-1)?.windowId === windowId) return true;
-                    if (windows.length >= limit) {
-                      stop = "limit";
-                      return false;
+                    if (pending?.windowId !== windowId) {
+                      stop = finishPendingRun();
+                      if (stop !== null) return false;
+                      // Only a row of a matching window proves a further matching run exists;
+                      // a non-matching run is still counted through, never reported as more.
+                      if (windows.length >= limit && matchesWindowFilter(windowId)) {
+                        stop = "limit";
+                        return false;
+                      }
+                      pending = {
+                        windowId,
+                        boundaryKind: windowBoundaryKind ?? "root",
+                        itemCount: 0,
+                      };
                     }
-                    windows.push({ windowId, boundaryKind: windowBoundaryKind ?? "root" });
-                    if (byteLength() > payloadBudget) {
-                      windows.pop();
-                      stop = "payload";
-                      return false;
-                    }
+                    if (projectHistory(message).text) pending.itemCount++;
                     return true;
                   }
                   if (args.window_id != null && args.window_id !== windowId) return true;
@@ -467,7 +489,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           noteSkippedRows(page);
           state.scan = page.cursor;
           if (stop !== null) return { type: "publish", stop };
-          return page.cursor ? { type: "continue" } : { type: "publish", stop: "exhausted" };
+          if (page.cursor) return { type: "continue" };
+          // End of history closes the last run; a run that no longer fits is left behind.
+          return { type: "publish", stop: finishPendingRun() ?? "exhausted" };
         };
         try {
           while (true) {

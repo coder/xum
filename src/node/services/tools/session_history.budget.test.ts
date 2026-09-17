@@ -174,9 +174,10 @@ test("a target window behind 40 MiB of earlier rows is listed in one call across
   expect(await call({ action: "list_windows" })).toMatchObject({
     success: true,
     has_more: false,
+    // The rollover boundary and its hidden lead-in are not visible rows.
     windows: [
-      { windowId: "w:0", boundaryKind: "root" },
-      { windowId: targetWindow, boundaryKind: "reset" },
+      { windowId: "w:0", boundaryKind: "root", itemCount: bulk.length },
+      { windowId: targetWindow, boundaryKind: "reset", itemCount: requests.length + 1 },
     ],
   });
 });
