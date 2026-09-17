@@ -210,6 +210,11 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { useComposerSuggestions } from "./useComposerSuggestions";
+import {
+  commandBypassesTranscriptBarrier,
+  isTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -880,13 +885,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   const isProcessingAttachments = processingAttachmentCount > 0;
+  const hasSendableDraft = hasTypedText || hasImages || hasReviews;
+  // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
+  // the onChat replay to finish; the creation composer has no transcript to catch up with.
+  // Goal and settings commands act on backend/local state by id and stay usable meanwhile
+  // (a /goal with attachments becomes a message send, so it does not bypass).
+  const draftBypassesTranscriptBarrier =
+    hasTypedText &&
+    !hasImages &&
+    !hasReviews &&
+    commandBypassesTranscriptBarrier(parseCommand(input.trim()));
+  const transcriptBlocksSend =
+    variant === "workspace" && !isTranscriptCaughtUp && !draftBypassesTranscriptBarrier;
   const canSend =
-    (hasTypedText || hasImages || hasReviews) &&
+    hasSendableDraft &&
     !disabled &&
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
     !coderPresetsLoading &&
-    !policyBlocksCreateSend;
+    !policyBlocksCreateSend &&
+    !transcriptBlocksSend;
   const runningGoalActive =
     variant === "workspace" && isGoalRunning(workspaceGoal?.status ?? "paused");
 
@@ -1725,6 +1743,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, []);
 
   const handleSend = async (overrides?: InternalSendOverrides) => {
+    // Checked before `canSend` (which also carries the barrier) so a refused Enter on a real
+    // draft explains itself instead of silently doing nothing. Reads the live store rather
+    // than the render-time prop so a keybind racing a workspace switch sees current state.
+    // Slash commands (/clear, /reset, /compact, edits) all enter through here as well.
+    if (
+      variant === "workspace" &&
+      hasSendableDraft &&
+      !draftBypassesTranscriptBarrier &&
+      !isTranscriptMutationAllowed(props.workspaceId)
+    ) {
+      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      return;
+    }
     if (!canSend) {
       return;
     }
@@ -2173,6 +2204,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           return;
         }
         if (!isSendScopeCurrent()) return;
+
+        // Last re-check before anything is cleared or sent: command/skill/MCP resolution and
+        // the persistence wait above are async, and the transcript can stop being current in
+        // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
+        // outer `finally` releases sendingCount.
+        if (!isTranscriptMutationAllowed(props.workspaceId)) {
+          pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+          return;
+        }
 
         if (editMessageForSend) {
           setOptimisticallyDismissedEditId(editMessageForSend.id);

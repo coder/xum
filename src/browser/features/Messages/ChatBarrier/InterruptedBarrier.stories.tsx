@@ -37,7 +37,7 @@ export const ContextExceededSuggestion: AppStory = {
                   timestamp: STABLE_TIMESTAMP - 100000,
                 })
               );
-              callback({ type: "caught-up" });
+              callback({ type: "caught-up", historyReplayStatus: "complete" });
 
               callback({
                 type: "stream-start",

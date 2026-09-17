@@ -87,6 +87,11 @@ import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import { useAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import {
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+  TRANSCRIPT_REPLAY_FAILED_BANNER,
+} from "@/constants/transcriptBarrier";
 import {
   ChatDockColumnProvider,
   ChatDockSurface,
@@ -442,6 +447,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     loading,
     isHydratingTranscript,
     isTranscriptCaughtUp,
+    transcriptReplayFailed,
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
@@ -833,9 +839,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Handlers for editing messages
   const handleEditUserMessage = useCallback(
     (message: EditingMessageState) => {
+      // Rows hide their Edit affordance while hydrating; this covers a click racing catch-up
+      // being lost (workspace switch, reconnect) so the composer never enters edit mode
+      // against a transcript that is not a verified copy of history.
+      if (!isTranscriptMutationAllowed(workspaceId)) return;
       setEditingMessage(message);
     },
-    [setEditingMessage]
+    [setEditingMessage, workspaceId]
   );
 
   const restoreQueuedDraft = useCallback(
@@ -953,7 +963,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    // Otherwise, edit last user message
+    // Otherwise, edit last user message. `current.messages` may be a cached/provisional view
+    // while the replay is still running, so ArrowUp must not enter edit mode until caught up.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
     const transformedMessages = mergeConsecutiveStreamErrors(current.messages);
     const lastUserMessage = [...transformedMessages]
       .reverse()
@@ -978,7 +990,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         block: "center",
       });
     });
-  }, [restoreQueuedDraft, contentRef, disableAutoScroll, setEditingMessage, transcriptOnly]);
+  }, [
+    restoreQueuedDraft,
+    contentRef,
+    disableAutoScroll,
+    setEditingMessage,
+    transcriptOnly,
+    workspaceId,
+  ]);
 
   const handleEditLastUserMessageClick = useCallback(() => {
     void handleEditLastUserMessage();
@@ -1019,6 +1038,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
+      // Clearing acts on the transcript the user sees. The only caller is the /clear slash
+      // command, whose phase already turns thrown errors into a restore + error toast.
+      if (!isTranscriptMutationAllowed(workspaceId)) {
+        throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      }
       // Re-arm the tail before clearing so the empty/starting state owns the bottom.
       handleJumpToBottom();
 
@@ -1036,6 +1060,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 
   const handleResetContext = useCallback(async (): Promise<"reset" | "noop"> => {
+    // Same contract as handleClearHistory: the /reset (soft clear) phase surfaces the throw.
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+    }
     handleJumpToBottom();
 
     const result = await api?.workspace.resetContext({ workspaceId });
@@ -1325,7 +1353,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const messageNode = (
       <MessageRenderer
         message={message}
-        onEditUserMessage={transcriptOnly ? undefined : handleEditUserMessage}
+        // No onEdit → UserMessage omits its Edit button; provisional (not caught-up) rows
+        // must not offer an edit whose truncation point the backend may not agree with.
+        onEditUserMessage={
+          transcriptOnly || !isTranscriptCaughtUp ? undefined : handleEditUserMessage
+        }
         workspaceId={workspaceId}
         isCompacting={isCompacting}
         onReviewNote={handleReviewNote}
@@ -1702,6 +1734,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
+                      transcriptReplayFailed={transcriptReplayFailed}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
                       preStreamAgentTaskStatus={
@@ -1784,6 +1817,8 @@ interface ChatInputPaneProps {
   isCompacting: boolean;
   isStreamStarting: boolean;
   isTranscriptCaughtUp: boolean;
+  /** Last history replay failed; the store keeps cached rows and retries with backoff. */
+  transcriptReplayFailed: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
   canInterrupt: boolean;
@@ -1843,6 +1878,24 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             onActionStart={props.onClearQueuedActionError}
             onSendImmediately={props.onSendQueuedImmediately}
           />
+        ),
+      })
+    );
+  }
+  if (props.transcriptReplayFailed) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: "transcript-replay-failed",
+        // Hydration never completes while replays keep failing, so this must bypass the
+        // decoration reveal gate like the queued message does. Plain text: the shimmer above
+        // already signals activity, and the closed send barrier explains itself on dispatch.
+        revealBeforeReady: true,
+        node: (
+          <ChatDockSurface>
+            <p role="status" className="text-muted py-1 text-xs">
+              {TRANSCRIPT_REPLAY_FAILED_BANNER}
+            </p>
+          </ChatDockSurface>
         ),
       })
     );

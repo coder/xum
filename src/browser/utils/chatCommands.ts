@@ -94,6 +94,8 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
 
@@ -1560,6 +1562,13 @@ export function prepareCompactionMessage(options: CompactionOptions): {
 export async function executeCompaction(
   options: CompactionOptions & { api: RouterClient<AppRouter> }
 ): Promise<CompactionResult> {
+  // An editing compaction truncates history after the edited row, so its meaning depends on
+  // the transcript the user is looking at. Append-only compaction (auto/idle/model switch)
+  // never rewrites visible rows and stays available while a transcript is still hydrating.
+  if (options.editMessageId && !isTranscriptMutationAllowed(options.workspaceId)) {
+    return { success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE };
+  }
+
   const { messageText, metadata, sendOptions } = prepareCompactionMessage(options);
 
   const result = await options.api.workspace.sendMessage({

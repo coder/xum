@@ -3,6 +3,10 @@ import React from "react";
 import { StartHereModal } from "@/browser/components/StartHereModal/StartHereModal";
 import { createMuxMessage } from "@/common/types/message";
 import { useAPI } from "@/browser/contexts/API";
+import {
+  isTranscriptMutationAllowed,
+  useTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
 
 /**
  * Hook for managing Start Here button state and modal.
@@ -22,10 +26,16 @@ export function useStartHere(
   const { api } = useAPI();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isStartingHere, setIsStartingHere] = useState(false);
+  // Rendered disabled state follows the barrier, so the button never offers a click that
+  // `openModal`/`executeStartHere` would refuse.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
 
   // Opens the confirmation modal
   const openModal = () => {
     if (!workspaceId || isCompacted) return;
+    // Start Here rewrites the request window around a row the user sees; refuse while the
+    // transcript is not yet a verified copy of history (same barrier as sends and edits).
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
     setIsModalOpen(true);
   };
 
@@ -36,6 +46,8 @@ export function useStartHere(
   // Executes the Start Here operation
   const executeStartHere = async () => {
     if (!workspaceId || isStartingHere || isCompacted || !api) return;
+    // Re-checked at dispatch: the replay can drop out between opening the modal and confirming.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
 
     setIsStartingHere(true);
     try {
@@ -80,7 +92,7 @@ export function useStartHere(
     openModal,
     isStartingHere,
     buttonLabel: `Start Here`,
-    disabled: !workspaceId || isStartingHere || isCompacted,
+    disabled: !workspaceId || isStartingHere || isCompacted || !transcriptMutationAllowed,
     modal, // Pre-configured modal to render
   };
 }

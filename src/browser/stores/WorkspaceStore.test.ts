@@ -475,6 +475,7 @@ function mockChatReconnectScript(
 
 const caughtUpEvent = (overrides: Partial<ChatEvent<"caught-up">> = {}): WorkspaceChatMessage => ({
   type: "caught-up",
+  historyReplayStatus: "complete",
   ...overrides,
 });
 
@@ -1370,7 +1371,9 @@ describe("WorkspaceStore", () => {
       const createdAt = new Date().toISOString();
 
       // Setup mock stream
-      mockChatScript([{ type: "caught-up" }, tick(10)], { keepOpen: true });
+      mockChatScript([{ type: "caught-up", historyReplayStatus: "complete" }, tick(10)], {
+        keepOpen: true,
+      });
 
       createAndAddWorkspace(store, workspaceId, { name: "test-branch-2", createdAt });
 
@@ -1398,7 +1401,7 @@ describe("WorkspaceStore", () => {
       const unsubscribe = store.subscribe(listener);
 
       // Setup mock stream
-      mockChatScript([Promise.resolve(), { type: "caught-up" }]);
+      mockChatScript([Promise.resolve(), { type: "caught-up", historyReplayStatus: "complete" }]);
 
       // Add workspace (should trigger IPC subscription)
       createAndAddWorkspace(store, "test-workspace", TEST_WORKSPACE_OPTIONS);
@@ -1416,7 +1419,7 @@ describe("WorkspaceStore", () => {
       const unsubscribe = store.subscribe(listener);
 
       // Setup mock stream
-      mockChatScript([Promise.resolve(), { type: "caught-up" }]);
+      mockChatScript([Promise.resolve(), { type: "caught-up", historyReplayStatus: "complete" }]);
 
       // Unsubscribe before adding workspace (which triggers updates)
       unsubscribe();
@@ -1587,7 +1590,7 @@ describe("WorkspaceStore", () => {
       });
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
         yield {
           type: "message",
           ...createMuxMessage("skill-snapshot-1", "user", "<agent-skill>body</agent-skill>", {
@@ -2170,6 +2173,103 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
       expect(state().isTranscriptStale).toBe(false);
     });
+
+    describe("failed history replay", () => {
+      const failedCaughtUpEvent = (): WorkspaceChatMessage =>
+        caughtUpEvent({ replay: "full", historyReplayStatus: "failed" });
+
+      it("keeps cached rows and cursor, applies the queue snapshot, stays blocked and retries", async () => {
+        await hydrateCachedRow();
+        const cursorBefore = store.getAggregator(workspaceId)!.getOnChatCursor();
+        expect(cursorBefore?.history).toBeDefined();
+        store.setActiveWorkspaceId(otherWorkspaceId);
+        await tick(0);
+        const attempt = await revisit(2);
+
+        // The server sends a queue snapshot and a failed caught-up; a row it managed to emit
+        // before failing must not replace the cached view.
+        attempt.push(createHistoryMessageEvent("history-99", 99));
+        attempt.push(queuedFollowUpEvent(workspaceId, "queued during outage"));
+        attempt.push(failedCaughtUpEvent());
+        expect(await waitUntil(() => state().transcriptReplayFailed)).toBe(true);
+        expect(state().isTranscriptCaughtUp).toBe(false);
+        expect(state().isHydratingTranscript).toBe(true);
+        expect(state().messages.map((message) => message.id)).toEqual(["history-1"]);
+        expect(store.getAggregator(workspaceId)!.getOnChatCursor()).toEqual(cursorBefore);
+        expect(state().queuedMessage?.content).toBe("queued during outage");
+
+        // The attempt is aborted so the loop retries with backoff; the next complete replay
+        // clears the banner and opens the barrier.
+        const retry = await chatAttempt(workspaceId, 3);
+        expect(state().transcriptReplayFailed).toBe(true);
+        retry.push(createHistoryMessageEvent("history-1", 1));
+        retry.push(createHistoryMessageEvent("history-2", 2));
+        retry.push(sinceCaughtUpEvent(2));
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+        expect(state().transcriptReplayFailed).toBe(false);
+        expect(state().messages.map((message) => message.id)).toEqual(["history-1", "history-2"]);
+      });
+
+      it("ignores rows from the aborted attempt that arrive after its failed caught-up", async () => {
+        await hydrateCachedRow();
+        store.setActiveWorkspaceId(otherWorkspaceId);
+        await tick(0);
+        const attempt = await revisit(2);
+        attempt.push(failedCaughtUpEvent());
+        expect(await waitUntil(() => state().transcriptReplayFailed)).toBe(true);
+        // Late events from the aborted attempt must be dropped by the attempt-signal check.
+        attempt.push(createHistoryMessageEvent("history-late", 5));
+        attempt.push(fullCaughtUpEvent(5, "history-late"));
+        await tick(20);
+        expect(state().isTranscriptCaughtUp).toBe(false);
+        expect(state().messages.map((message) => message.id)).toEqual(["history-1"]);
+        const retry = await chatAttempt(workspaceId, 3);
+        retry.push(createHistoryMessageEvent("history-1", 1));
+        retry.push(sinceCaughtUpEvent());
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      });
+
+      it("backs off longer after consecutive failed replays than after a complete one", async () => {
+        const sleeps: number[] = [];
+        const realSetTimeout = globalThis.setTimeout;
+        const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+          handler: TimerHandler,
+          timeout?: number,
+          ...args: unknown[]
+        ) => {
+          // Backoff sleeps only (250 ms … 5 s); the stall watchdog arms a 10 s timer.
+          if (typeof timeout === "number" && timeout >= 250 && timeout <= 5000)
+            sleeps.push(timeout);
+          return realSetTimeout(handler, 0, ...args);
+        }) as typeof setTimeout);
+        try {
+          createAndAddWorkspace(store, workspaceId);
+          for (let ordinal = 1; ordinal <= 3; ordinal += 1) {
+            const attempt = await chatAttempt(workspaceId, ordinal);
+            attempt.push(queuedFollowUpEvent(workspaceId, `queued ${ordinal}`));
+            attempt.push(failedCaughtUpEvent());
+            await waitUntil(() => sleeps.length >= ordinal);
+          }
+          // Queue snapshots are events too, but only a complete caught-up resets the backoff.
+          expect(sleeps.slice(0, 3)).toEqual([250, 500, 1000]);
+        } finally {
+          timeoutSpy.mockRestore();
+        }
+      });
+
+      it("a live caught-up lets events flow but never opens the barrier", async () => {
+        createAndAddWorkspace(store, workspaceId);
+        const attempt = await chatAttempt(workspaceId, 1);
+        attempt.push(caughtUpEvent({ replay: "live" }));
+        await tick(10);
+        expect(state().isTranscriptCaughtUp).toBe(false);
+        expect(store.isWorkspaceTranscriptCaughtUp(workspaceId)).toBe(false);
+        expect(state().isHydratingTranscript).toBe(false);
+        // Live events are applied immediately (not buffered) after a live caught-up.
+        attempt.push(createHistoryMessageEvent("history-1", 1));
+        expect(await waitUntil(() => state().messages.length === 1)).toBe(true);
+      });
+    });
   });
 
   describe("live usage identity pinning", () => {
@@ -2537,7 +2637,7 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
       mockChatStreamFor(backgroundWorkspaceId, async function* () {
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await Promise.resolve();
         yield createUserMessageEvent("pending-start-message", "hello", 1, streamingRecency);
       });
@@ -2581,6 +2681,7 @@ describe("WorkspaceStore", () => {
           // it verbatim, so the second subscription legitimately requests since.
           yield {
             type: "caught-up",
+            historyReplayStatus: "complete",
             cursor: {
               history: {
                 messageId: "reconnect-pending-start",
@@ -2597,6 +2698,7 @@ describe("WorkspaceStore", () => {
         yield createUserMessageEvent("reconnect-pending-start", "hello", 1, 1_000);
         yield {
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "since",
           cursor: {
             history: {
@@ -2629,7 +2731,7 @@ describe("WorkspaceStore", () => {
       const workspaceId = "stream-starting-lifecycle-gap";
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await Promise.resolve();
         yield createUserMessageEvent("lifecycle-gap-user", "hello", 1, 1_000);
         await Promise.resolve();
@@ -2667,7 +2769,7 @@ describe("WorkspaceStore", () => {
       });
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
         await abortReady;
         yield {
           type: "stream-abort",
@@ -2708,6 +2810,7 @@ describe("WorkspaceStore", () => {
         subscriptionCount += 1;
         yield {
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "full",
         };
       });
@@ -2751,7 +2854,7 @@ describe("WorkspaceStore", () => {
       recreateStore();
       mockChatStreamFor(workspaceId, async function* () {
         await caughtUpReady;
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -2786,7 +2889,7 @@ describe("WorkspaceStore", () => {
           startTime: 1_000,
         };
         await caughtUpReady;
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -2830,7 +2933,7 @@ describe("WorkspaceStore", () => {
           startTime: 1_000,
         };
         await caughtUpReady;
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -2865,7 +2968,7 @@ describe("WorkspaceStore", () => {
         options?: { signal?: AbortSignal }
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         if (options?.signal?.aborted) {
-          yield { type: "caught-up" };
+          yield { type: "caught-up", historyReplayStatus: "complete" };
         }
         await waitForAbortSignal(options?.signal);
       });
@@ -3301,7 +3404,7 @@ describe("WorkspaceStore", () => {
         options?: { signal?: AbortSignal }
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         if (options?.signal?.aborted) {
-          yield { type: "caught-up" };
+          yield { type: "caught-up", historyReplayStatus: "complete" };
         }
         await waitForAbortSignal(options?.signal);
       });
@@ -3334,7 +3437,10 @@ describe("WorkspaceStore", () => {
         tokens: 3,
         timestamp: 1_500,
       });
-      rawStore.handleChatMessage(workspaceId, { type: "caught-up" });
+      rawStore.handleChatMessage(workspaceId, {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+      });
 
       // Subscribe so stale-cache regression would surface as a missed bump.
       let notifications = 0;
@@ -3378,7 +3484,7 @@ describe("WorkspaceStore", () => {
         options?: { signal?: AbortSignal }
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         if (options?.signal?.aborted) {
-          yield { type: "caught-up" };
+          yield { type: "caught-up", historyReplayStatus: "complete" };
         }
         await waitForAbortSignal(options?.signal);
       });
@@ -3410,7 +3516,10 @@ describe("WorkspaceStore", () => {
         tokens: 3,
         timestamp: 1_500,
       });
-      rawStore.handleChatMessage(workspaceId, { type: "caught-up" });
+      rawStore.handleChatMessage(workspaceId, {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+      });
 
       const beforeA = store.getWorkspaceStreamingStats(workspaceId);
       expect(beforeA).not.toBeNull();
@@ -3495,7 +3604,7 @@ describe("WorkspaceStore", () => {
           startTime: 1_000,
         };
         await caughtUpReady;
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -3525,7 +3634,7 @@ describe("WorkspaceStore", () => {
         subscriptionCount += 1;
 
         if (subscriptionCount === 1) {
-          yield { type: "caught-up" };
+          yield { type: "caught-up", historyReplayStatus: "complete" };
           await Promise.resolve();
           yield {
             type: "stream-lifecycle",
@@ -3561,7 +3670,7 @@ describe("WorkspaceStore", () => {
         await new Promise<void>((resolve) => {
           releaseSecondCaughtUp = resolve;
         });
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -3621,7 +3730,7 @@ describe("WorkspaceStore", () => {
         subscriptionCount += 1;
 
         if (subscriptionCount === 1) {
-          yield { type: "caught-up" };
+          yield { type: "caught-up", historyReplayStatus: "complete" };
           await Promise.resolve();
           yield {
             type: "init-start",
@@ -3665,7 +3774,7 @@ describe("WorkspaceStore", () => {
         await new Promise<void>((resolve) => {
           releaseSecondCaughtUp = resolve;
         });
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -3745,7 +3854,7 @@ describe("WorkspaceStore", () => {
       };
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await Promise.resolve();
         yield { type: "init-start", hookPath: "/tmp/project", timestamp: 1_000 };
         await new Promise<void>((resolve) => {
@@ -3787,7 +3896,7 @@ describe("WorkspaceStore", () => {
       const workspaceId = "stream-starting-active-workspace";
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await Promise.resolve();
         yield createUserMessageEvent("active-pending-start", "hello", 1, 2_000);
       });
@@ -3818,7 +3927,7 @@ describe("WorkspaceStore", () => {
         await bufferedUserReady;
         yield createUserMessageEvent("buffered-first-turn", "hello", 1, 2_750, requestedModel);
         await caughtUpReady;
-        yield { type: "caught-up", replay: "full" };
+        yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
       });
 
       createAndAddWorkspace(store, workspaceId);
@@ -3853,7 +3962,7 @@ describe("WorkspaceStore", () => {
       const requestedModel = "openai:gpt-4o-mini";
 
       mockChatStreamFor(workspaceId, async function* () {
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await Promise.resolve();
         yield createUserMessageEvent("pending-model-message", "hello", 1, 2_500, requestedModel);
       });
@@ -3920,7 +4029,7 @@ describe("WorkspaceStore", () => {
             await tick();
           }
           await caughtUpReady;
-          yield { type: "caught-up", replay: "full" };
+          yield { type: "caught-up", historyReplayStatus: "complete", replay: "full" };
         });
 
         const findInitRow = () =>
@@ -3966,7 +4075,7 @@ describe("WorkspaceStore", () => {
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         yield createHistoryMessageEvent("msg-newer", 5);
         await Promise.resolve();
-        yield { type: "caught-up", hasOlderHistory: true };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
         await waitForAbortSignal(options?.signal);
       });
 
@@ -3987,7 +4096,7 @@ describe("WorkspaceStore", () => {
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         yield createHistoryMessageEvent("msg-non-boundary", 5);
         await Promise.resolve();
-        yield { type: "caught-up" };
+        yield { type: "caught-up", historyReplayStatus: "complete" };
         await waitForAbortSignal(options?.signal);
       });
 
@@ -4008,7 +4117,7 @@ describe("WorkspaceStore", () => {
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         yield createHistoryMessageEvent("msg-newer", 5);
         await Promise.resolve();
-        yield { type: "caught-up", hasOlderHistory: true };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
         await waitForAbortSignal(options?.signal);
       });
 
@@ -4048,7 +4157,7 @@ describe("WorkspaceStore", () => {
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         yield createHistoryMessageEvent("msg-newer", 5);
         await Promise.resolve();
-        yield { type: "caught-up", hasOlderHistory: true };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
         await waitForAbortSignal(options?.signal);
       });
 
@@ -4091,7 +4200,7 @@ describe("WorkspaceStore", () => {
       ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
         yield createHistoryMessageEvent("msg-newer", 5);
         await Promise.resolve();
-        yield { type: "caught-up", hasOlderHistory: true };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
         await waitForAbortSignal(options?.signal);
       });
 
@@ -4688,7 +4797,7 @@ describe("WorkspaceStore", () => {
           historySequence: 2,
           mode: "exec",
         });
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
       });
       const onResponseComplete = createResponseCompleteSpy();
 
@@ -4721,7 +4830,7 @@ describe("WorkspaceStore", () => {
         [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
       );
       mockChatStreamFor(backgroundWorkspaceId, function* () {
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield streamStartEvent(backgroundWorkspaceId, "response-stream");
         yield queuedFollowUpEvent(backgroundWorkspaceId, followUpText);
       });
@@ -4767,7 +4876,7 @@ describe("WorkspaceStore", () => {
         ]
       );
       mockChatStreamFor(backgroundWorkspaceId, function* () {
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield streamStartEvent(backgroundWorkspaceId, "response-stream-a");
         yield queuedFollowUpEvent(backgroundWorkspaceId, followUpText);
       });
@@ -4808,7 +4917,7 @@ describe("WorkspaceStore", () => {
           historySequence: 2,
           mode: "exec",
         });
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
       });
       const onResponseComplete = createResponseCompleteSpy();
 
@@ -4833,7 +4942,7 @@ describe("WorkspaceStore", () => {
       const workspaceId = "active-workspace-normal-queued-follow-up";
       const followUpText = "follow-up after response";
       mockChatStreamFor(workspaceId, function* () {
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield streamStartEvent(workspaceId, "response-stream");
         yield queuedFollowUpEvent(workspaceId, followUpText);
         yield {
@@ -4864,7 +4973,7 @@ describe("WorkspaceStore", () => {
       const workspaceId = "active-workspace-queued-follow-up";
       const timestamp = Date.now();
       mockChatStreamFor(workspaceId, function* () {
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield compactionRequestEvent("compaction-request-msg", undefined, timestamp);
         yield streamStartEvent(workspaceId, "compaction-stream", {
           historySequence: 2,
@@ -4909,7 +5018,7 @@ describe("WorkspaceStore", () => {
         [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
       );
       mockChatStreamFor(backgroundWorkspaceId, function* () {
-        yield { type: "caught-up", hasOlderHistory: false };
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield compactionRequestEvent("compaction-request-msg", undefined, timestamp);
         yield streamStartEvent(backgroundWorkspaceId, "compaction-stream", {
           historySequence: 2,
@@ -5235,7 +5344,7 @@ describe("WorkspaceStore", () => {
     it("should call onModelUsed when stream starts", async () => {
       // Setup mock stream
       mockChatScript([
-        { type: "caught-up" },
+        { type: "caught-up", historyReplayStatus: "complete" },
         tick(0),
         {
           type: "stream-start",
@@ -5374,7 +5483,7 @@ describe("WorkspaceStore", () => {
     it("invalidates getWorkspaceState() cache when workspace changes", async () => {
       // Setup mock stream
       mockChatScript([
-        { type: "caught-up" },
+        { type: "caught-up", historyReplayStatus: "complete" },
         tick(30),
         {
           type: "stream-start",
@@ -5402,7 +5511,7 @@ describe("WorkspaceStore", () => {
     it("invalidates getAllStates() cache when workspace changes", async () => {
       // Setup mock stream
       mockChatScript([
-        { type: "caught-up" },
+        { type: "caught-up", historyReplayStatus: "complete" },
         tick(0),
         {
           type: "stream-start",
@@ -5542,7 +5651,7 @@ describe("WorkspaceStore", () => {
         queuedMessages: ["first", "second"],
         displayText: "first\nsecond",
       };
-      yield { type: "caught-up", hasOlderHistory: false };
+      yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
       await tick(25);
       yield {
         type: "queued-message-changed",
@@ -6034,7 +6143,7 @@ describe("WorkspaceStore", () => {
       mockChatScript([
         workflowRunAttachedEvent(workspaceId, "call-workflow-2", run.id, 1, run),
         Promise.resolve(),
-        { type: "caught-up", replay: "full" },
+        { type: "caught-up", historyReplayStatus: "complete", replay: "full" },
       ]);
 
       createAndAddWorkspace(store, workspaceId);
@@ -6339,7 +6448,7 @@ describe("WorkspaceStore", () => {
             contextUsage: { inputTokens: 42, outputTokens: 0, totalTokens: undefined },
           },
         },
-        { type: "caught-up" },
+        { type: "caught-up", historyReplayStatus: "complete" },
       ]);
 
       createAndAddWorkspace(store, workspaceId);

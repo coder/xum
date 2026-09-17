@@ -1456,7 +1456,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             activeWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: activeWorkspace.id,
@@ -1471,7 +1471,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             parentWithActiveSubagentsWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: parentWithActiveSubagentsWorkspace.id,
@@ -1486,7 +1486,7 @@ export const MixedAgentStatesAndAges: AppStory = {
           [
             errorWorkspace.id,
             (emit) => {
-              emit({ type: "caught-up", hasOlderHistory: false });
+              emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
               emit({
                 type: "stream-start",
                 workspaceId: errorWorkspace.id,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import type {
   ProposePlanToolResult,
   ProposePlanToolError,
@@ -54,6 +54,9 @@ import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -201,6 +204,18 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     ? workspaceContext?.workspaceMetadata.get(workspaceId)
     : undefined;
   const runtimeConfig = workspaceMetadata?.runtimeConfig;
+
+  // Implement / Continue in Auto send (and may replace history) based on the transcript the
+  // user sees, so they stay disabled until the onChat replay is complete. Leaf subscription to
+  // the caught-up flag only; the full WorkspaceState would re-render every plan card per delta.
+  // Ephemeral previews have no workspace: nothing to subscribe to, and no primary actions.
+  // The snapshot is the same predicate the click handlers re-check at dispatch time.
+  const workspaceStore = useWorkspaceStoreRaw();
+  const isTranscriptCaughtUp = useSyncExternalStore(
+    (listener) =>
+      workspaceId ? workspaceStore.subscribeKey(workspaceId, listener) : () => undefined,
+    () => (workspaceId ? isTranscriptMutationAllowed(workspaceId) : false)
+  );
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -526,6 +541,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const handleImplement = async () => {
     if (!workspaceId || !api) return;
     if (isImplementingRef.current) return;
+    // The button is disabled while hydrating; this covers a click racing the barrier closing.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
 
     isImplementingRef.current = true;
     if (isMountedRef.current) {
@@ -543,6 +560,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         // Ignore config read errors (we'll default to old behavior).
       }
 
+      // Re-check after the await: the replacement below rewrites history, so it must not run
+      // against a transcript that stopped being current while the config was loading.
+      if (!isTranscriptMutationAllowed(workspaceId)) return;
       if (shouldReplaceChatHistory) {
         await replaceChatHistoryWithPlan({
           idPrefix: "start-here",
@@ -564,6 +584,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         new AbortController().signal
       );
 
+      if (!isTranscriptMutationAllowed(workspaceId)) return;
       await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
@@ -586,6 +607,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const handleContinueInAuto = async () => {
     if (!workspaceId || !api) return;
     if (isContinuingInAutoRef.current) return;
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
 
     isContinuingInAutoRef.current = true;
     if (isMountedRef.current) {
@@ -603,6 +625,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         // Ignore config read errors (we'll default to old behavior).
       }
 
+      // Same dispatch-time re-checks as handleImplement.
+      if (!isTranscriptMutationAllowed(workspaceId)) return;
       if (shouldReplaceChatHistory) {
         await replaceChatHistoryWithPlan({
           idPrefix: "continue-auto",
@@ -624,6 +648,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         new AbortController().signal
       );
 
+      if (!isTranscriptMutationAllowed(workspaceId)) return;
       await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
@@ -714,11 +739,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Implement",
           onClick: () => void handleImplement(),
-          disabled: !api || isImplementing || isContinuingInAuto,
+          disabled: !api || isImplementing || isContinuingInAuto || !isTranscriptCaughtUp,
           icon: <Play className="size-4" />,
-          tooltip: implementReplacesChatHistory
-            ? "Replace chat history with this plan, switch to Exec, and start implementing"
-            : "Switch to Exec and start implementing",
+          tooltip: !isTranscriptCaughtUp
+            ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+            : implementReplacesChatHistory
+              ? "Replace chat history with this plan, switch to Exec, and start implementing"
+              : "Switch to Exec and start implementing",
         }
       : null;
 
@@ -727,11 +754,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Continue in Auto",
           onClick: () => void handleContinueInAuto(),
-          disabled: !api || isContinuingInAuto || isImplementing,
+          disabled: !api || isContinuingInAuto || isImplementing || !isTranscriptCaughtUp,
           icon: <Sparkles className="size-4" />,
-          tooltip: implementReplacesChatHistory
-            ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
-            : "Switch to Auto and let it decide the executor",
+          tooltip: !isTranscriptCaughtUp
+            ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+            : implementReplacesChatHistory
+              ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
+              : "Switch to Auto and let it decide the executor",
         }
       : null;
 
