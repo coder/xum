@@ -1,6 +1,9 @@
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
+// writeFileAtomic reads fs through the CommonJS module object (the default import); a spy
+// on the `import * as fs` namespace would not reach it.
+import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
@@ -376,12 +379,12 @@ describe("Config", () => {
     function mockFsWrite(
       behavior: (call: number, original: BufferWrite, args: Parameters<BufferWrite>) => void
     ): { restore: () => void; callCount: () => number } {
-      const original: BufferWrite = fs.write.bind(fs);
+      const original: BufferWrite = cjsFs.write.bind(cjsFs);
       let calls = 0;
-      const spy = spyOn(fs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
+      const spy = spyOn(cjsFs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
         calls += 1;
         behavior(calls, original, args);
-      }) as typeof fs.write);
+      }) as typeof cjsFs.write);
       // mockRestore() also clears the spy's recorded calls, so count them here.
       return { restore: () => spy.mockRestore(), callCount: () => calls };
     }

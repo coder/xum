@@ -16,8 +16,13 @@
  * temp file's size is compared with the payload before the rename.
  */
 import * as crypto from "crypto";
-import * as fs from "fs";
+// Default import on purpose: it is the CommonJS module object that `require("fs")`
+// returns, which is what the replaced package used. Tests across the repo observe or
+// fail individual steps (fs.rename, fs.write, fs.writeSync) by spying on that object;
+// the `import * as fs` namespace is a separate binding that such spies never reach.
+import fs from "fs";
 import * as path from "path";
+import { promisify } from "util";
 import { threadId } from "worker_threads";
 
 export interface Options {
@@ -99,6 +104,8 @@ function fillOptionsFromStats(options: ResolvedOptions, stats: fs.Stats | undefi
   }
 }
 
+// Callback fs API promisified at call time (not the promise API), so the spies above
+// see every step.
 function write(fd: number, buffer: Buffer, offset: number): Promise<number> {
   return new Promise((resolve, reject) => {
     fs.write(fd, buffer, offset, buffer.length - offset, offset, (error, bytesWritten) => {
@@ -131,7 +138,7 @@ function assertCompleteSize(size: number, expected: number, tempFile: string): v
 async function applyOwnership(tempFile: string, options: ResolvedOptions): Promise<void> {
   if (options.chown) {
     try {
-      await fs.promises.chown(tempFile, options.chown.uid, options.chown.gid);
+      await promisify(fs.chown)(tempFile, options.chown.uid, options.chown.gid);
     } catch (error) {
       if (!isOwnershipErrorOk(error)) throw error;
     }
@@ -139,7 +146,7 @@ async function applyOwnership(tempFile: string, options: ResolvedOptions): Promi
   if (options.mode != null) {
     // open() applies the umask to the requested mode; chmod pins the exact mode.
     try {
-      await fs.promises.chmod(tempFile, options.mode);
+      await promisify(fs.chmod)(tempFile, options.mode);
     } catch (error) {
       if (!isOwnershipErrorOk(error)) throw error;
     }
@@ -152,29 +159,29 @@ async function writeFileAtomicUnserialized(
   options: ResolvedOptions
 ): Promise<void> {
   // Follow symlinks so the rename replaces the link's target rather than the link.
-  const target = await fs.promises.realpath(filename).catch(() => filename);
-  fillOptionsFromStats(options, await fs.promises.stat(target).catch(() => undefined));
+  const target = await promisify(fs.realpath)(filename).catch(() => filename);
+  fillOptionsFromStats(options, await promisify(fs.stat)(target).catch(() => undefined));
   const buffer = toBuffer(data, options.encoding);
   const tempFile = tempPathFor(target);
   pendingTempFiles.add(tempFile);
-  let fd: fs.promises.FileHandle | undefined;
+  let fd: number | undefined;
   try {
-    fd = await fs.promises.open(tempFile, "w", options.mode);
-    await writeAll(fd.fd, buffer, tempFile);
+    fd = await promisify(fs.open)(tempFile, "w", options.mode);
+    await writeAll(fd, buffer, tempFile);
     if (options.fsync !== false) {
-      await fd.sync();
+      await promisify(fs.fsync)(fd);
     }
-    assertCompleteSize((await fd.stat()).size, buffer.length, tempFile);
-    await fd.close();
+    assertCompleteSize((await promisify(fs.fstat)(fd)).size, buffer.length, tempFile);
+    await promisify(fs.close)(fd);
     fd = undefined;
     await applyOwnership(tempFile, options);
-    await fs.promises.rename(tempFile, target);
+    await promisify(fs.rename)(tempFile, target);
   } finally {
-    if (fd) {
-      await fd.close().catch(() => undefined);
+    if (fd !== undefined) {
+      await promisify(fs.close)(fd).catch(() => undefined);
     }
     pendingTempFiles.delete(tempFile);
-    await fs.promises.unlink(tempFile).catch(() => undefined);
+    await promisify(fs.unlink)(tempFile).catch(() => undefined);
   }
 }
 

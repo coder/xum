@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import * as fs from "fs";
+import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
@@ -277,20 +277,20 @@ describe("Config snapshots", () => {
     const external = fs
       .readFileSync(configPath, "utf8")
       .replace('"name": "active"', '"name": "external"');
-    // writeFileAtomic renames through fs.promises after resolving the destination's
-    // realpath (tmpdir is a symlink on macOS), so hook there and compare realpaths.
-    const rename = fs.promises.rename.bind(fs.promises);
-    const realConfigPath = fs.realpathSync(configPath);
+    const rename = nativeFs.rename;
+    const filesystem: { rename: (...args: Parameters<typeof rename>) => void } = nativeFs;
     let replaced = false;
-    const renameSpy = spyOn(fs.promises, "rename").mockImplementation(
-      async (source, destination) => {
-        await rename(source, destination);
-        if (String(destination) === realConfigPath) {
-          const replacement = path.join(root, "external.json");
-          fs.writeFileSync(replacement, external);
-          fs.renameSync(replacement, configPath);
-          replaced = true;
-        }
+    const renameSpy = spyOn(filesystem, "rename").mockImplementation(
+      (source, destination, callback) => {
+        rename(source, destination, (error) => {
+          if (!error && destination === configPath) {
+            const replacement = path.join(root, "external.json");
+            fs.writeFileSync(replacement, external);
+            fs.renameSync(replacement, configPath);
+            replaced = true;
+          }
+          callback(error);
+        });
       }
     );
     try {

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import * as fs from "fs";
+// Default import: the module under test reads fs through the same CommonJS object, so
+// spies installed here are the ones it observes (see the note in writeFileAtomic.ts).
+import fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import writeFileAtomic, { sync as writeFileAtomicSync } from "./writeFileAtomic";
