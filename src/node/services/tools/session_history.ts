@@ -280,6 +280,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         const items = result.items!;
         const windows = result.windows!;
         const warnings = new Set<Warning>();
+        // Any scan of this attempt (caller authorization or target) that had to skip rows
+        // it could not read is reported; codes only, since chunks re-encounter rows.
+        const noteSkippedRows = (page: { oversizedLines: number; malformedLines: number }) => {
+          if (page.oversizedLines > 0) warnings.add("oversized_rows_skipped");
+          if (page.malformedLines > 0) warnings.add("malformed_rows_skipped");
+        };
         const byteLength = () => Buffer.byteLength(JSON.stringify(result));
         // One protected chunk. Descendant reads hold the caller's history locks across BOTH
         // scans so no backend can append a caller reset between proving the floor and
@@ -317,6 +323,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             });
             budget.maxBytes -= auth.bytesRead;
             budget.maxRows -= auth.rowsScanned;
+            noteSkippedRows(auth);
             // Four disjoint cases; only the first two may read target rows in this chunk.
             if (previous?.proven) {
               assert(auth.state, "a resumed caller scan reports its final state");
@@ -457,8 +464,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             abortSignal
           );
           if (page === null) return { type: "continue" };
-          if (page.oversizedLines > 0) warnings.add("oversized_rows_skipped");
-          if (page.malformedLines > 0) warnings.add("malformed_rows_skipped");
+          noteSkippedRows(page);
           state.scan = page.cursor;
           if (stop !== null) return { type: "publish", stop };
           return page.cursor ? { type: "continue" } : { type: "publish", stop: "exhausted" };

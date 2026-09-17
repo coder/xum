@@ -3237,6 +3237,30 @@ describe("session_history descendant task history", () => {
       )
     );
 
+  test("rows the caller authorization scan had to skip are reported as warnings", async () => {
+    await appendRawRows([
+      "not-json",
+      createMuxMessage("huge", "assistant", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 10)),
+    ]);
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    const result = await completeAs({ action: "list_items", task_id: childId });
+    expect(result.items?.map((item) => item.text)).toEqual(["child one"]);
+    expect(result.warnings?.toSorted()).toEqual([
+      "malformed_rows_skipped",
+      "oversized_rows_skipped",
+    ]);
+    // The target itself is clean; the codes came from the caller's authorization scan.
+    expect((await completeAs({ action: "list_items" })).warnings?.toSorted()).toEqual([
+      "malformed_rows_skipped",
+      "oversized_rows_skipped",
+    ]);
+    await appendChild("child-two", "child two");
+    expect(
+      (await completeAs({ action: "list_items", task_id: childId, role: "user" })).warnings
+    ).toEqual(expect.arrayContaining(["oversized_rows_skipped"]) as string[]);
+  });
+
   test("a receipt found in a chunk with an unfinished caller scan authorizes that same chunk", async () => {
     // The caller's floor discovery needs a second chunk; the receipt is browsed in chunk 2
     // with rows still ahead of it, so the caller scan stays resumable (auth.cursor set).
