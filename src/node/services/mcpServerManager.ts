@@ -4,11 +4,15 @@ import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
 import type { Tool } from "ai";
 import { getExecutionScope } from "./tools/withExecutionScope";
+import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
+import { resolveServerIcon } from "./mcpServerIcon";
 import {
   buildToolCallDisplay,
   describeConnection,
   normalizeServerIdentity,
   takeStandardDisplayMeta,
+  type IconCandidate,
+  type NormalizedServerIdentity,
 } from "./mcpServerIdentity";
 import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
@@ -324,7 +328,11 @@ export function wrapMCPTools(
     display?: {
       connection: MCPConnectionRef;
       identity?: MCPServerIdentity;
+      /** Handshake icons, used only when a call falls back to the connection identity. */
+      iconCandidates?: readonly IconCandidate[];
       registry: ToolCallDisplayRegistry;
+      /** One owner per connected generation; without this, snapshots carry no iconRef. */
+      icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
     };
   }
 ): Record<string, Tool> {
@@ -366,13 +374,25 @@ export function wrapMCPTools(
           const identity = response?.identity ?? options?.display?.identity;
           const scope = getExecutionScope(context);
           if (scope && identity && options?.display) {
+            const { display } = options;
+            // A result that names its own identity also owns its artwork: a
+            // response identity without icons stays unbranded instead of
+            // borrowing the handshake's. Registration only mints the ref;
+            // resolution runs in the background and is never awaited here.
+            const candidates = response ? response.iconCandidates : (display.iconCandidates ?? []);
+            const iconRef = display.icons?.registry.ensure(
+              display.icons.owner,
+              candidates,
+              display.connection
+            );
             const snapshot = buildToolCallDisplay({
-              connection: options.display.connection,
+              connection: display.connection,
               identity,
               source: response ? "response" : "connection",
+              ...(iconRef ? { iconRef } : {}),
             });
             if (snapshot) {
-              published = options.display.registry.set(scope, context.toolCallId, snapshot);
+              published = display.registry.set(scope, context.toolCallId, snapshot);
             }
           }
           return transformMCPResult(rest as MCPCallToolResult);
@@ -807,7 +827,8 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
 
 /**
  * Run a test connection to an MCP server.
- * Connects, fetches tools, then closes.
+ * Connects, fetches tools, then closes; a successful connection then has its
+ * handshake icon resolved (bounded by the icon resolver's own deadline).
  */
 async function runServerTest(
   server:
@@ -819,7 +840,8 @@ async function runServerTest(
         authProvider?: OAuthClientProvider;
       },
   projectPath: string,
-  logContext: string
+  logContext: string,
+  icons: { registry: MCPIconRegistry; connectionKey: string }
 ): Promise<MCPTestResult> {
   // Resettable deadline: the fragile-legacy stdio respawn below restarts the
   // clock so the compatibility retry gets a full test window instead of
@@ -841,10 +863,16 @@ async function runServerTest(
   };
   armTestDeadline();
 
+  // Captured by the connection attempt for the icon step below, which runs
+  // only after the race has produced a success verdict.
+  const observed: { current?: { identity: NormalizedServerIdentity; binding: MCPConnectionRef } } =
+    {};
+
   const testPromise = (async (): Promise<MCPTestResult> => {
     let stdioTransport: MCPStdioTransport | null = null;
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
     let getCapturedWwwAuthenticateHeader: (() => string | null) | null = null;
+    let actualTransport: "http" | "sse" | undefined;
 
     try {
       if (server.transport === "stdio") {
@@ -919,12 +947,15 @@ async function runServerTest(
 
         if (server.transport === "http") {
           client = await tryHttp();
+          actualTransport = "http";
         } else if (server.transport === "sse") {
           client = await trySse();
+          actualTransport = "sse";
         } else {
           // auto
           try {
             client = await tryHttp();
+            actualTransport = "http";
           } catch (error) {
             if (!shouldAutoFallbackToSse(error)) {
               throw error;
@@ -933,6 +964,7 @@ async function runServerTest(
               status: extractHttpStatusCode(error),
             });
             client = await trySse();
+            actualTransport = "sse";
           }
         }
       }
@@ -940,7 +972,22 @@ async function runServerTest(
       const tools = await client.tools();
       const toolNames = Object.keys(tools);
       const protocolVersion = client.negotiatedProtocolVersion();
-      const serverInfo = normalizeServerIdentity(client.serverInfo())?.identity;
+      const normalizedIdentity = normalizeServerIdentity(client.serverInfo());
+      const serverInfo = normalizedIdentity?.identity;
+      if (normalizedIdentity) {
+        // Remote icons are bound to the configured URL's origin (never a
+        // reported website), on the transport that actually connected.
+        observed.current = {
+          identity: normalizedIdentity,
+          binding: describeConnection(
+            icons.connectionKey,
+            server.transport === "stdio"
+              ? { transport: "stdio", command: server.command, disabled: false }
+              : { transport: server.transport, url: server.url, disabled: false },
+            actualTransport
+          ),
+        };
+      }
 
       await client.close();
       client = null;
@@ -995,7 +1042,22 @@ async function runServerTest(
     }
   })();
 
-  return Promise.race([testPromise, timeoutPromise]);
+  let result: MCPTestResult;
+  try {
+    result = await Promise.race([testPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+  // Icon work starts only after a successful, in-deadline connection: awaiting
+  // it inside the race would turn a slow-but-good handshake into a timeout,
+  // and a failed or timed-out test has no identity worth decorating.
+  if (!result.success || !observed.current) {
+    return result;
+  }
+  const { identity, binding } = observed.current;
+  const iconRef = icons.registry.ensure({}, identity.iconCandidates, binding);
+  const icon = iconRef === undefined ? null : await icons.registry.get(iconRef);
+  return icon === null ? result : { ...result, icon };
 }
 
 type MCPPromptContent = MCPGetPromptResult["messages"][number]["content"];
@@ -1363,6 +1425,8 @@ function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_st
 
 export class MCPServerManager {
   private readonly toolCallDisplayRegistry: ToolCallDisplayRegistry;
+  /** Session-local server artwork behind the opaque `iconRef`s on tool-call snapshots. */
+  private readonly iconRegistry = new MCPIconRegistry(resolveServerIcon);
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   // Survives idle cleanup so an explicit prompt invocation can revive reaped
   // servers at send time; forgotten only on workspace removal.
@@ -4663,6 +4727,15 @@ export class MCPServerManager {
     }
   }
 
+  /**
+   * Resolve an `iconRef` from a tool-call snapshot to its bounded PNG data
+   * URL. Lookup only: unknown, expired, or evicted refs yield null without
+   * any network or decode work.
+   */
+  getIcon(iconRef: string): Promise<string | null> {
+    return this.iconRegistry.get(iconRef);
+  }
+
   async testForApi(
     input: {
       projectPath?: string;
@@ -4797,7 +4870,10 @@ export class MCPServerManager {
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
         try {
           const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
-            runServerTest(launch, projectPath, `server "${trimmedName}"`)
+            runServerTest(launch, projectPath, `server "${trimmedName}"`, {
+              registry: this.iconRegistry,
+              connectionKey: trimmedName,
+            })
           );
           return await pending;
         } catch (error) {
@@ -4833,7 +4909,10 @@ export class MCPServerManager {
       if (!isTransportAllowed("stdio")) {
         return { success: false, error: "MCP transport is disabled by policy" };
       }
-      return runServerTest({ transport: "stdio", command }, projectPath, "command");
+      return runServerTest({ transport: "stdio", command }, projectPath, "command", {
+        registry: this.iconRegistry,
+        connectionKey: trimmedName ?? "command",
+      });
     }
 
     if (url?.trim()) {
@@ -4864,7 +4943,8 @@ export class MCPServerManager {
             ...(authProvider ? { authProvider } : {}),
           },
           projectPath,
-          trimmedName ? `server "${trimmedName}" (url)` : "url"
+          trimmedName ? `server "${trimmedName}" (url)` : "url",
+          { registry: this.iconRegistry, connectionKey: trimmedName ?? "url" }
         );
       } catch (error) {
         const message = getErrorMessage(error);
@@ -6064,14 +6144,20 @@ export class MCPServerManager {
           return null;
         }
 
-        const identity = normalizeServerIdentity(readyClient.serverInfo())?.identity;
+        const normalizedIdentity = normalizeServerIdentity(readyClient.serverInfo());
+        const identity = normalizedIdentity?.identity;
         const connectionRef = describeConnection(name, info, "stdio");
+        // One icon owner per connected generation: tool refreshes reuse it,
+        // a reconnect gets a fresh one so historical refs are never relabeled.
+        const iconOwner: MCPIconOwner = {};
         const wrapRawTools = (raw: Record<string, Tool>) =>
           wrapMCPTools(raw, {
             display: {
               connection: connectionRef,
               identity,
+              iconCandidates: normalizedIdentity?.iconCandidates,
               registry: this.toolCallDisplayRegistry,
+              icons: { registry: this.iconRegistry, owner: iconOwner },
             },
             onActivity,
             onClosed: () => {
@@ -6350,11 +6436,20 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
-      const identity = normalizeServerIdentity(activeClient.serverInfo())?.identity;
+      const normalizedIdentity = normalizeServerIdentity(activeClient.serverInfo());
+      const identity = normalizedIdentity?.identity;
       const connectionRef = describeConnection(name, info, resolvedTransport);
+      // One icon owner per connected generation (see the stdio path).
+      const iconOwner: MCPIconOwner = {};
       const wrapRawTools = (raw: Record<string, Tool>) =>
         wrapMCPTools(raw, {
-          display: { connection: connectionRef, identity, registry: this.toolCallDisplayRegistry },
+          display: {
+            connection: connectionRef,
+            identity,
+            iconCandidates: normalizedIdentity?.iconCandidates,
+            registry: this.toolCallDisplayRegistry,
+            icons: { registry: this.iconRegistry, owner: iconOwner },
+          },
           onActivity,
           onClosed: () => {
             if (instanceRef.current) instanceRef.current.isClosed = true;

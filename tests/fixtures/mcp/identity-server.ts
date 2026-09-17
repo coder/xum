@@ -2,12 +2,30 @@ import { createInterface } from "node:readline";
 
 type Mode = "legacy" | "modern" | "response-only" | "malformed" | "plain";
 
+/** Optional `Implementation.icons`; every mode stays icon-free unless a wrapper opts in. */
+export interface IdentityServerOptions {
+  /** Icons on the handshake identity (legacy `initialize`, modern `server/discover`). */
+  connectionIcons?: unknown[];
+  /** Icons on the per-result identity (modern and response-only `tools/call`). */
+  responseIcons?: unknown[];
+}
+
 // Wire fixtures deliberately do not use a server SDK: negotiation and optional
 // metadata must work with the JSON a real third-party process sends.
-export function runIdentityServer(mode: Mode): void {
+export function runIdentityServer(mode: Mode, options: IdentityServerOptions = {}): void {
   const key = "io.modelcontextprotocol/serverInfo";
-  const connection = { name: "Connection identity", version: "1", title: "Fixture" };
-  const response = { name: "Response identity", version: "2", title: "Fixture response" };
+  const connection = {
+    name: "Connection identity",
+    version: "1",
+    title: "Fixture",
+    ...(options.connectionIcons ? { icons: options.connectionIcons } : {}),
+  };
+  const response = {
+    name: "Response identity",
+    version: "2",
+    title: "Fixture response",
+    ...(options.responseIcons ? { icons: options.responseIcons } : {}),
+  };
   const handshakeMeta = mode === "modern" || mode === "malformed" ? { [key]: connection } : {};
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   lines.on("line", (line) => {

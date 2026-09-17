@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Config } from "@/node/config";
 import { shellQuote } from "@/common/utils/shell";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { MCPConfigService } from "./mcpConfigService";
 import { createMCPClient } from "./mcpClient";
 import { MCPServerManager, wrapMCPTools } from "./mcpServerManager";
@@ -100,10 +102,88 @@ describe("real MCP identity negotiation", () => {
             ? "Connection identity"
             : undefined
         );
+        // No fixture mode reports icons: a response-only server stays unbranded in Settings.
+        expect(result.icon).toBeUndefined();
       } finally {
         manager.dispose();
       }
     },
     15_000
   );
+
+  test("branded: Test connection rasterizes the handshake icon after the connection verdict", async () => {
+    using tmp = new DisposableTempDir("mcp-identity-test");
+    const manager = new MCPServerManager(new MCPConfigService(new Config(tmp.path)));
+    try {
+      const result = await manager.test({
+        projectPath: tmp.path,
+        command: `${shellQuote(process.execPath)} ${shellQuote(path.join(fixtures, "branded-legacy-server.ts"))}`,
+        trusted: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      expect(result.serverInfo?.name).toBe("Connection identity");
+      expect(isPngDataUrl(result.icon)).toBe(true);
+    } finally {
+      manager.dispose();
+    }
+  }, 30_000);
+
+  test("branded: served tool calls carry a per-generation icon ref that outlives a reconnect", async () => {
+    using tmp = new DisposableTempDir("mcp-identity-serve");
+    const displayRegistry = new ToolCallDisplayRegistry();
+    const manager = new MCPServerManager(new MCPConfigService(new Config(tmp.path)), {
+      toolCallDisplayRegistry: displayRegistry,
+      inlineServers: {
+        branded: `${shellQuote(process.execPath)} ${shellQuote(path.join(fixtures, "branded-legacy-server.ts"))}`,
+      },
+    });
+    const request = {
+      workspaceId: "branded-workspace",
+      projectPath: tmp.path,
+      workspacePath: tmp.path,
+      runtime: new LocalRuntime(tmp.path),
+      trusted: true,
+    };
+    const scope = { workspaceId: request.workspaceId, messageId: "message", token: "turn" };
+    displayRegistry.open(scope);
+    const probe = async (callId: string): Promise<string> => {
+      const served = await manager.getToolsForWorkspace(request);
+      const tools = withExecutionScope(served.tools, scope);
+      const output: unknown = await tools.branded_identity_probe.execute!(
+        {},
+        { toolCallId: callId, messages: [], context: undefined }
+      );
+      expect(JSON.stringify(output)).not.toContain("data:image");
+      const snapshot = displayRegistry.take(scope, callId);
+      expect(snapshot).toMatchObject({
+        connection: { key: "branded", transport: "stdio" },
+        identity: { name: "Connection identity" },
+        source: "connection",
+      });
+      expect(JSON.stringify(snapshot)).not.toContain("data:");
+      expect(snapshot?.iconRef).toMatch(/^[a-f0-9]{32}$/);
+      return snapshot!.iconRef!;
+    };
+    try {
+      const first = await probe("first");
+      // The same connected generation reuses its ref across calls.
+      expect(await probe("second")).toBe(first);
+      const icon = await manager.getIcon(first);
+      expect(isPngDataUrl(icon)).toBe(true);
+
+      // A reconnect under the same alias is a new generation: new ref, and
+      // the historical ref still resolves to what it always did.
+      await manager.stopServers(request.workspaceId);
+      const reconnected = await probe("third");
+      expect(reconnected).not.toBe(first);
+      expect(await manager.getIcon(first)).toBe(icon);
+      expect(await manager.getIcon(reconnected)).toBe(icon);
+      // Lookup only: an unknown ref is null, never a fetch or decode.
+      expect(await manager.getIcon("0".repeat(32))).toBeNull();
+    } finally {
+      await manager.stopServers(request.workspaceId);
+      manager.dispose();
+    }
+  }, 60_000);
 });

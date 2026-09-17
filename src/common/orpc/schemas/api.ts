@@ -124,9 +124,11 @@ import {
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
   MCPSetToolAllowlistParamsSchema,
+  MCPIconRefSchema,
   MCPTestGlobalParamsSchema,
   MCPTestParamsSchema,
   MCPTestResultSchema,
+  PngDataUrlSchema,
   WorkspaceMCPOverridesSchema,
 } from "./mcp";
 import {
@@ -1038,6 +1040,11 @@ export const mcp = {
   test: {
     input: MCPTestGlobalParamsSchema,
     output: MCPTestResultSchema,
+  },
+  /** Session-local lookup of a tool-call snapshot's `iconRef`; null when unknown or expired. */
+  icon: {
+    input: z.object({ iconRef: MCPIconRefSchema }),
+    output: PngDataUrlSchema.nullable(),
   },
   setEnabled: {
     input: MCPSetEnabledGlobalParamsSchema,

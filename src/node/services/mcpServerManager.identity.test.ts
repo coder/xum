@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { convertToModelMessages, dynamicTool, jsonSchema, type Tool } from "ai";
 import type { MCPConnectionRef } from "@/common/types/mcp";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
 import { wrapMCPTools } from "./mcpServerManager";
+import type { IconCandidate } from "./mcpServerIdentity";
 import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import { withExecutionScope } from "./tools/withExecutionScope";
 
@@ -73,8 +76,8 @@ describe("MCP display metadata boundary", () => {
   );
 });
 
-const connection: MCPConnectionRef = { key: "configured", transport: "stdio" };
-const scope = { workspaceId: "workspace", messageId: "message", token: "turn" };
+const failureConnection: MCPConnectionRef = { key: "configured", transport: "stdio" };
+const failureScope = { workspaceId: "workspace", messageId: "message", token: "turn" };
 
 /** One wrapped tool under an open scope; `identity` undefined models a server without a handshake identity. */
 function failingHarness(options: {
@@ -83,7 +86,7 @@ function failingHarness(options: {
   onClosed?: () => void;
 }) {
   const registry = new ToolCallDisplayRegistry();
-  registry.open(scope);
+  registry.open(failureScope);
   const tools = withExecutionScope(
     wrapMCPTools(
       {
@@ -93,11 +96,11 @@ function failingHarness(options: {
         }),
       },
       {
-        display: { connection, identity: options.identity, registry },
+        display: { connection: failureConnection, identity: options.identity, registry },
         onClosed: options.onClosed,
       }
     ),
-    scope
+    failureScope
   );
   return { registry, execute: tools.probe.execute! };
 }
@@ -120,7 +123,11 @@ describe("MCP identity on failed tool calls", () => {
       h.execute({}, { toolCallId: "call", messages: [], context: undefined })
     );
     expect(caught).toBe(failure);
-    expect(h.registry.take(scope, "call")).toEqual({ connection, identity, source: "connection" });
+    expect(h.registry.take(failureScope, "call")).toEqual({
+      connection: failureConnection,
+      identity,
+      source: "connection",
+    });
   });
 
   test("an interrupted call publishes its snapshot before the client is recycled", async () => {
@@ -131,7 +138,7 @@ describe("MCP identity on failed tool calls", () => {
       execute: () => new Promise(() => undefined),
       identity,
       onClosed: () => {
-        seenDuringRecycle = h.registry.take(scope, "call");
+        seenDuringRecycle = h.registry.take(failureScope, "call");
       },
     });
     const pending: unknown = h.execute(
@@ -141,8 +148,12 @@ describe("MCP identity on failed tool calls", () => {
     abort.abort();
     expect(await rejectionOf(() => pending)).toMatchObject({ message: "Interrupted" });
     // The recycle callback already saw the snapshot; nothing was published twice.
-    expect(seenDuringRecycle).toEqual({ connection, identity, source: "connection" });
-    expect(h.registry.take(scope, "call")).toBeUndefined();
+    expect(seenDuringRecycle).toEqual({
+      connection: failureConnection,
+      identity,
+      source: "connection",
+    });
+    expect(h.registry.take(failureScope, "call")).toBeUndefined();
   });
 
   test("without a handshake identity or an open scope a failure publishes nothing", async () => {
@@ -152,16 +163,155 @@ describe("MCP identity on failed tool calls", () => {
         unknownServer.execute({}, { toolCallId: "call", messages: [], context: undefined })
       )
     ).toMatchObject({ message: "boom" });
-    expect(unknownServer.registry.take(scope, "call")).toBeUndefined();
+    expect(unknownServer.registry.take(failureScope, "call")).toBeUndefined();
 
     const closed = failingHarness({ execute: () => Promise.reject(new Error("boom")), identity });
-    closed.registry.close(scope);
+    closed.registry.close(failureScope);
     expect(
       await rejectionOf(() =>
         closed.execute({}, { toolCallId: "call", messages: [], context: undefined })
       )
     ).toMatchObject({ message: "boom" });
-    closed.registry.open(scope);
-    expect(closed.registry.take(scope, "call")).toBeUndefined();
+    closed.registry.open(failureScope);
+    expect(closed.registry.take(failureScope, "call")).toBeUndefined();
+  });
+});
+
+const PNG = `data:image/png;base64,${Buffer.from("89504e470d0a1a0a", "hex").toString("base64")}`;
+const connection: MCPConnectionRef = { key: "branded", transport: "stdio" };
+const connectionIcon: IconCandidate = { src: "data:image/svg+xml;base64,PHN2Zy8+", sizes: ["any"] };
+const responseIcon: IconCandidate = { src: "data:image/png;base64,iVBORw0KGgo=" };
+const scope = { workspaceId: "workspace", messageId: "message", token: "turn" };
+
+interface Harness {
+  registry: ToolCallDisplayRegistry;
+  icons: MCPIconRegistry;
+  resolved: Array<{ candidates: readonly IconCandidate[]; binding: MCPConnectionRef }>;
+  /** Wrap a tool as one connected generation would: same owner for its lifetime. */
+  wrap: (owner: MCPIconOwner, tool: Tool, callId: string) => Promise<void>;
+  take: (callId: string) => ReturnType<ToolCallDisplayRegistry["take"]>;
+}
+
+function harness(resolve?: () => Promise<string | null>): Harness {
+  const registry = new ToolCallDisplayRegistry();
+  registry.open(scope);
+  const resolved: Harness["resolved"] = [];
+  const icons = new MCPIconRegistry((candidates, binding) => {
+    resolved.push({ candidates, binding });
+    return resolve ? resolve() : Promise.resolve(PNG);
+  });
+  return {
+    registry,
+    icons,
+    resolved,
+    wrap: async (owner, tool, callId) => {
+      const tools = withExecutionScope(
+        wrapMCPTools(
+          { probe: tool },
+          {
+            display: {
+              connection,
+              identity,
+              iconCandidates: [connectionIcon],
+              registry,
+              icons: { registry: icons, owner },
+            },
+          }
+        ),
+        scope
+      );
+      const output: unknown = await tools.probe.execute!(
+        {},
+        { toolCallId: callId, messages: [], context: undefined }
+      );
+      // Neither the display key nor any artwork may leak into model-visible output.
+      expect(JSON.stringify(output)).not.toContain(displayKey);
+      expect(JSON.stringify(output)).not.toContain("data:image");
+    },
+    take: (callId) => registry.take(scope, callId),
+  };
+}
+
+const plainTool = dynamicTool({
+  inputSchema: jsonSchema({ type: "object" }),
+  execute: () => ({ content: [{ type: "text", text: "answer" }] }),
+});
+function brandedTool(icons?: IconCandidate[]): Tool {
+  return dynamicTool({
+    inputSchema: jsonSchema({ type: "object" }),
+    execute: () => ({
+      content: [{ type: "text", text: "answer" }],
+      _meta: { [displayKey]: { name: "Response", version: "2", ...(icons ? { icons } : {}) } },
+    }),
+  });
+}
+
+describe("MCP icon references on tool-call snapshots", () => {
+  test("a connection-identity fallback registers the handshake icon once per generation", async () => {
+    const h = harness();
+    const owner: MCPIconOwner = {};
+    await h.wrap(owner, plainTool, "first");
+    await h.wrap(owner, plainTool, "second");
+    const first = h.take("first");
+    const second = h.take("second");
+    expect(first).toMatchObject({ source: "connection", identity });
+    expect(first?.iconRef).toMatch(/^[a-f0-9]{32}$/);
+    // Same owner + same candidates = same immutable ref; no second resolution.
+    expect(second?.iconRef).toBe(first!.iconRef);
+    expect(h.resolved).toHaveLength(1);
+    expect(h.resolved[0].candidates).toEqual([connectionIcon]);
+    expect(h.resolved[0].binding).toEqual(connection);
+    // Snapshots persist into history: a ref, never the candidate URL or bytes.
+    expect(JSON.stringify(first)).not.toContain("data:");
+    expect(isPngDataUrl(await h.icons.get(first!.iconRef!))).toBe(true);
+  });
+
+  test("a response identity owns its artwork: none inherits nothing, its own replaces", async () => {
+    const h = harness();
+    const owner: MCPIconOwner = {};
+    await h.wrap(owner, brandedTool(), "unbranded");
+    await h.wrap(owner, brandedTool([responseIcon]), "branded");
+    const unbranded = h.take("unbranded");
+    expect(unbranded).toMatchObject({ source: "response", identity: { name: "Response" } });
+    expect(unbranded?.iconRef).toBeUndefined();
+    const branded = h.take("branded");
+    expect(branded?.iconRef).toMatch(/^[a-f0-9]{32}$/);
+    // Only the response candidates were resolved; the connection icon never was.
+    expect(h.resolved.map((r) => r.candidates)).toEqual([[responseIcon]]);
+  });
+
+  test("a reconnected generation mints a new ref while the old one keeps resolving", async () => {
+    const h = harness();
+    await h.wrap({}, plainTool, "before");
+    await h.wrap({}, plainTool, "after");
+    const before = h.take("before")!.iconRef!;
+    const after = h.take("after")!.iconRef!;
+    expect(after).not.toBe(before);
+    expect(await h.icons.get(before)).toBe(PNG);
+    expect(await h.icons.get(after)).toBe(PNG);
+    expect(await h.icons.get("0".repeat(32))).toBeNull();
+  });
+
+  test("the tool call never waits for icon resolution", async () => {
+    const h = harness(() => new Promise<string | null>(() => undefined));
+    await h.wrap({}, plainTool, "pending");
+    expect(h.take("pending")?.iconRef).toMatch(/^[a-f0-9]{32}$/);
+    expect(h.resolved).toHaveLength(1);
+  });
+
+  test("without an icon registry snapshots carry no ref", async () => {
+    const registry = new ToolCallDisplayRegistry();
+    registry.open(scope);
+    const tools = withExecutionScope(
+      wrapMCPTools(
+        { probe: plainTool },
+        { display: { connection, identity, iconCandidates: [connectionIcon], registry } }
+      ),
+      scope
+    );
+    await tools.probe.execute!({}, { toolCallId: "call", messages: [], context: undefined });
+    const snapshot = registry.take(scope, "call");
+    expect(snapshot).toMatchObject({ source: "connection" });
+    expect(snapshot?.iconRef).toBeUndefined();
   });
 });

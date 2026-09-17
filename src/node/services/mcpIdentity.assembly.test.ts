@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { Ok } from "@/common/types/result";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { MCP_SERVER_INFO_META_KEY } from "@/node/services/mcpServerIdentity";
 import type {
@@ -29,9 +30,11 @@ import { assertStreamSuccess, type StreamCollector } from "../../../tests/ipc/st
 
 // Runs under `bun test` (not Jest): the PTC sandbox's type generator loads prettier, whose CJS
 // bundle uses dynamic import(), which Jest's VM rejects without --experimental-vm-modules.
+// Branded: the handshake identity carries an SVG icon, every tool result a
+// different identity with its own PNG icon.
 const FIXTURE_SERVER = path.resolve(
   import.meta.dir,
-  "../../../tests/fixtures/mcp/modern-server.ts"
+  "../../../tests/fixtures/mcp/branded-modern-server.ts"
 );
 const MCP_SERVER_KEY = "identity";
 const MCP_TOOL_NAME = "identity_identity_probe";
@@ -192,6 +195,24 @@ describe("MCP identity through real turn assembly", () => {
       // The display key never reaches the model-visible output; unrelated _meta survives.
       expect(JSON.stringify(topLevelEnd.result)).not.toContain(MCP_SERVER_INFO_META_KEY);
       expect(JSON.stringify(topLevelEnd.result)).toContain("preserved");
+      // The response identity's own icon travels as an opaque ref: the event
+      // carries neither the server's data URL nor the rasterized bytes.
+      const iconRef = topLevelEnd.mcpServer?.iconRef;
+      expect(iconRef).toMatch(/^[a-f0-9]{32}$/);
+      expect(JSON.stringify(topLevelEnd)).not.toContain("data:image");
+      const responseIcon = await client.mcp.icon({ iconRef: iconRef! });
+      expect(isPngDataUrl(responseIcon)).toBe(true);
+      // Settings' Test connection sees the handshake icon, a different image.
+      const tested = await client.mcp.test({ name: MCP_SERVER_KEY });
+      expect(tested.success).toBe(true);
+      if (!tested.success) throw new Error(tested.error);
+      expect(tested.serverInfo?.name).toBe("Connection identity");
+      expect(isPngDataUrl(tested.icon)).toBe(true);
+      expect(tested.icon).not.toBe(responseIcon);
+      // Lookup only: an unknown ref yields null; a malformed one never reaches the manager.
+      expect(await client.mcp.icon({ iconRef: "f".repeat(32) })).toBeNull();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types type `rejects` matchers as void
+      await expect(client.mcp.icon({ iconRef: "data:image/png;base64,AAAA" })).rejects.toThrow();
 
       // Turn 2: PTC exclusive posture, the model reaches the same MCP tool from the sandbox.
       nextModel = () =>
@@ -211,6 +232,8 @@ describe("MCP identity through real turn assembly", () => {
         connection: { key: MCP_SERVER_KEY, transport: "stdio" },
         identity: { name: "Response identity" },
         source: "response",
+        // Same connected generation, same artwork: the ref is reused, not re-minted.
+        iconRef,
       });
       const parentEnd = await waitForToolCallEnd(
         scopedCollector,
@@ -239,6 +262,8 @@ describe("MCP identity through real turn assembly", () => {
       // shared one scope and one call id: the MCP wrapper published under
       // options.toolCallId, and the nested-event consumer took event.callId.
       const history = await readChatHistory(env.tempDir, workspaceId);
+      // Persisted history holds refs only: no icon URL or PNG anywhere in chat.jsonl.
+      expect(JSON.stringify(history)).not.toContain("data:image");
       const toolParts = history
         .filter((row) => row.role === "assistant")
         .flatMap((row) => row.parts.filter((part) => part.type === "dynamic-tool"));
