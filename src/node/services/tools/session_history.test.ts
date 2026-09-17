@@ -3979,3 +3979,187 @@ describe("session_history complete results", () => {
     expect(await call({ action: "search", query: "opening facts" })).toEqual(CHANGED_RESULT);
   });
 });
+
+describe("session_history window counts", () => {
+  const compaction = (epoch: number, sequence?: number): MuxMetadata => ({
+    compacted: true,
+    compactionBoundary: true,
+    compactionEpoch: epoch,
+    ...(sequence === undefined ? {} : { historySequence: sequence }),
+  });
+  const counts = async (input: SessionHistoryArgs, hasMore = false) =>
+    (await windowsOf({ action: "list_windows", ...input }, { hasMore })).map((window) => [
+      window.windowId,
+      window.itemCount,
+    ]);
+
+  test("itemCount is the exact visible row count in both directions, beyond limit and payload caps", async () => {
+    await append("second", "second facts");
+    const big = await append("big-boundary", "big summary", compaction(1));
+    // 60 rows of 400 characters: more than the 25-row search limit and more than 16 KiB of text.
+    for (let index = 0; index < 60; index++)
+      await append(`big-${index}`, `${index} `.padEnd(400, "x"));
+    const small = await append("small-boundary", "", compaction(2));
+    await append("small-one", "small one");
+    await append("small-two", "small two");
+    const bigId = `w:${String(big.metadata!.historySequence)}`;
+    const smallId = `w:${String(small.metadata!.historySequence)}`;
+    const expected = [
+      ["w:0", 2],
+      [bigId, 61],
+      [smallId, 2],
+    ];
+    expect(await counts({})).toEqual(expected);
+    expect(await counts({ recent_first: true })).toEqual(expected.toReversed());
+    expect(await counts({ window_id: bigId })).toEqual([[bigId, 61]]);
+    expect(await counts({ window_id: bigId, recent_first: true })).toEqual([[bigId, 61]]);
+    // list_items cannot return 61 rows in one response; the count still is exact.
+    expect(
+      await itemsOf({ action: "list_items", window_id: bigId, limit: 25 }, { hasMore: true })
+    ).toHaveLength(25);
+    // A boundary with no rows after it is an empty window.
+    const empty = await append("empty", "", rollover);
+    expect((await counts({ recent_first: true }))[0]).toEqual([
+      `w:${String(empty.metadata!.historySequence)}`,
+      0,
+    ]);
+  });
+
+  test("hidden rows are not counted and a manual reset floors the counts", async () => {
+    await append("hidden", "private needle", { synthetic: true });
+    await append("visible-synthetic", "visible", { synthetic: true, uiVisible: true });
+    await append("rejected", "private", { contextBudgetRejected: true });
+    expect(await counts({})).toEqual([["w:0", 2]]);
+    await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    const reset = await fixture.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(reset.success).toBe(true);
+    await append("after-one", "after one");
+    await append("after-two", "after two");
+    const resetWindow = (await windowsOf({ action: "list_windows" }))[0];
+    expect(resetWindow.boundaryKind).toBe("reset");
+    // The reset row itself is hidden; only the two rows behind it count, w:0 is gone.
+    expect(await counts({})).toEqual([[resetWindow.windowId, 2]]);
+    expect(await counts({ recent_first: true })).toEqual([[resetWindow.windowId, 2]]);
+  });
+
+  test("a window spanning the archive/chat seam is one run in both directions", async () => {
+    const root = createMuxMessage("root", "assistant", "root row", { historySequence: 1 });
+    const boundary = createMuxMessage(
+      "seam-boundary",
+      "assistant",
+      "seam summary",
+      compaction(1, 10)
+    );
+    const archived = createMuxMessage("archived", "assistant", "archived row", {
+      historySequence: 11,
+    });
+    const active = [12, 13].map((sequence) =>
+      createMuxMessage(`active-${sequence}`, "assistant", `active row ${sequence}`, {
+        historySequence: sequence,
+      })
+    );
+    await fs.writeFile(
+      archivePath,
+      [root, boundary, archived].map((row) => JSON.stringify(row) + "\n").join("")
+    );
+    await fs.writeFile(chatPath, active.map((row) => JSON.stringify(row) + "\n").join(""));
+    const expected = [
+      ["w:0", 1],
+      ["w:10", 4],
+    ];
+    expect(await counts({})).toEqual(expected);
+    expect(await counts({ recent_first: true })).toEqual(expected.toReversed());
+    expect(await textsOf({ action: "list_items", window_id: "w:10" })).toEqual([
+      "seam summary",
+      "archived row",
+      "active row 12",
+      "active row 13",
+    ]);
+  });
+
+  test("limit keeps returned counts exact and has_more proves a further matching window", async () => {
+    const one = await append("one", "one", compaction(1));
+    await append("one-row", "row");
+    const two = await append("two", "two", compaction(2));
+    const oneId = `w:${String(one.metadata!.historySequence)}`;
+    const twoId = `w:${String(two.metadata!.historySequence)}`;
+    expect(await counts({ limit: 2 }, true)).toEqual([
+      ["w:0", 1],
+      [oneId, 2],
+    ]);
+    expect(await counts({ limit: 3 })).toEqual([
+      ["w:0", 1],
+      [oneId, 2],
+      [twoId, 1],
+    ]);
+    expect(await counts({ limit: 1, recent_first: true }, true)).toEqual([[twoId, 1]]);
+    // Runs A, B filtered to A with limit 1: B's rows finalize A but do not prove another A.
+    expect(await counts({ window_id: "w:0", limit: 1 })).toEqual([["w:0", 1]]);
+    expect(await counts({ window_id: twoId, limit: 1, recent_first: true })).toEqual([[twoId, 1]]);
+  });
+
+  test("a window that does not fit is popped, also when it is finalized at the end of history", async () => {
+    // Entries of ~1 KiB: 15 fit the 16 KiB response, the 16th does not.
+    const ids = Array.from({ length: 16 }, (_, index) => `legacy-${index}-${"x".repeat(950)}`);
+    await appendRawRows(ids.map((id) => createMuxMessage(id, "assistant", "", compaction(1))));
+    const atEof = await complete({ action: "list_windows", limit: 50 }, { hasMore: true });
+    expect(atEof.windows!.map((window) => window.windowId)).toEqual([
+      "w:0",
+      ...ids.slice(0, 14).map((id) => `w:m:${id}`),
+    ]);
+    expect(
+      atEof.windows!.every((window) => window.itemCount === (window.windowId === "w:0" ? 1 : 0))
+    ).toBe(true);
+    // The remaining windows are reachable by narrowing.
+    expect(await counts({ recent_first: true, limit: 2 }, true)).toEqual([
+      [`w:m:${ids[15]}`, 0],
+      [`w:m:${ids[14]}`, 0],
+    ]);
+    await appendRawRows(
+      ids
+        .slice(14)
+        .map((id) => createMuxMessage(`${id}-again`, "assistant", "later", compaction(2)))
+    );
+    // Now the pop happens mid-scan; the published entries are unchanged.
+    const midScan = await complete({ action: "list_windows", limit: 50 }, { hasMore: true });
+    expect(midScan.windows).toEqual(atEof.windows);
+  });
+
+  test("a recurring window ID is one entry per contiguous run, in both directions and filtered", async () => {
+    const a = (id: string, text: string) =>
+      createMuxMessage(id, "assistant", text, compaction(1, 100));
+    await appendRawRows([
+      a("a-one", "summary A1"),
+      createMuxMessage("a-one-row", "assistant", "row a1"),
+      a("a-two", "summary A2"),
+      createMuxMessage("a-two-row", "assistant", "row a2"),
+      createMuxMessage("b", "assistant", "summary B", compaction(2, 200)),
+      createMuxMessage("b-row", "assistant", "row b"),
+      a("a-three", "summary A3"),
+      createMuxMessage("a-three-row-1", "assistant", "row a3.1"),
+      createMuxMessage("a-three-row-2", "assistant", "row a3.2"),
+    ]);
+    const forward = [
+      ["w:0", 1],
+      ["w:100", 4],
+      ["w:200", 2],
+      ["w:100", 3],
+    ];
+    expect(await counts({})).toEqual(forward);
+    expect(await counts({ recent_first: true })).toEqual(forward.toReversed());
+    expect(await counts({ window_id: "w:100" })).toEqual([
+      ["w:100", 4],
+      ["w:100", 3],
+    ]);
+    expect(await counts({ window_id: "w:100", recent_first: true })).toEqual([
+      ["w:100", 3],
+      ["w:100", 4],
+    ]);
+    expect(await counts({ window_id: "w:100", limit: 1 }, true)).toEqual([["w:100", 4]]);
+    expect(await counts({ window_id: "w:100", limit: 1, recent_first: true }, true)).toEqual([
+      ["w:100", 3],
+    ]);
+    // Exhaustive run counts sum to the unfiltered per-window listing.
+    expect(await itemsOf({ action: "list_items", window_id: "w:100" })).toHaveLength(7);
+  });
+});
