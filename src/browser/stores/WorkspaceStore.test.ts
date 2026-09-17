@@ -191,6 +191,7 @@ type WorkspaceStoreTestWindow = Omit<Window & typeof globalThis, "api"> & {
 };
 
 const originalWindow = global.window;
+const originalQueueMicrotask = global.queueMicrotask;
 
 const mockWindow = new GlobalWindow() as unknown as WorkspaceStoreTestWindow;
 Object.defineProperty(mockWindow, "localStorage", {
@@ -212,6 +213,8 @@ global.window = mockWindow as Window & typeof globalThis;
 
 afterAll(() => {
   global.window = originalWindow;
+  // Later suites need real microtask boundaries for publication ownership checks.
+  global.queueMicrotask = originalQueueMicrotask;
 });
 
 // Mock queueMicrotask synchronously for this suite only. Bun runs every unit
