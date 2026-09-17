@@ -9,10 +9,13 @@ import {
   seedAutoCompactionThreshold,
   type AgentSessionHarness,
 } from "../agentSession.testHarness";
+import type { CompactionHandler } from "../compactionHandler";
 import type { CompactionMonitor } from "../compactionMonitor";
 import type { ContinuousCompactor } from "../continuousCompactor";
 import type { SessionContextController } from "./sessionContextController";
 import type { SessionContextHost } from "./sessionContextHost";
+import type { TokenBudgetStrategy } from "./strategies/tokenBudget";
+import type { ContextResetReason } from "./types";
 
 let harness: AgentSessionHarness | undefined;
 afterEach(async () => {
@@ -52,6 +55,16 @@ function host(
 /** The controller-private monitor: latch/threshold state must never leak between sessions. */
 function monitorOf(controller: SessionContextController): CompactionMonitor {
   return Reflect.get(controller, "compactionMonitor") as CompactionMonitor;
+}
+
+/** The controller-private handler that owns durable compaction publication for one session. */
+function handlerOf(controller: SessionContextController): CompactionHandler {
+  return Reflect.get(controller, "compactionHandler") as CompactionHandler;
+}
+
+/** The controller-private token-budget strategy; its generation is the preparation fence. */
+function tokenBudgetOf(controller: SessionContextController): TokenBudgetStrategy {
+  return Reflect.get(controller, "tokenBudget") as TokenBudgetStrategy;
 }
 
 test("one factory gives each controller independent pressure latches over one persisted threshold", async () => {
@@ -106,7 +119,7 @@ test("durable completion records the tail summary before notifying the external 
     recorded = id;
   });
   const controller = h.contextManagement.openSession(sessionHost);
-  const handler = controller.transitionalCompactionHandler;
+  const handler = handlerOf(controller);
   expect(
     (
       await h.historyService.appendManyToHistory(workspaceId, [
@@ -182,4 +195,76 @@ test("controller transitions latch synchronously and map settings resets onto th
   expect(controller.dispose()).toBeUndefined();
   expect(generation()).toBeGreaterThan(before);
   expect(controller.isApplying()).toBe(false);
+});
+
+test("preparation receipts are owner-bound and only context resets invalidate them", async () => {
+  const h = (harness = await createAgentSessionHarness({ workspaceId: "receipts" }));
+  const controller = controllerOf(h);
+  const sibling = h.contextManagement.openSession(host(h, "sibling"));
+  const budget = tokenBudgetOf(controller);
+  const claimed = () => ({
+    warning: Reflect.get(budget, "contextBudgetWarningClaimed") as boolean,
+    flush: Reflect.get(budget, "contextBudgetFlushClaimed") as boolean,
+  });
+  const arm = () => {
+    Reflect.set(budget, "contextBudgetWarningClaimed", true);
+    Reflect.set(budget, "contextBudgetFlushClaimed", true);
+  };
+
+  // A receipt proves the issuing strategy has not been reset; another session's controller
+  // cannot validate it even when both generations happen to agree.
+  const receipt = controller.capturePreparation();
+  expect(controller.validatePreparation(receipt)).toBe(true);
+  expect(sibling.validatePreparation(receipt)).toBe(false);
+  expect(controller.validatePreparation(sibling.capturePreparation())).toBe(false);
+  expect(receipt.generation).toBe(sibling.capturePreparation().generation);
+
+  // Every reset reason must be classified: only the reasons that change the request context
+  // clear budget state. Compactor-only resets (edits, deletes, cancellation) leave a prepared
+  // rollover valid so its synchronous publication fence stays with the issuing checkpoint.
+  const clearing = new Set<ContextResetReason>([
+    "context-changed",
+    "context-mutation",
+    "compaction-request",
+  ]);
+  const reasons: ContextResetReason[] = [
+    "delete-messages",
+    "edit",
+    "context-changed",
+    "settings-changed",
+    "user-interrupt",
+    "delete-message",
+    "context-mutation",
+    "context-refresh",
+    "compaction-request",
+    "disabled",
+    "legacy-fallback",
+  ];
+  for (const reason of reasons) {
+    arm();
+    const before = controller.capturePreparation();
+    controller.reset(reason);
+    expect({ reason, valid: controller.validatePreparation(before) }).toEqual({
+      reason,
+      valid: !clearing.has(reason),
+    });
+    expect({ reason, ...claimed() }).toEqual({
+      reason,
+      warning: !clearing.has(reason),
+      flush: !clearing.has(reason),
+    });
+    // Resets never cross session boundaries.
+    expect(sibling.validatePreparation(sibling.capturePreparation())).toBe(true);
+  }
+
+  // Cancellation clears the budget itself, ahead of its own user-interrupt reset, whether or
+  // not it also abandons a partial compaction.
+  for (const abandonPartial of [false, true]) {
+    arm();
+    const before = controller.capturePreparation();
+    controller.onUserInterrupt({ abandonPartial });
+    expect(controller.validatePreparation(before)).toBe(false);
+    expect(claimed()).toEqual({ warning: false, flush: false });
+  }
+  expect(sibling.validatePreparation(receipt)).toBe(false);
 });

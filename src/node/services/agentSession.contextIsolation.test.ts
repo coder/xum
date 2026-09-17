@@ -50,7 +50,10 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   const continuousState = continuous.session as unknown as {
     contextController: { continuous: { continuousCompactor: ContinuousCompactor } };
   };
-  const budgetState = budget.session as unknown as {
+  const budgetState = Reflect.get(
+    Reflect.get(budget.session, "contextController") as object,
+    "tokenBudget"
+  ) as {
     contextBudgetGeneration: number;
     pendingBudgetPrompt?: "warn" | "handoff";
   };

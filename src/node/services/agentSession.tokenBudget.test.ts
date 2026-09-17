@@ -11,8 +11,9 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
+import type { SessionContextController } from "./contextManagement/sessionContextController";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -72,6 +73,17 @@ function trackedFilePaths(h: AgentSessionHarness): string[] {
     .paths;
 }
 
+/** Budget state lives on the controller-private token-budget strategy, not the session. */
+function budgetOf(h: AgentSessionHarness) {
+  return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
+    contextBudgetGeneration: number;
+    contextBudgetWarningClaimed: boolean;
+    contextBudgetHandoffClaimed: boolean;
+    contextBudgetFlushClaimed: boolean;
+    contextBudgetHistoryAvailable: boolean;
+  };
+}
+
 function text(row: MuxMessage): string {
   return row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
 }
@@ -108,13 +120,10 @@ function isHandoffRow(row: MuxMessage): boolean {
 
 /** Per-window advisory claims; set only once a row is durable, never by pending intent. */
 function budgetClaims(h: AgentSessionHarness): { warning: boolean; handoff: boolean } {
-  const session = h.session as unknown as {
-    contextBudgetWarningClaimed: boolean;
-    contextBudgetHandoffClaimed: boolean;
-  };
+  const budget = budgetOf(h);
   return {
-    warning: session.contextBudgetWarningClaimed,
-    handoff: session.contextBudgetHandoffClaimed,
+    warning: budget.contextBudgetWarningClaimed,
+    handoff: budget.contextBudgetHandoffClaimed,
   };
 }
 
@@ -330,11 +339,7 @@ describe("AgentSession token-budget lifecycle", () => {
       (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
     );
     await seedHistory(h, 20_000);
-    const state = h.session as unknown as {
-      contextBudgetGeneration: number;
-      contextBudgetWarningClaimed: boolean;
-      contextBudgetFlushClaimed: boolean;
-    };
+    const state = budgetOf(h);
     state.contextBudgetWarningClaimed = true;
     state.contextBudgetFlushClaimed = true;
     const generation = state.contextBudgetGeneration;
@@ -1878,7 +1883,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
       expect(warningRows(await allRows(h))).toHaveLength(0);
       expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-      const state = h.session as unknown as { contextBudgetHandoffClaimed: boolean };
+      const state = budgetOf(h);
       expect(state.contextBudgetHandoffClaimed).toBe(false);
       await seedThreshold(h, threshold);
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -2280,7 +2285,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
     spyOn(
-      h.session as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
+      budgetOf(h) as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
       "resolveAgentForBudgetChecks"
     ).mockResolvedValueOnce(Err(exceeded));
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -3330,6 +3335,112 @@ describe("AgentSession token-budget lifecycle", () => {
       }
     }
   );
+
+  /**
+   * Records the recovery path's preparation fence and the protected calls it guards. Each
+   * valid fence check queues a microtask; protected work that starts before that microtask
+   * runs proves the session did not yield between the check and the call.
+   */
+  function armRecoveryFenceWitness(h: Awaited<ReturnType<typeof setup>>) {
+    const controller = Reflect.get(h.session, "contextController") as SessionContextController;
+    const session = h.session as unknown as {
+      applyContextResetSideEffects(...args: unknown[]): Promise<void>;
+      appendContextRolloverRows(...args: unknown[]): Promise<Result<void>>;
+    };
+    const order: string[] = [];
+    let validated = 0;
+    const validate = controller.validatePreparation.bind(controller);
+    const validateSpy = spyOn(controller, "validatePreparation").mockImplementation((receipt) => {
+      const valid = validate(receipt);
+      if (valid) {
+        const tag = ++validated;
+        order.push(`validate:${tag}`);
+        queueMicrotask(() => order.push(`microtask:${tag}`));
+      }
+      return valid;
+    });
+    const apply = session.applyContextResetSideEffects.bind(session);
+    const applySpy = spyOn(session, "applyContextResetSideEffects").mockImplementation(
+      (...args) => {
+        order.push(`apply:${validated}`);
+        return apply(...args);
+      }
+    );
+    const append = session.appendContextRolloverRows.bind(session);
+    const appendSpy = spyOn(session, "appendContextRolloverRows").mockImplementation((...args) => {
+      order.push(`append:${validated}`);
+      return append(...args);
+    });
+    const failFirstRequest = async () => {
+      const streamError = {
+        workspaceId,
+        messageId: "assistant-1",
+        error: "context limit",
+        errorType: "context_exceeded" as const,
+      };
+      h.aiEmitter.emit("error", streamError);
+      h.completions[0].settle({ status: "failed", streamError });
+      return h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId);
+    };
+    return { controller, order, validateSpy, applySpy, appendSpy, failFirstRequest };
+  }
+
+  test("recovery starts each protected publication step synchronously after its fence check", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const witness = armRecoveryFenceWitness(h);
+    const generation = budgetOf(h).contextBudgetGeneration;
+    expect(await witness.failFirstRequest()).toBe("retry-started");
+    expect(h.requests).toHaveLength(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    expect(witness.applySpy).toHaveBeenCalledTimes(1);
+    expect(witness.appendSpy).toHaveBeenCalledTimes(1);
+    // The recovery clears budget state exactly once, after the rows are durable.
+    expect(budgetOf(h).contextBudgetGeneration).toBe(generation + 1);
+    // Both protected calls must directly follow a valid fence check, ahead of the microtask
+    // that check queued. An intervening await would let the microtask run first.
+    for (const kind of ["apply", "append"] as const) {
+      const entry = witness.order.find((item) => item.startsWith(`${kind}:`));
+      assert(entry, `${kind} must have been recorded`);
+      const index = witness.order.indexOf(entry);
+      const tag = entry.slice(kind.length + 1);
+      expect({ kind, before: witness.order[index - 1] }).toEqual({
+        kind,
+        before: `validate:${tag}`,
+      });
+      expect({ kind, microtaskAfter: witness.order.indexOf(`microtask:${tag}`) > index }).toEqual({
+        kind,
+        microtaskAfter: true,
+      });
+    }
+    // The earlier fence checks yield to awaited work; only the final checkpoints are no-await.
+    expect(witness.order.slice(0, 2)).toEqual(["validate:1", "microtask:1"]);
+  });
+
+  test("budget invalidation before the fence check aborts recovery without replacement", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const before = await allRows(h);
+    const witness = armRecoveryFenceWitness(h);
+    // Invalidate right before the checkpoint that guards cleanup: the prepared candidate is
+    // complete, but the fence must reject it instead of sealing the old window.
+    let checks = 0;
+    const validate = witness.validateSpy.getMockImplementation()!;
+    witness.validateSpy.mockImplementation((receipt) => {
+      if (++checks === 2) witness.controller.clearBudgetState();
+      return validate(receipt);
+    });
+    expect(await witness.failFirstRequest()).toBe("terminal");
+    expect(checks).toBeGreaterThanOrEqual(2);
+    expect(witness.applySpy).not.toHaveBeenCalled();
+    expect(witness.appendSpy).not.toHaveBeenCalled();
+    expect(h.requests).toHaveLength(1);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    // Only the rejected request is quarantined; nothing else was appended or replaced.
+    expect((await allRows(h)).map((row) => row.id)).toEqual(before.map((row) => row.id));
+  });
 
   test.each([
     "auto-off",

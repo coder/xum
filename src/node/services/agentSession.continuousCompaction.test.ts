@@ -60,7 +60,7 @@ interface SessionInternals {
   contextController: {
     continuous: ContinuousStrategyInternals;
     summarize: { interruptForCompaction(): Promise<void> };
-    transitionalCompactionHandler: CompactionHandler;
+    compactionHandler: CompactionHandler;
   };
   activeStreamContext?: {
     modelString: string;
@@ -580,7 +580,7 @@ describe("AgentSession continuous compaction wiring", () => {
     const h = await setup();
     const retained = createMuxMessage("retained-user", "user", "Earlier task");
     await h.historyService.appendToHistory(workspaceId, retained);
-    const handler = internals(h.session).contextController.transitionalCompactionHandler;
+    const handler = internals(h.session).contextController.compactionHandler;
     const preparation = handler.beginPreparation(() => true);
     const source = await rows(h);
     expect(
@@ -979,7 +979,7 @@ describe("AgentSession continuous compaction wiring", () => {
         }
         return read(id);
       });
-      const handler = internals(h.session).contextController.transitionalCompactionHandler;
+      const handler = internals(h.session).contextController.compactionHandler;
       spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
         async (_usage, context) => {
           if (context.phase !== "mid-stream") return "none";
