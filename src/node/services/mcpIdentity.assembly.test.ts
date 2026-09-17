@@ -49,7 +49,11 @@ const FINISH_USAGE = {
  * language model is substituted: turn assembly, tool wrapping, the PTC
  * sandbox, the MCP process, and stream persistence are all real.
  */
-function scriptedModel(toolCall: { toolName: string; input: unknown }): MockLanguageModelV3 {
+function scriptedModel(toolCall: {
+  toolName: string;
+  input: unknown;
+  toolCallId?: string;
+}): MockLanguageModelV3 {
   let step = 0;
   return new MockLanguageModelV3({
     doStream: () => {
@@ -59,7 +63,7 @@ function scriptedModel(toolCall: { toolName: string; input: unknown }): MockLang
           ? [
               {
                 type: "tool-call",
-                toolCallId: `scripted-${toolCall.toolName}`,
+                toolCallId: toolCall.toolCallId ?? `scripted-${toolCall.toolName}`,
                 toolName: toolCall.toolName,
                 input: JSON.stringify(toolCall.input),
               },
@@ -215,6 +219,21 @@ describe("MCP identity through real turn assembly", () => {
       // The sandbox result itself is not an MCP result: no snapshot on the parent.
       expect(parentEnd.mcpServer).toBeUndefined();
 
+      // Turn 3: the server rejects the call. There is no result metadata to
+      // replace the handshake identity, so the failed part keeps the
+      // connection-derived snapshot the wrapper published before rethrowing.
+      nextModel = () =>
+        scriptedModel({ toolName: MCP_TOOL_NAME, input: { fail: true }, toolCallId: "failed" });
+      await runScriptedTurn(scopedCollector, env, workspaceId, "make the probe fail");
+      const failedEnd = await waitForToolCallEnd(scopedCollector, (e) => e.toolCallId === "failed");
+      expect(failedEnd.result).toMatchObject({ success: false });
+      expect(JSON.stringify(failedEnd.result)).toContain("fixture tool failure");
+      expect(failedEnd.mcpServer).toEqual({
+        connection: { key: MCP_SERVER_KEY, transport: "stdio" },
+        identity: { name: "Connection identity", version: "1", title: "Fixture" },
+        source: "connection",
+      });
+
       // Persisted history: the snapshot is frozen on the part (top-level) and the
       // nested record (PTC). The nested record matching proves writer and consumer
       // shared one scope and one call id: the MCP wrapper published under
@@ -237,6 +256,10 @@ describe("MCP identity through real turn assembly", () => {
       expect(nestedCalls?.[0]?.toolCallId).toBe(nestedEnd.toolCallId);
       expect(nestedCalls?.[0]?.mcpServer).toEqual(nestedEnd.mcpServer);
       expect(JSON.stringify(nestedCalls?.[0]?.output)).not.toContain(MCP_SERVER_INFO_META_KEY);
+      const persistedFailed = toolParts.find((part) => part.toolCallId === "failed");
+      expect(persistedFailed?.state).toBe("output-available");
+      expect(persistedFailed?.output).toMatchObject({ success: false });
+      expect(persistedFailed?.mcpServer).toEqual(failedEnd.mcpServer);
     } finally {
       scopedCollector?.stop();
       if (workspaceId) {

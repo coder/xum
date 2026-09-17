@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { convertToModelMessages, dynamicTool, jsonSchema } from "ai";
+import { convertToModelMessages, dynamicTool, jsonSchema, type Tool } from "ai";
+import type { MCPConnectionRef } from "@/common/types/mcp";
 import { wrapMCPTools } from "./mcpServerManager";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
+import { withExecutionScope } from "./tools/withExecutionScope";
 
 const displayKey = "io.modelcontextprotocol/serverInfo";
 const identity = { name: "server-display-only", version: "1.0" };
@@ -68,4 +71,97 @@ describe("MCP display metadata boundary", () => {
       expect(result).toBeDefined();
     }
   );
+});
+
+const connection: MCPConnectionRef = { key: "configured", transport: "stdio" };
+const scope = { workspaceId: "workspace", messageId: "message", token: "turn" };
+
+/** One wrapped tool under an open scope; `identity` undefined models a server without a handshake identity. */
+function failingHarness(options: {
+  execute: Tool["execute"];
+  identity?: typeof identity;
+  onClosed?: () => void;
+}) {
+  const registry = new ToolCallDisplayRegistry();
+  registry.open(scope);
+  const tools = withExecutionScope(
+    wrapMCPTools(
+      {
+        probe: dynamicTool({
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: options.execute!,
+        }),
+      },
+      {
+        display: { connection, identity: options.identity, registry },
+        onClosed: options.onClosed,
+      }
+    ),
+    scope
+  );
+  return { registry, execute: tools.probe.execute! };
+}
+
+/** The rejection of `run`; fails the test when it settles successfully. */
+async function rejectionOf(run: () => unknown): Promise<unknown> {
+  try {
+    await run();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected the call to reject");
+}
+
+describe("MCP identity on failed tool calls", () => {
+  test("a thrown execution keeps the handshake identity for the failed part and rethrows unchanged", async () => {
+    const failure = new Error("upstream exploded");
+    const h = failingHarness({ execute: () => Promise.reject(failure), identity });
+    const caught = await rejectionOf(() =>
+      h.execute({}, { toolCallId: "call", messages: [], context: undefined })
+    );
+    expect(caught).toBe(failure);
+    expect(h.registry.take(scope, "call")).toEqual({ connection, identity, source: "connection" });
+  });
+
+  test("an interrupted call publishes its snapshot before the client is recycled", async () => {
+    const abort = new AbortController();
+    let seenDuringRecycle: unknown = "not called";
+    const h = failingHarness({
+      // Never settles on its own; only the deadline/abort path can end it.
+      execute: () => new Promise(() => undefined),
+      identity,
+      onClosed: () => {
+        seenDuringRecycle = h.registry.take(scope, "call");
+      },
+    });
+    const pending: unknown = h.execute(
+      {},
+      { toolCallId: "call", messages: [], context: undefined, abortSignal: abort.signal }
+    );
+    abort.abort();
+    expect(await rejectionOf(() => pending)).toMatchObject({ message: "Interrupted" });
+    // The recycle callback already saw the snapshot; nothing was published twice.
+    expect(seenDuringRecycle).toEqual({ connection, identity, source: "connection" });
+    expect(h.registry.take(scope, "call")).toBeUndefined();
+  });
+
+  test("without a handshake identity or an open scope a failure publishes nothing", async () => {
+    const unknownServer = failingHarness({ execute: () => Promise.reject(new Error("boom")) });
+    expect(
+      await rejectionOf(() =>
+        unknownServer.execute({}, { toolCallId: "call", messages: [], context: undefined })
+      )
+    ).toMatchObject({ message: "boom" });
+    expect(unknownServer.registry.take(scope, "call")).toBeUndefined();
+
+    const closed = failingHarness({ execute: () => Promise.reject(new Error("boom")), identity });
+    closed.registry.close(scope);
+    expect(
+      await rejectionOf(() =>
+        closed.execute({}, { toolCallId: "call", messages: [], context: undefined })
+      )
+    ).toMatchObject({ message: "boom" });
+    closed.registry.open(scope);
+    expect(closed.registry.take(scope, "call")).toBeUndefined();
+  });
 });

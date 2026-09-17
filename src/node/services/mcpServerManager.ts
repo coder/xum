@@ -345,6 +345,9 @@ export function wrapMCPTools(
         // calls (including closed-client races) still count as activity.
         onActivity?.();
 
+        // Set once a result's snapshot is published, so the failure path never
+        // replaces response metadata with the weaker connection identity.
+        let published = false;
         try {
           const abortSignal =
             context && typeof context === "object" && "abortSignal" in context
@@ -368,10 +371,26 @@ export function wrapMCPTools(
               identity,
               source: response ? "response" : "connection",
             });
-            if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+            if (snapshot) {
+              published = options.display.registry.set(scope, context.toolCallId, snapshot);
+            }
           }
           return transformMCPResult(rest as MCPCallToolResult);
         } catch (error) {
+          // A call that throws or hits its deadline produced no result metadata,
+          // but the failed part still belongs to a known server: publish the
+          // handshake identity for it before the client may be recycled. Only
+          // here, not before every call, so a successful result's own identity
+          // is still the first and only snapshot for its call.
+          const scope = getExecutionScope(context);
+          if (!published && scope && options?.display?.identity) {
+            const snapshot = buildToolCallDisplay({
+              connection: options.display.connection,
+              identity: options.display.identity,
+              source: "connection",
+            });
+            if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+          }
           if (shouldRecycleClientAfterToolError(error)) {
             try {
               onClosed?.();

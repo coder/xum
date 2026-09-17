@@ -11,9 +11,25 @@ export function runIdentityServer(mode: Mode): void {
   const handshakeMeta = mode === "modern" || mode === "malformed" ? { [key]: connection } : {};
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   lines.on("line", (line) => {
-    const request = JSON.parse(line) as { id?: string | number; method: string };
+    const request = JSON.parse(line) as {
+      id?: string | number;
+      method: string;
+      params?: { arguments?: { fail?: unknown } };
+    };
     if (request.id === undefined) return;
     let result: Record<string, unknown> | undefined;
+    // `{ fail: true }` makes the tool call itself fail with a JSON-RPC error,
+    // so tests can exercise the host's failed-call path against a real server.
+    if (request.method === "tools/call" && request.params?.arguments?.fail === true) {
+      process.stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32603, message: "fixture tool failure" },
+        }) + "\n"
+      );
+      return;
+    }
     switch (request.method) {
       case "server/discover":
         if (mode === "legacy") break;
