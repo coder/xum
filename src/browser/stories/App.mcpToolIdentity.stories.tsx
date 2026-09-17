@@ -1,3 +1,4 @@
+import type { ComponentType } from "react";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { MuxToolPart } from "@/common/types/message";
@@ -273,6 +274,20 @@ export const Nested: AppStory = {
 const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
 const phoneGlobals = { viewport: { value: "mobile1", isRotated: false } };
 
+/**
+ * Fixed 375 px frame (the plan's narrowest acceptance width): the Storybook
+ * test-runner ignores `globals.viewport` and the Pixel matrix, so only a
+ * decorator makes the narrow layout real for play assertions.
+ */
+const PHONE_FRAME = { width: 375, height: 812 } as const;
+function PhoneFrameDecorator(Story: ComponentType) {
+  return (
+    <div data-testid="phone-frame" style={{ ...PHONE_FRAME, overflow: "hidden" }}>
+      <Story />
+    </div>
+  );
+}
+
 export const Phone: AppStory = {
   ...Branded,
   render: () => (
@@ -300,27 +315,33 @@ export const Phone: AppStory = {
 /**
  * An allowed 80-char unbroken title must not push the tool name or status off
  * the card: the compact label is bounded and shrinkable, so it truncates at
- * every width while the icon, tool name and status stay visible.
+ * every width while the icon, tool name and status stay visible. The frame
+ * decorator pins 375 px even under the desktop-sized test-runner.
  */
 export const LongTitlePhone: AppStory = {
   ...Branded,
   render: () => (
     <AppWithMocks setup={() => setupChat({ branded: true, phone: true, longTitle: true })} />
   ),
+  decorators: [PhoneFrameDecorator],
   globals: phoneGlobals,
   parameters: phoneParameters,
   play: async (context) => {
     await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
-    await prepareChat(context.canvasElement);
-    const { search, badge } = await expectBranded(context.canvasElement, LONG_TITLE);
+    const frame = await within(context.canvasElement).findByTestId("phone-frame");
+    await expect(frame.clientWidth).toBe(PHONE_FRAME.width);
+    await prepareChat(frame);
+    const { search, badge } = await expectBranded(frame, LONG_TITLE);
     const label = badge.querySelector("span");
     if (!label) throw new Error("Compact label not rendered");
-    // Holds at the runner's desktop width as well as the pinned phone width.
     await expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
     await expect(search.header.scrollWidth).toBeLessThanOrEqual(search.header.clientWidth);
+    await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth);
+    // Icon, tool name and status survive next to the truncated label.
+    await expect(badge.querySelector("img, svg")).toBeVisible();
     await expect(search.name).toBeVisible();
-    if (window.innerWidth < 768) {
-      await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
-    }
+    await expect(search.name.getBoundingClientRect().right).toBeLessThanOrEqual(
+      frame.getBoundingClientRect().right
+    );
   },
 };

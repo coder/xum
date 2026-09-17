@@ -168,6 +168,28 @@ describe("McpIconRefCache", () => {
     expect(untouched.calls).toEqual([]);
   });
 
+  test("more misses than the capacity in one tick stay bounded in entries and per-call batches", async () => {
+    const cache = new McpIconRefCache(3);
+    const api = client((refs) => Promise.resolve(icons(refs)));
+    const refs = Array.from({ length: 8 }, (_, i) => ref(i + 1));
+    const results = refs.map((r) => cache.resolve(r, api));
+    expect(cache.size).toBe(3);
+    await Promise.resolve();
+    expect(api.calls.map((call) => call.length)).toEqual([3, 3, 2]);
+    expect(api.calls.flat()).toEqual(refs);
+    // Every caller is answered; only the surviving entries are memoized.
+    expect(await Promise.all(results)).toEqual(refs.map(() => PNG));
+    expect(cache.size).toBe(3);
+    expect(refs.slice(0, 5).map((r) => cache.peek(r))).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(refs.slice(5).map((r) => cache.peek(r))).toEqual([PNG, PNG, PNG]);
+  });
+
   test("rejects a non-positive capacity", () => {
     expect(() => new McpIconRefCache(0)).toThrow();
   });
