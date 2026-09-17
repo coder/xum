@@ -22,10 +22,11 @@ def codex_relative_time: "<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+<
 def codex_completed_row: codex_review_row_prefix + "Completed\\*\\*( " + codex_relative_time + ")?" + codex_review_row_suffix;
 def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_relative_time + codex_review_row_suffix;
 
-# Parse the review summary board Codex edits in place. Emit its metadata status
-# ("completed" or "running") only when every line has an observed informational
-# shape; emit null for anything else so unknown content stays blocking. A status
-# of "completed" with a Running row is contradictory and also emits null.
+# Parse the review summary board Codex edits in place. Emit "completed" or
+# "running" only when every line has an observed informational shape; emit null
+# for anything else so unknown content stays blocking. The metadata status tracks
+# the security review alone (observed on coder/mux#4271: "completed" while the
+# Code Review row still read Running), so a Running row also means "running".
 def codex_summary_status($bot):
   if .author.login != $bot then null
   else
@@ -61,8 +62,8 @@ def codex_summary_status($bot):
               or test("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r[0-9]+\\)"
                 + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
             ))
-            and ($security.status == "running" or ($lines[2:] | any(test(codex_running_row)) | not))
-            then $security.status
+            then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+                  then "running" else "completed" end)
             else null
             end
         # capture() yields empty, not an error, on a non-matching metadata line;

@@ -218,11 +218,17 @@ else:
     def test_wait_for_review_polls_until_codex_finishes(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
         completed = snapshot([comment(FIXTURES["summary"]["body"])])
-        for name in ("running_summary", "pr_opened_summary", "mixed_summary"):
+        in_progress = [name for name, fixture in FIXTURES.items() if fixture.get("in_progress")]
+        self.assertIn("security_first_summary", in_progress)
+        for name in in_progress:
             with self.subTest(name=name):
                 data = [snapshot([comment(FIXTURES[name]["body"])]), completed]
                 self.assert_gate(0, data, wait=60)
                 self.assertEqual(self.comment_fetches, 2)
+        with self.subTest("security-first board keeps waiting through a later poll"):
+            security_first = snapshot([comment(FIXTURES["security_first_summary"]["body"])])
+            self.assert_gate(0, [running, security_first, completed], wait=60)
+            self.assertEqual(self.comment_fetches, 3)
         with self.subTest("cache is refreshed before waiting"):
             self.assert_gate(0, [running, completed], cache=running, wait=60)
             self.assertEqual(self.comment_fetches, 2)
