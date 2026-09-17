@@ -86,13 +86,13 @@ const TREE_SCOPE_RESTRICTED_NOTE =
   "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";
 
 const INSTANCE_SCOPE_NOTE =
-  "Rows are root workspaces in this Xum instance and an availability snapshot: archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including `refused` with a retry-after reason when a delegated turn starts on it). " +
+  "Rows are local/worktree root workspaces in this Xum instance and an availability snapshot: non-local or unresolved runtimes, archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including its runtime or a delegated turn starting on it). " +
   'Message them with task_send_message — "unrelated" rows receive your text as an untrusted agent message, queued to turn-end while they are busy, under their own agent/model settings; discovery grants no additional control. Your own "self" row is not addressable.';
 
 // The tree note promises self/descendant rows, which would be false here: a restricted caller
 // gets no instance rows at all.
 const INSTANCE_SCOPE_RESTRICTED_NOTE =
-  "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so no instance rows are listed.";
+  "Instance discovery is unavailable from this workspace. Unrelated discovery and messaging require local/worktree runtimes and exclude best-of candidates and workflow-owned tasks. Existing same-tree messaging rules are unchanged; no instance rows are listed.";
 
 const INSTANCE_SCOPE_TRUNCATED_NOTE =
   " More rows match; pass `nextOffset` as `offset` to continue. Paging is best-effort while workspaces are created, removed, or archived, so restart from offset 0 or deduplicate by ID when completeness matters.";
