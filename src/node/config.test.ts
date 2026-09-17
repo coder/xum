@@ -1,6 +1,9 @@
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
+// write-file-atomic reads fs through require(), whose exports object is the default
+// import; spying on the `import * as fs` namespace only rebinds this module's view.
+import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
@@ -330,6 +333,145 @@ describe("Config", () => {
       };
       expect(rewritten.updateChannel).toBe("nightly");
       errorSpy.mockRestore();
+    });
+  });
+
+  describe("saveConfig under partial writes", () => {
+    // Regression for coder/xum#4197: while a disk was filling up, a single write(2)
+    // accepted only part of the serialized config without reporting an error, and the
+    // unpatched write-file-atomic renamed that truncated temp file over the good
+    // config.json. The next load then rejected it and fell back to an empty registry.
+    type BufferWrite = (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+      callback: (
+        error: NodeJS.ErrnoException | null,
+        written: number,
+        buffer: NodeJS.ArrayBufferView
+      ) => void
+    ) => void;
+
+    let configFile: string;
+    let seededContents: string;
+    let errorSpy: ReturnType<typeof spyOn<typeof log, "error">>;
+
+    beforeEach(async () => {
+      configFile = path.join(tempDir, "config.json");
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [{ path: "/repo/a", id: "aaaaaaaaaa", name: "a" }],
+        });
+        return cfg;
+      });
+      seededContents = fs.readFileSync(configFile, "utf-8");
+      errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    // Mirrors the kernel contract: a short count is not an error, and any failure only
+    // surfaces on the following write.
+    function mockFsWrite(
+      behavior: (call: number, original: BufferWrite, args: Parameters<BufferWrite>) => void
+    ): { restore: () => void; callCount: () => number } {
+      const original: BufferWrite = cjsFs.write.bind(cjsFs);
+      let calls = 0;
+      const spy = spyOn(cjsFs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
+        calls += 1;
+        behavior(calls, original, args);
+      }) as typeof cjsFs.write);
+      // mockRestore() also clears the spy's recorded calls, so count them here.
+      return { restore: () => spy.mockRestore(), callCount: () => calls };
+    }
+
+    function writeHalf(original: BufferWrite, args: Parameters<BufferWrite>): void {
+      const [fd, buffer, offset, length, position, callback] = args;
+      original(fd, buffer, offset, Math.floor(length / 2), position, callback);
+    }
+
+    function configFiles(): string[] {
+      return fs.readdirSync(tempDir).filter((name) => name.startsWith("config.json"));
+    }
+
+    it("keeps the previous config when the disk fills up after a short write", async () => {
+      const fsWrite = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          writeHalf(original, args);
+          return;
+        }
+        const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+        error.code = "ENOSPC";
+        args[5](error, 0, args[1]);
+      });
+      try {
+        await config.setUpdateChannel("nightly");
+      } finally {
+        fsWrite.restore();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      expect(errorSpy).toHaveBeenCalledWith(
+        "Error saving config:",
+        expect.objectContaining({ code: "ENOSPC" })
+      );
+      // The good config survives byte for byte and the failed edit is simply dropped.
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
+      const reloaded = new Config(tempDir);
+      expect(reloaded.loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(reloaded.getUpdateChannel()).not.toBe("nightly");
+      // No temp file left behind and no corrupt sidecar needed on reload.
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("completes a short write so the saved config is whole", async () => {
+      const fsWrite = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          writeHalf(original, args);
+          return;
+        }
+        original(...args);
+      });
+      try {
+        await config.setUpdateChannel("nightly");
+      } finally {
+        fsWrite.restore();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      expect(errorSpy).not.toHaveBeenCalled();
+      const reloaded = new Config(tempDir);
+      expect(reloaded.getUpdateChannel()).toBe("nightly");
+      expect(reloaded.loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("refuses to publish a temp file whose size disagrees with the payload", async () => {
+      // Independent of the retry loop: a write that reports the full length but stores
+      // less must still be caught before the rename.
+      const fsWrite = mockFsWrite((_call, original, args) => {
+        const [fd, buffer, offset, length, position, callback] = args;
+        original(fd, buffer, offset, Math.floor(length / 2), position, (error) =>
+          callback(error, length, buffer)
+        );
+      });
+      try {
+        await config.setUpdateChannel("nightly");
+      } finally {
+        fsWrite.restore();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      const saveError = errorSpy.mock.calls.find((call) => call[0] === "Error saving config:")?.[1];
+      expect(saveError).toBeInstanceOf(Error);
+      expect((saveError as Error).message).toContain("Incomplete write");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
+      expect(new Config(tempDir).loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(configFiles()).toEqual(["config.json"]);
     });
   });
 

@@ -214,6 +214,7 @@
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
     "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch",
+    "write-file-atomic@6.0.0": "patches/write-file-atomic@6.0.0.patch",
   },
   "packages": {
     "7zip-bin": ["7zip-bin@5.2.0", "", {}, "sha512-ukTPVhqG4jNzMro2qA9HSCSSVJN3aN7tlb+hfqYCt3ER0yWroeA2VR38MNrOHLQ/cVj+DaIMad0kFCtWWowh/A=="],

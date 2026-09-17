@@ -2377,6 +2377,10 @@ export class Config {
           }
         }
       }
+      // write-file-atomic is patched (patches/) to write the whole payload and verify the
+      // temp file's size before the rename: a filling disk makes write(2) accept a short
+      // count without an error, and the unpatched library renamed that truncated file
+      // over config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
         try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
         catch: (error) => error,
