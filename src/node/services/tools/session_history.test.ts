@@ -10,7 +10,7 @@ import {
 import type { TaskService } from "@/node/services/taskService";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
 import { HistoryService } from "@/node/services/historyService";
-import { hasRawResetMarker } from "@/node/services/historyScanner";
+import { hasRawResetMarker, type BoundedHistoryScanResult } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
@@ -20,12 +20,12 @@ import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/ty
 import {
   SESSION_HISTORY_MAX_RESULT_BYTES,
   SESSION_HISTORY_MAX_ID_CHARS,
-  SESSION_HISTORY_MAX_CURSOR_CHARS,
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_SCAN_ROWS,
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
   SESSION_HISTORY_ANCHOR_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_TOOL_DEADLINE_MS,
 } from "@/common/constants/contextBudget";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
@@ -64,37 +64,127 @@ async function appendTrackedHistory(filePath: string, data: string | Buffer): Pr
   await store.runMutation(() => store.appendChat(Buffer.isBuffer(data) ? data : Buffer.from(data)));
 }
 
-async function pages(input: SessionHistoryArgs) {
-  const results: SessionHistoryResult[] = [];
-  let cursor: string | undefined;
-  do {
-    const result = await call({ ...input, cursor });
-    if (input.action === "read_item" && result.error === "item_not_found") {
-      expect(result).toMatchObject({ success: false, exhausted: true, items: [] });
-      expect(result.nextCursor).toBeUndefined();
-    } else {
-      expect(result.success).toBe(true);
-    }
-    expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-    expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
-      SESSION_HISTORY_MAX_RESULT_BYTES
-    );
-    for (const item of result.items ?? []) {
-      expect(item.itemId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
-      expect(item.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
-    }
-    for (const window of result.windows ?? []) {
-      expect(window.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
-    }
-    if (result.nextCursor)
-      expect(result.nextCursor.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_CURSOR_CHARS);
-    results.push(result);
-    cursor = result.nextCursor;
-    expect(results.length).toBeLessThan(40);
-  } while (cursor);
-  return results;
+/**
+ * One complete call. Asserts the result envelope: success (or read_item's clean
+ * item_not_found), the 16 KiB cap, representable IDs and, unless the caller expects
+ * more, that the read left nothing behind (has_more: false).
+ */
+async function complete(
+  input: SessionHistoryArgs,
+  options?: { hasMore?: boolean; workspace?: string }
+): Promise<SessionHistoryResult> {
+  const result = await call(input, options?.workspace);
+  if (input.action === "read_item") {
+    expect(result.has_more).toBeUndefined();
+    if (result.error === "item_not_found")
+      expect(result).toEqual({ success: false, error: "item_not_found" });
+    else expect(result.success).toBe(true);
+  } else {
+    expect(result.success).toBe(true);
+    expect(result.has_more).toBe(options?.hasMore ?? false);
+  }
+  expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
+    SESSION_HISTORY_MAX_RESULT_BYTES
+  );
+  for (const item of result.items ?? []) {
+    expect(item.itemId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+    expect(item.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+  }
+  for (const window of result.windows ?? []) {
+    expect(window.windowId.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_ID_CHARS);
+  }
+  return result;
 }
+const itemsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolean }) =>
+  (await complete(input, options)).items ?? [];
+const textsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolean }) =>
+  (await itemsOf(input, options)).map((item) => item.text);
+const windowsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolean }) =>
+  (await complete(input, options)).windows ?? [];
+const windowIdsOf = async (input: SessionHistoryArgs, options?: { hasMore?: boolean }) =>
+  (await windowsOf(input, options)).map((window) => window.windowId);
+const readError = async (item_id: string) => (await complete({ action: "read_item", item_id })).error;
+/** A tracked (cooperatively receipted) raw append, as another local writer would produce. */
+const appendRawRows = (rows: Array<MuxMessage | string>) =>
+  appendTrackedHistory(
+    chatPath,
+    rows.map((row) => (typeof row === "string" ? row : JSON.stringify(row))).join("\n") + "\n"
+  );
+/**
+ * Enough small tracked rows that a read of this history needs several protected chunks under
+ * the clamped test budget (SESSION_HISTORY_MAX_SCAN_ROWS rows per chunk), so between-chunk
+ * hooks land on an intermediate chunk. Filler never matches the "facts"/"match" queries.
+ */
+const filler = (count = SESSION_HISTORY_MAX_SCAN_ROWS, prefix = "filler") =>
+  Array.from({ length: count }, (_, index) =>
+    createMuxMessage(`${prefix}-${index}`, "assistant", `${prefix} ${index}`)
+  );
+const seedFiller = (count?: number, prefix?: string) => appendRawRows(filler(count, prefix));
+const manualReset = (id = "manual-reset") =>
+  createMuxMessage(id, "assistant", "", { contextBoundaryKind: "reset" });
+// Every scan the tool issues (auth or target), in order, and optional per-scan hooks. Hooks run
+// UNDER both history locks: they may observe or advance the fake clock, never mutate history.
+let scanned: string[];
+let beforeScan: ((workspace: string) => void) | undefined;
+let afterScan: ((workspace: string, page: BoundedHistoryScanResult) => void) | undefined;
+/**
+ * Between-chunk seam: run `hook(chunk)` after the `chunk`th protected chunk of a read by
+ * `caller` has RELEASED its locks (own reads: the target lock is the outermost; descendant
+ * reads: the caller lock wraps the nested target lock). Chunks that throw (an invalidated
+ * baseline) are not counted, so numbering continues into a restarted attempt. Mutations
+ * belong here, never inside the scan spy (it runs under both locks and would deadlock).
+ */
+function afterChunks(hook: (chunk: number) => Promise<unknown> | void, caller = workspaceId) {
+  const real = fixture.historyService.withHistoryScanLocks.bind(fixture.historyService);
+  const seam = { chunks: 0, restore: () => spy.mockRestore() };
+  const spy = spyOn(fixture.historyService, "withHistoryScanLocks").mockImplementation(
+    async (workspace, operation, abortSignal) => {
+      const outcome = await real(workspace, operation, abortSignal);
+      if (workspace === caller) await hook(++seam.chunks);
+      return outcome;
+    }
+  );
+  return seam;
+}
+/** `mutate` runs once, after intermediate chunk `chunk`; assert with `expectIntermediate`. */
+function mutateBetweenChunks(
+  mutate: () => Promise<unknown>,
+  options?: { chunk?: number; caller?: string }
+) {
+  const target = options?.chunk ?? 1;
+  const seam = afterChunks(async (chunk) => {
+    if (chunk !== target) return;
+    seam.runs++;
+    await mutate();
+  }, options?.caller);
+  return Object.assign(seam, { runs: 0, target });
+}
+/** The hook ran exactly once, and a later chunk followed it (it was not the final chunk). */
+function expectIntermediate(seam: ReturnType<typeof mutateBetweenChunks>) {
+  expect(seam.runs).toBe(1);
+  expect(seam.chunks).toBeGreaterThan(seam.target);
+}
+/** Controllable performance.now() shared by the tool and the scanner. Restore in finally. */
+function fakeClock(start = 0) {
+  let now = start;
+  const spy = spyOn(performance, "now").mockImplementation(() => now);
+  return {
+    set: (ms: number) => {
+      now = ms;
+    },
+    restore: () => spy.mockRestore(),
+  };
+}
+const TIMEOUT_RESULT = {
+  success: false,
+  error: "history_timeout",
+  notice: expect.stringContaining("narrow"),
+};
+const CHANGED_RESULT = {
+  success: false,
+  error: "history_changed",
+  notice: expect.stringContaining("retry"),
+};
 const rollover: MuxMetadata = {
   contextBoundaryKind: "reset",
   synthetic: true,
@@ -111,19 +201,26 @@ const rollover: MuxMetadata = {
 
 beforeEach(async () => {
   fixture = await createTestHistoryService();
+  scanned = [];
+  beforeScan = undefined;
+  afterScan = undefined;
   // Keep the privacy/race fixtures small while exercising the real scanner. Clamp the
-  // shared object so descendant authorization still subtracts from the same page budget.
+  // shared object so descendant authorization still subtracts from the same chunk budget.
   // Production-budget acceptance lives in session_history.budget.test.ts.
   const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
   const budgetSpy = spyOn(
     fixture.historyService,
     "scanHistoryBoundedUnderLocks"
-  ).mockImplementation((workspace, options) => {
+  ).mockImplementation(async (workspace, options) => {
     if (options.budget) {
       options.budget.maxBytes = Math.min(options.budget.maxBytes, SESSION_HISTORY_MAX_SCAN_BYTES);
       options.budget.maxRows = Math.min(options.budget.maxRows, SESSION_HISTORY_MAX_SCAN_ROWS);
     }
-    return scan(workspace, options);
+    scanned.push(workspace);
+    beforeScan?.(workspace);
+    const page = await scan(workspace, options);
+    afterScan?.(workspace, page);
+    return page;
   });
   restoreScanBudget = () => budgetSpy.mockRestore();
   chatPath = path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl");
@@ -3470,6 +3567,129 @@ describe("session_history descendant task history", () => {
       )
     ).toBe("ENOENT");
 
+  const childReads = () => scanned.filter((scan) => scan === childId).length;
+  const completeAs = async (input: SessionHistoryArgs, hasMore = false) => {
+    const result = await callAs(input);
+    expect(result).toMatchObject({ success: true, has_more: hasMore });
+    return result;
+  };
+  // Untracked bulk rows in the target: a fresh target read spans several chunks.
+  const seedChildFiller = (prefix: string) =>
+    fs.appendFile(
+      path.join(sessionDir(childId), "chat.jsonl"),
+      filler(undefined, prefix)
+        .map((row) => JSON.stringify(row))
+        .join("\n") + "\n"
+    );
+  const largeCallerAppend = () =>
+    appendRawRows(
+      Array.from({ length: 650 }, (_, index) =>
+        createMuxMessage(`later-${index}`, "assistant", "later " + "z".repeat(4096))
+      )
+    );
+
+  test("a receipt found in a chunk with an unfinished caller scan authorizes that same chunk", async () => {
+    // The caller's floor discovery needs a second chunk; the receipt is browsed in chunk 2
+    // with rows still ahead of it, so the caller scan stays resumable (auth.cursor set).
+    await spawn([childId]);
+    await seedFiller();
+    await appendChild("child-one", "child one");
+    expect(
+      (await completeAs({ action: "list_items", task_id: childId })).items?.map((item) => item.text)
+    ).toEqual(["child one"]);
+    // Chunk 1 ended inside discovery and read no target rows; chunk 2 proved and read.
+    expect(scanned).toEqual([workspaceId, workspaceId, childId]);
+  });
+
+  test("a proven authorization whose append check is unfinished reads no target rows that chunk", async () => {
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    await seedChildFiller("child-filler");
+    await appendChild("child-two", "child two");
+    const seam = mutateBetweenChunks(largeCallerAppend);
+    let result: SessionHistoryResult;
+    try {
+      result = await completeAs({ action: "list_items", task_id: childId, role: "assistant", limit: 25 }, true);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(result.items?.[0]?.text).toBe("child one");
+    // Chunk 1: proof + target. Chunk 2: the 2.6 MiB append check exhausts the chunk budget, no
+    // target read. Chunk 3: the check completes, then the target read resumes.
+    expect(scanned.slice(0, 5)).toEqual([workspaceId, childId, workspaceId, workspaceId, childId]);
+  });
+
+  test("a caller reset appended between chunks denies the read after the restart", async () => {
+    await spawn([childId]);
+    await seedChildFiller("child-filler");
+    const seam = mutateBetweenChunks(() =>
+      append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true })
+    );
+    try {
+      expect(await callAs({ action: "list_items", task_id: childId })).toEqual({
+        success: false,
+        error: "task_not_found",
+      });
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(childReads()).toBe(1);
+  });
+
+  test("target rotation between chunks restarts once, then reports history_changed", async () => {
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    await seedChildFiller("child-filler");
+    const rotate = (id: string) => appendChild(id, "", rollover);
+    const once = mutateBetweenChunks(() => rotate("roll-once"));
+    try {
+      expect(
+        (await completeAs({ action: "search", query: "child one", task_id: childId })).items?.map(
+          (item) => item.text
+        )
+      ).toEqual(["child one"]);
+    } finally {
+      once.restore();
+    }
+    expectIntermediate(once);
+    await seedChildFiller("child-more");
+    const twice = afterChunks(async (chunk) => {
+      if (chunk > 2) return;
+      await rotate(`roll-${chunk}`);
+      // Keep the restarted read multi-chunk so the second rotation lands between its chunks.
+      await seedChildFiller(`child-after-${chunk}`);
+    });
+    try {
+      expect(await callAs({ action: "search", query: "child one", task_id: childId })).toEqual(
+        CHANGED_RESULT
+      );
+    } finally {
+      twice.restore();
+    }
+    expect(twice.chunks).toBe(2);
+  });
+
+  test("a caller append check unfinished at the deadline is history_timeout", async () => {
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    await seedChildFiller("child-filler");
+    const clock = fakeClock();
+    const seam = afterChunks(async (chunk) => {
+      if (chunk === 1) await largeCallerAppend();
+      if (chunk === 2) clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+    });
+    try {
+      expect(await callAs({ action: "list_items", task_id: childId })).toEqual(TIMEOUT_RESULT);
+    } finally {
+      seam.restore();
+      clock.restore();
+    }
+    expect(seam.chunks).toBe(2);
+    expect(scanned).toEqual([workspaceId, childId, workspaceId]);
+  });
+
   test("reads a descendant's retained history behind its own reset floor and never the caller's rows", async () => {
     await spawn([childId]);
     await appendChild("child-private", "child private facts");
@@ -3790,5 +4010,296 @@ describe("session_history descendant task history", () => {
       error: "session_unavailable",
     });
     await expectNoSession(childId);
+  });
+});
+
+describe("session_history complete results", () => {
+  const readsOf = (workspace: string) => scanned.filter((scan) => scan === workspace).length;
+
+  test("has_more reports a proven further match beyond limit, not an exactly-limit result", async () => {
+    await append("second", "second facts");
+    await append("third", "third facts");
+    const capped = await complete({ action: "search", query: "facts", limit: 2 }, { hasMore: true });
+    expect(capped.items?.map((item) => item.text)).toEqual(["opening facts", "second facts"]);
+    expect(await textsOf({ action: "search", query: "facts", limit: 3 })).toEqual([
+      "opening facts",
+      "second facts",
+      "third facts",
+    ]);
+    // Narrowing instead of paging: newest-first with a small limit reaches the tail directly.
+    expect(
+      await textsOf({ action: "list_items", recent_first: true, limit: 1 }, { hasMore: true })
+    ).toEqual(["third facts"]);
+    expect(await textsOf({ action: "list_items", role: "user" })).toEqual([]);
+  });
+
+  test("has_more is set when the response budget pops an item; a smaller snippet completes the read", async () => {
+    for (const id of ["a", "b", "c"]) await append(`big-${id}`, `${id}`.repeat(7_000));
+    const popped = await complete(
+      { action: "list_items", role: "assistant", max_chars_per_item: 8_000 },
+      { hasMore: true }
+    );
+    expect(popped.items?.map((item) => item.text.length)).toEqual([13, 7_000, 7_000]);
+    expect(popped.truncated).toBeUndefined();
+    expect(
+      (await complete({ action: "list_items", role: "assistant", max_chars_per_item: 100 })).items?.map(
+        (item) => item.text.length
+      )
+    ).toEqual([13, 100, 100, 100]);
+  });
+
+  test("list_windows has_more: a further window beyond limit, or a window that does not fit", async () => {
+    const compaction = (epoch: number) => ({
+      compacted: true as const,
+      compactionBoundary: true as const,
+      compactionEpoch: epoch,
+    });
+    const one = await append("compact-one", "summary", compaction(1));
+    const two = await append("compact-two", "summary", compaction(2));
+    const ids = ["w:0", `w:${one.metadata!.historySequence}`, `w:${two.metadata!.historySequence}`];
+    expect(await windowIdsOf({ action: "list_windows", limit: 2 }, { hasMore: true })).toEqual(
+      ids.slice(0, 2)
+    );
+    expect(await windowIdsOf({ action: "list_windows", limit: 3 })).toEqual(ids);
+    // Legacy boundary rows (no sequence) carry their long IDs into the window list.
+    const legacy = Array.from({ length: 20 }, (_, index) => `legacy-${index}-${"x".repeat(900)}`);
+    await appendRawRows(legacy.map((id) => createMuxMessage(id, "assistant", "", compaction(3))));
+    const popped = await complete({ action: "list_windows" }, { hasMore: true });
+    expect(popped.windows!.length).toBeGreaterThan(3);
+    expect(popped.windows!.length).toBeLessThan(23);
+    expect(await windowIdsOf({ action: "list_windows", recent_first: true, limit: 2 }, { hasMore: true })).toEqual(
+      [`w:m:${legacy[19]}`, `w:m:${legacy[18]}`]
+    );
+  });
+
+  test("warnings name skipped oversized and malformed rows once each, and are absent otherwise", async () => {
+    expect((await complete({ action: "search", query: "facts" })).warnings).toBeUndefined();
+    await appendRawRows([
+      "not-json",
+      createMuxMessage("huge", "assistant", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 10)),
+      "{broken",
+      createMuxMessage("after", "assistant", "later facts"),
+    ]);
+    const result = await complete({ action: "search", query: "facts" });
+    expect(result.items?.map((item) => item.text)).toEqual(["opening facts", "later facts"]);
+    expect(result.warnings?.toSorted()).toEqual(["malformed_rows_skipped", "oversized_rows_skipped"]);
+    expect((await complete({ action: "list_windows" })).warnings).toEqual(["malformed_rows_skipped"]);
+  });
+
+  test("a read spanning several chunks returns its rows in one call", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    await append("two", "match two");
+    await seedFiller(undefined, "later");
+    await append("three", "match three");
+    expect(await textsOf({ action: "search", query: "match" })).toEqual([
+      "match one",
+      "match two",
+      "match three",
+    ]);
+    expect(readsOf(workspaceId)).toBeGreaterThanOrEqual(3);
+    expect(await textsOf({ action: "search", query: "match", recent_first: true })).toEqual([
+      "match three",
+      "match two",
+      "match one",
+    ]);
+  });
+
+  test("the deadline between chunks returns history_timeout without data", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const clock = fakeClock();
+    const seam = mutateBetweenChunks(() => {
+      clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+      return Promise.resolve();
+    });
+    try {
+      expect(await call({ action: "search", query: "match" })).toEqual(TIMEOUT_RESULT);
+    } finally {
+      seam.restore();
+      clock.restore();
+    }
+    expect(seam.runs).toBe(1);
+    expect(readsOf(workspaceId)).toBe(1);
+    expect(await textsOf({ action: "search", query: "match" })).toEqual(["match one"]);
+  });
+
+  test("an unfinished append check at the deadline discards rows accumulated earlier", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    await append("two", "match two");
+    const clock = fakeClock();
+    let accumulatedChunks = 0;
+    const seam = afterChunks(async (chunk) => {
+      if (chunk === 2) {
+        // Chunk 2 browsed "match one"; a large tracked append now needs its own append check.
+        await appendRawRows(
+          Array.from({ length: 650 }, (_, index) =>
+            createMuxMessage(`tail-${index}`, "assistant", "match " + "z".repeat(4096))
+          )
+        );
+      }
+      if (chunk === 3) {
+        accumulatedChunks = scanned.length;
+        clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+      }
+    });
+    try {
+      expect(await call({ action: "search", query: "match" })).toEqual(TIMEOUT_RESULT);
+    } finally {
+      seam.restore();
+      clock.restore();
+    }
+    expect(seam.chunks).toBe(3);
+    expect(accumulatedChunks).toBe(3);
+    // The pinned snapshot excludes the appended rows; the rows before it are still readable.
+    expect(await textsOf({ action: "search", query: "match", limit: 2 }, { hasMore: true })).toEqual([
+      "match one",
+      "match two",
+    ]);
+  });
+
+  test("a history mutex held past the deadline yields history_timeout after acquisition, without a read", async () => {
+    const clock = fakeClock();
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let held!: () => void;
+    const holding = new Promise<void>((resolve) => (held = resolve));
+    const holder = fixture.historyService.withHistoryScanLocks(workspaceId, async () => {
+      held();
+      await released;
+      clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+    });
+    await holding;
+    const real = fixture.historyService.withHistoryScanLocks.bind(fixture.historyService);
+    let waits = 0;
+    const spy = spyOn(fixture.historyService, "withHistoryScanLocks").mockImplementation(
+      (workspace, operation, abortSignal) => {
+        // The tool is about to wait behind the holder; let the holder finish past the deadline.
+        if (workspace === workspaceId && ++waits === 1) release();
+        return real(workspace, operation, abortSignal);
+      }
+    );
+    try {
+      expect(await call({ action: "list_items" })).toEqual(TIMEOUT_RESULT);
+      await holder;
+    } finally {
+      spy.mockRestore();
+      clock.restore();
+    }
+    expect(waits).toBe(1);
+    expect(scanned).toEqual([]);
+    expect(await textsOf({ action: "list_items" })).toEqual(["opening facts"]);
+  });
+
+  test("a final chunk validated after the deadline still publishes; cancellation wins over both", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const clock = fakeClock();
+    afterScan = (_workspace, page) => {
+      if (!page.cursor) clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+    };
+    try {
+      expect(await textsOf({ action: "search", query: "match" })).toEqual(["match one"]);
+      expect(readsOf(workspaceId)).toBeGreaterThan(1);
+      const controller = new AbortController();
+      const reason = new Error("cancel late");
+      afterScan = (_workspace, page) => {
+        if (!page.cursor) {
+          clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS * 2);
+          controller.abort(reason);
+        }
+      };
+      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+      config.historyService = fixture.historyService;
+      expect(
+        await createSessionHistoryTool(config)
+          .execute!({ action: "search", query: "match" }, { ...mockToolCallOptions, abortSignal: controller.signal })
+          .catch((error: unknown) => error)
+      ).toBe(reason);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a manual reset appended between chunks restarts the read from the new floor", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const seam = mutateBetweenChunks(async () => {
+      await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+      await append("after", "match after reset");
+    });
+    try {
+      expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+    expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset"]);
+  });
+
+  test("a second invalidation during the restarted read returns history_changed without data", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const seam = afterChunks(async (chunk) => {
+      if (chunk > 2) return;
+      await append(`reset-${chunk}`, "", { contextBoundaryKind: "reset", synthetic: true });
+      await append(`after-${chunk}`, `match after reset ${chunk}`);
+      // Keep the restarted read multi-chunk so the second reset lands between its chunks.
+      await seedFiller(undefined, `filler-${chunk}`);
+    });
+    try {
+      expect(await call({ action: "search", query: "match" })).toEqual(CHANGED_RESULT);
+    } finally {
+      seam.restore();
+    }
+    expect(seam.chunks).toBe(2);
+    expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset 2"]);
+  });
+
+  test("one in-place rewrite between chunks restarts once from the fresh baseline", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const seam = mutateBetweenChunks(async () => {
+      const handle = await fs.open(chatPath, "r+");
+      try {
+        await handle.write(Buffer.from("!"), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    try {
+      // The first row is now malformed; the rest of the fresh baseline is delivered.
+      const result = await complete({ action: "search", query: "match" });
+      expect(result.items?.map((item) => item.text)).toEqual(["match one"]);
+      expect(result.warnings).toEqual(["malformed_rows_skipped"]);
+    } finally {
+      seam.restore();
+    }
+    expectIntermediate(seam);
+  });
+
+  test("a first invalidation with no time left is history_timeout, not history_changed", async () => {
+    await append("one", "match one");
+    await seedFiller();
+    const clock = fakeClock();
+    const seam = mutateBetweenChunks(async () => {
+      await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+      // The clock crosses the deadline inside the chunk whose validation detects the reset.
+      beforeScan = () => clock.set(SESSION_HISTORY_TOOL_DEADLINE_MS + 1);
+    });
+    try {
+      expect(await call({ action: "search", query: "match" })).toEqual(TIMEOUT_RESULT);
+    } finally {
+      seam.restore();
+      clock.restore();
+    }
+    expect(seam.runs).toBe(1);
+    expect(readsOf(workspaceId)).toBe(2);
+  });
+
+  test("an unresolved truncate marker is history_changed after the single restart", async () => {
+    await fs.writeFile(`${archivePath}.truncate`, "pending transaction");
+    expect(await call({ action: "search", query: "opening facts" })).toEqual(CHANGED_RESULT);
   });
 });

@@ -13,6 +13,9 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { createSessionHistoryTool, type SessionHistoryArgs } from "./session_history";
 import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 
+/** Production chunk budgets apply here; record every scan the tool issues, in order. */
+let scanned: string[];
+
 let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
 const workspaceId = "budget-history";
 const serialize = (messages: MuxMessage[]) =>
@@ -20,6 +23,14 @@ const serialize = (messages: MuxMessage[]) =>
 
 beforeEach(async () => {
   fixture = await createTestHistoryService();
+  scanned = [];
+  const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
+  spyOn(fixture.historyService, "scanHistoryBoundedUnderLocks").mockImplementation(
+    (workspace, options) => {
+      scanned.push(workspace);
+      return scan(workspace, options);
+    }
+  );
 });
 afterEach(async () => {
   await fixture.cleanup();
@@ -94,8 +105,7 @@ test("a 15.5MiB rollover-only archive needs no discovery-page chase", async () =
   );
 
   const windows = await call({ action: "list_windows" });
-  expect(windows).toMatchObject({ success: true, status: "complete", exhausted: true });
-  expect(windows.nextCursor).toBeUndefined();
+  expect(windows).toMatchObject({ success: true, has_more: false });
   expect(windows.windows?.map((window) => window.windowId)).toEqual([
     "w:0",
     "w:744",
@@ -104,13 +114,62 @@ test("a 15.5MiB rollover-only archive needs no discovery-page chase", async () =
     "w:2976",
     "w:3720",
   ]);
+  expect(scanned).toHaveLength(1);
   const messages = await call({ action: "list_items", role: "user", recent_first: true, limit: 3 });
-  expect(messages.success).toBe(true);
+  expect(messages).toMatchObject({ success: true, has_more: true });
   expect(messages.items?.map((item) => item.text)).toEqual(recent.toReversed());
-  for (const result of [windows, messages]) {
-    expect(result.bytesRead).toBeLessThanOrEqual(32 * 1024 * 1024);
-    expect(result.rowsScanned).toBeLessThanOrEqual(10_000);
-  }
+});
+
+test("a target window behind 40 MiB of earlier rows is listed in one call across chunks", async () => {
+  // The reported failure: the first 32 MiB chunk stopped inside an early window and the
+  // model was handed an empty "scanning" page for the window it asked about.
+  const bulk = Array.from({ length: 3_300 }, (_, index) =>
+    createMuxMessage(`bulk-${index}`, "assistant", "b".repeat(13_000), {
+      timestamp: 1,
+      historySequence: index,
+    })
+  );
+  expect(Buffer.byteLength(serialize(bulk))).toBeGreaterThan(40 * 1024 * 1024);
+  const prefix = createRolloverPrefix({
+    type: "context-window-rollover",
+    rolloverId: "rollover-target",
+    reason: "on-send",
+    previousWindowId: "w:0",
+    flushOpportunity: false,
+    contextTokens: 150_000,
+    maxTokens: 200_000,
+  });
+  prefix.forEach((row, offset) => {
+    row.id = `prefix-${offset}`;
+    row.metadata = { ...row.metadata, timestamp: 1, historySequence: 5_000 + offset };
+  });
+  const targetWindow = `w:${prefix[0].metadata!.historySequence}`;
+  const requests = ["first request after rollover", "second request after rollover"];
+  await seed(
+    [
+      ...prefix,
+      ...requests.map((text, index) =>
+        createMuxMessage(`request-${index}`, "user", text, {
+          timestamp: 1,
+          historySequence: 6_000 + index,
+        })
+      ),
+      createMuxMessage("reply", "assistant", "assistant reply", { timestamp: 1, historySequence: 7_000 }),
+    ],
+    bulk
+  );
+  const listed = await call({ action: "list_items", window_id: targetWindow, role: "user" });
+  expect(listed).toMatchObject({ success: true, has_more: false });
+  expect(listed.items?.map((item) => item.text)).toEqual(requests);
+  expect(scanned.length).toBeGreaterThanOrEqual(2);
+  expect(await call({ action: "list_windows" })).toMatchObject({
+    success: true,
+    has_more: false,
+    windows: [
+      { windowId: "w:0", boundaryKind: "root" },
+      { windowId: targetWindow, boundaryKind: "reset" },
+    ],
+  });
 });
 
 test.each([false, true])(
@@ -120,32 +179,17 @@ test.each([false, true])(
       createMuxMessage(`row-${index}`, index % 1000 === 0 ? "user" : "assistant", `row ${index}`)
     );
     await seed(rows);
-    let cursor: string | undefined;
-    const contents: string[] = [];
-    let pageCount = 0;
-    do {
-      const page = await call({
-        action: "list_items",
-        role: "user",
-        recent_first: recentFirst,
-        cursor,
-      });
-      expect(page.success).toBe(true);
-      expect(page.rowsScanned).toBeLessThanOrEqual(10_000);
-      expect(page.bytesRead).toBeLessThan(32 * 1024 * 1024);
-      if (pageCount === 0) {
-        expect(page.status).toBe("scanning");
-        expect(page.rowsScanned).toBe(10_000);
-      }
-      contents.push(...(page.items ?? []).map((item) => item.text));
-      cursor = page.nextCursor;
-      expect(++pageCount).toBeLessThan(10);
-    } while (cursor);
+    const result = await call({ action: "list_items", role: "user", recent_first: recentFirst });
+    expect(result).toMatchObject({ success: true, has_more: false });
+    // 10,040 rows exceed one chunk's row allowance twice over (floor pass, then browse).
+    expect(scanned.length).toBeGreaterThanOrEqual(2);
     const expected = rows
       .filter((row) => row.role === "user")
       .map((row) => row.parts[0])
       .map((part) => (part.type === "text" ? part.text : ""));
-    expect(contents).toEqual(recentFirst ? expected.toReversed() : expected);
+    expect(result.items?.map((item) => item.text)).toEqual(
+      recentFirst ? expected.toReversed() : expected
+    );
   }
 );
 
@@ -160,28 +204,11 @@ test.each([false, true])(
       )
     );
     await seed(rows);
-    let cursor: string | undefined;
-    const contents: string[] = [];
-    let pages = 0;
-    do {
-      const page = await call({
-        action: "list_items",
-        role: "user",
-        recent_first: recentFirst,
-        cursor,
-      });
-      expect(page.success).toBe(true);
-      expect(page.rowsScanned).toBeLessThan(10_000);
-      expect(page.bytesRead).toBeLessThanOrEqual(32 * 1024 * 1024);
-      if (pages === 0) {
-        expect(page.status).toBe("scanning");
-        expect(page.bytesRead).toBeGreaterThan(31 * 1024 * 1024);
-      }
-      contents.push(...(page.items ?? []).map((item) => item.text));
-      cursor = page.nextCursor;
-      expect(++pages).toBeLessThan(10);
-    } while (cursor);
-    expect(contents).toEqual(
+    const result = await call({ action: "list_items", role: "user", recent_first: recentFirst });
+    expect(result).toMatchObject({ success: true, has_more: false });
+    // ~34 MiB of rows exceed one chunk's byte allowance.
+    expect(scanned.length).toBeGreaterThanOrEqual(2);
+    expect(result.items?.map((item) => item.text)).toEqual(
       recentFirst
         ? ["request 78", "request 39", "request 0"]
         : ["request 0", "request 39", "request 78"]
@@ -203,11 +230,13 @@ test("short-token reserve fits worst-case escaped metadata and preserves Unicode
     createMuxMessage("next", "user", text),
   ]);
   const first = await call({ action: "list_items", max_chars_per_item: 16_000 });
-  expect(first).toMatchObject({ success: true, status: "partial" });
+  // The second row did not fit: the model narrows (read_item paging below) instead of paging.
+  expect(first).toMatchObject({ success: true, has_more: true, truncated: true });
+  expect(first.items).toHaveLength(1);
   expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(
     SESSION_HISTORY_MAX_RESULT_BYTES
   );
-  // Short handles leave the former cursor reserve available for useful payload.
+  // The small envelope reserve leaves most of the 16 KiB for payload.
   expect(Buffer.byteLength(JSON.stringify(first))).toBeGreaterThan(8 * 1024);
   expect(first.items?.[0]?.text.length).toBeGreaterThan(0);
   const item = first.items![0];
@@ -260,26 +289,16 @@ test.each(["rows", "bytes"] as const)(
       [],
       "child"
     );
-    const args = { action: "list_items", role: "user", task_id: "child" } as const;
-    const page = await call(args);
-    expect(page).toMatchObject({ success: true, status: "scanning", items: [] });
-    expect(page.rowsScanned).toBeLessThanOrEqual(10_000);
-    expect(page.bytesRead).toBeLessThanOrEqual(32 * 1024 * 1024);
-    if (limit === "rows") expect(page.rowsScanned).toBe(10_000);
-    else expect(page.bytesRead).toBeGreaterThan(31 * 1024 * 1024);
-    let cursor = page.nextCursor;
-    const texts: string[] = [];
-    let pages = 0;
-    while (cursor) {
-      const next = await call({ ...args, cursor });
-      expect(next.success).toBe(true);
-      expect(next.rowsScanned).toBeLessThanOrEqual(10_000);
-      expect(next.bytesRead).toBeLessThanOrEqual(32 * 1024 * 1024);
-      texts.push(...(next.items ?? []).map((item) => item.text));
-      cursor = next.nextCursor;
-      expect(++pages).toBeLessThan(10);
-    }
-    expect(texts).toEqual(["child request"]);
+    const result = await call({ action: "list_items", role: "user", task_id: "child" });
+    expect(result).toMatchObject({ success: true, has_more: false });
+    expect(result.items?.map((item) => item.text)).toEqual(["child request"]);
+    // Authorization and target share one chunk allowance: the caller's 4,000 rows (or 8 MiB)
+    // plus the target's 3,000 rows (or 20 MiB) cannot fit one chunk, so the target read is
+    // deferred to a later chunk, whose authorization re-check precedes it.
+    expect(scanned.length).toBeGreaterThanOrEqual(3);
+    expect(scanned[0]).toBe(workspaceId);
+    expect(scanned.at(-1)).toBe("child");
+    expect(scanned[scanned.indexOf("child") - 1]).toBe(workspaceId);
   }
 );
 
@@ -298,25 +317,23 @@ test.each(["deadline", "caller abort", "target abort"] as const)(
       fixture.historyService,
       "scanHistoryBoundedUnderLocks"
     ).mockImplementation(async (...args) => {
+      scanned.push(args[0]);
       const result = await scan(...args);
       validations++;
-      if (mode === "deadline") now = 2_001;
-      else if (validations === (mode === "caller abort" ? 1 : 2)) controller.abort(reason);
+      // The first authorization scan consumes the chunk's 2 s allowance ...
+      if (mode === "deadline") {
+        if (validations === 1) now = 2_001;
+      } else if (validations === (mode === "caller abort" ? 1 : 2)) controller.abort(reason);
       return result;
     });
     try {
       const operation = call({ action: "list_items", task_id: "child" }, controller.signal);
       if (mode === "deadline") {
-        const page = await operation;
-        expect(page).toMatchObject({ success: true, status: "scanning", items: [] });
-        expect(validations).toBe(1);
-        validate.mockRestore();
-        clock.mockRestore();
-        expect(
-          (
-            await call({ action: "list_items", task_id: "child", cursor: page.nextCursor })
-          ).items?.map((item) => item.text)
-        ).toEqual(["child request"]);
+        const result = await operation;
+        expect(result).toMatchObject({ success: true, has_more: false });
+        expect(result.items?.map((item) => item.text)).toEqual(["child request"]);
+        // ... so that chunk reads no target; the next chunk re-checks the caller, then reads.
+        expect(scanned).toEqual([workspaceId, workspaceId, "child"]);
       } else expect(await operation.catch((error: unknown) => error)).toBe(reason);
     } finally {
       validate.mockRestore();
@@ -340,18 +357,21 @@ test("an already-aborted tool call propagates cancellation rather than history_u
   expect((await call({ action: "list_items" })).items?.[0]?.text).toBe("private");
 });
 
-test("tool deadline returns resumable progress and still validates provenance", async () => {
+test("a read that never completes a chunk before the tool deadline is history_timeout", async () => {
   await seed([createMuxMessage("row", "user", "visible")]);
   let now = 0;
+  // Every clock read jumps past the chunk allowance: each chunk validates its snapshot and
+  // returns no progress, until the cooperative call deadline ends the loop without data.
   const clock = spyOn(performance, "now").mockImplementation(() => (now += 2_001));
   try {
-    const page = await call({ action: "list_items" });
-    expect(page).toMatchObject({ success: true, status: "scanning", items: [] });
-    clock.mockRestore();
-    const resumed = await call({ action: "list_items", cursor: page.nextCursor });
-    expect(resumed).toMatchObject({ success: true, status: "complete" });
-    expect(resumed.items?.map((item) => item.text)).toEqual(["visible"]);
+    expect(await call({ action: "list_items" })).toEqual({
+      success: false,
+      error: "history_timeout",
+      notice: expect.stringContaining("narrow"),
+    });
   } finally {
     clock.mockRestore();
   }
+  expect(scanned.length).toBeGreaterThan(1);
+  expect((await call({ action: "list_items" })).items?.map((item) => item.text)).toEqual(["visible"]);
 });

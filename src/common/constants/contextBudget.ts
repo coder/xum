@@ -40,11 +40,18 @@ export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;
 export const SESSION_HISTORY_MAX_SCAN_BYTES = 2 * 1024 * 1024;
 export const SESSION_HISTORY_MAX_SCAN_ROWS = 500;
-// Recovery tools can traverse a typical rollover archive in one call without
-// increasing the lower-level scanner's default work allowance.
+// One session_history call finishes its scan internally as a sequence of protected chunks
+// (history locks are released between chunks so writers interleave). These bound the work
+// of ONE chunk, not the call, and stay above the lower-level scanner's default allowance so a
+// typical rollover archive needs few lock holds.
 export const SESSION_HISTORY_TOOL_MAX_SCAN_BYTES = 32 * 1024 * 1024;
 export const SESSION_HISTORY_TOOL_MAX_SCAN_ROWS = 10_000;
 export const SESSION_HISTORY_SCAN_DEADLINE_MS = 2_000;
+// Cooperative processing ceiling for a whole call, including its single permitted restart.
+// Checked before new work only (each chunk, each lock acquisition, each scanner read); lock
+// waits and filesystem latency are not interrupted by it. Codex's history backend uses a
+// 35 s request timeout for the equivalent tools.
+export const SESSION_HISTORY_TOOL_DEADLINE_MS = 30_000;
 export const SESSION_HISTORY_MAX_LINE_BYTES = 1024 * 1024;
 export const SESSION_HISTORY_DEFAULT_LIMIT = 10;
 export const SESSION_HISTORY_MAX_SEARCH_LIMIT = 25;
@@ -53,14 +60,10 @@ export const SESSION_HISTORY_DEFAULT_READ_CHARS = 8_000;
 export const SESSION_HISTORY_MAX_READ_CHARS = 16_000;
 export const SESSION_HISTORY_SCAN_CHUNK_BYTES = 64 * 1024;
 export const SESSION_HISTORY_ANCHOR_BYTES = 64;
-export const SESSION_HISTORY_MAX_CURSOR_CHARS = 12 * 1024;
-export const SESSION_HISTORY_CURSOR_MAX_ENTRIES = 512;
-export const SESSION_HISTORY_CURSOR_MAX_BYTES = 8 * 1024 * 1024;
-export const SESSION_HISTORY_CURSOR_TTL_MS = 30 * 60 * 1000;
 export const SESSION_HISTORY_MAX_QUERY_CHARS = 1024;
 export const SESSION_HISTORY_MAX_ID_CHARS = 1024;
 // IDs and escaped payloads are counted while staging rows. The remaining fields
-// (26-character handle, status, counters and character offsets) fit within 512 bytes.
+// (has_more, the two warning codes, truncation marker and character offsets) fit within 512 bytes.
 export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
