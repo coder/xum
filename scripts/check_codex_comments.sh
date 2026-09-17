@@ -51,6 +51,7 @@ fi
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
+PR_HEAD_OID=""
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
 REGULAR_COUNT=0
@@ -123,9 +124,9 @@ compute_codex_sets_from_arrays() {
   # JSON goes through stdin, never argv: a long review history exceeds Linux's
   # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
-  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; [
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments"; [
     .[]
-    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot) | not))
+    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot; $head) | not))
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
@@ -138,8 +139,18 @@ compute_codex_sets_from_arrays() {
 
   # In-progress summaries are a subset of REGULAR_COMMENTS: they block, but the
   # wait loop below may give Codex time to finish before the verdict.
-  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments";
-    [.[] | select(codex_review_in_progress($bot))] | length')
+  IN_PROGRESS_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments";
+    [.[] | select(codex_review_in_progress($bot; $head))] | length')
+}
+
+# The classifier compares Codex's recorded head with the PR head, so a payload
+# without a usable head cannot produce a verdict. Fail closed rather than guess.
+set_pr_head_oid() {
+  PR_HEAD_OID="$1"
+  if ! [[ "$PR_HEAD_OID" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$PR_HEAD_OID'" >&2
+    exit 1
+  fi
 }
 
 # True while the in-progress summary is the sole blocker. Waiting only helps in
@@ -203,6 +214,7 @@ load_result_from_cache() {
   local cached_threads
   cached_comments=$(jq -c '.data.repository.pullRequest.comments.nodes // []' "$PR_DATA_FILE")
   cached_threads=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' "$PR_DATA_FILE")
+  set_pr_head_oid "$(jq -r '.data.repository.pullRequest.headRefOid // empty' "$PR_DATA_FILE")"
   compute_codex_sets_from_arrays "$cached_comments" "$cached_threads"
   return 0
 }
@@ -212,6 +224,7 @@ fetch_all_comments_via_api() {
   local graphql_query='query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
+        headRefOid
         comments(first: 100, after: $cursor) {
           pageInfo {
             hasNextPage
@@ -244,6 +257,10 @@ fetch_all_comments_via_api() {
     if [ "$(echo "$page_data" | jq -r '.data.repository.pullRequest == null')" = "true" ]; then
       echo "❌ PR #$PR_NUMBER does not exist in ${OWNER}/${REPO}." >&2
       return 1
+    fi
+
+    if [ "$cursor" = "null" ]; then
+      set_pr_head_oid "$(echo "$page_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')"
     fi
 
     page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')

@@ -106,6 +106,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
       state
+      headRefOid
       comments(last: 100) {
         pageInfo {
           hasPreviousPage
@@ -371,6 +372,7 @@ run_codex_comments_gate() {
 CHECK_CODEX_STATUS_ONCE() {
   local pr_data
   local pr_state
+  local pr_head
   local all_comments
   local all_threads
   local request_at
@@ -395,6 +397,11 @@ CHECK_CODEX_STATUS_ONCE() {
   fi
 
   pr_state=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.state // empty')
+  pr_head=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')
+  if ! [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$pr_head'" >&2
+    return 1
+  fi
 
   if [[ -z "$pr_state" ]]; then
     echo "❌ Unable to fetch PR state for #$PR_NUMBER in ${OWNER}/${REPO}." >&2
@@ -468,27 +475,19 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  # Completed status/no-findings envelopes are neither approval nor a failed
-  # review, and an in-progress summary is Codex still working. Reuse the CI
-  # classifier and keep waiting for the approval signal in both cases.
-  # Unknown envelopes and account errors retain their blocking behavior.
-  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
+  # Completed status/no-findings envelopes for the current head are neither
+  # approval nor a failed review; they are excluded so the poller keeps waiting
+  # for the approval signal. Unknown envelopes and account errors still count.
+  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
       | select(
-          (((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
-            and codex_comment_is_informational($bot))
-          or codex_review_in_progress($bot)) | not
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
+            and codex_comment_is_informational($bot; $head)) | not
         )] | length
   ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
   codex_response_count=$((codex_response_count_comments + codex_response_count_threads))
-  # Codex creates the summary board once and edits it in place, so on a re-review
-  # its createdAt predates the request. Its Running state is current regardless.
-  codex_in_progress_count=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" '
-    include "codex_comments";
-    [.[] | select(.author.login == $bot and codex_review_in_progress($bot))] | length
-  ')
 
   reactions_has_previous=$(echo "$pr_data" | jq -r '(.data.repository.pullRequest.reactions.pageInfo.hasPreviousPage | if . == null then "unknown" else tostring end)')
 
@@ -534,33 +533,15 @@ CHECK_CODEX_STATUS_ONCE() {
     fi
   fi
 
-  if [ "$codex_response_count" -eq 0 ]; then
-    if [ "$codex_in_progress_count" -eq 0 ]; then
-      return 10
-    fi
-    # Codex is still reviewing. Blockers that predate the request already fix the
-    # verdict, so ask the gate now instead of sleeping until the review ends. The
-    # gate exits 10 while the in-progress summary is the sole blocker.
-    run_codex_comments_gate
-    case "$check_rc" in
-      0 | 10)
-        return 10
-        ;;
-      *)
-        echo ""
-        echo "$check_output"
-        return 1
-        ;;
-    esac
-  fi
-
-  # Codex responded to the latest @codex review request; defer to check_codex_comments.sh for
-  # unresolved comment/thread detection so we don't duplicate filtering logic here.
+  # No approval yet. The gate is the single source of truth for what blocks: it
+  # paginates every comment and thread, so an unresolved thread from before the
+  # request or a board pushed out of this script's 100-comment window still fails
+  # fast here instead of after the review ends. Gate 10 means Codex is still
+  # reviewing the current head and nothing else blocks.
   run_codex_comments_gate
   case "$check_rc" in
     0) ;;
     10)
-      # Resolved threads count as a response, but a review is still running.
       return 10
       ;;
     *)
@@ -569,6 +550,10 @@ CHECK_CODEX_STATUS_ONCE() {
       return 1
       ;;
   esac
+
+  if [ "$codex_response_count" -eq 0 ]; then
+    return 10
+  fi
 
   echo ""
   echo "❌ Codex responded, but no approval signal was found after the latest '@codex review'."

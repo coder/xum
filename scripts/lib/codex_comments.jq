@@ -27,7 +27,11 @@ def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_
 # for anything else so unknown content stays blocking. The metadata status tracks
 # the security review alone (observed on coder/mux#4271: "completed" while the
 # Code Review row still read Running), so a Running row also means "running".
-def codex_summary_status($bot):
+# $head is the PR's current head commit. Codex records the reviewed head in the
+# board's metadata; a Completed board for another head is a review of an older
+# push, not of this one. Codex re-reviews on new commits and edits the board in
+# place, so that state is "running" for the current head, never "completed".
+def codex_summary_status($bot; $head):
   if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
@@ -63,6 +67,7 @@ def codex_summary_status($bot):
                 + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
             ))
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+                     or $security.headSha != $head
                   then "running" else "completed" end)
             else null
             end
@@ -75,15 +80,15 @@ def codex_summary_status($bot):
 
 # Codex is still reviewing. Callers may wait on this state instead of failing on
 # it, but it never supplies approval: after any wait budget it blocks like before.
-def codex_review_in_progress($bot):
-  codex_summary_status($bot) == "running";
+def codex_review_in_progress($bot; $head):
+  codex_summary_status($bot; $head) == "running";
 
-def codex_comment_is_informational($bot):
+def codex_comment_is_informational($bot; $head):
   if .author.login != $bot then false
   else
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
-        codex_summary_status($bot) == "completed"
+        codex_summary_status($bot; $head) == "completed"
       else
         ($body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or

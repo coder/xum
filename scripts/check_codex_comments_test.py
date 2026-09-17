@@ -6,6 +6,7 @@ cache refresh. No credentials, network calls, review requests, or polling sleeps
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,18 @@ BOT = "chatgpt-codex-connector"
 BEFORE = "2026-09-08T14:00:00Z"
 REQUEST = "2026-09-08T15:00:00Z"
 AFTER = "2026-09-08T16:00:00Z"
+# A PR head no fixture board was written for.
+NEWER_HEAD = "b" * 40
+
+
+def board_head(body):
+    """The head Codex recorded in a summary board's metadata."""
+    return re.search(r'"headSha":"([0-9a-f]{40})"', body).group(1)
+
+
+def board_for(body, head):
+    """The same board, re-recorded for another head."""
+    return body.replace(board_head(body), head)
 
 
 def comment(body, author=BOT, created_at=AFTER, minimized=False):
@@ -44,12 +57,18 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False):
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
+    # The PR head defaults to the head of the first board in the snapshot, so a
+    # fixture board describes the current head unless a test says otherwise.
+    if head is None:
+        heads = [board_head(c["body"]) for c in comments if '"headSha"' in c["body"]]
+        head = heads[0] if heads else "a" * 40
     return {
         "data": {
             "repository": {
                 "pullRequest": {
                     "state": "OPEN",
+                    "headRefOid": head,
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
                     "reactions": connection(list(reactions)),
@@ -97,10 +116,14 @@ else:
     index = 0 if cursor == 'null' else int(cursor)
     nodes = snapshot['data']['repository']['pullRequest'][field]['nodes']
     more = index + 1 < len(nodes)
-    print(json.dumps({'data': {'repository': {'pullRequest': {field: {
-        'nodes': nodes[index:index + 1],
-        'pageInfo': {'hasNextPage': more, 'endCursor': str(index + 1) if more else None}
-    }}}}}))
+    pull_request = snapshot['data']['repository']['pullRequest']
+    print(json.dumps({'data': {'repository': {'pullRequest': {
+        'headRefOid': pull_request['headRefOid'],
+        field: {
+            'nodes': nodes[index:index + 1],
+            'pageInfo': {'hasNextPage': more, 'endCursor': str(index + 1) if more else None}
+        }
+    }}}}))
 """)
         gh.chmod(0o755)
 
@@ -237,6 +260,33 @@ else:
             result = self.assert_gate(10, [running, completed])
             self.assertEqual(self.comment_rounds, 1)
             self.assertIn("has not finished reviewing", result.stdout)
+
+    def test_completed_board_counts_only_for_the_current_head(self):
+        # Push B starts CI while the board still describes push A. Codex edits the
+        # board in place once it reviews B; until then A's Completed board is not a
+        # review of the current head and must never pass the gate for B.
+        old_board = comment(FIXTURES["summary"]["body"])
+        stale = snapshot([old_board], head=NEWER_HEAD)
+        current = snapshot([comment(board_for(FIXTURES["summary"]["body"], NEWER_HEAD))])
+        with self.subTest("a completed board for an older head is still in progress"):
+            result = self.assert_gate(10, stale)
+            self.assertIn("has not finished reviewing", result.stdout)
+        with self.subTest("the wait ends once the board is re-recorded for this head"):
+            self.assert_gate(0, [stale, current], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("a running board for an older head keeps waiting"):
+            running_old = snapshot(
+                [comment(FIXTURES["running_summary"]["body"])], head=NEWER_HEAD
+            )
+            self.assert_gate(0, [running_old, current], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("an older head never hides a finding"):
+            finding = thread("[P1] Validate the caller before reading credentials")
+            self.assert_gate(1, snapshot([old_board], [finding], head=NEWER_HEAD), wait=60)
+            self.assertEqual(self.comment_rounds, 1)
+        with self.subTest("the poller keeps waiting rather than reporting a missing approval"):
+            request = comment("@codex review", "maintainer", REQUEST)
+            self.assert_gate(10, snapshot([request, old_board], head=NEWER_HEAD), "wait_pr_codex.sh")
 
     def test_wait_for_review_gives_up_and_never_hides_findings(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
@@ -387,6 +437,15 @@ else:
     def test_in_progress_review_fails_fast_on_older_blockers(self):
         request = comment("@codex review", "maintainer", REQUEST)
         older = thread("[P1] Fix authorization", created_at=BEFORE)
+        # The poller only sees the last 100 comments; the board may be older than
+        # that. The gate paginates everything, so it must run even when no Codex
+        # comment is visible at all.
+        with self.subTest("no visible Codex comment, unresolved older thread"):
+            result = self.assert_gate(1, snapshot([request], [older]), "wait_pr_codex.sh")
+            self.assertIn("1 unresolved review thread", result.stdout)
+        with self.subTest("no visible Codex comment, resolved older thread"):
+            resolved = thread("[P1] Fixed", resolved=True, created_at=BEFORE)
+            self.assert_gate(10, snapshot([request], [resolved]), "wait_pr_codex.sh")
         # Codex creates the summary board once and edits it in place, so on a
         # re-review the running board predates the request.
         for board_at in (BEFORE, AFTER):
@@ -431,6 +490,8 @@ else:
                 str(SCRIPTS / "lib"),
                 'include "codex_comments"; [.[] | codex_comment_is_informational("'
                 + BOT
+                + '"; "'
+                + board_head(FIXTURES["summary"]["body"])
                 + '")]',
             ],
             input=json.dumps(comments),
