@@ -192,6 +192,79 @@ describeIntegration("MCP settings server identity", () => {
     expect(persistedCache()[SERVER]).toBeUndefined();
   }, 60000);
 
+  test.each(["Settings", "workspace modal"] as const)(
+    "%s discards branding when a newer test is unbranded or fails",
+    async (surface) => {
+      const canvas =
+        surface === "Settings"
+          ? await openMcpSettings(app)
+          : (() => {
+              fireEvent.keyDown(window, { key: "m", ctrlKey: true, shiftKey: true });
+              return within(document.body);
+            })();
+      if (surface === "workspace modal") {
+        await canvas.findByRole("dialog", { name: "Workspace MCP Configuration" });
+        await canvas.findByRole("switch", { name: `Toggle ${SERVER} MCP server` });
+      }
+      const row = () => {
+        if (surface === "Settings") return serverRow(canvas, SERVER);
+        const toggle = canvas.getByRole("switch", { name: `Toggle ${SERVER} MCP server` });
+        const card = toggle.closest(".p-4");
+        if (!(card instanceof HTMLElement)) throw new Error("MCP modal row not found");
+        return card;
+      };
+      const testButton = () =>
+        within(row()).getByRole<HTMLButtonElement>("button", {
+          name: surface === "Settings" ? "Test connection" : /^(Fetch|Refresh) Tools$/,
+        });
+      const expectBranding = async (present: boolean) => {
+        await waitFor(() => {
+          if (testButton().disabled) throw new Error("Test is still running");
+          expect(within(row()).queryByRole("button", { name: INFO_BUTTON }) !== null).toBe(present);
+        });
+      };
+
+      for (const outcome of ["unbranded", "failure", "rejection"] as const) {
+        testSpy.mockResolvedValueOnce(BRANDED);
+        fireEvent.click(testButton());
+        await expectBranding(true);
+
+        if (outcome === "rejection") {
+          testSpy.mockImplementationOnce(() => Promise.reject(new Error("Connection lost")));
+        } else {
+          testSpy.mockResolvedValueOnce(
+            outcome === "unbranded"
+              ? { success: true, tools: [] }
+              : { success: false, error: "Connection failed" }
+          );
+        }
+        fireEvent.click(testButton());
+        await expectBranding(false);
+      }
+    },
+    60000
+  );
+
+  test("adding an edited stdio draft does not reuse the tested identity or rerun its command", async () => {
+    const canvas = await openMcpSettings(app);
+    const user = userEvent.setup({ document: app.view.container.ownerDocument });
+    fireEvent.click(canvas.getByText("Add server"));
+    await user.type(canvas.getByLabelText("Name"), "draft-server");
+    await user.type(canvas.getByLabelText("Command"), "bun run first-server.ts");
+    await user.click(canvas.getByRole("button", { name: "Test" }));
+    await waitFor(() => expect(testSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect(canvas.getByRole<HTMLButtonElement>("button", { name: "Test" }).disabled).toBe(false);
+    });
+
+    await user.clear(canvas.getByLabelText("Command"));
+    await user.type(canvas.getByLabelText("Command"), "bun run changed-server.ts");
+    await user.click(canvas.getByRole("button", { name: "Add" }));
+    await canvas.findByRole("switch", { name: "Toggle draft-server enabled" });
+    await expectBadge(canvas, "draft-server", false);
+    expect(testSpy).toHaveBeenCalledTimes(1);
+  }, 60000);
+
   test("a test completion from a previous configuration load is cached but not branded", async () => {
     const canvas = await openMcpSettings(app);
     let release: (() => void) | undefined;

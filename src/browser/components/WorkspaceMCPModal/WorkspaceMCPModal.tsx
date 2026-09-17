@@ -102,6 +102,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       if (!api) return;
       const generation = loadGeneration.current;
       setLoadingTools((prev) => ({ ...prev, [serverName]: true }));
+      // A failed or unbranded refresh must not retain the previous test's identity.
+      setBranding((prev) => {
+        const { [serverName]: _previous, ...remaining } = prev;
+        return remaining;
+      });
       try {
         const result = await api.mcp.test({ projectPath, name: serverName, workspaceId });
         setResult(serverName, stripServerInfo(result));

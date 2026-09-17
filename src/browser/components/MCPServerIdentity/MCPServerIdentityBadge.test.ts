@@ -3,7 +3,7 @@ import type { MCPServerInfo, MCPTestResult } from "@/common/types/mcp";
 import { describeConfiguredConnection, stripServerInfo } from "./MCPServerIdentityBadge";
 
 describe("describeConfiguredConnection", () => {
-  test("remote servers expose only key, transport family and the HTTPS origin", () => {
+  test("remote servers retain the configured mode without assuming auto negotiated HTTP", () => {
     const entry: MCPServerInfo = {
       transport: "auto",
       url: "https://mcp.example.com:8443/tenant/42/mcp?token=secret#frag",
@@ -12,7 +12,7 @@ describe("describeConfiguredConnection", () => {
     };
     expect(describeConfiguredConnection("work", entry)).toEqual({
       key: "work",
-      transport: "http",
+      transport: "auto",
       origin: "https://mcp.example.com:8443",
     });
     expect(describeConfiguredConnection("legacy", { ...entry, transport: "sse" }).transport).toBe(
@@ -25,7 +25,7 @@ describe("describeConfiguredConnection", () => {
     // The hostname may contain "mcp"; only userinfo and the path are private.
     expect(credentialed).toEqual({
       key: "work",
-      transport: "http",
+      transport: "auto",
       origin: "https://mcp.example.com",
     });
   });

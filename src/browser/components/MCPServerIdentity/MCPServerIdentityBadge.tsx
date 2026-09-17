@@ -10,15 +10,18 @@ import type {
 import { httpsOriginOf } from "@/common/utils/mcp/httpsUrl";
 import { serverDisplayName } from "@/common/utils/mcp/serverDisplayName";
 
+// Settings knows the configured mode, not the transport negotiated by the test.
+// Keep "auto" in this UI-only shape; captured chat connections remain resolved.
+type DisplayConnection = Omit<MCPConnectionRef, "transport"> & Pick<MCPServerInfo, "transport">;
+
 /**
  * UI-safe description of a configured connection. Only the configured key, the
  * transport and (for remote servers) the HTTPS origin leave this function:
  * never commands, args, cwd, env, paths, query strings or URL credentials.
  */
-export function describeConfiguredConnection(key: string, entry: MCPServerInfo): MCPConnectionRef {
+export function describeConfiguredConnection(key: string, entry: MCPServerInfo): DisplayConnection {
   if (entry.transport === "stdio") return { key, transport: "stdio" };
-  // "auto" negotiates streamable HTTP first; the popover shows the protocol family.
-  const transport = entry.transport === "sse" ? "sse" : "http";
+  const transport = entry.transport;
   // httpsOriginOf keeps scheme + host + port only (no userinfo, path or query)
   // and yields nothing for non-HTTPS or unparseable URLs.
   const origin = httpsOriginOf(entry.url);
@@ -37,7 +40,7 @@ export function stripServerInfo(result: MCPTestResult): MCPTestResult {
 }
 
 interface MCPServerIdentityBadgeProps {
-  connection: MCPConnectionRef;
+  connection: DisplayConnection;
   identity: MCPServerIdentity;
   /** Show the short display name next to the icon (chat headers). */
   compact?: boolean;

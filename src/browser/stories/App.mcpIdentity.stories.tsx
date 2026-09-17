@@ -24,7 +24,7 @@ const NOTION = "notion-work";
 const LOCAL = "local-docs";
 const INFO_BUTTON = `Server information: ${NOTION}`;
 
-function setupIdentityStory() {
+function setupIdentityStory(transport: "http" | "auto" = "http") {
   expandLeftSidebar();
   const workspace = createWorkspace({
     id: "ws-mcp-identity",
@@ -38,7 +38,7 @@ function setupIdentityStory() {
     projects: groupWorkspacesByProject([workspace]),
     workspaces: [workspace],
     globalMcpServers: {
-      [NOTION]: { transport: "http", url: "https://mcp.notion.com/mcp", disabled: false },
+      [NOTION]: { transport, url: "https://mcp.notion.com/mcp", disabled: false },
       [LOCAL]: {
         transport: "stdio",
         command: "bun",
@@ -142,6 +142,18 @@ export const SettingsServerDetails: AppStory = {
       "https://developers.notion.com/docs/mcp"
     );
     await expect(popover).toHaveTextContent("Not a verified identity.");
+  },
+};
+
+export const SettingsAutoTransport: AppStory = {
+  ...SettingsBeforeTest,
+  render: () => <AppWithMocks setup={() => setupIdentityStory("auto")} />,
+  play: async ({ canvasElement }) => {
+    await openMcpSettings(canvasElement);
+    await testBothServers(canvasElement);
+    await userEvent.click(within(canvasElement).getByRole("button", { name: INFO_BUTTON }));
+    const popover = await within(document.body).findByRole("dialog", { name: `About ${NOTION}` });
+    await expect(popover).toHaveTextContent("auto · https://mcp.notion.com");
   },
 };
 

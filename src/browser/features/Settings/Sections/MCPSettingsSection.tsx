@@ -963,6 +963,11 @@ export const MCPSettingsSection: React.FC = () => {
       if (!api) return;
       const generation = loadGeneration.current;
       setTestingServer(name);
+      // The new result replaces the old test, even if it fails or has no identity.
+      setBranding((prev) => {
+        const { [name]: _previous, ...remaining } = prev;
+        return remaining;
+      });
       try {
         const result = await api.mcp.test({ name });
         cacheTestResult(name, stripServerInfo(result));
@@ -1195,6 +1200,8 @@ export const MCPSettingsSection: React.FC = () => {
             }),
       });
 
+      // Adding reloads configuration, so only cacheable test data crosses that
+      // boundary. The saved row needs its own test before it can show branding.
       setNewTestResult({ result: stripServerInfo(result), testedAt: Date.now() });
     } catch (err) {
       setNewTestResult({
