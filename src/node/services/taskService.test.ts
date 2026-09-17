@@ -75,6 +75,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -13727,6 +13728,34 @@ describe("TaskService", () => {
         const result = taskService.listInstanceWorkspaces("alpha-id", { query });
         expect(result.rows.map((row) => row.workspaceId)).toEqual([...expected]);
         expect(result.totalMatching).toBe(expected.length);
+      }
+    );
+
+    test.each(["multi", "scratch"] as const)(
+      "uses the attributed project path for %s roots in rows and queries",
+      async (kind) => {
+        const config = await createTestConfig(rootDir);
+        const primaryPath = path.join(rootDir, "Primary-Project");
+        const bucket = kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : MULTI_PROJECT_CONFIG_KEY;
+        const workspace = projectWorkspace(rootDir, "managed-root", "root", {
+          runtimeConfig: { type: "local" },
+          ...(kind === "scratch"
+            ? { kind: "scratch" as const }
+            : { projects: [{ projectPath: primaryPath, projectName: "Primary" }] }),
+        });
+        await saveWorkspaces(config, bucket, [workspace]);
+        const { taskService } = createTaskServiceHarness(config);
+        const expectedPath = kind === "scratch" ? workspace.path : primaryPath;
+
+        const all = taskService.listInstanceWorkspaces("root", {});
+        expect(all.rows).toHaveLength(1);
+        expect(all.rows[0]?.projectPath).toBe(expectedPath);
+        const matching = taskService.listInstanceWorkspaces("root", {
+          query: expectedPath.toUpperCase(),
+        });
+        expect(matching.rows.map((row) => row.workspaceId)).toEqual(["root"]);
+        expect(matching.totalMatching).toBe(1);
+        expect(taskService.listInstanceWorkspaces("root", { query: bucket }).totalMatching).toBe(0);
       }
     );
 

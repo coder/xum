@@ -11469,7 +11469,7 @@ export class TaskService implements AgentTaskIntegration {
       row: Omit<InstanceWorkspacesResult["rows"][number], "busy">;
       createdAtMs: number;
     }> = [];
-    for (const [projectPath, project] of cfg.projects) {
+    for (const [projectConfigPath, project] of cfg.projects) {
       for (const workspace of project.workspaces) {
         const id = workspace.id;
         if (
@@ -11487,6 +11487,11 @@ export class TaskService implements AgentTaskIntegration {
           this.isBestOfChainUsingIndex(index, id)
         )
           continue;
+        // Match config metadata attribution: synthetic buckets are not searchable project paths.
+        const projectPath =
+          workspace.kind === "scratch"
+            ? workspace.path
+            : (workspace.projects?.[0]?.projectPath ?? projectConfigPath);
         if (
           query &&
           ![id, workspace.title, workspace.name, projectPath].some((value) =>
