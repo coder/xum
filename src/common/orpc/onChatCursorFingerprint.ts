@@ -1,4 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
+import assert from "@/common/utils/assert";
+import { stableStringify } from "@/common/utils/stableStringify";
 
 const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
@@ -64,4 +66,104 @@ export function computePriorHistoryFingerprint(
   }
 
   return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Normalizes one part for the range fingerprint so a client-assembled row and its persisted
+ * form hash identically. Verified against real IPC (tests/ipc/historyFingerprintParity.test.ts):
+ * the client stamps part-level `timestamp`s the persisted row drops (and tool parts carry a
+ * different one), and object key order differs between the two representations. Everything
+ * else — text, reasoning, tool call ids/names/inputs/outputs/states, file parts — round-trips.
+ */
+function normalizePartForFingerprint(part: MuxMessage["parts"][number]): unknown {
+  const { timestamp: _timestamp, ...rest } = part as { timestamp?: number } & Record<
+    string,
+    unknown
+  >;
+  return rest;
+}
+
+const UNSETTLED_ASSISTANT_PARTS = "<unsettled>";
+
+/**
+ * An assistant row whose content is not settled is fenced by identity only (id, sequence,
+ * role), not by its parts. The persisted form is the empty placeholder appended before
+ * streaming, or a committed partial (`partial: true`); the client's form is the same row with
+ * whatever it streamed, also marked `partial`. Their parts legitimately differ — and a stream
+ * that failed without usage never persists its text at all — while neither holds content the
+ * fence needs to protect. A row the server completed meanwhile is no longer unsettled on its
+ * side, so a client still holding the partial version conflicts, as it should.
+ */
+function isUnsettledAssistantRow(message: MuxMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    (message.metadata?.partial === true || message.parts.length === 0)
+  );
+}
+
+/**
+ * Fingerprint of the rows with `fromSequence <= historySequence <= throughSequence` (both
+ * inclusive). An edit fences the range it deletes (truncation target through the newest row)
+ * with this value: the client computes it over the rows it holds when editing begins and the
+ * server recomputes it over the rows it is about to delete, under the history write lock.
+ * Rows without a `historySequence` are not evidence on either side.
+ *
+ * Unlike {@link computePriorHistoryFingerprint} (server-only on both ends), this hash must
+ * agree between a client-assembled row and its persisted form, so it covers `historySequence`,
+ * `id`, `role` and the key-order-insensitive, timestamp-free projection of `parts` — not
+ * `metadata.timestamp`, which the client derives from stream events rather than the row.
+ *
+ * Returns the row count alongside the hash so a client that is missing a row in the middle of
+ * the range (or holds an extra one) is caught explicitly.
+ */
+export function computeHistoryRangeFingerprint(
+  messages: readonly MuxMessage[],
+  fromSequence: number,
+  throughSequence: number
+): { rowCount: number; fingerprint: string } {
+  assert(Number.isInteger(fromSequence) && fromSequence >= 0, "fromSequence must be >= 0");
+  assert(
+    Number.isInteger(throughSequence) && throughSequence >= fromSequence,
+    "throughSequence must be >= fromSequence"
+  );
+
+  const entries: Array<{
+    id: string;
+    historySequence: number;
+    role: MuxMessage["role"];
+    partsFingerprint: string;
+  }> = [];
+
+  for (const message of messages) {
+    const historySequence = message.metadata?.historySequence;
+    if (
+      historySequence === undefined ||
+      historySequence < fromSequence ||
+      historySequence > throughSequence
+    ) {
+      continue;
+    }
+    entries.push({
+      id: message.id,
+      historySequence,
+      role: message.role,
+      partsFingerprint: isUnsettledAssistantRow(message)
+        ? UNSETTLED_ASSISTANT_PARTS
+        : stableStringify(message.parts.map(normalizePartForFingerprint)),
+    });
+  }
+
+  entries.sort(
+    (left, right) => left.historySequence - right.historySequence || left.id.localeCompare(right.id)
+  );
+
+  let hash = FNV_OFFSET_BASIS;
+  for (const entry of entries) {
+    hash = updateFnv1a(
+      hash,
+      `${entry.historySequence}|${entry.id}|${entry.role}|${entry.partsFingerprint};`
+    );
+  }
+
+  return { rowCount: entries.length, fingerprint: hash.toString(16).padStart(8, "0") };
 }

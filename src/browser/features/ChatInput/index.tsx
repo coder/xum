@@ -126,6 +126,8 @@ import { ChatAttachments } from "@/browser/features/ChatInput/ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
 import {
   buildPendingFromRestoredInput,
+  getEditSendPrecondition,
+  type EditingMessageState,
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
@@ -214,7 +216,12 @@ import {
   commandBypassesTranscriptBarrier,
   isTranscriptMutationAllowed,
 } from "@/browser/utils/transcriptBarrier";
-import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import {
+  EDIT_RETRY_REFRESH_LABEL,
+  EDIT_TARGET_GONE_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
+import type { HistoryEditPrecondition } from "@/common/orpc/types";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -897,6 +904,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     commandBypassesTranscriptBarrier(parseCommand(input.trim()));
   const transcriptBlocksSend =
     variant === "workspace" && !isTranscriptCaughtUp && !draftBypassesTranscriptBarrier;
+  // A refused edit stays in edit mode with Send disabled until the transcript refresh hands
+  // back a fresh candidate (or the user leaves edit mode); nothing is re-sent automatically.
+  const editPreconditionInvalidated = editingMessageForUi?.preconditionInvalidated === true;
   const canSend =
     hasSendableDraft &&
     !disabled &&
@@ -904,7 +914,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !isProcessingAttachments &&
     !coderPresetsLoading &&
     !policyBlocksCreateSend &&
-    !transcriptBlocksSend;
+    !transcriptBlocksSend &&
+    !editPreconditionInvalidated;
   const runningGoalActive =
     variant === "workspace" && isGoalRunning(workspaceGoal?.status ?? "paused");
 
@@ -1637,6 +1648,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       resetContext: variant === "workspace" ? props.onResetContext : undefined,
       truncateHistory: variant === "workspace" ? props.onTruncateHistory : undefined,
       editMessageId: editingMessageForUi?.id,
+      historyEditPrecondition: editingMessageForUi
+        ? getEditSendPrecondition(editingMessageForUi)
+        : undefined,
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
@@ -1741,6 +1755,87 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const handleDestructiveCommandCancel = useCallback(() => {
     setPendingDestructiveCommand(false);
   }, []);
+
+  /**
+   * Conflict recovery after a `history-changed` refusal: one logical transcript refresh whose
+   * outcome updates the parent-owned editing state. Nothing here re-sends — the user's next
+   * explicit Send carries the refreshed candidate unchanged. Escape (cancel editing) stays
+   * available throughout and cancels the request through the editing-state owner.
+   */
+  const startEditTranscriptRefresh = (
+    editMessageId: string,
+    precondition: HistoryEditPrecondition
+  ): void => {
+    if (variant !== "workspace") return;
+    const targetWorkspaceId = props.workspaceId;
+    const onEditingMessageChange = props.onEditingMessageChange;
+    const onCancelEdit = props.onCancelEdit;
+    const patchEditing = (
+      patch: Pick<EditingMessageState, "preconditionInvalidated" | "pendingReconfirmation">
+    ) =>
+      onEditingMessageChange?.((current) =>
+        current.id === editMessageId ? { ...current, ...patch } : current
+      );
+
+    patchEditing({ preconditionInvalidated: true, pendingReconfirmation: undefined });
+    store
+      .requestTranscriptRefresh(targetWorkspaceId, {
+        throughSequence: precondition.rangeStartHistorySequence,
+        editMessageId,
+      })
+      .then((outcome) => {
+        // The editing state lives in the parent, so its updates apply even if this composer
+        // instance remounted meanwhile; only this instance's toasts need the mount guard.
+        switch (outcome.kind) {
+          case "refreshed":
+            patchEditing({
+              preconditionInvalidated: false,
+              pendingReconfirmation: outcome.candidate,
+            });
+            return;
+          case "target-not-found":
+            // Leave edit mode without restoring the pre-edit draft: the typed text stays in
+            // the composer as a normal draft.
+            onCancelEdit?.();
+            if (isMountedRef.current) {
+              pushToast({ type: "error", message: EDIT_TARGET_GONE_MESSAGE });
+            }
+            return;
+          case "failed":
+            // Draft and invalidated state stay; a failure is never read as exhausted history.
+            if (!isMountedRef.current) return;
+            setToast({
+              id: Date.now().toString(),
+              type: "error",
+              title: "Transcript refresh failed",
+              message: outcome.error,
+              solution: (
+                <button
+                  type="button"
+                  onClick={() => startEditTranscriptRefresh(editMessageId, precondition)}
+                  className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                >
+                  {EDIT_RETRY_REFRESH_LABEL}
+                </button>
+              ),
+            });
+            return;
+          case "superseded":
+          case "cancelled":
+            return;
+        }
+      })
+      .catch((error: unknown) => {
+        if (!isMountedRef.current) return;
+        console.error("Transcript refresh failed:", error);
+        setToast(
+          createErrorToast({
+            type: "unknown",
+            raw: error instanceof Error ? error.message : "Transcript refresh failed",
+          })
+        );
+      });
+  };
 
   const handleSend = async (overrides?: InternalSendOverrides) => {
     // Checked before `canSend` (which also carries the barrier) so a refused Enter on a real
@@ -2175,6 +2270,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           reviews: reviewsData,
           reviewIds: reviewIdsForCheck,
           editMessageId: editMessageForSend?.id,
+          // The refreshed candidate is sent exactly as handed back; nothing is re-captured here.
+          historyEditPrecondition: editMessageForSend
+            ? getEditSendPrecondition(editMessageForSend)
+            : undefined,
           baseMetadata: muxMetadata,
           agentSkillRefs: combinedSkillRefs,
           mcpPromptRefs: combinedMcpPromptRefs,
@@ -2260,6 +2359,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           setOptimisticallyDismissedEditId(null);
           setDraft(preSendDraft);
           setDraftReviews(preSendReviews);
+          // The rows this edit would delete changed after its evidence was captured. Stay in
+          // edit mode with the draft, block Send, and re-read the transcript so the user can
+          // review it and send again explicitly (never automatically).
+          if (
+            result.error.type === "history-changed" &&
+            editMessageForSend &&
+            sendOptions.historyEditPrecondition
+          ) {
+            startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
+          }
         } else {
           // Track telemetry for successful message send
           telemetry.messageSent(
@@ -2711,7 +2820,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               {/* Editing indicator - workspace only */}
               {variant === "workspace" && editingMessageForUi && (
                 <div className="text-edit-mode text-[11px] font-medium">
-                  Editing message{" "}
+                  {/* Send is disabled while a history-changed refresh is pending or failed;
+                      say why here since the toast can be dismissed. */}
+                  {editPreconditionInvalidated
+                    ? "Editing message — history changed, refreshing transcript"
+                    : "Editing message"}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)

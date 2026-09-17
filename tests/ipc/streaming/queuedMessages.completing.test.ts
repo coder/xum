@@ -449,6 +449,8 @@ describe("Queued messages during stream completion", () => {
         HAIKU_MODEL,
         {
           editMessageId: firstUserMessageId,
+          // Programmatic edit with no client transcript view: opt out of the content fence.
+          unfencedEdit: true,
         }
       );
 
@@ -672,6 +674,8 @@ describe("Queued messages during stream completion", () => {
       const editedText = "Edited message";
       const editSendPromise = sendMessageWithModel(env, workspaceId, editedText, HAIKU_MODEL, {
         editMessageId: firstUserMessageId,
+        // Programmatic edit with no client transcript view: opt out of the content fence.
+        unfencedEdit: true,
       });
 
       // Join the actual edit wait before releasing completion, rather than polling

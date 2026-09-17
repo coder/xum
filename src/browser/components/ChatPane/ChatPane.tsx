@@ -88,6 +88,8 @@ import { useAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
+import { EDIT_NOT_HELD_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
   TRANSCRIPT_REPLAY_FAILED_BANNER,
@@ -404,12 +406,49 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     editingState.workspaceId === workspaceId ? editingState.message : undefined;
   const setEditingMessage = useCallback(
     (message: EditingMessageState | undefined) => {
+      // Any change of edit target ends the conflict recovery of the previous edit (no-op
+      // when none is pending); only the composer's own updater keeps a request alive.
+      storeRaw.cancelTranscriptRefresh(workspaceId);
       setEditingState({
         workspaceId,
         message: transcriptOnly ? undefined : message,
       });
     },
-    [workspaceId, transcriptOnly]
+    [storeRaw, workspaceId, transcriptOnly]
+  );
+  const updateEditingMessage = useCallback(
+    (update: (current: EditingMessageState) => EditingMessageState) => {
+      setEditingState((previous) =>
+        previous.workspaceId === workspaceId && previous.message
+          ? { ...previous, message: update(previous.message) }
+          : previous
+      );
+    },
+    [workspaceId]
+  );
+  /**
+   * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
+   * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
+   */
+  const beginEditingMessage = useCallback(
+    (message: EditingMessageState) => {
+      const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
+      if (!precondition) {
+        publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
+        return false;
+      }
+      setEditingMessage({ ...message, precondition });
+      return true;
+    },
+    [setEditingMessage, storeRaw, workspaceId]
+  );
+  // Cancelling a compaction edits its request row; the fence is captured before the interrupt,
+  // so rows the interruption settles inside the range surface as an explicit conflict.
+  const startEditingMessage = useCallback(
+    (message: EditingMessageState) => {
+      beginEditingMessage(message);
+    },
+    [beginEditingMessage]
   );
 
   // Transcript-only workspaces swap the composer for a read-only notice, so clear any
@@ -843,9 +882,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       // being lost (workspace switch, reconnect) so the composer never enters edit mode
       // against a transcript that is not a verified copy of history.
       if (!isTranscriptMutationAllowed(workspaceId)) return;
-      setEditingMessage(message);
+      beginEditingMessage(message);
     },
-    [setEditingMessage, workspaceId]
+    [beginEditingMessage, workspaceId]
   );
 
   const restoreQueuedDraft = useCallback(
@@ -949,8 +988,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    void cancelCompaction(api, workspaceId, aggregator, setEditingMessage);
-  }, [api, workspaceId, aggregator, setEditingMessage]);
+    void cancelCompaction(api, workspaceId, aggregator, startEditingMessage);
+  }, [api, workspaceId, aggregator, startEditingMessage]);
 
   const handleEditLastUserMessage = useCallback(async () => {
     if (transcriptOnly) return;
@@ -978,7 +1017,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    setEditingMessage(buildEditingStateFromDisplayed(lastUserMessage));
+    if (!beginEditingMessage(buildEditingStateFromDisplayed(lastUserMessage))) return;
     disableAutoScroll(); // Show jump-to-bottom indicator
 
     // Scroll to the message being edited
@@ -994,7 +1033,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     restoreQueuedDraft,
     contentRef,
     disableAutoScroll,
-    setEditingMessage,
+    beginEditingMessage,
     transcriptOnly,
     workspaceId,
   ]);
@@ -1247,7 +1286,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleOpenTerminal: onOpenTerminal,
     handleOpenInEditor,
     aggregator,
-    setEditingMessage,
+    setEditingMessage: startEditingMessage,
     vimEnabled,
     canResumeInterruptedStream: interruptedTailResumable,
     resumeInterruptedStream,
@@ -1257,6 +1296,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
+    // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
+    // a pre-window range discards cached pages); the refresh outcome decides whether the
+    // edited row is gone, not the transient absence of its row.
+    if (editingMessage.preconditionInvalidated === true) return;
 
     const transformedMessages = mergeConsecutiveStreamErrors(workspaceState.messages);
     const editCutoffHistoryId = transformedMessages.find(
@@ -1757,6 +1800,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onTruncateHistory={handleClearHistory}
                       editingMessage={editingMessage}
                       onCancelEdit={handleCancelEdit}
+                      onEditingMessageChange={updateEditingMessage}
                       onEditLastUserMessage={handleEditLastUserMessageClick}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
@@ -1835,6 +1879,7 @@ interface ChatInputPaneProps {
   onTruncateHistory: (percentage?: number) => Promise<void>;
   editingMessage: EditingMessageState | undefined;
   onCancelEdit: () => void;
+  onEditingMessageChange: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage: () => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
@@ -2009,6 +2054,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}
+        onEditingMessageChange={props.onEditingMessageChange}
         onEditLastUserMessage={props.onEditLastUserMessage}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}

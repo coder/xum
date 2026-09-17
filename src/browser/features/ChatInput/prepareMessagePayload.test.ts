@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { prepareMessagePayload } from "./prepareMessagePayload";
 
@@ -95,5 +95,24 @@ describe("prepareMessagePayload", () => {
       "turn-end",
       "pause",
     ]);
+  });
+
+  it("fences an edit with its precondition and never attaches one to a plain send", () => {
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "message-1",
+      rangeStartMessageId: "message-1",
+      rangeStartHistorySequence: 4,
+      newestMessageId: "message-3",
+      newestHistorySequence: 6,
+      rangeRowCount: 3,
+      rangeFingerprint: "cafebabe",
+    };
+    const edit = prepare({ editMessageId: "message-1", historyEditPrecondition });
+    expect(edit.options.editMessageId).toBe("message-1");
+    expect(edit.options.historyEditPrecondition).toBe(historyEditPrecondition);
+    // A stale fence from a finished edit must not ride along on a normal send.
+    const plain = prepare({ historyEditPrecondition });
+    expect(plain.options.editMessageId).toBeUndefined();
+    expect("historyEditPrecondition" in plain.options).toBe(false);
   });
 });

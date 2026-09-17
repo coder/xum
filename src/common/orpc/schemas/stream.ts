@@ -864,9 +864,51 @@ export const ExperimentsSchema = z.preprocess(
  */
 export const GoalInterventionPolicySchema = z.enum(["steer", "pause"]);
 
+/**
+ * Content evidence for the range an edit deletes: the truncation target (the edited row or the
+ * synthetic snapshot rows immediately preceding it, see `getEditTruncateTargetFromMessages`)
+ * through the newest committed row, as the client held it when editing began. The backend
+ * recomputes the same evidence over the rows it is about to delete, under the history write
+ * lock, and refuses with `history-changed` on any difference (missing rows, extra rows,
+ * rewritten rows, a different truncation target or a different newest row).
+ */
+export const HistoryEditPreconditionSchema = z.object({
+  editMessageId: z.string().min(1),
+  rangeStartMessageId: z.string().min(1),
+  rangeStartHistorySequence: z.number().int().nonnegative(),
+  newestMessageId: z.string().min(1),
+  newestHistorySequence: z.number().int().nonnegative(),
+  rangeRowCount: z.number().int().positive(),
+  rangeFingerprint: z.string().min(1),
+});
+
+/**
+ * Every edit send must say how it is fenced: UI edits carry `historyEditPrecondition`;
+ * programmatic callers (debug CLI) opt out explicitly with `unfencedEdit`. Checked at the
+ * sendMessage RPC boundary (see api.ts) because `.pick`/`.extend` consumers of this schema
+ * must keep a plain object shape.
+ */
+export function hasExactlyOneEditFence(options: {
+  editMessageId?: string;
+  historyEditPrecondition?: unknown;
+  unfencedEdit?: boolean;
+}): boolean {
+  if (!options.editMessageId) return true;
+  const fenced = options.historyEditPrecondition !== undefined;
+  const unfenced = options.unfencedEdit === true;
+  return fenced !== unfenced;
+}
+
+export const EDIT_FENCE_REQUIRED_MESSAGE =
+  "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
+  /** See {@link HistoryEditPreconditionSchema}; required for UI edits. */
+  historyEditPrecondition: HistoryEditPreconditionSchema.optional(),
+  /** Programmatic edit without content evidence (debug CLI). Mutually exclusive with the above. */
+  unfencedEdit: z.boolean().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),

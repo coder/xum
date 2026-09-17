@@ -23,7 +23,9 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type DisplayedMessage,
+  type MuxMessage,
 } from "@/common/types/message";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
@@ -41,6 +43,7 @@ import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   WorkspaceStore,
+  type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
 } from "./WorkspaceStore";
 import {
@@ -2268,6 +2271,356 @@ describe("WorkspaceStore", () => {
         // Live events are applied immediately (not buffered) after a live caught-up.
         attempt.push(createHistoryMessageEvent("history-1", 1));
         expect(await waitUntil(() => state().messages.length === 1)).toBe(true);
+      });
+    });
+
+    describe("transcript refresh for fenced edits", () => {
+      const row = (
+        id: string,
+        historySequence: number,
+        text = `message-${historySequence}`,
+        metadata: Partial<MuxMessage["metadata"]> = {}
+      ): MuxMessage => ({
+        id,
+        role: "user",
+        parts: [{ type: "text", text }],
+        metadata: { historySequence, timestamp: historySequence, ...metadata },
+      });
+      const snapshotRow = (id: string, historySequence: number): MuxMessage =>
+        row(id, historySequence, `snapshot-${historySequence}`, {
+          synthetic: true,
+          fileAtMentionSnapshot: ["/tmp/a.ts"],
+        });
+      const asEvent = (message: MuxMessage): WorkspaceChatMessage => ({
+        type: "message",
+        ...message,
+      });
+      const newest = (rows: MuxMessage[]) => rows[rows.length - 1];
+      const failedCaughtUpEvent = (): WorkspaceChatMessage =>
+        caughtUpEvent({ replay: "since", historyReplayStatus: "failed" });
+      /** Resolves to the outcome, or "pending" if the request has not settled within `ms`. */
+      const settledWithin = (
+        request: Promise<TranscriptRefreshOutcome>,
+        ms = 50
+      ): Promise<TranscriptRefreshOutcome | "pending"> =>
+        Promise.race([request, tick(ms).then(() => "pending" as const)]);
+
+      /** Register both workspaces and land `rows` through a full replay (attempt 1). */
+      async function hydrateRows(rows: MuxMessage[], hasOlderHistory = false): Promise<void> {
+        createAndAddWorkspace(store, workspaceId);
+        createAndAddWorkspace(store, otherWorkspaceId, {}, false);
+        const attempt = await chatAttempt(workspaceId, 1);
+        for (const message of rows) attempt.push(asEvent(message));
+        const tail = newest(rows);
+        attempt.push(
+          caughtUpEvent({
+            replay: "full",
+            hasOlderHistory,
+            cursor: {
+              history: { messageId: tail.id, historySequence: tail.metadata!.historySequence! },
+            },
+          })
+        );
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      }
+
+      /** Land a since caught-up for `rows` on `attempt`; the anchor is the newest row. */
+      function finishSince(attempt: ChatAttempt, rows: MuxMessage[]): void {
+        for (const message of rows) attempt.push(asEvent(message));
+        const tail = newest(rows);
+        attempt.push(sinceCaughtUpEvent(tail.metadata!.historySequence, tail.id));
+      }
+
+      it("captures the shared truncation rule over committed rows, ignoring the active stream and rows before the range", async () => {
+        const rows = [row("h1", 1), snapshotRow("snap", 2), row("h3", 3), row("h4", 4)];
+        await hydrateRows(rows);
+        const attempt = await chatAttempt(workspaceId, 1);
+        attempt.push({
+          type: "stream-start",
+          workspaceId,
+          messageId: "stream-5",
+          historySequence: 5,
+          model: TEST_MODEL,
+          startTime: 5_000,
+        });
+        expect(
+          await waitUntil(
+            () => store.getAggregator(workspaceId)!.getActiveStreamMessageId() !== undefined
+          )
+        ).toBe(true);
+
+        const captured = store.captureHistoryEditPrecondition(workspaceId, "h3");
+        expect(captured).toBeDefined();
+        // The snapshot row before the edited message starts the range; the stream placeholder
+        // (sequence 5) is not the newest committed row.
+        expect(captured).toMatchObject({
+          editMessageId: "h3",
+          rangeStartMessageId: "snap",
+          rangeStartHistorySequence: 2,
+          newestMessageId: "h4",
+          newestHistorySequence: 4,
+          rangeRowCount: 3,
+        });
+        // Rows older than the range start are not evidence: the same value with h1 absent.
+        expect(captured!.rangeFingerprint).toBe(
+          buildHistoryEditPrecondition(rows.slice(1), "h3")!.rangeFingerprint
+        );
+        expect(store.captureHistoryEditPrecondition(workspaceId, "missing")).toBeUndefined();
+      });
+
+      it("does not fence a pre-stream error's synthetic row, which has no persisted counterpart", async () => {
+        const rows = [row("h1", 1), row("h2", 2)];
+        await hydrateRows(rows);
+        const attempt = await chatAttempt(workspaceId, 1);
+        // No stream-start: the aggregator fabricates an assistant row (locally sequenced 3).
+        attempt.push({
+          type: "stream-error",
+          messageId: "assistant-failed",
+          error: "context exceeded",
+          errorType: "context_exceeded",
+        });
+        expect(
+          await waitUntil(() =>
+            store
+              .getAggregator(workspaceId)!
+              .getAllMessages()
+              .some((message) => message.id === "assistant-failed")
+          )
+        ).toBe(true);
+
+        const captured = store.captureHistoryEditPrecondition(workspaceId, "h2")!;
+        expect(captured).toMatchObject({
+          newestMessageId: "h2",
+          newestHistorySequence: 2,
+          rangeRowCount: 1,
+        });
+        expect(captured).toEqual(buildHistoryEditPrecondition(rows, "h2")!);
+
+        // A replayed server row with the same id is real evidence again.
+        const persisted = row("assistant-failed", 3, "", { partial: true });
+        attempt.push(asEvent({ ...persisted, role: "assistant" }));
+        expect(
+          await waitUntil(
+            () =>
+              store.captureHistoryEditPrecondition(workspaceId, "h2")?.newestHistorySequence === 3
+          )
+        ).toBe(true);
+      });
+
+      it("settles refreshed after a complete caught-up from an attempt it owns, not from the attempt it aborted", async () => {
+        const rows = [row("h1", 1), row("h2", 2)];
+        await hydrateRows(rows);
+        const before = store.captureHistoryEditPrecondition(workspaceId, "h2")!;
+        const first = await chatAttempt(workspaceId, 1);
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 2,
+          editMessageId: "h2",
+        });
+        expect(await waitUntil(() => !state().isTranscriptCaughtUp)).toBe(true);
+        // The aborted attempt's late caught-up proves nothing for this request.
+        finishSince(first, rows);
+        expect(await settledWithin(request)).toBe("pending");
+
+        const owned = await chatAttempt(workspaceId, 2);
+        finishSince(owned, [row("h2", 2, "rewritten on disk")]);
+        const outcome = await request;
+        expect(outcome.kind).toBe("refreshed");
+        if (outcome.kind !== "refreshed") throw new Error("unreachable");
+        expect(outcome.candidate.editMessageId).toBe("h2");
+        expect(outcome.candidate.rangeFingerprint).not.toBe(before.rangeFingerprint);
+        expect(outcome.candidate).toEqual(store.captureHistoryEditPrecondition(workspaceId, "h2")!);
+        expect(state().isTranscriptCaughtUp).toBe(true);
+      });
+
+      it("stays pending across a failed caught-up and settles refreshed on the loop's retry", async () => {
+        const rows = [row("h1", 1), row("h2", 2)];
+        await hydrateRows(rows);
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+
+        const failing = await chatAttempt(workspaceId, 2);
+        failing.push(failedCaughtUpEvent());
+        expect(await waitUntil(() => state().transcriptReplayFailed)).toBe(true);
+        expect(await settledWithin(request)).toBe("pending");
+
+        const retry = await chatAttempt(workspaceId, 3);
+        finishSince(retry, [row("h2", 2)]);
+        expect((await request).kind).toBe("refreshed");
+        expect(state().transcriptReplayFailed).toBe(false);
+      });
+
+      it("discards cached pre-window pages and re-pages fresh reads down to the predecessor row", async () => {
+        // Window [h5, h6]; the user had paged the older epoch [h3, h4] in from cache.
+        await hydrateRows([row("h5", 5), row("h6", 6)], true);
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [asEvent(row("h3", 3)), asEvent(row("h4", 4))],
+          nextCursor: { beforeHistorySequence: 3, beforeMessageId: "h3" },
+          hasOlder: true,
+        });
+        expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+        const stale = store.captureHistoryEditPrecondition(workspaceId, "h4")!;
+        expect(stale.rangeStartHistorySequence).toBe(4);
+        mockHistoryLoadMore.mockClear();
+
+        // Fresh reads: h4 was rewritten on disk; the first page lacks the predecessor row.
+        const freshH4 = row("h4", 4, "rewritten on disk");
+        mockHistoryLoadMore
+          .mockResolvedValueOnce({
+            messages: [asEvent(freshH4)],
+            nextCursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+            hasOlder: true,
+          })
+          .mockResolvedValueOnce({
+            messages: [asEvent(row("h3", 3))],
+            nextCursor: { beforeHistorySequence: 3, beforeMessageId: "h3" },
+            hasOlder: true,
+          });
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 4,
+          editMessageId: "h4",
+        });
+        const owned = await chatAttempt(workspaceId, 2);
+        finishSince(owned, [row("h6", 6)]);
+        const outcome = await request;
+        expect(outcome.kind).toBe("refreshed");
+        if (outcome.kind !== "refreshed") throw new Error("unreachable");
+
+        // Paged from the window floor, twice: the lookback row (sequence 3) needed a second page.
+        expect(mockHistoryLoadMore).toHaveBeenCalledTimes(2);
+        expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(1, {
+          workspaceId,
+          cursor: { beforeHistorySequence: 5, beforeMessageId: "h5" },
+        });
+        expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(2, {
+          workspaceId,
+          cursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+        });
+        expect(state().muxMessages.map((message) => message.id)).toEqual(["h3", "h4", "h5", "h6"]);
+        // Regression: the cached target row was replaced by the fresh copy.
+        expect(outcome.candidate.rangeFingerprint).not.toBe(stale.rangeFingerprint);
+        const fresh = buildHistoryEditPrecondition(
+          [row("h3", 3), freshH4, row("h5", 5), row("h6", 6)],
+          "h4"
+        );
+        expect(fresh).toBeDefined();
+        expect(outcome.candidate).toEqual(fresh!);
+      });
+
+      it("reports target-not-found only once fresh reads reach the start of history", async () => {
+        await hydrateRows([row("h5", 5), row("h6", 6)], true);
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [asEvent(row("h4", 4))],
+          nextCursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+          hasOlder: true,
+        });
+        expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+        // h4 is gone on disk: the fresh read finds nothing older than the window.
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [],
+          nextCursor: null,
+          hasOlder: false,
+        });
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 4,
+          editMessageId: "h4",
+        });
+        finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
+        expect(await request).toEqual({ kind: "target-not-found" });
+        expect(state().hasOlderHistory).toBe(false);
+      });
+
+      it("fails, rather than reporting the target gone, when an older-page read errors", async () => {
+        await hydrateRows([row("h5", 5), row("h6", 6)], true);
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [asEvent(row("h4", 4))],
+          nextCursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+          hasOlder: true,
+        });
+        expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+        mockHistoryLoadMore.mockRejectedValueOnce(new Error("disk unavailable"));
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 4,
+          editMessageId: "h4",
+        });
+        finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
+        const outcome = await request;
+        expect(outcome.kind).toBe("failed");
+      });
+
+      it("fails when the subscription loop ends before delivering a baseline", async () => {
+        await hydrateRows([row("h1", 1)]);
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+        await chatAttempt(workspaceId, 2);
+        store.removeWorkspace(workspaceId);
+        expect((await request).kind).toBe("failed");
+      });
+
+      it("supersedes the pending request when a newer one is made for the workspace", async () => {
+        await hydrateRows([row("h1", 1), row("h2", 2)]);
+        const first = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+        const second = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 2,
+          editMessageId: "h2",
+        });
+        expect(await first).toEqual({ kind: "superseded" });
+        expect(await settledWithin(second)).toBe("pending");
+        finishSince(await chatAttempt(workspaceId, 2), [row("h2", 2)]);
+        const outcome = await second;
+        expect(outcome.kind).toBe("refreshed");
+        if (outcome.kind !== "refreshed") throw new Error("unreachable");
+        expect(outcome.candidate.editMessageId).toBe("h2");
+      });
+
+      it("cancels on workspace switch, explicit cancel and disposal, releasing every waiter", async () => {
+        await hydrateRows([row("h1", 1)]);
+        const switched = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+        store.setActiveWorkspaceId(otherWorkspaceId);
+        expect(await settledWithin(switched, 0)).toEqual({ kind: "cancelled" });
+
+        // Not subscribed: nothing can deliver a baseline for a workspace the user left.
+        expect(
+          await settledWithin(
+            store.requestTranscriptRefresh(workspaceId, {
+              throughSequence: 1,
+              editMessageId: "h1",
+            }),
+            0
+          )
+        ).toEqual({ kind: "cancelled" });
+
+        store.setActiveWorkspaceId(workspaceId);
+        await chatAttempt(workspaceId, 2);
+        const cancelled = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+        store.cancelTranscriptRefresh(workspaceId);
+        expect(await settledWithin(cancelled, 0)).toEqual({ kind: "cancelled" });
+        // Cancelling with nothing pending is a no-op.
+        store.cancelTranscriptRefresh(workspaceId);
+
+        const disposed = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 1,
+          editMessageId: "h1",
+        });
+        store.dispose();
+        expect(await settledWithin(disposed, 0)).toEqual({ kind: "cancelled" });
+        recreateStore();
       });
     });
   });

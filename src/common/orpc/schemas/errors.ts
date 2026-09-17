@@ -26,6 +26,11 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
     hardCeiling: z.number().finite(),
   }),
   z.object({ type: z.literal("context_budget_blocked"), message: z.string() }),
+  /**
+   * An edit's history precondition no longer matched under the write lock: the rows it would
+   * have deleted changed since the client captured its evidence. Nothing was truncated.
+   */
+  z.object({ type: z.literal("history-changed") }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 
