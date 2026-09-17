@@ -1,6 +1,7 @@
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -55,11 +56,17 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   }),
 }));
 
+// Copy values before Bun replaces live module bindings. Otherwise this inline
+// tooltip mock leaks extra text into later suites' accessible names.
+const originalTooltipModule = { ...tooltipModule };
 void mock.module("@/browser/components/Tooltip/Tooltip", () => ({
   Tooltip: (props: { children: React.ReactNode }) => <>{props.children}</>,
   TooltipTrigger: (props: { children: React.ReactNode }) => <>{props.children}</>,
   TooltipContent: (props: { children: React.ReactNode }) => <div>{props.children}</div>,
 }));
+afterAll(() => {
+  void mock.module("@/browser/components/Tooltip/Tooltip", () => originalTooltipModule);
+});
 
 void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ModelSelector: (props: {
