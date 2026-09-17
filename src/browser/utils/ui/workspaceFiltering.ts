@@ -886,7 +886,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * or unparseable values as 0. Used as a sort key so absent/malformed timestamps
  * deterministically sort last (oldest) instead of leaking NaN into comparisons.
  */
-function parseTimestampMs(value: string | undefined): number {
+export function parseTimestampMs(value: string | undefined): number {
   const parsed = Date.parse(value ?? "");
   return Number.isFinite(parsed) ? parsed : 0;
 }

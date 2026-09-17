@@ -939,10 +939,13 @@ describe("ProjectSidebar flat chat list", () => {
     };
 
     function renderFlatSidebar(
-      sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>
+      sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
+      workspaceDraftsByProject: ReturnType<
+        typeof WorkspaceContextModule.useWorkspaceActions
+      >["workspaceDraftsByProject"] = {}
     ) {
       const createWorkspaceDraft = mock(() => undefined);
-      mockWorkspaceActions({ createWorkspaceDraft });
+      mockWorkspaceActions({ createWorkspaceDraft, workspaceDraftsByProject });
       const view = render(
         <ProjectSidebar
           collapsed={false}
@@ -1023,6 +1026,33 @@ describe("ProjectSidebar flat chat list", () => {
         "/projects/demo-project",
         "/projects/demo-project/features"
       );
+    });
+
+    test("follows an unsent draft that is newer than every created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          ["/projects/other", [newerOther]],
+        ]),
+        {
+          "/projects/demo-project": [
+            {
+              draftId: "draft-newest",
+              subProjectPath: null,
+              createdAt: Date.parse("2026-01-03T00:00:00.000Z"),
+            },
+          ],
+        }
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/demo-project", undefined);
     });
 
     test("falls back to scratch when there are no chats", () => {

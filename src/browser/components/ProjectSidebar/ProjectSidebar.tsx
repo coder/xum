@@ -52,6 +52,7 @@ import {
   partitionWorkspacesByAge,
   buildSortedWorkspacesFlat,
   findMostRecentlyCreatedWorkspace,
+  parseTimestampMs,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
@@ -1051,6 +1052,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Scratch chats are bucketed under the scratch config key while their
   // projectPath is the app-managed workdir, so the bucket lookup below misses
   // them; check kind first.
+  // useCallback is required here, not for memoization: the keydown useEffect
+  // lists this handler as a dependency and react-hooks/exhaustive-deps rejects
+  // a plain function there.
   const handleAddSiblingWorkspace = useCallback(
     (meta: FrontendWorkspaceMetadata) => {
       if (meta.kind === "scratch") {
@@ -2585,12 +2589,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   };
 
   // Default the flat-mode "New chat" to the project of the most recently
-  // created chat; only fall back to Scratch when that chat is a scratch chat
-  // or there are no chats at all.
+  // created chat, including unsent drafts (flatDrafts is newest-first); only
+  // fall back to Scratch when that chat is a scratch chat or there are no
+  // chats at all.
   const handleAddFlatWorkspace = () => {
-    const recent = findMostRecentlyCreatedWorkspace(flatWorkspaces, workspaceRecency);
-    if (recent) {
-      handleAddSiblingWorkspace(recent);
+    const recentWorkspace = findMostRecentlyCreatedWorkspace(flatWorkspaces, workspaceRecency);
+    const recentDraft = flatDrafts[0];
+    if (
+      recentDraft &&
+      (!recentWorkspace ||
+        recentDraft.draft.createdAt > parseTimestampMs(recentWorkspace.createdAt))
+    ) {
+      handleAddWorkspace(recentDraft.projectPath, recentDraft.draft.subProjectPath ?? undefined);
+    } else if (recentWorkspace) {
+      handleAddSiblingWorkspace(recentWorkspace);
     } else {
       handleAddScratchWorkspace();
     }
