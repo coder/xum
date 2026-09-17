@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";

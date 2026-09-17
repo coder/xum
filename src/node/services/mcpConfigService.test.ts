@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { rejects } from "node:assert/strict";
 import { promises as fs } from "fs";
 import * as jsonc from "jsonc-parser";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import type { AgentPluginsMcpProvider } from "./agentPlugins/mcpConfig";
 import * as path from "path";

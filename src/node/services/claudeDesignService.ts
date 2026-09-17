@@ -5,7 +5,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   CLAUDE_DESIGN_MAX_CREDENTIAL_BYTES,
   CLAUDE_DESIGN_MAX_ERROR_BYTES,

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";

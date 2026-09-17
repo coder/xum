@@ -1,7 +1,7 @@
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import { stat, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { EventEmitter } from "node:events";
 import * as syncFs from "node:fs";
 import * as path from "node:path";

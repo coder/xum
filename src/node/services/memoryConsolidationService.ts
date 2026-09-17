@@ -26,7 +26,7 @@ import { Duration, Effect } from "effect";
 import { EventEmitter } from "events";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { z } from "zod";
 import type { LanguageModel } from "ai";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";

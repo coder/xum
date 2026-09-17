@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 

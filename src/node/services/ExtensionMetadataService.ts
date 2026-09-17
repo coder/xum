@@ -13,7 +13,7 @@ import {
   stat,
 } from "fs/promises";
 import { constants } from "fs";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   coerceAgentStatus,
   coerceExtensionMetadata,

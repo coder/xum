@@ -3,7 +3,7 @@ import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   auth,
   type OAuthClientProvider,

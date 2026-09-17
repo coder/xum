@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as fileIO from "node:fs/promises";
 import * as path from "node:path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { historyWriteLockPath } from "./workspaceRemoval";
 import assert from "@/common/utils/assert";
 import nodeAssert from "node:assert/strict";

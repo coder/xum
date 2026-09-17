@@ -3,7 +3,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import * as fs from "fs";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { Effect, Semaphore } from "effect";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
@@ -2377,10 +2377,10 @@ export class Config {
           }
         }
       }
-      // write-file-atomic is patched (patches/) to write the whole payload and verify the
-      // temp file's size before the rename: a filling disk makes write(2) accept a short
-      // count without an error, and the unpatched library renamed that truncated file
-      // over config.json, which then loaded as an empty registry (coder/xum#4197).
+      // writeFileAtomic writes the whole payload and verifies the temp file's size before
+      // the rename: a filling disk makes write(2) accept a short count without an error,
+      // and the npm write-file-atomic package renamed that truncated file over
+      // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
         try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
         catch: (error) => error,

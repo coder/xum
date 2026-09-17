@@ -146,7 +146,6 @@
     "turndown": "^7.2.2",
     "typescript": "^5.1.3",
     "undici": "^7.16.0",
-    "write-file-atomic": "^6.0.0",
     "ws": "^8.18.3",
     "xxhash-wasm": "^1.1.0",
     "yaml": "^2.8.2",
@@ -184,7 +183,6 @@
     "@types/ssh2": "^1.15.0",
     "@types/sshpk": "^1.17.4",
     "@types/turndown": "^5.0.6",
-    "@types/write-file-atomic": "^4.0.3",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.44.1",
     "@typescript-eslint/parser": "^8.44.1",
@@ -342,7 +340,6 @@
   ],
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
-    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch",
-    "write-file-atomic@6.0.0": "patches/write-file-atomic@6.0.0.patch"
+    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch"
   }
 }

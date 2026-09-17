@@ -8,7 +8,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type {
   MCPConfig,

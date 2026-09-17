@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { log } from "@/node/services/log";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";

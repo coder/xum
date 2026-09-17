@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { isDeepStrictEqual } from "node:util";
 import { modelMessageSchema, type ModelMessage } from "ai";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
 import {

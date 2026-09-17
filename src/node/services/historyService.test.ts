@@ -14,7 +14,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {

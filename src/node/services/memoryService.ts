@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
 import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";

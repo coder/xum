@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
 import { Effect } from "effect";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { getXumHome } from "@/common/constants/paths";
 import type {
   BaseProviderConfig as ProviderConfig,

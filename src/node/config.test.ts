@@ -1,9 +1,6 @@
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
-// write-file-atomic reads fs through require(), whose exports object is the default
-// import; spying on the `import * as fs` namespace only rebinds this module's view.
-import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
@@ -339,7 +336,7 @@ describe("Config", () => {
   describe("saveConfig under partial writes", () => {
     // Regression for coder/xum#4197: while a disk was filling up, a single write(2)
     // accepted only part of the serialized config without reporting an error, and the
-    // unpatched write-file-atomic renamed that truncated temp file over the good
+    // npm write-file-atomic package renamed that truncated temp file over the good
     // config.json. The next load then rejected it and fell back to an empty registry.
     type BufferWrite = (
       fd: number,
@@ -379,12 +376,12 @@ describe("Config", () => {
     function mockFsWrite(
       behavior: (call: number, original: BufferWrite, args: Parameters<BufferWrite>) => void
     ): { restore: () => void; callCount: () => number } {
-      const original: BufferWrite = cjsFs.write.bind(cjsFs);
+      const original: BufferWrite = fs.write.bind(fs);
       let calls = 0;
-      const spy = spyOn(cjsFs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
+      const spy = spyOn(fs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
         calls += 1;
         behavior(calls, original, args);
-      }) as typeof cjsFs.write);
+      }) as typeof fs.write);
       // mockRestore() also clears the spy's recorded calls, so count them here.
       return { restore: () => spy.mockRestore(), callCount: () => calls };
     }

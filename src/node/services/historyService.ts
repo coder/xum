@@ -52,7 +52,7 @@ import {
   type CompactionReplacementOperation,
   type CompactionReplacementOutcome,
 } from "./compactionCancellation";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { Result } from "@/common/types/result";

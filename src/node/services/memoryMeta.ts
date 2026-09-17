@@ -12,7 +12,7 @@
  */
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
 import { getErrorMessage } from "@/common/utils/errors";

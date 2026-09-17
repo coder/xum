@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import type { SendMessageOptions } from "@/common/orpc/types";
