@@ -483,9 +483,11 @@ CHECK_CODEX_STATUS_ONCE() {
   ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
   codex_response_count=$((codex_response_count_comments + codex_response_count_threads))
-  codex_in_progress_count=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
+  # Codex creates the summary board once and edits it in place, so on a re-review
+  # its createdAt predates the request. Its Running state is current regardless.
+  codex_in_progress_count=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" '
     include "codex_comments";
-    [.[] | select(.author.login == $bot and .createdAt > $request_at and codex_review_in_progress($bot))] | length
+    [.[] | select(.author.login == $bot and codex_review_in_progress($bot))] | length
   ')
 
   reactions_has_previous=$(echo "$pr_data" | jq -r '(.data.repository.pullRequest.reactions.pageInfo.hasPreviousPage | if . == null then "unknown" else tostring end)')

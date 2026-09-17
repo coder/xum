@@ -242,8 +242,9 @@ else:
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
         completed = snapshot([comment(FIXTURES["summary"]["body"])])
         with self.subTest("still running at the deadline"):
+            # The loop's integer-second clock may expire before a second poll,
+            # so only the give-up outcome is asserted here; polling is covered above.
             result = self.assert_gate(10, [running, running], wait=1)
-            self.assertGreater(self.comment_rounds, 1)
             self.assertIn("still running after 1s", result.stdout)
         finding = thread("[P1] Validate the caller before reading credentials")
         completed_with_finding = snapshot(
@@ -385,17 +386,18 @@ else:
 
     def test_in_progress_review_fails_fast_on_older_blockers(self):
         request = comment("@codex review", "maintainer", REQUEST)
-        running = comment(FIXTURES["running_summary"]["body"])
         older = thread("[P1] Fix authorization", created_at=BEFORE)
-        with self.subTest("an unresolved thread from before the request blocks now"):
-            result = self.assert_gate(1, snapshot([request, running], [older]), "wait_pr_codex.sh")
-            self.assertIn("1 unresolved review thread", result.stdout)
-        with self.subTest("a resolved older thread keeps polling"):
-            resolved = thread("[P1] Fixed", resolved=True, created_at=BEFORE)
-            self.assert_gate(10, snapshot([request, running], [resolved]), "wait_pr_codex.sh")
-        with self.subTest("a resolved thread after the request keeps polling"):
-            resolved = thread("[P1] Fixed", resolved=True)
-            self.assert_gate(10, snapshot([request, running], [resolved]), "wait_pr_codex.sh")
+        # Codex creates the summary board once and edits it in place, so on a
+        # re-review the running board predates the request.
+        for board_at in (BEFORE, AFTER):
+            running = comment(FIXTURES["running_summary"]["body"], created_at=board_at)
+            with self.subTest(board_at=board_at, thread="unresolved before the request"):
+                result = self.assert_gate(1, snapshot([request, running], [older]), "wait_pr_codex.sh")
+                self.assertIn("1 unresolved review thread", result.stdout)
+            for resolved_at in (BEFORE, AFTER):
+                with self.subTest(board_at=board_at, thread=f"resolved at {resolved_at}"):
+                    resolved = thread("[P1] Fixed", resolved=True, created_at=resolved_at)
+                    self.assert_gate(10, snapshot([request, running], [resolved]), "wait_pr_codex.sh")
 
     def test_informational_comments_do_not_hide_findings_or_account_errors(self):
         request = comment("@codex review", "maintainer", REQUEST)
