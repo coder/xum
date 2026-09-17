@@ -137,7 +137,11 @@ import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceS
 import { WorkspaceDragLayer } from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { Separator } from "../Separator/Separator";
 import { ScrollArea } from "../ScrollArea/ScrollArea";
-import { getProjectDisplayName, getSubProjectsForParent } from "@/common/utils/subProjects";
+import {
+  getProjectDisplayName,
+  getSubProjectsForParent,
+  resolveWorkspaceCreationScope,
+} from "@/common/utils/subProjects";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
@@ -2594,13 +2598,26 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // chats at all.
   const handleAddFlatWorkspace = () => {
     const recentWorkspace = findMostRecentlyCreatedWorkspace(flatWorkspaces, workspaceRecency);
-    const recentDraft = flatDrafts[0];
+    // Empty drafts render no row, so only a visible draft counts as a chat.
+    // Same visibility predicate as the grouped renderer.
+    const recentDraft = flatDrafts.find(
+      ({ projectPath, draft }) =>
+        draftVisibilityByProject[projectPath]?.[draft.draftId] ??
+        isDraftVisible(projectPath, draft.draftId)
+    );
     if (
       recentDraft &&
       (!recentWorkspace ||
         recentDraft.draft.createdAt > parseTimestampMs(recentWorkspace.createdAt))
     ) {
-      handleAddWorkspace(recentDraft.projectPath, recentDraft.draft.subProjectPath ?? undefined);
+      // Drop a sub-project that was deleted since the draft was created, like
+      // handleAddSiblingWorkspace does for persisted chats.
+      const scope = resolveWorkspaceCreationScope(
+        recentDraft.projectPath,
+        userProjects,
+        recentDraft.draft.subProjectPath
+      );
+      handleAddWorkspace(scope.projectPath, scope.subProjectPath ?? undefined);
     } else if (recentWorkspace) {
       handleAddSiblingWorkspace(recentWorkspace);
     } else {

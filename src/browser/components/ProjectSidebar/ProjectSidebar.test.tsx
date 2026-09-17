@@ -1028,7 +1028,40 @@ describe("ProjectSidebar flat chat list", () => {
       );
     });
 
-    test("follows an unsent draft that is newer than every created chat", () => {
+    const twoProjects = new Map([
+      ["/projects/demo-project", [olderDemo]],
+      ["/projects/other", [newerOther]],
+    ]);
+    const newestDraft = (subProjectPath: string | null) => ({
+      "/projects/demo-project": [
+        {
+          draftId: "draft-newest",
+          subProjectPath,
+          createdAt: Date.parse("2026-01-03T00:00:00.000Z"),
+        },
+      ],
+    });
+    const giveDraftContent = () =>
+      updatePersistedState(
+        getInputKey(getDraftScopeId("/projects/demo-project", "draft-newest")),
+        "Typed but unsent"
+      );
+
+    test("follows a visible unsent draft that is newer than every created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+      giveDraftContent();
+
+      const createWorkspaceDraft = renderFlatSidebar(twoProjects, newestDraft(null));
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/demo-project", undefined);
+    });
+
+    test("ignores a newer empty draft because it renders no row", () => {
       projectContextValue = createProjectContextValue({
         userProjects: new Map([
           ["/projects/demo-project", { workspaces: [] }],
@@ -1036,20 +1069,20 @@ describe("ProjectSidebar flat chat list", () => {
         ]),
       });
 
+      const createWorkspaceDraft = renderFlatSidebar(twoProjects, newestDraft(null));
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("drops a draft sub-project that no longer exists", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
+      });
+      giveDraftContent();
+
       const createWorkspaceDraft = renderFlatSidebar(
-        new Map([
-          ["/projects/demo-project", [olderDemo]],
-          ["/projects/other", [newerOther]],
-        ]),
-        {
-          "/projects/demo-project": [
-            {
-              draftId: "draft-newest",
-              subProjectPath: null,
-              createdAt: Date.parse("2026-01-03T00:00:00.000Z"),
-            },
-          ],
-        }
+        new Map([["/projects/demo-project", [olderDemo]]]),
+        newestDraft("/projects/demo-project/deleted-section")
       );
 
       expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/demo-project", undefined);
