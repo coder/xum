@@ -2595,11 +2595,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Default the flat-mode "New chat" to the project of the most recently
   // created chat, including unsent drafts (flatDrafts is newest-first); only
   // fall back to Scratch when that chat is a scratch chat or there are no
-  // chats at all.
+  // chats at all. Candidates are the rows that actually render, so hidden
+  // sub-agents (SIDEBAR_HIDE_SUBAGENTS_KEY) and empty drafts do not count.
   const handleAddFlatWorkspace = () => {
-    const recentWorkspace = findMostRecentlyCreatedWorkspace(flatWorkspaces, workspaceRecency);
-    // Empty drafts render no row, so only a visible draft counts as a chat.
-    // Same visibility predicate as the grouped renderer.
+    const recentWorkspace = findMostRecentlyCreatedWorkspace(
+      visibleFlatWorkspaces,
+      workspaceRecency
+    );
+    // Same draft visibility predicate as the grouped renderer.
     const recentDraft = flatDrafts.find(
       ({ projectPath, draft }) =>
         draftVisibilityByProject[projectPath]?.[draft.draftId] ??

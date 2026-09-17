@@ -976,6 +976,33 @@ describe("ProjectSidebar flat chat list", () => {
       expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
     });
 
+    test("ignores a newer sub-agent while sub-agent rows are hidden", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+      updatePersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, true);
+      const newestChild = {
+        ...createWorkspace("newest-child", {
+          title: "Newest sub-agent",
+          parentWorkspaceId: olderDemo.id,
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo, newestChild]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
     test("targets scratch when the most recently created chat is a scratch chat", () => {
       const scratchPath = "/home/user/.xum/scratch/scratch-newest";
       const scratch: FrontendWorkspaceMetadata = {
