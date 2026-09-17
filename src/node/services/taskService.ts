@@ -1106,7 +1106,7 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
 }
 
 type CompletedTaskReportReceipt =
-  | { kind: "initial"; taskId: string }
+  | { kind: "initial"; taskId: string; reportMarkdown: string }
   | {
       kind: "continuation";
       taskId: string;
@@ -1115,64 +1115,91 @@ type CompletedTaskReportReceipt =
       reportMarkdown: string;
     };
 
-/** Only canonical successful tool results prove consumption, never task IDs in prose or inputs. */
-function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskReportReceipt[] {
-  const reports: CompletedTaskReportReceipt[] = [];
-  const addReport = (row: unknown) => {
+/** Read only canonical task-result containers, never arbitrary JSON or prose. */
+function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
+  if (!isPlainObject(output)) return [];
+  const rows: unknown[] = [];
+  if (toolName === "task") {
+    if (output.status === "completed") rows.push(output);
+    // A group can return completed members while other members are still running.
+    if (Array.isArray(output.reports)) output.reports.forEach((row: unknown) => rows.push(row));
+  } else if (toolName === "task_await" && Array.isArray(output.results)) {
+    output.results.forEach((row: unknown) => {
+      if (isPlainObject(row) && row.status === "completed") rows.push(row);
+    });
+  }
+  return rows.flatMap((row): CompletedTaskReportReceipt[] => {
     if (
       !isPlainObject(row) ||
       typeof row.taskId !== "string" ||
       typeof row.reportMarkdown !== "string"
     )
-      return;
+      return [];
     const messageId =
       row.messageId ??
       (isPlainObject(row.finalMessageRef) ? row.finalMessageRef.messageId : undefined);
-    // Workspace-turn tools expose a handle as taskId; stable-child awaits expose the
-    // child itself. Normalize once, retaining an explicit handle as matching evidence.
+    // Workspace-target tools expose a handle; stable-child awaits expose the child itself.
     const handleId = isWorkspaceTurnTaskId(row.taskId) ? row.taskId : undefined;
     const taskId = handleId != null ? coerceNonEmptyString(row.workspaceId) : row.taskId;
-    if (taskId == null) return;
+    if (taskId == null) return [];
     if (typeof messageId === "string") {
-      reports.push({
-        kind: "continuation",
-        taskId,
-        handleId,
-        messageId,
-        reportMarkdown: row.reportMarkdown,
-      });
-    } else if (handleId == null) {
-      reports.push({ kind: "initial", taskId });
+      return [
+        { kind: "continuation", taskId, handleId, messageId, reportMarkdown: row.reportMarkdown },
+      ];
     }
-  };
+    return handleId == null
+      ? [{ kind: "initial", taskId, reportMarkdown: row.reportMarkdown }]
+      : [];
+  });
+}
+
+function sameTaskReportReceipt(
+  a: CompletedTaskReportReceipt,
+  b: CompletedTaskReportReceipt
+): boolean {
+  return (
+    a.kind === b.kind &&
+    a.taskId === b.taskId &&
+    a.reportMarkdown === b.reportMarkdown &&
+    (a.kind === "initial" ||
+      (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
+  );
+}
+
+/** Only model-visible successful tool results prove consumption. UI telemetry does not. */
+function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskReportReceipt[] {
+  const reports: CompletedTaskReportReceipt[] = [];
+  const succeeded = (call: unknown): call is Record<string, unknown> =>
+    isPlainObject(call) &&
+    call.failed !== true &&
+    call.error == null &&
+    call.ok !== false &&
+    (call.state == null || call.state === "output-available");
   const visit = (call: unknown, depth: number): void => {
-    if (
-      depth > 30 ||
-      !isPlainObject(call) ||
-      call.failed === true ||
-      call.error != null ||
-      call.ok === false ||
-      (call.state != null && call.state !== "output-available")
-    )
-      return;
+    if (depth > 30 || !succeeded(call)) return;
     const output = call.output ?? call.result;
     if (!isPlainObject(output)) return;
-    if (call.toolName === "task") {
-      if (output.status === "completed") addReport(output);
-      // A grouped task can return completed members while other members are still running.
-      if (Array.isArray(output.reports)) output.reports.forEach(addReport);
-    } else if (call.toolName === "task_await" && Array.isArray(output.results)) {
-      for (const result of output.results) {
-        if (isPlainObject(result) && result.status === "completed") addReport(result);
-      }
-    } else if (call.toolName === "code_execution") {
-      // Both live nestedCalls and legacy kernel toolCalls are persisted. Do not traverse
-      // arbitrary tool output: repository-controlled JSON is not a delivery receipt.
-      if (Array.isArray(call.nestedCalls)) {
-        for (const nested of call.nestedCalls) visit(nested, depth + 1);
-      }
-      if (Array.isArray(output.toolCalls)) {
-        for (const nested of output.toolCalls) visit(nested, depth + 1);
+    reports.push(...completedTaskReports(call.toolName, output));
+    if (call.toolName !== "code_execution") return;
+
+    // Classic executions expose these result records to the model, even when a later
+    // call fails. Persistent kernels replace them with summaries that contain no report.
+    if (Array.isArray(output.toolCalls)) {
+      for (const nested of output.toolCalls) visit(nested, depth + 1);
+    }
+    // Persistent nestedCalls hold UI-only full values. Use them solely as provenance for
+    // a complete canonical report deliberately returned through output.result. Offload
+    // handles, previews, hidden values, and unrelated returns must retain their wake.
+    if (Array.isArray(call.nestedCalls)) {
+      for (const nested of call.nestedCalls) {
+        if (!succeeded(nested)) continue;
+        const genuine = completedTaskReports(nested.toolName, nested.output);
+        const visible = completedTaskReports(nested.toolName, output.result);
+        reports.push(
+          ...visible.filter((receipt) =>
+            genuine.some((source) => sameTaskReportReceipt(source, receipt))
+          )
+        );
       }
     }
   };

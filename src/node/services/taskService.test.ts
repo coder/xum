@@ -685,9 +685,9 @@ describe("TaskService", () => {
         }),
       ],
       [
-        "persisted nested calls",
+        "explicitly returned kernel report",
         {
-          ...toolPart("code_execution", { success: true }),
+          ...toolPart("code_execution", { success: true, result: awaitOutput }),
           nestedCalls: [toolPart("task_await", awaitOutput)],
         },
       ],
@@ -704,6 +704,65 @@ describe("TaskService", () => {
         expect(
           await fixture.terminalAttentionStore.get(fixture.parentId, fixture.notification.id)
         ).toMatchObject({ status: "delivered" });
+      });
+    }
+
+    for (const [name, toolName, genuine, returned, success, expectedWakes] of [
+      ["hidden successful eval", "task_await", awaitOutput, undefined, true, 1],
+      ["hidden failed eval", "task_await", awaitOutput, undefined, false, 1],
+      ["canonical await return", "task_await", awaitOutput, awaitOutput, true, 0],
+      ["canonical task return", "task", completed, completed, true, 0],
+      [
+        "canonical grouped return",
+        "task",
+        { status: "completed", reports: [completed] },
+        { status: "completed", reports: [completed] },
+        true,
+        0,
+      ],
+      [
+        "offloaded preview",
+        "task_await",
+        awaitOutput,
+        { handle: "vars.__h0", preview: JSON.stringify(awaitOutput) },
+        true,
+        1,
+      ],
+      ["unrelated return", "task_await", awaitOutput, { summary: "done" }, true, 1],
+      [
+        "truncated report text",
+        "task_await",
+        awaitOutput,
+        { results: [{ ...completed, reportMarkdown: reportMarkdown.slice(0, 10) }] },
+        true,
+        1,
+      ],
+      ["missing provenance", "task_await", { results: [] }, awaitOutput, true, 1],
+      [
+        "different identity",
+        "task_await",
+        { results: [{ ...completed, taskId: "other-child" }] },
+        awaitOutput,
+        true,
+        1,
+      ],
+    ] satisfies Array<[string, string, unknown, unknown, boolean, number]>) {
+      test("kernel report visibility: " + name, async () => {
+        const fixture = await setup();
+        fixture.assistant.parts = [
+          {
+            ...toolPart("code_execution", {
+              success,
+              result: returned,
+              toolCalls: [{ toolName, ok: true, bytes: 100 }],
+            }),
+            nestedCalls: [toolPart(toolName, genuine)],
+          },
+          { type: "text", text: "Finished." },
+        ];
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(expectedWakes);
       });
     }
 

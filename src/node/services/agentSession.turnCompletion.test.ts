@@ -23,13 +23,13 @@ const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
 
 interface InternalSession {
-  compactionHandler: CompactionHandler;
   lastSystemMessageTokens?: number;
   activeCompactionRequest?: { id: string; modelString: string };
   clearStartupAutoRetryAbandon(): Promise<void>;
   recordGoalAccountingFromUsage(input: unknown): Promise<void>;
   updateStartupAutoRetryAbandonFromAbort(...args: unknown[]): Promise<void>;
   contextController: {
+    compaction: Pick<CompactionHandler, "handleCompletion">;
     continuous: { observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void> };
   };
   coordinator: TurnCoordinator;
@@ -485,9 +485,9 @@ describe("AgentSession turn completion", () => {
       });
       const consumer = observePolicy(h.session);
       const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
-      const compact = spyOn(internal(h.session).compactionHandler, "handleCompletion");
+      const compact = spyOn(internal(h.session).contextController.compaction, "handleCompletion");
       const observeCompaction = spyOn(
-        internal(h.session),
+        internal(h.session).contextController.continuous,
         "observeContinuousCompactionAtStreamEnd"
       );
       try {
