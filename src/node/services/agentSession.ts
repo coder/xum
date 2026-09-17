@@ -2832,6 +2832,9 @@ export class AgentSession {
     let epochRowCount: number | undefined;
     let sentRowCount = 0;
     let emittedReplayMessages = false;
+    // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
+    // whether the history it closes is trustworthy (see CaughtUpMessageSchema).
+    let historyReplayFailed = false;
 
     // Self-healing: persisted rows can fail the current wire schema (older
     // writers, schema drift, corruption). oRPC validates every event yielded to
@@ -2951,8 +2954,9 @@ export class AgentSession {
       let sinceHistorySequence: number | undefined;
       let afterTimestamp: number | undefined;
 
-      if (!historyResult.success && mode?.type === "since") {
-        downgradeReason = "history-read-failed";
+      if (!historyResult.success) {
+        historyReplayFailed = true;
+        if (mode?.type === "since") downgradeReason = "history-read-failed";
       }
 
       if (historyResult.success) {
@@ -3151,6 +3155,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         error,
       });
+      historyReplayFailed = true;
 
       // Keep append/live semantics when we've already emitted incremental payload.
       // Downgrading to full at that point would make the frontend apply replace-mode to
@@ -3223,6 +3228,7 @@ export class AgentSession {
         message: {
           type: "caught-up",
           replay: replayMode,
+          historyReplayStatus: historyReplayFailed ? "failed" : "complete",
           ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
           cursor: serverCursor,

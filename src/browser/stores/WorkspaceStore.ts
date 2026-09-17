@@ -180,6 +180,15 @@ export type AutoRetryStatus = Extract<
   | { type: "auto-retry-abandoned" }
 >;
 
+function isAutoRetryStatusEvent(msg: WorkspaceChatMessage): msg is AutoRetryStatus {
+  const type = (msg as { type?: string }).type;
+  return (
+    type === "auto-retry-scheduled" ||
+    type === "auto-retry-starting" ||
+    type === "auto-retry-abandoned"
+  );
+}
+
 export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 
 export interface WorkspaceState {
@@ -192,6 +201,12 @@ export interface WorkspaceState {
   awaitingUserQuestion: boolean;
   loading: boolean;
   isTranscriptCaughtUp: boolean;
+  /**
+   * The last replay attempt reported a failed history read. Cached rows stay visible as a
+   * provisional view, the mutation barrier stays closed, and the subscription keeps retrying
+   * with backoff until a complete replay lands.
+   */
+  transcriptReplayFailed: boolean;
   isHydratingTranscript: boolean;
   // Cached rows are known to be missing backend content that arrived while this
   // workspace was not subscribed to onChat. Hydration must hide them behind the
@@ -362,7 +377,16 @@ export interface WorkflowToolLiveRunState {
 }
 
 interface WorkspaceChatTransientState {
+  /** The current attempt delivered its caught-up: live events now flow to the aggregator. */
   caughtUp: boolean;
+  /**
+   * The current attempt's caught-up closed a complete full/since history replay, so the
+   * aggregator rows are a verified copy of backend history. Only this opens the transcript
+   * mutation barrier; a live caught-up (no history read) never does.
+   */
+  historyVerified: boolean;
+  /** The last caught-up closed a failed history replay; cleared by the next complete one. */
+  replayFailed: boolean;
   isHydratingTranscript: boolean;
   /** Aggregator rows are missing transcript content that landed while unsubscribed from onChat. */
   cachedTranscriptStale: boolean;
@@ -493,6 +517,8 @@ export interface WorkspaceStoreOptions {
 function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
+    historyVerified: false,
+    replayFailed: false,
     isHydratingTranscript: false,
     cachedTranscriptStale: false,
     onChatIteratorOpen: false,
@@ -1580,6 +1606,7 @@ export class WorkspaceStore {
       transient.cachedTranscriptStale = true;
     }
     transient.caughtUp = false;
+    transient.historyVerified = false;
     transient.replayingHistory = false;
     transient.historicalMessages.length = 0;
     transient.pendingStreamEvents.length = 0;
@@ -1674,6 +1701,7 @@ export class WorkspaceStore {
       const transient = this.chatTransientState.get(targetWorkspaceId);
       if (transient) {
         transient.caughtUp = false;
+        transient.historyVerified = false;
         // Only show transcript hydration once we can actually establish onChat.
         // When the ORPC client is unavailable, avoid pinning the pane in loading.
         transient.isHydratingTranscript = this.client !== null;
@@ -2424,7 +2452,8 @@ export class WorkspaceStore {
         isStreamStarting,
         awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
         loading: !hasMessages && !hasRunningInitMessage && !transient.caughtUp,
-        isTranscriptCaughtUp: transient.caughtUp,
+        isTranscriptCaughtUp: transient.caughtUp && transient.historyVerified,
+        transcriptReplayFailed: transient.replayFailed,
         isHydratingTranscript,
         isTranscriptStale,
         hasOlderHistory: historyPagination.hasOlder,
@@ -2828,7 +2857,8 @@ export class WorkspaceStore {
    * intentionally empty persisted transcript state.
    */
   isWorkspaceTranscriptCaughtUp(workspaceId: string): boolean {
-    return this.chatTransientState.get(workspaceId)?.caughtUp ?? false;
+    const transient = this.chatTransientState.get(workspaceId);
+    return transient !== undefined && transient.caughtUp && transient.historyVerified;
   }
 
   getWorkspaceHistoryEpoch(workspaceId: string): number {
@@ -3897,6 +3927,10 @@ export class WorkspaceStore {
     if (previousTransient?.isHydratingTranscript) {
       nextTransient.isHydratingTranscript = true;
     }
+    // A retry after a failed replay keeps the banner until a complete caught-up clears it.
+    if (previousTransient?.replayFailed) {
+      nextTransient.replayFailed = true;
+    }
 
     this.chatTransientState.set(workspaceId, nextTransient);
 
@@ -3915,12 +3949,17 @@ export class WorkspaceStore {
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
       signal,
+      // A failed replay still delivers queue snapshots and a caught-up; only a complete
+      // replay proves the attempt worked, so only that resets the retry backoff.
+      isSuccessEvent: (event: WorkspaceChatMessage) =>
+        isCaughtUpMessage(event) && event.historyReplayStatus === "complete",
       getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
       subscribe: async (client, attemptSignal, abortAttempt) => {
         const transient = this.chatTransientState.get(workspaceId);
         if (transient) {
           transient.caughtUp = false;
+          transient.historyVerified = false;
           // Every attempt replays, including retries that keep the same client and cached rows.
           if (!transient.isHydratingTranscript) {
             transient.isHydratingTranscript = true;
@@ -4453,6 +4492,33 @@ export class WorkspaceStore {
     if (isCaughtUpMessage(data)) {
       const replay = data.replay ?? "full";
 
+      if (data.historyReplayStatus === "failed") {
+        // The server could not read/emit history but still closed the attempt (caught-up is
+        // sent from a `finally`). Nothing here is authoritative: drop this attempt's buffered
+        // rows, keep the aggregator rows and the last good cursor as a provisional view, apply
+        // only the queue/retry snapshots (Stop and queue state stay current), keep the barrier
+        // closed, and abort the attempt so the loop retries with increasing backoff.
+        assert(!transient.caughtUp, "a failed caught-up must not arrive after catch-up");
+        transient.historicalMessages.length = 0;
+        // The retry snapshot is only replayed while a retry is scheduled, so its absence is
+        // authoritative: a retry that resolved while disconnected must not keep its banner
+        // (and Stop) alive through the outage.
+        transient.autoRetryStatus = null;
+        for (const event of transient.pendingStreamEvents) {
+          if (isQueuedMessageChanged(event) || isAutoRetryStatusEvent(event)) {
+            this.processStreamEvent(workspaceId, aggregator, event);
+          }
+        }
+        transient.pendingStreamEvents.length = 0;
+        transient.replayFailed = true;
+        console.warn(
+          `[WorkspaceStore] onChat history replay failed for ${workspaceId}; keeping cached rows and retrying`
+        );
+        this.states.bump(workspaceId);
+        attemptContext?.abort();
+        return;
+      }
+
       if (data.downgradeReason !== undefined) {
         // Dev observability: a requested since reconnect was downgraded to a full
         // replay server-side. Silent downgrades previously hid full re-transfers.
@@ -4613,8 +4679,12 @@ export class WorkspaceStore {
           this.deriveHistoryPaginationState(aggregator, data.hasOlderHistory)
         );
       }
-      // Mark as caught up
+      // Mark as caught up. Only a complete full/since replay verifies the transcript: the
+      // store never requests live mode (it replays no history), so a live caught-up lets
+      // events flow but leaves the mutation barrier closed.
       transient.caughtUp = true;
+      transient.historyVerified = replay !== "live";
+      transient.replayFailed = false;
       transient.isHydratingTranscript = false;
       transient.cachedTranscriptStale = false;
       transient.fullReplayInFlight = false;
@@ -4949,6 +5019,15 @@ export const workspaceStore = {
    */
   getWorkspaceSidebarState: (workspaceId: string) =>
     getStoreInstance().getWorkspaceSidebarState(workspaceId),
+  /**
+   * Whether the active subscription has delivered a complete history replay for the
+   * workspace. Read by the transcript mutation barrier at dispatch time.
+   */
+  isWorkspaceTranscriptCaughtUp: (workspaceId: string) =>
+    getStoreInstance().isWorkspaceTranscriptCaughtUp(workspaceId),
+  /** Per-workspace change notifications, so barrier-derived disabled states can subscribe. */
+  subscribeKey: (workspaceId: string, listener: () => void) =>
+    getStoreInstance().subscribeKey(workspaceId, listener),
   /**
    * Register a workspace in the store (idempotent).
    * Exposed for test helpers that need to ensure workspace registration

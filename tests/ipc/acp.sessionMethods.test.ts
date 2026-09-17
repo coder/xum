@@ -437,7 +437,9 @@ describe("ACP session list/resume/fork support", () => {
     });
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -485,7 +487,9 @@ describe("ACP session list/resume/fork support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -516,7 +520,9 @@ describe("ACP session list/resume/fork support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -539,7 +545,9 @@ describe("ACP session list/resume/fork support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -566,7 +574,9 @@ describe("ACP session list/resume/fork support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      onChatStream: createNeverEndingChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+      onChatStream: createNeverEndingChatStream([
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ]),
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -713,7 +723,9 @@ describe("ACP session list/resume/fork support", () => {
 
     const harness = createHarness({
       activeWorkspaces: [workspaceA, workspaceB, workspaceC],
-      onChatStream: createNeverEndingChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+      onChatStream: createNeverEndingChatStream([
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ]),
       agentOptions: {
         maxTrackedSessions: 2,
         sessionIdleTtlMs: 60_000,
@@ -765,7 +777,9 @@ describe("ACP wire-level session dispatch", () => {
 
     const wire = createWireHarness({
       activeWorkspaces: [workspace],
-      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+      onChatEvents: [
+        { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+      ],
     });
 
     const initResponse = await wire.client.initialize({

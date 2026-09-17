@@ -1,7 +1,8 @@
-import { describe, expect, test, beforeEach, mock } from "bun:test";
+import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
+  executeCompaction,
   parseRuntimeString,
   prepareCompactionMessage,
   WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE,
@@ -16,6 +17,7 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 // Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
@@ -167,6 +169,19 @@ function setHeartbeatExperiment(enabled: boolean): void {
     getExperimentKey(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
     JSON.stringify(enabled)
   );
+}
+
+/**
+ * The transcript mutation barrier reads the store's caught-up flag at dispatch time. Pin it for
+ * the duration of `fn` instead of driving a full onChat replay through the singleton store.
+ */
+async function withTranscriptBarrier<T>(open: boolean, fn: () => Promise<T> | T): Promise<T> {
+  const spy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockReturnValue(open);
+  try {
+    return await fn();
+  } finally {
+    spy.mockRestore();
+  }
 }
 
 const completedWorkflowRun = {
@@ -989,24 +1004,27 @@ describe("compact and plan command results", () => {
       sentMessages.push(input);
       return Promise.resolve({ success: true });
     });
-    const initial = await processSlashCommand(
-      { type: "compact" },
-      createEnv({
-        api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
-        reviews,
-        editMessageId: "edit-id",
-        attachedReviewIds: ["review-1"],
-        sendMessageOptions: { ...sendMessageOptions, queueDispatchMode: "turn-end" },
-      })
-    );
-    expect(initial.kind).toBe("phase");
-    if (initial.kind !== "phase") throw new Error("expected phase result");
-    expect(initial.actions).toEqual([
-      { type: "clear-input" },
-      { type: "clear-attachments" },
-      { type: "set-sending", sending: true },
-    ]);
-    const complete = await initial.continue();
+    // Editing compaction rewrites history, so it only dispatches through an open barrier.
+    const complete = await withTranscriptBarrier(true, async () => {
+      const initial = await processSlashCommand(
+        { type: "compact" },
+        createEnv({
+          api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+          reviews,
+          editMessageId: "edit-id",
+          attachedReviewIds: ["review-1"],
+          sendMessageOptions: { ...sendMessageOptions, queueDispatchMode: "turn-end" },
+        })
+      );
+      expect(initial.kind).toBe("phase");
+      if (initial.kind !== "phase") throw new Error("expected phase result");
+      expect(initial.actions).toEqual([
+        { type: "clear-input" },
+        { type: "clear-attachments" },
+        { type: "set-sending", sending: true },
+      ]);
+      return initial.continue();
+    });
     expect(complete.kind).toBe("complete");
     if (complete.kind !== "complete") throw new Error("expected complete result");
     expectDisposition(complete, "consume");
@@ -1016,6 +1034,29 @@ describe("compact and plan command results", () => {
     expect(sentMessages[0]?.options?.muxMetadata?.parsed?.followUpContent?.reviews).toEqual(
       reviews
     );
+  });
+
+  test("compact edit refuses through the slash error path while the transcript is not caught up", async () => {
+    const sendMessage = mock(() => Promise.resolve({ success: true }));
+    const settled = await withTranscriptBarrier(false, async () =>
+      finishCommand(
+        await processSlashCommand(
+          { type: "compact" },
+          createEnv({
+            api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+            editMessageId: "edit-id",
+          })
+        )
+      )
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+    expectDisposition(settled.result, "restore");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+    });
+    expect(settled.result.actions).toContainEqual({ type: "set-sending", sending: false });
+    expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
   });
 
   test("compact validation errors restore without starting a phase", async () => {
@@ -1174,6 +1215,57 @@ describe("compact and plan command results", () => {
         Object.defineProperty(globalThis, "location", previousLocation);
       }
     }
+  });
+});
+
+describe("executeCompaction transcript barrier", () => {
+  const runCompaction = (editMessageId: string | undefined) => {
+    const sendMessage = mock(
+      (_input: { workspaceId: string; options?: { editMessageId?: string } }) =>
+        Promise.resolve({ success: true })
+    );
+    const result = executeCompaction({
+      api: { workspace: { sendMessage } } as unknown as Parameters<
+        typeof executeCompaction
+      >[0]["api"],
+      workspaceId: "test-ws",
+      sendMessageOptions,
+      editMessageId,
+    });
+    return { sendMessage, result };
+  };
+
+  test("refuses an editing compaction while the transcript is not caught up", async () => {
+    const { sendMessage, result } = await withTranscriptBarrier(false, async () => {
+      const run = runCompaction("edit-id");
+      return { sendMessage: run.sendMessage, result: await run.result };
+    });
+    expect(result).toEqual({ success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("dispatches an editing compaction once the transcript is caught up", async () => {
+    const { sendMessage, result } = await withTranscriptBarrier(true, async () => {
+      const run = runCompaction("edit-id");
+      return { sendMessage: run.sendMessage, result: await run.result };
+    });
+    expect(result).toEqual({ success: true });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toMatchObject({
+      workspaceId: "test-ws",
+      options: { editMessageId: "edit-id" },
+    });
+  });
+
+  test("append-only compaction is not gated by the transcript barrier", async () => {
+    // No editMessageId: nothing visible is rewritten, so auto/idle/model-switch compaction
+    // must keep working while a transcript is still hydrating.
+    const { sendMessage, result } = await withTranscriptBarrier(false, async () => {
+      const run = runCompaction(undefined);
+      return { sendMessage: run.sendMessage, result: await run.result };
+    });
+    expect(result).toEqual({ success: true });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });
 

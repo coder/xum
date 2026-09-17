@@ -99,6 +99,7 @@ function makeStreamError(
 function makeCaughtUp(replay: "full" | "since" | "live" = "full"): WorkspaceChatMessage {
   return {
     type: "caught-up",
+    historyReplayStatus: "complete",
     replay,
   } as WorkspaceChatMessage;
 }

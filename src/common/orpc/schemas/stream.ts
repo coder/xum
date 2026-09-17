@@ -82,6 +82,15 @@ export const CaughtUpMessageSchema = z.object({
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
   /**
+   * Whether the history read/emission this caught-up closes succeeded. `caught-up` is sent
+   * from a `finally` so clients never hang, which means it must say whether the transcript
+   * it closes is authoritative: only a `complete` full/since replay may open the client's
+   * mutation barrier (send/edit/clear). `failed` = the history read returned an error or
+   * emission threw; queue/retry snapshots still precede it. Required on purpose: an absent
+   * field must never read as success.
+   */
+  historyReplayStatus: z.enum(["complete", "failed"]),
+  /**
    * Present only when the client requested since-mode and the server downgraded to
    * full replay. Silent downgrades defeat incremental reconnects, so this must stay
    * observable to clients and tests.
