@@ -11449,6 +11449,11 @@ export class TaskService implements AgentTaskIntegration {
     );
     const query = options.query?.trim().toLowerCase() ?? "";
     const cfg = this.config.loadConfigOrDefault();
+    const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
+    // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
+    if (caller == null || !this.isLocalUnrelatedMessagingEndpoint(caller.workspace)) {
+      return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
+    }
     const index = this.buildAgentTaskIndex(cfg);
     if (
       this.isWorkflowOwnedTaskUsingIndex(index, callerWorkspaceId) ||
@@ -11471,6 +11476,7 @@ export class TaskService implements AgentTaskIntegration {
           id == null ||
           id.trim().length === 0 ||
           workspace.parentWorkspaceId ||
+          !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||

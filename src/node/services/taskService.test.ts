@@ -13473,6 +13473,124 @@ describe("TaskService", () => {
   });
 
   describe("listInstanceWorkspaces", () => {
+    const nonLocalRuntimes = [
+      { label: "ssh", runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" } },
+      {
+        label: "coder",
+        runtimeConfig: {
+          type: "ssh",
+          host: "coder.example",
+          srcBaseDir: "~/src",
+          coder: { workspaceName: "remote-workspace", existingWorkspace: true },
+        },
+      },
+      { label: "docker", runtimeConfig: { type: "docker", image: "node:22" } },
+      {
+        label: "devcontainer",
+        runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+      },
+    ] as const;
+
+    test.each(
+      nonLocalRuntimes.flatMap((runtime) =>
+        [false, true].map((isChild) => ({ ...runtime, isChild }))
+      )
+    )(
+      "returns no instance rows to $label callers (child=$isChild)",
+      async ({ runtimeConfig, isChild }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(config, projectPath, [
+          projectWorkspace(projectPath, "local-root", "local-root"),
+          projectWorkspace(projectPath, "caller", "caller", {
+            runtimeConfig,
+            ...(isChild ? { parentWorkspaceId: "local-root", taskStatus: "running" } : {}),
+          }),
+        ]);
+        const isBusyForMessage = mock(() => false);
+        const isStreaming = mock(() => false);
+        const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+        const { aiService } = createAIServiceMocks(config, { isStreaming });
+        const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+        expect(taskService.listInstanceWorkspaces("caller", {})).toEqual({
+          rows: [],
+          totalMatching: 0,
+          callerPeerMessagingRestricted: true,
+        });
+        expect(isBusyForMessage).not.toHaveBeenCalled();
+        expect(isStreaming).not.toHaveBeenCalled();
+      }
+    );
+
+    test("filters remote and unresolved roots before query, counts and paging while preserving local defaults", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "default", "a-default"),
+        projectWorkspace(projectPath, "local", "b-local", { runtimeConfig: { type: "local" } }),
+        projectWorkspace(projectPath, "legacy-local", "c-legacy", {
+          runtimeConfig: { type: "local", srcBaseDir: "~/src" },
+        }),
+        projectWorkspace(projectPath, "worktree", "d-worktree", {
+          runtimeConfig: { type: "worktree", srcBaseDir: "~/src" },
+        }),
+        ...nonLocalRuntimes.map(({ label, runtimeConfig }) =>
+          projectWorkspace(projectPath, `remote-${label}`, `remote-${label}`, { runtimeConfig })
+        ),
+        // Missing inline identity can defer runtime resolution to legacy session metadata.
+        { ...projectWorkspace(projectPath, "partial", "partial"), name: undefined },
+      ]);
+      const legacyDir = path.join(config.sessionsDir, "partial");
+      await fsPromises.mkdir(legacyDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacyDir, "metadata.json"),
+        JSON.stringify({
+          id: "partial",
+          name: "partial",
+          projectPath,
+          runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" },
+        })
+      );
+      const isBusyForMessage = mock((_workspaceId: string) => false);
+      const isStreaming = mock((_workspaceId: string) => false);
+      const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+      const { aiService } = createAIServiceMocks(config, { isStreaming });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+      for (const caller of ["partial", "missing"]) {
+        expect(taskService.listInstanceWorkspaces(caller, {})).toEqual({
+          rows: [],
+          totalMatching: 0,
+          callerPeerMessagingRestricted: true,
+        });
+      }
+      expect(isBusyForMessage).not.toHaveBeenCalled();
+      expect(isStreaming).not.toHaveBeenCalled();
+
+      const first = taskService.listInstanceWorkspaces("a-default", { limit: 2 });
+      expect(first.rows.map((row) => row.workspaceId)).toEqual(["a-default", "b-local"]);
+      expect(first.totalMatching).toBe(4);
+      expect(first.nextOffset).toBe(2);
+      const second = taskService.listInstanceWorkspaces("b-local", {
+        limit: 2,
+        offset: first.nextOffset,
+      });
+      expect(second.rows.map((row) => row.workspaceId)).toEqual(["c-legacy", "d-worktree"]);
+      expect(second.totalMatching).toBe(4);
+      expect(second.nextOffset).toBeUndefined();
+      for (const query of ["remote", "partial"]) {
+        expect(taskService.listInstanceWorkspaces("c-legacy", { query, limit: 1 })).toEqual({
+          rows: [],
+          totalMatching: 0,
+        });
+      }
+      const expectedActivityIds = ["a-default", "b-local", "c-legacy", "d-worktree"];
+      expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual(expectedActivityIds);
+      expect(isStreaming.mock.calls.map(([id]) => id)).toEqual(expectedActivityIds);
+      expect(taskService.listInstanceWorkspaces("d-worktree", {}).totalMatching).toBe(4);
+    });
+
     test("omits stopped, stopping and delegated roots before counting, and restores them when eligible", async () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
