@@ -22,10 +22,6 @@ import type { IconCandidate } from "./mcpServerIdentity";
 /** Data URL forms the decoder can sniff; anything else is not artwork we render. */
 const DATA_URL_PREFIX = /^data:(image\/(?:png|jpeg|gif|webp|svg\+xml));base64,/;
 const SIZE_ENTRY = /^(\d{1,5})x(\d{1,5})$/i;
-const PREFERRED_MIN_PX = 32;
-const PREFERRED_MAX_PX = 128;
-/** The worker rejects longer hints; a hint this long is noise, not evidence. */
-const MIME_HINT_MAX_CHARS = 128;
 
 export type SelectedIcon =
   | { kind: "https"; url: URL; mimeTypes: string[] }
@@ -43,7 +39,10 @@ function sizeRank(sizes: readonly string[] | undefined): number {
     const match = SIZE_ENTRY.exec(entry);
     if (match) {
       const largest = Math.max(Number(match[1]), Number(match[2]));
-      if (largest >= PREFERRED_MIN_PX && largest <= PREFERRED_MAX_PX) {
+      if (
+        largest >= MCP_ICON_LIMITS.preferredMinSize &&
+        largest <= MCP_ICON_LIMITS.preferredMaxSize
+      ) {
         return 0;
       }
     }
@@ -69,7 +68,7 @@ function mimeHints(...hints: Array<string | undefined>): string[] | null {
     if (essence.length === 0) {
       continue;
     }
-    if (essence.length > MIME_HINT_MAX_CHARS) {
+    if (essence.length > MCP_ICON_LIMITS.mimeHintMaxChars) {
       if (essence.startsWith("image/")) {
         return null;
       }

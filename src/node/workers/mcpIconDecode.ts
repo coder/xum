@@ -88,7 +88,8 @@ async function decode(message: unknown): Promise<string | null> {
     !Array.isArray(message.mimeTypes) ||
     message.mimeTypes.length > 3 ||
     !message.mimeTypes.every(
-      (mime): mime is string => typeof mime === "string" && mime.length <= 128
+      (mime): mime is string =>
+        typeof mime === "string" && mime.length <= MCP_ICON_LIMITS.mimeHintMaxChars
     )
   )
     return null;
