@@ -220,8 +220,15 @@ afterAll(() => {
   global.window = originalWindow;
 });
 
-// Mock queueMicrotask
+// Mock queueMicrotask synchronously for this suite only. Bun runs every unit
+// file in one process, so the native asynchronous scheduler must be restored
+// afterwards: later suites (e.g. the MCP icon batching cache) rely on
+// queueMicrotask running after the current call returns.
+const originalQueueMicrotask = global.queueMicrotask;
 global.queueMicrotask = (fn) => fn();
+afterAll(() => {
+  global.queueMicrotask = originalQueueMicrotask;
+});
 
 /** Build a FrontendWorkspaceMetadata fixture with sensible test defaults. */
 function makeWorkspaceMetadata(
