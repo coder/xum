@@ -208,6 +208,49 @@ describe("selectIconCandidate", () => {
 });
 
 describe("resolveServerIcon", () => {
+  test("refuses an over-budget candidate set before its deadline, selection, fetch, or decode", async () => {
+    const seams = { deadline: 0, fetch: 0, decode: 0 };
+    const resolver = createIconResolver({
+      createDeadline: () => {
+        seams.deadline++;
+        return new AbortController().signal;
+      },
+      fetch: () => {
+        seams.fetch++;
+        return Promise.resolve(null);
+      },
+      decode: () => {
+        seams.decode++;
+        return Promise.resolve(pngDataUrl);
+      },
+    });
+    // Near the single-source limit while still decodable (<= bodyMaxBytes once decoded).
+    const src = `data:image/png;base64,${"A".repeat(699_048)}`;
+    expect(src.length).toBeLessThanOrEqual(MCP_ICON_LIMITS.candidateSrcTotalMaxChars);
+    const reads: Array<Array<string | symbol>> = [];
+    const candidates = Array.from({ length: MCP_IDENTITY_LIMITS.iconCandidatesMax }, () => {
+      const keys: Array<string | symbol> = [];
+      reads.push(keys);
+      return new Proxy<IconCandidate>(
+        { src, mimeType: "image/png", sizes: ["64x64"] },
+        {
+          get: (target, key): unknown => {
+            keys.push(key);
+            return Reflect.get(target, key);
+          },
+        }
+      );
+    });
+    expect(await resolver.resolve(candidates, stdio)).toBeNull();
+    expect(seams).toEqual({ deadline: 0, fetch: 0, decode: 0 });
+    // Only `src` lengths were read, and only until the budget overflowed.
+    expect(reads).toEqual([["src"], ["src"], [], [], [], [], [], []]);
+
+    // A single near-limit source still takes the normal path.
+    expect(await resolver.resolve([{ src, mimeType: "image/png" }], stdio)).toBe(pngDataUrl);
+    expect(seams).toEqual({ deadline: 1, fetch: 0, decode: 1 });
+  });
+
   test("renders the unchanged Notion SVG data URL into a bounded PNG through the real decoder", async () => {
     const result = await resolveServerIcon(
       [{ src: notionDataUrl, mimeType: "image/svg+xml" }],

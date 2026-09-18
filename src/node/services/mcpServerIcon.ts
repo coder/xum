@@ -82,6 +82,28 @@ function mimeHints(...hints: Array<string | undefined>): string[] | null {
 }
 
 /**
+ * Cheap admission shared by the registry and the resolver: the normalized
+ * candidate window's summed `src` length must fit the aggregate budget. Reads
+ * only `src` and stops at the first overflow, so an over-budget set costs no
+ * copy, serialization, hash, selection, or I/O.
+ */
+export function isWithinIconSourceBudget(candidates: readonly IconCandidate[]): boolean {
+  let total = 0;
+  const window = Math.min(candidates.length, MCP_IDENTITY_LIMITS.iconCandidatesMax);
+  for (let index = 0; index < window; index++) {
+    const src: unknown = candidates[index].src;
+    if (typeof src !== "string") {
+      return false;
+    }
+    total += src.length;
+    if (total > MCP_ICON_LIMITS.candidateSrcTotalMaxChars) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Eligibility of one candidate. Copies every retained value so the result
  * never aliases the (server-controlled, possibly still mutating) candidate.
  */
@@ -253,6 +275,9 @@ export function createIconResolver(dependencies: IconResolverDependencies = {}):
 
   return {
     async resolve(candidates, binding) {
+      if (!isWithinIconSourceBudget(candidates)) {
+        return null;
+      }
       // One budget for the whole attempt: selection, queueing, fetch, decode.
       const signal = createDeadline();
       const selected = selectIconCandidate(candidates, binding);

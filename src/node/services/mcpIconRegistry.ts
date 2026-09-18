@@ -4,6 +4,7 @@ import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
 import type { MCPConnectionRef } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { isWithinIconSourceBudget } from "./mcpServerIcon";
 import type { IconCandidate } from "./mcpServerIdentity";
 
 /** Empty host-created token: object identity, not serializable data, owns one generation. */
@@ -47,6 +48,9 @@ export class MCPIconRegistry {
       candidates.length <= MCP_IDENTITY_LIMITS.iconCandidatesMax,
       "Icon candidates must be normalized before registration"
     );
+    // Runs on every tool call, including cached handshake icons, on the main
+    // process: refuse an over-budget set before the copy and digest below.
+    if (!isWithinIconSourceBudget(candidates)) return undefined;
     this.prune();
     const copied = candidates.map((candidate) => ({
       ...candidate,

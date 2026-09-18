@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import sharp from "sharp";
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
 import type { MCPConnectionRef } from "@/common/types/mcp";
 import type { IconCandidate } from "./mcpServerIdentity";
 import { MCPIconRegistry } from "./mcpIconRegistry";
@@ -201,5 +202,49 @@ describe("immutable MCP icon registry", () => {
     }
     expect(await registry.get(first)).toBeNull();
     expect(await registry.get(last)).toBe(icon);
+  });
+
+  test("refuses an over-budget candidate set before copying, serializing, or hashing it", async () => {
+    let calls = 0;
+    const registry = new MCPIconRegistry(() => {
+      calls++;
+      return Promise.resolve(null);
+    });
+    // One candidate at the single-source limit; the aggregate budget equals that limit.
+    const src = `data:image/png;base64,${"A".repeat(MCP_IDENTITY_LIMITS.iconDataSrcMaxChars - 22)}`;
+    expect(src.length).toBeLessThanOrEqual(MCP_ICON_LIMITS.candidateSrcTotalMaxChars);
+    const reads: Array<Array<string | symbol>> = [];
+    const enumerated: number[] = [];
+    const candidates = Array.from({ length: MCP_IDENTITY_LIMITS.iconCandidatesMax }, (_, i) => {
+      const keys: Array<string | symbol> = [];
+      reads.push(keys);
+      return new Proxy<IconCandidate>(
+        { src, mimeType: "image/png", sizes: ["64x64"] },
+        {
+          get: (target, key): unknown => {
+            keys.push(key);
+            return Reflect.get(target, key);
+          },
+          ownKeys: (target) => {
+            enumerated.push(i);
+            return Reflect.ownKeys(target);
+          },
+        }
+      );
+    });
+    expect(registry.ensure({}, candidates, binding)).toBeUndefined();
+    await Promise.resolve();
+    expect(calls).toBe(0);
+    // Admission summed `src` lengths and stopped at the first overflow: nothing
+    // was spread (no ownKeys) or serialized (no other field read), and the
+    // remaining candidates were never touched.
+    expect(enumerated).toEqual([]);
+    expect(reads).toEqual([["src"], ["src"], [], [], [], [], [], []]);
+
+    // The same single maximum-size source is still admitted and resolved.
+    const ref = registry.ensure({}, [{ src }], binding);
+    expect(ref).toMatch(/^[a-f0-9]{32}$/);
+    await Promise.resolve();
+    expect(calls).toBe(1);
   });
 });

@@ -1,5 +1,13 @@
+import { MCP_IDENTITY_LIMITS } from "./mcpIdentity";
+
 /** Untrusted MCP artwork is bounded before fetching, decoding, caching, and rendering. */
 export const MCP_ICON_LIMITS = {
+  /**
+   * Aggregate `src` characters admitted per candidate set, checked before any
+   * copy, serialization, hash, or selection. Equal to the single-source limit
+   * so one maximum-size icon still passes while eight cannot be stacked.
+   */
+  candidateSrcTotalMaxChars: MCP_IDENTITY_LIMITS.iconDataSrcMaxChars,
   bodyMaxBytes: 512 * 1024,
   svgMaxBytes: 256 * 1024,
   pngMaxBytes: 32 * 1024,

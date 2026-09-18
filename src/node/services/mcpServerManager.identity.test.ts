@@ -1,10 +1,17 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { convertToModelMessages, dynamicTool, jsonSchema, type Tool } from "ai";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
 import type { MCPConnectionRef } from "@/common/types/mcp";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { Config } from "@/node/config";
+import { PIXEL_PNG_ICON } from "../../../tests/fixtures/mcp/branded-icons";
+import * as mcpSdk from "./mcpClient";
+import { MCPConfigService } from "./mcpConfigService";
 import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
-import { wrapMCPTools } from "./mcpServerManager";
+import * as serverIcon from "./mcpServerIcon";
+import { MCPServerManager, wrapMCPTools } from "./mcpServerManager";
 import type { IconCandidate } from "./mcpServerIdentity";
+import { DisposableTempDir } from "./tempDir";
 import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import { withExecutionScope } from "./tools/withExecutionScope";
 
@@ -314,4 +321,59 @@ describe("MCP icon references on tool-call snapshots", () => {
     expect(snapshot).toMatchObject({ source: "connection" });
     expect(snapshot?.iconRef).toBeUndefined();
   });
+});
+
+describe("connection tests and the historical icon registry", () => {
+  test("connection tests resolve through the process resolver and never admit registry entries", async () => {
+    using tmp = new DisposableTempDir("mcp-icon-test-isolation");
+    const manager = new MCPServerManager(new MCPConfigService(new Config(tmp.path)));
+    // Seed one immutable ref the way a served tool call does (real resolution).
+    const registry = Reflect.get(manager, "iconRegistry") as MCPIconRegistry;
+    const historicalOwner: MCPIconOwner = {};
+    const historicalBinding: MCPConnectionRef = { key: "history", transport: "stdio" };
+    const historicalRef = registry.ensure(historicalOwner, [PIXEL_PNG_ICON], historicalBinding)!;
+    const historicalIcon = await manager.getIcon(historicalRef);
+    expect(isPngDataUrl(historicalIcon)).toBe(true);
+
+    const testIcon = PNG;
+    const resolveSpy = spyOn(serverIcon, "resolveServerIcon").mockImplementation(() =>
+      Promise.resolve(testIcon)
+    );
+    const clientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+      Promise.resolve({
+        tools: () => Promise.resolve({}),
+        negotiatedProtocolVersion: () => "2026-07-28",
+        serverInfo: () => ({ name: "Mock", version: "1", icons: [responseIcon] }),
+        close: () => Promise.resolve(),
+      } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>)
+    );
+    try {
+      // More successful tests than the registry holds entries: had they been
+      // admitted, the LRU would have evicted the historical ref by now.
+      const runs = MCP_ICON_LIMITS.registryMaxEntries + 1;
+      for (let i = 0; i < runs; i++) {
+        const result = await manager.test({
+          projectPath: tmp.path,
+          url: `https://mock.example/${i}`,
+          transport: "http",
+          trusted: true,
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) throw new Error(result.error);
+        expect(result.icon).toBe(testIcon);
+      }
+      expect(resolveSpy).toHaveBeenCalledTimes(runs);
+      expect(clientSpy).toHaveBeenCalledTimes(runs);
+      // Historical artwork is untouched: same bytes, and the owner still
+      // deduplicates onto the same ref, so nothing was evicted or refetched.
+      expect(await manager.getIcon(historicalRef)).toBe(historicalIcon);
+      expect(registry.ensure(historicalOwner, [PIXEL_PNG_ICON], historicalBinding)).toBe(
+        historicalRef
+      );
+    } finally {
+      resolveSpy.mockRestore();
+      clientSpy.mockRestore();
+      manager.dispose();
+    }
+  }, 30_000);
 });

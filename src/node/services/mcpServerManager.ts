@@ -38,6 +38,7 @@ import type {
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -841,7 +842,8 @@ async function runServerTest(
       },
   projectPath: string,
   logContext: string,
-  icons: { registry: MCPIconRegistry; connectionKey: string }
+  /** Configured server key the icon binding is described under. */
+  connectionKey: string
 ): Promise<MCPTestResult> {
   // Resettable deadline: the fragile-legacy stdio respawn below restarts the
   // clock so the compatibility retry gets a full test window instead of
@@ -980,7 +982,7 @@ async function runServerTest(
         observed.current = {
           identity: normalizedIdentity,
           binding: describeConnection(
-            icons.connectionKey,
+            connectionKey,
             server.transport === "stdio"
               ? { transport: "stdio", command: server.command, disabled: false }
               : { transport: server.transport, url: server.url, disabled: false },
@@ -1054,10 +1056,21 @@ async function runServerTest(
   if (!result.success || !observed.current) {
     return result;
   }
+  // The test returns the image bytes directly and never exposes a ref, so it
+  // resolves through the process-wide resolver (same gate, deadline, and
+  // origin binding as tool calls) without admitting anything into the
+  // historical icon registry, whose entries belong to chat history.
   const { identity, binding } = observed.current;
-  const iconRef = icons.registry.ensure({}, identity.iconCandidates, binding);
-  const icon = iconRef === undefined ? null : await icons.registry.get(iconRef);
-  return icon === null ? result : { ...result, icon };
+  if (identity.iconCandidates.length === 0) {
+    return result;
+  }
+  let icon: unknown = null;
+  try {
+    icon = await resolveServerIcon(identity.iconCandidates, binding);
+  } catch {
+    // Icon failures never fail a successful connection test.
+  }
+  return isPngDataUrl(icon) ? { ...result, icon } : result;
 }
 
 type MCPPromptContent = MCPGetPromptResult["messages"][number]["content"];
@@ -4870,10 +4883,7 @@ export class MCPServerManager {
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
         try {
           const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
-            runServerTest(launch, projectPath, `server "${trimmedName}"`, {
-              registry: this.iconRegistry,
-              connectionKey: trimmedName,
-            })
+            runServerTest(launch, projectPath, `server "${trimmedName}"`, trimmedName)
           );
           return await pending;
         } catch (error) {
@@ -4909,10 +4919,12 @@ export class MCPServerManager {
       if (!isTransportAllowed("stdio")) {
         return { success: false, error: "MCP transport is disabled by policy" };
       }
-      return runServerTest({ transport: "stdio", command }, projectPath, "command", {
-        registry: this.iconRegistry,
-        connectionKey: trimmedName ?? "command",
-      });
+      return runServerTest(
+        { transport: "stdio", command },
+        projectPath,
+        "command",
+        trimmedName ?? "command"
+      );
     }
 
     if (url?.trim()) {
@@ -4944,7 +4956,7 @@ export class MCPServerManager {
           },
           projectPath,
           trimmedName ? `server "${trimmedName}" (url)` : "url",
-          { registry: this.iconRegistry, connectionKey: trimmedName ?? "url" }
+          trimmedName ?? "url"
         );
       } catch (error) {
         const message = getErrorMessage(error);
