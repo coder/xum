@@ -44,10 +44,15 @@ async function openConsentDialog(canvasElement: HTMLElement): Promise<HTMLElemen
   await userEvent.click(
     await waitFor(() => within(document.body).getByTestId("workspace-unrelated-messaging-button"))
   );
-  return waitFor(
+  const dialog = await waitFor(
     () => within(document.body).getByRole("dialog", { name: "Messages from other workspaces" }),
     { timeout: 10_000 }
   );
+  const descriptionId = dialog.getAttribute("aria-describedby");
+  if (!descriptionId || !document.getElementById(descriptionId)?.textContent?.trim()) {
+    throw new Error("Consent dialog must expose a readable accessible description");
+  }
+  return dialog;
 }
 
 export default {

@@ -4,6 +4,7 @@ import { Button } from "@/browser/components/Button/Button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
@@ -77,10 +78,10 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                 >
                   Allow unrelated workspaces to find and message this chat
                 </div>
-                <div className="text-muted mt-1 text-xs">
+                <DialogDescription className="text-muted mt-1 text-xs">
                   Applies to agents in other local chats in this Xum instance, outside this
                   chat&apos;s task tree. Off by default; same-tree sub-agents are unaffected.
-                </div>
+                </DialogDescription>
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {isSaving && (
