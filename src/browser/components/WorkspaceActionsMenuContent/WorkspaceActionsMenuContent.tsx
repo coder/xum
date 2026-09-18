@@ -5,6 +5,7 @@ import {
   HeartPulse,
   History,
   Maximize2,
+  MessagesSquare,
   Pencil,
   Pin,
   PinOff,
@@ -50,6 +51,8 @@ interface WorkspaceActionsMenuContentProps {
   onConfigureMcp?: (() => void) | null;
   /** Experiment-gated workspace heartbeat settings action. */
   onConfigureHeartbeat?: (() => void) | null;
+  /** Recipient consent for discovery/messages from unrelated workspaces (menu bar only). */
+  onConfigureUnrelatedMessaging?: (() => void) | null;
   /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
   onOpenTouchFullscreenReview?: (() => void) | null;
   onEnterImmersiveReview?: (() => void) | null;
@@ -111,6 +114,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onCloseMenu();
             props.onConfigureHeartbeat?.();
           }}
+        />
+      )}
+      {props.onConfigureUnrelatedMessaging && (
+        <WorkspaceActionButton
+          label="Messages from other workspaces"
+          shortcut={formatKeybind(KEYBINDS.CONFIGURE_UNRELATED_MESSAGING)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<MessagesSquare className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onConfigureUnrelatedMessaging?.();
+          }}
+          testId="workspace-unrelated-messaging-button"
         />
       )}
       {props.onOpenTouchFullscreenReview && (

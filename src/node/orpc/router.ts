@@ -1724,6 +1724,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.workspaceService.setAutoCompactionThreshold(input.workspaceId, input.threshold)
         ),
+      setUnrelatedWorkspaceConsent: t
+        .input(schemas.workspace.setUnrelatedWorkspaceConsent.input)
+        .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
+        ),
       interruptStream: t
         .input(schemas.workspace.interruptStream.input)
         .output(schemas.workspace.interruptStream.output)

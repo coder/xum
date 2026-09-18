@@ -317,6 +317,7 @@ import type {
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -7276,7 +7277,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private resolveHeartbeatWorkspaceEntry(
     workspaceId: string,
-    methodName: "getHeartbeatSettings" | "setHeartbeatSettings" | "unsetHeartbeatSettings"
+    methodName:
+      | "getHeartbeatSettings"
+      | "setHeartbeatSettings"
+      | "unsetHeartbeatSettings"
+      | "setUnrelatedWorkspaceConsent"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -7399,6 +7404,82 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to unset heartbeat settings: ${message}`);
+    }
+  }
+
+  /**
+   * Recipient consent for unrelated (cross-tree) workspaces to discover this workspace and send it
+   * untrusted agent messages. Persisted as an opaque revocation GENERATION, never a credential:
+   * off deletes the field; off→on mints a fresh `crypto.randomUUID()`; an already-on workspace
+   * keeps its value so a repeat enable is not a revocation. Messaging enforcement (TaskService)
+   * captures the generation at admission and treats a changed or absent value as stale, which is
+   * why every off→on transition must produce a new value. The returned Ok means the change is
+   * committed to config AND published on the metadata channel; the UI must not flip its switch
+   * before that ack. Application-level only: any same-UID process with config access can edit
+   * this field, so it is an opt-in, not an isolation boundary. Recency is deliberately not bumped
+   * (a settings toggle should not reorder the sidebar) and no timeline row is recorded.
+   */
+  async setUnrelatedWorkspaceConsent(
+    workspaceId: string,
+    enabled: boolean
+  ): Promise<Result<void, string>> {
+    try {
+      assert(typeof enabled === "boolean", "setUnrelatedWorkspaceConsent requires a boolean");
+      const resolved = this.resolveHeartbeatWorkspaceEntry(
+        workspaceId,
+        "setUnrelatedWorkspaceConsent"
+      );
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+
+      const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<{ changed: boolean }, string> = Err("Workspace not found");
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err("Workspace not found");
+          return freshConfig;
+        }
+        const current = getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent);
+        if (!enabled) {
+          // Absent is the only "off" representation on disk. A malformed value already reads
+          // as off, but it is scrubbed here so the entry does not carry junk indefinitely.
+          if (!("unrelatedWorkspaceConsent" in entry)) {
+            outcome = Ok({ changed: false });
+            return freshConfig;
+          }
+          delete entry.unrelatedWorkspaceConsent;
+          outcome = Ok({ changed: true });
+          return freshConfig;
+        }
+        if (current != null) {
+          outcome = Ok({ changed: false });
+          return freshConfig;
+        }
+        // Off (or malformed) → on: a NEW generation, so nothing admitted under an earlier
+        // consent can be revived by re-enabling.
+        entry.unrelatedWorkspaceConsent = crypto.randomUUID();
+        outcome = Ok({ changed: true });
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      if (outcome.data.changed) {
+        // Publish only after the config write above has committed so metadata readers never
+        // observe a generation that is not yet durable.
+        await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      }
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
     }
   }
 

@@ -464,6 +464,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   const projects = new Map(providedProjects);
   const workspaceMap = new Map(workspaces.map((w) => [w.id, w]));
+  // Metadata pushes for handlers that change persisted workspace settings (mirrors the
+  // backend's emitCurrentWorkspaceMetadata so metadata-driven controls update in stories).
+  interface MetadataEvent {
+    workspaceId: string;
+    metadata: FrontendWorkspaceMetadata | null;
+  }
+  const metadataListeners = new Set<(event: MetadataEvent) => void>();
+  const publishWorkspaceMetadata = (metadata: FrontendWorkspaceMetadata) => {
+    workspaceMap.set(metadata.id, metadata);
+    for (const listener of metadataListeners) {
+      listener({ workspaceId: metadata.id, metadata });
+    }
+  };
 
   // Terminal sessions are used by RightSidebar and TerminalView.
   // Stories can seed deterministic sessions (with screenState) to make the embedded terminal look
@@ -1687,6 +1700,24 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       getStartupAutoRetryModel: () => Promise.resolve({ success: true, data: null }),
       setAutoCompactionThreshold: () => Promise.resolve({ success: true, data: undefined }),
+      setUnrelatedWorkspaceConsent: (input: { workspaceId: string; enabled: boolean }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same generation rules as the backend: off deletes, off→on mints, on→on retains.
+        const { unrelatedWorkspaceConsent: _previous, ...rest } = current;
+        const next: FrontendWorkspaceMetadata = input.enabled
+          ? {
+              ...rest,
+              unrelatedWorkspaceConsent:
+                current.unrelatedWorkspaceConsent ??
+                `mock-consent-${workspaceMap.size}-${Date.now()}`,
+            }
+          : rest;
+        publishWorkspaceMetadata(next);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
@@ -1760,9 +1791,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
       },
       onMetadata: async function* () {
-        // No metadata updates in the mock, but keep the subscription open.
-        yield* [];
-        await new Promise<void>(() => undefined);
+        // Deliver pushes from settings handlers; otherwise keep the subscription open.
+        const queue: MetadataEvent[] = [];
+        let wake: (() => void) | null = null;
+        const listener = (event: MetadataEvent) => {
+          queue.push(event);
+          wake?.();
+        };
+        metadataListeners.add(listener);
+        try {
+          while (true) {
+            while (queue.length > 0) {
+              yield queue.shift()!;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+            wake = null;
+          }
+        } finally {
+          metadataListeners.delete(listener);
+        }
       },
       activity: {
         list: () => Promise.resolve(workspaceActivitySnapshots),

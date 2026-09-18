@@ -407,6 +407,10 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+H, Win/Linux: Ctrl+Shift+H
   CONFIGURE_HEARTBEAT: { key: "H", ctrl: true, shift: true },
 
+  /** Configure whether unrelated workspaces may discover/message the current workspace */
+  // macOS: Cmd+Shift+U, Win/Linux: Ctrl+Shift+U
+  CONFIGURE_UNRELATED_MESSAGING: { key: "U", ctrl: true, shift: true },
+
   /** Open Command Palette */
   // VS Code-style palette
   // macOS: Cmd+Shift+P, Win/Linux: Ctrl+Shift+P
