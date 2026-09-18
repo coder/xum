@@ -42,7 +42,18 @@ export interface BoundedTranscriptReveal {
 
 interface RevealState {
   workspaceId: string;
-  /** null ⇒ fully revealed. Anchored by id so appends/deletes above cannot shift the cut. */
+  /**
+   * Bumped on every reset (new workspace, bulk arrival, replaced tail). A step scheduled by an
+   * older generation is discarded even when the reset happens to pick the same anchor row,
+   * so a stale frame can never mount a chunk before the reset tail has painted.
+   */
+  generation: number;
+  /**
+   * null ⇒ fully revealed. Anchored by id so appends/deletes above cannot shift the cut.
+   * Always a safe cut under the grouping it was last rendered with: a boundary the grouping
+   * pulled back (a bundle came to span it) is persisted here, so the mounted range can only
+   * grow — never advance again when the grouping changes back.
+   */
   anchorMessageId: string | null;
   /** Index the anchor had when chosen; the fallback bound if the id disappears. */
   anchorIndexHint: number;
@@ -132,11 +143,14 @@ function exceedsOneStep(start: number, end: number, inputs: StepInputs): boolean
 function startState<Row extends RevealRow>(
   workspaceId: string,
   messages: readonly Row[],
-  inputs: StepInputs
+  inputs: StepInputs,
+  generation: number
 ): RevealState {
+  assert(Number.isInteger(generation) && generation >= 0, "generation must be a counter");
   const length = messages.length;
   const base: Omit<RevealState, "anchorMessageId" | "anchorIndexHint"> = {
     workspaceId,
+    generation,
     newestMessageId: length > 0 ? messages[length - 1].id : null,
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
@@ -170,7 +184,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     rowWeight: args.rowWeight ?? unitRowWeight,
   };
   const [state, setState] = useState<RevealState>(() =>
-    startState(args.workspaceId, args.messages, stepInputs)
+    startState(args.workspaceId, args.messages, stepInputs, 0)
   );
 
   // State adjustments during render (React's derived-state idiom): a new transcript or a bulk
@@ -192,7 +206,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
         : exceedsOneStep(previousNewestIndex + 1, length, stepInputs);
   }
   if (restart) {
-    current = startState(args.workspaceId, args.messages, stepInputs);
+    current = startState(args.workspaceId, args.messages, stepInputs, current.generation + 1);
     setState(current);
   } else if (current.newestMessageId !== newestMessageId) {
     current = { ...current, newestMessageId };
@@ -202,7 +216,8 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // fromIndex is derived every render from the anchor id, re-validated against the CURRENT
   // grouping (a bundle can come to span the anchor when density changes): a found anchor is
   // moved to the nearest safe cut at or before it, and a vanished anchor falls back to a safe
-  // cut at or before its last known index, never to an unbounded jump.
+  // cut at or before its last known index, never to an unbounded jump. A boundary that moved
+  // is persisted as the new anchor so it cannot move forward again (see RevealState).
   let fromIndex = 0;
   if (current.anchorMessageId !== null) {
     const anchorIndex = args.messages.findIndex((row) => row.id === current.anchorMessageId);
@@ -211,6 +226,17 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       length,
       args.isSafeCut
     );
+    if (fromIndex === 0) {
+      current = { ...current, anchorMessageId: null, anchorIndexHint: 0 };
+      setState(current);
+    } else if (fromIndex < length && args.messages[fromIndex].id !== current.anchorMessageId) {
+      current = {
+        ...current,
+        anchorMessageId: args.messages[fromIndex].id,
+        anchorIndexHint: fromIndex,
+      };
+      setState(current);
+    }
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
 
@@ -221,14 +247,20 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const scheduleFrame = args.scheduleFrame ?? transcriptRevealFrameScheduler.schedule;
 
   const anchorMessageId = current.anchorMessageId;
+  const generation = current.generation;
   const workspaceId = args.workspaceId;
   useEffect(() => {
     if (anchorMessageId === null) return;
     const cancel = scheduleFrame(() => {
       const snapshot = latest.current;
       setState((previous) => {
-        // A reset since scheduling (new workspace / bulk arrival) supersedes this step.
-        if (previous.anchorMessageId !== anchorMessageId || previous.workspaceId !== workspaceId) {
+        // A reset since scheduling (new workspace / bulk arrival — a new generation, even if it
+        // re-chose this anchor) or a persisted boundary move supersedes this step.
+        if (
+          previous.generation !== generation ||
+          previous.anchorMessageId !== anchorMessageId ||
+          previous.workspaceId !== workspaceId
+        ) {
           return previous;
         }
         const cut = nextStepCut(
@@ -241,7 +273,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       });
     });
     return cancel;
-  }, [anchorMessageId, workspaceId, scheduleFrame]);
+  }, [anchorMessageId, generation, workspaceId, scheduleFrame]);
 
   return { fromIndex, isFullyRevealed: current.anchorMessageId === null };
 }

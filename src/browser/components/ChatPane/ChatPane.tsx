@@ -1497,9 +1497,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             tabIndex={0}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
-            // decoration data readiness so waiting on it observes the chat
-            // view's final (post-reveal) layout.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady}
+            // decoration data readiness AND the tail-first reveal having mounted
+            // every row, so waiting on it observes the chat view's final layout
+            // rather than a tail whose earlier chunks are still committing.
+            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && isFullyRevealed}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:
