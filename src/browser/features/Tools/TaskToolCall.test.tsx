@@ -4,7 +4,9 @@ import { GlobalWindow } from "happy-dom";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 
-import type { DisplayedMessage } from "@/common/types/message";
+import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displayedMessageBuilder";
+import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 
@@ -885,6 +887,68 @@ describe("TaskSendMessageToolCall", () => {
       );
       expect(view.getByRole("status").className).toContain(
         status === "queued" ? "text-backgrounded" : "text-success"
+      );
+    }
+  );
+
+  test.each([
+    { ok: true, expectedStatus: "redacted" },
+    { ok: false, expectedStatus: "failed" },
+  ] as const)(
+    "renders compacted communication history without inventing delivery: $ok",
+    ({ ok, expectedStatus }) => {
+      const message = createMuxMessage("compacted", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "execution",
+          toolName: "code_execution",
+          input: { code: "// Send updates" },
+          state: "output-available",
+          output: {
+            success: true,
+            toolCalls: [
+              {
+                toolName: "task_send_message",
+                args: taskSendMessageArgs,
+                ok,
+                bytes: 64,
+                duration_ms: 1,
+              },
+              {
+                toolName: "agent_report",
+                args: { reportMarkdown: "Preserved findings" },
+                ok,
+                bytes: 32,
+                duration_ms: 1,
+              },
+            ],
+          },
+        },
+      ]);
+      const row = buildDisplayedMessagesForMessage({
+        message,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      }).find((part) => part.type === "tool");
+      if (row?.type !== "tool" || !row.nestedCalls) throw new Error("Expected nested tool calls");
+      const view = render(
+        <TooltipProvider>
+          <NestedToolsContainer
+            calls={row.nestedCalls.map((call) => ({ ...call, input: call.input }))}
+          />
+        </TooltipProvider>
+      );
+      const statuses = view.getAllByRole("status");
+      expect(statuses).toHaveLength(2);
+      for (const status of statuses) {
+        expect(status.className).not.toContain("text-success");
+        expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
+        expect(status.textContent).not.toContain("Result unavailable");
+      }
+      expect(view.getByText("Preserved findings")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
+      expect(view.getByRole("region", { name: "Message content" }).textContent).toBe(
+        taskSendMessageArgs.message
       );
     }
   );
