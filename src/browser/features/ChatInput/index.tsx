@@ -291,6 +291,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Extract workspace-specific props with defaults
   const disabled = (props.disabled ?? false) || initialStagingLocked;
   const editingMessage = variant === "workspace" ? props.editingMessage : undefined;
+  // Live edit target for callbacks that outlive the render they were created in (a transcript
+  // refresh outcome, the "Retry refresh" toast): they must not act on an edit the user has
+  // since cancelled or replaced.
+  const editingMessageIdRef = useRef<string | undefined>(editingMessage?.id);
+  useEffect(() => {
+    editingMessageIdRef.current = editingMessage?.id;
+  }, [editingMessage?.id]);
   const [pendingBoundaryEditConfirmation, setPendingBoundaryEditConfirmation] =
     useState<SendOverrides | null>(null);
   // Hide edit-mode chrome as soon as an edit send starts so the input doesn't sit blank
@@ -1704,6 +1711,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           case "cancel-edit":
             commandOnCancelEdit?.();
             break;
+          case "edit-history-changed":
+            startEditTranscriptRefresh(action.editMessageId, action.precondition);
+            break;
         }
       }
     };
@@ -1777,6 +1787,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         current.id === editMessageId ? { ...current, ...patch } : current
       );
 
+    // Every outcome and the retry affordance are scoped to THIS edit: once the user cancels it
+    // or edits another row, a late outcome or a stale toast must not touch the new edit.
+    const isSameEdit = () => editingMessageIdRef.current === editMessageId;
+
     patchEditing({ preconditionInvalidated: true, pendingReconfirmation: undefined });
     store
       .requestTranscriptRefresh(targetWorkspaceId, {
@@ -1794,6 +1808,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             });
             return;
           case "target-not-found":
+            if (!isSameEdit()) return;
             // Leave edit mode without restoring the pre-edit draft: the typed text stays in
             // the composer as a normal draft.
             onCancelEdit?.();
@@ -1803,7 +1818,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             return;
           case "failed":
             // Draft and invalidated state stay; a failure is never read as exhausted history.
-            if (!isMountedRef.current) return;
+            if (!isMountedRef.current || !isSameEdit()) return;
             setToast({
               id: Date.now().toString(),
               type: "error",
@@ -1812,7 +1827,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               solution: (
                 <button
                   type="button"
-                  onClick={() => startEditTranscriptRefresh(editMessageId, precondition)}
+                  onClick={() => {
+                    // The toast can outlive the edit it belongs to; a click then only clears it.
+                    if (!isSameEdit()) {
+                      setToast(null);
+                      return;
+                    }
+                    startEditTranscriptRefresh(editMessageId, precondition);
+                  }}
                   className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
                 >
                   {EDIT_RETRY_REFRESH_LABEL}

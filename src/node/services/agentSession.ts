@@ -3898,6 +3898,32 @@ export class AgentSession {
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");
       this.contextController.reset("edit");
+
+      // Fence preflight BEFORE interrupting: a turn that started after the client captured its
+      // evidence (queued follow-up, goal continuation, background report) has already added
+      // rows inside the fenced range, so the atomic check below would refuse the edit — but
+      // only after the interruption discarded the very response the fence protects. The
+      // preflight is advisory (read lock only); the truncation re-verifies atomically.
+      if (options.historyEditPrecondition) {
+        const preflightTarget = await this.getEditTruncateTargetId(editMessageId);
+        const preflight = await this.historyService.checkHistoryEditPrecondition(
+          this.workspaceId,
+          preflightTarget,
+          options.historyEditPrecondition
+        );
+        if (!preflight.success) {
+          if (isHistoryEditPreconditionMismatch(preflight.error)) {
+            log.info("Edit refused before interruption: history changed since the capture", {
+              workspaceId: this.workspaceId,
+              editMessageId,
+              error: preflight.error,
+            });
+            return refuseBeforeAcceptance({ type: "history-changed" });
+          }
+          return Err(createUnknownSendMessageError(preflight.error));
+        }
+      }
+
       // Ignore our own reservation when deciding whether a turn needs to settle.
       if (this.coordinator.phase !== "idle") {
         // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
@@ -3954,11 +3980,6 @@ export class AgentSession {
       }
 
       attempt.expectedTurn = this.coordinator.turnId;
-
-      // The edit is about to truncate and rewrite history. Any queued content from
-      // the previous turn was written in the old context — return it to the input
-      // so the user can re-evaluate, and start the edit stream with an empty queue.
-      this.restoreQueueToInput();
 
       // A fenced edit is verified against persisted rows as they are: the client's view of an
       // unfinished turn (placeholder overlaid with partial.json) is fenced by identity only
@@ -4026,6 +4047,15 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(truncateResult.error));
         }
       }
+
+      // The edit has rewritten history (or confirmed there was nothing to cut). Any queued
+      // content from the previous turn was written in the old context — return it to the
+      // input so the user can re-evaluate, and start the edit stream with an empty queue.
+      // Deliberately after the fence: a `history-changed` refusal above must leave the queue
+      // exactly as it was, since the composer keeps its edit draft and would otherwise drop
+      // (or overwrite with the pre-send draft) the restored text, files and reviews.
+      this.restoreQueueToInput();
+
       if (truncateResult.success) {
         editTailTruncated = true;
         // RLM mode: summarize the truncated tail into a durable labeled row

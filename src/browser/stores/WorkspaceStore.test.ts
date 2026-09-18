@@ -2331,7 +2331,7 @@ describe("WorkspaceStore", () => {
         attempt.push(sinceCaughtUpEvent(tail.metadata!.historySequence, tail.id));
       }
 
-      it("captures the shared truncation rule over committed rows, ignoring the active stream and rows before the range", async () => {
+      it("captures the shared truncation rule over committed rows, fencing the active stream by identity and ignoring rows before the range", async () => {
         const rows = [row("h1", 1), snapshotRow("snap", 2), row("h3", 3), row("h4", 4)];
         await hydrateRows(rows);
         const attempt = await chatAttempt(workspaceId, 1);
@@ -2348,22 +2348,43 @@ describe("WorkspaceStore", () => {
             () => store.getAggregator(workspaceId)!.getActiveStreamMessageId() !== undefined
           )
         ).toBe(true);
+        attempt.push({
+          type: "stream-delta",
+          workspaceId,
+          messageId: "stream-5",
+          delta: "streamed so far",
+          tokens: 3,
+          timestamp: 5_100,
+        });
+        expect(
+          await waitUntil(
+            () => store.getAggregator(workspaceId)!.getMessagePartCount("stream-5") > 0
+          )
+        ).toBe(true);
 
         const captured = store.captureHistoryEditPrecondition(workspaceId, "h3");
         expect(captured).toBeDefined();
         // The snapshot row before the edited message starts the range; the stream placeholder
-        // (sequence 5) is not the newest committed row.
+        // (sequence 5) is the newest row the edit's interruption deletes.
         expect(captured).toMatchObject({
           editMessageId: "h3",
           rangeStartMessageId: "snap",
           rangeStartHistorySequence: 2,
-          newestMessageId: "h4",
-          newestHistorySequence: 4,
-          rangeRowCount: 3,
+          newestMessageId: "stream-5",
+          newestHistorySequence: 5,
+          rangeRowCount: 4,
         });
-        // Rows older than the range start are not evidence: the same value with h1 absent.
+        // Rows older than the range start are not evidence, and the streaming row hashes by
+        // identity only: the same value with h1 absent and the server's empty placeholder in
+        // place of the streamed text.
+        const placeholder: MuxMessage = {
+          id: "stream-5",
+          role: "assistant",
+          parts: [],
+          metadata: { historySequence: 5 },
+        };
         expect(captured!.rangeFingerprint).toBe(
-          buildHistoryEditPrecondition(rows.slice(1), "h3")!.rangeFingerprint
+          buildHistoryEditPrecondition([...rows.slice(1), placeholder], "h3")!.rangeFingerprint
         );
         expect(store.captureHistoryEditPrecondition(workspaceId, "missing")).toBeUndefined();
       });

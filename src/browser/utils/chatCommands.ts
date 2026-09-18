@@ -186,7 +186,12 @@ export type CommandAction =
   | { type: "detach-reviews" }
   | { type: "check-reviews"; reviewIds: string[] }
   | { type: "message-sent"; dispatchMode: QueueDispatchMode }
-  | { type: "cancel-edit" };
+  | { type: "cancel-edit" }
+  /**
+   * The backend refused an editing command with `history-changed`: the composer stays in edit
+   * mode and starts the same transcript refresh a refused edit send does.
+   */
+  | { type: "edit-history-changed"; editMessageId: string; precondition: HistoryEditPrecondition };
 
 export type CommandResult =
   | { kind: "phase"; actions: CommandAction[]; continue: () => Promise<CommandResult> }
@@ -1479,6 +1484,12 @@ export interface CompactionOptions {
 export interface CompactionResult {
   success: boolean;
   error?: string;
+  /**
+   * The backend refused an editing compaction with `history-changed`: the fenced range changed
+   * since the caller captured its evidence. Callers that own an edit session (the composer)
+   * start a transcript refresh; others just report the failure.
+   */
+  historyChanged?: true;
 }
 
 /**
@@ -1598,15 +1609,24 @@ export async function executeCompaction(
 
   if (!result.success) {
     // Convert SendMessageError to string for error display. Typed errors get their user-facing
-    // text so a `history-changed` refusal reads as guidance rather than an error code.
+    // text so a `history-changed` refusal reads as guidance rather than an error code; the
+    // refusal itself is kept as a flag so an edit session can start its recovery.
+    const typedError =
+      result.error && typeof result.error === "object" && "type" in result.error
+        ? result.error
+        : undefined;
     const errorString = result.error
       ? typeof result.error === "string"
         ? result.error
-        : "type" in result.error
-          ? formatSendMessageError(result.error).message
+        : typedError
+          ? formatSendMessageError(typedError).message
           : "Failed to compact"
       : undefined;
-    return { success: false, error: errorString };
+    return {
+      success: false,
+      error: errorString,
+      ...(typedError?.type === "history-changed" ? { historyChanged: true as const } : {}),
+    };
   }
 
   return { success: true };
@@ -1720,6 +1740,17 @@ function handleCompactCommand(
               message: result.error ?? "Failed to start compaction",
             }),
             { type: "set-sending", sending: false },
+            // An editing /compact refused with `history-changed` recovers exactly like a refused
+            // edit send: stay in edit mode and refresh the transcript for an explicit re-send.
+            ...(result.historyChanged && env.editMessageId && env.historyEditPrecondition
+              ? ([
+                  {
+                    type: "edit-history-changed",
+                    editMessageId: env.editMessageId,
+                    precondition: env.historyEditPrecondition,
+                  },
+                ] satisfies CommandAction[])
+              : []),
           ]);
         }
         trackCommandUsed("compact");

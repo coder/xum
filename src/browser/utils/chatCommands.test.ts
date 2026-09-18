@@ -1078,6 +1078,41 @@ describe("compact and plan command results", () => {
     expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
   });
 
+  test("compact edit refused with history-changed stays in edit mode and starts the transcript refresh", async () => {
+    const sendMessage = mock(() =>
+      Promise.resolve({ success: false as const, error: { type: "history-changed" as const } })
+    );
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "edit-id",
+      rangeStartMessageId: "edit-id",
+      rangeStartHistorySequence: 1,
+      newestMessageId: "newest-id",
+      newestHistorySequence: 2,
+      rangeRowCount: 2,
+      rangeFingerprint: "feedface",
+    };
+    const settled = await withTranscriptBarrier(true, async () =>
+      finishCommand(
+        await processSlashCommand(
+          { type: "compact" },
+          createEnv({
+            api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+            editMessageId: "edit-id",
+            historyEditPrecondition,
+          })
+        )
+      )
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expectDisposition(settled.result, "restore");
+    expect(settled.result.actions).toContainEqual({
+      type: "edit-history-changed",
+      editMessageId: "edit-id",
+      precondition: historyEditPrecondition,
+    });
+    expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
+  });
+
   test("compact validation errors restore without starting a phase", async () => {
     const result = await processSlashCommand(
       { type: "compact", model: "invalid" },
@@ -1299,7 +1334,7 @@ describe("executeCompaction transcript barrier", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("surfaces a history-changed refusal as its user-facing message", async () => {
+  test("surfaces a history-changed refusal as its user-facing message and keeps the typed refusal", async () => {
     const sendMessage = mock(() =>
       Promise.resolve({ success: false as const, error: { type: "history-changed" as const } })
     );
@@ -1314,7 +1349,11 @@ describe("executeCompaction transcript barrier", () => {
         historyEditPrecondition: editFence,
       })
     );
-    expect(result).toEqual({ success: false, error: EDIT_HISTORY_CHANGED_MESSAGE });
+    expect(result).toEqual({
+      success: false,
+      error: EDIT_HISTORY_CHANGED_MESSAGE,
+      historyChanged: true,
+    });
   });
 
   test("append-only compaction is not gated by the transcript barrier", async () => {

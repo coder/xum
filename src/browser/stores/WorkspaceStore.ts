@@ -2862,11 +2862,12 @@ export class WorkspaceStore {
   /**
    * Content evidence for editing `editMessageId`: the shared truncation rule and range
    * fingerprint (`buildHistoryEditPrecondition`) over the committed rows this client holds.
-   * The active stream's row is not evidence — its persisted form is a placeholder the edit
-   * interrupts anyway — and neither is a row the aggregator fabricated locally (a pre-stream
-   * error's synthetic assistant row has no persisted counterpart), but committed rows keep
-   * their `partial` flag on both sides, so they stay in. Returns undefined when the edited row
-   * is not held: the edit cannot be fenced and must not start.
+   * The active stream's row is evidence fenced by identity only (its persisted form is the
+   * placeholder the edit's interruption deletes — see `getHistoryEvidenceMessages`); a row the
+   * aggregator fabricated locally (a pre-stream error's synthetic assistant row has no
+   * persisted counterpart) is not. Committed rows keep their `partial` flag on both sides, so
+   * they stay in. Returns undefined when the edited row is not held: the edit cannot be fenced
+   * and must not start.
    */
   captureHistoryEditPrecondition(
     workspaceId: string,

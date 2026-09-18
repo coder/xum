@@ -197,11 +197,61 @@ describe("computeHistoryRangeFingerprint", () => {
     );
   });
 
-  test("ignores rows without a historySequence and rejects an inverted range", () => {
+  test("an empty assistant row completed without parts is settled, not a placeholder", () => {
+    const placeholder = createMuxMessage("a1", "assistant", "", { historySequence: 1 });
+    const placeholderHash = computeHistoryRangeFingerprint([placeholder], 1, 1).fingerprint;
+    // Stream end stamps completion metadata even when the turn produced no parts (refusal,
+    // content filter); any one of them settles the row.
+    for (const completion of [
+      { finishReason: "content-filter" },
+      { usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
+      { duration: 250 },
+    ]) {
+      const completedEmpty = createMuxMessage("a1", "assistant", "", {
+        historySequence: 1,
+        ...completion,
+      });
+      expect(computeHistoryRangeFingerprint([completedEmpty], 1, 1).fingerprint).not.toBe(
+        placeholderHash
+      );
+      // A settled empty row hashes its (empty) content, so two of them agree regardless of
+      // which completion fields they carry.
+      expect(computeHistoryRangeFingerprint([completedEmpty], 1, 1)).toEqual(
+        computeHistoryRangeFingerprint(
+          [createMuxMessage("a1", "assistant", "", { historySequence: 1, duration: 1 })],
+          1,
+          1
+        )
+      );
+    }
+    // An interrupted turn is unsettled by its `partial` flag whatever else it carries.
+    const abortedWithDuration = createMuxMessage("a1", "assistant", "", {
+      historySequence: 1,
+      partial: true,
+      duration: 250,
+    });
+    expect(computeHistoryRangeFingerprint([abortedWithDuration], 1, 1).fingerprint).toBe(
+      placeholderHash
+    );
+  });
+
+  test("ignores rows without a valid historySequence and rejects an inverted range", () => {
     const withUncommitted = [...rows, createMuxMessage("streaming", "assistant", "…")];
     expect(computeHistoryRangeFingerprint(withUncommitted, 0, 3)).toEqual(
       computeHistoryRangeFingerprint(rows, 0, 3)
     );
+    // The wire schema admits any number: negative and fractional sequences are not evidence.
+    const withMalformed = [
+      ...rows,
+      createMuxMessage("neg", "assistant", "…", { historySequence: -1 }),
+      createMuxMessage("frac", "assistant", "…", { historySequence: 2.5 }),
+      createMuxMessage("nan", "assistant", "…", { historySequence: Number.NaN }),
+    ];
+    expect(computeHistoryRangeFingerprint(withMalformed, 0, 3)).toEqual(
+      computeHistoryRangeFingerprint(rows, 0, 3)
+    );
     expect(() => computeHistoryRangeFingerprint(rows, 2, 1)).toThrow();
+    expect(() => computeHistoryRangeFingerprint(rows, -1, 1)).toThrow();
+    expect(() => computeHistoryRangeFingerprint(rows, 0, 1.5)).toThrow();
   });
 });
