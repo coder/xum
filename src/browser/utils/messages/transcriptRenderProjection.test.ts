@@ -4,6 +4,7 @@ import {
   computeOperationalBundleInfos,
   computeTaskAwaitPollGroupInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
 
@@ -98,6 +99,19 @@ function planDisplay(id: string, historyId: string): DisplayedMessage & { type: 
     historySequence: 1,
   };
 }
+
+describe("estimateTranscriptRowWeight", () => {
+  test("charges a stream error for the text it mounts, not a nominal marker", () => {
+    const verbose = { ...streamError("e1", "h-e1"), error: "x".repeat(50_000) };
+    const marker = streamError("e2", "h-e2");
+    // Distinct verbose failures are not merged, so a run of them would otherwise mount far more
+    // than the step ceiling accounts for.
+    expect(estimateTranscriptRowWeight(verbose)).toBeGreaterThanOrEqual(50_000);
+    expect(estimateTranscriptRowWeight(verbose) - estimateTranscriptRowWeight(marker)).toBe(
+      50_000 - marker.error.length
+    );
+  });
+});
 
 describe("work bundle coalescing", () => {
   test("collapses completed assistant work before the final row", () => {
