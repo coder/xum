@@ -2596,6 +2596,35 @@ function createFrontendWorkspaceMetadata(
   };
 }
 
+describe("WorkspaceService.getHistoryLoadMore", () => {
+  test("rejects on a failed page read instead of reporting an exhausted empty page", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "load-more-read-failure";
+    try {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "first", { historySequence: 0, timestamp: 1 })
+      );
+      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      // A legitimately empty read (nothing older) is still an exhausted page...
+      expect(
+        await workspaceService.getHistoryLoadMore(workspaceId, { beforeHistorySequence: 0 })
+      ).toEqual({ messages: [], nextCursor: null, hasOlder: false });
+      // ...but a read failure must not look like one: the client would take `hasOlder: false`
+      // as authoritative coverage (and edit-conflict recovery would report the row deleted).
+      spyOn(historyService, "getHistoryBoundaryWindow").mockResolvedValueOnce(
+        Err("EIO: disk unreadable")
+      );
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        workspaceService.getHistoryLoadMore(workspaceId, { beforeHistorySequence: 0 })
+      ).rejects.toThrow(/disk unreadable/);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService.stageAttachment", () => {
   test("waits for workspace init before writing into the workspace", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();

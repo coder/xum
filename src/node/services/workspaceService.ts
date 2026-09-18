@@ -15312,6 +15312,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       hasOlder: false,
     };
 
+    // A failed read is reported as a failure, never as an empty page with `hasOlder: false`:
+    // the client treats that shape as authoritative exhaustion (edit-conflict recovery would
+    // report the edited row gone while it still sits on disk), whereas a rejection keeps its
+    // pagination cursor so the page can be retried.
     try {
       let beforeHistorySequence: number | undefined = cursor?.beforeHistorySequence;
 
@@ -15322,11 +15326,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           0
         );
         if (!latestBoundaryResult.success) {
-          log.warn("workspace.history.loadMore: failed to read latest boundary", {
-            workspaceId,
-            error: latestBoundaryResult.error,
-          });
-          return emptyResult;
+          throw new Error(
+            `workspace.history.loadMore: failed to read latest boundary: ${latestBoundaryResult.error}`
+          );
         }
 
         const oldestFromLatestBoundary = getOldestSequencedMessage(latestBoundaryResult.data);
@@ -15347,12 +15349,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         beforeHistorySequence
       );
       if (!historyWindowResult.success) {
-        log.warn("workspace.history.loadMore: failed to read boundary window", {
-          workspaceId,
-          beforeHistorySequence,
-          error: historyWindowResult.error,
-        });
-        return emptyResult;
+        throw new Error(
+          `workspace.history.loadMore: failed to read boundary window before ${beforeHistorySequence}: ${historyWindowResult.error}`
+        );
       }
 
       const messages: WorkspaceChatMessage[] = historyWindowResult.data.messages.map((message) => ({
@@ -15395,7 +15394,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceId,
         error: getErrorMessage(error),
       });
-      return emptyResult;
+      throw error;
     }
   }
 

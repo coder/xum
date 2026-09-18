@@ -1037,7 +1037,6 @@ describe("compact and plan command results", () => {
       if (initial.kind !== "phase") throw new Error("expected phase result");
       expect(initial.actions).toEqual([
         { type: "clear-input" },
-        { type: "clear-attachments" },
         { type: "set-sending", sending: true },
       ]);
       return initial.continue();
@@ -1045,6 +1044,8 @@ describe("compact and plan command results", () => {
     expect(complete.kind).toBe("complete");
     if (complete.kind !== "complete") throw new Error("expected complete result");
     expectDisposition(complete, "consume");
+    // Attachments are cleared only once compaction actually started.
+    expect(complete.actions).toContainEqual({ type: "clear-attachments" });
     expect(complete.actions).toContainEqual({ type: "cancel-edit" });
     expect(complete.actions).toContainEqual({ type: "check-reviews", reviewIds: ["review-1"] });
     expect(complete.actions).toContainEqual({ type: "message-sent", dispatchMode: "turn-end" });
@@ -1111,6 +1112,8 @@ describe("compact and plan command results", () => {
       precondition: historyEditPrecondition,
     });
     expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
+    // The whole draft comes back for review: no phase or completion action dropped the files.
+    expect(settled.batches.flat()).not.toContainEqual({ type: "clear-attachments" });
   });
 
   test("compact validation errors restore without starting a phase", async () => {

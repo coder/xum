@@ -1700,89 +1700,86 @@ function handleCompactCommand(
     return complete("restore", [showToast(createInvalidCompactModelToast(parsed.model))]);
   }
 
-  return phase(
-    [
-      { type: "clear-input" },
-      { type: "clear-attachments" },
-      { type: "set-sending", sending: true },
-    ],
-    async () => {
-      try {
-        const stagedAttachments = env.attachments ? getStagedAttachments(env.attachments) : [];
-        const hasContent =
-          parsed.continueMessage ??
-          env.fileParts?.length ??
-          env.reviews?.length ??
-          stagedAttachments.length;
-        const followUpContent: CompactionFollowUpInput | undefined = hasContent
-          ? {
-              text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
-              fileParts: env.fileParts,
-              reviews: env.reviews,
-            }
-          : undefined;
-        const result = await executeCompaction({
-          api: env.api,
-          workspaceId: env.workspaceId,
-          maxOutputTokens: parsed.maxOutputTokens,
-          followUpContent,
-          model: normalizedModel.model ?? undefined,
-          sendMessageOptions: env.sendMessageOptions,
-          editMessageId: env.editMessageId,
-          historyEditPrecondition: env.historyEditPrecondition,
-        });
-        if (!result.success) {
-          console.error("Failed to initiate compaction:", result.error);
-          return complete("restore", [
-            showToast({
-              id: Date.now().toString(),
-              type: "error",
-              message: result.error ?? "Failed to start compaction",
-            }),
-            { type: "set-sending", sending: false },
-            // An editing /compact refused with `history-changed` recovers exactly like a refused
-            // edit send: stay in edit mode and refresh the transcript for an explicit re-send.
-            ...(result.historyChanged && env.editMessageId && env.historyEditPrecondition
-              ? ([
-                  {
-                    type: "edit-history-changed",
-                    editMessageId: env.editMessageId,
-                    precondition: env.historyEditPrecondition,
-                  },
-                ] satisfies CommandAction[])
-              : []),
-          ]);
-        }
-        trackCommandUsed("compact");
-        return complete("consume", [
-          showToast({
-            id: Date.now().toString(),
-            type: "success",
-            message: parsed.continueMessage
-              ? "Compaction started. Will continue automatically after completion."
-              : "Compaction started. AI will summarize the conversation.",
-          }),
-          ...(env.editMessageId ? ([{ type: "cancel-edit" }] satisfies CommandAction[]) : []),
-          { type: "set-sending", sending: false },
-          { type: "check-reviews", reviewIds: env.attachedReviewIds ?? [] },
-          {
-            type: "message-sent",
-            dispatchMode: env.sendMessageOptions.queueDispatchMode ?? "tool-end",
-          },
-        ]);
-      } catch (error) {
-        console.error("Compaction error:", error);
+  // Attachments are cleared only once compaction has started (like `/clear`): every failure
+  // path below restores the text with `"restore"`, and a refused edit (`history-changed`) must
+  // hand the whole draft back for review, files included.
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    try {
+      const stagedAttachments = env.attachments ? getStagedAttachments(env.attachments) : [];
+      const hasContent =
+        parsed.continueMessage ??
+        env.fileParts?.length ??
+        env.reviews?.length ??
+        stagedAttachments.length;
+      const followUpContent: CompactionFollowUpInput | undefined = hasContent
+        ? {
+            text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
+            fileParts: env.fileParts,
+            reviews: env.reviews,
+          }
+        : undefined;
+      const result = await executeCompaction({
+        api: env.api,
+        workspaceId: env.workspaceId,
+        maxOutputTokens: parsed.maxOutputTokens,
+        followUpContent,
+        model: normalizedModel.model ?? undefined,
+        sendMessageOptions: env.sendMessageOptions,
+        editMessageId: env.editMessageId,
+        historyEditPrecondition: env.historyEditPrecondition,
+      });
+      if (!result.success) {
+        console.error("Failed to initiate compaction:", result.error);
         return complete("restore", [
           showToast({
             id: Date.now().toString(),
             type: "error",
-            message: error instanceof Error ? error.message : "Failed to start compaction",
+            message: result.error ?? "Failed to start compaction",
           }),
           { type: "set-sending", sending: false },
+          // An editing /compact refused with `history-changed` recovers exactly like a refused
+          // edit send: stay in edit mode and refresh the transcript for an explicit re-send.
+          ...(result.historyChanged && env.editMessageId && env.historyEditPrecondition
+            ? ([
+                {
+                  type: "edit-history-changed",
+                  editMessageId: env.editMessageId,
+                  precondition: env.historyEditPrecondition,
+                },
+              ] satisfies CommandAction[])
+            : []),
         ]);
       }
+      trackCommandUsed("compact");
+      return complete("consume", [
+        { type: "clear-attachments" },
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: parsed.continueMessage
+            ? "Compaction started. Will continue automatically after completion."
+            : "Compaction started. AI will summarize the conversation.",
+        }),
+        ...(env.editMessageId ? ([{ type: "cancel-edit" }] satisfies CommandAction[]) : []),
+        { type: "set-sending", sending: false },
+        { type: "check-reviews", reviewIds: env.attachedReviewIds ?? [] },
+        {
+          type: "message-sent",
+          dispatchMode: env.sendMessageOptions.queueDispatchMode ?? "tool-end",
+        },
+      ]);
+    } catch (error) {
+      console.error("Compaction error:", error);
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Failed to start compaction",
+        }),
+        { type: "set-sending", sending: false },
+      ]);
     }
-  );
+  });
 }
 
 function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
