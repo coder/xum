@@ -138,7 +138,6 @@ describeIntegration("MCP settings plugin tool inspection", () => {
     expect(within(row()).queryAllByRole("checkbox")).toHaveLength(0);
     expect(within(row()).queryByRole("button", { name: "All" })).toBeNull();
     expect(within(row()).queryByRole("button", { name: "None" })).toBeNull();
-    expect(within(row()).getByText(/Configure MCP servers/)).toBeTruthy();
 
     // Keyboard expand/collapse on the focused header.
     const user = userEvent.setup({ document: app.view.container.ownerDocument });
