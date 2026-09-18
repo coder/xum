@@ -121,6 +121,43 @@ function toolCalls(options: {
   return [search, fetch, local, ...(options.nested ? [nested] : [])];
 }
 
+/** One user request, one assistant turn carrying the tool calls, one answer. */
+function setupIdentityChat(options: {
+  variant: string;
+  phone?: boolean;
+  request: string;
+  lookup: string;
+  answer: string;
+  toolCalls: MuxToolPart[];
+}) {
+  if (options.phone) collapseLeftSidebar();
+  else expandLeftSidebar();
+  expandProjects(["/home/user/projects/xum"]);
+  // The app's singleton WorkspaceStore retains history by workspace ID across
+  // story switches. Distinct fixture histories need distinct workspace IDs.
+  return setupSimpleChatStory({
+    workspaceId: `ws-mcp-tool-identity-${options.variant}`,
+    workspaceName: "mcp-server-identity",
+    projectName: "xum",
+    mcpIcons: new Map([[REF_LIVE, NOTION_ICON]]),
+    messages: [
+      createUserMessage("request", options.request, {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+      }),
+      createAssistantMessage("lookup", options.lookup, {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP + 1000,
+        toolCalls: options.toolCalls,
+      }),
+      createAssistantMessage("answer", options.answer, {
+        historySequence: 3,
+        timestamp: STABLE_TIMESTAMP + 2000,
+      }),
+    ],
+  });
+}
+
 function setupChat(options: {
   branded: boolean;
   historical?: boolean;
@@ -128,11 +165,6 @@ function setupChat(options: {
   phone?: boolean;
   longTitle?: boolean;
 }) {
-  if (options.phone) collapseLeftSidebar();
-  else expandLeftSidebar();
-  expandProjects(["/home/user/projects/xum"]);
-  // The app's singleton WorkspaceStore retains history by workspace ID across
-  // story switches. Distinct fixture histories need distinct workspace IDs.
   const variant = options.longTitle
     ? "long-title"
     : options.phone
@@ -144,27 +176,13 @@ function setupChat(options: {
           : options.branded
             ? "branded"
             : "plain";
-  return setupSimpleChatStory({
-    workspaceId: `ws-mcp-tool-identity-${variant}`,
-    workspaceName: "mcp-server-identity",
-    projectName: "xum",
-    mcpIcons: new Map([[REF_LIVE, NOTION_ICON]]),
-    messages: [
-      createUserMessage(
-        "request",
-        "Find our workspace setup guide in Notion and check it against the local docs.",
-        { historySequence: 1, timestamp: STABLE_TIMESTAMP }
-      ),
-      createAssistantMessage(
-        "lookup",
-        "I’ll check the connected Notion workspace and the local documentation.",
-        { historySequence: 2, timestamp: STABLE_TIMESTAMP + 1000, toolCalls: toolCalls(options) }
-      ),
-      createAssistantMessage("answer", "Both guides agree: run `bun install`, then `make dev`.", {
-        historySequence: 3,
-        timestamp: STABLE_TIMESTAMP + 2000,
-      }),
-    ],
+  return setupIdentityChat({
+    variant,
+    phone: options.phone,
+    request: "Find our workspace setup guide in Notion and check it against the local docs.",
+    lookup: "I’ll check the connected Notion workspace and the local documentation.",
+    answer: "Both guides agree: run `bun install`, then `make dev`.",
+    toolCalls: toolCalls(options),
   });
 }
 
@@ -343,5 +361,241 @@ export const LongTitlePhone: AppStory = {
     await expect(search.name.getBoundingClientRect().right).toBeLessThanOrEqual(
       frame.getBoundingClientRect().right
     );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Agent Plugin servers. Their connection key is `plugin:<16 hex instance
+// id>:<server>` and the model-facing tool name is that key normalized plus
+// the tool, so without the badge chat would read
+// `plugin_656443adaa7377b9_coder_coder_create_chat`. Seeded history, not live
+// calls: the snapshots below are what the host would have frozen on the parts.
+// ---------------------------------------------------------------------------
+
+/** Two installations of the same plugin server: distinct instance IDs, same branding. */
+const CODER_A_KEY = "plugin:656443adaa7377b9:coder";
+const CODER_B_KEY = "plugin:9f8e7d6c5b4a3210:coder";
+const CODER_A_INFO = `Server information: ${CODER_A_KEY}`;
+const CODER_B_INFO = `Server information: ${CODER_B_KEY}`;
+const CODER_A_CREATE_CHAT = "plugin_656443adaa7377b9_coder_coder_create_chat";
+const CODER_B_LIST_TEMPLATES = "plugin_9f8e7d6c5b4a3210_coder_coder_list_templates";
+/** Captured before identity snapshots existed: no `mcpServer`, so the raw name must stay. */
+const CODER_A_LEGACY = "plugin_656443adaa7377b9_coder_coder_get_workspace";
+/**
+ * Shape buildMcpToolName yields once the base exceeds 64 chars: base cut to
+ * 55, then `_` + 8-char hash. The hash must survive on the short label.
+ */
+const CODER_A_LONG = "plugin_656443adaa7377b9_coder_coder_create_workspace_bu_1a2b3c4d";
+const CODER_A_LONG_SHORT = "coder_create_workspace_bu_1a2b3c4d";
+/** Ordinary (non-plugin) server whose normalized key also prefixes its tools. */
+const NOTION_PLAIN = "notion_work_notion_ai_search";
+
+function coderSnapshot(key: string, version: string): MCPToolCallDisplay {
+  return {
+    connection: { key, transport: "stdio" },
+    identity: {
+      name: "coder-mcp",
+      title: "Coder",
+      version,
+      description: "Manage Coder workspaces, templates and agent chats.",
+      websiteUrl: "https://coder.com",
+    },
+    source: "connection",
+  };
+}
+
+function pluginToolCalls(options: { nested?: boolean }): MuxToolPart[] {
+  const createChat: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "coder-create-chat",
+    toolName: CODER_A_CREATE_CHAT,
+    state: "output-available",
+    input: { task: "Run the UAT round on the pushed SHA", organization_id: "703f72a1" },
+    output: text("Created chat 6b1c… (running)."),
+    mcpServer: coderSnapshot(CODER_A_KEY, "2.0.0"),
+  };
+  const listTemplates: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "coder-list-templates",
+    toolName: CODER_B_LIST_TEMPLATES,
+    state: "output-available",
+    input: {},
+    output: text("coder (Write Coder on Coder), agents_allowed=true"),
+    mcpServer: coderSnapshot(CODER_B_KEY, "1.9.0"),
+  };
+  const legacy: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "coder-legacy",
+    toolName: CODER_A_LEGACY,
+    state: "output-available",
+    input: { workspace: "uat-runner" },
+    output: text("uat-runner: running"),
+  };
+  const long: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "coder-long",
+    toolName: CODER_A_LONG,
+    state: "output-available",
+    input: { template_version: "v42" },
+    output: text("Build queued."),
+    mcpServer: coderSnapshot(CODER_A_KEY, "2.0.0"),
+  };
+  const notion: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "notion-plain",
+    toolName: NOTION_PLAIN,
+    state: "output-available",
+    input: { query: "UAT checklist" },
+    output: text("Found: UAT checklist."),
+    mcpServer: notionSnapshot(REF_LIVE, "1.2.0"),
+  };
+  const nested: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "coder-code",
+    toolName: "code_execution",
+    state: "output-available",
+    input: { code: "return await mux.tool('coder_create_chat', { task: 'retry' });" },
+    output: { success: true, result: "ok", toolCalls: [], consoleOutput: [], duration_ms: 42 },
+    nestedCalls: [
+      {
+        toolCallId: "nested-coder",
+        toolName: CODER_A_CREATE_CHAT,
+        input: { task: "retry" },
+        output: text("Created chat 7c2d…"),
+        state: "output-available",
+        mcpServer: coderSnapshot(CODER_A_KEY, "2.0.0"),
+      },
+      {
+        toolCallId: "nested-legacy",
+        toolName: CODER_A_LEGACY,
+        input: { workspace: "uat-runner" },
+        output: text("uat-runner: running"),
+        state: "output-available",
+      },
+    ],
+  };
+  return [createChat, listTemplates, legacy, long, notion, ...(options.nested ? [nested] : [])];
+}
+
+function setupPluginChat(options: { nested?: boolean; phone?: boolean }) {
+  return setupIdentityChat({
+    variant: `plugin-${options.phone ? "phone" : options.nested ? "nested" : "desktop"}`,
+    phone: options.phone,
+    request: "Kick off a UAT chat on Coder and pull the checklist from Notion.",
+    lookup: "I’ll use the installed Coder plugin and the Notion connection.",
+    answer: "UAT chat created; the checklist is attached above.",
+    toolCalls: pluginToolCalls(options),
+  });
+}
+
+async function preparePluginChat(root: HTMLElement) {
+  await waitForScrollStabilization(root);
+  blurActiveElement();
+  await within(root).findByText("coder_list_templates", { exact: true });
+}
+
+/** Association rules the header must honor; returns the rows later plays interact with. */
+async function expectPluginLabels(root: HTMLElement) {
+  const create = toolCard(root, "coder_create_chat");
+  const createBadge = within(create.header).getByRole("button", { name: CODER_A_INFO });
+  await expect(createBadge).toHaveTextContent("Coder");
+  const list = toolCard(root, "coder_list_templates");
+  within(list.header).getByRole("button", { name: CODER_B_INFO });
+  const long = toolCard(root, CODER_A_LONG_SHORT);
+  within(long.header).getByRole("button", { name: CODER_A_INFO });
+  // The installation hash never reaches a matched row's label...
+  for (const { header } of [create, list, long]) {
+    await expect(header).not.toHaveTextContent(/plugin_[0-9a-f]{16}/);
+  }
+  // ...but older history without a snapshot keeps its raw name, unparsed.
+  const legacy = toolCard(root, CODER_A_LEGACY);
+  await expect(
+    within(legacy.header).queryByRole("button", { name: /Server information/ })
+  ).not.toBeInTheDocument();
+  // Non-plugin servers are never shortened, even with a matching prefix.
+  const notion = toolCard(root, NOTION_PLAIN);
+  within(notion.header).getByRole("button", { name: INFO_BUTTON });
+  return { create, createBadge, list, long, legacy };
+}
+
+export const PluginTools: AppStory = {
+  render: () => <AppWithMocks setup={() => setupPluginChat({})} />,
+  parameters: laptop,
+  play: async ({ canvasElement }) => {
+    await preparePluginChat(canvasElement);
+    await expectPluginLabels(canvasElement);
+  },
+};
+
+export const PluginServerDetails: AppStory = {
+  ...PluginTools,
+  play: async ({ canvasElement }) => {
+    await preparePluginChat(canvasElement);
+    const { create, createBadge, list } = await expectPluginLabels(canvasElement);
+    await userEvent.click(createBadge);
+    const dialog = await within(document.body).findByRole("dialog", {
+      name: `About ${CODER_A_KEY}`,
+    });
+    // The popover keeps the exact configured connection the label dropped.
+    await expect(dialog).toHaveTextContent(CODER_A_KEY);
+    await expect(dialog).toHaveTextContent("v2.0.0");
+    await expect(dialog).toHaveTextContent("stdio");
+    await expect(create.card).not.toHaveTextContent("Arguments");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    // The sibling installation resolves to its own connection and version.
+    await userEvent.click(within(list.header).getByRole("button", { name: CODER_B_INFO }));
+    const sibling = await within(document.body).findByRole("dialog", {
+      name: `About ${CODER_B_KEY}`,
+    });
+    await expect(sibling).toHaveTextContent(CODER_B_KEY);
+    await expect(sibling).toHaveTextContent("v1.9.0");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(sibling).not.toBeInTheDocument());
+    // Expanding still works from the short label and shows the untouched call.
+    await userEvent.click(create.name);
+    await expect(create.card).toHaveTextContent("Arguments");
+    await expect(create.card).toHaveTextContent("Run the UAT round on the pushed SHA");
+  },
+};
+
+export const PluginNested: AppStory = {
+  ...PluginTools,
+  render: () => <AppWithMocks setup={() => setupPluginChat({ nested: true })} />,
+  play: async ({ canvasElement }) => {
+    await preparePluginChat(canvasElement);
+    await expectPluginLabels(canvasElement);
+    // Nested rows go through the same header: shortened with its badge, or raw without one.
+    const nested = toolCard(canvasElement, "coder_create_chat", 1);
+    within(nested.header).getByRole("button", { name: CODER_A_INFO });
+    await expect(nested.header).not.toHaveTextContent(/plugin_[0-9a-f]{16}/);
+    const nestedLegacy = toolCard(canvasElement, CODER_A_LEGACY, 1);
+    await expect(
+      within(nestedLegacy.header).queryByRole("button", { name: /Server information/ })
+    ).not.toBeInTheDocument();
+  },
+};
+
+/** 375 px frame: short labels, badges and status must all fit without horizontal overflow. */
+export const PluginPhone: AppStory = {
+  ...PluginTools,
+  render: () => <AppWithMocks setup={() => setupPluginChat({ phone: true })} />,
+  decorators: [PhoneFrameDecorator],
+  globals: phoneGlobals,
+  parameters: phoneParameters,
+  play: async (context) => {
+    await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
+    const frame = await within(context.canvasElement).findByTestId("phone-frame");
+    await expect(frame.clientWidth).toBe(PHONE_FRAME.width);
+    await preparePluginChat(frame);
+    const { create, list, long } = await expectPluginLabels(frame);
+    for (const { header, name } of [create, list, long]) {
+      await expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
+      await expect(name).toBeVisible();
+      await expect(name.getBoundingClientRect().right).toBeLessThanOrEqual(
+        frame.getBoundingClientRect().right
+      );
+    }
+    await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth);
   },
 };
