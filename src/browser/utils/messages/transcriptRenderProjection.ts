@@ -151,6 +151,10 @@ export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
         estimateToolPayloadChars(message.args) +
         estimateToolPayloadChars(message.result)
       );
+    case "stream-error":
+      // Rendered in full; distinct verbose provider failures are not merged, so a run of them
+      // must count as the text it mounts, not as markers.
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS + message.error.length;
     default:
       return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS;
   }
