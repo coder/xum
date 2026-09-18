@@ -798,7 +798,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  const handleJumpToBottom = jumpToBottom;
+  // Returning to the live tail supersedes a navigation still waiting for its row to mount;
+  // otherwise the historical chunk mounting later would scroll away from the tail again.
+  const handleJumpToBottom = useCallback(() => {
+    setPendingScrollTarget(null);
+    jumpToBottom();
+  }, [jumpToBottom]);
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
@@ -1079,8 +1084,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // on the edited message. Dismissing the edit hands scroll ownership back to
     // the transcript tail; without this the view stays scrolled up until the
     // user manually returns to the bottom.
-    jumpToBottom();
-  }, [jumpToBottom, setEditingMessage]);
+    handleJumpToBottom();
+  }, [handleJumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
