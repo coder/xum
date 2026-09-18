@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Loader2, MessagesSquare } from "lucide-react";
+import { MessagesSquare } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import {
   Dialog,
@@ -25,10 +25,12 @@ interface WorkspaceUnrelatedMessagingModalProps {
 }
 
 /**
- * One switch controlling BOTH cross-tree discovery and incoming messages from unrelated local
- * workspaces (other task trees in this Xum instance). Same-tree messaging is unaffected. The
- * consent is application-level: any process running as the same user with access to the config
- * can change it, so the copy below avoids claiming isolation.
+ * One switch controlling incoming messages from unrelated local workspaces (other task trees in
+ * this Xum instance) and, where cross-workspace discovery is available, whether they can list this
+ * chat. The copy states discovery conditionally: this dialog ships before discovery does, and must
+ * not promise an exposure that is not yet wired. Same-tree messaging is unaffected. The consent is
+ * application-level: any process running as the same user with access to the config can change
+ * it, so the copy below avoids claiming isolation.
  */
 export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessagingModalProps) {
   const [isSaving, setIsSaving] = useState(false);
@@ -76,7 +78,7 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                   id="unrelated-messaging-consent-label"
                   className="text-foreground text-sm font-medium"
                 >
-                  Allow unrelated workspaces to find and message this chat
+                  Allow messages from unrelated workspaces
                 </div>
                 <DialogDescription className="text-muted mt-1 text-xs">
                   Applies to agents in other local chats in this Xum instance, outside this
@@ -85,8 +87,7 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {isSaving && (
-                  <span role="status" className="text-muted flex items-center gap-1 text-xs">
-                    <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
+                  <span role="status" className="text-muted text-xs">
                     Saving
                   </span>
                 )}
@@ -102,8 +103,9 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
 
           <ul className="text-muted list-disc space-y-1.5 pl-5 text-xs">
             <li>
-              While on, other local agents can list this chat&apos;s title, branch name, project
-              path, and busy/idle state, and send it messages.
+              While on, other local agents can send this chat messages. Where cross-workspace
+              discovery is available, they can also list this chat&apos;s title, branch name,
+              project path, and busy/idle state.
             </li>
             <li>
               Incoming messages arrive as untrusted agent text. If this chat is idle, they wake it
@@ -112,9 +114,9 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
               the next tool boundary instead, which interrupts sooner).
             </li>
             <li>
-              Turning this off stops new deliveries and discovery. Messages already received stay in
-              the transcript, and a reply that is already running finishes. After an app restart,
-              resume these turns yourself.
+              Turning this off stops new deliveries and removes this chat from any such listing.
+              Messages already received stay in the transcript, and a reply that is already running
+              finishes. After an app restart, resume these turns yourself.
             </li>
           </ul>
 

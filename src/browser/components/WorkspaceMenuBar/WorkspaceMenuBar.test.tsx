@@ -19,6 +19,7 @@ import * as TutorialContextModule from "@/browser/contexts/TutorialContext";
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { WorkspaceMenuBar as WorkspaceMenuBarComponent } from "./WorkspaceMenuBar";
 import * as WorkspaceMCPModalModule from "../WorkspaceMCPModal/WorkspaceMCPModal";
+import * as WorkspaceUnrelatedMessagingModalModule from "../WorkspaceUnrelatedMessagingModal";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as PopoverModule from "../Popover/Popover";
 import * as CheckboxModule from "../Checkbox/Checkbox";
@@ -61,6 +62,7 @@ function getLastMenuContentProps() {
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
             onOpenTimeline?: (() => void) | null;
+            onConfigureUnrelatedMessaging?: () => void;
           },
         ]
       >;
@@ -283,6 +285,13 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(TimelineDialogModule, "TimelineDialog").mockImplementation(
     (() => null) as unknown as typeof TimelineDialogModule.TimelineDialog
   );
+  spyOn(
+    WorkspaceUnrelatedMessagingModalModule,
+    "WorkspaceUnrelatedMessagingModal"
+  ).mockImplementation(
+    (() =>
+      null) as unknown as typeof WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal
+  );
 }
 
 // Records render props like the WorkspaceActionsMenuContent double, so tests can
@@ -291,6 +300,15 @@ function getLastTimelineDialogProps() {
   const spy = TimelineDialogModule.TimelineDialog as unknown as {
     mock: { calls: Array<[{ workspaceId: string; open: boolean }]> };
   };
+  return spy.mock.calls.at(-1)?.[0];
+}
+
+// Same recording double for the consent dialog (Radix portals do not render in happy-dom).
+function getLastUnrelatedMessagingModalProps() {
+  const spy =
+    WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
+      mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+    };
   return spy.mock.calls.at(-1)?.[0];
 }
 
@@ -584,6 +602,42 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     view.rerender(<WorkspaceMenuBar {...defaultProps} />);
 
     expect(getLastTimelineDialogProps()?.open).toBe(false);
+  });
+
+  it.each([
+    {
+      opener: "More menu",
+      open: () => getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.(),
+    },
+    {
+      opener: "keyboard shortcut",
+      open: () => fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true }),
+    },
+  ])("closes the consent dialog opened from the $opener when switching workspaces", ({ open }) => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    act(() => {
+      open();
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
+
+    // Consent is granted per recipient workspace. Selecting another workspace while App
+    // reuses this menu bar must close the dialog so the switch cannot be flipped against
+    // the workspace the user navigated to.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    // A callback retained from the first workspace's dialog cannot reopen it here either.
+    act(() => {
+      staleOnOpenChange(true);
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    // Returning does not resurrect it: the retained id is cleared on leave.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
   });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {

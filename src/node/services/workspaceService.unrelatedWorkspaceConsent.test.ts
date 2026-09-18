@@ -88,15 +88,26 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
 
   test("consent is off by default and revoking an already-off workspace is a committed no-op", async () => {
     expect(harness.persistedConsent()).toBeUndefined();
-    const metadataEvents: unknown[] = [];
-    service.on("metadata", (event: { workspaceId: string }) => metadataEvents.push(event));
+    const metadataEvents: Array<{
+      workspaceId: string;
+      metadata: { unrelatedWorkspaceConsent?: string } | null;
+    }> = [];
+    service.on(
+      "metadata",
+      (event: { workspaceId: string; metadata: { unrelatedWorkspaceConsent?: string } | null }) =>
+        metadataEvents.push(event)
+    );
 
     const result = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false);
 
     expect(result.success).toBe(true);
     expect(harness.persistedConsent()).toBeUndefined();
-    // Nothing changed on disk, so nothing is republished.
-    expect(metadataEvents).toEqual([]);
+    // Nothing changed on disk, but the authoritative state is still republished: the Ok ack
+    // promises "committed AND published", and a no-op is what a retry after a failed
+    // publication looks like.
+    expect(metadataEvents).toHaveLength(1);
+    expect(metadataEvents[0].workspaceId).toBe(WORKSPACE_ID);
+    expect(metadataEvents[0].metadata?.unrelatedWorkspaceConsent).toBeUndefined();
   });
 
   test("enabling persists an opaque generation, publishes metadata, and stays idempotent while on", async () => {
@@ -132,12 +143,73 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
       undefined
     );
 
-    // Already on: the generation is retained (no revocation semantics on a repeat enable).
+    // Already on: the generation is retained (no revocation semantics on a repeat enable),
+    // and the unchanged state is republished so a retry can heal a stale UI.
     const again = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true);
     expect(again.success).toBe(true);
     expect(harness.persistedConsent()).toBe(generation);
-    expect(published).toHaveLength(1);
+    expect(published).toHaveLength(2);
+    expect(published[1].workspaceId).toBe(WORKSPACE_ID);
+    expect(published[1].metadata?.unrelatedWorkspaceConsent).toBe(generation as string);
   });
+
+  test.each([
+    { label: "enabling", enabled: true },
+    { label: "disabling", enabled: false },
+  ])(
+    "$label: a failed publication leaves the write committed and the idempotent retry publishes it",
+    async ({ enabled }) => {
+      // Start from the opposite state so the first call is a real transition.
+      if (!enabled) {
+        expect((await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(true);
+      }
+      const before = harness.persistedConsent();
+
+      // A real downstream consumer failing during publication: registered first so it runs
+      // before the observing listener and aborts the emit (EventEmitter runs listeners
+      // synchronously and propagates the throw).
+      let failNextPublication = true;
+      service.on("metadata", () => {
+        if (failNextPublication) {
+          failNextPublication = false;
+          throw new Error("metadata consumer exploded");
+        }
+      });
+      const published: Array<{
+        workspaceId: string;
+        metadata: { unrelatedWorkspaceConsent?: string } | null;
+      }> = [];
+      service.on(
+        "metadata",
+        (event: { workspaceId: string; metadata: { unrelatedWorkspaceConsent?: string } | null }) =>
+          published.push(event)
+      );
+
+      const first = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, enabled);
+      // The ack is "committed AND published", so a publication failure is an error...
+      expect(first.success).toBe(false);
+      // ...but the config write already happened and is not rolled back.
+      const committed = harness.persistedConsent();
+      expect(committed).not.toBe(before);
+      if (enabled) {
+        expect(getValidUnrelatedWorkspaceConsent(committed)).toBe(committed as string);
+      } else {
+        expect(committed).toBeUndefined();
+      }
+      expect(published).toEqual([]);
+
+      // Retrying the same value is a no-op on disk yet must publish the authoritative state:
+      // same generation (no re-mint, so nothing admitted under it is invalidated), same "off".
+      const retry = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, enabled);
+      expect(retry.success).toBe(true);
+      expect(harness.persistedConsent()).toBe(committed);
+      expect(published).toHaveLength(1);
+      expect(published[0].workspaceId).toBe(WORKSPACE_ID);
+      expect(published[0].metadata?.unrelatedWorkspaceConsent).toBe(
+        enabled ? (committed as string) : undefined
+      );
+    }
+  );
 
   test("revoking deletes the field and re-enabling mints a different generation", async () => {
     expect((await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(true);
@@ -182,11 +254,15 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
     expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
   });
 
-  test("rejects unknown workspaces without touching config", async () => {
+  test("rejects unknown workspaces without touching config or publishing", async () => {
     const before = JSON.stringify([...config.loadConfigOrDefault().projects.entries()]);
+    const metadataEvents: unknown[] = [];
+    service.on("metadata", (event: unknown) => metadataEvents.push(event));
     const result = await service.setUnrelatedWorkspaceConsent("0000000000", true);
     expect(result.success).toBe(false);
     expect(JSON.stringify([...config.loadConfigOrDefault().projects.entries()])).toBe(before);
+    // Republishing is for successful writes only; a rejected id must not emit a null row.
+    expect(metadataEvents).toEqual([]);
   });
 
   test("loading a child does not derive consent from its parent", async () => {

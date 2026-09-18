@@ -132,7 +132,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
-  const [unrelatedMessagingModalOpen, setUnrelatedMessagingModalOpen] = useState(false);
+  // Keyed by workspace (same pattern as the timeline dialog below): consent is granted per
+  // recipient workspace, so switching workspaces while the dialog is open must close it
+  // rather than let the switch be flipped against the workspace the user navigated to.
+  const [unrelatedMessagingWorkspaceId, setUnrelatedMessagingWorkspaceId] = useState<string | null>(
+    null
+  );
+  if (unrelatedMessagingWorkspaceId !== null && unrelatedMessagingWorkspaceId !== workspaceId) {
+    setUnrelatedMessagingWorkspaceId(null);
+  }
+  const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
   // workspace" action) implicitly closes the dialog instead of covering the new view.
   const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
@@ -532,12 +541,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     const handler = (e: KeyboardEvent) => {
       if (matchesKeybind(e, KEYBINDS.CONFIGURE_UNRELATED_MESSAGING)) {
         e.preventDefault();
-        setUnrelatedMessagingModalOpen(true);
+        setUnrelatedMessagingWorkspaceId(workspaceId);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [workspaceId]);
 
   useEffect(() => {
     isSkillsMountedRef.current = true;
@@ -847,7 +856,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onConfigureHeartbeat={
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
-              onConfigureUnrelatedMessaging={() => setUnrelatedMessagingModalOpen(true)}
+              onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
@@ -903,7 +912,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       )}
       <WorkspaceUnrelatedMessagingModal
         open={unrelatedMessagingModalOpen}
-        onOpenChange={setUnrelatedMessagingModalOpen}
+        onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
         // Read straight from published metadata: the switch moves only after the backend
         // commits and republishes, never on the local ack alone.
         enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}

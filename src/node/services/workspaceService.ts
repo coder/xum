@@ -7436,7 +7436,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
-      let outcome: Result<{ changed: boolean }, string> = Err("Workspace not found");
+      let outcome: Result<void, string> = Err("Workspace not found");
       await this.config.editConfig((freshConfig) => {
         const entry = this.findFreshWorkspaceEntry(freshConfig, {
           projectPath,
@@ -7447,36 +7447,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           outcome = Err("Workspace not found");
           return freshConfig;
         }
-        const current = getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent);
+        outcome = Ok(undefined);
         if (!enabled) {
           // Absent is the only "off" representation on disk. A malformed value already reads
           // as off, but it is scrubbed here so the entry does not carry junk indefinitely.
-          if (!("unrelatedWorkspaceConsent" in entry)) {
-            outcome = Ok({ changed: false });
-            return freshConfig;
-          }
           delete entry.unrelatedWorkspaceConsent;
-          outcome = Ok({ changed: true });
           return freshConfig;
         }
-        if (current != null) {
-          outcome = Ok({ changed: false });
+        if (getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent) != null) {
+          // Already on: keep the generation (a repeat enable is not a revocation).
           return freshConfig;
         }
         // Off (or malformed) → on: a NEW generation, so nothing admitted under an earlier
         // consent can be revived by re-enabling.
         entry.unrelatedWorkspaceConsent = crypto.randomUUID();
-        outcome = Ok({ changed: true });
         return freshConfig;
       });
       if (!outcome.success) {
         return Err(outcome.error);
       }
-      if (outcome.data.changed) {
-        // Publish only after the config write above has committed so metadata readers never
-        // observe a generation that is not yet durable.
-        await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
-      }
+      // Publish after EVERY successful write, including on-disk no-ops. The write above is
+      // committed before this runs, so metadata readers never observe a generation that is
+      // not yet durable; and if publication throws (the Err below), the retry with the same
+      // value is a no-op on disk but is exactly what gets the authoritative state to the UI.
+      // Gating on "changed" would leave the switch stale forever after one failed publish.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
