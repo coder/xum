@@ -1520,7 +1520,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
-              aria-live={canInterrupt ? "polite" : "off"}
+              // Live only once the historical reveal has finished: chunks of replayed history
+              // mounting during a stream would otherwise be announced as fresh output.
+              aria-live={canInterrupt && isFullyRevealed ? "polite" : "off"}
               aria-busy={canInterrupt || isHydratingTranscript}
               aria-label="Conversation transcript"
               className={cn(
