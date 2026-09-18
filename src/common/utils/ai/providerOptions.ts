@@ -509,13 +509,10 @@ export function buildProviderOptions(
           }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
-    // Bedrock Mantle keeps the openai.<model> ID on the wire, which
-    // @ai-sdk/openai does not classify as a reasoning model (it keys on
-    // gpt-*/o* IDs), so it would drop reasoning.effort with a warning and
-    // Mantle would run its default effort whatever the thinking level. Every
-    // OpenAI model Bedrock serves is a reasoning model, so force the
-    // classification. Mantle also rejects reasoning.summary values other than
-    // "auto" with HTTP 400.
+    // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
+    // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
+    // would drop reasoning.effort. Force the classification; Mantle rejects
+    // every reasoning.summary value except "auto" with HTTP 400.
     const bedrockOpenAIWire =
       routeProvider === "coder" &&
       modelString.startsWith("coder:") &&
