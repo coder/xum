@@ -263,6 +263,10 @@ describe("getThinkingPolicyForModel", () => {
     const defaultPolicy: ThinkingLevel[] = ["off", "low", "medium", "high"];
     expect(getThinkingPolicyForModel("openai:gpt-6-astra-mini")).toEqual(defaultPolicy);
     expect(getThinkingPolicyForModel("openai:gpt-6")).toEqual(defaultPolicy);
+    // Provisional registry entry (unannounced; see GPT_6_SOL in knownModels.ts):
+    // no official reasoning docs exist, so it must not inherit Astra's or the
+    // GPT-5.6 family's native-max/no-off surfaces.
+    expect(getThinkingPolicyForModel("openai:gpt-6-sol")).toEqual(defaultPolicy);
     expect(enforceThinkingPolicy("openai:gpt-6-astra-mini", "max")).toBe("high");
   });
 

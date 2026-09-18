@@ -5,7 +5,7 @@
  */
 
 import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isModelAvailable } from "@/common/routing";
 import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -173,6 +173,14 @@ export function getHigherContextCompactionSuggestion(
   const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
 
   for (const known of Object.values(KNOWN_MODELS)) {
+    // Default-hidden models (restricted-access Daybreak tiers, provisional
+    // unreleased entries like GPT-6 Sol) must never be auto-suggested: routing
+    // context-limit recovery to a model most users cannot call would strand the
+    // retry. Users who unhid one can still pick it manually or set it as their
+    // explicit compaction model (getExplicitCompactionSuggestion honors that).
+    if (DEFAULT_HIDDEN_MODELS.includes(known.id)) {
+      continue;
+    }
     if (
       !isModelAvailable(
         known.id,

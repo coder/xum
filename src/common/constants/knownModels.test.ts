@@ -4,11 +4,13 @@
 
 import { describe, test, expect } from "@jest/globals";
 import {
+  DEFAULT_HIDDEN_MODELS,
   KNOWN_MODELS,
   MODEL_ABBREVIATIONS,
   TOKENIZER_MODEL_OVERRIDES,
 } from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
+import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
 describe("Known Models Integration", () => {
@@ -50,6 +52,31 @@ describe("Known Models Integration", () => {
     expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_ASTRA.id));
     // Approximate tokenizer: GPT-6's tokenizer is unpublished, so reuse gpt-5.
     expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-astra"]).toBe("openai/gpt-5");
+  });
+
+  test("provisional GPT-6 Sol never surfaces by default", () => {
+    // The id is unannounced (community API sightings only): it must stay
+    // default-hidden and alias-free so nothing routes to it until OpenAI
+    // officially releases the model.
+    expect(DEFAULT_HIDDEN_MODELS).toContain(KNOWN_MODELS.GPT_6_SOL.id);
+    expect(KNOWN_MODELS.GPT_6_SOL.aliases).toBeUndefined();
+    // `sol` keeps resolving to GPT-5.6 Sol until OpenAI documents the succession.
+    expect(MODEL_ABBREVIATIONS.sol).toBe(KNOWN_MODELS.GPT.id);
+    // Not warmed: most users cannot access it, and its tokenizer override is
+    // already warmed via GPT.
+    expect(KNOWN_MODELS.GPT_6_SOL.warm).toBeUndefined();
+    expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-sol"]).toBe("openai/gpt-5");
+    // Ordering after GPT-5.6 Sol keeps Sol the first 1.05M-context candidate for
+    // compaction "switch model" suggestions (same invariant as Astra above).
+    const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
+    expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_SOL.id));
+    // Pricing provenance: the stats are a maintainer-authorized PROVISIONAL
+    // ESTIMATE copied 1:1 from the effective gpt-5.6-sol baseline (see the
+    // gpt-6-sol comment in models-extra.ts). Pinning equality keeps the
+    // estimate pegged to the baseline: a divergence must be a conscious
+    // decision (ideally replacing it with official GPT-6 Sol pricing).
+    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).not.toBeNull();
+    expect(getModelStats(KNOWN_MODELS.GPT_6_SOL.id)).toEqual(getModelStats(KNOWN_MODELS.GPT.id));
   });
 
   test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {

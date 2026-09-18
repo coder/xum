@@ -135,6 +135,25 @@ const MODEL_DEFINITIONS = {
     // counting (same approach as the GPT-5.6 family).
     tokenizerOverride: "openai/gpt-5",
   },
+  // GPT-6 Sol - PROVISIONAL, NOT OFFICIALLY ANNOUNCED (verified 2026-09-15).
+  // The id `gpt-6-sol` has only been sighted in community reports of the OpenAI
+  // API; OpenAI has published no model page, pricing, context window, or
+  // capability docs, and the GPT-6 launch shipped only Astra. Prepared here so
+  // it can be enabled quickly at release, but default-hidden (see
+  // DEFAULT_HIDDEN_MODELS) until OpenAI confirms it. Its stats are a
+  // maintainer-authorized PROVISIONAL ESTIMATE copied from the GPT-5.6 Sol
+  // baseline (see models-extra.ts). Deliberately additive:
+  // no aliases (`sol` stays on GPT-5.6 Sol until OpenAI documents the tier
+  // succession), not warmed, and ordered after the GPT-5.6 tiers and Astra so
+  // GPT-5.6 Sol stays the first 1.05M-context candidate for compaction
+  // "switch model" suggestions.
+  GPT_6_SOL: {
+    provider: "openai",
+    providerModelId: "gpt-6-sol",
+    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate
+    // counting (same approach as Astra and the GPT-5.6 family).
+    tokenizerOverride: "openai/gpt-5",
+  },
   // GPT Pro alias tracks the latest GPT-5 Pro tier.
   GPT_PRO: {
     provider: "openai",
@@ -298,7 +317,13 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
-export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
+export const DEFAULT_HIDDEN_MODELS = [
+  KNOWN_MODELS.DAYBREAK_BLUE.id,
+  KNOWN_MODELS.DAYBREAK_RED.id,
+  // Provisional unreleased model (see GPT_6_SOL): stays hidden until OpenAI
+  // officially announces it.
+  KNOWN_MODELS.GPT_6_SOL.id,
+];
 
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)

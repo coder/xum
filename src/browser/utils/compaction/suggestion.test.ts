@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 
-import { getExplicitCompactionSuggestion } from "./suggestion";
+import {
+  getExplicitCompactionSuggestion,
+  getHigherContextCompactionSuggestion,
+} from "./suggestion";
 
 const COPILOT_ONLY_PROVIDERS_CONFIG: ProvidersConfigMap = {
   "github-copilot": {
@@ -91,5 +94,56 @@ describe("getExplicitCompactionSuggestion", () => {
         modelId: "coder:openai/claude-sonnet-4-5",
       })
     ).toBeNull();
+  });
+});
+
+describe("getHigherContextCompactionSuggestion", () => {
+  const OPENAI_PROVIDERS_CONFIG: ProvidersConfigMap = {
+    openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+  };
+
+  test("never auto-suggests default-hidden models even when policy leaves only them", () => {
+    // Policy allows the small current model plus only default-hidden entries
+    // (restricted Daybreak tiers, provisional GPT-6 Sol). Without the
+    // default-hidden exclusion, the provisional GPT-6 Sol entry (1.05M-context
+    // estimate, first such candidate in registry order) would win the
+    // higher-context scan and "Compact & retry" would route to a model most
+    // users cannot call.
+    const hiddenOnlyPolicy: EffectivePolicy = {
+      policyFormatVersion: "0.1",
+      providerAccess: [
+        {
+          id: "openai",
+          allowedModels: [
+            KNOWN_MODELS.GPT_54_MINI.providerModelId,
+            ...DEFAULT_HIDDEN_MODELS.map((id) => id.split(":")[1]),
+          ],
+        },
+      ],
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    };
+
+    expect(
+      getHigherContextCompactionSuggestion({
+        currentModel: KNOWN_MODELS.GPT_54_MINI.id,
+        providersConfig: OPENAI_PROVIDERS_CONFIG,
+        policy: hiddenOnlyPolicy,
+        routePriority: ["direct"],
+        routeOverrides: {},
+      })
+    ).toBeNull();
+  });
+
+  test("still suggests a visible higher-context model when one is allowed", () => {
+    expect(
+      getHigherContextCompactionSuggestion({
+        currentModel: KNOWN_MODELS.GPT_54_MINI.id,
+        providersConfig: OPENAI_PROVIDERS_CONFIG,
+        policy: null,
+        routePriority: ["direct"],
+        routeOverrides: {},
+      })
+    ).toMatchObject({ kind: "higher_context", modelId: KNOWN_MODELS.GPT.id });
   });
 });
