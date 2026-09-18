@@ -87,3 +87,24 @@ export const MAX_CONSECUTIVE_PEER_WAKES = 3;
  */
 export const WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE =
   "A stop is in progress for this workspace; retry once it has settled.";
+
+/**
+ * Refusal for a send that would continue an agent-task attempt whose settlement has begun or
+ * completed (idle stop, terminal failure, launch failure). Not retryable as a continuation: an
+ * intentional resume is a new attempt (user resume, task_send_message reawaken), which mints a
+ * fresh attempt id and is admitted on its own.
+ */
+export const TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE =
+  "This sub-agent's current attempt has settled; resume it explicitly to start a new attempt.";
+
+/**
+ * Stable refusal for every admission of an attempt a workflow retired (taskAttemptRetiredBy):
+ * reawaken, reactivation, startup re-drive and queue launch all surface exactly this text.
+ */
+export function retiredAttemptMessage(claim: { runId: string; stepId: string }): string {
+  return `This sub-agent's attempt was retired by workflow run ${claim.runId} (step ${claim.stepId}); start a new task instead.`;
+}
+
+/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
+export const SEND_ADMISSION_STALE_MESSAGE =
+  "Send refused: the target was stopped or interrupted while the message was being admitted.";

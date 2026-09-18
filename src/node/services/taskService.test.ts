@@ -33397,7 +33397,7 @@ describe("TaskService", () => {
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
 
-    test("failed reactivation preserves the prior owned settlement", async () => {
+    test("failed reactivation keeps its published attempt: indeterminate until a Stop settles it", async () => {
       const taskId = "task-outcome-reactivation-failed";
       const { config } = await setupTree([
         { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
@@ -33409,9 +33409,13 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
+      const retiredAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
+      expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
 
-      // Exercise a real createWorkspaceTurn pre-admission failure. It must not erase the
-      // already-retired attempt's evidence and strand a workflow checkpoint on this child.
+      // A real createWorkspaceTurn failure AFTER the reactivation published its fresh attempt.
+      // createWorkspaceTurn can fail past validation (even after a send), so a refusal proves
+      // nothing about admission: the fresh identity stays in config and memory (never rolled
+      // back to the retired attempt), reads as owned-but-unsettled, and only a Stop settles it.
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
         Err("owner metadata unavailable")
       );
@@ -33424,20 +33428,31 @@ describe("TaskService", () => {
         );
         expect(result).toMatchObject({ success: false, error: { code: "send_failed" } });
         expect(sendMessage).not.toHaveBeenCalled();
+        const published = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
+        expect(published).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(published).not.toBe(retiredAttemptId);
+        const outcome = await taskService.readAttemptOutcome(taskId, requesting);
+        expect(outcome.kind).toBe("indeterminate");
+        if (outcome.kind === "indeterminate") {
+          expect(outcome.reason).toContain("without settlement evidence");
+        }
+        await taskService.terminateAllDescendantAgentTasks(rootId);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "terminal-no-report",
         });
+        expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBe(published);
       } finally {
         metadata.mockRestore();
       }
     });
 
-    test("failed reactivation does not manufacture retirement for a legacy owner", async () => {
+    test("failed reactivation of a legacy owner publishes an unproven attempt this process owns", async () => {
       const taskId = "task-outcome-reactivation-legacy";
       const { config } = await setupTree([
         { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
       ]);
       const { taskService, aiService } = createTaskServiceHarness(config);
+      expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBeUndefined();
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
         Err("owner metadata unavailable")
       );
@@ -33450,12 +33465,27 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
-        // A later Stop must not turn the rejected speculative attempt into evidence that the
-        // unknown prior-process owner retired. No new turn was ever admitted here.
-        await taskService.terminateAllDescendantAgentTasks(rootId);
+        // The reactivation stamped the pre-identity entry with a fresh attempt this process owns
+        // — marked unproven, because nothing vouches for the unknown prior-process predecessor.
+        const entry = findWorkspaceInConfig(config, taskId);
+        expect(entry?.taskAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(entry?.taskAttemptUnproven).toBe(true);
         expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe(
           "indeterminate"
         );
+        // A Stop settles THIS process's attempt (same-process authority, as on main for any
+        // owned attempt); cross-process authority stays fail-closed through the marker.
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+        const owned = (
+          taskService as unknown as {
+            ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+          }
+        ).ownedAttemptByTaskId.get(taskId);
+        expect(owned?.attemptId).toBe(entry?.taskAttemptId);
+        expect(owned?.receiptEligible).toBe(false);
       } finally {
         metadata.mockRestore();
       }
