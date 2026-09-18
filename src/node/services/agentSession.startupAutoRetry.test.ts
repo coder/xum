@@ -15,6 +15,7 @@ import {
   createAgentSessionHarness,
   createStartedTurnHandle,
   createTestAgentSession,
+  seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -570,6 +571,70 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test.each([
+    ["disabled (100%) persisted threshold", { seed: 100 }, false],
+    ["corrupt persisted threshold entry", { corrupt: true }, true],
+  ] as const)(
+    "startup recovery resumes with the %s and no frontend push",
+    async (_label, fixture, rolloverAvailable) => {
+      const workspaceId = "startup-retry-persisted-threshold";
+      const { session, config, historyService, aiService, cleanup } =
+        await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const model = "openai:gpt-4o";
+      if ("seed" in fixture) {
+        await seedAutoCompactionThreshold(config, model, fixture.seed);
+      } else {
+        // Written behind the schema on purpose: a hand-edited or downgraded config must
+        // resolve to the default without crashing startup.
+        await fsPromises.writeFile(
+          path.join(config.rootDir, "config.json"),
+          JSON.stringify({
+            projects: [],
+            userPreferences: {
+              ai: { autoCompactionThresholdByModel: { [model]: "seventy", "other:model": 100 } },
+            },
+          })
+        );
+        // The file itself loads (the sibling entry survives); only the corrupt entry is dropped.
+        expect(
+          config.loadConfigOrDefault().userPreferences?.ai?.autoCompactionThresholdByModel
+        ).toEqual({ "other:model": 100 });
+      }
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted token-budget turn", {
+          timestamp: Date.now(),
+          retrySendOptions: pickStartupRetrySendOptions({
+            model,
+            agentId: "exec",
+            experiments: { tokenBudget: true },
+          }),
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      const streamMessageMock = mock(
+        (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+          Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+      );
+      aiService.streamMessage =
+        streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
+      const privateSession = session as unknown as { retryActiveStream: () => Promise<void> };
+
+      await session.ensureStartupAutoRetryCheck();
+      await privateSession.retryActiveStream();
+
+      // The resumed request's rollover gate reads the persisted per-model threshold directly;
+      // no RPC could have pushed a slider value before recovery ran.
+      expect(streamMessageMock).toHaveBeenCalledTimes(1);
+      expect(streamMessageMock.mock.calls[0]?.[0].contextBudgetRolloverAvailable).toBe(
+        rolloverAvailable
+      );
+
+      await session.dispose();
+    }
+  );
+
   test("startup auto-retry does not stamp workflow-result metadata on assistant streams", async () => {
     const workspaceId = "startup-retry-workflow-result-metadata";
     const { session, historyService, aiService, cleanup } = await createSessionBundle(workspaceId);
@@ -640,9 +705,6 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-
-    const startupRetryModelHint = await session.getStartupAutoRetryModelHint();
-    expect(startupRetryModelHint).toBe("anthropic:claude-sonnet-4-5");
 
     await session.ensureStartupAutoRetryCheck();
 
@@ -748,7 +810,6 @@ describe("AgentSession startup auto-retry recovery", () => {
       expect(followUp).not.toHaveBeenCalled();
       expect(session.hasPendingAutoRetry()).toBe(false);
       expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-      expect(await session.getStartupAutoRetryModelHint()).toBeNull();
     } finally {
       await session.dispose();
     }

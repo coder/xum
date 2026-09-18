@@ -1694,8 +1694,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           success: true,
           data: { previousEnabled: true, enabled: true },
         }),
-      getStartupAutoRetryModel: () => Promise.resolve({ success: true, data: null }),
-      setAutoCompactionThreshold: () => Promise.resolve({ success: true, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),

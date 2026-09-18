@@ -2556,29 +2556,6 @@ export class AgentSession {
           !this.isPendingAskUserQuestion(last);
   }
 
-  async getStartupAutoRetryModelHint(): Promise<string | null> {
-    this.assertNotDisposed("getStartupAutoRetryModelHint");
-
-    const [partial, historyResult] = (await this.readStartupTail()) ?? [];
-    if (partial === undefined || !historyResult?.success) {
-      return null;
-    }
-
-    if (this.findLastRetryUserMessage(historyResult.data)?.metadata?.contextBudgetRejected) {
-      return null;
-    }
-    if (this.lastAutoRetryResumeRequest?.options.model) {
-      return this.lastAutoRetryResumeRequest.options.model;
-    }
-    if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return null;
-
-    const retryRequest = await this.deriveStartupAutoRetryRequest({
-      partial,
-      historyTail: historyResult.data,
-    });
-    return retryRequest?.model ?? null;
-  }
-
   private async runStartupRecoveryStep<T>(step: () => T | Promise<T>): Promise<T | undefined> {
     if (this.coordinator.closing) return;
     using _execution = this.coordinator.enterExecution();
@@ -4438,7 +4415,8 @@ export class AgentSession {
         contextBudgetPrefix[0].metadata.muxMetadata.final === true;
       if (
         flushPrefix &&
-        (this.pendingRollover == null || this.contextController.autoCompactionThreshold >= 1) &&
+        (this.pendingRollover == null ||
+          this.contextController.autoCompactionThreshold(optionsForStream.model) >= 1) &&
         userMessage.metadata?.muxMetadata?.contextBudgetFlush === true
       ) {
         optionsForStream = this.degradeFlushEntryToContinuation(userMessage, optionsForStream);
@@ -5097,11 +5075,6 @@ export class AgentSession {
     return { previousEnabled, enabled };
   }
 
-  setAutoCompactionThreshold(threshold: number): void {
-    this.assertNotDisposed("setAutoCompactionThreshold");
-    this.contextController.setAutoCompactionThreshold(threshold);
-  }
-
   private getUsageState(): AutoCompactionUsageState | undefined {
     return this.lastUsageState;
   }
@@ -5507,7 +5480,7 @@ export class AgentSession {
     if (
       !context ||
       context.contextBudgetRetried ||
-      this.contextController.autoCompactionThreshold >= 1 ||
+      this.contextController.autoCompactionThreshold(model) >= 1 ||
       this.coordinator.admissionBlocked ||
       this.coordinator.editBlocked(editReservation?.id) ||
       this.coordinator.disposed ||
@@ -5838,7 +5811,8 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
+          this.isTokenBudgetActive(options) &&
+          this.contextController.autoCompactionThreshold(modelString) < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
         requestAssemblySnapshot: snapshot,
       });
@@ -5964,6 +5938,8 @@ export class AgentSession {
     const knownLimit = maxTokens != null && maxTokens > 0;
     if (!knownLimit)
       log.warn("Token budget has no known model context limit", { model: options.model });
+    // One threshold per budget decision; every gate below reads this same value.
+    const threshold = this.contextController.autoCompactionThreshold(options.model);
     const lastAssistant = history.data.findLast(
       (row) => row.role === "assistant" && row.metadata?.contextUsage
     );
@@ -6029,7 +6005,7 @@ export class AgentSession {
             ...estimateLastStepToolResults(lastAssistant),
             toolResultTokens,
             modelContextLimit: maxTokens,
-            threshold: this.contextController.autoCompactionThreshold,
+            threshold,
             warningEmitted: this.contextBudgetWarningClaimed,
             handoffRequested: this.contextBudgetHandoffClaimed,
           })
@@ -6044,7 +6020,7 @@ export class AgentSession {
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
-      const rolloverEnabled = this.contextController.autoCompactionThreshold < 1;
+      const rolloverEnabled = threshold < 1;
       // The hard ceiling reserves OUTPUT_RESERVE_TOKENS for the step's output; a model whose
       // inherent thinking minimum needs a larger flush cap must find that extra room too. A
       // refusal may hand the flush to a fallback model with its own (possibly higher) minimum,
@@ -6081,14 +6057,15 @@ export class AgentSession {
         (await this.checkContextBudgetHistoryAccess(options)).success
           ? await this.captureRolloverRequestAssembly()
           : undefined;
-      // Re-read the gates after the last await: the slider may have moved meanwhile, and a Stop
-      // (interruptStream → clearContextBudgetState) drops the intent and its paired
-      // continuation, so a flush accepted now would run with nothing to seal the window.
+      // Re-read the intent gates after the last await: a Stop (interruptStream →
+      // clearContextBudgetState) drops the intent and its paired continuation, so a flush
+      // accepted now would run with nothing to seal the window. The threshold is fixed for
+      // this decision; a slider move lands on the next one.
       if (
         admitted?.success &&
         this.contextBudgetGeneration === generation &&
         this.pendingRollover != null &&
-        this.contextController.autoCompactionThreshold < 1
+        rolloverEnabled
       ) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
         // invalidated by registry changes that happen during the flush turn itself. The flush
@@ -6113,7 +6090,7 @@ export class AgentSession {
       userMessage.parts = [{ type: "text", text: "Continue" }];
       const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
       userMessage.metadata.muxMetadata = rest;
-      if (this.contextController.autoCompactionThreshold >= 1) {
+      if (!rolloverEnabled) {
         // Rollover was disabled after the pair was queued: drop the paired rollover entry and
         // the stale claims so nothing seals the window if rollover is re-enabled later, and a
         // later genuine rollover may offer the flush this turn never delivered.
@@ -6123,7 +6100,7 @@ export class AgentSession {
           this.emitQueuedMessageChanged();
       }
     }
-    if (this.pendingRollover != null && this.contextController.autoCompactionThreshold >= 1) {
+    if (this.pendingRollover != null && threshold >= 1) {
       // Rollover was disabled after the intent was recorded (e.g. during a flush turn that
       // ended without a settled tool step): a stale intent must not seal a later, unrelated
       // send once rollover is re-enabled.
@@ -6142,7 +6119,7 @@ export class AgentSession {
       hasUnconsumedNewContextRequest(history.data) &&
       (await this.checkContextBudgetHistoryAccess(options)).success;
     const shouldRollover =
-      this.contextController.autoCompactionThreshold < 1 &&
+      threshold < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover" || modelRequested);
     const rollover: AgentSession["pendingRollover"] =
       shouldRollover && hasRolloverEligibleMessages(history.data)
@@ -6225,10 +6202,7 @@ export class AgentSession {
               contextTokens: advisory.projected,
               maxTokens: recordedLimit,
               budgetTokens: getContextBudgetHardCeiling(recordedLimit),
-              handoffTokens: getContextBudgetHandoffPoint(
-                recordedLimit,
-                this.contextController.autoCompactionThreshold
-              ),
+              handoffTokens: getContextBudgetHandoffPoint(recordedLimit, threshold),
               handoff: advisory.decision === "handoff",
               ...permissions,
             }),
@@ -6310,7 +6284,8 @@ export class AgentSession {
       context.providersConfig ?? null,
       { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
     );
-    const threshold = this.contextController.autoCompactionThreshold;
+    // One threshold per settled step; the flush gate below reuses it.
+    const threshold = this.contextController.autoCompactionThreshold(step.model);
     const contextTokens = usage
       ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
       : 0;
@@ -6353,7 +6328,7 @@ export class AgentSession {
     // "block" only exists at threshold 100%, where requests are not offered and never honored.
     if (decision.decision === "block") return { decision: "block" };
     if (context.contextBudgetFlushTurn === true) {
-      if (this.contextController.autoCompactionThreshold >= 1) {
+      if (threshold >= 1) {
         // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
         // stale intent. The paired "Continue" is kept on purpose: with the intent gone it
         // dispatches as an ordinary continuation of the interrupted work in this window, and a
@@ -7471,7 +7446,7 @@ export class AgentSession {
           flushMuxMetadata?.contextBudgetFlush === true &&
           finalRow?.type === "context-budget-warning" &&
           this.pendingRollover == null &&
-          this.contextController.autoCompactionThreshold < 1
+          this.contextController.autoCompactionThreshold(modelString) < 1
         ) {
           // The promised reset needs the same admission as any rollover; surface a failure
           // now (as the reset itself would) instead of resuming a flush that cannot be sealed.
@@ -7789,7 +7764,8 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
+          this.isTokenBudgetActive(options) &&
+          this.contextController.autoCompactionThreshold(modelString) < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
         // A flush turn stays bounded to one step even when token-budget mode was disabled
         // after its trigger was persisted (the callback then only stops it).

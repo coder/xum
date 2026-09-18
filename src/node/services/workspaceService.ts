@@ -12675,28 +12675,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.withStartupSession(workspaceId, (session) => session.getStartupRecoveryState());
   }
 
-  async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {
-    try {
-      return Ok(await this.getOrCreateSession(workspaceId).getStartupAutoRetryModelHint());
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      log.error("Unexpected error in getStartupAutoRetryModel handler:", error);
-      return Err(`Failed to inspect startup auto-retry model: ${errorMessage}`);
-    }
-  }
-
-  setAutoCompactionThreshold(workspaceId: string, threshold: number): Result<void> {
-    try {
-      const session = this.getOrCreateSession(workspaceId);
-      session.setAutoCompactionThreshold(threshold);
-      return Ok(undefined);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      log.error("Unexpected error in setAutoCompactionThreshold handler:", error);
-      return Err(`Failed to set auto-compaction threshold: ${errorMessage}`);
-    }
-  }
-
   async interruptStream(
     workspaceId: string,
     options?: {

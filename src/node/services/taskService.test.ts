@@ -32447,7 +32447,6 @@ describe("TaskService", () => {
           runtimeConfig: { type: "local" },
         } as WorkspaceMetadata)
       );
-      session.setAutoCompactionThreshold(0.7);
 
       // TaskService sees the child through the seam, backed by the real session.
       const listeners = new Set<(workspaceId: string) => void>();
