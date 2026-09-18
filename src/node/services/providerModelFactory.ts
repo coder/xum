@@ -2486,7 +2486,7 @@ export class ProviderModelFactory {
               message: `Invalid Coder model "${modelId}". Expected coder:<provider>/<model> where <provider> is an AI Gateway provider on the deployment (e.g. coder:anthropic/<model>). Unknown provider names can be declared under the coder provider's additionalProviders setting.`,
             });
           }
-          const wire = coderGatewayWireProtocol(gatewayProvider.type);
+          const wire = coderGatewayWireProtocol(gatewayProvider.type, originModelId);
           if (!wire) {
             return Err({
               type: "invalid_model_string",

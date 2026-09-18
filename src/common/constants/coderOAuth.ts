@@ -83,6 +83,18 @@ export const CODER_GATEWAY_DEFAULT_PROVIDER_NAMES: readonly string[] =
   CODER_GATEWAY_PROVIDER_TYPES.filter((type) => type !== "copilot");
 
 /**
+ * Bedrock model IDs in the OpenAI namespace: openai.<model>, optionally behind
+ * an inference-profile region prefix (global.openai.<model>, us.openai.<model>).
+ * Bedrock Mantle serves these over /v1/responses and rejects Anthropic-format
+ * requests for them, while its anthropic.<model> IDs stay on /v1/messages.
+ * Returns the namespace-stripped model ID, or null for every other ID.
+ */
+export function bedrockOpenAIModelId(modelId: string): string | null {
+  const match = /^(?:[a-z]+(?:-[a-z]+)*\.)?openai\.(.+)$/.exec(modelId);
+  return match?.[1] ?? null;
+}
+
+/**
  * Wire protocol Xum must speak to a gateway provider, derived from its type.
  * Mirrors the gateway's own client mapping: anthropic/bedrock are served by
  * its Anthropic client (/v1/messages), everything else by its OpenAI client.
@@ -91,14 +103,21 @@ export const CODER_GATEWAY_DEFAULT_PROVIDER_NAMES: readonly string[] =
  * /chat/completions can be assumed. Unknown (future) types default to
  * openai-chat to match the gateway's own default. Returns null for
  * unsupported types (copilot, see above).
+ *
+ * Bedrock is the one type whose wire depends on the MODEL: its OpenAI-namespaced
+ * IDs (see bedrockOpenAIModelId) speak OpenAI Responses. Callers without a
+ * model (the catalog probe) get the type's Anthropic default.
  */
 export type CoderGatewayWire = "anthropic" | "openai-responses" | "openai-chat";
 
-export function coderGatewayWireProtocol(type: string): CoderGatewayWire | null {
+export function coderGatewayWireProtocol(type: string, modelId?: string): CoderGatewayWire | null {
   switch (type) {
     case "anthropic":
-    case "bedrock":
       return "anthropic";
+    case "bedrock":
+      return modelId != null && bedrockOpenAIModelId(modelId) != null
+        ? "openai-responses"
+        : "anthropic";
     case "openai":
       return "openai-responses";
     case "copilot":
@@ -157,13 +176,14 @@ export function resolveCoderWireCanonicalModel(
   if (!provider) {
     return null;
   }
-  const wire = coderGatewayWireProtocol(provider.type);
+  const modelId = gatewayModelId.slice(separatorIndex + 1);
+  const wire = coderGatewayWireProtocol(provider.type, modelId);
   if (!wire) {
     return null;
   }
   return {
     origin: wire === "anthropic" ? "anthropic" : "openai",
-    modelId: gatewayModelId.slice(separatorIndex + 1),
+    modelId,
     // The instance's exact type: origin collapses every OpenAI-shaped wire
     // to "openai", but some config is upstream-specific (e.g. the OpenAI ZDR
     // store flag applies to the real OpenAI Responses upstream only).
@@ -199,6 +219,14 @@ export function resolveCoderMetadataCanonicalModel(
     return null;
   }
   const modelId = gatewayModelId.slice(separatorIndex + 1);
+  // Bedrock's openai.<model> IDs are the OpenAI models themselves. The
+  // bedrock gateway rules below would only canonicalize the unprefixed form
+  // (bedrock:openai.<model>), and capability gates that strip just the
+  // provider prefix would see "openai.gpt-..." and miss the model family.
+  const bedrockOpenAIModel = provider.type === "bedrock" ? bedrockOpenAIModelId(modelId) : null;
+  if (bedrockOpenAIModel != null) {
+    return `openai:${bedrockOpenAIModel}`;
+  }
   switch (provider.type) {
     case "anthropic":
     case "openai":

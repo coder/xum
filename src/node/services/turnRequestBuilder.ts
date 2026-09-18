@@ -989,12 +989,13 @@ export class TurnRequestBuilder {
         return { modelString: canonical };
       }
       // The factory creates Coder instances from the wire alone (openai
-      // type → provider.responses, openai-chat types → provider.chat), so
-      // BOTH OpenAI wire kinds must override any pre-existing wireFormat:
-      // a refusal chain that starts on direct OpenAI Chat Completions and
-      // falls back to an openai-typed Coder instance would otherwise build
-      // Chat Completions tools/options for a Responses request.
-      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType);
+      // type and bedrock openai.* models → provider.responses, openai-chat
+      // types → provider.chat), so BOTH OpenAI wire kinds must override any
+      // pre-existing wireFormat: a refusal chain that starts on direct OpenAI
+      // Chat Completions and falls back to an openai-typed Coder instance
+      // would otherwise build Chat Completions tools/options for a Responses
+      // request.
+      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType, coderWire.modelId);
       return {
         modelString: `${coderWire.origin}:${coderWire.modelId}`,
         ...(wireProtocol === "openai-chat"

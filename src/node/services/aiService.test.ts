@@ -2923,6 +2923,69 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
+  it.each([
+    {
+      modelId: "openai.gpt-5.6-sol",
+      origin: "openai" as const,
+      toolsModelString: "openai:openai.gpt-5.6-sol",
+      openaiWireFormat: "responses",
+    },
+    {
+      modelId: "anthropic.claude-sonnet-5",
+      origin: "anthropic" as const,
+      toolsModelString: "anthropic:anthropic.claude-sonnet-5",
+      openaiWireFormat: undefined,
+    },
+  ])(
+    "assembles tools for the model's wire on a bedrock-typed Coder instance: $modelId",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-coder-bedrock-wire");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-coder-bedrock-wire";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const model = `coder:bedrock-mantle-us-east-1/${testCase.modelId}`;
+      // The factory's wire snapshot for a Mantle instance: OpenAI-namespaced
+      // models are created as provider.responses(), so tool assembly must key
+      // on the Responses wire rather than the instance type's Anthropic default.
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockResolvedValue({
+        success: true,
+        data: {
+          model: Object.create(null) as LanguageModel,
+          effectiveModelString: model,
+          canonicalModelString: model,
+          canonicalProviderName: "coder",
+          canonicalModelId: model.slice("coder:".length),
+          wireProviderName: testCase.origin,
+          routeProvider: "coder",
+          routedThroughGateway: false,
+          coderWire: {
+            origin: testCase.origin,
+            modelId: testCase.modelId,
+            providerType: "bedrock",
+          },
+        },
+      });
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue")],
+        workspaceId,
+        modelString: model,
+        thinkingLevel: "medium",
+      });
+
+      expect(result.success).toBe(true);
+      const toolsCall = harness.getToolsForModelSpy.mock.calls[0];
+      if (!toolsCall) throw new Error("Expected getToolsForModel call");
+      expect(toolsCall[0]).toBe(testCase.toolsModelString);
+      expect(toolsCall[1].openaiWireFormat).toBe(testCase.openaiWireFormat);
+    }
+  );
+
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
     using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");
     const projectPath = path.join(xumHome.path, "project");
