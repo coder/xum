@@ -151,7 +151,7 @@ describe("normalizeServerIdentity", () => {
     ]);
   });
 
-  test("keeps at most the first eight valid icon candidates and tolerates non-array icons", () => {
+  test("inspects only the first eight icon entries and tolerates non-array icons", () => {
     const icons = Array.from({ length: 20 }, (_, i) => ({ src: `https://icons.example/${i}.png` }));
     const result = normalizeServerIdentity({ name: "n", version: "1", icons });
     expect(result!.iconCandidates.map((c) => c.src)).toStrictEqual(
@@ -160,6 +160,45 @@ describe("normalizeServerIdentity", () => {
     expect(
       normalizeServerIdentity({ name: "n", version: "1", icons: "nope" })!.iconCandidates
     ).toStrictEqual([]);
+  });
+
+  test("invalid entries consume the inspection budget and later entries are never read", () => {
+    // Eight rejected entries exhaust the budget; a valid ninth is out of reach
+    // and its getter must never fire, so a huge hostile array costs bounded work.
+    const icons: unknown[] = Array.from({ length: MCP_IDENTITY_LIMITS.iconCandidatesMax }, () => ({
+      src: "http://insecure.example/icon.png",
+    }));
+    let ninthRead = false;
+    Object.defineProperty(icons, MCP_IDENTITY_LIMITS.iconCandidatesMax, {
+      enumerable: true,
+      get: () => {
+        ninthRead = true;
+        return { src: "https://icons.example/valid.png" };
+      },
+    });
+    const result = normalizeServerIdentity({ name: "n", version: "1", title: "t", icons });
+    expect(result!.iconCandidates).toStrictEqual([]);
+    expect(ninthRead).toBe(false);
+    // The text identity is unaffected by hostile icon metadata.
+    expect(result!.identity).toStrictEqual({ name: "n", version: "1", title: "t" });
+
+    // The same bounded prefix applies to a candidate's `sizes`.
+    const sizes: unknown[] = Array.from({ length: 8 }, () => 64);
+    let ninthSizeRead = false;
+    Object.defineProperty(sizes, 8, {
+      enumerable: true,
+      get: () => {
+        ninthSizeRead = true;
+        return "64x64";
+      },
+    });
+    const sized = normalizeServerIdentity({
+      name: "n",
+      version: "1",
+      icons: [{ src: "https://icons.example/sized.png", sizes }],
+    });
+    expect(sized!.iconCandidates).toStrictEqual([{ src: "https://icons.example/sized.png" }]);
+    expect(ninthSizeRead).toBe(false);
   });
 });
 

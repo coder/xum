@@ -96,10 +96,11 @@ function normalizeIconCandidate(raw: unknown): IconCandidate | undefined {
     candidate.mimeType = mimeType;
   }
   if (Array.isArray(raw.sizes)) {
+    // Bounded prefix (see normalizeIconCandidates): slice before any per-entry work.
     const sizes = raw.sizes
+      .slice(0, ICON_SIZES_MAX)
       .map((size) => sanitizeText(size, ICON_SIZE_MAX_CHARS))
-      .filter((size): size is string => size !== undefined)
-      .slice(0, ICON_SIZES_MAX);
+      .filter((size): size is string => size !== undefined);
     if (sizes.length > 0) {
       candidate.sizes = sizes;
     }
@@ -115,10 +116,11 @@ function normalizeIconCandidates(raw: unknown): IconCandidate[] {
   if (!Array.isArray(raw)) {
     return candidates;
   }
-  for (const entry of raw) {
-    if (candidates.length >= MCP_IDENTITY_LIMITS.iconCandidatesMax) {
-      break;
-    }
+  // Bounded prefix: only the first `iconCandidatesMax` raw entries are ever
+  // inspected. Invalid entries consume that budget and valid entries beyond it
+  // are ignored, so a huge or hostile `icons` array costs bounded work (the
+  // per-entry string bounds are unchanged). The text identity is unaffected.
+  for (const entry of raw.slice(0, MCP_IDENTITY_LIMITS.iconCandidatesMax)) {
     const candidate = normalizeIconCandidate(entry);
     if (candidate) {
       candidates.push(candidate);
