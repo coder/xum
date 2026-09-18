@@ -68,6 +68,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
@@ -3533,6 +3534,10 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: normalizeWorkspaceMetadataHeartbeat(workspace.heartbeat, config),
               goalDefaults: workspace.goalDefaults,
+              // Fail closed: a corrupted/blank consent value publishes as absent (off).
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
               // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
@@ -3832,6 +3837,9 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: workspace.heartbeat,
               goalDefaults: workspace.goalDefaults,
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -3908,6 +3916,9 @@ export class Config {
             aiSettings: workspace.aiSettings,
             heartbeat: workspace.heartbeat,
             goalDefaults: workspace.goalDefaults,
+            unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+              workspace.unrelatedWorkspaceConsent
+            ),
             aiSettingsByAgent:
               workspace.aiSettingsByAgent ??
               (workspace.aiSettings
@@ -4044,6 +4055,12 @@ export class Config {
         aiSettings: metadata.aiSettings,
         heartbeat: metadata.heartbeat,
         goalDefaults: metadata.goalDefaults,
+        // Carried only when the caller's metadata carries it: create/fork/child paths assemble
+        // metadata without consent, so a new entry never inherits it, while a re-add of an
+        // existing consented entry does not silently revoke it.
+        unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+          metadata.unrelatedWorkspaceConsent
+        ),
         parentWorkspaceId: metadata.parentWorkspaceId,
         agentType: metadata.agentType,
         agentId: metadata.agentId,

@@ -12,6 +12,7 @@ import {
   getNotifyOnResponseAutoEnableKey,
 } from "@/common/constants/storage";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
+import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
@@ -131,6 +132,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  const [unrelatedMessagingModalOpen, setUnrelatedMessagingModalOpen] = useState(false);
   // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
   // workspace" action) implicitly closes the dialog instead of covering the new view.
   const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
@@ -524,6 +526,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [workspaceHeartbeatsEnabled]);
 
+  // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
+  // a window listener subscribing to an external event source, not derived state).
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (matchesKeybind(e, KEYBINDS.CONFIGURE_UNRELATED_MESSAGING)) {
+        e.preventDefault();
+        setUnrelatedMessagingModalOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   useEffect(() => {
     isSkillsMountedRef.current = true;
 
@@ -832,6 +847,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onConfigureHeartbeat={
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
+              onConfigureUnrelatedMessaging={() => setUnrelatedMessagingModalOpen(true)}
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
@@ -885,6 +901,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onOpenChange={setHeartbeatModalOpen}
         />
       )}
+      <WorkspaceUnrelatedMessagingModal
+        open={unrelatedMessagingModalOpen}
+        onOpenChange={setUnrelatedMessagingModalOpen}
+        // Read straight from published metadata: the switch moves only after the backend
+        // commits and republishes, never on the local ack alone.
+        enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
+        onSetEnabled={(enabled) =>
+          api
+            ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
+            : Promise.resolve({ success: false as const, error: "Not connected to server" })
+        }
+      />
       <WorkspaceMCPModal
         workspaceId={workspaceId}
         projectPath={projectPath}

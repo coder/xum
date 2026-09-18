@@ -27,6 +27,8 @@ export interface WorkspaceFixture {
   title?: string;
   transcriptOnly?: boolean;
   pinnedAt?: string;
+  /** Recipient consent generation; present means cross-tree discovery/messaging is on. */
+  unrelatedWorkspaceConsent?: string;
 }
 
 /** Create a workspace with sensible defaults */
@@ -51,6 +53,7 @@ export function createWorkspace(
     workflowTask: opts.workflowTask,
     transcriptOnly: opts.transcriptOnly,
     pinnedAt: opts.pinnedAt,
+    unrelatedWorkspaceConsent: opts.unrelatedWorkspaceConsent,
   };
 }
 
