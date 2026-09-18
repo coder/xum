@@ -932,11 +932,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         },
       ]);
       expect(created.success).toBe(true);
+      // The in-memory settlement follows the status write asynchronously (the closing window is
+      // covered separately below); poll the authoritative phase.
       const deadline = Date.now() + 2_000;
-      while (entryOf(config, spawnedId)?.taskStatus !== "interrupted") {
-        if (Date.now() > deadline) throw new Error("launch failure did not persist");
+      while (svc.attemptSettlementByTaskId.get(spawnedId)?.phase !== "settled") {
+        if (Date.now() > deadline) throw new Error("launch failure did not settle");
         await settle();
       }
+      expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(isTaskAttemptId(attemptId)).toBe(true);
       expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
