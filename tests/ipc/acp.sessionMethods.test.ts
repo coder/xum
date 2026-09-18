@@ -39,6 +39,8 @@ interface HarnessOptions {
    */
   activityListUnavailable?: boolean;
   onChatEvents?: WorkspaceChatMessage[];
+  /** Stream for the Nth onChat call (falls back to `onChatEvents`); each call is its own replay. */
+  onChatStreamByCall?: Array<() => AsyncIterable<WorkspaceChatMessage>>;
   onChatStream?: AsyncIterable<WorkspaceChatMessage>;
   requireTrustedProjectForCreate?: boolean;
   projectEntries?: Array<[string, ProjectConfig]>;
@@ -49,6 +51,7 @@ interface Harness {
   agent: MuxAgent;
   onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
   sendMessageCalls: Array<{ workspaceId: string; message: string }>;
+  truncateHistoryCalls: Array<{ workspaceId: string }>;
   setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
@@ -87,6 +90,7 @@ interface MockServer {
   server: ServerConnection;
   onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
   sendMessageCalls: Array<{ workspaceId: string; message: string }>;
+  truncateHistoryCalls: Array<{ workspaceId: string }>;
   setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
@@ -111,6 +115,7 @@ function createMockServer(options?: HarnessOptions): MockServer {
   const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
   const onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }> = [];
   const sendMessageCalls: Array<{ workspaceId: string; message: string }> = [];
+  const truncateHistoryCalls: Array<{ workspaceId: string }> = [];
   const listCalls: Array<{ archived?: boolean } | undefined> = [];
 
   const client = {
@@ -153,7 +158,11 @@ function createMockServer(options?: HarnessOptions): MockServer {
         allWorkspacesById.get(workspaceId) ?? null,
       onChat: async (input: { workspaceId: string; mode?: OnChatMode }) => {
         onChatCalls.push(input);
-        return sharedOnChatStream ?? createChatStream(onChatEvents);
+        return (
+          options?.onChatStreamByCall?.[onChatCalls.length - 1]?.() ??
+          sharedOnChatStream ??
+          createChatStream(onChatEvents)
+        );
       },
       create: async (input: WorkspaceCreateInput) => {
         createCalls.push(input);
@@ -207,6 +216,11 @@ function createMockServer(options?: HarnessOptions): MockServer {
         sendMessageCalls.push({ workspaceId: input.workspaceId, message: input.message });
         return { success: true as const, data: undefined };
       },
+      interruptStream: async () => ({ success: true as const, data: undefined }),
+      truncateHistory: async (input: { workspaceId: string }) => {
+        truncateHistoryCalls.push({ workspaceId: input.workspaceId });
+        return { success: true as const, data: undefined };
+      },
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
     },
@@ -231,6 +245,7 @@ function createMockServer(options?: HarnessOptions): MockServer {
     server,
     onChatCalls,
     sendMessageCalls,
+    truncateHistoryCalls,
     setTrustCalls,
     createCalls,
     forkCalls,
@@ -260,6 +275,7 @@ function createHarness(options?: HarnessOptions): Harness {
     agent: agentInstance,
     onChatCalls: mockServer.onChatCalls,
     sendMessageCalls: mockServer.sendMessageCalls,
+    truncateHistoryCalls: mockServer.truncateHistoryCalls,
     setTrustCalls: mockServer.setTrustCalls,
     createCalls: mockServer.createCalls,
     forkCalls: mockServer.forkCalls,
@@ -613,6 +629,101 @@ describe("ACP session list/resume/fork support", () => {
       })
     ).rejects.toThrow(/history could not be read/);
     expect(harness.sendMessageCalls).toHaveLength(0);
+
+    // `/clear` truncates history the client never saw: gated the same way, before the handler.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-unreadable",
+        prompt: [{ type: "text", text: "/clear" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.truncateHistoryCalls).toHaveLength(0);
+  });
+
+  it("re-subscribes after a failed replay so a later readable history unblocks prompts", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-recovering",
+      projectPath: "/repo/recovering",
+      namedWorkspacePath: "/repo/recovering/.mux/ws-recovering",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatStreamByCall: [
+        () =>
+          createChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "failed",
+            } as WorkspaceChatMessage,
+          ]),
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-recovering",
+      cwd: "/repo/recovering",
+      mcpServers: [],
+    });
+    expect(harness.onChatCalls).toHaveLength(1);
+
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-recovering",
+        prompt: [{ type: "text", text: "first" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+
+    // The failed subscription was dropped, so the next prompt replays again; that replay is
+    // complete and the send goes through. Cancel settles the (never-ending) live turn.
+    const secondPrompt = harness.agent.prompt({
+      sessionId: "ws-recovering",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (harness.sendMessageCalls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(harness.sendMessageCalls.map((call) => call.message)).toEqual(["second"]);
+    expect(harness.onChatCalls).toHaveLength(2);
+    expect(harness.onChatCalls[1]?.mode).toEqual({ type: "full" });
+    await harness.agent.cancel({ sessionId: "ws-recovering" });
+    await expect(secondPrompt).resolves.toMatchObject({ stopReason: "cancelled" });
+  });
+
+  it("refuses a prompt when the full subscription ends before reporting its replay", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-dropped",
+      projectPath: "/repo/dropped",
+      namedWorkspacePath: "/repo/dropped/.mux/ws-dropped",
+    });
+    // No caught-up at all: the transport dropped mid-replay, so nothing was verified.
+    const harness = createHarness({ activeWorkspaces: [workspace], onChatEvents: [] });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-dropped",
+      cwd: "/repo/dropped",
+      mcpServers: [],
+    });
+
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-dropped",
+        prompt: [{ type: "text", text: "hello" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
   });
 
   it("updates cached onChat mode even when a subscription already exists", async () => {
@@ -673,6 +784,13 @@ describe("ACP session list/resume/fork support", () => {
       activeWorkspaces: [workspace],
       requireTrustedProjectForCreate: true,
       projectEntries: [["/repo/follow-on", { workspaces: [], trusted: false }]],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "complete",
+        } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
@@ -702,6 +820,13 @@ describe("ACP session list/resume/fork support", () => {
       activeWorkspaces: [workspace],
       requireTrustedProjectForCreate: true,
       projectEntries: [["/repo/fork-follow-on", { workspaces: [], trusted: false }]],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "complete",
+        } as WorkspaceChatMessage,
+      ],
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
