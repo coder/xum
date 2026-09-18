@@ -189,10 +189,8 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
     expect(JSON.stringify([...config.loadConfigOrDefault().projects.entries()])).toBe(before);
   });
 
-  test("consent is not carried into a new workspace entry built from another workspace's metadata", async () => {
-    // Forks and child tasks assemble their own metadata; the loader's metadata→entry
-    // projection is the one place where a copied field could resurrect consent, so pin
-    // that an entry written from consented metadata still needs an explicit opt-in.
+  test("loading a child does not derive consent from its parent", async () => {
+    // Consent belongs to the actual recipient; metadata loading must not inherit the parent's grant.
     expect((await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(true);
     const source = (await config.getAllWorkspaceMetadata()).find((m) => m.id === WORKSPACE_ID);
     expect(source?.unrelatedWorkspaceConsent).toBeDefined();

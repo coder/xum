@@ -1076,6 +1076,207 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test.each(
+    (["unrelated", "sibling"] as const).flatMap((relationship) =>
+      [false, true].flatMap((correlated) =>
+        [false, true].map((partial) => ({ relationship, correlated, partial }))
+      )
+    )
+  )(
+    "startup peer recovery keeps $relationship policy (correlated=$correlated, partial=$partial)",
+    async ({ relationship, correlated, partial }) => {
+      const workspaceId = "startup-peer-policy";
+      const { session, config, historyService, aiService, events, cleanup } =
+        await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      // Even current consent cannot reconstruct all of the original admission guards after a crash.
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/tmp/project", {
+          workspaces: [
+            {
+              id: workspaceId,
+              name: workspaceId,
+              path: `/tmp/project/${workspaceId}`,
+              unrelatedWorkspaceConsent: "enabled",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const attribution = { fromWorkspaceId: "peer-sender", relationship };
+      const muxMetadata = correlated
+        ? {
+            type: "workspace-turn-task" as const,
+            taskHandleId: "wst_peer",
+            ownerWorkspaceId: "owner",
+            turnId: "turn",
+            agentPeerMessageTrigger: attribution,
+          }
+        : { type: "agent-peer-message" as const, ...attribution };
+      for (const row of [
+        createMuxMessage("earlier-user", "user", "Earlier request"),
+        createMuxMessage("earlier-answer", "assistant", "Earlier answer"),
+        createMuxMessage("peer-payload", "assistant", "Peer request", {
+          synthetic: true,
+          muxMetadata,
+        }),
+        createMuxMessage("peer-trigger", "user", "Agent message received.", {
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata,
+          retrySendOptions: { model: "anthropic:claude-sonnet-4-5", agentId: "exec" },
+        }),
+      ]) {
+        expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+      }
+      if (partial) {
+        const partialMessage = createMuxMessage("partial", "assistant", "Interrupted response", {
+          partial: true,
+        });
+        // Real streams allocate the assistant row's sequence before writing the partial file.
+        expect((await historyService.appendToHistory(workspaceId, partialMessage)).success).toBe(
+          true
+        );
+        expect((await historyService.writePartial(workspaceId, partialMessage)).success).toBe(true);
+      }
+      const stream = spyOn(aiService, "streamMessage");
+      try {
+        await session.runStartupRecovery();
+        expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(
+          relationship === "sibling"
+        );
+        if (relationship === "unrelated") {
+          expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(true);
+          expect(stream).not.toHaveBeenCalled();
+          // Do not fall back to an earlier user row with the refused payload still in context.
+          expect(
+            (session as unknown as RetryableSessionForTests).lastAutoRetryResumeRequest
+          ).toBeUndefined();
+        } else {
+          await (session as unknown as RetryableSessionForTests).retryActiveStream();
+          expect(stream).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        stream.mockRestore();
+        await session.dispose();
+      }
+    }
+  );
+
+  test.each([
+    { type: "agent-peer-message", relationship: "unrelated" },
+    { type: "agent-peer-message", fromWorkspaceId: "sender" },
+    { type: "workspace-turn-task", agentPeerMessageTrigger: true },
+    { type: "workspace-turn-task", agentPeerMessageTrigger: null },
+  ])("fails closed on malformed startup peer metadata %j", async (muxMetadata) => {
+    const workspaceId = "startup-peer-malformed";
+    const { session, historyService, aiService, events, cleanup } =
+      await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const trigger = createMuxMessage("trigger", "user", "Agent message received.", {
+      synthetic: true,
+      uiVisible: true,
+    });
+    // Persisted history is untyped; corrupt peer attribution must not become user authority.
+    Object.assign(trigger.metadata!, { muxMetadata });
+    expect((await historyService.appendToHistory(workspaceId, trigger)).success).toBe(true);
+    const stream = spyOn(aiService, "streamMessage");
+    try {
+      await session.runStartupRecovery();
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(true);
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      stream.mockRestore();
+      await session.dispose();
+    }
+  });
+
+  test("does not recover an unrelated send refused after durable acceptance", async () => {
+    const workspaceId = "startup-unrelated-refused";
+    const {
+      session,
+      config,
+      historyService,
+      aiService,
+      initStateManager,
+      backgroundProcessManager,
+      cleanup,
+    } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const muxMetadata = {
+      type: "agent-peer-message" as const,
+      fromWorkspaceId: "unrelated-sender",
+      relationship: "unrelated" as const,
+    };
+    let revoked = false;
+    const stream = spyOn(aiService, "streamMessage");
+    const result = await session.sendMessage(
+      "Agent message received.",
+      { model: "anthropic:claude-sonnet-4-5", agentId: "exec", muxMetadata },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        admissionStale: () => revoked,
+        preTurnMessages: [
+          createMuxMessage("peer-payload", "assistant", "Untrusted request", {
+            synthetic: true,
+            uiVisible: true,
+            muxMetadata,
+          }),
+        ],
+        // The history rows are already durable, but the final session admission has not run.
+        onAccepted: () => {
+          revoked = true;
+        },
+      }
+    );
+    expect(revoked).toBe(true);
+    expect(result.success).toBe(false);
+    expect(stream).not.toHaveBeenCalled();
+    const beforeRestart = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(beforeRestart.success && beforeRestart.data.map((row) => row.role)).toEqual([
+      "assistant",
+      "user",
+    ]);
+    await session.dispose();
+
+    const recovered = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiService,
+      initStateManager,
+      backgroundProcessManager,
+      captureEvents: true,
+    });
+    cleanups.push(recovered.cleanup);
+    try {
+      await recovered.session.runStartupRecovery();
+      expect(recovered.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(recovered.events.some((event) => event.type === "auto-retry-abandoned")).toBe(true);
+      expect(stream).not.toHaveBeenCalled();
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(beforeRestart);
+
+      // An old peer payload in history must not prevent a new, explicit user turn.
+      stream.mockImplementation(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(recovered.session.closingSignal)))
+      );
+      expect(
+        (
+          await recovered.session.sendMessage("I choose to continue", {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+    } finally {
+      stream.mockRestore();
+      await recovered.session.dispose();
+    }
+  });
+
   test("respects persisted auto-retry opt-out across restart", async () => {
     const workspaceId = "startup-retry-opt-out";
     const {

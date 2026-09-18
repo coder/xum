@@ -78,7 +78,7 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                   Allow unrelated workspaces to find and message this chat
                 </div>
                 <div className="text-muted mt-1 text-xs">
-                  Applies to agents in other chats on this computer that are not part of this
+                  Applies to agents in other local chats in this Xum instance, outside this
                   chat&apos;s task tree. Off by default; same-tree sub-agents are unaffected.
                 </div>
               </div>
@@ -112,7 +112,8 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
             </li>
             <li>
               Turning this off stops new deliveries and discovery. Messages already received stay in
-              the transcript, and a reply that is already running finishes.
+              the transcript, and a reply that is already running finishes. After an app restart,
+              resume these turns yourself.
             </li>
           </ul>
 

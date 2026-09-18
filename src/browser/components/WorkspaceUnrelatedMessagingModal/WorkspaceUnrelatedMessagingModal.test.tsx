@@ -7,6 +7,12 @@ import { installDom } from "../../../../tests/ui/dom";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+
+// Bun's module stubs outlive mock.restore(); do not alter later dialogs in the shared Unit run.
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+
 // Radix Dialog portals do not render in happy-dom; inline the shell (same as the heartbeat modal test).
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
@@ -90,6 +96,9 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     // Turning off sends the revocation and again waits for metadata.
     fireEvent.click(view.getByRole("switch"));
     expect(onSetEnabled.mock.calls[1]?.[0]).toBe(false);
+    await waitFor(() => {
+      expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    });
   });
 
   test("surfaces a backend refusal and unlocks the control without changing state", async () => {
@@ -119,7 +128,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     });
   });
 
-  test("ignores a stale response that lands after a newer toggle", async () => {
+  test("clears the prior error while a retry waits for its response", async () => {
     const first = deferred<Result<void, string>>();
     const second = deferred<Result<void, string>>();
     const responses = [first.promise, second.promise];

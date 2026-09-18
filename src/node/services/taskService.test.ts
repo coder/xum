@@ -11714,11 +11714,15 @@ describe("TaskService", () => {
         [
           projectWorkspace(projectPath, "root", "tree-root"),
           projectWorkspace(projectPath, "child", "child-a", {
+            unrelatedWorkspaceConsent: "child-consent",
             parentWorkspaceId: "tree-root",
             taskStatus: "running",
           }),
-          projectWorkspace(projectPath, "other-root", "other-root"),
+          projectWorkspace(projectPath, "other-root", "other-root", {
+            unrelatedWorkspaceConsent: "root-consent",
+          }),
           projectWorkspace(projectPath, "other-child", "other-child", {
+            unrelatedWorkspaceConsent: "other-child-consent",
             parentWorkspaceId: "other-root",
             taskStatus: "running",
           }),
@@ -11786,6 +11790,123 @@ describe("TaskService", () => {
   );
 
   describe("sendAgentTreeMessage unrelated targets", () => {
+    test.each([undefined, null, "", "  ", " padded ", true, 42, {}])(
+      "refuses unrelated targets without valid recipient consent (%j)",
+      async (consent) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        const target = projectWorkspace(projectPath, "target", "target");
+        // Config is persisted JSON; malformed settings must not grant access.
+        Object.assign(target, { unrelatedWorkspaceConsent: consent });
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [projectWorkspace(projectPath, "sender", "sender"), target],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+
+        // Knowing an ID must not reveal whether an unrelated recipient exists or wake it.
+        const missing = await taskService.sendAgentTreeMessage("sender", "missing", "No consent");
+        expect(missing).toEqual(Err({ code: "not_found" }));
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "No consent")).toEqual(
+          missing
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+      }
+    );
+
+    test.each(
+      (["pre-admission", "queued"] as const).flatMap((phase) =>
+        [false, true].map((reenable) => ({ phase, reenable }))
+      )
+    )(
+      "revokes and refunds unrelated consent at $phase (reenable=$reenable)",
+      async ({ phase, reenable }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "original-generation",
+            }),
+          ],
+          testTaskSettings()
+        );
+        expect(
+          findWorkspaceEntry(config.loadConfigOrDefault(), "target")?.workspace
+            .unrelatedWorkspaceConsent
+        ).toBe("original-generation");
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService, historyService } = createTaskServiceHarness(config, {
+          workspaceService,
+        });
+        reserveFamilyMessageTargetSlots(
+          taskService,
+          "target",
+          TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+        );
+        const setGeneration = async (generation?: string) => {
+          await config.editConfig((cfg) => {
+            const entry = findWorkspaceEntry(cfg, "target");
+            assert(entry);
+            if (generation == null) delete entry.workspace.unrelatedWorkspaceConsent;
+            else entry.workspace.unrelatedWorkspaceConsent = generation;
+            return cfg;
+          });
+        };
+        const revoke = async () => {
+          await setGeneration();
+          if (reenable) await setGeneration("new-generation");
+        };
+        const internals = taskService as unknown as {
+          resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
+        };
+        const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
+        try {
+          if (phase === "pre-admission") {
+            resolve.mockImplementationOnce(async () => {
+              await revoke();
+              return { model: defaultModel, agentId: "exec" };
+            });
+          }
+          const result = await taskService.sendAgentTreeMessage("sender", "target", "Old consent");
+          if (phase === "queued") {
+            expect(result).toMatchObject(Ok({ delivery: "queued" }));
+            const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
+              WorkspaceHost["sendMessage"]
+            >;
+            expect(internal?.admissionStale?.()).toBe(false);
+            await revoke();
+            expect(internal?.admissionStale?.()).toBe(true);
+            await internal?.onCanceled?.("Recipient consent was revoked");
+          } else {
+            expect(result).toEqual(Err({ code: "not_found" }));
+            expect(sendMessage).not.toHaveBeenCalled();
+          }
+          expect(await collectFullHistory(historyService, "target")).toEqual([]);
+          await setGeneration("new-generation");
+          // A fresh send can use the refunded slot, even though the sender never opted in.
+          expect(
+            findWorkspaceEntry(config.loadConfigOrDefault(), "sender")?.workspace
+              .unrelatedWorkspaceConsent
+          ).toBeUndefined();
+          expect(
+            (await taskService.sendAgentTreeMessage("sender", "target", "Fresh consent")).success
+          ).toBe(true);
+        } finally {
+          resolve.mockRestore();
+        }
+      }
+    );
+
     test("refuses unrelated messaging while legacy runtime identity is unresolved", async () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
@@ -11794,7 +11915,12 @@ describe("TaskService", () => {
         projectPath,
         [
           projectWorkspace(projectPath, "sender", "sender"),
-          { ...projectWorkspace(projectPath, "target", "target"), name: undefined },
+          {
+            ...projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
+            }),
+            name: undefined,
+          },
         ],
         testTaskSettings()
       );
@@ -11853,6 +11979,7 @@ describe("TaskService", () => {
                 : {}),
             }),
             projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
               runtimeConfig: endpoint === "target" ? runtimeConfig : { type: "local" },
               ...(endpoint === "target" && isChild
                 ? { parentWorkspaceId: "local-parent", taskStatus: "running" }
@@ -11888,8 +12015,12 @@ describe("TaskService", () => {
           config,
           projectPath,
           [
-            projectWorkspace(projectPath, "sender", "sender", { runtimeConfig }),
+            projectWorkspace(projectPath, "sender", "sender", {
+              runtimeConfig,
+              unrelatedWorkspaceConsent: "sender-consent",
+            }),
             projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
               runtimeConfig: { type: "worktree", srcBaseDir: "~/src" },
             }),
           ],
@@ -11963,6 +12094,7 @@ describe("TaskService", () => {
           [
             projectWorkspace(projectPath, "sender", "sender", { agentId: "explore" }),
             projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
               agentId: entry.selected,
               aiSettings: hasSettings
                 ? { model: "openai:gpt-5.2", thinkingLevel: "low" }
@@ -12034,6 +12166,7 @@ describe("TaskService", () => {
           [
             projectWorkspace(projectPath, "sender", "sender"),
             projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
               parentWorkspaceId: "foreign-root",
               taskStatus,
             }),
@@ -12060,7 +12193,10 @@ describe("TaskService", () => {
           projectPath,
           [
             projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target", { agentId: "exec" }),
+            projectWorkspace(projectPath, "target", "target", {
+              agentId: "exec",
+              unrelatedWorkspaceConsent: "consent",
+            }),
           ],
           testTaskSettings()
         );
@@ -12117,7 +12253,10 @@ describe("TaskService", () => {
           projectPath,
           [
             projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target", { agentId: "plan" }),
+            projectWorkspace(projectPath, "target", "target", {
+              agentId: "plan",
+              unrelatedWorkspaceConsent: "consent",
+            }),
           ],
           testTaskSettings()
         );
@@ -12208,7 +12347,10 @@ describe("TaskService", () => {
           projectPath,
           [
             projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target", { agentId: "plan" }),
+            projectWorkspace(projectPath, "target", "target", {
+              agentId: "plan",
+              unrelatedWorkspaceConsent: "consent",
+            }),
           ],
           testTaskSettings()
         );
@@ -12290,7 +12432,9 @@ describe("TaskService", () => {
           projectPath,
           [
             projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target"),
+            projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
+            }),
           ],
           testTaskSettings()
         );
@@ -12346,13 +12490,16 @@ describe("TaskService", () => {
           [
             projectWorkspace(projectPath, "source-root", "source-root"),
             projectWorkspace(projectPath, "sender", "sender", {
+              unrelatedWorkspaceConsent: "sender-consent",
               parentWorkspaceId: "source-root",
               taskStatus: "running",
               ...(restriction === "workflow"
                 ? { workflowTask: { runId: "wfr_peer", stepId: "step" } }
                 : { bestOf: { groupId: "group", index: 0, total: 2 } }),
             }),
-            projectWorkspace(projectPath, "target", "target"),
+            projectWorkspace(projectPath, "target", "target", {
+              unrelatedWorkspaceConsent: "consent",
+            }),
           ],
           testTaskSettings()
         );
@@ -12376,7 +12523,9 @@ describe("TaskService", () => {
         projectPath,
         [
           projectWorkspace(projectPath, "sender", "sender"),
-          projectWorkspace(projectPath, "foreign-root", "foreign-root"),
+          projectWorkspace(projectPath, "foreign-root", "foreign-root", {
+            unrelatedWorkspaceConsent: "root-consent",
+          }),
           projectWorkspace(projectPath, "target", "target", {
             parentWorkspaceId: "foreign-root",
             taskStatus: "reported",
@@ -12392,6 +12541,17 @@ describe("TaskService", () => {
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", "foreign-root");
+      // A parent's opt-in cannot grant access to its child, even during a live execution.
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "target", "Parent consent only")
+      ).toEqual(Err({ code: "not_found" }));
+      expect(sendMessage).not.toHaveBeenCalled();
+      await config.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "target");
+        assert(entry);
+        entry.workspace.unrelatedWorkspaceConsent = "child-consent";
+        return cfg;
+      });
       expect(
         await taskService.sendAgentTreeMessage("sender", "target", "Reply to live execution")
       ).toEqual(

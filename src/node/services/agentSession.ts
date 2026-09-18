@@ -19,6 +19,7 @@ import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
+import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
@@ -2618,6 +2619,30 @@ export class AgentSession {
     const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
     if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
     if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return "completed";
+
+    // Unrelated peer triggers can be durable before final admission. Their in-memory consent,
+    // runtime and lifecycle guards do not survive restart, so require user action rather than
+    // replaying an ambiguously admitted request. Keep the selected row (never retry an older one).
+    const retryMetadata = startupRetryUserMessage?.metadata?.muxMetadata;
+    const isPeerTrigger =
+      retryMetadata?.type === "agent-peer-message" ||
+      (retryMetadata?.type === "workspace-turn-task" && "agentPeerMessageTrigger" in retryMetadata);
+    const peerMetadata = getValidAgentPeerTriggerMeta(
+      retryMetadata?.type === "workspace-turn-task"
+        ? retryMetadata.agentPeerMessageTrigger
+        : retryMetadata
+    );
+    if (
+      isPeerTrigger &&
+      peerMetadata?.relationship !== "sibling" &&
+      peerMetadata?.relationship !== "descendant"
+    ) {
+      this.emitRetryEvent({
+        type: "auto-retry-abandoned",
+        reason: "unrelated_message_requires_user",
+      });
+      return "completed";
+    }
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
