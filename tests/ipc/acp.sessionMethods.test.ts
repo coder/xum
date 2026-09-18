@@ -726,6 +726,32 @@ describe("ACP session list/resume/fork support", () => {
     expect(harness.sendMessageCalls).toHaveLength(0);
   });
 
+  it("refuses a destructive slash command when the replay was never verified", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-dropped-clear",
+      projectPath: "/repo/dropped-clear",
+      namedWorkspacePath: "/repo/dropped-clear/.mux/ws-dropped-clear",
+    });
+    const harness = createHarness({ activeWorkspaces: [workspace], onChatEvents: [] });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-dropped-clear",
+      cwd: "/repo/dropped-clear",
+      mcpServers: [],
+    });
+
+    // The gate sits after slash-command discovery, directly before the truncation.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-dropped-clear",
+        prompt: [{ type: "text", text: "/clear" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.truncateHistoryCalls).toHaveLength(0);
+    expect(harness.sendMessageCalls).toHaveLength(0);
+  });
+
   it("updates cached onChat mode even when a subscription already exists", async () => {
     const workspace = createWorkspaceInfo({
       id: "ws-live-to-full",
