@@ -163,7 +163,6 @@ describe("compaction cancellation runtime", () => {
     });
     await fileIO.writeFile(h.storage.path, unsupported);
     const before = await h.rows();
-    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
     spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
@@ -211,7 +210,6 @@ describe("compaction cancellation runtime", () => {
         .dispatchPendingCompactionFollowUpIfNeeded()
         .catch((error: unknown) => String(error));
       expect(failedCleanup).toContain("injected cleanup failure");
-      spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
       spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
         shouldShowWarning: usagePercentage > 70,
         shouldForceCompact: usagePercentage > 70,
@@ -253,7 +251,6 @@ describe("compaction cancellation runtime", () => {
 
   test("automatic input still starts legacy compaction without cancellation debt", async () => {
     const h = await fixture();
-    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
     spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,

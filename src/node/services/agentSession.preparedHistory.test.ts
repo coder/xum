@@ -289,7 +289,6 @@ describe("prepared history publication", () => {
       contextTokens: 99_000,
       maxTokens: 100_000,
     });
-    spyOn(h.inputs.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.85);
     expect(await h.session.sendMessage("inspect input", options)).toEqual(Ok(undefined));
     const rows = await h.rows();
     expect(rows).toHaveLength(1);

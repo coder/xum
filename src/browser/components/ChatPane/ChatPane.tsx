@@ -75,7 +75,6 @@ import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSw
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
-import { AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT } from "@/common/constants/ui";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
@@ -380,22 +379,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceId,
     pendingModel
   );
-
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    // Keep backend session threshold in sync with the persisted per-model slider value.
-    const normalizedThreshold = Math.max(
-      AUTO_COMPACTION_THRESHOLD_EFFECTIVE_MIN_PERCENT / 100,
-      Math.min(1, autoCompactionThreshold / 100)
-    );
-    void api.workspace.setAutoCompactionThreshold({
-      workspaceId,
-      threshold: normalizedThreshold,
-    });
-  }, [api, workspaceId, autoCompactionThreshold]);
 
   const [queuedActionErrorState, setQueuedActionErrorState] = useState<{
     workspaceId: string;

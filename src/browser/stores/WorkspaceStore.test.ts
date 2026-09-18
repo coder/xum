@@ -30,9 +30,7 @@ import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
 import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
 import {
-  getAutoCompactionThresholdKey,
   getAutoRetryKey,
   getPinnedTodoExpandedKey,
   getStatusStateKey,
@@ -134,11 +132,6 @@ const mockOnProvidersConfigChanged = mock((_input?: void, options?: { signal?: A
   return Promise.resolve(subscription.iterable);
 });
 
-const mockSetAutoCompactionThreshold = mock(() =>
-  Promise.resolve({ success: true, data: undefined })
-);
-const mockGetStartupAutoRetryModel = mock(() => Promise.resolve({ success: true, data: null }));
-
 const mockClient = {
   workspace: {
     onChat: mockOnChat,
@@ -150,8 +143,6 @@ const mockClient = {
       list: mockActivityList,
       subscribe: mockActivitySubscribe,
     },
-    setAutoCompactionThreshold: mockSetAutoCompactionThreshold,
-    getStartupAutoRetryModel: mockGetStartupAutoRetryModel,
     resumeStream: mockResumeStream,
     sendMessage: mockSendMessage,
   },
@@ -796,8 +787,6 @@ describe("WorkspaceStore", () => {
     mockActivityList.mockClear();
     mockActivitySubscribe.mockClear();
     mockTerminalActivitySubscribe.mockClear();
-    mockSetAutoCompactionThreshold.mockClear();
-    mockGetStartupAutoRetryModel.mockClear();
     mockGetProvidersConfig.mockClear();
     mockOnProvidersConfigChanged.mockClear();
     mockResumeStream.mockClear();
@@ -1756,6 +1745,28 @@ describe("WorkspaceStore", () => {
     const pushActivity = (id: string, activity: WorkspaceActivitySnapshot) =>
       activityEvents.push({ type: "activity", workspaceId: id, activity });
     const state = () => store.getWorkspaceState(workspaceId);
+    /**
+     * Hold the next onChat call before its iterator opens: the workspace is selected but no
+     * chat events can flow yet, so nothing in flight covers that window. `reached` resolves
+     * when the held call arrives; `release` lets the subscription open.
+     */
+    const holdNextOnChatOpen = (): { release: () => void; reached: Promise<void> } => {
+      let release: () => void = () => undefined;
+      let markReached: () => void = () => undefined;
+      const opened = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const reached = new Promise<void>((resolve) => {
+        markReached = resolve;
+      });
+      const base = mockOnChat.getMockImplementation();
+      if (!base) throw new Error("mockOnChat has no implementation to hold");
+      mockOnChat.mockImplementationOnce(((...args: Parameters<typeof base>) => {
+        markReached();
+        return opened.then(() => base(...args));
+      }) as unknown as typeof base);
+      return { release, reached };
+    };
 
     beforeEach(() => {
       chatAttempts = [];
@@ -1920,16 +1931,11 @@ describe("WorkspaceStore", () => {
       store.setActiveWorkspaceId(otherWorkspaceId);
       await tick(0);
 
-      // Hold the next subscribe attempt in its startup await: the workspace is selected but
-      // no chat events can flow yet, so this stream is not covered by any replay in flight.
-      let releaseStartup: () => void = () => undefined;
-      mockGetStartupAutoRetryModel.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseStartup = () => resolve({ success: true, data: null });
-          })
-      );
+      // Hold the next subscribe attempt before its iterator opens: the workspace is selected
+      // but no chat events can flow yet, so this stream is not covered by any replay in flight.
+      const hold = holdNextOnChatOpen();
       store.setActiveWorkspaceId(workspaceId);
+      await hold.reached;
       await tick(0);
       expect(state().isHydratingTranscript).toBe(true);
       expect(attemptsFor(workspaceId)).toHaveLength(1);
@@ -1937,7 +1943,7 @@ describe("WorkspaceStore", () => {
       await tick(0);
       expect(state().isTranscriptStale).toBe(true);
 
-      releaseStartup();
+      hold.release();
       const attempt = await chatAttempt(workspaceId, 2);
       expect(state().isTranscriptStale).toBe(true);
       await finishSinceReplay(attempt);
@@ -2034,22 +2040,14 @@ describe("WorkspaceStore", () => {
       expect(state().isTranscriptStale).toBe(true);
 
       // The attempt dies before caught-up: the lone card must not surface during backoff.
-      // Hold the retry in its startup await so the post-failure state can be observed.
-      let releaseStartup: () => void = () => undefined;
-      mockGetStartupAutoRetryModel.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseStartup = () => resolve({ success: true, data: null });
-          })
-      );
+      // Hold the retry before its iterator opens so the post-failure state can be observed.
+      const hold = holdNextOnChatOpen();
       attempt.close();
-      expect(
-        await waitUntil(() => mockGetStartupAutoRetryModel.mock.calls.length >= 2, 3_000)
-      ).toBe(true);
+      await hold.reached;
       expect(state().isHydratingTranscript).toBe(true);
       expect(state().messages.some((m) => m.type === "workspace-init")).toBe(true);
       expect(state().isTranscriptStale).toBe(true);
-      releaseStartup();
+      hold.release();
     });
 
     it("keeps the stale skeleton deadline running across quick subscribe retries", async () => {
@@ -2075,15 +2073,10 @@ describe("WorkspaceStore", () => {
       store.setActiveWorkspaceId(otherWorkspaceId);
       await tick(0);
 
-      // Trustworthy cache, hung startup: no bound should be running yet.
-      let releaseStartup: () => void = () => undefined;
-      mockGetStartupAutoRetryModel.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseStartup = () => resolve({ success: true, data: null });
-          })
-      );
+      // Trustworthy cache, hung subscribe: no bound should be running yet.
+      const hold = holdNextOnChatOpen();
       store.setActiveWorkspaceId(workspaceId);
+      await hold.reached;
       await tick(200);
       expect(state().isHydratingTranscript).toBe(true);
       expect(state().isTranscriptStale).toBe(false);
@@ -2097,7 +2090,7 @@ describe("WorkspaceStore", () => {
       expect(state().isTranscriptStale).toBe(true);
       expect(await waitUntil(() => !state().isTranscriptStale)).toBe(true);
       expect(state().isHydratingTranscript).toBe(true);
-      releaseStartup();
+      hold.release();
     });
 
     it("marks the cache stale when a since replay is dropped after buffering rows", async () => {
@@ -2111,25 +2104,13 @@ describe("WorkspaceStore", () => {
       // behind, so the retry must hydrate behind the skeleton.
       attempt.push(createHistoryMessageEvent("history-2", 2));
       await tick(0);
-      let releaseStartup: () => void = () => undefined;
-      mockGetStartupAutoRetryModel.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseStartup = () => resolve({ success: true, data: null });
-          })
-      );
-      const startupCallsBeforeRetry = mockGetStartupAutoRetryModel.mock.calls.length;
+      const hold = holdNextOnChatOpen();
       attempt.close();
-      expect(
-        await waitUntil(
-          () => mockGetStartupAutoRetryModel.mock.calls.length > startupCallsBeforeRetry,
-          3_000
-        )
-      ).toBe(true);
+      await hold.reached;
       expect(state().isHydratingTranscript).toBe(true);
       expect(state().messages).toHaveLength(1);
       expect(state().isTranscriptStale).toBe(true);
-      releaseStartup();
+      hold.release();
     });
 
     it("releases the stale skeleton after the deadline when the replay never lands", async () => {
@@ -2401,26 +2382,26 @@ describe("WorkspaceStore", () => {
       expect(mockOnChat).toHaveBeenCalledWith({ workspaceId: "workspace-1" }, expect.anything());
     });
 
-    it("sanitizes malformed startup threshold values before backend sync", async () => {
-      const workspaceId = "workspace-threshold-sanitize";
-      const thresholdKey = getAutoCompactionThresholdKey("default");
-      global.window.localStorage.setItem(thresholdKey, JSON.stringify("not-a-number"));
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const deadline = Date.now() + 1_000;
-      while (mockSetAutoCompactionThreshold.mock.calls.length === 0 && Date.now() < deadline) {
-        await tick(10);
+    it("opens onChat without waiting on any other workspace RPC after activation", async () => {
+      const workspaceId = "workspace-first-rpc";
+      // Every other workspace.* RPC hangs. The compaction threshold is a persisted preference
+      // the backend reads itself, so no round-trip may gate the subscription (the old startup
+      // push serialized two RPCs ahead of onChat on every switch).
+      const workspaceClient = mockClient.workspace as unknown as Record<string, unknown>;
+      const restore: Array<() => void> = [];
+      for (const [name, value] of Object.entries(workspaceClient)) {
+        if (typeof value !== "function" || name === "onChat") continue;
+        workspaceClient[name] = () => new Promise<never>(() => undefined);
+        restore.push(() => {
+          workspaceClient[name] = value;
+        });
       }
-
-      expect(mockSetAutoCompactionThreshold).toHaveBeenCalledWith({
-        workspaceId,
-        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT / 100,
-      });
-
-      expect(global.window.localStorage.getItem(thresholdKey)).toBe(
-        JSON.stringify(DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT)
-      );
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => mockOnChat.mock.calls.length > 0, 1_000)).toBe(true);
+      } finally {
+        for (const undo of restore) undo();
+      }
     });
 
     it("sanitizes malformed legacy auto-retry values before subscribing", async () => {

@@ -19,6 +19,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
   backgroundProcessManager: BackgroundProcessManager;
@@ -78,18 +79,30 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   );
 }
 
-async function setDeterministicForceCompactionThreshold(
-  env: TestEnvironment,
-  workspaceId: string
-): Promise<void> {
-  // Keep force-compaction tests deterministic even if persisted settings enable 1M context
-  // or raise the auto-compaction threshold. 10% threshold + 5% force buffer => trigger at 15%.
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), 10);
-  const result = await env.orpc.workspace.setAutoCompactionThreshold({
-    workspaceId,
-    threshold: 0.1,
-  });
-  expect(result.success).toBe(true);
+const FORCE_THRESHOLD_PERCENT = 10;
+
+/**
+ * Move the per-model slider the way the UI does (a persisted-state write that the
+ * UserPreferencesProvider mirrors into config.json). 10% threshold + 5% force buffer =>
+ * force compaction triggers at 15%.
+ */
+function moveThresholdSlider(percent: number): void {
+  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), percent);
+}
+
+/** The backend reads the threshold from config.json; wait until the mirrored write landed. */
+async function waitForPersistedThreshold(env: TestEnvironment, fraction: number): Promise<void> {
+  await waitFor(
+    () => {
+      expect(
+        resolveAutoCompactionThreshold(
+          env.config.loadConfigOrDefault().userPreferences,
+          WORKSPACE_DEFAULTS.model
+        )
+      ).toBe(fraction);
+    },
+    { timeout: 10_000 }
+  );
 }
 
 describe("Compaction UI (mock AI router)", () => {
@@ -159,14 +172,11 @@ describe("Compaction UI (mock AI router)", () => {
       });
       expect(seedResult.success).toBe(true);
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
-      await setDeterministicForceCompactionThreshold(app.env, app.workspaceId);
-
-      const triggerResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: triggerMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(triggerResult.success).toBe(true);
+      // Slider, then an immediate composer send: the composer waits for the preference write
+      // to be acknowledged, so the backend decides with the new threshold.
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await app.chat.send(triggerMessage);
+      await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
       const compactionAssertionTimeoutMs = 120_000;
       await app.chat.expectTranscriptContains(
@@ -187,6 +197,35 @@ describe("Compaction UI (mock AI router)", () => {
       await app.dispose();
     }
   }, 120_000);
+
+  test("a slider change whose save fails refuses the send and keeps the draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "compaction-ui" });
+
+    try {
+      const seedMessage = "Seed before the failing save";
+      await app.chat.send(seedMessage);
+      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
+
+      const sendMessage = jest.spyOn(app.env.services.workspaceService, "sendMessage");
+      const saveUserConfig = jest
+        .spyOn(app.env.config, "saveUserConfig")
+        .mockRejectedValue(new Error("disk full"));
+      const draft = "Draft that must survive a failed settings save";
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await waitFor(() => expect(saveUserConfig).toHaveBeenCalled(), { timeout: 10_000 });
+      await app.chat.send(draft);
+
+      // The composer refuses the send visibly rather than streaming with a stale threshold.
+      await waitFor(
+        () => expect(app.view.container.textContent ?? "").toContain("Settings could not be saved"),
+        { timeout: 10_000 }
+      );
+      await app.chat.expectInputValue(draft);
+      expect(sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
 
   test("/compact command sends any foreground bash to background", async () => {
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
@@ -329,7 +368,8 @@ describe("Compaction UI (mock AI router)", () => {
       });
       expect(seedResult.success).toBe(true);
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
-      await setDeterministicForceCompactionThreshold(app.env, app.workspaceId);
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
       // Send via the UI path so the foreground bash auto-background logic runs exactly
       // as it does for real user sends, while backend mid-stream compaction handles the rest.

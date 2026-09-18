@@ -35,6 +35,7 @@ import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { TranscriptQuoteRoot } from "../Messages/TranscriptQuoteBoundary";
 import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
+import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -187,6 +188,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
+  const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const { agentId: currentAgentId, agents } = useAgent();
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
@@ -554,6 +556,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         targetAgentId,
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+      // Same barrier as the composer: the backend reads the send model's auto-compaction
+      // threshold from persisted preferences, so a slider move right before this click must
+      // reach config.json first. A failed save lands in the best-effort catch below.
+      await waitForPreferencePersisted(
+        { kind: "autoCompactionThreshold", model: resolvedModel },
+        new AbortController().signal
+      );
 
       await api.workspace.sendMessage({
         workspaceId,
@@ -607,6 +616,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         targetAgentId,
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+      // Same barrier as the composer: the backend reads the send model's auto-compaction
+      // threshold from persisted preferences, so a slider move right before this click must
+      // reach config.json first. A failed save lands in the best-effort catch below.
+      await waitForPreferencePersisted(
+        { kind: "autoCompactionThreshold", model: resolvedModel },
+        new AbortController().signal
+      );
 
       await api.workspace.sendMessage({
         workspaceId,

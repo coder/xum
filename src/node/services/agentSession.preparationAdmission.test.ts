@@ -326,7 +326,6 @@ describe("preparation admission", () => {
     const monitor = (
       h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
     ).contextController.compactionMonitor;
-    spyOn(monitor, "getThreshold").mockReturnValue(0.85);
     spyOn(monitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
