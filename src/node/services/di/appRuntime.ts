@@ -75,6 +75,15 @@
  * RC rename touches one directory. Tests may inject a `TestClock` beneath the
  * real graph (`serviceContainer.test.ts`) but go through `di/` helpers.
  *
+ * ## Context-management ownership
+ *
+ * `ContextManagement` is an app-lifetime factory in `CoreLive`; `openSession`
+ * synchronously creates a controller owned by its `AgentSession`. Mutable strategy
+ * state stays in that controller, not in the shared factory. Eager compaction work
+ * retains the session's `TurnCoordinator.enterExecution` lease so session shutdown
+ * can drain it. The factory adds no Effect forks or layer finalizers; strategy
+ * internals remain Promise-based.
+ *
  * ## Two seams, deliberately asymmetric
  *
  * - `EffectRunner` is **unsupervised**: fibers forked through it belong to the

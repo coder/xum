@@ -4253,7 +4253,7 @@ export class AgentSession {
     // turn in model context (the compaction would otherwise summarize a transcript that already
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
-    const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
+    const tokenBudgetActive = this.contextController.isTokenBudgetActive(optionsForStream);
     optionsForStream = this.contextController.normalizeSend(
       userMessage,
       optionsForStream,
@@ -5267,10 +5267,6 @@ export class AgentSession {
     this.lastUsageState = undefined;
   }
 
-  private isTokenBudgetActive(options?: SendMessageOptions): boolean {
-    return this.contextController.isTokenBudgetActive(options);
-  }
-
   /** Shared with manual reset, but only context-scoped state: tasks, costs and goal consent survive. */
   async applyContextResetSideEffects(options?: { deferCarryoverDiscard?: boolean }): Promise<void> {
     assert(
@@ -5692,7 +5688,10 @@ export class AgentSession {
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(
             model,
-            { ...memoryOptions, tokenBudgetActive: this.isTokenBudgetActive(options) },
+            {
+              ...memoryOptions,
+              tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
+            },
             cache
           ),
         workspaceGoalService: this.workspaceGoalService,
@@ -5704,7 +5703,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) &&
+          this.contextController.isTokenBudgetActive(options) &&
           this.contextController.autoCompactionThreshold(modelString) < 1,
         onStepSettled: this.contextController.stepSettlement({ kind: "prepared" }),
         requestAssemblySnapshot: snapshot,
@@ -6099,6 +6098,8 @@ export class AgentSession {
     return stamp === undefined ? metadata : { ...metadata, keepRecentTail: stamp };
   }
 
+  // Request construction stays session-owned: it resolves live workspace compact settings
+  // through the provider/auth-aware configuration view shared with ordinary session sends.
   private buildAutoCompactionRequest(params: {
     followUpContent: CompactionFollowUpRequest;
     baseOptions: SendMessageOptions;
@@ -7535,7 +7536,7 @@ export class AgentSession {
         resolveMemoryContext: (forModelString, memoryOptions) =>
           this.resolveMemoryContext(forModelString, {
             ...memoryOptions,
-            tokenBudgetActive: this.isTokenBudgetActive(options),
+            tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
           }),
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
@@ -7545,7 +7546,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) &&
+          this.contextController.isTokenBudgetActive(options) &&
           this.contextController.autoCompactionThreshold(modelString) < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
         // A flush turn stays bounded to one step even when token-budget mode was disabled
