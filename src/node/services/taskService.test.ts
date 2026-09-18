@@ -43,6 +43,8 @@ import {
   agentReportProgressDedupePrefix,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
+  INSTANCE_DISCOVERY_DEFAULT_LIMIT,
+  INSTANCE_DISCOVERY_MAX_LIMIT,
 } from "@/constants/agentMessaging";
 import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
@@ -73,6 +75,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -13468,6 +13471,563 @@ describe("TaskService", () => {
       Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
     );
     expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  describe("listInstanceWorkspaces", () => {
+    test.each([undefined, null, "", " padded ", 42])(
+      "filters unrelated recipients without valid consent (%j) before disclosure and activity",
+      async (consent) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "public-project");
+        const privatePath = path.join(rootDir, "private-project");
+        const hidden = projectWorkspace(privatePath, "private-name", "private-id", {
+          title: "Private title",
+          createdAt: "2026-09-18T12:00:00Z",
+        });
+        Object.assign(hidden, { unrelatedWorkspaceConsent: consent });
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "caller", "caller"),
+            projectWorkspace(projectPath, "visible", "visible", {
+              unrelatedWorkspaceConsent: "visible-consent",
+              createdAt: "2026-09-18T11:00:00Z",
+            }),
+          ],
+          { extraProjects: [[privatePath, { workspaces: [hidden] }]] }
+        );
+        const isBusyForMessage = mock((_workspaceId: string) => false);
+        const isStreaming = mock((_workspaceId: string) => false);
+        const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+        const { aiService } = createAIServiceMocks(config, { isStreaming });
+        const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+        const first = taskService.listInstanceWorkspaces("caller", { limit: 1 });
+        expect(first.rows.map((row) => row.workspaceId)).toEqual(["visible"]);
+        expect(first.totalMatching).toBe(2);
+        expect(first.nextOffset).toBe(1);
+        const second = taskService.listInstanceWorkspaces("caller", { limit: 1, offset: 1 });
+        // The caller never opted in: same-tree discovery is not a grant to unrelated callers.
+        expect(second.rows.map((row) => row.workspaceId)).toEqual(["caller"]);
+        expect(second.nextOffset).toBeUndefined();
+        for (const query of ["private-id", "private-name", "Private title", privatePath]) {
+          expect(taskService.listInstanceWorkspaces("caller", { query })).toEqual({
+            rows: [],
+            totalMatching: 0,
+          });
+        }
+        expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual(["visible", "caller"]);
+        expect(isStreaming.mock.calls.map(([id]) => id)).toEqual(["visible", "caller"]);
+
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "private-id");
+          assert(entry);
+          entry.workspace.unrelatedWorkspaceConsent = "new-consent";
+          return cfg;
+        });
+        expect(
+          taskService.listInstanceWorkspaces("caller", { query: privatePath }).rows
+        ).toMatchObject([{ workspaceId: "private-id", projectPath: privatePath }]);
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "private-id");
+          assert(entry);
+          delete entry.workspace.unrelatedWorkspaceConsent;
+          return cfg;
+        });
+        expect(taskService.listInstanceWorkspaces("caller", { query: privatePath })).toEqual({
+          rows: [],
+          totalMatching: 0,
+        });
+        expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual([
+          "visible",
+          "caller",
+          "private-id",
+        ]);
+      }
+    );
+
+    // These existing availability/runtime cases start from explicitly consented recipients.
+    function optedInWorkspace(...args: Parameters<typeof projectWorkspace>) {
+      return { ...projectWorkspace(...args), unrelatedWorkspaceConsent: "discovery-test-consent" };
+    }
+
+    const nonLocalRuntimes = [
+      { label: "ssh", runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" } },
+      {
+        label: "coder",
+        runtimeConfig: {
+          type: "ssh",
+          host: "coder.example",
+          srcBaseDir: "~/src",
+          coder: { workspaceName: "remote-workspace", existingWorkspace: true },
+        },
+      },
+      { label: "docker", runtimeConfig: { type: "docker", image: "node:22" } },
+      {
+        label: "devcontainer",
+        runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+      },
+    ] as const;
+
+    test.each(
+      nonLocalRuntimes.flatMap((runtime) =>
+        [false, true].map((isChild) => ({ ...runtime, isChild }))
+      )
+    )(
+      "returns no instance rows to $label callers (child=$isChild)",
+      async ({ runtimeConfig, isChild }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        await saveWorkspaces(config, projectPath, [
+          optedInWorkspace(projectPath, "local-root", "local-root"),
+          optedInWorkspace(projectPath, "caller", "caller", {
+            runtimeConfig,
+            ...(isChild ? { parentWorkspaceId: "local-root", taskStatus: "running" } : {}),
+          }),
+        ]);
+        const isBusyForMessage = mock(() => false);
+        const isStreaming = mock(() => false);
+        const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+        const { aiService } = createAIServiceMocks(config, { isStreaming });
+        const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+        expect(taskService.listInstanceWorkspaces("caller", {})).toEqual({
+          rows: [],
+          totalMatching: 0,
+          callerPeerMessagingRestricted: true,
+        });
+        expect(isBusyForMessage).not.toHaveBeenCalled();
+        expect(isStreaming).not.toHaveBeenCalled();
+      }
+    );
+
+    test("filters remote and unresolved roots before query, counts and paging while preserving local defaults", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        optedInWorkspace(projectPath, "default", "a-default"),
+        optedInWorkspace(projectPath, "local", "b-local", { runtimeConfig: { type: "local" } }),
+        optedInWorkspace(projectPath, "legacy-local", "c-legacy", {
+          runtimeConfig: { type: "local", srcBaseDir: "~/src" },
+        }),
+        optedInWorkspace(projectPath, "worktree", "d-worktree", {
+          runtimeConfig: { type: "worktree", srcBaseDir: "~/src" },
+        }),
+        ...nonLocalRuntimes.map(({ label, runtimeConfig }) =>
+          optedInWorkspace(projectPath, `remote-${label}`, `remote-${label}`, { runtimeConfig })
+        ),
+        // Missing inline identity can defer runtime resolution to legacy session metadata.
+        { ...optedInWorkspace(projectPath, "partial", "partial"), name: undefined },
+      ]);
+      const legacyDir = path.join(config.sessionsDir, "partial");
+      await fsPromises.mkdir(legacyDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacyDir, "metadata.json"),
+        JSON.stringify({
+          id: "partial",
+          name: "partial",
+          projectPath,
+          runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" },
+        })
+      );
+      const isBusyForMessage = mock((_workspaceId: string) => false);
+      const isStreaming = mock((_workspaceId: string) => false);
+      const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+      const { aiService } = createAIServiceMocks(config, { isStreaming });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+      for (const caller of ["partial", "missing"]) {
+        expect(taskService.listInstanceWorkspaces(caller, {})).toEqual({
+          rows: [],
+          totalMatching: 0,
+          callerPeerMessagingRestricted: true,
+        });
+      }
+      expect(isBusyForMessage).not.toHaveBeenCalled();
+      expect(isStreaming).not.toHaveBeenCalled();
+
+      const first = taskService.listInstanceWorkspaces("a-default", { limit: 2 });
+      expect(first.rows.map((row) => row.workspaceId)).toEqual(["a-default", "b-local"]);
+      expect(first.totalMatching).toBe(4);
+      expect(first.nextOffset).toBe(2);
+      const second = taskService.listInstanceWorkspaces("b-local", {
+        limit: 2,
+        offset: first.nextOffset,
+      });
+      expect(second.rows.map((row) => row.workspaceId)).toEqual(["c-legacy", "d-worktree"]);
+      expect(second.totalMatching).toBe(4);
+      expect(second.nextOffset).toBeUndefined();
+      for (const query of ["remote", "partial"]) {
+        expect(taskService.listInstanceWorkspaces("c-legacy", { query, limit: 1 })).toEqual({
+          rows: [],
+          totalMatching: 0,
+        });
+      }
+      const expectedActivityIds = ["a-default", "b-local", "c-legacy", "d-worktree"];
+      expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual(expectedActivityIds);
+      expect(isStreaming.mock.calls.map(([id]) => id)).toEqual(expectedActivityIds);
+      expect(taskService.listInstanceWorkspaces("d-worktree", {}).totalMatching).toBe(4);
+    });
+
+    test("omits stopped, stopping and delegated roots before counting, and restores them when eligible", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        ["available", "stopped", "stopping", "pending", "accepted"].map((id) =>
+          optedInWorkspace(projectPath, id, id)
+        )
+      );
+      const isBusyForMessage = mock(() => false);
+      const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      taskService.markParentWorkspaceInterrupted("stopped");
+      const release = taskService.latchWorkspaceStopsInProgress(["stopping"]);
+      await registerLiveWorkspaceTurnHandle(taskService, "pending", "wst_pending", "owner", false);
+      await registerLiveWorkspaceTurnHandle(taskService, "accepted", "wst_accepted", "owner", true);
+      try {
+        const result = taskService.listInstanceWorkspaces("available", { limit: 1 });
+        expect(result.rows.map((row) => row.workspaceId)).toEqual(["available"]);
+        expect(result.totalMatching).toBe(1);
+        expect(result.nextOffset).toBeUndefined();
+        expect(isBusyForMessage).toHaveBeenCalledTimes(1);
+        expect(isBusyForMessage).toHaveBeenCalledWith("available");
+      } finally {
+        release();
+      }
+      taskService.resetAutoResumeCount("stopped");
+      const internals = taskService as unknown as {
+        activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
+      };
+      internals.activeWorkspaceTurnHandleByWorkspaceId.delete("pending");
+      internals.activeWorkspaceTurnHandleByWorkspaceId.delete("accepted");
+      expect(
+        taskService.listInstanceWorkspaces("available", {}).rows.map((row) => row.workspaceId)
+      ).toEqual(["accepted", "available", "pending", "stopped", "stopping"]);
+    });
+
+    test("returns no roots to workflow or best-of callers and their descendants", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        optedInWorkspace(projectPath, "root", "root"),
+        optedInWorkspace(projectPath, "other", "other"),
+        optedInWorkspace(projectPath, "candidate", "candidate", {
+          parentWorkspaceId: "root",
+          bestOf: { groupId: "group", index: 0, total: 2 },
+        }),
+        optedInWorkspace(projectPath, "candidate-child", "candidate-child", {
+          parentWorkspaceId: "candidate",
+        }),
+        optedInWorkspace(projectPath, "workflow", "workflow", {
+          parentWorkspaceId: "root",
+          workflowTask: { runId: "wfr_instance", stepId: "step" },
+        }),
+        optedInWorkspace(projectPath, "workflow-child", "workflow-child", {
+          parentWorkspaceId: "workflow",
+        }),
+      ]);
+      const isBusyForMessage = mock(() => false);
+      const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      for (const caller of ["candidate", "candidate-child", "workflow", "workflow-child"]) {
+        expect(taskService.listInstanceWorkspaces(caller, {})).toEqual({
+          rows: [],
+          totalMatching: 0,
+          callerPeerMessagingRestricted: true,
+        });
+      }
+      expect(isBusyForMessage).not.toHaveBeenCalled();
+      // Root discovery never exposes task children, regardless of their task-specific tags.
+      expect(
+        taskService.listInstanceWorkspaces("root", {}).rows.map((row) => row.workspaceId)
+      ).toEqual(["other", "root"]);
+    });
+
+    test("orders by creation time then id, with missing or invalid dates last, independently of activity", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        optedInWorkspace(projectPath, "missing", "missing"),
+        optedInWorkspace(projectPath, "tie-b", "tie-b", { createdAt: "2026-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "invalid", "invalid", { createdAt: "not-a-date" }),
+        optedInWorkspace(projectPath, "oldest", "oldest", { createdAt: "1960-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "newest", "newest", { createdAt: "2026-02-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "tie-a", "tie-a", { createdAt: "2026-01-01T00:00:00Z" }),
+      ]);
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "missing"),
+      });
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock((id: string) => id === "tie-b"),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+      const result = taskService.listInstanceWorkspaces("newest", {});
+      expect(result.rows.map((row) => row.workspaceId)).toEqual([
+        "newest",
+        "tie-a",
+        "tie-b",
+        "oldest",
+        "invalid",
+        "missing",
+      ]);
+      expect(result.rows.filter((row) => row.busy).map((row) => row.workspaceId)).toEqual([
+        "tie-b",
+        "missing",
+      ]);
+      expect(result.nextOffset).toBeUndefined();
+    });
+
+    test.each([
+      { query: "ALPHA-ID", expected: ["alpha-id"] },
+      { query: "  IMPLEMENTER  ", expected: ["beta-id"] },
+      { query: "Feature/Plan", expected: ["alpha-id"] },
+      { query: "project-ALPHA", expected: ["alpha-id", "beta-id"] },
+      { query: "nothing-matches", expected: [] },
+      { query: "", expected: ["alpha-id", "beta-id"] },
+      { query: "   ", expected: ["alpha-id", "beta-id"] },
+      { query: null, expected: ["alpha-id", "beta-id"] },
+    ])(
+      "filters id/title/name/project path case-insensitively ($query)",
+      async ({ query, expected }) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "Project-Alpha");
+        await saveWorkspaces(config, projectPath, [
+          optedInWorkspace(projectPath, "feature/plan", "alpha-id", { title: "Planner" }),
+          optedInWorkspace(projectPath, "feature/exec", "beta-id", { title: "Implementer" }),
+          optedInWorkspace(projectPath, "hidden", "archived", {
+            title: "Implementer",
+            archivedAt: "2026-01-01T00:00:00Z",
+          }),
+        ]);
+        const { taskService } = createTaskServiceHarness(config);
+        const result = taskService.listInstanceWorkspaces("alpha-id", { query });
+        expect(result.rows.map((row) => row.workspaceId)).toEqual([...expected]);
+        expect(result.totalMatching).toBe(expected.length);
+      }
+    );
+
+    test.each(["multi", "scratch"] as const)(
+      "uses the attributed project path for %s roots in rows and queries",
+      async (kind) => {
+        const config = await createTestConfig(rootDir);
+        const primaryPath = path.join(rootDir, "Primary-Project");
+        const bucket = kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : MULTI_PROJECT_CONFIG_KEY;
+        const workspace = optedInWorkspace(rootDir, "managed-root", "root", {
+          runtimeConfig: { type: "local" },
+          ...(kind === "scratch"
+            ? { kind: "scratch" as const }
+            : { projects: [{ projectPath: primaryPath, projectName: "Primary" }] }),
+        });
+        await saveWorkspaces(config, bucket, [workspace]);
+        const { taskService } = createTaskServiceHarness(config);
+        const expectedPath = kind === "scratch" ? workspace.path : primaryPath;
+
+        const all = taskService.listInstanceWorkspaces("root", {});
+        expect(all.rows).toHaveLength(1);
+        expect(all.rows[0]?.projectPath).toBe(expectedPath);
+        const matching = taskService.listInstanceWorkspaces("root", {
+          query: expectedPath.toUpperCase(),
+        });
+        expect(matching.rows.map((row) => row.workspaceId)).toEqual(["root"]);
+        expect(matching.totalMatching).toBe(1);
+        expect(taskService.listInstanceWorkspaces("root", { query: bucket }).totalMatching).toBe(0);
+      }
+    );
+
+    test("pages filtered roots and omits nextOffset at or past the end", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        optedInWorkspace(projectPath, "hidden", "a", { archivedAt: "2026-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "unmatched", "b"),
+        optedInWorkspace(projectPath, "match", "c"),
+        optedInWorkspace(projectPath, "match", "d"),
+        optedInWorkspace(projectPath, "match", "e"),
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const first = taskService.listInstanceWorkspaces("c", { query: "match", limit: 2 });
+      // "unmatched" also contains "match"; use a boundary-independent substring search.
+      expect(first.totalMatching).toBe(4);
+      expect(first.rows.map((row) => row.workspaceId)).toEqual(["b", "c"]);
+      expect(first.nextOffset).toBe(2);
+      const second = taskService.listInstanceWorkspaces("c", {
+        query: "match",
+        limit: 2,
+        offset: first.nextOffset,
+      });
+      expect(second.rows.map((row) => row.workspaceId)).toEqual(["d", "e"]);
+      expect(second.totalMatching).toBe(4);
+      expect(second.nextOffset).toBeUndefined();
+      for (const offset of [4, 40]) {
+        expect(
+          taskService.listInstanceWorkspaces("c", { query: "match", limit: 2, offset })
+        ).toEqual({ rows: [], totalMatching: 4 });
+      }
+    });
+
+    test("bounds large-instance output and probes activity only for the returned page, without history reads", async () => {
+      const fixture = await createTestHistoryService();
+      await using _cleanup = { [Symbol.asyncDispose]: fixture.cleanup };
+      const { config, historyService } = fixture;
+      const projects: Array<[string, { workspaces: WorkspaceConfigEntry[] }]> = Array.from(
+        { length: 10 },
+        (_, project) => {
+          const projectPath = path.join(fixture.tempDir, `project-${project}`);
+          return [
+            projectPath,
+            {
+              workspaces: Array.from({ length: 20 }, (_, index) => {
+                const id = project * 20 + index;
+                return optedInWorkspace(projectPath, `root-${id}`, `root-${id}`, {
+                  createdAt: new Date(Date.UTC(2026, 0, 1, 0, id)).toISOString(),
+                });
+              }),
+            },
+          ];
+        }
+      );
+      await saveTestConfig(config, projects);
+      const isBusyForMessage = mock((id: string) => id === "root-197");
+      const isStreaming = mock((id: string) => id === "root-196");
+      const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+      const { aiService } = createAIServiceMocks(config, { isStreaming });
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+        aiService,
+        historyService,
+      });
+      const reads = [
+        spyOn(historyService, "iterateFullHistory"),
+        spyOn(historyService, "getHistoryFromLatestBoundary"),
+        spyOn(historyService, "getLastMessages"),
+        spyOn(historyService, "readPartial"),
+      ];
+      try {
+        const startedAt = performance.now();
+        const first = taskService.listInstanceWorkspaces("root-0", { limit: 7 });
+        const second = taskService.listInstanceWorkspaces("root-0", {
+          limit: 7,
+          offset: first.nextOffset,
+        });
+        console.info(
+          `Instance discovery: 200 roots / 10 projects / two 7-row pages in ${(performance.now() - startedAt).toFixed(2)}ms`
+        );
+        expect(first.rows.map((row) => row.workspaceId)).toEqual([
+          "root-199",
+          "root-198",
+          "root-197",
+          "root-196",
+          "root-195",
+          "root-194",
+          "root-193",
+        ]);
+        expect(first.rows.filter((row) => row.busy).map((row) => row.workspaceId)).toEqual([
+          "root-197",
+          "root-196",
+        ]);
+        expect(first.totalMatching).toBe(200);
+        expect(first.nextOffset).toBe(7);
+        expect(second.nextOffset).toBe(14);
+        const ids = [...first.rows, ...second.rows].map((row) => row.workspaceId);
+        expect(new Set(ids).size).toBe(14);
+        expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual(ids);
+        expect(isStreaming.mock.calls.map(([id]) => id)).toEqual(
+          ids.filter((id) => id !== "root-197")
+        );
+        expect(taskService.listInstanceWorkspaces("root-0", {}).rows).toHaveLength(
+          INSTANCE_DISCOVERY_DEFAULT_LIMIT
+        );
+        expect(
+          taskService.listInstanceWorkspaces("root-0", { limit: null, offset: null }).rows
+        ).toHaveLength(INSTANCE_DISCOVERY_DEFAULT_LIMIT);
+        expect(
+          taskService.listInstanceWorkspaces("root-0", { limit: INSTANCE_DISCOVERY_MAX_LIMIT }).rows
+        ).toHaveLength(INSTANCE_DISCOVERY_MAX_LIMIT);
+        for (const read of reads) expect(read).not.toHaveBeenCalled();
+      } finally {
+        for (const read of reads) read.mockRestore();
+      }
+    });
+
+    test.each([
+      { limit: 0 },
+      { limit: INSTANCE_DISCOVERY_MAX_LIMIT + 1 },
+      { limit: 1.5 },
+      { offset: -1 },
+      { offset: 0.5 },
+    ])("rejects invalid paging arguments %j", (options) => {
+      const config = new Config(rootDir);
+      const { taskService } = createTaskServiceHarness(config);
+      expect(() => taskService.listInstanceWorkspaces("caller", options)).toThrow();
+    });
+
+    test("lists roots across projects and distinguishes self, ancestor and unrelated", async () => {
+      const config = await createTestConfig(rootDir);
+      const firstProject = path.join(rootDir, "first");
+      const secondProject = path.join(rootDir, "second");
+      await saveWorkspaces(
+        config,
+        firstProject,
+        [
+          optedInWorkspace(firstProject, "planner", "root-a", { title: "Planner" }),
+          optedInWorkspace(firstProject, "child", "child-a", {
+            parentWorkspaceId: "root-a",
+            taskStatus: "running",
+          }),
+          optedInWorkspace(firstProject, "archived", "archived", {
+            archivedAt: "2026-09-01T00:00:00Z",
+          }),
+          optedInWorkspace(firstProject, "no-id", ""),
+        ],
+        {
+          extraProjects: [
+            [
+              secondProject,
+              {
+                workspaces: [
+                  optedInWorkspace(secondProject, "implementer", "root-b", {
+                    title: "Implementer",
+                  }),
+                  optedInWorkspace(secondProject, "foreign-child", "child-b", {
+                    parentWorkspaceId: "root-b",
+                    taskStatus: "running",
+                  }),
+                ],
+              },
+            ],
+          ],
+        }
+      );
+      const { taskService } = createTaskServiceHarness(config);
+      const fromRoot = taskService.listInstanceWorkspaces("root-a", {});
+      expect(fromRoot.totalMatching).toBe(2);
+      expect(fromRoot.rows).toEqual([
+        {
+          workspaceId: "root-a",
+          title: "Planner",
+          name: "planner",
+          projectPath: firstProject,
+          createdAt: undefined,
+          relationship: "self",
+          busy: false,
+        },
+        {
+          workspaceId: "root-b",
+          title: "Implementer",
+          name: "implementer",
+          projectPath: secondProject,
+          createdAt: undefined,
+          relationship: "unrelated",
+          busy: false,
+        },
+      ]);
+      expect(
+        taskService.listInstanceWorkspaces("child-a", {}).rows.map((row) => row.relationship)
+      ).toEqual(["ancestor", "unrelated"]);
+    });
   });
 
   test("listTaskTreeAgents tags relationships relative to the caller and excludes workflow subtrees", async () => {
