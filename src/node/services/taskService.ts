@@ -1,5 +1,6 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
@@ -6607,6 +6608,15 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "invalid_scope" as const });
       }
 
+      // Recipient consent is separate from knowing its ID. Refuse before exposing target state
+      // or reserving budget, using the same response as an unknown workspace.
+      const unrelatedConsent = getValidUnrelatedWorkspaceConsent(
+        targetEntry.workspace.unrelatedWorkspaceConsent
+      );
+      if (relation === "target_unrelated" && unrelatedConsent == null) {
+        return Err({ code: "not_found" as const });
+      }
+
       const unrelatedRuntimeRefusal = {
         code: "refused" as const,
         reason: "Unrelated messages require local or worktree runtimes on both endpoints.",
@@ -7004,6 +7014,16 @@ export class TaskService implements AgentTaskIntegration {
           }
           const freshEntry = findWorkspaceEntry(freshCfg, targetId);
           if (freshEntry == null) {
+            admissionRefusal = { code: "not_found" as const };
+            return true;
+          }
+          // An off/on cycle is a new grant, not permission to revive previously queued input.
+          // Recheck through the final synchronous session gate as well as after preparation awaits.
+          if (
+            relation === "target_unrelated" &&
+            getValidUnrelatedWorkspaceConsent(freshEntry.workspace.unrelatedWorkspaceConsent) !==
+              unrelatedConsent
+          ) {
             admissionRefusal = { code: "not_found" as const };
             return true;
           }

@@ -22222,7 +22222,7 @@ describe("WorkspaceService fork", () => {
       getOrCreateSessionSpy.mockRestore();
     }
   });
-  test("fork inherits a paused goal snapshot with fresh accounting", async () => {
+  test("fork inherits a paused goal with fresh accounting but not unrelated-message consent", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -22234,6 +22234,7 @@ describe("WorkspaceService fork", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
       namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+      unrelatedWorkspaceConsent: "source-consent",
     };
 
     await fsPromises.mkdir(sourceProjectPath, { recursive: true });
@@ -22326,6 +22327,14 @@ describe("WorkspaceService fork", () => {
       if (!result.success) {
         throw new Error(`Expected success result, got error: ${result.error}`);
       }
+
+      const metadataAfterFork = await config.getAllWorkspaceMetadata();
+      expect(
+        metadataAfterFork.find((entry) => entry.id === sourceWorkspaceId)?.unrelatedWorkspaceConsent
+      ).toBe("source-consent");
+      expect(
+        metadataAfterFork.find((entry) => entry.id === newWorkspaceId)?.unrelatedWorkspaceConsent
+      ).toBeUndefined();
 
       const forkGoal = await goalService.getGoal(newWorkspaceId);
       expect(forkGoal).toMatchObject({
