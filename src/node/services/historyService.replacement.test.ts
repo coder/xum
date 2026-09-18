@@ -3077,6 +3077,17 @@ describe("compaction replacement acceptance", () => {
       releaseForeign.resolve();
       await foreignLock;
     }
+
+    // The scoped witness must still detect a real read under this workspace's lock.
+    await workspaceFileLocks.withLock(workspaceId, async () => {
+      const handle = await fs.open(archivePath, "r");
+      try {
+        await handle.read(Buffer.alloc(1), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    expect(archiveBytesReadUnderLock).toBe(1);
   });
 
   it.each(["Stop", "append"] as const)(
