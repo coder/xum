@@ -826,6 +826,7 @@ describe("WorkflowRunner attempt disposition", () => {
         },
       ]);
       // The lease is released after the drain so an explicit resume is accepted.
+      await waitForLeaseLockRelease(tmp.path);
       await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
     }
   });
