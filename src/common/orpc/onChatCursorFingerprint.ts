@@ -1,5 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stableStringify } from "@/common/utils/stableStringify";
 
 const FNV_OFFSET_BASIS = 0x811c9dc5;
@@ -93,11 +94,21 @@ const UNSETTLED_ASSISTANT_PARTS = "<unsettled>";
  * that failed without usage never persists its text at all — while neither holds content the
  * fence needs to protect. A row the server completed meanwhile is no longer unsettled on its
  * side, so a client still holding the partial version conflicts, as it should.
+ *
+ * An empty row counts as the placeholder only while it carries no completion metadata: a turn
+ * the server finished without parts (refusal, content filter) is stamped `finishReason` /
+ * `usage` / `duration` at stream end and is settled — a client still holding the placeholder
+ * must conflict with it rather than hash identically.
  */
 function isUnsettledAssistantRow(message: MuxMessage): boolean {
+  if (message.role !== "assistant") return false;
+  if (message.metadata?.partial === true) return true;
+  if (message.parts.length !== 0) return false;
+  const metadata = message.metadata;
   return (
-    message.role === "assistant" &&
-    (message.metadata?.partial === true || message.parts.length === 0)
+    metadata?.finishReason === undefined &&
+    metadata?.usage === undefined &&
+    metadata?.duration === undefined
   );
 }
 
@@ -115,16 +126,20 @@ function isUnsettledAssistantRow(message: MuxMessage): boolean {
  *
  * Returns the row count alongside the hash so a client that is missing a row in the middle of
  * the range (or holds an extra one) is caught explicitly.
+ *
+ * Rows whose persisted `historySequence` is not a non-negative integer (the wire schema allows
+ * any number) are skipped like rows without one: they are self-healed out of sequence
+ * accounting everywhere else and must not be evidence on either side.
  */
 export function computeHistoryRangeFingerprint(
   messages: readonly MuxMessage[],
   fromSequence: number,
   throughSequence: number
 ): { rowCount: number; fingerprint: string } {
-  assert(Number.isInteger(fromSequence) && fromSequence >= 0, "fromSequence must be >= 0");
+  assert(isNonNegativeInteger(fromSequence), "fromSequence must be a non-negative integer");
   assert(
-    Number.isInteger(throughSequence) && throughSequence >= fromSequence,
-    "throughSequence must be >= fromSequence"
+    isNonNegativeInteger(throughSequence) && throughSequence >= fromSequence,
+    "throughSequence must be an integer >= fromSequence"
   );
 
   const entries: Array<{
@@ -137,7 +152,7 @@ export function computeHistoryRangeFingerprint(
   for (const message of messages) {
     const historySequence = message.metadata?.historySequence;
     if (
-      historySequence === undefined ||
+      !isNonNegativeInteger(historySequence) ||
       historySequence < fromSequence ||
       historySequence > throughSequence
     ) {

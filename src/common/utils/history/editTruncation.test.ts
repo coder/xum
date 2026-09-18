@@ -2,13 +2,44 @@ import { describe, expect, test } from "bun:test";
 
 import { createMuxMessage } from "@/common/types/message";
 
-import { getEditTruncateTargetFromMessages } from "./editTruncation";
+import { buildHistoryEditPrecondition, getEditTruncateTargetFromMessages } from "./editTruncation";
 
 const snapshot = (id: string) =>
   createMuxMessage(id, "user", "snapshot", {
     synthetic: true,
     fileAtMentionSnapshot: [],
   });
+
+describe("buildHistoryEditPrecondition", () => {
+  const committed = (id: string, seq: number) =>
+    createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", `text ${seq}`, {
+      historySequence: seq,
+    });
+  const rows = [committed("u0", 0), committed("a0", 1), committed("u1", 2), committed("a1", 3)];
+
+  test("treats rows with a malformed historySequence like uncommitted rows", () => {
+    const expected = buildHistoryEditPrecondition(rows, "u1");
+    // Negative, fractional and NaN sequences pass the wire schema (any number) but are not
+    // evidence; they neither move the newest row nor make the fingerprint throw.
+    const polluted = [
+      ...rows,
+      createMuxMessage("neg", "assistant", "…", { historySequence: -4 }),
+      createMuxMessage("frac", "assistant", "…", { historySequence: 3.5 }),
+      createMuxMessage("nan", "assistant", "…", { historySequence: Number.NaN }),
+      createMuxMessage("uncommitted", "assistant", "…"),
+    ];
+    expect(buildHistoryEditPrecondition(polluted, "u1")).toEqual(expected);
+    expect(expected).toMatchObject({ newestMessageId: "a1", newestHistorySequence: 3 });
+  });
+
+  test("cannot fence an edited row whose own sequence is malformed", () => {
+    const rowsWithBadEdit = [
+      committed("u0", 0),
+      createMuxMessage("u1", "user", "edited", { historySequence: -1 }),
+    ];
+    expect(buildHistoryEditPrecondition(rowsWithBadEdit, "u1")).toBeUndefined();
+  });
+});
 
 describe("getEditTruncateTargetFromMessages", () => {
   test("returns the edited row when nothing precedes it", () => {

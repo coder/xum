@@ -2,6 +2,7 @@ import { computeHistoryRangeFingerprint } from "@/common/orpc/onChatCursorFinger
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
 import { isSyntheticSnapshotUserMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 
 /**
  * The row an edit truncates from: the edited message itself, or the first of the synthetic
@@ -36,20 +37,26 @@ export function getEditTruncateTargetFromMessages(
 
 /**
  * Content evidence for an edit, computed over the committed rows a client holds when editing
- * begins (rows with a `historySequence`; streaming placeholders excluded by the caller). The
- * range runs from the truncation target through the newest committed row. Returns `undefined`
- * when the edited message is not among `messages` (the caller cannot fence what it does not
+ * begins (rows with a valid `historySequence`; a row without one, or with a malformed one the
+ * wire schema still admits, is not evidence — see computeHistoryRangeFingerprint). The range
+ * runs from the truncation target through the newest committed row. Returns `undefined` when
+ * the edited message is not among the committed rows (the caller cannot fence what it does not
  * hold) — the backend then decides with its own view.
  */
 export function buildHistoryEditPrecondition(
   messages: readonly MuxMessage[],
   editMessageId: string
 ): HistoryEditPrecondition | undefined {
-  const committed = messages.filter((message) => message.metadata?.historySequence !== undefined);
+  const committed = messages.filter((message) =>
+    isNonNegativeInteger(message.metadata?.historySequence)
+  );
   const rangeStartMessageId = getEditTruncateTargetFromMessages(committed, editMessageId);
   if (rangeStartMessageId === undefined) return undefined;
   const rangeStart = committed.find((message) => message.id === rangeStartMessageId);
-  assert(rangeStart?.metadata?.historySequence !== undefined, "range start must be committed");
+  assert(
+    rangeStart !== undefined && isNonNegativeInteger(rangeStart.metadata?.historySequence),
+    "range start must be committed"
+  );
   let newest = rangeStart;
   for (const message of committed) {
     if (message.metadata!.historySequence! > newest.metadata!.historySequence!) newest = message;

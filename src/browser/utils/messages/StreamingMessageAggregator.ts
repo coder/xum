@@ -1808,13 +1808,22 @@ export class StreamingMessageAggregator {
     return this.getActiveStreamEntry()?.[0];
   }
 
-  /** Committed rows a server-side history check can be asked about: no active stream row and
-   *  no locally fabricated row (see `locallyFabricatedRows`). */
+  /**
+   * Committed rows a server-side history check can be asked about: every held row except a
+   * locally fabricated one (see `locallyFabricatedRows`). The active stream's row IS evidence —
+   * its persisted counterpart is the empty placeholder the turn appended before streaming, and
+   * an edit that interrupts the turn deletes that placeholder, so the fence must name it as
+   * the newest row. It is presented as `partial` so both sides hash it by identity only (see
+   * computeHistoryRangeFingerprint): the client holds whatever streamed so far, the server
+   * holds the placeholder, and neither is settled content the fence protects.
+   */
   getHistoryEvidenceMessages(): MuxMessage[] {
     const activeStreamMessageId = this.getActiveStreamMessageId();
-    return this.getAllMessages().filter(
-      (message) => message.id !== activeStreamMessageId && !this.locallyFabricatedRows.has(message)
-    );
+    return this.getAllMessages().flatMap((message) => {
+      if (this.locallyFabricatedRows.has(message)) return [];
+      if (message.id !== activeStreamMessageId) return [message];
+      return [{ ...message, metadata: { ...message.metadata, partial: true } }];
+    });
   }
 
   isStreamActive(messageId: string): boolean {

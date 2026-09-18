@@ -4,7 +4,7 @@
  * service verifies it under the write lock and refuses with `history-changed` on any drift,
  * without writing anything.
  */
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import path from "path";
 
@@ -53,6 +53,7 @@ describe("AgentSession edit precondition", () => {
     const h = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: streamMessage ? { streamMessage } : undefined,
+      captureEvents: true,
     });
     harness = h;
     return h;
@@ -293,12 +294,23 @@ describe("AgentSession edit precondition", () => {
     expect(after.some((row) => row.id === "a0" || row.id === "u1")).toBe(false);
   });
 
-  /** A stream that stays in its preparing phase until aborted (the edit interrupts it). */
+  /**
+   * A stream that stays in its preparing phase until aborted (the edit interrupts it) or
+   * released. A released turn has no engine behind it, so its handle also retires with the
+   * session (`closingSignal`) — a refused edit now leaves that turn running (see f3).
+   */
   function preparingStream() {
     const resolvers: Array<() => void> = [];
     const streamMessage: AgentSessionHarness["aiService"]["streamMessage"] = (opts) =>
       new Promise((resolve) => {
-        const resolveOk = () => resolve(Ok(createStartedTurnHandle(opts.abortSignal!)));
+        const resolveOk = () =>
+          resolve(
+            Ok(
+              createStartedTurnHandle(
+                AbortSignal.any([opts.abortSignal!, harness!.session.closingSignal])
+              )
+            )
+          );
         if (opts.abortSignal?.aborted === true) return resolveOk();
         opts.abortSignal?.addEventListener("abort", resolveOk, { once: true });
         resolvers.push(resolveOk);
@@ -470,6 +482,192 @@ describe("AgentSession edit precondition", () => {
     ).toBe(false);
     // Plain sends need no fence.
     expect(input({})).toBe(true);
+  });
+
+  it("(f3) a stale fence is refused BEFORE the active turn is interrupted, and its queue survives", async () => {
+    const stream = preparingStream();
+    const h = await setup(stream.streamMessage);
+    const rows = await seed(h, threeTurns());
+    // Captured before the next turn committed its user row inside the fenced range.
+    const precondition = fence(rows, "u2");
+    const firstSend = h.session.sendMessage("third question", baseOptions);
+    expect(await waitForCondition(() => h.session.isPreparingTurn())).toBe(true);
+    // A follow-up the user queued behind the active turn.
+    h.session.queueMessage("queued follow-up", baseOptions);
+    const result = await h.session.sendMessage("edited during stream", {
+      ...baseOptions,
+      editMessageId: "u2",
+      historyEditPrecondition: precondition,
+    });
+    expect(result).toEqual({ success: false, error: { type: "history-changed" } });
+    // The newer turn the fence protects is still running: the refusal happened before the
+    // interruption, and the queue was neither consumed nor returned to the input.
+    expect(h.session.isPreparingTurn()).toBe(true);
+    expect(h.events.some((event) => event.type === "restore-to-input")).toBe(false);
+    stream.release();
+    await firstSend;
+    h.session.restoreQueueToInput();
+    expect(
+      h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+    ).toEqual(["queued follow-up"]);
+  });
+
+  it("(f4) an accepted edit still returns the queue to the input, after the fence held", async () => {
+    const stream = preparingStream();
+    const h = await setup(stream.streamMessage);
+    await seed(h, threeTurns());
+    const firstSend = h.session.sendMessage("third question", baseOptions);
+    expect(await waitForCondition(() => h.session.isPreparingTurn())).toBe(true);
+    h.session.queueMessage("queued follow-up", baseOptions);
+    const live = await persisted(h);
+    const result = await h.session.sendMessage("edited during stream", {
+      ...baseOptions,
+      editMessageId: "u2",
+      historyEditPrecondition: fence(live, "u2"),
+    });
+    stream.release();
+    await firstSend;
+    expect(result).toEqual(Ok(undefined));
+    expect(
+      h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+    ).toEqual(["queued follow-up"]);
+  });
+
+  it("a fenced edit whose target vanished is a conflict, not the missing-target leniency", async () => {
+    const h = await setup();
+    const rows = await seed(h, threeTurns());
+    const precondition = fence(rows, "u2");
+    // Another client truncated from u2 meanwhile: the edited row is gone.
+    expect((await h.historyService.truncateAfterMessage(workspaceId, "u2")).success).toBe(true);
+    const before = await chatFileBytes(h);
+    const result = await h.session.sendMessage("edited", {
+      ...baseOptions,
+      editMessageId: "u2",
+      historyEditPrecondition: precondition,
+    });
+    expect(result).toEqual({ success: false, error: { type: "history-changed" } });
+    expect(await chatFileBytes(h)).toEqual(before);
+  });
+
+  it("a completed empty assistant row is settled: a client still holding the placeholder conflicts", async () => {
+    const h = await setup();
+    const rows = await seed(h, [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer"),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage("a2", "assistant", ""),
+    ]);
+    // The client captured its evidence while a2 was the pre-stream placeholder.
+    const precondition = fence(rows, "u2");
+    const placeholder = rows.find((row) => row.id === "a2")!;
+    // The turn then finished without parts (refusal): stream end stamps completion metadata.
+    const completed = createMuxMessage("a2", "assistant", "", {
+      ...placeholder.metadata,
+      finishReason: "content-filter",
+      duration: 1_200,
+      usage: { inputTokens: 10, outputTokens: 0, totalTokens: 10 },
+    });
+    expect((await h.historyService.updateHistory(workspaceId, completed)).success).toBe(true);
+    expect(
+      await h.session.sendMessage("second, edited", {
+        ...baseOptions,
+        editMessageId: "u2",
+        historyEditPrecondition: precondition,
+      })
+    ).toEqual({ success: false, error: { type: "history-changed" } });
+    // Evidence captured over the completed row matches it.
+    expect(
+      await h.session.sendMessage("second, edited", {
+        ...baseOptions,
+        editMessageId: "u2",
+        historyEditPrecondition: fence(await persisted(h), "u2"),
+      })
+    ).toEqual(Ok(undefined));
+  });
+
+  it("verifies the client's range start against the rows replay delivers, not unparseable ones", async () => {
+    const h = await setup();
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const readable = (id: string, role: "user" | "assistant", text: string, seq: number) =>
+      createMuxMessage(id, role, text, { historySequence: seq, timestamp: seq + 1 });
+    // A synthetic snapshot row directly before the edited message that the readable floor
+    // admits (valid id/role/parts) but the wire schema rejects (non-numeric timestamp): replay
+    // never delivers it, so the client cannot know the server's cut starts there.
+    const malformedSnapshot = {
+      id: "snap-bad",
+      role: "user",
+      parts: [{ type: "text", text: "notes.md contents" }],
+      metadata: {
+        historySequence: 2,
+        timestamp: "corrupt",
+        synthetic: true,
+        fileAtMentionSnapshot: ["notes.md"],
+      },
+    };
+    const persistedRows = [
+      readable("u1", "user", "first", 0),
+      readable("a1", "assistant", "answer", 1),
+      malformedSnapshot,
+      readable("u2", "user", "second", 3),
+      readable("a2", "assistant", "second answer", 4),
+    ];
+    await fs.writeFile(
+      path.join(sessionDir, "chat.jsonl"),
+      persistedRows.map((row) => JSON.stringify(row)).join("\n") + "\n"
+    );
+    const events: WorkspaceChatMessage[] = [];
+    await h.session.replayHistory(({ message }) => {
+      events.push(message);
+    });
+    const clientRows = events.filter(isMuxMessage);
+    expect(clientRows.map((row) => row.id)).toEqual(["u1", "a1", "u2", "a2"]);
+    const precondition = fence(clientRows, "u2");
+    // The client's range starts at u2 (it never saw the snapshot); the server's cut starts at
+    // the snapshot. The fence accepts and the cut removes the snapshot with the edited turn.
+    expect(precondition.rangeStartMessageId).toBe("u2");
+    expect(
+      await h.session.sendMessage("second, edited", {
+        ...baseOptions,
+        editMessageId: "u2",
+        historyEditPrecondition: precondition,
+      })
+    ).toEqual(Ok(undefined));
+    await h.session.waitForIdle();
+    const after = await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8");
+    expect(after.includes("snap-bad")).toBe(false);
+    expect(after.includes('"a2"')).toBe(false);
+  });
+
+  it("a failed partial retirement after the cut is logged, not reported as a failed truncation", async () => {
+    const h = await setup();
+    const rows = await seed(h, threeTurns());
+    const a2 = rows.find((row) => row.id === "a2")!;
+    const partial = createMuxMessage("a2", "assistant", "streamed", {
+      historySequence: a2.metadata?.historySequence,
+      partial: true,
+    });
+    expect((await h.historyService.writePartial(workspaceId, partial)).success).toBe(true);
+    // Reading the partial for retirement fails after the truncated history was published.
+    const readPartial = h.historyService.readPartial.bind(h.historyService);
+    let failed = false;
+    const reading = spyOn(h.historyService, "readPartial").mockImplementation(async (id) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("partial read failed");
+      }
+      return readPartial(id);
+    });
+    try {
+      const result = await h.historyService.truncateAfterMessage(workspaceId, "u2", {
+        precondition: fence(rows, "u2"),
+      });
+      expect(result.success).toBe(true);
+      expect(failed).toBe(true);
+      expect((await persisted(h)).map((row) => row.id)).toEqual(["u1", "a1"]);
+    } finally {
+      reading.mockRestore();
+    }
   });
 
   it("verifies the precondition atomically with the truncation under the history lock", async () => {
