@@ -32,6 +32,41 @@ describe("buildHistoryEditPrecondition", () => {
     expect(expected).toMatchObject({ newestMessageId: "a1", newestHistorySequence: 3 });
   });
 
+  test("a malformed-sequence row still separates a snapshot from the edited row", () => {
+    // Adjacency is decided over every row, as the backend's cut is: the snapshot is NOT part of
+    // the edited turn here, so the range starts at the edited row on both sides.
+    const separated = [
+      committed("u0", 0),
+      createMuxMessage("snap", "user", "snapshot", {
+        historySequence: 1,
+        synthetic: true,
+        fileAtMentionSnapshot: [],
+      }),
+      createMuxMessage("junk", "assistant", "…", { historySequence: 1.5 }),
+      committed("u1", 2),
+      committed("a1", 3),
+    ];
+    expect(buildHistoryEditPrecondition(separated, "u1")).toMatchObject({
+      rangeStartMessageId: "u1",
+      rangeStartHistorySequence: 2,
+      newestMessageId: "a1",
+      rangeRowCount: 2,
+    });
+  });
+
+  test("cannot fence when the range starts at a snapshot whose sequence is malformed", () => {
+    const badSnapshotStart = [
+      committed("u0", 0),
+      createMuxMessage("snap", "user", "snapshot", {
+        historySequence: -1,
+        synthetic: true,
+        fileAtMentionSnapshot: [],
+      }),
+      committed("u1", 2),
+    ];
+    expect(buildHistoryEditPrecondition(badSnapshotStart, "u1")).toBeUndefined();
+  });
+
   test("cannot fence an edited row whose own sequence is malformed", () => {
     const rowsWithBadEdit = [
       committed("u0", 0),
