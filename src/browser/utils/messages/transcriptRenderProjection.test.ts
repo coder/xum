@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { TRANSCRIPT_REVEAL_STEP_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
   computeTaskAwaitPollGroupInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
 
@@ -98,6 +100,49 @@ function planDisplay(id: string, historyId: string): DisplayedMessage & { type: 
     historySequence: 1,
   };
 }
+
+describe("estimateTranscriptRowWeight", () => {
+  test("charges a stream error for the text it mounts, not a nominal marker", () => {
+    const verbose = { ...streamError("e1", "h-e1"), error: "x".repeat(50_000) };
+    const marker = streamError("e2", "h-e2");
+    // Distinct verbose failures are not merged, so a run of them would otherwise mount far more
+    // than the step ceiling accounts for.
+    expect(estimateTranscriptRowWeight(verbose)).toBeGreaterThanOrEqual(50_000);
+    expect(estimateTranscriptRowWeight(verbose) - estimateTranscriptRowWeight(marker)).toBe(
+      50_000 - marker.error.length
+    );
+  });
+
+  test("charges tool payload nested inside result wrappers, not only top-level strings", () => {
+    const wrapped = tool({
+      id: "t1",
+      historyId: "h-t1",
+      timestamp: 1,
+      result: { type: "json", value: { content: [{ type: "text", text: "y".repeat(40_000) }] } },
+    });
+    const flat = tool({ id: "t2", historyId: "h-t2", timestamp: 1, result: "y".repeat(40_000) });
+    // A `{ type: "json", value }` result is serialized in full by an expanded card, so it must
+    // weigh like the same text delivered as a plain string.
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(40_000);
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(
+      estimateTranscriptRowWeight(flat)
+    );
+  });
+
+  test("stops charging a wide payload once it exceeds one reveal step", () => {
+    const wide = (fields: number) =>
+      tool({
+        id: `w-${fields}`,
+        historyId: `h-w-${fields}`,
+        timestamp: 1,
+        result: Array.from({ length: fields }, () => "z".repeat(1_000)),
+      });
+    // The caller only needs "heavier than one step": a result ten times wider weighs the same.
+    const saturated = estimateTranscriptRowWeight(wide(1_000));
+    expect(saturated).toBeGreaterThan(TRANSCRIPT_REVEAL_STEP_CHARS);
+    expect(estimateTranscriptRowWeight(wide(10_000))).toBe(saturated);
+  });
+});
 
 describe("work bundle coalescing", () => {
   test("collapses completed assistant work before the final row", () => {

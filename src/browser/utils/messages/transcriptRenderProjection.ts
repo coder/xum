@@ -1,3 +1,7 @@
+import {
+  TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS,
+  TRANSCRIPT_REVEAL_STEP_CHARS,
+} from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
@@ -113,6 +117,59 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
     detailLabelPlural: "operations",
   },
 };
+
+/** Nesting walked when charging a tool payload: provider/MCP results wrap content a few levels deep. */
+const TOOL_PAYLOAD_WALK_DEPTH = 4;
+
+/**
+ * Characters of string payload a tool card can render when expanded: every string reachable
+ * within a few levels (file contents, command output, a plan body, `{ type: "json", value }`
+ * result wrappers whose value an expanded card serializes in full). Nothing is serialized —
+ * expansion is per workspace/tool and not visible to this projection, so this errs toward
+ * charging the visible payload. The walk is bounded in depth and in work: the caller only
+ * needs to know whether a row exceeds one reveal step, so it stops once that ceiling is
+ * reached (a very wide result must not itself become a long task).
+ */
+function estimateToolPayloadChars(value: unknown, depth = TOOL_PAYLOAD_WALK_DEPTH): number {
+  if (typeof value === "string") return value.length;
+  if (value === null || typeof value !== "object" || depth === 0) return 0;
+  let chars = 0;
+  const fields = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  for (const field of fields) {
+    if (chars >= TRANSCRIPT_REVEAL_STEP_CHARS) break;
+    chars += estimateToolPayloadChars(field, depth - 1);
+  }
+  return chars;
+}
+
+/**
+ * Relative render + layout cost of a transcript row for the tail-first reveal: the text body
+ * length for rows that render one (markdown, code blocks); for tool cards a nominal constant
+ * plus their string payload (args and result), since expanded cards — sticky per tool, and
+ * default for some tools — render it in full; a nominal constant for markers. A heuristic in
+ * characters, deliberately cheap — never serializes a message.
+ */
+export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
+  switch (message.type) {
+    case "user":
+    case "assistant":
+    case "reasoning":
+    case "plan-display":
+      return message.content.length;
+    case "tool":
+      return (
+        TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS +
+        estimateToolPayloadChars(message.args) +
+        estimateToolPayloadChars(message.result)
+      );
+    case "stream-error":
+      // Rendered in full; distinct verbose provider failures are not merged, so a run of them
+      // must count as the text it mounts, not as markers.
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS + message.error.length;
+    default:
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS;
+  }
+}
 
 export function computeWorkBundleInfos(
   messages: DisplayedMessage[]

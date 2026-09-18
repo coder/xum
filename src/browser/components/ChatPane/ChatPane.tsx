@@ -55,6 +55,7 @@ import {
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
+import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
@@ -118,6 +119,7 @@ import {
 import {
   computeOperationalBundleInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
@@ -195,6 +197,7 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // layout by a frame and tear. The dock must never be a scroll-anchoring
 // candidate: while locked the sentinel owns anchoring, and while released the
 // browser must anchor to a transcript row, not the sticky dock.
+const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
 
 function findTranscriptMessageElement(
@@ -453,6 +456,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Track which bash_output groups are expanded (keyed by first message ID)
   const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
 
+  // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
+  // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
+  // DOM instead of a one-shot requestAnimationFrame that would find nothing.
+  const [pendingScrollTarget, setPendingScrollTarget] = useState<{
+    workspaceId: string;
+    historyId: string;
+  } | null>(null);
+
   const [workBundleExpansionOverrides, setWorkBundleExpansionOverrides] = useState<
     Map<string, boolean>
   >(new Map());
@@ -484,7 +495,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
-  const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();
   const loadOlderMessagesShortcutLabel = formatKeybind(KEYBINDS.LOAD_OLDER_MESSAGES);
 
   const {
@@ -568,6 +578,45 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       }),
     [canInterrupt, deferredMessages, isStreamStarting, transcriptDensity]
   );
+
+  // Tail-first rendering: projections above are computed over the full array; only the
+  // mounted range starts at `revealFromIndex`. A cut is safe when the row is not inside a
+  // bundle or group (a head counts as safe), so bundles always mount whole.
+  const isSafeRevealCut = (index: number): boolean => {
+    const bashOutputGroup = bashOutputGroupInfos[index];
+    if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
+    const workBundle = workBundleInfos?.[index];
+    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    const operationalBundle = operationalBundleInfos?.[index];
+    return operationalBundle === undefined || operationalBundle.position === "head";
+  };
+  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
+  // workspace switches feel stable; rows known to be missing backend content hide behind
+  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
+  // renders in the tail lane below the skeleton, so it never vetoes it. The skeleton
+  // additionally holds until decoration data sources are known so the transcript and all
+  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
+  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
+    computeChatViewReveal({
+      isHydratingTranscript,
+      chatViewDataReady,
+      hasRenderableMessages: deferredMessages.length > 0,
+      isTranscriptStale: workspaceState.isTranscriptStale,
+    });
+  // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
+  // it: it would otherwise mount the whole transcript in the one commit that replaces the
+  // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
+  const { fromIndex: revealFromIndex, isFullyRevealed } = useBoundedTranscriptReveal({
+    workspaceId,
+    messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
+    isSafeCut: isSafeRevealCut,
+    rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+  });
+  const revealedMessages =
+    revealFromIndex === 0 ? deferredMessages : deferredMessages.slice(revealFromIndex);
+  // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
+  const shouldRenderLoadOlderMessagesButton =
+    hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
 
   // A tail propose_plan usually means the agent paused for user review; reveal only the
   // containing hyper-density bundles by default so historical plans stay collapsed.
@@ -654,7 +703,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!pendingTimelineReveal) {
       return;
     }
-    if (pendingTimelineReveal.workspaceId !== workspaceId) {
+    // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
+    if (pendingTimelineReveal.workspaceId !== workspaceId || autoScroll) {
       setPendingTimelineReveal(null);
       return;
     }
@@ -690,6 +740,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
+    // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
+    if (targetIndex < revealFromIndex) {
+      return;
+    }
+
     const scrollContainer = contentRef.current;
     const targetElement = scrollContainer
       ? findTranscriptRevealElement(scrollContainer, pendingTimelineReveal)
@@ -707,6 +762,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
     setPendingTimelineReveal(null);
   }, [
+    autoScroll,
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
@@ -714,6 +770,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
     pendingTimelineReveal,
+    revealFromIndex,
     workBundleExpansionOverrides,
     workBundleInfos,
     workspaceId,
@@ -767,17 +824,39 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     (historyId: string) => {
       // Disable auto-scroll so the navigation isn't undone by streaming content
       disableAutoScroll();
-      requestAnimationFrame(() => {
-        const scrollContainer = contentRef.current;
-        if (!scrollContainer) return;
-        findTranscriptMessageElement(scrollContainer, historyId)?.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
-      });
+      setPendingScrollTarget({ workspaceId, historyId });
     },
-    [contentRef, disableAutoScroll]
+    [disableAutoScroll, workspaceId]
   );
+
+  useEffect(() => {
+    if (pendingScrollTarget === null) return;
+    // Navigation disables auto-scroll first; the tail being pinned again (jump to bottom, a
+    // send, dismissing an edit, scrolling back down) supersedes a navigation still waiting
+    // for its row to mount, so the chunk mounting later cannot scroll away from the tail.
+    if (pendingScrollTarget.workspaceId !== workspaceId || autoScroll) {
+      setPendingScrollTarget(null);
+      return;
+    }
+    const scrollContainer = contentRef.current;
+    const target = scrollContainer
+      ? findTranscriptMessageElement(scrollContainer, pendingScrollTarget.historyId)
+      : undefined;
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingScrollTarget(null);
+      return;
+    }
+    // Not in the DOM: keep waiting only while the row exists below the reveal boundary. A
+    // row that is gone, or eligible but hidden inside a collapsed bundle, is dropped (the
+    // pre-reveal behavior for an unmounted target was a silent no-op too).
+    const targetIndex = deferredMessages.findIndex(
+      (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
+    );
+    if (targetIndex === -1 || targetIndex >= revealFromIndex) {
+      setPendingScrollTarget(null);
+    }
+  }, [autoScroll, contentRef, deferredMessages, pendingScrollTarget, revealFromIndex, workspaceId]);
 
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
@@ -1008,15 +1087,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!beginEditingMessage(buildEditingStateFromDisplayed(lastUserMessage))) return;
     disableAutoScroll(); // Show jump-to-bottom indicator
 
-    // Scroll to the message being edited
-    requestAnimationFrame(() => {
-      const scrollContainer = contentRef.current;
-      if (!scrollContainer) return;
-      findTranscriptMessageElement(scrollContainer, lastUserMessage.historyId)?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
-    });
+    // Scroll to the message being edited once it is mounted (see pendingScrollTarget).
+    setPendingScrollTarget({ workspaceId, historyId: lastUserMessage.historyId });
   };
 
   const handleEditLastUserMessageClick = () => {
@@ -1029,8 +1101,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // on the edited message. Dismissing the edit hands scroll ownership back to
     // the transcript tail; without this the view stays scrolled up until the
     // user manually returns to the bottom.
-    jumpToBottom();
-  }, [jumpToBottom, setEditingMessage]);
+    handleJumpToBottom();
+  }, [handleJumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
@@ -1130,19 +1202,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
   // show its "waiting on monitor" state instead of the chat looking idle.
   const shouldMountStreamingBarrier = shouldShowStreamingBarrier || activeBashMonitorCount > 0;
-  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
-  // workspace switches feel stable; rows known to be missing backend content hide behind
-  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
-  // renders in the tail lane below the skeleton, so it never vetoes it. The skeleton
-  // additionally holds until decoration data sources are known so the transcript and all
-  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
-  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
-    computeChatViewReveal({
-      isHydratingTranscript,
-      chatViewDataReady,
-      hasRenderableMessages: deferredMessages.length > 0,
-      isTranscriptStale: workspaceState.isTranscriptStale,
-    });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
@@ -1447,9 +1506,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             tabIndex={0}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
-            // decoration data readiness so waiting on it observes the chat
-            // view's final (post-reveal) layout.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady}
+            // decoration data readiness AND the tail-first reveal having mounted
+            // every row, so waiting on it observes the chat view's final layout
+            // rather than a tail whose earlier chunks are still committing.
+            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && isFullyRevealed}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:
@@ -1469,7 +1529,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
-              aria-live={canInterrupt ? "polite" : "off"}
+              // Live only once the historical reveal has finished: chunks of replayed history
+              // mounting during a stream would otherwise be announced as fresh output.
+              aria-live={canInterrupt && isFullyRevealed ? "polite" : "off"}
               aria-busy={canInterrupt || isHydratingTranscript}
               aria-label="Conversation transcript"
               className={cn(
@@ -1531,7 +1593,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         </TooltipIfPresent>
                       </div>
                     )}
-                    {deferredMessages.map((msg, index) => {
+                    {revealedMessages.map((msg, revealOffset) => {
+                      const index = revealFromIndex + revealOffset;
                       const workBundle = workBundleInfos?.[index];
                       const operationalBundle = workBundle
                         ? undefined
