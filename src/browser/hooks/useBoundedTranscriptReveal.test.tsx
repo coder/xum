@@ -247,6 +247,66 @@ describe("useBoundedTranscriptReveal", () => {
     expect(result.current.fromIndex).toBe(0);
   });
 
+  test("(k') a boundary the grouping pulled back stays there when the grouping changes back", () => {
+    const frames = manualFrames();
+    const messages = rows(200);
+    let bundles: Array<[number, number]> = [];
+    const isSafeCut = (index: number) =>
+      !bundles.some(([head, end]) => index > head && index < end);
+    const { result, rerender } = renderHook(() =>
+      useBoundedTranscriptReveal({
+        workspaceId: "ws",
+        messages,
+        isSafeCut,
+        scheduleFrame: frames.scheduleFrame,
+      })
+    );
+    expect(result.current.fromIndex).toBe(160);
+    // normal → hyper density: a work bundle comes to span the anchor row (160) → its head.
+    bundles = [[140, 175]];
+    rerender();
+    expect(result.current.fromIndex).toBe(140);
+    // hyper → normal: the bundle is gone again. Rows 140..159 were already mounted; the cut
+    // must not advance back to 160 and unmount them.
+    bundles = [];
+    rerender();
+    expect(result.current.fromIndex).toBe(140);
+    // The step after the move continues from the persisted boundary.
+    act(() => frames.flush());
+    expect(result.current.fromIndex).toBe(140 - TRANSCRIPT_REVEAL_CHUNK_ROWS);
+  });
+
+  test("(l') a frame scheduled before a tail replacement that re-chose the same anchor is dropped", () => {
+    // A scheduler whose cancel is a no-op, so an already-cancelled (stale) callback can still be
+    // invoked — the way a frame that slipped past cancellation would fire.
+    const scheduled: Array<() => void> = [];
+    const scheduleFrame = (callback: () => void) => {
+      scheduled.push(callback);
+      return () => undefined;
+    };
+    let props = { workspaceId: "ws", messages: rows(300) };
+    const { result, rerender } = renderHook(() =>
+      useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe, scheduleFrame })
+    );
+    const initialFrom = result.current.fromIndex;
+    expect(scheduled).toHaveLength(1);
+    const stale = scheduled[0];
+    // The newest row is replaced by another single row before the first step ran: same length,
+    // so the reset's tail cut lands on the same anchor row as before.
+    props = { ...props, messages: [...props.messages.slice(0, -1), ...rows(1, "replaced")] };
+    rerender();
+    expect(result.current.fromIndex).toBe(initialFrom);
+    // The reset scheduled its own generation's frame…
+    expect(scheduled).toHaveLength(2);
+    // …and the older generation's frame, firing late, must not mount a chunk ahead of the reset
+    // tail's paint.
+    act(() => stale());
+    expect(result.current.fromIndex).toBe(initialFrom);
+    // Only the new generation's frame moves the boundary, by exactly one step.
+    act(() => scheduled[1]());
+    expect(result.current.fromIndex).toBe(initialFrom - TRANSCRIPT_REVEAL_CHUNK_ROWS);
+  });
+
   test("(l) a step whose generation changed before it ran is a no-op", () => {
     const frames = manualFrames();
     let props = { workspaceId: "ws", messages: rows(300) };
