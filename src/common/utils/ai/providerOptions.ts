@@ -41,6 +41,7 @@ import {
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
 import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "./proMode";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -352,10 +353,15 @@ export function buildProviderOptions(
   // Custom-provider model entries (mappedToModel aliases) live under the raw
   // custom prefix; the wire-remapped identity above is only for namespace and
   // payload-format selection, so metadata must resolve from the raw identity.
+  // Coder strings likewise resolve from the raw identity whenever the instance
+  // type maps them to an upstream model: the wire identity keeps Bedrock's
+  // openai.<model> namespace, which the GPT-5.6/Astra effort matchers miss.
   const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
-  const metadataModel = isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata])
-    ? modelString
-    : normalizedModel;
+  const metadataModel =
+    isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) ||
+    resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
+      ? modelString
+      : normalizedModel;
   const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
@@ -503,6 +509,18 @@ export function buildProviderOptions(
           }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
+    // Bedrock Mantle keeps the openai.<model> ID on the wire, which
+    // @ai-sdk/openai does not classify as a reasoning model (it keys on
+    // gpt-*/o* IDs), so it would drop reasoning.effort with a warning and
+    // Mantle would run its default effort whatever the thinking level. Every
+    // OpenAI model Bedrock serves is a reasoning model, so force the
+    // classification. Mantle also rejects reasoning.summary values other than
+    // "auto" with HTTP 400.
+    const bedrockOpenAIWire =
+      routeProvider === "coder" &&
+      modelString.startsWith("coder:") &&
+      resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
+        ?.providerType === "bedrock";
 
     log.debug("buildProviderOptions: OpenAI config", {
       reasoningEffort,
@@ -518,6 +536,7 @@ export function buildProviderOptions(
     const options = {
       openai: {
         parallelToolCalls: true, // Always enable concurrent tool execution
+        ...(bedrockOpenAIWire && { forceReasoning: true }),
         ...(serviceTier != null && { serviceTier }),
         ...(store != null && { store }), // ZDR: pass store flag through to OpenAI SDK
         ...(isResponses && {
@@ -551,7 +570,11 @@ export function buildProviderOptions(
           // reasoning effort is set, so models that reject the parameter must
           // explicitly opt out with null.
           ...(isResponses && {
-            reasoningSummary: shouldSendReasoningSummary ? ("detailed" as const) : null,
+            reasoningSummary: bedrockOpenAIWire
+              ? ("auto" as const)
+              : shouldSendReasoningSummary
+                ? ("detailed" as const)
+                : null,
           }),
           ...(isResponses && {
             // Include reasoning encrypted content to preserve reasoning context across conversation steps
