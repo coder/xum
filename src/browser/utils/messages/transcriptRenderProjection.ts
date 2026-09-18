@@ -1,4 +1,7 @@
-import { TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS } from "@/common/constants/ui";
+import {
+  TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS,
+  TRANSCRIPT_REVEAL_STEP_CHARS,
+} from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
@@ -123,15 +126,19 @@ const TOOL_PAYLOAD_WALK_DEPTH = 4;
  * within a few levels (file contents, command output, a plan body, `{ type: "json", value }`
  * result wrappers whose value an expanded card serializes in full). Nothing is serialized —
  * expansion is per workspace/tool and not visible to this projection, so this errs toward
- * charging the visible payload — and the walk is depth-bounded so a pathological result
- * cannot turn a weight estimate into a traversal.
+ * charging the visible payload. The walk is bounded in depth and in work: the caller only
+ * needs to know whether a row exceeds one reveal step, so it stops once that ceiling is
+ * reached (a very wide result must not itself become a long task).
  */
 function estimateToolPayloadChars(value: unknown, depth = TOOL_PAYLOAD_WALK_DEPTH): number {
   if (typeof value === "string") return value.length;
   if (value === null || typeof value !== "object" || depth === 0) return 0;
   let chars = 0;
   const fields = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
-  for (const field of fields) chars += estimateToolPayloadChars(field, depth - 1);
+  for (const field of fields) {
+    if (chars >= TRANSCRIPT_REVEAL_STEP_CHARS) break;
+    chars += estimateToolPayloadChars(field, depth - 1);
+  }
   return chars;
 }
 

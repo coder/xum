@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { TRANSCRIPT_REVEAL_STEP_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
@@ -126,6 +127,20 @@ describe("estimateTranscriptRowWeight", () => {
     expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(
       estimateTranscriptRowWeight(flat)
     );
+  });
+
+  test("stops charging a wide payload once it exceeds one reveal step", () => {
+    const wide = (fields: number) =>
+      tool({
+        id: `w-${fields}`,
+        historyId: `h-w-${fields}`,
+        timestamp: 1,
+        result: Array.from({ length: fields }, () => "z".repeat(1_000)),
+      });
+    // The caller only needs "heavier than one step": a result ten times wider weighs the same.
+    const saturated = estimateTranscriptRowWeight(wide(1_000));
+    expect(saturated).toBeGreaterThan(TRANSCRIPT_REVEAL_STEP_CHARS);
+    expect(estimateTranscriptRowWeight(wide(10_000))).toBe(saturated);
   });
 });
 
