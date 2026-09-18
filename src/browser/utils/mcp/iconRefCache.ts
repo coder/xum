@@ -93,9 +93,15 @@ export class McpIconRefCache {
   private enqueue(iconRef: string, pending: Pending): void {
     // A batch belongs to one client and never exceeds the capacity per call;
     // it flushes on the next microtask so one render pass yields one IPC call.
+    // It also flushes when it already holds this ref: that earlier request was
+    // evicted from `entries` before the microtask ran (LRU pressure within one
+    // tick) and its callers must still be answered, so it is sent as is rather
+    // than overwritten by the replacement.
     if (
       this.batch &&
-      (this.batch.owner !== pending.owner || this.batch.refs.size >= this.capacity)
+      (this.batch.owner !== pending.owner ||
+        this.batch.refs.size >= this.capacity ||
+        this.batch.refs.has(iconRef))
     ) {
       this.flush(this.batch);
     }

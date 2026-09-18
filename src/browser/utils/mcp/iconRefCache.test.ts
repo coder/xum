@@ -190,6 +190,101 @@ describe("McpIconRefCache", () => {
     expect(refs.slice(5).map((r) => cache.peek(r))).toEqual([PNG, PNG, PNG]);
   });
 
+  test("a request evicted while its batch is still open is settled, and re-requesting it is not orphaned", async () => {
+    // Attach observers before anything settles so a never-settling promise is
+    // detected as a plain boolean instead of hanging the test.
+    const observe = (promise: Promise<unknown>) => {
+      const state = { settled: false };
+      promise.then(
+        () => (state.settled = true),
+        () => (state.settled = true)
+      );
+      return state;
+    };
+    const cache = new McpIconRefCache(3);
+    const batches: Array<ReturnType<typeof deferred<Icons>>> = [];
+    const api = client(() => {
+      const batch = deferred<Icons>();
+      batches.push(batch);
+      return batch.promise;
+    });
+    for (const n of [1, 2, 3]) {
+      const seeded = cache.resolve(ref(n), api);
+      await Promise.resolve();
+      batches[batches.length - 1].resolve(icons([ref(n)]));
+      await seeded;
+    }
+    expect(api.calls).toHaveLength(3);
+
+    // Same tick (no awaits, so the batch microtask has not run): miss 4, touch
+    // 2 and 3, miss 5 evicts the pending 4, then 4 again.
+    const first = cache.resolve(ref(4), api);
+    const firstSettled = observe(first);
+    void cache.resolve(ref(2), api);
+    void cache.resolve(ref(3), api);
+    const fifth = cache.resolve(ref(5), api);
+    expect(cache.peek(ref(4))).toBeUndefined();
+    const again = cache.resolve(ref(4), api);
+    expect(again).not.toBe(first);
+    await Promise.resolve();
+    // The open batch holding the evicted request is sent before 4 is queued anew.
+    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
+    expect(cache.size).toBe(3);
+
+    // Settle the replacement first, then the original: every caller is answered.
+    batches[4].resolve(icons([ref(4)]));
+    expect(await again).toBe(PNG);
+    expect(cache.peek(ref(4))).toBe(PNG);
+    batches[3].resolve({ [ref(4)]: "data:image/png;base64,old=", [ref(5)]: null });
+    expect(await fifth).toBeNull();
+    expect(await first).toBe("data:image/png;base64,old=");
+    expect(firstSettled.settled).toBe(true);
+    // The late original completion cannot overwrite the current entry.
+    expect(cache.peek(ref(4))).toBe(PNG);
+    expect(cache.peek(ref(5))).toBeNull();
+  });
+
+  test("an evicted-then-re-requested ref whose original batch rejects still resolves through the new one", async () => {
+    const cache = new McpIconRefCache(3);
+    const batches: Array<ReturnType<typeof deferred<Icons>>> = [];
+    const api = client(() => {
+      const batch = deferred<Icons>();
+      batches.push(batch);
+      return batch.promise;
+    });
+    for (const n of [1, 2, 3]) {
+      const seeded = cache.resolve(ref(n), api);
+      await Promise.resolve();
+      batches[batches.length - 1].resolve(icons([ref(n)]));
+      await seeded;
+    }
+    const first = cache.resolve(ref(4), api);
+    const outcome = { first: "pending" };
+    first.then(
+      () => (outcome.first = "resolved"),
+      () => (outcome.first = "rejected")
+    );
+    void cache.resolve(ref(2), api);
+    void cache.resolve(ref(3), api);
+    const fifth = cache.resolve(ref(5), api);
+    const again = cache.resolve(ref(4), api);
+    await Promise.resolve();
+    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
+
+    batches[3].reject(new Error("socket closed"));
+    await fifth.catch(() => undefined);
+    await Promise.resolve();
+    expect(outcome.first).toBe("rejected");
+    // The rejection deleted only its own surviving entry (5); the replacement
+    // request for 4 and the resolved 3 are untouched.
+    expect(cache.peek(ref(5))).toBeUndefined();
+    expect(cache.peek(ref(3))).toBe(PNG);
+    expect(cache.size).toBe(2);
+    batches[4].resolve(icons([ref(4)]));
+    expect(await again).toBe(PNG);
+    expect(cache.peek(ref(4))).toBe(PNG);
+  });
+
   test("rejects a non-positive capacity", () => {
     expect(() => new McpIconRefCache(0)).toThrow();
   });
