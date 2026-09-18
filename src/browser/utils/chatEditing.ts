@@ -37,7 +37,8 @@ export interface EditingMessageState {
   precondition?: HistoryEditPrecondition;
   /**
    * The backend refused the last send with `history-changed` and a transcript refresh is
-   * pending or failed: Send stays disabled until a fresh candidate arrives.
+   * pending or failed: Send stays disabled until a fresh candidate arrives (after a failure
+   * the composer offers a retry in the edit-mode indicator as well as in the toast).
    */
   preconditionInvalidated?: boolean;
   /**
