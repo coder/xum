@@ -326,18 +326,11 @@ describe("MCP icon references on tool-call snapshots", () => {
 describe("connection tests and the historical icon registry", () => {
   test("connection tests resolve through the process resolver and never admit registry entries", async () => {
     using tmp = new DisposableTempDir("mcp-icon-test-isolation");
-    const manager = new MCPServerManager(new MCPConfigService(new Config(tmp.path)));
-    // Seed one immutable ref the way a served tool call does (real resolution).
-    const registry = Reflect.get(manager, "iconRegistry") as MCPIconRegistry;
-    const historicalOwner: MCPIconOwner = {};
-    const historicalBinding: MCPConnectionRef = { key: "history", transport: "stdio" };
-    const historicalRef = registry.ensure(historicalOwner, [PIXEL_PNG_ICON], historicalBinding)!;
-    const historicalIcon = await manager.getIcon(historicalRef);
-    expect(isPngDataUrl(historicalIcon)).toBe(true);
-
-    const testIcon = PNG;
+    // Installed before the manager exists so its registry captures the same
+    // fake resolver the test path calls: every resolution, seed included, is
+    // the same injected PNG, and no decode work can mask the retention check.
     const resolveSpy = spyOn(serverIcon, "resolveServerIcon").mockImplementation(() =>
-      Promise.resolve(testIcon)
+      Promise.resolve(PNG)
     );
     const clientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
       Promise.resolve({
@@ -347,7 +340,16 @@ describe("connection tests and the historical icon registry", () => {
         close: () => Promise.resolve(),
       } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>)
     );
+    const manager = new MCPServerManager(new MCPConfigService(new Config(tmp.path)));
     try {
+      // Seed one immutable ref the way a served tool call does.
+      const registry = Reflect.get(manager, "iconRegistry") as MCPIconRegistry;
+      const historicalOwner: MCPIconOwner = {};
+      const historicalBinding: MCPConnectionRef = { key: "history", transport: "stdio" };
+      const historicalRef = registry.ensure(historicalOwner, [PIXEL_PNG_ICON], historicalBinding)!;
+      expect(await manager.getIcon(historicalRef)).toBe(PNG);
+      resolveSpy.mockClear();
+
       // More successful tests than the registry holds entries: had they been
       // admitted, the LRU would have evicted the historical ref by now.
       const runs = MCP_ICON_LIMITS.registryMaxEntries + 1;
@@ -360,13 +362,14 @@ describe("connection tests and the historical icon registry", () => {
         });
         expect(result.success).toBe(true);
         if (!result.success) throw new Error(result.error);
-        expect(result.icon).toBe(testIcon);
+        expect(result.icon).toBe(PNG);
       }
+      // The decisive check first: historical artwork survives untouched.
+      expect(await manager.getIcon(historicalRef)).toBe(PNG);
+      // One resolution per test, none for the historical ref; the owner still
+      // deduplicates onto the same ref, so nothing was evicted or refetched.
       expect(resolveSpy).toHaveBeenCalledTimes(runs);
       expect(clientSpy).toHaveBeenCalledTimes(runs);
-      // Historical artwork is untouched: same bytes, and the owner still
-      // deduplicates onto the same ref, so nothing was evicted or refetched.
-      expect(await manager.getIcon(historicalRef)).toBe(historicalIcon);
       expect(registry.ensure(historicalOwner, [PIXEL_PNG_ICON], historicalBinding)).toBe(
         historicalRef
       );
