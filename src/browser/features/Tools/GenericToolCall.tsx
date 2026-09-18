@@ -20,6 +20,7 @@ import { ToolResultImages, extractImagesFromToolResult } from "./Shared/ToolResu
 import { MCPServerIdentityBadge } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 import { useMcpIcon } from "@/browser/hooks/useMcpIcon";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 
 interface GenericToolCallProps {
   toolName: string;
@@ -68,7 +69,11 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
         {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
         {mcpServer && <McpServerBadge mcpServer={mcpServer} />}
         {TOOL_NAME_TO_ICON[toolName] && <ToolIcon toolName={toolName} />}
-        <ToolName>{toolName}</ToolName>
+        {/* Display only: a plugin's stable installation ID stays in the model-facing
+            name (dispatch, history, sticky expansion) but not in the readable label. */}
+        <ToolName>
+          {mcpServer ? mcpToolDisplayName(toolName, mcpServer.connection) : toolName}
+        </ToolName>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
       </ToolHeader>
 
