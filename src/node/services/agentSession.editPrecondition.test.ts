@@ -348,11 +348,19 @@ describe("AgentSession edit precondition", () => {
     const precondition = fence(rows, "u2");
     const firstSend = h.session.sendMessage("third question", baseOptions);
     expect(await waitForCondition(() => h.session.isPreparingTurn())).toBe(true);
+    // The refusal must leave the newer turn's context state alone too: `reset("edit")` aborts
+    // its compactor and prefix-swap bookkeeping, so it may only run once the edit proceeds.
+    const contextController = (
+      h.session as unknown as { contextController: { reset: (reason: string) => void } }
+    ).contextController;
+    const reset = spyOn(contextController, "reset");
     const result = await h.session.sendMessage("edited during stream", {
       ...baseOptions,
       editMessageId: "u2",
       historyEditPrecondition: precondition,
     });
+    expect(reset).not.toHaveBeenCalled();
+    reset.mockRestore();
     stream.release();
     await firstSend;
     expect(result).toEqual({ success: false, error: { type: "history-changed" } });
@@ -636,6 +644,44 @@ describe("AgentSession edit precondition", () => {
     await h.session.waitForIdle();
     const after = await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8");
     expect(after.includes("snap-bad")).toBe(false);
+    expect(after.includes('"a2"')).toBe(false);
+  });
+
+  it("ignores a persisted row with a malformed sequence as evidence, like the client does", async () => {
+    const h = await setup();
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const readable = (id: string, role: "user" | "assistant", text: string, seq: number) =>
+      createMuxMessage(id, role, text, { historySequence: seq, timestamp: seq + 1 });
+    // Wire-parseable (a number is a number) but not a valid sequence: the client drops it from
+    // its evidence, so the server must not pick it as the newest row of the removed range.
+    const persistedRows = [
+      readable("u1", "user", "first", 0),
+      readable("a1", "assistant", "answer", 1),
+      readable("u2", "user", "second", 2),
+      readable("a2", "assistant", "second answer", 3),
+      readable("junk", "assistant", "fractional sequence", 3.5),
+    ];
+    await fs.writeFile(
+      path.join(sessionDir, "chat.jsonl"),
+      persistedRows.map((row) => JSON.stringify(row)).join("\n") + "\n"
+    );
+    const events: WorkspaceChatMessage[] = [];
+    await h.session.replayHistory(({ message }) => {
+      events.push(message);
+    });
+    const precondition = fence(events.filter(isMuxMessage), "u2");
+    expect(precondition.newestMessageId).toBe("a2");
+    expect(
+      await h.session.sendMessage("second, edited", {
+        ...baseOptions,
+        editMessageId: "u2",
+        historyEditPrecondition: precondition,
+      })
+    ).toEqual(Ok(undefined));
+    await h.session.waitForIdle();
+    const after = await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8");
+    expect(after.includes('"junk"')).toBe(false);
     expect(after.includes('"a2"')).toBe(false);
   });
 

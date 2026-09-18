@@ -3897,13 +3897,14 @@ export class AgentSession {
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");
-      this.contextController.reset("edit");
 
-      // Fence preflight BEFORE interrupting: a turn that started after the client captured its
-      // evidence (queued follow-up, goal continuation, background report) has already added
-      // rows inside the fenced range, so the atomic check below would refuse the edit — but
-      // only after the interruption discarded the very response the fence protects. The
-      // preflight is advisory (read lock only); the truncation re-verifies atomically.
+      // Fence preflight BEFORE the context reset and the interruption: a turn that started
+      // after the client captured its evidence (queued follow-up, goal continuation,
+      // background report) has already added rows inside the fenced range, so the atomic
+      // check below would refuse the edit — but only after the reset aborted that turn's
+      // compactor and prefix-swap state and the interruption discarded the very response the
+      // fence protects. The preflight is advisory (read lock only); the truncation
+      // re-verifies atomically.
       if (options.historyEditPrecondition) {
         const preflightTarget = await this.getEditTruncateTargetId(editMessageId);
         const preflight = await this.historyService.checkHistoryEditPrecondition(
@@ -3923,6 +3924,7 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(preflight.error));
         }
       }
+      this.contextController.reset("edit");
 
       // Ignore our own reservation when deciding whether a turn needs to settle.
       if (this.coordinator.phase !== "idle") {

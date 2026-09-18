@@ -4300,7 +4300,12 @@ export class WorkspaceStore {
           );
       },
       onAttemptFinished: () => {
-        this.currentOnChatAttempts.delete(workspaceId);
+        // The transport withholds this callback once the loop signal is aborted, so the entry
+        // is this loop's own attempt; the guard keeps that true by construction should a
+        // replacement loop (switch away and back) ever register first.
+        if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
+          this.currentOnChatAttempts.delete(workspaceId);
+        }
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
         const transient = this.chatTransientState.get(workspaceId);

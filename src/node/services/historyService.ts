@@ -424,12 +424,18 @@ export function isHistoryEditPreconditionMismatch(error: string): boolean {
  * The projection of a persisted row the client actually receives: oRPC validates every replayed
  * row against the wire schema, which drops keys it does not know (a persisted user text part
  * carries `state: "done"`, the wire part does not) and skips rows that fail it entirely.
- * Evidence is compared over this projection so it matches what the client can compute.
+ * Evidence is compared over this projection so it matches what the client can compute. The
+ * client additionally fences only rows with a valid `historySequence` (see
+ * `buildHistoryEditPrecondition`), so a persisted row whose sequence is negative or fractional
+ * — admitted by the wire schema — is dropped here too; otherwise it would be selected as the
+ * range start or newest row on this side only and refuse every refreshed fence.
  */
 function toWireProjection(rows: readonly MuxMessage[]): MuxMessage[] {
   return rows.flatMap((row) => {
     const parsed = MuxMessageSchema.safeParse(row);
-    return parsed.success ? [parsed.data as MuxMessage] : [];
+    return parsed.success && isNonNegativeInteger(parsed.data.metadata?.historySequence)
+      ? [parsed.data as MuxMessage]
+      : [];
   });
 }
 
