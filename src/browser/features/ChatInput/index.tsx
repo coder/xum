@@ -295,6 +295,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // refresh outcome, the "Retry refresh" toast): they must not act on an edit the user has
   // since cancelled or replaced.
   const editingMessageIdRef = useRef<string | undefined>(editingMessage?.id);
+  // A failed conflict refresh keeps Send disabled (stale evidence is never re-sent blindly), so
+  // the retry must live in persistent edit-mode UI, not only in the dismissible toast.
+  const [editRefreshRetry, setEditRefreshRetry] = useState<{
+    editMessageId: string;
+    precondition: HistoryEditPrecondition;
+  } | null>(null);
   useEffect(() => {
     editingMessageIdRef.current = editingMessage?.id;
   }, [editingMessage?.id]);
@@ -1792,6 +1798,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const isSameEdit = () => editingMessageIdRef.current === editMessageId;
 
     patchEditing({ preconditionInvalidated: true, pendingReconfirmation: undefined });
+    setEditRefreshRetry(null);
     store
       .requestTranscriptRefresh(targetWorkspaceId, {
         throughSequence: precondition.rangeStartHistorySequence,
@@ -1819,6 +1826,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           case "failed":
             // Draft and invalidated state stay; a failure is never read as exhausted history.
             if (!isMountedRef.current || !isSameEdit()) return;
+            setEditRefreshRetry({ editMessageId, precondition });
             setToast({
               id: Date.now().toString(),
               type: "error",
@@ -2843,10 +2851,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               {variant === "workspace" && editingMessageForUi && (
                 <div className="text-edit-mode text-[11px] font-medium">
                   {/* Send is disabled while a history-changed refresh is pending or failed;
-                      say why here since the toast can be dismissed. */}
+                      say why here since the toast can be dismissed — and after a failure keep
+                      the retry here too, so the edit is never stuck once the toast is gone. */}
                   {editPreconditionInvalidated
-                    ? "Editing message — history changed, refreshing transcript"
+                    ? editRefreshRetry?.editMessageId === editingMessageForUi.id
+                      ? "Editing message — history changed, transcript refresh failed"
+                      : "Editing message — history changed, refreshing transcript"
                     : "Editing message"}{" "}
+                  {editPreconditionInvalidated &&
+                    editRefreshRetry?.editMessageId === editingMessageForUi.id && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setToast(null);
+                          startEditTranscriptRefresh(
+                            editRefreshRetry.editMessageId,
+                            editRefreshRetry.precondition
+                          );
+                        }}
+                        className="cursor-pointer border-0 bg-transparent p-0 underline"
+                      >
+                        {EDIT_RETRY_REFRESH_LABEL}
+                      </button>
+                    )}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)

@@ -566,6 +566,13 @@ export class StreamingMessageAggregator {
    * membership expires with the fabricated row itself.
    */
   private readonly locallyFabricatedRows = new WeakSet<MuxMessage>();
+  /**
+   * Persisted rows a frontend projection currently overlays under the same id (a workflow-run
+   * card refreshed with the run's live status, see `addEphemeralMessage`): the projection is
+   * displayed, the persisted row stays the edit evidence — it is what the backend fingerprints.
+   * Refreshed when the backend sends a newer version of the row, dropped with the row.
+   */
+  private readonly overlaidPersistedRows = new Map<string, MuxMessage>();
 
   /** Oldest historySequence from the server's last replay window.
    *  Used for reconnect cursors instead of the absolute minimum (which
@@ -875,6 +882,7 @@ export class StreamingMessageAggregator {
 
   private deleteMessage(messageId: string): boolean {
     const didDelete = this.messages.delete(messageId);
+    this.overlaidPersistedRows.delete(messageId);
     if (didDelete) {
       this.displayedMessageCache.delete(messageId);
       this.messageVersions.delete(messageId);
@@ -1036,6 +1044,15 @@ export class StreamingMessageAggregator {
 
   addMessage(message: MuxMessage): void {
     const normalizedMessage = normalizeMessageRouteProvider(message);
+    // A backend row for an overlaid id is the persisted version the fence must see, whether or
+    // not the richer displayed projection below keeps its place.
+    if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+    }
+    this.upsertMessage(normalizedMessage);
+  }
+
+  private upsertMessage(normalizedMessage: MuxMessage): void {
     const existing = this.messages.get(normalizedMessage.id);
     if (existing) {
       const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
@@ -1064,9 +1081,21 @@ export class StreamingMessageAggregator {
    * can be asked about (see `getHistoryEvidenceMessages`).
    */
   addEphemeralMessage(message: MuxMessage): void {
-    this.addMessage(message);
-    const stored = this.messages.get(message.id);
-    if (stored) this.locallyFabricatedRows.add(stored);
+    const normalizedMessage = normalizeMessageRouteProvider(message);
+    const existing = this.messages.get(normalizedMessage.id);
+    const overlaysPersistedRow =
+      existing !== undefined &&
+      !this.locallyFabricatedRows.has(existing) &&
+      !this.overlaidPersistedRows.has(normalizedMessage.id);
+    if (overlaysPersistedRow) {
+      // A projection over a persisted row (same id): keep the persisted version as evidence.
+      this.overlaidPersistedRows.set(normalizedMessage.id, existing);
+    }
+    this.upsertMessage(normalizedMessage);
+    const stored = this.messages.get(normalizedMessage.id);
+    if (stored !== undefined && !this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.locallyFabricatedRows.add(stored);
+    }
   }
 
   /**
@@ -1100,6 +1129,7 @@ export class StreamingMessageAggregator {
       this.historyEpoch++;
       // Clear existing state to prevent stale messages from persisting.
       this.messages.clear();
+      this.overlaidPersistedRows.clear();
       this.displayedMessageCache.clear();
       this.messageVersions.clear();
       this.deltaHistory.clear();
@@ -1127,6 +1157,9 @@ export class StreamingMessageAggregator {
     // Add/overwrite messages in the map
     for (const message of messages) {
       const normalizedMessage = normalizeMessageRouteProvider(message);
+      if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+        this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+      }
       const existing = mode === "append" ? this.messages.get(normalizedMessage.id) : undefined;
 
       if (existing) {
@@ -1832,8 +1865,9 @@ export class StreamingMessageAggregator {
    */
   getHistoryEvidenceMessages(): MuxMessage[] {
     const activeStreamMessageId = this.getActiveStreamMessageId();
-    return this.getAllMessages().flatMap((message) => {
-      if (this.locallyFabricatedRows.has(message)) return [];
+    return this.getAllMessages().flatMap((displayed) => {
+      if (this.locallyFabricatedRows.has(displayed)) return [];
+      const message = this.overlaidPersistedRows.get(displayed.id) ?? displayed;
       if (message.id !== activeStreamMessageId) return [message];
       return [{ ...message, metadata: { ...message.metadata, partial: true } }];
     });
@@ -1996,6 +2030,7 @@ export class StreamingMessageAggregator {
 
   clear(): void {
     this.messages.clear();
+    this.overlaidPersistedRows.clear();
     this.activeStreams.clear();
     this.displayedMessageCache.clear();
     this.messageVersions.clear();

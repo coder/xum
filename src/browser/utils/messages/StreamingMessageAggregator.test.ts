@@ -265,6 +265,43 @@ function historicalTodoMessage(
 }
 
 describe("StreamingMessageAggregator", () => {
+  describe("history edit evidence", () => {
+    const row = (id: string, seq: number, text: string) =>
+      createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", text, {
+        historySequence: seq,
+        timestamp: seq + 1,
+      });
+
+    test("a projection over a persisted row keeps the persisted version as evidence", () => {
+      const aggregator = new StreamingMessageAggregator(new Date().toISOString());
+      const persistedCard = row("workflow-run-1", 1, "workflow running");
+      aggregator.loadHistoricalMessages([row("u0", 0, "hi"), persistedCard, row("u2", 2, "next")]);
+      const before = aggregator.getHistoryEvidenceMessages();
+
+      // The projection (same id, live status) is displayed; the backend still holds the card.
+      aggregator.addEphemeralMessage(row("workflow-run-1", 1, "workflow completed"));
+      expect(aggregator.getAllMessages().find((m) => m.id === "workflow-run-1")?.parts).toEqual(
+        row("workflow-run-1", 1, "workflow completed").parts
+      );
+      expect(aggregator.getHistoryEvidenceMessages()).toEqual(before);
+
+      // A newer persisted version from the backend becomes the evidence, projection or not.
+      const republished = row("workflow-run-1", 1, "workflow finished (persisted)");
+      aggregator.addMessage(republished);
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(republished.parts);
+
+      // A frontend-only row with no persisted counterpart is not evidence at all.
+      aggregator.addEphemeralMessage(
+        row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
+      );
+      expect(
+        aggregator.getHistoryEvidenceMessages().some((m) => m.id === "plan-display-preview")
+      ).toBe(false);
+    });
+  });
+
   describe("workflow run attachments", () => {
     test("preserves persisted workflow run attachments on displayed tool rows", () => {
       const aggregator = createTestAggregator();
