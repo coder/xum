@@ -4319,38 +4319,57 @@ describe("WorkspaceMcpOverridesService", () => {
     // snapshot (in either direction). Both writers publish INSIDE the
     // exclusive write queue, so concurrent launches publish in write order.
     const published: Array<{ via: string; enabled: unknown }> = [];
-    await Promise.all([
-      service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:", {
-        publish: (persisted) => {
-          published.push({ via: "prune", enabled: persisted?.enabledServers });
-          return Promise.resolve();
-        },
-      }),
-      service.setOverridesForWorkspace(
-        workspaceId,
-        { enabledServers: ["other-server", "third-server"] },
-        {
+    const writes: Array<"prune" | "set"> = [];
+    const canonicalFilePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const realRename = fsPromisesModule.rename;
+    // Metadata/realpath resolution precedes lock acquisition, so launch order
+    // is not write order. Observe completed atomic writes independently of publication.
+    const renameSpy = spyOn(fsPromisesModule, "rename").mockImplementation(
+      async (oldPath, newPath) => {
+        await realRename(oldPath, newPath);
+        if (newPath === filePath) writes.push("prune");
+        if (newPath === canonicalFilePath) writes.push("set");
+      }
+    );
+    try {
+      await Promise.all([
+        service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:", {
           publish: (persisted) => {
-            published.push({ via: "set", enabled: persisted?.enabledServers });
+            published.push({ via: "prune", enabled: persisted?.enabledServers });
             return Promise.resolve();
           },
-        }
-      ),
-    ]);
+        }),
+        service.setOverridesForWorkspace(
+          workspaceId,
+          { enabledServers: ["other-server", "third-server"] },
+          {
+            publish: (persisted) => {
+              published.push({ via: "set", enabled: persisted?.enabledServers });
+              return Promise.resolve();
+            },
+          }
+        ),
+      ]);
+    } finally {
+      renameSpy.mockRestore();
+    }
 
-    // Queue order: prune first (pruned snapshot), then the save (its own
-    // normalized payload). Each publication carries the state its write
-    // persisted, and the LAST publication matches the final disk state.
-    expect(published).toEqual([
-      { via: "prune", enabled: ["other-server"] },
-      { via: "set", enabled: ["other-server", "third-server"] },
-    ]);
-    // The save writes the CANONICAL file (.xum); the seeded legacy .mux file
-    // was edited in place by the prune and is now shadowed on reads.
-    const finalState = JSON.parse(
-      await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
-    ) as Record<string, unknown>;
+    // Prune publishes the legacy state only when it writes first; otherwise
+    // the canonical save already shadows it. Neither order may reorder publications.
+    expect(writes).toHaveLength(2);
+    expect(published).toEqual(
+      writes.map((via, index) => ({
+        via,
+        enabled:
+          via === "prune" && index === 0 ? ["other-server"] : ["other-server", "third-server"],
+      }))
+    );
+    const finalState = JSON.parse(await fs.readFile(canonicalFilePath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
     expect(finalState.enabledServers).toEqual(["other-server", "third-server"]);
+    expect(published.at(-1)?.enabled).toEqual(finalState.enabledServers);
   });
 
   it("prunePluginOverrideKeys preserves JSONC comments and formatting", async () => {
