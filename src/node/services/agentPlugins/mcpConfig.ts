@@ -13,6 +13,7 @@ import type { MCPServerInfo, MCPStdioServerInfo, WorkspaceMCPOverrides } from "@
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isCanonicalPluginServerKey } from "@/common/utils/mcp/pluginServerKey";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
@@ -36,6 +37,8 @@ export const AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
 export const PLUGIN_SERVER_KEY_PREFIX = "plugin:";
+// The canonical-key predicate lives in common so the renderer can share it.
+export { isCanonicalPluginServerKey };
 
 /**
  * Stable plugin-instance identity. Global plugins hash their LEXICAL
@@ -72,18 +75,6 @@ const CANONICAL_PLUGIN_KEY_PREFIX_PATTERN = /^plugin:[0-9a-f]{16}:$/;
 
 export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
   return CANONICAL_PLUGIN_KEY_PREFIX_PATTERN.test(prefix);
-}
-
-/**
- * Whether a FULL override key has the canonical managed-plugin shape
- * `plugin:<16-hex instanceId>:<server>`. MCP server names are otherwise
- * arbitrary user strings (a user-defined server may legitimately be named
- * "plugin:custom"), so plugin-key pruning must match only this shape.
- */
-const CANONICAL_PLUGIN_KEY_PATTERN = /^plugin:[0-9a-f]{16}:/;
-
-export function isCanonicalPluginServerKey(key: string): boolean {
-  return CANONICAL_PLUGIN_KEY_PATTERN.test(key);
 }
 
 /**
