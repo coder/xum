@@ -96,11 +96,15 @@ describe("xum workflow CLI helpers", () => {
     );
     await trustProject(muxRoot, repo);
 
-    const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo.js --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
-        .nothrow()
-        .quiet();
+    // Test the shipped Node entrypoint; Bun's source runner can crash before shutdown checks.
+    const compiledEntry = path.resolve(import.meta.dir, "../../dist/cli/index.js");
+    await fs.access(compiledEntry).catch((cause: unknown) => {
+      throw new Error("Build the CLI with make build-main before running this test", { cause });
+    });
+    const result = await Bun.$`node ${compiledEntry} wf run ./workflows/echo.js --dir ${repo}`
+      .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
+      .nothrow()
+      .quiet();
 
     expect(result.exitCode).toBe(0);
     const output = result.stdout.toString() + result.stderr.toString();
