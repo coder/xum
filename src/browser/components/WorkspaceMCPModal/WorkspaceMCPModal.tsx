@@ -399,9 +399,12 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             <div className="min-w-0 font-medium wrap-anywhere">{displayName}</div>
                           </div>
                           {info.plugin ? (
+                            // Provenance only: the backend folds global plugin opt-in
+                            // into `disabled`, so a hardcoded default-state claim here
+                            // would contradict the switch for globally enabled plugins.
                             <div className="text-muted text-xs wrap-anywhere">
                               Agent Plugin ({info.plugin.sourceScope} · {info.plugin.sourceLocation}
-                              ) — disabled by default
+                              )
                             </div>
                           ) : (
                             projectDisabled && (
