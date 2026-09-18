@@ -54,7 +54,9 @@ describe("buildHistoryEditPrecondition", () => {
     });
   });
 
-  test("cannot fence when the range starts at a snapshot whose sequence is malformed", () => {
+  test("a snapshot with a malformed sequence before the edit is cut but is not evidence", () => {
+    // The target is the snapshot (it is deleted with the edited turn, like a wire-unparseable
+    // one); the evidence starts at the first committed row from the target on — the edit.
     const badSnapshotStart = [
       committed("u0", 0),
       createMuxMessage("snap", "user", "snapshot", {
@@ -63,8 +65,15 @@ describe("buildHistoryEditPrecondition", () => {
         fileAtMentionSnapshot: [],
       }),
       committed("u1", 2),
+      committed("a1", 3),
     ];
-    expect(buildHistoryEditPrecondition(badSnapshotStart, "u1")).toBeUndefined();
+    expect(getEditTruncateTargetFromMessages(badSnapshotStart, "u1")).toBe("snap");
+    expect(buildHistoryEditPrecondition(badSnapshotStart, "u1")).toMatchObject({
+      rangeStartMessageId: "u1",
+      rangeStartHistorySequence: 2,
+      newestMessageId: "a1",
+      rangeRowCount: 2,
+    });
   });
 
   test("cannot fence an edited row whose own sequence is malformed", () => {

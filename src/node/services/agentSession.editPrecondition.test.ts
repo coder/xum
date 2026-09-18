@@ -731,6 +731,49 @@ describe("AgentSession edit precondition", () => {
     expect(after.includes('"a2"')).toBe(false);
   });
 
+  it("a snapshot with a malformed sequence before the edit is cut with the edited turn", async () => {
+    const h = await setup();
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const readable = (id: string, role: "user" | "assistant", text: string, seq: number) =>
+      createMuxMessage(id, role, text, { historySequence: seq, timestamp: seq + 1 });
+    // The snapshot belongs to the edited turn (adjacent), so both sides cut from it; it is not
+    // evidence (no valid sequence), so the fence starts at the edited row instead of refusing.
+    const persistedRows = [
+      readable("u1", "user", "first", 0),
+      readable("a1", "assistant", "answer", 1),
+      createMuxMessage("snap", "user", "notes.md contents", {
+        historySequence: 1.5,
+        timestamp: 3,
+        synthetic: true,
+        fileAtMentionSnapshot: ["notes.md"],
+      }),
+      readable("u2", "user", "second", 2),
+      readable("a2", "assistant", "second answer", 3),
+    ];
+    await fs.writeFile(
+      path.join(sessionDir, "chat.jsonl"),
+      persistedRows.map((row) => JSON.stringify(row)).join("\n") + "\n"
+    );
+    const events: WorkspaceChatMessage[] = [];
+    await h.session.replayHistory(({ message }) => {
+      events.push(message);
+    });
+    const precondition = fence(events.filter(isMuxMessage), "u2");
+    expect(precondition).toMatchObject({ rangeStartMessageId: "u2", rangeStartHistorySequence: 2 });
+    expect(
+      await h.session.sendMessage("second, edited", {
+        ...baseOptions,
+        editMessageId: "u2",
+        historyEditPrecondition: precondition,
+      })
+    ).toEqual(Ok(undefined));
+    await h.session.waitForIdle();
+    const after = await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8");
+    expect(after.includes('"snap"')).toBe(false);
+    expect(after.includes('"a2"')).toBe(false);
+  });
+
   it("a failed partial retirement after the cut is logged, not reported as a failed truncation", async () => {
     const h = await setup();
     const rows = await seed(h, threeTurns());

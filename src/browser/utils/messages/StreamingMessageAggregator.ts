@@ -1059,6 +1059,17 @@ export class StreamingMessageAggregator {
   }
 
   /**
+   * Add a frontend-only row (a `/plan show` preview, a projected workflow-run card): displayed
+   * like any other row but never persisted, so it is not evidence a server-side history check
+   * can be asked about (see `getHistoryEvidenceMessages`).
+   */
+  addEphemeralMessage(message: MuxMessage): void {
+    this.addMessage(message);
+    const stored = this.messages.get(message.id);
+    if (stored) this.locallyFabricatedRows.add(stored);
+  }
+
+  /**
    * Remove a message from the aggregator.
    * Used for dismissing ephemeral messages like /plan output.
    * Rebuilds detected links to remove any that only existed in the removed message.
@@ -1810,7 +1821,9 @@ export class StreamingMessageAggregator {
 
   /**
    * Committed rows a server-side history check can be asked about: every held row except a
-   * locally fabricated one (see `locallyFabricatedRows`). The active stream's row IS evidence —
+   * locally fabricated one (`locallyFabricatedRows`: the pre-stream error row and ephemeral
+   * frontend-only rows, whose display-only `historySequence` the backend can never reproduce).
+   * The active stream's row IS evidence —
    * its persisted counterpart is the empty placeholder the turn appended before streaming, and
    * an edit that interrupts the turn deletes that placeholder, so the fence must name it as
    * the newest row. It is presented as `partial` so both sides hash it by identity only (see
