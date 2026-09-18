@@ -46,6 +46,8 @@ function recordingToken(): RecordedToken {
       token.admittedTurns.push(turnId);
     },
     onDisposed: (kind) => {
+      // Contract: ignored once admitted (the turn owns the obligation from then on).
+      if (token.events.includes("admitted")) return;
       token.events.push(`disposed:${kind}`);
     },
   };
@@ -53,18 +55,20 @@ function recordingToken(): RecordedToken {
 }
 
 const internal = (session: AgentSession) => session as unknown as { coordinator: TurnCoordinator };
+const streamCalls = (aiService: unknown): number =>
+  (aiService as { streamMessage: ReturnType<typeof mock> }).streamMessage.mock.calls.length;
 
 describe("AgentSession turn admission tokens", () => {
   let h: AgentSessionHarness | undefined;
   const settled: symbol[] = [];
   const superseded: Array<[symbol, symbol]> = [];
-  const completions: Array<Promise.PromiseWithResolvers<TurnCompletion>> = [];
+  const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
 
   const resolved = new Set<number>();
   function abortTurn(index: number, abortReason: "user" | "system"): void {
     if (resolved.has(index)) return;
     resolved.add(index);
-    completions[index]!.resolve({ status: "aborted", abortReason });
+    completions[index].resolve({ status: "aborted", abortReason });
   }
 
   async function harness() {
@@ -122,7 +126,7 @@ describe("AgentSession turn admission tokens", () => {
   /** Complete the index-th stream; resolves once the coordinator published the outcome. */
   async function settleTurn(index: number, after: () => boolean): Promise<void> {
     resolved.add(index);
-    completions[index]!.resolve({
+    completions[index].resolve({
       status: "completed",
       streamEnd: {
         type: "stream-end",
@@ -144,7 +148,7 @@ describe("AgentSession turn admission tokens", () => {
     expect(settled).toHaveLength(0);
     await settleTurn(0, () => settled.length > 0);
     // Exact turn correlation: the settled generation is the one the token was admitted under.
-    expect(settled).toEqual([token.admittedTurns[0]!]);
+    expect(settled).toEqual([token.admittedTurns[0]]);
     expect(token.events).toEqual(["admitted"]);
   });
 
@@ -167,7 +171,7 @@ describe("AgentSession turn admission tokens", () => {
     expect(result.success).toBe(false);
     expect(accepted).toBe(true);
     expect(token.events).toEqual([]);
-    expect(aiService.streamMessage).not.toHaveBeenCalled();
+    expect(streamCalls(aiService)).toBe(0);
     // The refused preparation settled its own turn; nothing was admitted under this token.
     expect(internal(session).coordinator.phase).toBe("idle");
   });
@@ -188,7 +192,7 @@ describe("AgentSession turn admission tokens", () => {
     // The completing first turn drains the queue: the coordinator prepares the dequeued turn
     // while the first is still completing, so the first generation is SUPERSEDED (never idle).
     await settleTurn(0, () => token.admittedTurns.length > 0 && completions.length >= 2);
-    const dispatched = token.admittedTurns[0]!;
+    const dispatched = token.admittedTurns[0];
     expect(dispatched).not.toBe(firstTurn);
     expect(superseded).toEqual([[firstTurn, dispatched]]);
     expect(settled).toEqual([]);
@@ -220,7 +224,7 @@ describe("AgentSession turn admission tokens", () => {
     });
     // Closed while queued (a Stop settled the attempt, or a successor superseded it).
     stale.stale = true;
-    const streamsBefore = (aiService.streamMessage as ReturnType<typeof mock>).mock.calls.length;
+    const streamsBefore = streamCalls(aiService);
 
     await settleTurn(0, () => fresh.admittedTurns.length > 0 && completions.length >= 2);
     expect(stale.events).toEqual(["enqueued", "disposed:refused"]);
@@ -228,12 +232,10 @@ describe("AgentSession turn admission tokens", () => {
     // The stale entry never became a turn: the only new stream is the fresh entry's, and the
     // only generation that replaced the first turn is the fresh entry's.
     expect(fresh.events).toEqual(["enqueued", "admitted"]);
-    expect((aiService.streamMessage as ReturnType<typeof mock>).mock.calls.length).toBe(
-      streamsBefore + 1
-    );
-    expect(superseded.map(([, next]) => next)).toEqual([fresh.admittedTurns[0]!]);
+    expect(streamCalls(aiService)).toBe(streamsBefore + 1);
+    expect(superseded.map(([, next]) => next)).toEqual([fresh.admittedTurns[0]]);
     await settleTurn(1, () => settled.length > 0);
-    expect(settled).toEqual([fresh.admittedTurns[0]!]);
+    expect(settled).toEqual([fresh.admittedTurns[0]]);
   });
 
   test("clearing the queue disposes enqueued tokens as canceled before admission", async () => {
@@ -272,7 +274,7 @@ describe("AgentSession turn admission tokens", () => {
     ).toEqual(Ok({ started: true }));
     expect(token.events).toEqual(["admitted"]);
     await settleTurn(1, () => settled.length > 1);
-    expect(settled.at(-1)).toBe(token.admittedTurns[0]!);
+    expect(settled.at(-1)).toBe(token.admittedTurns[0]);
   });
 
   test("a queued entry dispatched at a step boundary supersedes the live turn instead of settling it", async () => {
@@ -292,7 +294,7 @@ describe("AgentSession turn admission tokens", () => {
     // generation without an idle transition for `first` (the cut stream settles as aborted).
     session.sendQueuedMessages("provider-tool");
     expect(token.events).toEqual(["enqueued", "admitted"]);
-    const second = token.admittedTurns[0]!;
+    const second = token.admittedTurns[0];
     expect(second).not.toBe(first);
     expect(superseded).toEqual([[first, second]]);
     expect(settled).not.toContain(first);

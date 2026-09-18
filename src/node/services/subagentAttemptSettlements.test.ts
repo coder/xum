@@ -183,6 +183,12 @@ describe("subagentAttemptSettlements", () => {
       },
     });
     expect(noOwner.success).toBe(false);
-    await expect(fsPromises.access(parentDir)).rejects.toThrow();
+    let parentDirExists = true;
+    try {
+      await fsPromises.access(parentDir);
+    } catch {
+      parentDirExists = false;
+    }
+    expect(parentDirExists).toBe(false);
   });
 });

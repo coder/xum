@@ -12632,8 +12632,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if (admission?.kind === "admitted") taskTurnAdmission = admission.token;
       }
+      let resumeRefused = true;
       using _taskTurnAdmissionScope = {
-        [Symbol.dispose]: () => taskTurnAdmission?.onDisposed("no-work"),
+        [Symbol.dispose]: () =>
+          taskTurnAdmission?.onDisposed(resumeRefused ? "refused" : "no-work"),
       };
       if (taskTurnAdmission?.admissionStale() === true) {
         return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
@@ -12655,6 +12657,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         turnAdmission: taskTurnAdmission,
       });
       sessionInvisiblePreflight.release();
+      // A resume that returned without starting a turn had no work for its obligation (an
+      // admitted one is bound to its turn and ignores this disposal).
+      resumeRefused = !result.success;
       if (!result.success) {
         log.error("resumeStream handler: session returned error", {
           workspaceId,

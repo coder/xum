@@ -3,8 +3,9 @@ import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 
-import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
-import { Err, Ok, type Result } from "@/common/types/result";
+import type { Config } from "@/node/config";
+import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { Ok, type Result } from "@/common/types/result";
 import { SecretsStore } from "@/node/config";
 import {
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,

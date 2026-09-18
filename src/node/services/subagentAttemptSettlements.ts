@@ -124,7 +124,7 @@ export async function readSubagentAttemptSettlementReceiptStrict(
   attemptId: string
 ): Promise<SubagentAttemptSettlementReceiptReadResult> {
   if (!isTaskAttemptId(attemptId)) {
-    return { kind: "unreadable", error: `malformed attempt id ${attemptId}` };
+    return { kind: "unreadable", error: `malformed attempt id ${String(attemptId)}` };
   }
   const receiptPath = getSubagentAttemptSettlementReceiptPath(
     ownerWorkspaceSessionDir,
@@ -162,7 +162,7 @@ export async function writeSubagentAttemptSettlementReceipt(params: {
 }): Promise<Result<void, string>> {
   const { receipt } = params;
   if (!isTaskAttemptId(receipt.attemptId)) {
-    return Err(`refusing to write a receipt for malformed attempt id ${receipt.attemptId}`);
+    return Err(`refusing to write a receipt for malformed attempt id ${String(receipt.attemptId)}`);
   }
   if (params.ownerWorkspaceSessionDirs.length === 0) {
     return Err("no owner session dir to write the receipt into");

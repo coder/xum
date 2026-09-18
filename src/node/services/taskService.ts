@@ -2252,7 +2252,7 @@ export class TaskService implements AgentTaskIntegration {
     // Owner settled + cleanup finished + marker persisted: authoritative for the attempt captured
     // in Phase A. An unknown (legacy) attempt has none to settle — stopping it proves nothing,
     // but its id is closed to further sends until a new admission rotates it.
-    if (record.ownedAttempt == null) {
+    if (record.ownedAttempt == null && record.attemptId != null) {
       this.closeAttemptAdmission(workspaceId, { attemptId: record.attemptId }, "stop-settled");
     }
     this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
@@ -2306,7 +2306,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     const record = this.workspaceStopRecords.get(workspaceId);
-    if (record == null || !record.capturedTurns.has(turnGeneration)) return;
+    if (!record?.capturedTurns.has(turnGeneration)) return;
     record.capturedTurns.delete(turnGeneration);
     this.recheckWorkspaceStopRelease(workspaceId);
   }
@@ -2323,7 +2323,7 @@ export class TaskService implements AgentTaskIntegration {
       if (send.state === "admitted" && send.turnId === previous) send.turnId = next;
     }
     const record = this.workspaceStopRecords.get(workspaceId);
-    if (record == null || !record.capturedTurns.has(previous)) return;
+    if (!record?.capturedTurns.has(previous)) return;
     record.capturedTurns.delete(previous);
     record.capturedTurns.add(next);
   }
@@ -2485,7 +2485,7 @@ export class TaskService implements AgentTaskIntegration {
   /** A closure or settlement is recorded for exactly this attempt id. */
   private isAttemptClosed(taskId: string, attemptId: string): boolean {
     const entry = this.attemptSettlementByTaskId.get(taskId);
-    return entry != null && entry.attemptId === attemptId;
+    return entry?.attemptId === attemptId;
   }
 
   /**
@@ -2644,7 +2644,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       return { kind: "not-a-task" };
     }
-    if (entry == null || !entry.parentWorkspaceId) return { kind: "not-a-task" };
+    if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
     const attemptId = this.currentTaskAttemptId(workspaceId, entry);
     if (attemptId == null) {
       log.debug("[task-attempt] send into a pre-identity task entry carries no obligation", {
@@ -6830,6 +6830,7 @@ export class TaskService implements AgentTaskIntegration {
           }
         };
         let accepted = false;
+        // Admission classification: guidance into a live child continues its attempt (no rotation).
         const sendResult = await this.workspaceService.sendMessage(
           taskId,
           // Synthetic metadata avoids treating parent/sibling orchestration as a direct human
@@ -7631,6 +7632,8 @@ export class TaskService implements AgentTaskIntegration {
         }
 
         let accepted = false;
+        // Admission classification: parent guidance into a live child continues its attempt (no
+        // rotation); the fence at the handoff refuses it once the attempt closed.
         const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
           acceptanceOrigin: "automatic",
           admissionStale,
@@ -10658,6 +10661,7 @@ export class TaskService implements AgentTaskIntegration {
       !(await this.shouldAllowLegacyInvalidWorkflowOutputSchema(taskId, freshEntry));
     const model = freshEntry.workspace.taskModelString ?? defaultModel;
     const agentId = resolveTaskAgentIdForResume(freshEntry.workspace);
+    // Admission classification: timeout finalization continues the same attempt (no rotation).
     const sendResult = await this.workspaceService.sendMessage(
       taskId,
       buildWorkflowTimeoutFinalizationPrompt(
@@ -13181,6 +13185,7 @@ export class TaskService implements AgentTaskIntegration {
     const model = entry.workspace.taskModelString ?? defaultModel;
     const agentId = resolveTaskAgentIdForResume(entry.workspace);
     const startedAt = Date.now();
+    // Admission classification: recovery prompt = same-attempt continuation (no rotation).
     const sendResult = await this.workspaceService.sendMessage(
       workspaceId,
       this.buildTaskCompletionRecoveryMessage(completionKind, requiresStructuredOutput, options),
@@ -13254,6 +13259,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const model = entry.workspace.taskModelString ?? defaultModel;
     const agentId = entry.workspace.agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID;
+    // Admission classification: recovery prompt = same-attempt continuation (no rotation).
     const sendResult = await this.workspaceService.sendMessage(
       workspaceId,
       buildBackgroundAwaitPrompt(params),
@@ -13538,6 +13544,7 @@ export class TaskService implements AgentTaskIntegration {
         reasoningMode: resumeOptions.reasoningMode,
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       };
+      // Admission classification: in-owner auto-resume continues the same attempt (no rotation).
       let sendResult = await this.workspaceService.sendMessage(
         workspaceId,
         prompt,
@@ -13591,6 +13598,7 @@ export class TaskService implements AgentTaskIntegration {
 
         // AgentSession can still be in COMPLETING when StreamManager has emitted stream-end.
         // Queue this nudge rather than dropping the only await prompt for active background work.
+        // Admission classification: same-attempt continuation (fenced at the handoff, no rotation).
         sendResult = await this.workspaceService.sendMessage(
           workspaceId,
           buildBackgroundAwaitPrompt({
@@ -14616,6 +14624,8 @@ export class TaskService implements AgentTaskIntegration {
       await this.setTaskStatus(args.workspaceId, "running");
 
       try {
+        // Admission classification: plan→exec kickoff continues the owned attempt (no rotation);
+        // the fence at the WorkspaceService handoff binds it to the current attempt id.
         const sendKickoffResult = await this.workspaceService.sendMessage(
           args.workspaceId,
           "Implement the plan.",

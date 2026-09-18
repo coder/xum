@@ -989,7 +989,7 @@ export class MessageQueue {
    * cancellation callbacks, or null when the head moved since the capture.
    */
   removeEntry(
-    identity: object,
+    identity: unknown,
     disposition: "refused" | "canceled-before-admission"
   ): QueueClearCallbacks | null {
     const index = this.entries.findIndex((entry) => entry === identity);
