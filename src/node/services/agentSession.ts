@@ -2974,6 +2974,11 @@ export class AgentSession {
             oldestHistorySequence = historySequence;
           }
         }
+        // The fingerprint is a pure function of (history, anchor) and serializes every prior
+        // row's parts, so it dominates the since-replay cost on large transcripts. Remember the
+        // client-anchor computation: on an unchanged revisit the server cursor anchors at the
+        // same newest row and can reuse it instead of hashing the whole epoch twice.
+        let anchorFingerprint: { historySequence: number; value: string | undefined } | undefined;
 
         if (historyCursor) {
           const matchedHistoryCursor = history.find(
@@ -3001,6 +3006,10 @@ export class AgentSession {
             history,
             historyCursor.historySequence
           );
+          anchorFingerprint = {
+            historySequence: historyCursor.historySequence,
+            value: priorHistoryFingerprint,
+          };
           const priorHistoryMatches =
             !hasRowsBeforeCursor ||
             (historyCursor.priorHistoryFingerprint !== undefined &&
@@ -3092,7 +3101,10 @@ export class AgentSession {
             continue;
           }
 
-          const priorHistoryFingerprint = computePriorHistoryFingerprint(history, historySequence);
+          const priorHistoryFingerprint =
+            anchorFingerprint?.historySequence === historySequence
+              ? anchorFingerprint.value
+              : computePriorHistoryFingerprint(history, historySequence);
 
           serverCursor = {
             ...serverCursor,
