@@ -2148,6 +2148,9 @@ export class StreamingMessageAggregator {
         if (data.agentId != null) {
           existingMessage.metadata.agentId = data.agentId;
         }
+        if (data.muxMetadata != null) {
+          existingMessage.metadata.muxMetadata = data.muxMetadata;
+        }
         existingMessage.metadata.mode = data.mode;
         existingMessage.metadata.thinkingLevel = data.thinkingLevel;
       }
@@ -2170,6 +2173,9 @@ export class StreamingMessageAggregator {
       agentId: data.agentId,
       mode: data.mode,
       thinkingLevel: data.thinkingLevel,
+      // Turn classification must be known before the first delta so a hidden maintenance
+      // turn (token-budget flush) never paints; stream-end re-merges the same metadata.
+      ...(data.muxMetadata != null ? { muxMetadata: data.muxMetadata } : {}),
     });
 
     this.messages.set(data.messageId, streamingMessage);
@@ -3707,9 +3713,15 @@ export class StreamingMessageAggregator {
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
+      // The token-budget flush turn is machine maintenance (one memory write before the
+      // window is sealed), not a reply to the user. Its trigger row is already a hidden
+      // synthetic user row; the assistant output it produces carries the same turn flag on
+      // the live stream, the recovered partial, and the settled history row, so hide the
+      // whole turn by that flag rather than by the text it happens to emit.
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
         !showSyntheticMessages &&
         ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
+          message.metadata?.muxMetadata?.contextBudgetFlush === true ||
           isWorkflowResultMessage(message));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.

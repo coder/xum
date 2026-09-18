@@ -12,6 +12,23 @@ import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
 
 const CREATED_AT = "2026-01-01T00:00:00.000Z";
 
+// Enable the "show synthetic messages" debug flag for the duration of fn.
+function withDebugLlmRequestEnabled<T>(fn: () => T): T {
+  const globalWithWindow = globalThis as unknown as { window?: { api?: WindowApi } };
+  const previousWindow = globalWithWindow.window;
+  globalWithWindow.window = {
+    ...previousWindow,
+    api: { ...(previousWindow?.api ?? { platform: process.platform, versions: {} }) },
+  };
+  globalWithWindow.window.api!.debugLlmRequest = true;
+  try {
+    return fn();
+  } finally {
+    if (previousWindow) globalWithWindow.window = previousWindow;
+    else delete globalWithWindow.window;
+  }
+}
+
 describe("token-budget replay", () => {
   test("retains old windows and machine warnings while hiding the provider lead-in", () => {
     const messages = [
@@ -226,6 +243,57 @@ describe("token-budget replay", () => {
     expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(false);
     expect(aggregator.getAllMessages().at(-1)?.parts).toEqual([]);
   });
+
+  test.each([false, true])(
+    "final flush turn rows stay out of the transcript (debug=%s)",
+    (debug) => {
+      const flushTurn = {
+        type: "normal",
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      } as const;
+      const messages = [
+        createMuxMessage("user", "user", "Investigate the failing test", { historySequence: 1 }),
+        createMuxMessage("answer", "assistant", "Looking into it.", { historySequence: 2 }),
+        createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+          historySequence: 3,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: flushTurn,
+        }),
+        // A crash-recovered partial and a settled flush answer both carry the turn flag.
+        createMuxMessage("flush-answer", "assistant", "Wrote notes; window can close.", {
+          historySequence: 4,
+          partial: true,
+          muxMetadata: flushTurn,
+        }),
+        createMuxMessage("continue", "user", "Continue", {
+          historySequence: 5,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+        createMuxMessage("next-answer", "assistant", "Back to the fix.", {
+          historySequence: 6,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+      ].map((message) => MuxMessageSchema.parse(message));
+      const aggregator = new StreamingMessageAggregator(CREATED_AT);
+      aggregator.loadHistoricalMessages(messages, false);
+      const displayedIds = () =>
+        aggregator
+          .getDisplayedMessages()
+          .map((row) => ("historyId" in row ? row.historyId : row.id));
+      if (debug) {
+        // Debug mode keeps showing every machine row, including the flush turn.
+        expect(withDebugLlmRequestEnabled(displayedIds)).toEqual(
+          messages.map((message) => message.id)
+        );
+        return;
+      }
+      expect(displayedIds()).toEqual(["user", "answer", "next-answer"]);
+    }
+  );
 
   test.each([false, true])(
     "does not collapse human or malformed warning rows (synthetic=%s)",
