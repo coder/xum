@@ -49,6 +49,7 @@ function renderBackupSection(
       commandApprovals: [],
       projectImports: [],
       projectBundleSkipped: false,
+      unsupportedSettings: [],
       pushError: null,
     },
     backupRestore: {
@@ -58,6 +59,7 @@ function renderBackupSection(
       localOnlyFiles: ["agents/local.md"],
       projectImportResults: [],
       projectBundleSkipped: false,
+      unsupportedSettings: [],
       unapprovedProjectImports: [],
     },
     ...overrides,
@@ -565,6 +567,7 @@ describe("BackupSection", () => {
         commandApprovals: [approval],
         projectImports: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
     });
@@ -629,6 +632,7 @@ describe("BackupSection", () => {
         commandApprovals: [approval],
         projectImports: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
     });
@@ -676,6 +680,7 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         projectImportResults: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         unapprovedProjectImports: [],
       },
     });
@@ -729,6 +734,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [candidate, unapproved],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
       backupRestore: {
@@ -748,6 +754,7 @@ describe("BackupSection", () => {
           },
         ],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         unapprovedProjectImports: [],
       },
     });
@@ -793,6 +800,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [candidate],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
       backupRestore: {
@@ -813,6 +821,7 @@ describe("BackupSection", () => {
           },
         ],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         // The backend re-offers a conflicted import; the UI must not call it done.
         unapprovedProjectImports: [candidate],
       },
@@ -864,6 +873,7 @@ describe("BackupSection", () => {
         },
       ],
       projectBundleSkipped: false,
+      unsupportedSettings: [],
       unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
     });
     const { view } = renderBackupSection(
@@ -876,6 +886,7 @@ describe("BackupSection", () => {
           commandApprovals: [],
           projectImports: [candidate],
           projectBundleSkipped: false,
+          unsupportedSettings: [],
           pushError: null,
         },
       },
@@ -965,6 +976,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [staleCandidate],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
     });
@@ -1014,6 +1026,7 @@ describe("BackupSection", () => {
           },
         ],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: null,
       },
     });
@@ -1039,6 +1052,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         pushError: "mcp.jsonc is not valid JSONC",
       },
     });
@@ -1061,6 +1075,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: true,
+        unsupportedSettings: [],
         pushError: null,
       },
     });
@@ -1069,5 +1084,27 @@ describe("BackupSection", () => {
 
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText(/carries a project bundle, but project backup is disabled/);
+  });
+
+  test("names the backed-up settings this version cannot apply after a preview", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [{ status: "M", path: "preferences.json" }],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        unsupportedSettings: ["agentAiDefaults", "defaultRuntime"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText("agentAiDefaults, defaultRuntime")).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("agentAiDefaults, defaultRuntime");
   });
 });

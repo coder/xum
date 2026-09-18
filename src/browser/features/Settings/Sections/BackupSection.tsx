@@ -5,6 +5,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { seedConfigMirrors } from "@/browser/utils/configMirrors";
 import {
   formatKeybind,
   isDialogOpen,
@@ -90,6 +91,8 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
   {
     flag: "includePreferences",
     label: "Portable preferences",
+    description:
+      "Appearance and workflow preferences, plus model and agent settings such as default models, thinking levels, advisor and task settings, and layout presets.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
   },
   {
@@ -208,6 +211,15 @@ function describeRestoredFiles(count: number): string {
   return `${count} file${count === 1 ? "" : "s"}`;
 }
 
+/** A restore rewrites config behind the renderer's localStorage mirrors. */
+async function reseedConfigMirrors(api: APIClient): Promise<void> {
+  try {
+    seedConfigMirrors(await api.config.getConfig());
+  } catch {
+    // Best-effort: the mirrors re-seed on the next startup.
+  }
+}
+
 function ChangeList(props: {
   title: string;
   emptyLabel: string;
@@ -261,6 +273,7 @@ export function BackupSection() {
   >({});
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
+  const [unsupportedSettings, setUnsupportedSettings] = useState<string[]>([]);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -322,6 +335,7 @@ export function BackupSection() {
           setProjectImports([]);
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
+          setUnsupportedSettings([]);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -438,6 +452,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setUnsupportedSettings([]);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -505,6 +520,7 @@ export function BackupSection() {
     // change.
     setProjectImports([]);
     setProjectBundleSkipped(false);
+    setUnsupportedSettings([]);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -537,6 +553,7 @@ export function BackupSection() {
         return next;
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setUnsupportedSettings(result.data.unsupportedSettings);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -579,6 +596,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setUnsupportedSettings([]);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -610,7 +628,9 @@ export function BackupSection() {
       });
       if (!result.success) {
         // A failure after the snapshot completed may have overwritten files already; the
-        // snapshot is the only recovery path, so its location belongs in the error.
+        // snapshot is the only recovery path, so its location belongs in the error. Config may
+        // have been rewritten as well, so the mirrors are re-seeded as after a success.
+        if (result.error.snapshotPath != null) await reseedConfigMirrors(api);
         setActionError(
           result.error.snapshotPath != null
             ? `${getOperationErrorMessage(result.error)} Your settings from before the restore are saved at: ${result.error.snapshotPath}`
@@ -655,6 +675,8 @@ export function BackupSection() {
         mergeImportResults(previous, result.data.projectImportResults)
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setUnsupportedSettings(result.data.unsupportedSettings);
+      await reseedConfigMirrors(api);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -1040,6 +1062,14 @@ export function BackupSection() {
         <div className="border-border-light text-muted rounded-md border p-3 text-xs">
           This backup carries a project bundle, but project backup is disabled here, so it was
           skipped. Enable “Include project list &amp; project memories” and save to restore it.
+        </div>
+      ) : null}
+
+      {unsupportedSettings.length > 0 ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          This version does not understand some backed-up settings, so they keep their current
+          values here: <code className="text-foreground">{unsupportedSettings.join(", ")}</code>.
+          They were likely saved by a newer Xum; update and restore again to apply them.
         </div>
       ) : null}
 
