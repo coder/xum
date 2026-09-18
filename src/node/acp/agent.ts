@@ -590,6 +590,10 @@ export class MuxAgent implements Agent {
     const sessionState = await this.refreshSessionState(sessionId);
     const parsedPrompt = parsePromptBlocks(params.prompt);
 
+    // Slash commands mutate too (`/clear` truncates, `/compact` sends), so the transcript is
+    // verified before any of them, not only before an ordinary send.
+    await this.assertTranscriptVerified(sessionId, workspaceId);
+
     const slashCommandResponse = await this.tryHandleSlashCommand(
       sessionId,
       workspaceId,
@@ -723,22 +727,9 @@ export class MuxAgent implements Agent {
     try {
       // Re-establish chat subscription if a prior one dropped (e.g., transient
       // websocket interruption). Register the turn first so subscription
-      // failures can reject it instead of leaving prompt() hanging.
-      await this.ensureChatSubscription(
-        args.sessionId,
-        args.workspaceId,
-        this.getSessionOnChatMode(args.sessionId)
-      );
-
-      // A full-mode replay must be observed before the send: an unreadable history closes the
-      // replay with `historyReplayStatus: "failed"`, and a prompt into that unverified
-      // transcript would persist a user row before request construction fails.
-      await this.firstCaughtUpBySessionId.get(args.sessionId);
-      if (this.historyReplayFailedSessionIds.has(args.sessionId)) {
-        throw new Error(
-          `prompt: workspace ${args.workspaceId} history could not be read; refusing to send into an unverified transcript`
-        );
-      }
+      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
+      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
+      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
 
       this.markTurnDispatched(args.sessionId, promptCorrelationId);
 
@@ -779,6 +770,28 @@ export class MuxAgent implements Agent {
       this.takeTurnCompletion(args.sessionId);
       throw error;
     }
+  }
+
+  /**
+   * Ensure the session's transcript is verified before a mutation. A full-mode replay must
+   * be observed first: an unreadable history closes it with `historyReplayStatus: "failed"`
+   * (or the stream ends before reporting), and a mutation against that unverified transcript
+   * would persist a user row or truncate rows the client never saw. A failed subscription is
+   * torn down here because prompts reuse a ready subscription, so it would never replay
+   * again on its own; the next prompt re-subscribes and replays afresh.
+   */
+  private async assertTranscriptVerified(sessionId: string, workspaceId: string): Promise<void> {
+    await this.ensureChatSubscription(sessionId, workspaceId, this.getSessionOnChatMode(sessionId));
+    await this.firstCaughtUpBySessionId.get(sessionId);
+    if (!this.historyReplayFailedSessionIds.has(sessionId)) {
+      return;
+    }
+
+    await this.stopChatSubscription(sessionId, "history replay failed");
+    this.firstCaughtUpBySessionId.delete(sessionId);
+    throw new Error(
+      `prompt: workspace ${workspaceId} history could not be read; refusing to mutate an unverified transcript`
+    );
   }
 
   private attachPromptCorrelationToSendOptions(
@@ -1448,6 +1461,11 @@ export class MuxAgent implements Agent {
       }
     };
 
+    // Retire the token before unwinding so the subscription's own teardown observes an
+    // intentional stop: its drain loop must neither count the missing caught-up as a failed
+    // replay nor reject a turn that already moved to the replacement subscription.
+    this.chatSubscriptionTokenBySessionId.delete(sessionId);
+
     const iterator = this.chatIteratorsBySessionId.get(sessionId);
     if (iterator != null) {
       try {
@@ -1739,7 +1757,13 @@ export class MuxAgent implements Agent {
           }
         }
       } finally {
-        // A subscription that ends before its caught-up must not leave a prompt waiting.
+        // A current full-mode subscription that ends before its caught-up verified nothing:
+        // treat it as a failed replay so the waiting prompt is refused (and re-subscribes
+        // next time) instead of sending into an unverified transcript. A replaced
+        // subscription breaking out of the loop says nothing about the session.
+        if (!hasCaughtUp && isCurrentSubscription()) {
+          this.historyReplayFailedSessionIds.add(sessionId);
+        }
         firstCaughtUp.resolve();
         end();
       }

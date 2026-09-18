@@ -1287,7 +1287,10 @@ describe("ACP prompt stream correlation", () => {
       throw new Error("Expected prompt to reject when chat stream ends before terminal events");
     }
 
-    expect(promptResult.message).toContain("Chat stream ended unexpectedly");
+    // The stream ended before its replay reported, so nothing was verified: the prompt is
+    // refused (fail closed) rather than sent and then rejected by the dropped stream.
+    expect(promptResult.message).toContain("history could not be read");
+    expect(harness.sendMessageCalls).toHaveLength(0);
 
     harness.closeConnection();
     await harness.connectionClosed;
