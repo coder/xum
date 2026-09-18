@@ -1853,6 +1853,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
     const combinedMcpPromptRefs = mcpPromptRefsResult.refs;
 
+    // The barrier is re-checked here, after the resolution awaits and before any command runs:
+    // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
+    // starts, refinement actions) return before the plain-send re-check further down. Same
+    // bypass rule as the render-time term, evaluated on the RESOLVED command.
+    if (
+      variant === "workspace" &&
+      !commandBypassesTranscriptBarrier(parsed) &&
+      !isTranscriptMutationAllowed(props.workspaceId)
+    ) {
+      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      return;
+    }
+
     // Route to creation handler for creation variant
     if (variant === "creation") {
       // The initial /goal path sets a goal without sending a user message, so

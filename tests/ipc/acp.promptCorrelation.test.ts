@@ -307,6 +307,9 @@ function createHarness(options?: HarnessOptions): Harness {
     options?: Record<string, unknown>;
   }> = [];
   const chatStream = createControlledChatStream();
+  // Every full-mode replay closes with a caught-up (the backend emits it in `finally`); a prompt
+  // waits for that first one before dispatching so a failed replay is refused, not raced.
+  chatStream.push({ type: "caught-up", replay: "full", historyReplayStatus: "complete" });
 
   const client = {
     config: {
@@ -1129,6 +1132,13 @@ describe("ACP prompt stream correlation", () => {
           await firstInterruptGate;
         }
         return { success: true, data: undefined };
+      },
+      // Two sessions: each gets its own replayed subscription (as in production), so both
+      // observe the caught-up a prompt waits for.
+      onChat: async () => {
+        const stream = createControlledChatStream();
+        stream.push({ type: "caught-up", replay: "full", historyReplayStatus: "complete" });
+        return stream.stream;
       },
     });
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });

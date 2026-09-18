@@ -48,6 +48,7 @@ interface HarnessOptions {
 interface Harness {
   agent: MuxAgent;
   onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
+  sendMessageCalls: Array<{ workspaceId: string; message: string }>;
   setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
@@ -85,6 +86,7 @@ function createWorkspaceInfo(overrides?: Partial<WorkspaceInfo>): WorkspaceInfo 
 interface MockServer {
   server: ServerConnection;
   onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
+  sendMessageCalls: Array<{ workspaceId: string; message: string }>;
   setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
@@ -108,6 +110,7 @@ function createMockServer(options?: HarnessOptions): MockServer {
   const forkCalls: WorkspaceForkInput[] = [];
   const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
   const onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }> = [];
+  const sendMessageCalls: Array<{ workspaceId: string; message: string }> = [];
   const listCalls: Array<{ archived?: boolean } | undefined> = [];
 
   const client = {
@@ -200,7 +203,10 @@ function createMockServer(options?: HarnessOptions): MockServer {
         activeWorkspaces.push(metadata);
         return { success: true as const, metadata };
       },
-      sendMessage: async () => ({ success: true as const, data: undefined }),
+      sendMessage: async (input: { workspaceId: string; message: string }) => {
+        sendMessageCalls.push({ workspaceId: input.workspaceId, message: input.message });
+        return { success: true as const, data: undefined };
+      },
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
     },
@@ -221,7 +227,15 @@ function createMockServer(options?: HarnessOptions): MockServer {
     close: async () => undefined,
   };
 
-  return { server, onChatCalls, setTrustCalls, createCalls, forkCalls, listCalls };
+  return {
+    server,
+    onChatCalls,
+    sendMessageCalls,
+    setTrustCalls,
+    createCalls,
+    forkCalls,
+    listCalls,
+  };
 }
 
 function createHarness(options?: HarnessOptions): Harness {
@@ -245,6 +259,7 @@ function createHarness(options?: HarnessOptions): Harness {
   return {
     agent: agentInstance,
     onChatCalls: mockServer.onChatCalls,
+    sendMessageCalls: mockServer.sendMessageCalls,
     setTrustCalls: mockServer.setTrustCalls,
     createCalls: mockServer.createCalls,
     forkCalls: mockServer.forkCalls,
@@ -563,6 +578,41 @@ describe("ACP session list/resume/fork support", () => {
       workspaceId: "ws-resume",
       mode: { type: "live" },
     });
+  });
+
+  it("refuses prompts after a full replay reports a failed history read", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-unreadable",
+      projectPath: "/repo/unreadable",
+      namedWorkspacePath: "/repo/unreadable/.mux/ws-unreadable",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [
+        {
+          type: "caught-up",
+          replay: "full",
+          historyReplayStatus: "failed",
+        } as WorkspaceChatMessage,
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-unreadable",
+      cwd: "/repo/unreadable",
+      mcpServers: [],
+    });
+
+    // The browser and CLI refuse to send into an unverified transcript; ACP must too, and it
+    // must not persist a user row first.
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-unreadable",
+        prompt: [{ type: "text", text: "hello" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+    expect(harness.sendMessageCalls).toHaveLength(0);
   });
 
   it("updates cached onChat mode even when a subscription already exists", async () => {

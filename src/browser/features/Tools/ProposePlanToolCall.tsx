@@ -137,6 +137,16 @@ function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolAr
   return args !== null && typeof args === "object" && "title" in args && "plan" in args;
 }
 
+/** Resolved (not yet persisted) AI settings for a plan action's target agent. */
+interface TargetAgentSettings {
+  resolvedModel: string;
+  resolvedThinking: ThinkingLevel;
+  resolvedReasoningMode: OpenAIReasoningMode;
+  existingModel: string;
+  existingThinking: ThinkingLevel;
+  existingReasoning: OpenAIReasoningMode;
+}
+
 interface ProposePlanToolCallProps {
   args: Record<string, unknown>;
   result?: unknown;
@@ -489,10 +499,15 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // User request: propose_plan primary actions send immediately after agent switch.
   // Resolve and persist model/thinking synchronously here so the follow-up message
   // uses the target agent defaults instead of stale planning-mode preferences.
-  const resolveAndPersistTargetAgentSettings = (args: {
+  /**
+   * The AI settings a plan action switches the workspace to. Pure read: nothing is persisted
+   * until `persistTargetAgentSettings` runs, so the handlers can await their preconditions
+   * (preference persistence, the transcript barrier) before any side effect.
+   */
+  const resolveTargetAgentSettings = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-  }): { resolvedModel: string; resolvedThinking: ThinkingLevel } => {
+  }): TargetAgentSettings => {
     const modelKey = getModelKey(args.workspaceId);
     const thinkingKey = getThinkingLevelKey(args.workspaceId);
     const reasoningKey = getReasoningModeKey(args.workspaceId);
@@ -522,20 +537,92 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    return {
+      resolvedModel,
+      resolvedThinking,
+      resolvedReasoningMode,
+      existingModel,
+      existingThinking,
+      existingReasoning,
+    };
+  };
+
+  /** Switch the workspace to the resolved agent settings (synchronous, right before the send). */
+  const persistTargetAgentSettings = (args: {
+    workspaceId: string;
+    targetAgentId: "auto" | "exec";
+    settings: TargetAgentSettings;
+  }): void => {
+    const { settings } = args;
     updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
 
-    if (existingModel !== resolvedModel) {
-      setWorkspaceModelWithOrigin(args.workspaceId, resolvedModel, "agent");
+    if (settings.existingModel !== settings.resolvedModel) {
+      setWorkspaceModelWithOrigin(args.workspaceId, settings.resolvedModel, "agent");
     }
-    if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+    if (settings.existingThinking !== settings.resolvedThinking) {
+      updatePersistedState(getThinkingLevelKey(args.workspaceId), settings.resolvedThinking);
     }
     // Persist before getSendOptionsFromStorage reads the key for the follow-up send.
-    if (existingReasoning !== resolvedReasoningMode) {
-      updatePersistedState(reasoningKey, resolvedReasoningMode);
+    if (settings.existingReasoning !== settings.resolvedReasoningMode) {
+      updatePersistedState(getReasoningModeKey(args.workspaceId), settings.resolvedReasoningMode);
+    }
+  };
+
+  /**
+   * One plan action ("Implement the plan" as exec, or Continue in Auto). Ordering matters:
+   * every await and the final barrier check come BEFORE the irreversible steps (the optional
+   * history replacement, the workspace mode switch, the send), so a barrier that closes during
+   * the waits leaves the workspace exactly as it was instead of replaced-but-not-implemented.
+   */
+  const runPlanAction = async (args: {
+    workspaceId: string;
+    targetAgentId: "auto" | "exec";
+    replacementIdPrefix: string;
+    replacementErrorContext: string;
+  }): Promise<void> => {
+    if (!api) return;
+    const { workspaceId } = args;
+    let shouldReplaceChatHistory = false;
+
+    try {
+      const cfg = await api.config.getConfig();
+      shouldReplaceChatHistory = cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
+    } catch {
+      // Ignore config read errors (we'll default to old behavior).
     }
 
-    return { resolvedModel, resolvedThinking };
+    const settings = resolveTargetAgentSettings({
+      workspaceId,
+      targetAgentId: args.targetAgentId,
+    });
+    // Same barrier as the composer: the backend reads the send model's auto-compaction
+    // threshold from persisted preferences, so a slider move right before this click must
+    // reach config.json first. A failed save lands in the handlers' best-effort catch.
+    await waitForPreferencePersisted(
+      { kind: "autoCompactionThreshold", model: settings.resolvedModel },
+      new AbortController().signal
+    );
+
+    // Final re-check after every await; nothing has been changed yet.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
+    if (shouldReplaceChatHistory) {
+      await replaceChatHistoryWithPlan({
+        idPrefix: args.replacementIdPrefix,
+        errorContext: args.replacementErrorContext,
+      });
+    }
+    persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, settings });
+    const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+    await api.workspace.sendMessage({
+      workspaceId,
+      message: "Implement the plan",
+      options: {
+        ...sendMessageOptions,
+        agentId: args.targetAgentId,
+        model: settings.resolvedModel,
+        thinkingLevel: settings.resolvedThinking,
+      },
+    });
   };
 
   const handleImplement = async () => {
@@ -550,50 +637,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
 
     try {
-      let shouldReplaceChatHistory = false;
-
-      try {
-        const cfg = await api.config.getConfig();
-        shouldReplaceChatHistory =
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
-      } catch {
-        // Ignore config read errors (we'll default to old behavior).
-      }
-
-      // Re-check after the await: the replacement below rewrites history, so it must not run
-      // against a transcript that stopped being current while the config was loading.
-      if (!isTranscriptMutationAllowed(workspaceId)) return;
-      if (shouldReplaceChatHistory) {
-        await replaceChatHistoryWithPlan({
-          idPrefix: "start-here",
-          errorContext: "Failed to replace chat history before implementing:",
-        });
-      }
-
-      const targetAgentId = "exec";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      await runPlanAction({
         workspaceId,
-        targetAgentId,
-      });
-      const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
-      // Same barrier as the composer: the backend reads the send model's auto-compaction
-      // threshold from persisted preferences, so a slider move right before this click must
-      // reach config.json first. A failed save lands in the best-effort catch below.
-      await waitForPreferencePersisted(
-        { kind: "autoCompactionThreshold", model: resolvedModel },
-        new AbortController().signal
-      );
-
-      if (!isTranscriptMutationAllowed(workspaceId)) return;
-      await api.workspace.sendMessage({
-        workspaceId,
-        message: "Implement the plan",
-        options: {
-          ...sendMessageOptions,
-          agentId: targetAgentId,
-          model: resolvedModel,
-          thinkingLevel: resolvedThinking,
-        },
+        targetAgentId: "exec",
+        replacementIdPrefix: "start-here",
+        replacementErrorContext: "Failed to replace chat history before implementing:",
       });
     } catch {
       // Best-effort: user can retry manually if sending fails.
@@ -615,49 +663,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
 
     try {
-      let shouldReplaceChatHistory = false;
-
-      try {
-        const cfg = await api.config.getConfig();
-        shouldReplaceChatHistory =
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
-      } catch {
-        // Ignore config read errors (we'll default to old behavior).
-      }
-
-      // Same dispatch-time re-checks as handleImplement.
-      if (!isTranscriptMutationAllowed(workspaceId)) return;
-      if (shouldReplaceChatHistory) {
-        await replaceChatHistoryWithPlan({
-          idPrefix: "continue-auto",
-          errorContext: "Failed to replace chat history before continuing in auto:",
-        });
-      }
-
-      const targetAgentId = "auto";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      await runPlanAction({
         workspaceId,
-        targetAgentId,
-      });
-      const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
-      // Same barrier as the composer: the backend reads the send model's auto-compaction
-      // threshold from persisted preferences, so a slider move right before this click must
-      // reach config.json first. A failed save lands in the best-effort catch below.
-      await waitForPreferencePersisted(
-        { kind: "autoCompactionThreshold", model: resolvedModel },
-        new AbortController().signal
-      );
-
-      if (!isTranscriptMutationAllowed(workspaceId)) return;
-      await api.workspace.sendMessage({
-        workspaceId,
-        message: "Implement the plan",
-        options: {
-          ...sendMessageOptions,
-          agentId: targetAgentId,
-          model: resolvedModel,
-          thinkingLevel: resolvedThinking,
-        },
+        targetAgentId: "auto",
+        replacementIdPrefix: "continue-auto",
+        replacementErrorContext: "Failed to replace chat history before continuing in auto:",
       });
     } catch {
       // Best-effort: user can retry manually if sending fails.
