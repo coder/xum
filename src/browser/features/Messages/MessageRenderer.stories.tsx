@@ -33,6 +33,7 @@ import {
 } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 const meta = { ...appMeta, title: "App/Chat/Messages" };
 export default meta;
@@ -852,64 +853,86 @@ export const BashMonitorWakeMessages: AppStory = {
   },
 };
 
-/** Intra-tree agent peer messages: sibling row stays collapsed, ancestor-bound row expanded. */
+/**
+ * Agent peer messages from every relationship the envelope supports: a same-tree sibling, a
+ * descendant messaging upward, and an unrelated workspace from another task tree (cross-tree
+ * sends take the same untrusted peer path and render the same card with an "unrelated" badge).
+ */
+function setupAgentPeerMessagesStory() {
+  collapseLeftSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-agent-peer-messages",
+    messages: [
+      createUserMessage("msg-1", "Coordinate the migration with the other agents.", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 300000,
+      }),
+      createAgentPeerMessage("msg-2", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP - 200000,
+        fromWorkspaceId: "task-schema-migrator",
+        fromTitle: "Schema Migrator",
+        relationship: "sibling",
+        message:
+          "Heads up: I renamed the `sessions` table to `workspace_sessions`. Update your queries before landing.",
+      }),
+      createAssistantMessage("msg-3", "Acknowledged — updating my queries now.", {
+        historySequence: 3,
+        timestamp: STABLE_TIMESTAMP - 150000,
+      }),
+      createAgentPeerMessage("msg-4", {
+        historySequence: 4,
+        timestamp: STABLE_TIMESTAMP - 60000,
+        fromWorkspaceId: "task-test-runner",
+        relationship: "descendant",
+        message: "Integration suite is green after the rename.\n\n- 412 passed\n- 0 failed",
+      }),
+      createAgentPeerMessage("msg-5", {
+        historySequence: 5,
+        timestamp: STABLE_TIMESTAMP - 30000,
+        fromWorkspaceId: "ws-release-coordinator",
+        fromTitle: "Release Coordinator",
+        relationship: "unrelated",
+        message:
+          "Release branch `release/2026.09` is being cut at 17:00 UTC. Please hold merges touching `workspace_sessions` until then.",
+      }),
+    ],
+  });
+}
+
+const AGENT_PEER_MESSAGE_COUNT = 3;
+
+/** Waits for every peer card to render collapsed and returns their toggles in transcript order. */
+async function findCollapsedPeerMessageToggles(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  return waitFor(
+    () => {
+      const found = canvas.getAllByRole("button", { name: /show message/i });
+      if (found.length !== AGENT_PEER_MESSAGE_COUNT) {
+        throw new Error(
+          `Expected ${AGENT_PEER_MESSAGE_COUNT} collapsed peer messages, found ${found.length}`
+        );
+      }
+      return found;
+    },
+    { timeout: 15_000 }
+  );
+}
+
+/** Sibling and unrelated rows stay collapsed, the descendant row is expanded. */
 export const AgentPeerMessages: AppStory = {
   globals: {
-    viewport: { value: "mobile1", isRotated: false },
+    viewport: { value: "desktop", isRotated: false },
   },
   parameters: {
     pixel: {
       matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
     },
   },
-  render: () => (
-    <AppWithMocks
-      setup={() => {
-        collapseLeftSidebar();
-        return setupSimpleChatStory({
-          workspaceId: "ws-agent-peer-messages",
-          messages: [
-            createUserMessage("msg-1", "Coordinate the migration with the other agents.", {
-              historySequence: 1,
-              timestamp: STABLE_TIMESTAMP - 300000,
-            }),
-            createAgentPeerMessage("msg-2", {
-              historySequence: 2,
-              timestamp: STABLE_TIMESTAMP - 200000,
-              fromWorkspaceId: "task-schema-migrator",
-              fromTitle: "Schema Migrator",
-              relationship: "sibling",
-              message:
-                "Heads up: I renamed the `sessions` table to `workspace_sessions`. Update your queries before landing.",
-            }),
-            createAssistantMessage("msg-3", "Acknowledged — updating my queries now.", {
-              historySequence: 3,
-              timestamp: STABLE_TIMESTAMP - 150000,
-            }),
-            createAgentPeerMessage("msg-4", {
-              historySequence: 4,
-              timestamp: STABLE_TIMESTAMP - 60000,
-              fromWorkspaceId: "task-test-runner",
-              relationship: "descendant",
-              message: "Integration suite is green after the rename.\n\n- 412 passed\n- 0 failed",
-            }),
-          ],
-        });
-      }}
-    />
-  ),
+  render: () => <AppWithMocks setup={setupAgentPeerMessagesStory} />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    const toggles = await waitFor(
-      () => {
-        const found = canvas.getAllByRole("button", { name: /show message/i });
-        if (found.length !== 2) {
-          throw new Error(`Expected 2 collapsed peer messages, found ${found.length}`);
-        }
-        return found;
-      },
-      { timeout: 15_000 }
-    );
+    const toggles = await findCollapsedPeerMessageToggles(canvasElement);
 
     // Sender attribution and relationship badges must be visible while collapsed.
     if (canvas.queryByText(/Message from Schema Migrator/) == null) {
@@ -918,14 +941,103 @@ export const AgentPeerMessages: AppStory = {
     if (canvas.queryByText(/Message from task-test-runner/) == null) {
       throw new Error("Expected untitled peer message to fall back to the sender id");
     }
+    if (canvas.queryByText(/Message from Release Coordinator/) == null) {
+      throw new Error("Expected cross-tree peer message header");
+    }
+    // The badge is the only cue that the sender shares no ancestry with this workspace.
+    if (canvas.queryByText("unrelated", { exact: true }) == null) {
+      throw new Error("Expected the cross-tree peer message to carry an unrelated badge");
+    }
 
-    // Expand the second (descendant) message; the sibling message stays collapsed.
+    // Expand the second (descendant) message; the sibling and unrelated messages stay collapsed.
     await userEvent.click(toggles[1]);
     await waitFor(() => {
       if (canvas.queryByText(/412 passed/) == null) {
         throw new Error("Expected expanded peer message to reveal the markdown body");
       }
     });
+  },
+};
+
+const AGENT_PEER_PHONE_WIDTH = 390;
+
+/**
+ * Phone-width contract for the peer cards: the collapsed header (badge, sender, relationship) and
+ * the expanded cross-tree body must fit a 390px frame without horizontal overflow. Pinned to the
+ * Pixel phone viewport; the fixed-width decorator keeps the frame narrow in the desktop-sized
+ * test-runner, while media-dependent fit assertions are guarded on the real viewport width.
+ */
+export const AgentPeerMessagesPhone390: AppStory = {
+  globals: { viewport: { value: "agentPeerPhone", isRotated: false } },
+  decorators: [
+    (Story) => (
+      <div
+        data-agent-peer-phone-width={AGENT_PEER_PHONE_WIDTH}
+        style={{ width: AGENT_PEER_PHONE_WIDTH, height: 844, overflow: "hidden" }}
+      >
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: {
+    ...appMeta.parameters,
+    viewport: {
+      options: {
+        agentPeerPhone: {
+          name: "Phone 390",
+          styles: { width: `${AGENT_PEER_PHONE_WIDTH}px`, height: "844px" },
+          type: "mobile",
+        },
+      },
+    },
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
+  render: () => <AppWithMocks setup={setupAgentPeerMessagesStory} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggles = await findCollapsedPeerMessageToggles(canvasElement);
+
+    const frame = canvasElement.querySelector<HTMLElement>("[data-agent-peer-phone-width]");
+    if (!frame) throw new Error("Phone frame decorator did not render");
+    const frameWidth = frame.getBoundingClientRect().width;
+    if (frameWidth !== AGENT_PEER_PHONE_WIDTH) {
+      throw new Error(
+        `Phone frame is ${frameWidth}px wide; expected ${AGENT_PEER_PHONE_WIDTH}px — the story would snapshot the wrong layout`
+      );
+    }
+
+    // Expand the unrelated (last) message so the snapshot reviews body wrapping at phone width.
+    await userEvent.click(toggles[AGENT_PEER_MESSAGE_COUNT - 1]);
+    await waitFor(() => {
+      if (canvas.queryByText(/hold merges touching/) == null) {
+        throw new Error("Expected the expanded cross-tree message to reveal its body");
+      }
+    });
+
+    // The unrelated badge must survive truncation of the sender title at phone width.
+    if (canvas.queryByText("unrelated", { exact: true }) == null) {
+      throw new Error("Expected the unrelated badge to stay visible at phone width");
+    }
+
+    // The desktop-sized test-runner retains the app's desktop minimum width; only the
+    // manager/Pixel phone viewport activates its narrow media rules, so fit is asserted there.
+    if (window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX) {
+      const frameRight = frame.getBoundingClientRect().right;
+      const cards = canvasElement.querySelectorAll<HTMLElement>("[data-agent-peer-message]");
+      if (cards.length !== AGENT_PEER_MESSAGE_COUNT) {
+        throw new Error(`Expected ${AGENT_PEER_MESSAGE_COUNT} peer cards, found ${cards.length}`);
+      }
+      for (const card of cards) {
+        if (card.getBoundingClientRect().right > frameRight) {
+          throw new Error("Peer card extends past the phone frame");
+        }
+        if (card.scrollWidth > card.clientWidth) {
+          throw new Error(
+            `Peer card overflows horizontally (${card.scrollWidth}px > ${card.clientWidth}px)`
+          );
+        }
+      }
+    }
   },
 };
 

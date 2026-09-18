@@ -1713,6 +1713,15 @@ export const workspace = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  // Recipient opt-in for cross-tree discovery/messaging. The caller only says on/off; the
+  // backend mints and owns the generation (see WorkspaceMetadata.unrelatedWorkspaceConsent).
+  setUnrelatedWorkspaceConsent: {
+    input: z.object({
+      workspaceId: z.string(),
+      enabled: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   interruptStream: {
     input: z.object({
       workspaceId: z.string(),

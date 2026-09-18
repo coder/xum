@@ -1068,7 +1068,7 @@ export const TaskSendMessageToolArgsSchema = z
       .string()
       .min(1)
       .describe(
-        'Tree target ID returned by task or task_list — a descendant sub-agent task ID or, for sibling/upward messages, a same-tree peer, ancestor, or root workspace ID (task_list scope:"tree").'
+        'Target workspace ID: a descendant sub-agent task ID returned by task, a same-tree row from task_list scope:"tree" (peer, ancestor, or root), or any other workspace ID in this Xum instance that you already know — an envelope "from" reply address or an ID the user provided. Unrelated (cross-tree) targets may be root workspaces or live sub-agents of other trees, but both sender and target must use local or worktree runtimes and the actual recipient must opt in through its workspace settings.'
       ),
     message: z
       .string()
@@ -1081,13 +1081,21 @@ export const TaskSendMessageToolArgsSchema = z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor targets (often human-driven; do not cut into their active turn).'
+        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor and unrelated targets (often human-driven; do not cut into their active turn).'
       ),
   })
   .strict();
 
-/** Target's relation to the sender, computed server-side; a sender cannot claim it. */
-const TaskSendMessageTargetRelationSchema = z.enum(["descendant", "sibling", "ancestor"]);
+/**
+ * Target's relation to the sender, computed server-side; a sender cannot claim it. "unrelated"
+ * means no shared task-tree ancestry (another root or another tree's sub-agent).
+ */
+const TaskSendMessageTargetRelationSchema = z.enum([
+  "descendant",
+  "sibling",
+  "ancestor",
+  "unrelated",
+]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
   .object({
@@ -3077,10 +3085,11 @@ export const TOOL_DEFINITIONS = {
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send a plain-text message to another agent workspace in this task tree: a descendant sub-agent, a sibling/cousin, or an ancestor (including the root workspace). The relationship is computed server-side from the tree — you can never claim parent authority you do not have. Discover addressable peers with task_list scope:"tree". ' +
+      'Send a plain-text message to another agent workspace in this Xum instance: a descendant sub-agent, a sibling/cousin, an ancestor (including the root workspace), or an unrelated workspace outside your task tree. The relationship is computed server-side — you can never claim parent authority you do not have. Same-tree peers are discoverable with task_list scope:"tree"; an unrelated workspace ID you already know (an envelope "from" reply address, or an ID the user provided) is addressable only when that recipient has opted in. ' +
       "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
-      "Sibling and ancestor targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; they must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only). Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
-      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces outside this task tree.",
+      "Sibling, ancestor, and unrelated targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; sub-agent targets must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only), while idle root workspaces wake. Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
+      "Unrelated messaging is off by default: the actual recipient must enable it in its workspace settings; knowing its ID or its parent's consent does not grant access. Revocation cancels input not yet admitted, even after re-enabling; an already admitted turn may finish. Unrelated-message turns need user action to resume after an app restart. This tool cannot grant consent. Both endpoints must use local or worktree runtimes; SSH (including Coder), Docker, devcontainer, and unresolved runtimes are refused. Same-tree messaging is unchanged. Unrelated targets default to turn-end dispatch and keep their own agent, model, and thinking settings — your settings are never applied or persisted there. Messaging grants no additional control: your existing rights over task-tree descendants and over workspace-turn handles you already own remain exactly as before, and no other rights are added. An unrelated root that is inside a delegated workspace turn is temporarily unavailable and returns refused with a retry-after reason; retry once that turn finishes. " +
+      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces in other Xum instances.",
     schema: TaskSendMessageToolArgsSchema,
   },
   task_message_parent: {

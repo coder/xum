@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createControllableAsyncIterable } from "@/browser/testUtils";
 import {
   SUBSCRIPTION_RETRY_MAX_MS,
@@ -129,7 +129,21 @@ describe("runSubscriptionLoop", () => {
     const clientChange = new AbortController();
     let stream!: ReturnType<typeof closeOnAbort<number>>;
     let attemptSignal!: AbortSignal;
-
+    let now = 0;
+    let checkWatchdog!: () => void;
+    let consumed = Promise.withResolvers<void>();
+    const watchdogStarted = Promise.withResolvers<void>();
+    const realSetInterval = globalThis.setInterval;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    // DOM/Bun/Node declare different handle overloads. This fixture handles the watchdog's
+    // no-argument callback and delegates handle creation to the original timer API.
+    const interval = spyOn(globalThis, "setInterval").mockImplementation(((handler: unknown) => {
+      if (typeof handler !== "function") throw new Error("Expected a watchdog callback");
+      checkWatchdog = handler as () => void;
+      watchdogStarted.resolve();
+      // Own a real disposable timer, but drive its checks explicitly rather than racing the host.
+      return realSetInterval(() => undefined, 2_147_483_647);
+    }) as typeof globalThis.setInterval);
     const loop = runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
@@ -140,20 +154,36 @@ describe("runSubscriptionLoop", () => {
         stream = closeOnAbort<number>(signal);
         return Promise.resolve({ events: stream.iterable, context: undefined });
       },
-      onEvent: () => undefined,
+      onEvent: () => consumed.resolve(),
       watchdog: { timeoutMs: 30, checkIntervalMs: 2 },
     });
 
-    await flush();
-    for (let i = 0; i < 3; i++) {
-      await Bun.sleep(15);
-      stream.push(i);
+    try {
+      await watchdogStarted.promise;
+      for (let i = 1; i <= 3; i++) {
+        now = i * 20;
+        stream.push(i);
+        await consumed.promise;
+        consumed = Promise.withResolvers<void>();
+        now += 15;
+        checkWatchdog();
+        // Beyond the original deadline, but still inside the deadline reset by this event.
+        expect(attemptSignal.aborted).toBe(false);
+      }
+      now += 15;
+      checkWatchdog();
+      expect(attemptSignal.aborted).toBe(true);
+    } finally {
+      // An assertion failure must not leave a retry loop perturbing every later shared suite.
+      controller.abort();
+      stream?.close();
+      try {
+        await loop;
+      } finally {
+        interval.mockRestore();
+        clock.mockRestore();
+      }
     }
-    await Bun.sleep(15);
-    expect(attemptSignal.aborted).toBe(false);
-    controller.abort();
-    stream.close();
-    await loop;
   });
 
   test("a stalled attempt is aborted and retried", async () => {

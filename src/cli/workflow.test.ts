@@ -11,6 +11,15 @@ const WORKFLOW_ENTRY = path.join(import.meta.dir, "workflow.ts");
 // worktree need `./scripts/generate-version.sh` first (`make test` generates it).
 const INDEX_ENTRY = path.join(import.meta.dir, "index.ts");
 
+// Exercise the shipped Node CLI: Bun's source runner can crash before workflow assertions.
+async function getCompiledCliEntry(): Promise<string> {
+  const compiledEntry = path.resolve(import.meta.dir, "../../dist/cli/index.js");
+  await fs.access(compiledEntry).catch((cause: unknown) => {
+    throw new Error("Build the CLI with make build-main before running this test", { cause });
+  });
+  return compiledEntry;
+}
+
 async function getRejectedMessage(promise: Promise<unknown>): Promise<string> {
   try {
     await promise;
@@ -96,11 +105,11 @@ describe("xum workflow CLI helpers", () => {
     );
     await trustProject(muxRoot, repo);
 
-    const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo.js --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
-        .nothrow()
-        .quiet();
+    const compiledEntry = await getCompiledCliEntry();
+    const result = await Bun.$`node ${compiledEntry} wf run ./workflows/echo.js --dir ${repo}`
+      .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
+      .nothrow()
+      .quiet();
 
     expect(result.exitCode).toBe(0);
     const output = result.stdout.toString() + result.stderr.toString();
@@ -233,8 +242,9 @@ describe("xum workflow CLI helpers", () => {
 
     await trustProject(muxRoot, repo);
 
+    const compiledEntry = await getCompiledCliEntry();
     const runOutput =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"base":"main"}'} --json`
+      await Bun.$`node ${compiledEntry} wf run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"base":"main"}'} --json`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .text();
     const lines = runOutput.trim().split("\n");
@@ -247,15 +257,16 @@ describe("xum workflow CLI helpers", () => {
     });
 
     const quietOutput =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"input":"hello"}'} --quiet`
+      await Bun.$`node ${compiledEntry} wf run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"input":"hello"}'} --quiet`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .text();
     expect(quietOutput).toBe('Echo: {"input":"hello"}\n');
 
     const stdinProc = Bun.spawn(
       [
-        BUN_EXECUTABLE,
-        WORKFLOW_ENTRY,
+        "node",
+        compiledEntry,
+        "wf",
         "run",
         "./workflows/echo-review.js",
         "--dir",
@@ -286,11 +297,10 @@ describe("xum workflow CLI helpers", () => {
       result: { reportMarkdown: 'Echo: {"fromStdin":true}' },
     });
 
-    const failedRun =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/explode.js --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot })
-        .nothrow()
-        .quiet();
+    const failedRun = await Bun.$`node ${compiledEntry} wf run ./workflows/explode.js --dir ${repo}`
+      .env({ ...process.env, MUX_ROOT: muxRoot })
+      .nothrow()
+      .quiet();
     expect(failedRun.exitCode).toBe(1);
   }, 30_000);
 });
