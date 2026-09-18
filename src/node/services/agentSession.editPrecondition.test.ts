@@ -354,13 +354,17 @@ describe("AgentSession edit precondition", () => {
       h.session as unknown as { contextController: { reset: (reason: string) => void } }
     ).contextController;
     const reset = spyOn(contextController, "reset");
+    const clearUsage = spyOn(h.session, "clearUsageState");
     const result = await h.session.sendMessage("edited during stream", {
       ...baseOptions,
       editMessageId: "u2",
       historyEditPrecondition: precondition,
     });
     expect(reset).not.toHaveBeenCalled();
+    // Likewise the cached usage / context-budget state of the newer turn.
+    expect(clearUsage).not.toHaveBeenCalled();
     reset.mockRestore();
+    clearUsage.mockRestore();
     stream.release();
     await firstSend;
     expect(result).toEqual({ success: false, error: { type: "history-changed" } });
@@ -783,22 +787,17 @@ describe("AgentSession edit precondition", () => {
       partial: true,
     });
     expect((await h.historyService.writePartial(workspaceId, partial)).success).toBe(true);
-    // Reading the partial for retirement fails after the truncated history was published.
-    const readPartial = h.historyService.readPartial.bind(h.historyService);
-    let failed = false;
-    const reading = spyOn(h.historyService, "readPartial").mockImplementation(async (id) => {
-      if (!failed) {
-        failed = true;
-        throw new Error("partial read failed");
-      }
-      return readPartial(id);
-    });
+    // Reading the partial for retirement fails after the truncated history was published; the
+    // real implementation answers every later call.
+    const reading = spyOn(h.historyService, "readPartial").mockRejectedValueOnce(
+      new Error("partial read failed")
+    );
     try {
       const result = await h.historyService.truncateAfterMessage(workspaceId, "u2", {
         precondition: fence(rows, "u2"),
       });
       expect(result.success).toBe(true);
-      expect(failed).toBe(true);
+      expect(reading).toHaveBeenCalled();
       expect((await persisted(h)).map((row) => row.id)).toEqual(["u1", "a1"]);
     } finally {
       reading.mockRestore();

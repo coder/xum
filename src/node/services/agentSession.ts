@@ -3995,7 +3995,6 @@ export class AgentSession {
       // when the edit target is outside the active context window.
       const truncateTargetId = await this.getEditTruncateTargetId(editMessageId);
 
-      this.clearUsageState();
       const editCapture = replacementCapture;
       const truncateResult = await this.historyService.truncateAfterMessage(
         this.workspaceId,
@@ -4050,12 +4049,14 @@ export class AgentSession {
         }
       }
 
-      // The edit has rewritten history (or confirmed there was nothing to cut). Any queued
-      // content from the previous turn was written in the old context — return it to the
-      // input so the user can re-evaluate, and start the edit stream with an empty queue.
-      // Deliberately after the fence: a `history-changed` refusal above must leave the queue
-      // exactly as it was, since the composer keeps its edit draft and would otherwise drop
-      // (or overwrite with the pre-send draft) the restored text, files and reviews.
+      // The edit has rewritten history (or confirmed there was nothing to cut). The cached
+      // usage / context-budget state described the old context; any queued content from the
+      // previous turn was written in it too — return it to the input so the user can
+      // re-evaluate, and start the edit stream with an empty queue. Both deliberately after the
+      // fence: a `history-changed` refusal above must leave usage state and the queue exactly
+      // as they were (the composer keeps its edit draft and would otherwise drop, or overwrite
+      // with the pre-send draft, the restored text, files and reviews).
+      this.clearUsageState();
       this.restoreQueueToInput();
 
       if (truncateResult.success) {
