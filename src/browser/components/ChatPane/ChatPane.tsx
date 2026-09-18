@@ -703,7 +703,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!pendingTimelineReveal) {
       return;
     }
-    if (pendingTimelineReveal.workspaceId !== workspaceId) {
+    // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
+    if (pendingTimelineReveal.workspaceId !== workspaceId || autoScroll) {
       setPendingTimelineReveal(null);
       return;
     }
@@ -761,6 +762,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
     setPendingTimelineReveal(null);
   }, [
+    autoScroll,
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
@@ -815,13 +817,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  // Returning to the live tail supersedes a navigation still waiting for its row to mount;
-  // otherwise the historical chunk mounting later would scroll away from the tail again.
-  const handleJumpToBottom = useCallback(() => {
-    setPendingScrollTarget(null);
-    setPendingTimelineReveal(null);
-    jumpToBottom();
-  }, [jumpToBottom]);
+  const handleJumpToBottom = jumpToBottom;
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
@@ -835,7 +831,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   useEffect(() => {
     if (pendingScrollTarget === null) return;
-    if (pendingScrollTarget.workspaceId !== workspaceId) {
+    // Navigation disables auto-scroll first; the tail being pinned again (jump to bottom, a
+    // send, dismissing an edit, scrolling back down) supersedes a navigation still waiting
+    // for its row to mount, so the chunk mounting later cannot scroll away from the tail.
+    if (pendingScrollTarget.workspaceId !== workspaceId || autoScroll) {
       setPendingScrollTarget(null);
       return;
     }
@@ -857,7 +856,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (targetIndex === -1 || targetIndex >= revealFromIndex) {
       setPendingScrollTarget(null);
     }
-  }, [contentRef, deferredMessages, pendingScrollTarget, revealFromIndex, workspaceId]);
+  }, [autoScroll, contentRef, deferredMessages, pendingScrollTarget, revealFromIndex, workspaceId]);
 
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
