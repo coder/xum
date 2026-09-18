@@ -985,7 +985,7 @@ export const StreamError: AppStory = {
                   timestamp: STABLE_TIMESTAMP - 100000,
                 })
               );
-              callback({ type: "caught-up" });
+              callback({ type: "caught-up", historyReplayStatus: "complete" });
 
               // Generic rate-limit error (former StreamError)
               callback({

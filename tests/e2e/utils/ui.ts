@@ -212,6 +212,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       if (message.startsWith("/")) {
         await page.keyboard.press("Escape");
       }
+      // A send is refused (toast, draft kept) until the transcript is verified caught-up;
+      // wait for the send affordance like a user would instead of racing the replay.
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
     },
 
@@ -269,9 +274,12 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       });
 
       // Send the command. Dismiss suggestion menu first so Enter sends instead of
-      // accepting a completion.
+      // accepting a completion, and wait for the send affordance (transcript caught-up).
       await input.fill(command);
       await page.keyboard.press("Escape");
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
 
       // Wait for the toast we started watching for

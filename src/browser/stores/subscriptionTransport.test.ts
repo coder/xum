@@ -28,7 +28,13 @@ describe("runSubscriptionLoop", () => {
       eventsByAttempt: [[], [1], []],
       expectedSleeps: [250, 250, 500],
     },
-  ])("$name", async ({ eventsByAttempt, expectedSleeps }) => {
+    {
+      name: "with isSuccessEvent, non-success events keep backing off",
+      eventsByAttempt: [[0], [0], [0], [1], [0]],
+      expectedSleeps: [250, 500, 1000, 250, 500],
+      isSuccessEvent: (event: number) => event === 1,
+    },
+  ])("$name", async ({ eventsByAttempt, expectedSleeps, isSuccessEvent }) => {
     const controller = new AbortController();
     const clientChange = new AbortController();
     const sleeps: number[] = [];
@@ -49,6 +55,7 @@ describe("runSubscriptionLoop", () => {
       },
       onEvent: () => activeStream?.close(),
       watchdog: false,
+      isSuccessEvent,
       sleep: (timeoutMs) => {
         sleeps.push(timeoutMs);
         if (sleeps.length === expectedSleeps.length) controller.abort();

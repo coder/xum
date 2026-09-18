@@ -372,7 +372,7 @@ type MockMcpTestResult =
  *   projects: new Map([...]),
  *   workspaces: [...],
  *   onChat: (wsId, emit) => {
- *     emit({ type: "caught-up" });
+ *     emit({ type: "caught-up", historyReplayStatus: "complete" });
  *     // optionally return cleanup function
  *   },
  * });
@@ -1741,7 +1741,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         if (!onChat) {
           // Default mock behavior: subscriptions should remain open.
           // If this ends, WorkspaceStore will retry and reset state, which flakes stories.
-          const caughtUp: WorkspaceChatMessage = { type: "caught-up", hasOlderHistory: false };
+          const caughtUp: WorkspaceChatMessage = {
+            type: "caught-up",
+            historyReplayStatus: "complete",
+            hasOlderHistory: false,
+          };
           yield caughtUp;
 
           await new Promise<void>((resolve) => {

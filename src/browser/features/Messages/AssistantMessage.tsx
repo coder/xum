@@ -16,6 +16,11 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
+import {
+  isTranscriptMutationAllowed,
+  useTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import React, { useState } from "react";
 import { CompactingMessageContent } from "./CompactingMessageContent";
@@ -73,6 +78,11 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     icon: copied ? <ClipboardCheck /> : <Clipboard />,
   };
 
+  // A response fork names this row's history id as the branch point, so it must not run
+  // against a provisional transcript (the row may be stale or already removed): the action
+  // follows the barrier like Start Here does, rendered disabled and re-checked on dispatch.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
+
   const handleForkFromResponse = async () => {
     if (!workspaceId) {
       forkError.showError(message.historyId, "Workspace ID unavailable");
@@ -81,6 +91,11 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
     if (!api) {
       forkError.showError(message.historyId, "Not connected to server");
+      return;
+    }
+
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      forkError.showError(message.historyId, TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
       return;
     }
 
@@ -124,7 +139,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       buttons.push({
         label: "Fork",
         onClick: () => void handleForkFromResponse(),
-        disabled: !workspaceId || !api,
+        disabled: !workspaceId || !api || !transcriptMutationAllowed,
         tooltip: "Fork a new workspace from this response",
         icon: <GitBranch />,
       });

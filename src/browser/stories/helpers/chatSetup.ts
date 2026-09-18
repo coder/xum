@@ -34,7 +34,9 @@ export function createOnChatAdapter(chatHandlers: Map<string, ChatHandler>) {
     }
     // Default: emit caught-up immediately. Modern backends include hasOlderHistory
     // on full replays; default to false in stories to avoid phantom pagination UI.
-    queueMicrotask(() => emit({ type: "caught-up", hasOlderHistory: false }));
+    queueMicrotask(() =>
+      emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false })
+    );
     return undefined;
   };
 }
