@@ -1,4 +1,27 @@
 import { GlobalWindow } from "happy-dom";
+import { mock } from "bun:test";
+import * as React from "react";
+
+/**
+ * Rebind Radix's layout-effect hook to the genuine React hook once a document exists.
+ *
+ * `@radix-ui/react-use-layout-effect` decides at module evaluation time whether to export
+ * `React.useLayoutEffect` or a noop, based on `globalThis.document`. In the shared Bun test
+ * process a document-less suite (hooks/contexts tests importing API → AuthTokenModal → Radix)
+ * can evaluate that module first and pin the noop for every later UI suite, so Popover and
+ * Tooltip content never mounts. `mock.module` updates the live binding seen by consumers that
+ * already imported the noop and pre-registers the export when Radix has not loaded yet, so
+ * this is order-independent. Scoped to that single module; only DOM-installing suites reach
+ * here, and no test renders through react-dom/server, so the noop is never the correct value.
+ */
+let radixLayoutEffectRebound = false;
+function rebindRadixLayoutEffect(): void {
+  if (radixLayoutEffectRebound) return;
+  radixLayoutEffectRebound = true;
+  mock.module("@radix-ui/react-use-layout-effect", () => ({
+    useLayoutEffect: React.useLayoutEffect,
+  }));
+}
 
 interface DomGlobalsSnapshot {
   window: typeof globalThis.window;
@@ -55,6 +78,8 @@ export function installDom(): () => void {
 
   globalThis.window = domWindow;
   globalThis.document = domWindow.document;
+  // The document now exists: repair any Radix noop binding pinned by an earlier suite.
+  rebindRadixLayoutEffect();
   globalThis.navigator = domWindow.navigator;
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
@@ -249,6 +274,10 @@ export function installDom(): () => void {
  */
 if (typeof globalThis.document === "undefined") {
   installDom();
+} else {
+  // A document from an earlier suite does not prove Radix bound the real hook: a
+  // document-less suite may have evaluated Radix before that DOM was installed.
+  rebindRadixLayoutEffect();
 }
 
 // Require (not statically import) react-dnd after the DOM bootstrap because
