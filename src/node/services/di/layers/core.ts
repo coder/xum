@@ -388,7 +388,6 @@ export const MCPServerManagerLive = Layer.effect(
         // the sweep refreshes cached override snapshots from disk.
         config,
         telemetryService: opts.telemetryService,
-        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
         pluginInvalidation: {
           keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
           readComponentPolicy: () =>
@@ -416,6 +415,10 @@ export const MCPServerManagerLive = Layer.effect(
             workspaceMcpOverridesService.acquireExclusiveLock(options),
         },
         ...opts.mcpServerManagerOptions,
+        // After the spread: the registry is a shared dependency the core graph
+        // owns (the stream manager consumes what the MCP manager publishes), so
+        // a caller-supplied instance must not silently split the two.
+        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
       },
       opts.policyService
     );
