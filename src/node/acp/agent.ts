@@ -591,9 +591,9 @@ export class MuxAgent implements Agent {
     const parsedPrompt = parsePromptBlocks(params.prompt);
 
     // Slash commands mutate too (`/clear` truncates, `/compact` sends), so the transcript is
-    // verified before any of them, not only before an ordinary send.
-    await this.assertTranscriptVerified(sessionId, workspaceId);
-
+    // verified before any of them, not only before an ordinary send. The gate sits directly
+    // before each mutation: slash-command discovery awaits skill lookup, and a subscription
+    // that dies during that wait must still refuse the destructive command.
     const slashCommandResponse = await this.tryHandleSlashCommand(
       sessionId,
       workspaceId,
@@ -604,6 +604,7 @@ export class MuxAgent implements Agent {
       return slashCommandResponse;
     }
 
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.sendWorkspaceMessageAndAwaitTurn({
       sessionId,
       workspaceId,
@@ -861,6 +862,8 @@ export class MuxAgent implements Agent {
       return null;
     }
 
+    // Verified after discovery (which awaits), immediately before the command mutates.
+    await this.assertTranscriptVerified(sessionId, workspaceId);
     return this.handleSlashCommand(
       sessionId,
       workspaceId,
