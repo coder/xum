@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -3021,10 +3022,13 @@ export class WorkspaceStore {
       }
 
       const lookbackSequence = throughSequence - 1;
+      // Coverage is proven by a committed row (valid sequence) at or below the lookback: a
+      // malformed sequence is not evidence here either, or it could end paging early and
+      // report an existing target as gone.
       const hasLookbackRow = () =>
         aggregator.getAllMessages().some((message) => {
           const historySequence = message.metadata?.historySequence;
-          return historySequence !== undefined && historySequence <= lookbackSequence;
+          return isNonNegativeInteger(historySequence) && historySequence <= lookbackSequence;
         });
       while (!hasLookbackRow()) {
         const result = await this.loadOlderHistory(workspaceId);

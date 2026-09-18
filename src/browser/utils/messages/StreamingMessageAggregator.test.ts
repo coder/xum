@@ -292,6 +292,16 @@ describe("StreamingMessageAggregator", () => {
         aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
       ).toEqual(republished.parts);
 
+      // Every active stream's row is fenced by identity only (two can overlap briefly).
+      startTestStream(aggregator, { messageId: "s3", historySequence: 3 });
+      startTestStream(aggregator, { messageId: "s4", historySequence: 4 });
+      expect(
+        aggregator
+          .getHistoryEvidenceMessages()
+          .filter((m) => m.id === "s3" || m.id === "s4")
+          .map((m) => m.metadata?.partial)
+      ).toEqual([true, true]);
+
       // A frontend-only row with no persisted counterpart is not evidence at all.
       aggregator.addEphemeralMessage(
         row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
