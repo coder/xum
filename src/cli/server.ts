@@ -242,13 +242,15 @@ async function main(): Promise<void> {
     console.log(""); // blank line
   }
 
-  // Cleanup on shutdown
+  // Cleanup on shutdown. `reason` is the only record of *why* a graceful exit happened: the
+  // supervising launcher just sees exit code 0, and in server mode log.debug is dropped, so an
+  // externally sent SIGTERM and a self-update restart were indistinguishable in the log.
   let cleanupInProgress = false;
-  const cleanup = async () => {
+  const cleanup = async (reason: string) => {
     if (cleanupInProgress) return;
     cleanupInProgress = true;
 
-    console.log("Shutting down server...");
+    console.log(`Shutting down server (${reason})...`);
     const shutdownStartedAt = performance.now();
 
     // Force exit after timeout if cleanup hangs
@@ -308,11 +310,32 @@ async function main(): Promise<void> {
   await serviceContainer.updateService.enableServerUpdater(updateLayout, {
     refreshBlockers: () => serviceContainer.refreshRestartBlockers(),
     collectBlockers: () => serviceContainer.collectRestartBlockers(),
-    restart: cleanup,
+    restart: () => cleanup("self-update restart"),
   });
 
-  process.on("SIGINT", () => void cleanup());
-  process.on("SIGTERM", () => void cleanup());
+  process.on("SIGINT", () => void cleanup("SIGINT"));
+  process.on("SIGTERM", () => void cleanup("SIGTERM"));
+
+  startMemoryBreadcrumbs();
+}
+
+// Server mode has no desktop-side telemetry, and a SIGKILL (OOM killer, container stop) leaves
+// no in-process breadcrumb at all. A periodic stdout line makes the memory trajectory before an
+// external kill recoverable from the launcher's log, and splits V8 heap from external/native
+// memory, which an outside sampler reading RSS cannot do.
+const MEMORY_BREADCRUMB_INTERVAL_MS = 10 * 60 * 1000;
+
+function startMemoryBreadcrumbs(): void {
+  const toMb = (bytes: number) => Math.round(bytes / (1024 * 1024));
+  const emit = () => {
+    const usage = process.memoryUsage();
+    console.log(
+      `[memory] rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB heapTotal=${toMb(usage.heapTotal)}MB external=${toMb(usage.external)}MB arrayBuffers=${toMb(usage.arrayBuffers)}MB uptime=${Math.round(process.uptime())}s`
+    );
+  };
+  emit();
+  // unref: the timer must never keep the process alive once cleanup has run its course.
+  setInterval(emit, MEMORY_BREADCRUMB_INTERVAL_MS).unref();
 }
 
 void main().catch(async (error: unknown) => {
