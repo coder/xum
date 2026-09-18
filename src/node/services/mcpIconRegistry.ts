@@ -20,7 +20,7 @@ interface Entry {
 
 /**
  * Immutable session-local artwork. The host uses a fresh owner object for each
- * connection/test generation; aliases and URLs cannot relabel historical calls.
+ * connection generation; aliases and URLs cannot relabel historical calls.
  * Only digests, opaque refs and bounded PNGs survive resolution, not data URLs
  * from the server. Eviction never re-fetches or resurrects an old reference.
  */
