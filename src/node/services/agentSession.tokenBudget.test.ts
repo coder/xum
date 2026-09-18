@@ -3340,6 +3340,10 @@ describe("AgentSession token-budget lifecycle", () => {
    * Records the recovery path's preparation fence and the protected calls it guards. Each
    * valid fence check queues a microtask; protected work that starts before that microtask
    * runs proves the session did not yield between the check and the call.
+   *
+   * The marker is a real promise reaction, not `queueMicrotask`: another suite in the shared
+   * Bun process replaces the global with a synchronous stub, which would record the marker
+   * inside the fence check itself and fail this witness for the wrong reason.
    */
   function armRecoveryFenceWitness(h: Awaited<ReturnType<typeof setup>>) {
     const controller = Reflect.get(h.session, "contextController") as SessionContextController;
@@ -3355,7 +3359,7 @@ describe("AgentSession token-budget lifecycle", () => {
       if (valid) {
         const tag = ++validated;
         order.push(`validate:${tag}`);
-        queueMicrotask(() => order.push(`microtask:${tag}`));
+        void Promise.resolve().then(() => order.push(`microtask:${tag}`));
       }
       return valid;
     });
