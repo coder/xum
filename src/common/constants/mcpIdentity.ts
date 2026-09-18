@@ -4,9 +4,10 @@
  *
  * Identity is self-reported and display-only, so every field is capped: the
  * schema (`MCPServerIdentitySchema` & co.) rejects values above these limits,
- * and the normalizer (`normalizeServerIdentity`) truncates raw server input
- * to fit them. Character limits count UTF-16 code units (what zod's string
- * `max` measures); `displaySnapshotMaxBytes` is the aggregate UTF-8 size of
+ * and the normalizer (`normalizeServerIdentity`) inspects only a raw prefix of
+ * that length per field, so its output fits them. Character limits count
+ * UTF-16 code units (what zod's string `max` measures);
+ * `displaySnapshotMaxBytes` is the aggregate UTF-8 size of
  * the JSON-serialized per-call snapshot — required fields at their maximum
  * (3-byte BMP characters, longest ASCII origin) always fit beneath it, only
  * optional fields ever need trimming.

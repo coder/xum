@@ -48,35 +48,40 @@ const ICON_SIZES_MAX = 8;
 const ICON_SIZE_MAX_CHARS = 16;
 
 /**
- * Display-text sanitizer: unsafe characters become a space, whitespace runs
- * collapse, the result is trimmed and truncated to `maxChars` UTF-16 units
- * (the unit zod's string `max` counts) without splitting a surrogate pair.
- * Returns undefined for non-strings and for text that is empty afterwards.
+ * Display-text sanitizer over a bounded raw prefix. `maxChars` is the raw
+ * UTF-16 inspection budget (the unit zod's string `max` counts): the value is
+ * clipped to it first, never splitting a surrogate pair (a pair straddling
+ * the boundary is dropped, not halved), and only that prefix is sanitized:
+ * unsafe characters become a space, whitespace runs collapse, the result is
+ * trimmed. Nothing beyond the prefix is ever read, so a field whose in-budget
+ * prefix normalizes to nothing yields undefined even if valid text follows,
+ * and normalized text can be shorter than the budget. Replacements never
+ * lengthen text, so the result always fits the limit. Returns undefined for
+ * non-strings and empty results. This bounds work per field; it is not a
+ * latency guarantee for MCP parsing as a whole.
  */
 function sanitizeText(value: unknown, maxChars: number): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const cleaned = value.replace(UNSAFE_TEXT, " ").replace(/\s+/gu, " ").trim();
-  if (cleaned.length <= maxChars) {
-    return cleaned.length > 0 ? cleaned : undefined;
+  let prefix = value;
+  if (value.length > maxChars) {
+    const lastUnit = value.charCodeAt(maxChars - 1);
+    const cut = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? maxChars - 1 : maxChars;
+    prefix = value.slice(0, cut);
   }
-  const lastUnit = cleaned.charCodeAt(maxChars - 1);
-  const cut = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? maxChars - 1 : maxChars;
-  const truncated = cleaned.slice(0, cut).trimEnd();
-  return truncated.length > 0 ? truncated : undefined;
+  const cleaned = prefix.replace(UNSAFE_TEXT, " ").replace(/\s+/gu, " ").trim();
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function normalizeWebsiteUrl(value: unknown): string | undefined {
-  if (typeof value !== "string") {
+  // URLs are never truncated (that would change their meaning). The raw length
+  // is guarded before any trim or parse, so padding counts against the limit.
+  if (typeof value !== "string" || value.length > MCP_IDENTITY_LIMITS.websiteUrlMaxChars) {
     return undefined;
   }
-  // URLs are never truncated (that would change their meaning); over-long ones are dropped.
   const trimmed = value.trim();
-  return trimmed.length <= MCP_IDENTITY_LIMITS.websiteUrlMaxChars &&
-    isHttpsUrlWithoutUserinfo(trimmed)
-    ? trimmed
-    : undefined;
+  return isHttpsUrlWithoutUserinfo(trimmed) ? trimmed : undefined;
 }
 
 function isAcceptableIconSrc(src: string): boolean {

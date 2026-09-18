@@ -66,7 +66,7 @@ describe("normalizeServerIdentity", () => {
     });
   });
 
-  test("strips controls, trims, collapses whitespace and truncates every text field", () => {
+  test("strips controls, trims, and collapses whitespace within each field's raw prefix", () => {
     const result = normalizeServerIdentity({
       name: `  \u0000No\ttion\u202e${"n".repeat(200)}  `,
       version: `1.0\u0007${"x".repeat(100)}`,
@@ -75,23 +75,42 @@ describe("normalizeServerIdentity", () => {
     });
     expect(result).toBeDefined();
     const identity = result!.identity;
-    expect(identity.name).toHaveLength(MCP_IDENTITY_LIMITS.nameMaxChars);
-    expect(identity.name.startsWith("No tion")).toBe(true);
-    expect(identity.version).toHaveLength(MCP_IDENTITY_LIMITS.versionMaxChars);
-    expect(identity.version.startsWith("1.0 x")).toBe(true);
+    // Only the first maxChars raw units are inspected; replacements never
+    // lengthen text, so the normalized prefix can be shorter than the limit.
+    expect(identity.name).toBe(`No tion ${"n".repeat(MCP_IDENTITY_LIMITS.nameMaxChars - 11)}`);
+    expect(identity.version).toBe(`1.0 ${"x".repeat(MCP_IDENTITY_LIMITS.versionMaxChars - 4)}`);
     expect(identity.title).toBe("Notion MCP [31m");
-    expect(identity.description).toHaveLength(MCP_IDENTITY_LIMITS.descriptionMaxChars);
-    expect(identity.description!.startsWith("line one line two d")).toBe(true);
-    // Truncated values re-validate against the shared schema.
+    expect(identity.description).toBe(
+      `line one line two ${"d".repeat(MCP_IDENTITY_LIMITS.descriptionMaxChars - 19)}`
+    );
+    // Normalized values re-validate against the shared schema.
     expect(MCPServerIdentitySchema.safeParse(identity).success).toBe(true);
   });
 
-  test("truncation never splits a surrogate pair", () => {
-    const result = normalizeServerIdentity({ name: "😀".repeat(50), version: "1" });
-    expect(result!.identity.name.length).toBeLessThanOrEqual(MCP_IDENTITY_LIMITS.nameMaxChars);
+  test("a prefix that normalizes to nothing is empty even when valid text follows it", () => {
+    const controls = "\u0000".repeat(MCP_IDENTITY_LIMITS.nameMaxChars);
+    // Required field: the identity is unusable, whatever lies beyond the budget.
+    expect(normalizeServerIdentity({ name: `${controls}Valid`, version: "1" })).toBeUndefined();
+    // Optional field: omitted, the identity itself is kept.
+    const result = normalizeServerIdentity({
+      name: "n",
+      version: "1",
+      title: `${" ".repeat(MCP_IDENTITY_LIMITS.titleMaxChars)}Valid`,
+    });
+    expect(result!.identity).toStrictEqual({ name: "n", version: "1" });
+  });
+
+  test("the raw prefix never splits a surrogate pair", () => {
+    // Pairs aligned with the boundary: exactly forty fit.
+    const aligned = normalizeServerIdentity({ name: "😀".repeat(50), version: "1" });
+    expect(aligned!.identity.name).toBe("😀".repeat(MCP_IDENTITY_LIMITS.nameMaxChars / 2));
+    // A pair straddling the boundary is omitted, not left as a lone surrogate.
+    const straddling = normalizeServerIdentity({ name: `a${"😀".repeat(50)}`, version: "1" });
+    expect(straddling!.identity.name).toBe(
+      `a${"😀".repeat((MCP_IDENTITY_LIMITS.nameMaxChars - 2) / 2)}`
+    );
     // With the `u` flag, \p{Surrogate} matches only lone (unpaired) surrogates.
-    expect(/\p{Surrogate}/u.test(result!.identity.name)).toBe(false);
-    expect(result!.identity.name.endsWith("😀")).toBe(true);
+    expect(/\p{Surrogate}/u.test(straddling!.identity.name)).toBe(false);
   });
 
   test("drops empty or non-string optional fields without dropping the identity", () => {
@@ -113,6 +132,15 @@ describe("normalizeServerIdentity", () => {
     });
     expect(keep!.identity.websiteUrl).toBe("https://www.notion.so/product/ai");
 
+    // The raw length is guarded before trimming: padding that pushes an
+    // otherwise valid URL over the limit drops it (URLs are never truncated).
+    expect(
+      normalizeServerIdentity({
+        name: "n",
+        version: "1",
+        websiteUrl: `${" ".repeat(MCP_IDENTITY_LIMITS.websiteUrlMaxChars)}https://www.notion.so`,
+      })!.identity.websiteUrl
+    ).toBeUndefined();
     for (const websiteUrl of [
       "http://www.notion.so",
       "https://user:pw@www.notion.so",
@@ -275,8 +303,7 @@ describe("describeConnection", () => {
 
   test("sanitizes the configured key like other display text", () => {
     const ref = describeConnection(`\u0000 my\tserver ${"k".repeat(200)}`, stdio);
-    expect(ref.key.startsWith("my server k")).toBe(true);
-    expect(ref.key).toHaveLength(MCP_IDENTITY_LIMITS.connectionKeyMaxChars);
+    expect(ref.key).toBe(`my server ${"k".repeat(MCP_IDENTITY_LIMITS.connectionKeyMaxChars - 12)}`);
     expect(MCPConnectionRefSchema.safeParse(ref).success).toBe(true);
   });
 });
