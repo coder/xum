@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, test, mock } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import type { MuxMessage } from "@/common/types/message";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { MessageWindow } from "./MessageWindow";
 
 void mock.module("@/browser/contexts/ChatHostContext", () => ({
@@ -11,6 +13,9 @@ void mock.module("@/browser/contexts/ChatHostContext", () => ({
   }),
 }));
 
+// Bun module mocks are process-wide; the null content stub must not hide
+// tooltip content in later suites.
+restoreModulesAfterSuite([["@/browser/components/Tooltip/Tooltip", { ...RealTooltipModule }]]);
 void mock.module("@/browser/components/Tooltip/Tooltip", () => ({
   Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
