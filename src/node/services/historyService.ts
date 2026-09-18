@@ -27,8 +27,10 @@ import {
 } from "./historyReplacementRows";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
-import { computeHistoryRangeFingerprint } from "@/common/orpc/onChatCursorFingerprint";
-import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
+import {
+  buildHistoryEditPrecondition,
+  getEditTruncateTargetFromMessages,
+} from "@/common/utils/history/editTruncation";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -424,27 +426,40 @@ export function isHistoryEditPreconditionMismatch(error: string): boolean {
  * The projection of a persisted row the client actually receives: oRPC validates every replayed
  * row against the wire schema, which drops keys it does not know (a persisted user text part
  * carries `state: "done"`, the wire part does not) and skips rows that fail it entirely.
- * Evidence is compared over this projection so it matches what the client can compute. The
- * client additionally fences only rows with a valid `historySequence` (see
- * `buildHistoryEditPrecondition`), so a persisted row whose sequence is negative or fractional
- * — admitted by the wire schema — is dropped here too; otherwise it would be selected as the
- * range start or newest row on this side only and refuse every refreshed fence.
+ * Evidence is built over this projection so it matches what the client can compute; which of
+ * these rows count as evidence is `buildHistoryEditPrecondition`'s business, shared with the
+ * client.
  */
 function toWireProjection(rows: readonly MuxMessage[]): MuxMessage[] {
   return rows.flatMap((row) => {
     const parsed = MuxMessageSchema.safeParse(row);
-    return parsed.success && isNonNegativeInteger(parsed.data.metadata?.historySequence)
-      ? [parsed.data as MuxMessage]
-      : [];
+    return parsed.success ? [parsed.data as MuxMessage] : [];
   });
 }
 
+const HISTORY_EDIT_PRECONDITION_FIELDS = [
+  "rangeStartMessageId",
+  "rangeStartHistorySequence",
+  "newestMessageId",
+  "newestHistorySequence",
+  "rangeRowCount",
+  "rangeFingerprint",
+] as const satisfies ReadonlyArray<keyof HistoryEditPrecondition>;
+
 /**
- * Verifies an edit's content evidence against the rows a truncation is about to delete. Runs
- * under the history write lock, over the wire projection of the readable rows (the view the
- * client fenced against). `messagesInScope` are every readable row the truncation can see
- * (archive + active epoch for a pre-boundary target); `removed` are the rows about to be
- * deleted, in order.
+ * Verifies an edit's content evidence. Runs under the history write lock. `messagesInScope`
+ * are every readable row the truncation can see (archive + active epoch for a pre-boundary
+ * target); `removedReadable` are the rows about to be deleted, in order.
+ *
+ * The server cuts from the target it derives over every readable row (`truncateTargetId`,
+ * recomputed here so a stale caller cannot fence one cut and apply another). The evidence is
+ * then rebuilt with the client's own builder over the wire projection of the same rows and
+ * compared field by field, so client and server agree by construction — including how rows
+ * with a malformed sequence separate snapshots from the edited row without being evidence. A
+ * readable-but-unparseable snapshot directly before the edited message extends the server's
+ * cut without ever reaching the client; it is deleted with the edited turn and is not evidence
+ * either. Finally the rows actually removed must lie inside the fenced range: the evidence has
+ * to cover what is deleted, not merely agree about history.
  */
 function verifyHistoryEditPrecondition(
   precondition: HistoryEditPrecondition,
@@ -452,7 +467,6 @@ function verifyHistoryEditPrecondition(
   removedReadable: readonly MuxMessage[],
   truncateTargetId: string
 ): Result<void> {
-  const removed = toWireProjection(removedReadable);
   assert(precondition.rangeStartHistorySequence >= 0, "range start sequence must be >= 0");
   assert(
     precondition.newestHistorySequence >= precondition.rangeStartHistorySequence,
@@ -460,55 +474,35 @@ function verifyHistoryEditPrecondition(
   );
   const mismatch = (detail: string) => Err(`${HISTORY_EDIT_PRECONDITION_MISMATCH}: ${detail}`);
 
-  // Same truncation rule on both sides. The server cuts from the target it derives over every
-  // readable row (`truncateTargetId`, recomputed here so a stale caller cannot fence one cut
-  // and apply another); the client can only have derived its range start over the rows replay
-  // delivered, i.e. the wire projection. A readable-but-unparseable snapshot row directly
-  // before the edited message extends the server's cut without ever reaching the client, so
-  // the client's start is compared against the projected rule, not the raw one.
   const actualTarget = getEditTruncateTargetFromMessages(
     messagesInScope,
     precondition.editMessageId
   );
   if (actualTarget === undefined) return mismatch("edited message is no longer in history");
   if (actualTarget !== truncateTargetId) return mismatch("truncation target differs");
-  const projectedTarget = getEditTruncateTargetFromMessages(
+
+  const expected = buildHistoryEditPrecondition(
     toWireProjection(messagesInScope),
     precondition.editMessageId
   );
-  if (projectedTarget !== precondition.rangeStartMessageId) {
-    return mismatch("truncation target differs");
+  if (expected === undefined) return mismatch("edited message cannot be fenced");
+  // Field identities in the detail make a refusal diagnosable from the log alone.
+  for (const field of HISTORY_EDIT_PRECONDITION_FIELDS) {
+    if (expected[field] !== precondition[field]) {
+      return mismatch(
+        `${field} differs (client ${precondition[field]}, history ${expected[field]})`
+      );
+    }
   }
-  // Row identities in the detail make a refusal diagnosable from the log alone.
-  const describe = (row: MuxMessage | undefined) =>
-    row === undefined ? "none" : `${row.id}@${row.metadata?.historySequence ?? "?"}`;
-  const first = removed[0];
-  if (
-    first === undefined ||
-    first.id !== precondition.rangeStartMessageId ||
-    first.metadata?.historySequence !== precondition.rangeStartHistorySequence
-  ) {
+  const removedBelowRange = toWireProjection(removedReadable).find((row) => {
+    const sequence = row.metadata?.historySequence;
+    return isNonNegativeInteger(sequence) && sequence < expected.rangeStartHistorySequence;
+  });
+  if (removedBelowRange !== undefined) {
     return mismatch(
-      `range start differs (client ${precondition.rangeStartMessageId}@${precondition.rangeStartHistorySequence}, history ${describe(first)})`
+      `removed row ${removedBelowRange.id}@${String(removedBelowRange.metadata?.historySequence)} precedes the fenced range`
     );
   }
-  const newest = removed.findLast((row) => row.metadata?.historySequence !== undefined);
-  if (
-    newest === undefined ||
-    newest.id !== precondition.newestMessageId ||
-    newest.metadata?.historySequence !== precondition.newestHistorySequence
-  ) {
-    return mismatch(
-      `newest row differs (client ${precondition.newestMessageId}@${precondition.newestHistorySequence}, history ${describe(newest)})`
-    );
-  }
-  const range = computeHistoryRangeFingerprint(
-    removed,
-    precondition.rangeStartHistorySequence,
-    precondition.newestHistorySequence
-  );
-  if (range.rowCount !== precondition.rangeRowCount) return mismatch("row count differs");
-  if (range.fingerprint !== precondition.rangeFingerprint) return mismatch("row content differs");
   return Ok(undefined);
 }
 

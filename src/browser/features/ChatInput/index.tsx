@@ -1828,11 +1828,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 <button
                   type="button"
                   onClick={() => {
-                    // The toast can outlive the edit it belongs to; a click then only clears it.
-                    if (!isSameEdit()) {
-                      setToast(null);
-                      return;
-                    }
+                    // The toast belongs to the failed attempt: clear it before retrying so a
+                    // successful retry does not leave a stale failure (and its retry button)
+                    // behind. It can also outlive the edit; a click then only clears it.
+                    setToast(null);
+                    if (!isSameEdit()) return;
                     startEditTranscriptRefresh(editMessageId, precondition);
                   }}
                   className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
