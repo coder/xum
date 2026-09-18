@@ -52,6 +52,12 @@ export interface ChatInputWorkspaceVariant {
   isStreamStarting?: boolean;
   editingMessage?: EditingMessageState;
   onCancelEdit?: () => void;
+  /**
+   * Functional update of the editing state the parent owns (conflict recovery marks the
+   * precondition invalidated and later stores the refreshed candidate). The updater receives
+   * the current state and must return it unchanged when it targets a different message.
+   */
+  onEditingMessageChange?: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage?: () => void;
   canInterrupt?: boolean;
   disabled?: boolean;

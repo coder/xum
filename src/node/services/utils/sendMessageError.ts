@@ -1,3 +1,4 @@
+import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 import assert from "@/common/utils/assert";
 import type { ErrorEvent } from "@/common/types/stream";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
@@ -125,6 +126,8 @@ export const formatSendMessageError = (
         message: error.message,
         errorType: "unknown",
       };
+    case "history-changed":
+      return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
   }
 };
 

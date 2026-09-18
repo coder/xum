@@ -30,6 +30,7 @@ import type {
 
 export type BranchListResult = z.infer<typeof schemas.BranchListResultSchema>;
 export type SendMessageOptions = z.infer<typeof schemas.SendMessageOptionsSchema>;
+export type HistoryEditPrecondition = z.infer<typeof schemas.HistoryEditPreconditionSchema>;
 
 // Provider types (single source of truth - derived from schemas)
 export type AWSCredentialStatus = z.infer<typeof schemas.AWSCredentialStatusSchema>;

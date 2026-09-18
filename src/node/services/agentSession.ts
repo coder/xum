@@ -285,6 +285,8 @@ import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
+import { isHistoryEditPreconditionMismatch } from "./historyService";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 
 /**
@@ -2040,34 +2042,10 @@ export class AgentSession {
     );
   }
 
-  private getEditTruncateTargetFromMessages(
-    messages: readonly MuxMessage[],
-    editMessageId: string
-  ): string | undefined {
-    const editIndex = messages.findIndex((message) => message.id === editMessageId);
-    if (editIndex === -1) {
-      return undefined;
-    }
-
-    let truncateTargetId = editMessageId;
-    for (let i = editIndex - 1; i >= 0; i -= 1) {
-      const message = messages[i];
-      if (!isSyntheticSnapshotUserMessage(message)) {
-        break;
-      }
-      truncateTargetId = message.id;
-    }
-
-    return truncateTargetId;
-  }
-
   private async getEditTruncateTargetId(editMessageId: string): Promise<string> {
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (historyResult.success) {
-      const truncateTargetId = this.getEditTruncateTargetFromMessages(
-        historyResult.data,
-        editMessageId
-      );
+      const truncateTargetId = getEditTruncateTargetFromMessages(historyResult.data, editMessageId);
       if (truncateTargetId !== undefined) {
         return truncateTargetId;
       }
@@ -2085,7 +2063,7 @@ export class AgentSession {
       return editMessageId;
     }
 
-    return this.getEditTruncateTargetFromMessages(fullHistory, editMessageId) ?? editMessageId;
+    return getEditTruncateTargetFromMessages(fullHistory, editMessageId) ?? editMessageId;
   }
 
   private getLastNonSystemHistoryMessage(historyTail: MuxMessage[]): MuxMessage | undefined {
@@ -3919,7 +3897,35 @@ export class AgentSession {
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");
+
+      // Fence preflight BEFORE the context reset and the interruption: a turn that started
+      // after the client captured its evidence (queued follow-up, goal continuation,
+      // background report) has already added rows inside the fenced range, so the atomic
+      // check below would refuse the edit — but only after the reset aborted that turn's
+      // compactor and prefix-swap state and the interruption discarded the very response the
+      // fence protects. The preflight is advisory (read lock only); the truncation
+      // re-verifies atomically.
+      if (options.historyEditPrecondition) {
+        const preflightTarget = await this.getEditTruncateTargetId(editMessageId);
+        const preflight = await this.historyService.checkHistoryEditPrecondition(
+          this.workspaceId,
+          preflightTarget,
+          options.historyEditPrecondition
+        );
+        if (!preflight.success) {
+          if (isHistoryEditPreconditionMismatch(preflight.error)) {
+            log.info("Edit refused before interruption: history changed since the capture", {
+              workspaceId: this.workspaceId,
+              editMessageId,
+              error: preflight.error,
+            });
+            return refuseBeforeAcceptance({ type: "history-changed" });
+          }
+          return Err(createUnknownSendMessageError(preflight.error));
+        }
+      }
       this.contextController.reset("edit");
+
       // Ignore our own reservation when deciding whether a turn needs to settle.
       if (this.coordinator.phase !== "idle") {
         // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
@@ -3977,10 +3983,11 @@ export class AgentSession {
 
       attempt.expectedTurn = this.coordinator.turnId;
 
-      // The edit is about to truncate and rewrite history. Any queued content from
-      // the previous turn was written in the old context — return it to the input
-      // so the user can re-evaluate, and start the edit stream with an empty queue.
-      this.restoreQueueToInput();
+      // A fenced edit is verified against persisted rows as they are: the client's view of an
+      // unfinished turn (placeholder overlaid with partial.json) is fenced by identity only
+      // (see computeHistoryRangeFingerprint), so partial.json is NOT committed here. Committing
+      // would delete an errored empty placeholder the client still displays and turn the
+      // fence's "newest row" check into a spurious conflict.
 
       // Find the truncation target: the edited message or any immediately-preceding snapshots.
       // (snapshots are persisted immediately before their corresponding user message)
@@ -3988,26 +3995,43 @@ export class AgentSession {
       // when the edit target is outside the active context window.
       const truncateTargetId = await this.getEditTruncateTargetId(editMessageId);
 
-      this.clearUsageState();
       const editCapture = replacementCapture;
       const truncateResult = await this.historyService.truncateAfterMessage(
         this.workspaceId,
         truncateTargetId,
-        editCapture
-          ? {
-              replacement: {
-                capture: editCapture,
-                isCurrent: () => !isAdmissionStale(),
-                // Only this edit's held-lock fence can refresh its original capture.
-                onGenerationAdvanced: (generation) => {
-                  replacementCapture = { ...editCapture, generation };
-                  attempt.admissionCapture = replacementCapture;
+        {
+          ...(editCapture
+            ? {
+                replacement: {
+                  capture: editCapture,
+                  isCurrent: () => !isAdmissionStale(),
+                  // Only this edit's held-lock fence can refresh its original capture.
+                  onGenerationAdvanced: (generation) => {
+                    replacementCapture = { ...editCapture, generation };
+                    attempt.admissionCapture = replacementCapture;
+                  },
                 },
-              },
-            }
-          : undefined
+              }
+            : {}),
+          // UI edits fence the range they delete with the evidence captured when editing
+          // began; the service verifies it atomically with the truncation.
+          ...(options.historyEditPrecondition
+            ? { precondition: options.historyEditPrecondition }
+            : {}),
+        }
       );
       if (!truncateResult.success) {
+        // A stale fence is a typed, expected refusal: the composer keeps the draft and asks
+        // for an explicit review + re-send. Checked before the missing-target leniency so a
+        // conflict can never be downgraded to a no-op truncation.
+        if (isHistoryEditPreconditionMismatch(truncateResult.error)) {
+          log.info("Edit refused: history changed since the client captured its evidence", {
+            workspaceId: this.workspaceId,
+            editMessageId,
+            error: truncateResult.error,
+          });
+          return refuseBeforeAcceptance({ type: "history-changed" });
+        }
         const isMissingEditTarget =
           truncateResult.error.includes("Message with ID") &&
           truncateResult.error.includes("not found in history");
@@ -4024,6 +4048,17 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(truncateResult.error));
         }
       }
+
+      // The edit has rewritten history (or confirmed there was nothing to cut). The cached
+      // usage / context-budget state described the old context; any queued content from the
+      // previous turn was written in it too — return it to the input so the user can
+      // re-evaluate, and start the edit stream with an empty queue. Both deliberately after the
+      // fence: a `history-changed` refusal above must leave usage state and the queue exactly
+      // as they were (the composer keeps its edit draft and would otherwise drop, or overwrite
+      // with the pre-send draft, the restored text, files and reviews).
+      this.clearUsageState();
+      this.restoreQueueToInput();
+
       if (truncateResult.success) {
         editTailTruncated = true;
         // RLM mode: summarize the truncated tail into a durable labeled row
