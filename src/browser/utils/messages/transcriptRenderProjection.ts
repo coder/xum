@@ -1,3 +1,4 @@
+import { TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
@@ -113,6 +114,47 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
     detailLabelPlural: "operations",
   },
 };
+
+/**
+ * Characters of string payload a tool card can render when expanded: the string itself, or
+ * the string fields one level down (file contents, command output, a plan body). Nested
+ * structures are not walked and nothing is serialized — expansion is per workspace/tool and
+ * not visible to this projection, so this errs toward charging the visible payload.
+ */
+function estimateToolPayloadChars(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (value === null || typeof value !== "object") return 0;
+  let chars = 0;
+  for (const field of Object.values(value as Record<string, unknown>)) {
+    if (typeof field === "string") chars += field.length;
+  }
+  return chars;
+}
+
+/**
+ * Relative render + layout cost of a transcript row for the tail-first reveal: the text body
+ * length for rows that render one (markdown, code blocks); for tool cards a nominal constant
+ * plus their string payload (args and result), since expanded cards — sticky per tool, and
+ * default for some tools — render it in full; a nominal constant for markers. A heuristic in
+ * characters, deliberately cheap — never serializes a message.
+ */
+export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
+  switch (message.type) {
+    case "user":
+    case "assistant":
+    case "reasoning":
+    case "plan-display":
+      return message.content.length;
+    case "tool":
+      return (
+        TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS +
+        estimateToolPayloadChars(message.args) +
+        estimateToolPayloadChars(message.result)
+      );
+    default:
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS;
+  }
+}
 
 export function computeWorkBundleInfos(
   messages: DisplayedMessage[]

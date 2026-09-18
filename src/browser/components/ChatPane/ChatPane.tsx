@@ -55,6 +55,7 @@ import {
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
+import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
@@ -118,6 +119,7 @@ import {
 import {
   computeOperationalBundleInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
@@ -453,6 +455,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Track which bash_output groups are expanded (keyed by first message ID)
   const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
 
+  // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
+  // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
+  // DOM instead of a one-shot requestAnimationFrame that would find nothing.
+  const [pendingScrollTarget, setPendingScrollTarget] = useState<{
+    workspaceId: string;
+    historyId: string;
+  } | null>(null);
+
   const [workBundleExpansionOverrides, setWorkBundleExpansionOverrides] = useState<
     Map<string, boolean>
   >(new Map());
@@ -484,7 +494,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
-  const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();
   const loadOlderMessagesShortcutLabel = formatKeybind(KEYBINDS.LOAD_OLDER_MESSAGES);
 
   const {
@@ -568,6 +577,29 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       }),
     [canInterrupt, deferredMessages, isStreamStarting, transcriptDensity]
   );
+
+  // Tail-first rendering: projections above are computed over the full array; only the
+  // mounted range starts at `revealFromIndex`. A cut is safe when the row is not inside a
+  // bundle or group (a head counts as safe), so bundles always mount whole.
+  const isSafeRevealCut = (index: number): boolean => {
+    const bashOutputGroup = bashOutputGroupInfos[index];
+    if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
+    const workBundle = workBundleInfos?.[index];
+    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    const operationalBundle = operationalBundleInfos?.[index];
+    return operationalBundle === undefined || operationalBundle.position === "head";
+  };
+  const { fromIndex: revealFromIndex, isFullyRevealed } = useBoundedTranscriptReveal({
+    workspaceId,
+    messages: deferredMessages,
+    isSafeCut: isSafeRevealCut,
+    rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+  });
+  const revealedMessages =
+    revealFromIndex === 0 ? deferredMessages : deferredMessages.slice(revealFromIndex);
+  // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
+  const shouldRenderLoadOlderMessagesButton =
+    hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
 
   // A tail propose_plan usually means the agent paused for user review; reveal only the
   // containing hyper-density bundles by default so historical plans stay collapsed.
@@ -690,6 +722,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
+    // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
+    if (targetIndex < revealFromIndex) {
+      return;
+    }
+
     const scrollContainer = contentRef.current;
     const targetElement = scrollContainer
       ? findTranscriptRevealElement(scrollContainer, pendingTimelineReveal)
@@ -714,6 +751,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
     pendingTimelineReveal,
+    revealFromIndex,
     workBundleExpansionOverrides,
     workBundleInfos,
     workspaceId,
@@ -767,17 +805,36 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     (historyId: string) => {
       // Disable auto-scroll so the navigation isn't undone by streaming content
       disableAutoScroll();
-      requestAnimationFrame(() => {
-        const scrollContainer = contentRef.current;
-        if (!scrollContainer) return;
-        findTranscriptMessageElement(scrollContainer, historyId)?.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
-      });
+      setPendingScrollTarget({ workspaceId, historyId });
     },
-    [contentRef, disableAutoScroll]
+    [disableAutoScroll, workspaceId]
   );
+
+  useEffect(() => {
+    if (pendingScrollTarget === null) return;
+    if (pendingScrollTarget.workspaceId !== workspaceId) {
+      setPendingScrollTarget(null);
+      return;
+    }
+    const scrollContainer = contentRef.current;
+    const target = scrollContainer
+      ? findTranscriptMessageElement(scrollContainer, pendingScrollTarget.historyId)
+      : undefined;
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingScrollTarget(null);
+      return;
+    }
+    // Not in the DOM: keep waiting only while the row exists below the reveal boundary. A
+    // row that is gone, or eligible but hidden inside a collapsed bundle, is dropped (the
+    // pre-reveal behavior for an unmounted target was a silent no-op too).
+    const targetIndex = deferredMessages.findIndex(
+      (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
+    );
+    if (targetIndex === -1 || targetIndex >= revealFromIndex) {
+      setPendingScrollTarget(null);
+    }
+  }, [contentRef, deferredMessages, pendingScrollTarget, revealFromIndex, workspaceId]);
 
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
@@ -1008,15 +1065,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!beginEditingMessage(buildEditingStateFromDisplayed(lastUserMessage))) return;
     disableAutoScroll(); // Show jump-to-bottom indicator
 
-    // Scroll to the message being edited
-    requestAnimationFrame(() => {
-      const scrollContainer = contentRef.current;
-      if (!scrollContainer) return;
-      findTranscriptMessageElement(scrollContainer, lastUserMessage.historyId)?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
-    });
+    // Scroll to the message being edited once it is mounted (see pendingScrollTarget).
+    setPendingScrollTarget({ workspaceId, historyId: lastUserMessage.historyId });
   };
 
   const handleEditLastUserMessageClick = () => {
@@ -1528,7 +1578,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         </TooltipIfPresent>
                       </div>
                     )}
-                    {deferredMessages.map((msg, index) => {
+                    {revealedMessages.map((msg, revealOffset) => {
+                      const index = revealFromIndex + revealOffset;
                       const workBundle = workBundleInfos?.[index];
                       const operationalBundle = workBundle
                         ? undefined
