@@ -2164,6 +2164,13 @@ export class TaskService implements AgentTaskIntegration {
       label: string;
       abandonPartial: boolean;
       clearQueue: boolean;
+      /**
+       * Live continuation handles captured in Phase A (see WorkspaceStopRecord.capturedExecutionId),
+       * interrupted here so their mirror settles: the stream stop below is a `system` abort, which
+       * never settles a workspace-turn handle (only a user abort does), so without this the record
+       * would wait for an execution settlement that never comes and hold the latch until restart.
+       */
+      capturedExecutionsById?: ReadonlyMap<string, { ownerWorkspaceId: string; handleId: string }>;
       onTimeout?: (workspaceId: string) => void;
     }
   ): Promise<void> {
@@ -2186,6 +2193,10 @@ export class TaskService implements AgentTaskIntegration {
           } catch (error: unknown) {
             log.debug(`${options.label}: clearQueue threw`, { taskId: id, error });
           }
+        }
+        const execution = options.capturedExecutionsById?.get(id);
+        if (execution != null) {
+          await this.interruptCapturedExecution(id, execution, options.label);
         }
         // Success is NOT stop confirmation (an accepted-but-PREPARING turn has no registered
         // stream yet); only the owner's settlement recorded on the stop record confirms.
@@ -2223,6 +2234,40 @@ export class TaskService implements AgentTaskIntegration {
         taskIds: targets,
       });
     }
+  }
+
+  /**
+   * Settle the continuation handle a stop record captured (a reawakened child executes under a
+   * WorkspaceTurnManager handle): interruptWorkspaceTurn persists the handle and its execution
+   * mirror terminal within one settlement boundary and drops the live registration, which is the
+   * authoritative execution settlement the record waits on (releaseRetainedStopLatches). Same
+   * pairing as the task_stop subtree stop (finishSubtreeStopCleanup): the owner's terminal wake
+   * for a handle the stop itself interrupted is suppressed. A failure leaves the record waiting
+   * (fail closed), exactly as an unsettled execution does today.
+   */
+  private async interruptCapturedExecution(
+    taskId: string,
+    execution: { ownerWorkspaceId: string; handleId: string },
+    label: string
+  ): Promise<void> {
+    const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
+      execution.ownerWorkspaceId,
+      execution.handleId,
+      { scheduleQueueDrain: false }
+    );
+    if (!interrupted.success) {
+      log.warn(`${label}: interruptWorkspaceTurn failed for the captured execution`, {
+        taskId,
+        handleId: execution.handleId,
+        error: interrupted.error,
+      });
+      return;
+    }
+    await this.suppressTerminalAttention({
+      ownerWorkspaceId: execution.ownerWorkspaceId,
+      sourceKind: "workspace_turn",
+      sourceId: execution.handleId,
+    });
   }
 
   /**
@@ -8266,6 +8311,10 @@ export class TaskService implements AgentTaskIntegration {
 
     const interruptedTaskIds: string[] = [];
     const latched: string[] = [];
+    const capturedExecutionsById = new Map<
+      string,
+      { ownerWorkspaceId: string; handleId: string }
+    >();
 
     // Phase A (global mutex, config writes only — no stream or network awaits): snapshot the
     // subtree, latch every descendant with its captured owner, persist terminal statuses and
@@ -8302,8 +8351,20 @@ export class TaskService implements AgentTaskIntegration {
       // baseline and could wake a cousin or the root after Stop. Each latch holds until the
       // captured owner settles and the descendant's cleanup finishes (recheckWorkspaceStopRelease).
       for (const id of descendants) {
-        this.beginWorkspaceStop(id);
+        const record = this.beginWorkspaceStop(id);
         latched.push(id);
+        // A reawakened child's live continuation handle is an owner this record waits on; Phase B
+        // must settle it explicitly (interruptCapturedExecution). Captured here, in the same
+        // synchronous block as the record, so Phase B targets exactly the registration captured.
+        if (record.capturedExecutionId != null && !record.executionSettled) {
+          const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id);
+          if (live?.handleId === record.capturedExecutionId) {
+            capturedExecutionsById.set(id, {
+              ownerWorkspaceId: live.ownerWorkspaceId,
+              handleId: live.handleId,
+            });
+          }
+        }
       }
       for (const id of descendants) {
         try {
@@ -8368,6 +8429,7 @@ export class TaskService implements AgentTaskIntegration {
           label: "terminateAllDescendantAgentTasks",
           abandonPartial: false,
           clearQueue: true,
+          capturedExecutionsById,
         });
       }
     }

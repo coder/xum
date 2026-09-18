@@ -62,7 +62,13 @@ interface Internals {
   admittedSendsByTaskId: Map<string, Set<{ state: string; turnId?: symbol; attemptId: string }>>;
   workspaceStopRecords: Map<
     string,
-    { capturedTurns: Set<symbol>; pendingAdmissions: Set<unknown>; cleanupInFlight: number }
+    {
+      capturedTurns: Set<symbol>;
+      pendingAdmissions: Set<unknown>;
+      cleanupInFlight: number;
+      capturedExecutionId: string | undefined;
+      executionSettled: boolean;
+    }
   >;
   currentAttemptIdByTaskId: Map<string, string>;
   markTaskLaunchFailed: (taskId: string, message: string) => Promise<void>;
@@ -213,6 +219,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
   async function settle(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  /** Bounded wait for work that owns its own completion (a cleanup that outlived its deadline). */
+  async function waitForCondition(condition: () => boolean): Promise<void> {
+    for (let i = 0; i < 200 && !condition(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(condition()).toBe(true);
   }
 
   const entryOf = (config: Config, id: string) => findWorkspaceInConfig(config, id);
@@ -1075,6 +1089,98 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // A user reawaken mints a fresh id and reopens admission.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(attemptId);
+      const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+      expect(fresh.kind).toBe("admitted");
+      if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");
+    });
+
+    test("a parent Stop cascade settles a reactivation-owned continuation: the captured execution is interrupted and the latch drops once its turn settles", async () => {
+      // Remote UAT (round 3, criterion 6): a parent hard Stop landing on a child reawakened via
+      // task_send_message (reactivation → WorkspaceTurnManager continuation) held the child's stop
+      // latch until restart. The cascade's stream stop is a "system" abort, which never settles a
+      // live continuation handle, so the record's captured execution never read settled.
+      const taskId = "cascade-reactivated";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "interrupted", taskAttemptId: "att_0000000000000901" },
+        },
+      ]);
+      const turn = Symbol("reactivated-turn");
+      let activeTurn: symbol | undefined;
+      const harness: { taskService?: TaskService } = {};
+      const stopStream = mock(
+        (_id: string): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+      );
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const host = hostWithTurnEvents({
+        getActiveTurnGeneration: mock(() => activeTurn),
+        // The real WorkspaceService accepts the continuation prompt (live handle → running
+        // mirror), mints the task-attempt obligation at its handoff and reports the admitted
+        // streaming generation; the fake host does the same for the reactivation send.
+        sendMessage: mock(
+          async (
+            ...args: Parameters<WorkspaceHost["sendMessage"]>
+          ): ReturnType<WorkspaceHost["sendMessage"]> => {
+            await args[3]?.onAccepted?.();
+            const token = admitted(
+              harness.taskService!.admitTaskWorkspaceTurn(args[0], {
+                acceptanceOrigin: "automatic",
+              })
+            );
+            token.onAdmitted(turn);
+            activeTurn = turn;
+            return Ok(undefined);
+          }
+        ),
+      });
+      const { taskService } = createHarness(config, {
+        aiService,
+        workspaceService: host.workspaceService,
+      });
+      harness.taskService = taskService;
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+
+      const reactivated = await taskService.sendMessageToDescendantAgentTask(
+        rootId,
+        taskId,
+        "continue",
+        "tool-end"
+      );
+      expect(reactivated).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+      expect(svc.ownedAttemptByTaskId.get(taskId)?.source).toBe("reactivation");
+      const reactivatedEntry = entryOf(config, taskId);
+      const handleId = reactivatedEntry?.taskExecutionId;
+      expect(handleId).toMatch(/^wst_/);
+      expect(reactivatedEntry?.taskExecutionStatus).toBe("running");
+
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      const record = svc.workspaceStopRecords.get(taskId)!;
+      expect(record.capturedExecutionId).toBe(handleId);
+      // The shortened deadlines let the cascade return while its cleanup (handle interrupt +
+      // stream stop) is still in flight; ownership stays with that cleanup, so wait for it.
+      await waitForCondition(() => record.cleanupInFlight === 0);
+      // The cascade itself settles the execution it captured: handle + mirror read interrupted
+      // and the live registration is gone, so the stop is admission-visible.
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskExecutionId: handleId,
+        taskExecutionStatus: "interrupted",
+      });
+      expect(record.executionSettled).toBe(true);
+      // Only the streaming generation is still owed; its settlement releases the latch.
+      expect(record.capturedTurns.has(turn)).toBe(true);
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+      activeTurn = undefined;
+      host.settleTurn(taskId, turn);
+      await settle();
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+      // The stop is not permanent: a later reawaken mints a fresh id and is admitted again.
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
       expect(fresh.kind).toBe("admitted");
       if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");

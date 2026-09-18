@@ -29564,7 +29564,7 @@ describe("TaskService", () => {
     );
   });
 
-  test("unconfirmed stream stop retains the latch for a completed descendant with live execution", async () => {
+  test("unconfirmed stream stop retains the latch for a completed descendant whose live execution the cascade could not settle", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -29602,9 +29602,19 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    // The cascade settles the captured live execution itself (interruptCapturedExecution); this
+    // models the fail-closed case where that explicit interrupt fails, so the record keeps
+    // waiting for an authoritative settlement — the release mechanics under test.
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
 
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    expect(interruptSpy.mock.calls[0].slice(0, 2)).toEqual(["tree-root", "wst_leaf"]);
+    interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
     // User resume clears the level-triggered suppression; only the retained latch refuses.
@@ -29656,7 +29666,7 @@ describe("TaskService", () => {
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
-  test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution", async () => {
+  test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution the cascade could not settle", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -29690,9 +29700,17 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    // See the unconfirmed-stop test above: the cascade's own explicit interrupt of the captured
+    // execution fails here, leaving the record waiting for an authoritative settlement.
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
 
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
     const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
@@ -29751,9 +29769,16 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
 
-    // Establish a retained latch (accepted-but-unsettled live execution under a hard stop).
+    // Establish a retained latch (accepted-but-unsettled live execution under a hard stop whose
+    // own explicit interrupt of that execution failed; see the unconfirmed-stop test).
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    interruptSpy.mockRestore();
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
       activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
@@ -29793,6 +29818,70 @@ describe("TaskService", () => {
       })
     );
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("a parent Stop cascade settles a completed descendant's live continuation itself and releases the latch", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Reawakened completed child under an ancestor-owned continuation: its stable status is
+        // preserved, so only the execution mirror can carry the stop.
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { aiService, stopStream } = createAIServiceMocks(config);
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+
+    // The cascade's stream stop is a "system" abort, which never settles a continuation handle,
+    // so the cascade interrupts the captured execution explicitly: handle and mirror read
+    // interrupted, the live registration is gone, and the stream stop still ran for the child.
+    expect(findWorkspaceInConfig(config, "leaf-a")).toMatchObject({
+      taskStatus: "reported",
+      taskExecutionId: "wst_leaf",
+      taskExecutionStatus: "interrupted",
+    });
+    expect(await workspaceTurnSnapshot(taskService, "tree-root", "wst_leaf")).toMatchObject({
+      status: "interrupted",
+    });
+    const internals = taskService as unknown as {
+      workspaceStopsInProgress: Map<string, number>;
+      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
+    };
+    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.has("leaf-a")).toBe(false);
+    expect(stopStream).toHaveBeenCalledWith(
+      "leaf-a",
+      expect.objectContaining({ abandonPartial: false })
+    );
+    // No owner left to settle: the latch releases with the cascade instead of at restart.
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    // The owner's terminal wake for the handle its own Stop interrupted is suppressed (same as
+    // task_stop), so a restart cannot resurrect it as a wake-up.
+    const attention = await new TerminalAttentionStore(config).get(
+      "tree-root",
+      TerminalAttentionStore.notificationId("workspace_turn", "wst_leaf")
+    );
+    expect(attention).toMatchObject({ terminalOutcome: "interrupted", status: "superseded" });
   });
 
   test("park-after-settlement race releases the latch on already-settled evidence", async () => {
