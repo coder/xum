@@ -38,6 +38,7 @@ import {
 } from "@/browser/utils/policyUi";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
+import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -223,6 +224,7 @@ interface InternalSendOverrides extends SendOverrides {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
+  const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const policyState = usePolicy();
   const effectivePolicy =
     policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
@@ -2148,6 +2150,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         const sendOptions = preparedMessage.options;
         const effectiveModel = preparedMessage.effectiveModel;
         const sentReviewIds = preparedMessage.sentReviewIds;
+
+        // The backend reads this model's auto-compaction threshold from persisted user
+        // preferences when the stream starts, and the slider write reaches config.json
+        // asynchronously. Wait for the backend to accept that write so a send right after a
+        // slider change is not ordered ahead of it; a rejected save refuses the send visibly
+        // and leaves the draft untouched. (Config swallows disk-write failures for every
+        // preference today, so acceptance is ordering, not durability.)
+        try {
+          await waitForPreferencePersisted(
+            { kind: "autoCompactionThreshold", model: effectiveModel },
+            resolutionSignal
+          );
+        } catch (error) {
+          if (!isSendScopeCurrent()) return;
+          setToast(
+            createErrorToast({
+              type: "unknown",
+              raw: error instanceof Error ? error.message : "Settings could not be saved",
+            })
+          );
+          return;
+        }
+        if (!isSendScopeCurrent()) return;
 
         if (editMessageForSend) {
           setOptimisticallyDismissedEditId(editMessageForSend.id);

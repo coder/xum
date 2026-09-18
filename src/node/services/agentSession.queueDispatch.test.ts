@@ -1832,8 +1832,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }),
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
-      setThreshold: () => undefined,
-      getThreshold: () => 0.85,
     } as unknown as CompactionMonitor;
 
     try {

@@ -17,7 +17,9 @@ import { SummarizeStrategy } from "./strategies/summarize";
 import { resolveContextStrategy } from "./selection";
 import type { StreamContextSnapshot, ContextResetReason } from "./types";
 import { CompactionHandler } from "../compactionHandler";
+import type { Config } from "@/node/config";
 import { CompactionMonitor } from "../compactionMonitor";
+import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 import type { ContextManagementDependencies } from "./contextManagementService";
 import type { SessionContextHost } from "./sessionContextHost";
 
@@ -43,7 +45,9 @@ export class SessionContextController {
 
   constructor(
     private readonly deps: ContextManagementDependencies,
-    private readonly host: SessionContextHost
+    private readonly host: SessionContextHost,
+    /** Lets the owning service stop fanning config changes out to a disposed controller. */
+    private readonly onDisposed?: () => void
   ) {
     this.transitionalCompactionHandler = new CompactionHandler({
       workspaceId: host.workspaceId,
@@ -71,19 +75,32 @@ export class SessionContextController {
       deps,
       host,
       this.transitionalCompactionHandler,
-      this.compactionMonitor
+      this.compactionMonitor,
+      (model) => this.autoCompactionThreshold(model)
     );
     this.summarize = new SummarizeStrategy(host, this.continuous);
   }
 
-  get autoCompactionThreshold(): number {
-    return this.compactionMonitor.getThreshold();
+  /** Persisted preferences changed (shared listener in ContextManagementService). */
+  onPersistedPreferencesChanged(): void {
+    if (this.host.coordinator.disposed) return;
+    this.continuous.onPersistedThresholdMaybeChanged();
   }
 
-  setAutoCompactionThreshold(threshold: number): void {
-    const previous = this.autoCompactionThreshold;
-    this.compactionMonitor.setThreshold(threshold);
-    if (previous !== threshold) this.continuous.continuousCompactor.reset("threshold-changed");
+  /**
+   * Auto-compaction threshold for one decision, resolved fresh from the persisted user
+   * preferences (`config.json`). Callers resolve once per decision and thread the value; the
+   * controller never caches it, so a slider change is honored by the next decision.
+   */
+  autoCompactionThreshold(model: string): number {
+    const maybeConfig = this.deps.config as Config & {
+      loadConfigOrDefault?: () => ReturnType<Config["loadConfigOrDefault"]> | null;
+    };
+    const preferences =
+      typeof maybeConfig.loadConfigOrDefault === "function"
+        ? maybeConfig.loadConfigOrDefault()?.userPreferences
+        : undefined;
+    return resolveAutoCompactionThreshold(preferences, model);
   }
 
   onStreamStarting(): void {
@@ -111,6 +128,7 @@ export class SessionContextController {
     this.continuous.continuousCompactor.reset("shutdown");
   }
   dispose(): void {
+    this.onDisposed?.();
     this.continuous.continuousCompactor.reset("dispose");
   }
   isApplying(): boolean {
@@ -193,9 +211,12 @@ export class SessionContextController {
     const streamContext = input.stream;
     const streamOptions = streamContext?.options;
     if (streamContext?.modelString !== modelForUsage) return;
+    // One threshold per usage decision: shared by the continuous context and the mid-stream check.
+    const threshold = this.autoCompactionThreshold(modelForUsage);
     const continuousContext = this.continuous.getContinuousCompactionContext(
       modelForUsage,
-      streamOptions
+      streamOptions,
+      threshold
     );
     const usagePercent =
       continuousContext.contextWindowTokens > 0
@@ -236,6 +257,7 @@ export class SessionContextController {
     if (this.host.state.stream !== streamContext) return;
     const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
       model: modelForUsage,
+      threshold,
       usage: input.usage,
       use1MContext: isAnthropic1MEffectivelyEnabled(
         modelForUsage,
@@ -257,8 +279,12 @@ export class SessionContextController {
     const providersConfigForCompaction = this.host.state.providersConfig;
     // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
     if (await this.recover()) this.host.transitionContextState("invalidate");
+    // One threshold per admission decision: resolved from persisted preferences here and
+    // threaded through the pressure check, the continuous context and the compact-first gate.
+    const threshold = this.autoCompactionThreshold(modelForStream);
     const compactionResult = this.compactionMonitor.checkBeforeSend({
       model: modelForStream,
+      threshold,
       usage: this.host.state.usage,
       use1MContext: isAnthropic1MEffectivelyEnabled(
         modelForStream,
@@ -271,7 +297,8 @@ export class SessionContextController {
 
     const continuousContext = this.continuous.getContinuousCompactionContext(
       modelForStream,
-      optionsForStream
+      optionsForStream,
+      threshold
     );
     if (!continuousContext.enabled) this.reset("disabled");
     const continuousResult = continuousContext.enabled
@@ -286,7 +313,7 @@ export class SessionContextController {
     // A staged fold needs no compact turn. Without one, the experiment waits
     // until the force threshold; the legacy path retains its on-send threshold.
     const shouldCompactBeforeSend =
-      this.autoCompactionThreshold < 1 &&
+      threshold < 1 &&
       (continuousContext.enabled
         ? continuousResult === "fallback" && compactionResult.shouldForceCompact
         : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);

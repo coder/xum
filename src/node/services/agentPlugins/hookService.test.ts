@@ -591,7 +591,6 @@ describe("AgentPluginHookService", () => {
           contextUsage: { inputTokens: 120000, outputTokens: 10, totalTokens: 120010 },
         }),
       ]);
-      h.session.setAutoCompactionThreshold(0.7);
       expect(eventSpine.hasMiddleware("request.assemble")).toBe(false);
       expect(
         (

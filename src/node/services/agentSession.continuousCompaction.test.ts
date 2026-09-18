@@ -21,6 +21,7 @@ import type { AgentSession } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  seedAutoCompactionThreshold,
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
@@ -112,7 +113,6 @@ describe("AgentSession continuous compaction wiring", () => {
 
   async function setup(usagePercent = 0) {
     harness = await createAgentSessionHarness({ workspaceId, captureEvents: true });
-    harness.session.setAutoCompactionThreshold(0.7);
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
         workspaceId,
@@ -225,7 +225,9 @@ describe("AgentSession continuous compaction wiring", () => {
             // Physical ownership must leave normal turn admission and semantic idle intact.
             expect(coordinator.phase).toBe("idle");
             expect(coordinator.admissionBlocked).toBe(false);
-            if (outcome === "reset") h.session.setAutoCompactionThreshold(0.8);
+            // These jobs bypass the session's context builder, so trigger the reset the
+            // persisted-threshold listener would issue.
+            if (outcome === "reset") compactor.reset("threshold-changed");
             if (outcome === "shutdown") {
               h.session.beginShutdown();
               shutdown = h.session.finishShutdown();
@@ -260,13 +262,13 @@ describe("AgentSession continuous compaction wiring", () => {
     }
 
     test("reset permits replacement work without releasing either job's physical ownership", async () => {
-      const { h, deps, releases, start } = await setupEager();
+      const { h, compactor, deps, releases, start } = await setupEager();
       const first = deferred<void>();
       const second = deferred<void>();
       let preparations = 0;
       deps.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
       const original = await start();
-      h.session.setAutoCompactionThreshold(0.8);
+      compactor.reset("threshold-changed");
       const replacement = await start();
       try {
         expect(releases).toHaveLength(2);
@@ -377,7 +379,7 @@ describe("AgentSession continuous compaction wiring", () => {
     const journal = await store.write(swap.journal, swap.prefix, () => true);
     assert(journal, "Expected durable swap journal");
     swap.consumed = true;
-    if (mode === "threshold-terminal") h.session.setAutoCompactionThreshold(1);
+    if (mode === "threshold-terminal") compactor.reset("threshold-changed");
     if (mode === "disabled-terminal") compactor.reset("disabled");
     if (mode === "disabled-usage-terminal") {
       internals(h.session).activeStreamContext = {
@@ -735,7 +737,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("threshold 100 disables both automatic strategies even above the context limit", async () => {
     const h = await setup(110);
-    h.session.setAutoCompactionThreshold(1);
+    await seedAutoCompactionThreshold(h.config, model, 100);
     const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
     expect((await h.session.sendMessage("New work", sendOptions)).success).toBe(true);
     expect(observe).not.toHaveBeenCalled();
@@ -744,13 +746,26 @@ describe("AgentSession continuous compaction wiring", () => {
     ).toBe(false);
   });
 
-  test("resyncing an unchanged threshold preserves staged work", async () => {
+  test("a persisted threshold change resets the compactor only for its model", async () => {
     const h = await setup();
+    // The send builds the continuous-compaction context, which pins the model the listener
+    // compares against.
+    expect((await h.session.sendMessage("New work", sendOptions)).success).toBe(true);
     const reset = spyOn(continuous(h.session).continuousCompactor, "reset");
-    h.session.setAutoCompactionThreshold(0.7);
+    // Unchanged value re-saved: the fold stays staged.
+    await seedAutoCompactionThreshold(h.config, model, 70);
     expect(reset).not.toHaveBeenCalled();
-    h.session.setAutoCompactionThreshold(0.8);
+    // Another model's slider: unrelated to this compactor.
+    await seedAutoCompactionThreshold(h.config, "anthropic:claude-sonnet-4-5", 40);
+    expect(reset).not.toHaveBeenCalled();
+    await seedAutoCompactionThreshold(h.config, model, 80);
     expect(reset).toHaveBeenCalledTimes(1);
+    expect(reset).toHaveBeenLastCalledWith("threshold-changed");
+    // The listener is detached on dispose: later config writes no longer reach the compactor.
+    await h.session.dispose();
+    reset.mockClear();
+    await seedAutoCompactionThreshold(h.config, model, 90);
+    expect(reset).not.toHaveBeenCalledWith("threshold-changed");
   });
 
   function startStream(h: AgentSessionHarness) {
