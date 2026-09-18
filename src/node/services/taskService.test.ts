@@ -13474,6 +13474,84 @@ describe("TaskService", () => {
   });
 
   describe("listInstanceWorkspaces", () => {
+    test.each([undefined, null, "", " padded ", 42])(
+      "filters unrelated recipients without valid consent (%j) before disclosure and activity",
+      async (consent) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "public-project");
+        const privatePath = path.join(rootDir, "private-project");
+        const hidden = projectWorkspace(privatePath, "private-name", "private-id", {
+          title: "Private title",
+          createdAt: "2026-09-18T12:00:00Z",
+        });
+        Object.assign(hidden, { unrelatedWorkspaceConsent: consent });
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            projectWorkspace(projectPath, "caller", "caller"),
+            projectWorkspace(projectPath, "visible", "visible", {
+              unrelatedWorkspaceConsent: "visible-consent",
+              createdAt: "2026-09-18T11:00:00Z",
+            }),
+          ],
+          { extraProjects: [[privatePath, { workspaces: [hidden] }]] }
+        );
+        const isBusyForMessage = mock((_workspaceId: string) => false);
+        const isStreaming = mock((_workspaceId: string) => false);
+        const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
+        const { aiService } = createAIServiceMocks(config, { isStreaming });
+        const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+        const first = taskService.listInstanceWorkspaces("caller", { limit: 1 });
+        expect(first.rows.map((row) => row.workspaceId)).toEqual(["visible"]);
+        expect(first.totalMatching).toBe(2);
+        expect(first.nextOffset).toBe(1);
+        const second = taskService.listInstanceWorkspaces("caller", { limit: 1, offset: 1 });
+        // The caller never opted in: same-tree discovery is not a grant to unrelated callers.
+        expect(second.rows.map((row) => row.workspaceId)).toEqual(["caller"]);
+        expect(second.nextOffset).toBeUndefined();
+        for (const query of ["private-id", "private-name", "Private title", privatePath]) {
+          expect(taskService.listInstanceWorkspaces("caller", { query })).toEqual({
+            rows: [],
+            totalMatching: 0,
+          });
+        }
+        expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual(["visible", "caller"]);
+        expect(isStreaming.mock.calls.map(([id]) => id)).toEqual(["visible", "caller"]);
+
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "private-id");
+          assert(entry);
+          entry.workspace.unrelatedWorkspaceConsent = "new-consent";
+          return cfg;
+        });
+        expect(
+          taskService.listInstanceWorkspaces("caller", { query: privatePath }).rows
+        ).toMatchObject([{ workspaceId: "private-id", projectPath: privatePath }]);
+        await config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "private-id");
+          assert(entry);
+          delete entry.workspace.unrelatedWorkspaceConsent;
+          return cfg;
+        });
+        expect(taskService.listInstanceWorkspaces("caller", { query: privatePath })).toEqual({
+          rows: [],
+          totalMatching: 0,
+        });
+        expect(isBusyForMessage.mock.calls.map(([id]) => id)).toEqual([
+          "visible",
+          "caller",
+          "private-id",
+        ]);
+      }
+    );
+
+    // These existing availability/runtime cases start from explicitly consented recipients.
+    function optedInWorkspace(...args: Parameters<typeof projectWorkspace>) {
+      return { ...projectWorkspace(...args), unrelatedWorkspaceConsent: "discovery-test-consent" };
+    }
+
     const nonLocalRuntimes = [
       { label: "ssh", runtimeConfig: { type: "ssh", host: "remote.example", srcBaseDir: "~/src" } },
       {
@@ -13502,8 +13580,8 @@ describe("TaskService", () => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "repo");
         await saveWorkspaces(config, projectPath, [
-          projectWorkspace(projectPath, "local-root", "local-root"),
-          projectWorkspace(projectPath, "caller", "caller", {
+          optedInWorkspace(projectPath, "local-root", "local-root"),
+          optedInWorkspace(projectPath, "caller", "caller", {
             runtimeConfig,
             ...(isChild ? { parentWorkspaceId: "local-root", taskStatus: "running" } : {}),
           }),
@@ -13528,19 +13606,19 @@ describe("TaskService", () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(config, projectPath, [
-        projectWorkspace(projectPath, "default", "a-default"),
-        projectWorkspace(projectPath, "local", "b-local", { runtimeConfig: { type: "local" } }),
-        projectWorkspace(projectPath, "legacy-local", "c-legacy", {
+        optedInWorkspace(projectPath, "default", "a-default"),
+        optedInWorkspace(projectPath, "local", "b-local", { runtimeConfig: { type: "local" } }),
+        optedInWorkspace(projectPath, "legacy-local", "c-legacy", {
           runtimeConfig: { type: "local", srcBaseDir: "~/src" },
         }),
-        projectWorkspace(projectPath, "worktree", "d-worktree", {
+        optedInWorkspace(projectPath, "worktree", "d-worktree", {
           runtimeConfig: { type: "worktree", srcBaseDir: "~/src" },
         }),
         ...nonLocalRuntimes.map(({ label, runtimeConfig }) =>
-          projectWorkspace(projectPath, `remote-${label}`, `remote-${label}`, { runtimeConfig })
+          optedInWorkspace(projectPath, `remote-${label}`, `remote-${label}`, { runtimeConfig })
         ),
         // Missing inline identity can defer runtime resolution to legacy session metadata.
-        { ...projectWorkspace(projectPath, "partial", "partial"), name: undefined },
+        { ...optedInWorkspace(projectPath, "partial", "partial"), name: undefined },
       ]);
       const legacyDir = path.join(config.sessionsDir, "partial");
       await fsPromises.mkdir(legacyDir, { recursive: true });
@@ -13599,7 +13677,7 @@ describe("TaskService", () => {
         config,
         projectPath,
         ["available", "stopped", "stopping", "pending", "accepted"].map((id) =>
-          projectWorkspace(projectPath, id, id)
+          optedInWorkspace(projectPath, id, id)
         )
       );
       const isBusyForMessage = mock(() => false);
@@ -13634,20 +13712,20 @@ describe("TaskService", () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(config, projectPath, [
-        projectWorkspace(projectPath, "root", "root"),
-        projectWorkspace(projectPath, "other", "other"),
-        projectWorkspace(projectPath, "candidate", "candidate", {
+        optedInWorkspace(projectPath, "root", "root"),
+        optedInWorkspace(projectPath, "other", "other"),
+        optedInWorkspace(projectPath, "candidate", "candidate", {
           parentWorkspaceId: "root",
           bestOf: { groupId: "group", index: 0, total: 2 },
         }),
-        projectWorkspace(projectPath, "candidate-child", "candidate-child", {
+        optedInWorkspace(projectPath, "candidate-child", "candidate-child", {
           parentWorkspaceId: "candidate",
         }),
-        projectWorkspace(projectPath, "workflow", "workflow", {
+        optedInWorkspace(projectPath, "workflow", "workflow", {
           parentWorkspaceId: "root",
           workflowTask: { runId: "wfr_instance", stepId: "step" },
         }),
-        projectWorkspace(projectPath, "workflow-child", "workflow-child", {
+        optedInWorkspace(projectPath, "workflow-child", "workflow-child", {
           parentWorkspaceId: "workflow",
         }),
       ]);
@@ -13672,12 +13750,12 @@ describe("TaskService", () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(config, projectPath, [
-        projectWorkspace(projectPath, "missing", "missing"),
-        projectWorkspace(projectPath, "tie-b", "tie-b", { createdAt: "2026-01-01T00:00:00Z" }),
-        projectWorkspace(projectPath, "invalid", "invalid", { createdAt: "not-a-date" }),
-        projectWorkspace(projectPath, "oldest", "oldest", { createdAt: "1960-01-01T00:00:00Z" }),
-        projectWorkspace(projectPath, "newest", "newest", { createdAt: "2026-02-01T00:00:00Z" }),
-        projectWorkspace(projectPath, "tie-a", "tie-a", { createdAt: "2026-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "missing", "missing"),
+        optedInWorkspace(projectPath, "tie-b", "tie-b", { createdAt: "2026-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "invalid", "invalid", { createdAt: "not-a-date" }),
+        optedInWorkspace(projectPath, "oldest", "oldest", { createdAt: "1960-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "newest", "newest", { createdAt: "2026-02-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "tie-a", "tie-a", { createdAt: "2026-01-01T00:00:00Z" }),
       ]);
       const { workspaceService } = createWorkspaceServiceMocks({
         isBusyForMessage: mock((id: string) => id === "missing"),
@@ -13717,9 +13795,9 @@ describe("TaskService", () => {
         const config = await createTestConfig(rootDir);
         const projectPath = path.join(rootDir, "Project-Alpha");
         await saveWorkspaces(config, projectPath, [
-          projectWorkspace(projectPath, "feature/plan", "alpha-id", { title: "Planner" }),
-          projectWorkspace(projectPath, "feature/exec", "beta-id", { title: "Implementer" }),
-          projectWorkspace(projectPath, "hidden", "archived", {
+          optedInWorkspace(projectPath, "feature/plan", "alpha-id", { title: "Planner" }),
+          optedInWorkspace(projectPath, "feature/exec", "beta-id", { title: "Implementer" }),
+          optedInWorkspace(projectPath, "hidden", "archived", {
             title: "Implementer",
             archivedAt: "2026-01-01T00:00:00Z",
           }),
@@ -13737,7 +13815,7 @@ describe("TaskService", () => {
         const config = await createTestConfig(rootDir);
         const primaryPath = path.join(rootDir, "Primary-Project");
         const bucket = kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : MULTI_PROJECT_CONFIG_KEY;
-        const workspace = projectWorkspace(rootDir, "managed-root", "root", {
+        const workspace = optedInWorkspace(rootDir, "managed-root", "root", {
           runtimeConfig: { type: "local" },
           ...(kind === "scratch"
             ? { kind: "scratch" as const }
@@ -13763,11 +13841,11 @@ describe("TaskService", () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(config, projectPath, [
-        projectWorkspace(projectPath, "hidden", "a", { archivedAt: "2026-01-01T00:00:00Z" }),
-        projectWorkspace(projectPath, "unmatched", "b"),
-        projectWorkspace(projectPath, "match", "c"),
-        projectWorkspace(projectPath, "match", "d"),
-        projectWorkspace(projectPath, "match", "e"),
+        optedInWorkspace(projectPath, "hidden", "a", { archivedAt: "2026-01-01T00:00:00Z" }),
+        optedInWorkspace(projectPath, "unmatched", "b"),
+        optedInWorkspace(projectPath, "match", "c"),
+        optedInWorkspace(projectPath, "match", "d"),
+        optedInWorkspace(projectPath, "match", "e"),
       ]);
       const { taskService } = createTaskServiceHarness(config);
       const first = taskService.listInstanceWorkspaces("c", { query: "match", limit: 2 });
@@ -13803,7 +13881,7 @@ describe("TaskService", () => {
             {
               workspaces: Array.from({ length: 20 }, (_, index) => {
                 const id = project * 20 + index;
-                return projectWorkspace(projectPath, `root-${id}`, `root-${id}`, {
+                return optedInWorkspace(projectPath, `root-${id}`, `root-${id}`, {
                   createdAt: new Date(Date.UTC(2026, 0, 1, 0, id)).toISOString(),
                 });
               }),
@@ -13894,15 +13972,15 @@ describe("TaskService", () => {
         config,
         firstProject,
         [
-          projectWorkspace(firstProject, "planner", "root-a", { title: "Planner" }),
-          projectWorkspace(firstProject, "child", "child-a", {
+          optedInWorkspace(firstProject, "planner", "root-a", { title: "Planner" }),
+          optedInWorkspace(firstProject, "child", "child-a", {
             parentWorkspaceId: "root-a",
             taskStatus: "running",
           }),
-          projectWorkspace(firstProject, "archived", "archived", {
+          optedInWorkspace(firstProject, "archived", "archived", {
             archivedAt: "2026-09-01T00:00:00Z",
           }),
-          projectWorkspace(firstProject, "no-id", ""),
+          optedInWorkspace(firstProject, "no-id", ""),
         ],
         {
           extraProjects: [
@@ -13910,10 +13988,10 @@ describe("TaskService", () => {
               secondProject,
               {
                 workspaces: [
-                  projectWorkspace(secondProject, "implementer", "root-b", {
+                  optedInWorkspace(secondProject, "implementer", "root-b", {
                     title: "Implementer",
                   }),
-                  projectWorkspace(secondProject, "foreign-child", "child-b", {
+                  optedInWorkspace(secondProject, "foreign-child", "child-b", {
                     parentWorkspaceId: "root-b",
                     taskStatus: "running",
                   }),

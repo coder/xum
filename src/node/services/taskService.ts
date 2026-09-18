@@ -11476,6 +11476,9 @@ export class TaskService implements AgentTaskIntegration {
           id == null ||
           id.trim().length === 0 ||
           workspace.parentWorkspaceId ||
+          // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
+          (id !== callerRoot &&
+            getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
           !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
