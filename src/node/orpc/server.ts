@@ -43,6 +43,9 @@ import {
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getXumHome } from "@/common/constants/paths";
+import { resolveHealthResponse } from "@/node/orpc/healthProbe";
+import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
 import { escapeHtml } from "@/node/utils/oauthUtils";
 import type { Result } from "@/common/types/result";
 import {
@@ -879,6 +882,15 @@ export async function createOrpcServer({
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ extended: false }));
 
+  // Health check. Must be registered ahead of express.static: serve-static stats
+  // "<staticDir>/health" on every request before falling through, so a wedged libuv threadpool
+  // used to hang this route before it could answer. Probe the fs on purpose instead, bounded,
+  // against the directory the server actually depends on, and report a stalled pool as 503.
+  app.get("/health", async (_req, res) => {
+    const health = await resolveHealthResponse(fs.stat(getXumHome()), HEALTH_FS_PROBE_TIMEOUT_MS);
+    res.status(health.statusCode).json(health.body);
+  });
+
   let rawSpaIndexHtml: string | null = null;
 
   // Static file serving (optional)
@@ -898,11 +910,6 @@ export async function createOrpcServer({
       serveStaticAssets(req, res, next);
     });
   }
-
-  // Health check endpoint
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok" });
-  });
 
   // Version endpoint
   app.get("/version", (_req, res) => {
