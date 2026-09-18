@@ -111,6 +111,21 @@ describe("estimateTranscriptRowWeight", () => {
       50_000 - marker.error.length
     );
   });
+
+  test("charges tool payload nested inside result wrappers, not only top-level strings", () => {
+    const base = tool({ id: "t1", historyId: "h-t1", timestamp: 1 });
+    const wrapped = {
+      ...base,
+      result: { type: "json", value: { content: [{ type: "text", text: "y".repeat(40_000) }] } },
+    } as DisplayedMessage;
+    const flat = { ...base, result: "y".repeat(40_000) } as DisplayedMessage;
+    // A `{ type: "json", value }` result is serialized in full by an expanded card, so it must
+    // weigh like the same text delivered as a plain string.
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(40_000);
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(
+      estimateTranscriptRowWeight(flat)
+    );
+  });
 });
 
 describe("work bundle coalescing", () => {

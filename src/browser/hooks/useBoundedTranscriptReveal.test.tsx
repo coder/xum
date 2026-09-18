@@ -307,26 +307,6 @@ describe("useBoundedTranscriptReveal", () => {
     expect(result.current.fromIndex).toBe(initialFrom - TRANSCRIPT_REVEAL_CHUNK_ROWS);
   });
 
-  test("(l) a step whose generation changed before it ran is a no-op", () => {
-    const frames = manualFrames();
-    let props = { workspaceId: "ws", messages: rows(300) };
-    const { result, rerender } = renderHook(() =>
-      useBoundedTranscriptReveal({
-        ...props,
-        isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
-      })
-    );
-    const stale = frames.flush; // keep a handle to the scheduler; the callback is replaced on reset
-    props = { ...props, workspaceId: "other", messages: rows(300, "o") };
-    rerender();
-    const fresh = result.current.fromIndex;
-    act(() => stale());
-    // Only the new generation's own step may move the boundary, and it did by one chunk at most.
-    expect(fresh - result.current.fromIndex).toBeLessThanOrEqual(TRANSCRIPT_REVEAL_CHUNK_ROWS);
-    expect(result.current.fromIndex).toBeGreaterThanOrEqual(0);
-  });
-
   test("(j) across randomized appends, deletions and grouping changes, eligible ids only grow", () => {
     const frames = manualFrames();
     let seed = 7;

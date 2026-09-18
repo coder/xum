@@ -115,19 +115,23 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
   },
 };
 
+/** Nesting walked when charging a tool payload: provider/MCP results wrap content a few levels deep. */
+const TOOL_PAYLOAD_WALK_DEPTH = 4;
+
 /**
- * Characters of string payload a tool card can render when expanded: the string itself, or
- * the string fields one level down (file contents, command output, a plan body). Nested
- * structures are not walked and nothing is serialized — expansion is per workspace/tool and
- * not visible to this projection, so this errs toward charging the visible payload.
+ * Characters of string payload a tool card can render when expanded: every string reachable
+ * within a few levels (file contents, command output, a plan body, `{ type: "json", value }`
+ * result wrappers whose value an expanded card serializes in full). Nothing is serialized —
+ * expansion is per workspace/tool and not visible to this projection, so this errs toward
+ * charging the visible payload — and the walk is depth-bounded so a pathological result
+ * cannot turn a weight estimate into a traversal.
  */
-function estimateToolPayloadChars(value: unknown): number {
+function estimateToolPayloadChars(value: unknown, depth = TOOL_PAYLOAD_WALK_DEPTH): number {
   if (typeof value === "string") return value.length;
-  if (value === null || typeof value !== "object") return 0;
+  if (value === null || typeof value !== "object" || depth === 0) return 0;
   let chars = 0;
-  for (const field of Object.values(value as Record<string, unknown>)) {
-    if (typeof field === "string") chars += field.length;
-  }
+  const fields = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  for (const field of fields) chars += estimateToolPayloadChars(field, depth - 1);
   return chars;
 }
 
