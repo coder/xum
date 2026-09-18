@@ -56,6 +56,27 @@ import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
 
+/** Expand/collapse header shared by the editable and read-only tool sections. */
+const ToolsDisclosureButton: React.FC<{
+  expanded: boolean;
+  onToggle: () => void;
+  summary: string;
+  testedAt: number;
+  saving?: boolean;
+}> = (props) => (
+  <button
+    type="button"
+    onClick={props.onToggle}
+    aria-expanded={props.expanded}
+    className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
+  >
+    {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+    <span>{props.summary}</span>
+    <span className="text-muted/60 ml-1">({formatRelativeTime(props.testedAt)})</span>
+    {props.saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
+  </button>
+);
+
 /** Component for managing tool allowlist for a single MCP server */
 const ToolAllowlistSection: React.FC<{
   serverName: string;
@@ -159,17 +180,13 @@ const ToolAllowlistSection: React.FC<{
 
   return (
     <div>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
-      >
-        {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-        <span>
-          Tools: {localAllowlist.length}/{availableTools.length}
-        </span>
-        <span className="text-muted/60 ml-1">({formatRelativeTime(testedAt)})</span>
-        {saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
-      </button>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${localAllowlist.length}/${availableTools.length}`}
+        testedAt={testedAt}
+        saving={saving}
+      />
 
       {expanded && (
         <div className="mt-2">
@@ -181,6 +198,44 @@ const ToolAllowlistSection: React.FC<{
             onSelectNone={() => void handleSelectNone()}
             disabled={saving}
           />
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Read-only discovered-tool list for plugin-provided servers. Plugin
+ * definitions cannot be edited from Settings (the backend rejects canonical
+ * plugin keys in setToolAllowlist) and their permissions are granted per
+ * workspace, so this only lets users inspect what a connection test found
+ * without offering allowlist controls.
+ */
+const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${props.tools.length}`}
+        testedAt={props.testedAt}
+      />
+      {expanded && (
+        <div className="mt-2">
+          <p className="text-muted mb-2 text-xs">
+            Discovered by the connection test. Tool permissions for plugin servers are chosen per
+            workspace via Configure MCP servers.
+          </p>
+          {/* wrap-anywhere: repo-controlled tool names can be long unbroken
+              tokens; let them wrap instead of overflowing at ~375px. */}
+          <ul className="grid gap-x-3 gap-y-0.5 sm:grid-cols-2">
+            {props.tools.map((tool) => (
+              <li key={tool} className="min-w-0 font-mono text-xs wrap-anywhere">
+                {tool}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -1543,21 +1598,26 @@ export const MCPSettingsSection: React.FC = () => {
                           )}
                         </div>
                       )}
-                      {/* Plugin servers are read-only here (setToolAllowlist rejects
-                          plugin keys); their allowlists live in Workspace MCP. */}
-                      {!isPluginEntry &&
-                        cached?.result.success &&
-                        cached.result.tools.length > 0 &&
-                        !isEditing && (
-                          <div className="border-border-medium border-t px-3 py-2">
+                      {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
+                        <div className="border-border-medium border-t px-3 py-2">
+                          {isPluginEntry ? (
+                            // Plugin servers are read-only here (setToolAllowlist rejects
+                            // plugin keys); their allowlists live in Workspace MCP. Users
+                            // can still inspect what the connection test discovered.
+                            <PluginToolListSection
+                              tools={cached.result.tools}
+                              testedAt={cached.testedAt}
+                            />
+                          ) : (
                             <ToolAllowlistSection
                               serverName={name}
                               availableTools={cached.result.tools}
                               currentAllowlist={entry.toolAllowlist}
                               testedAt={cached.testedAt}
                             />
-                          </div>
-                        )}
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })
