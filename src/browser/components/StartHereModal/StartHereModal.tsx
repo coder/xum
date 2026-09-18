@@ -14,10 +14,21 @@ import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/
 interface StartHereModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Rejects (never silently resolves) when the operation was refused, so the dialog stays open. */
   onConfirm: () => void | Promise<void>;
+  /**
+   * Confirmation is not currently possible (the transcript stopped being a verified copy of
+   * history while the dialog was open): OK renders disabled and the confirm keybind is inert.
+   */
+  confirmDisabled?: boolean;
 }
 
-export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose, onConfirm }) => {
+export const StartHereModal: React.FC<StartHereModalProps> = ({
+  isOpen,
+  onClose,
+  onConfirm,
+  confirmDisabled = false,
+}) => {
   const [isExecuting, setIsExecuting] = useState(false);
 
   const handleCancel = useCallback(() => {
@@ -27,7 +38,7 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose,
   }, [isExecuting, onClose]);
 
   const handleConfirm = useCallback(async () => {
-    if (isExecuting) return;
+    if (isExecuting || confirmDisabled) return;
     setIsExecuting(true);
     try {
       await onConfirm();
@@ -36,7 +47,7 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose,
       console.error("Start Here error:", error);
       setIsExecuting(false);
     }
-  }, [isExecuting, onConfirm, onClose]);
+  }, [isExecuting, confirmDisabled, onConfirm, onClose]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
@@ -87,7 +98,7 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose,
               N
             </span>
           </Button>
-          <Button onClick={() => void handleConfirm()} disabled={isExecuting}>
+          <Button onClick={() => void handleConfirm()} disabled={isExecuting || confirmDisabled}>
             {isExecuting ? "Starting..." : "OK"}
             <span
               aria-hidden="true"

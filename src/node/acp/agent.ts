@@ -199,6 +199,18 @@ export class MuxAgent implements Agent {
   private readonly chatSubscriptionReady = new Map<string, Promise<void>>();
   /** Mode used for the currently active/connecting onChat subscription per session. */
   private readonly chatSubscriptionModeBySessionId = new Map<string, OnChatMode>();
+  /**
+   * Sessions whose last observed replay reported `historyReplayStatus: "failed"`: their history
+   * is unreadable and unverified, so prompts are refused (as the browser and CLI refuse sends)
+   * until a later caught-up reports a complete replay.
+   */
+  private readonly historyReplayFailedSessionIds = new Set<string>();
+  /**
+   * Settles at the first caught-up of a session's active full-mode subscription (or when that
+   * subscription ends without one). A prompt awaits it before dispatching so a failed replay is
+   * observed and refused rather than raced by the send.
+   */
+  private readonly firstCaughtUpBySessionId = new Map<string, Promise<void>>();
   /** Async iterators for active onChat streams so we can cancel on mode switch/eviction. */
   private readonly chatIteratorsBySessionId = new Map<
     string,
@@ -717,6 +729,16 @@ export class MuxAgent implements Agent {
         args.workspaceId,
         this.getSessionOnChatMode(args.sessionId)
       );
+
+      // A full-mode replay must be observed before the send: an unreadable history closes the
+      // replay with `historyReplayStatus: "failed"`, and a prompt into that unverified
+      // transcript would persist a user row before request construction fails.
+      await this.firstCaughtUpBySessionId.get(args.sessionId);
+      if (this.historyReplayFailedSessionIds.has(args.sessionId)) {
+        throw new Error(
+          `prompt: workspace ${args.workspaceId} history could not be read; refusing to send into an unverified transcript`
+        );
+      }
 
       this.markTurnDispatched(args.sessionId, promptCorrelationId);
 
@@ -1379,6 +1401,8 @@ export class MuxAgent implements Agent {
     this.sessionSkillsById.delete(sessionId);
     this.onChatModeBySessionId.delete(sessionId);
     this.chatSubscriptionModeBySessionId.delete(sessionId);
+    this.historyReplayFailedSessionIds.delete(sessionId);
+    this.firstCaughtUpBySessionId.delete(sessionId);
     this.latestUsageBySessionId.delete(sessionId);
     this.sessionLastTouchedAtById.delete(sessionId);
 
@@ -1584,6 +1608,17 @@ export class MuxAgent implements Agent {
       workspaceId,
       mode: onChatMode,
     });
+    // Registered before the connected signal so a prompt released by it always finds the
+    // gate. Full mode reads history; live mode reads none and cannot report on it, so it
+    // neither sets nor clears the failed flag and needs no first-caught-up gate.
+    const firstCaughtUp = Promise.withResolvers<void>();
+    if (onChatMode.type === "full") {
+      this.firstCaughtUpBySessionId.set(sessionId, firstCaughtUp.promise);
+    } else {
+      // A replaced subscription's gate must not outlive it (its teardown can linger).
+      this.firstCaughtUpBySessionId.delete(sessionId);
+      firstCaughtUp.resolve();
+    }
     onConnected();
     this.touchSession(sessionId);
 
@@ -1666,6 +1701,12 @@ export class MuxAgent implements Agent {
           this.handleStreamEvent(sessionId, event);
           if (event.type === "caught-up") {
             hasCaughtUp = true;
+            if (event.historyReplayStatus === "failed") {
+              this.historyReplayFailedSessionIds.add(sessionId);
+            } else if (event.replay !== "live") {
+              this.historyReplayFailedSessionIds.delete(sessionId);
+            }
+            firstCaughtUp.resolve();
           }
           // Skip heartbeats from the queue: they produce no sessionUpdate
           // output and are emitted periodically, so they would accumulate
@@ -1698,6 +1739,8 @@ export class MuxAgent implements Agent {
           }
         }
       } finally {
+        // A subscription that ends before its caught-up must not leave a prompt waiting.
+        firstCaughtUp.resolve();
         end();
       }
     })();
