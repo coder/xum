@@ -1,7 +1,3 @@
-// Must load before the command modules: their import graph reaches Radix, which binds its
-// layout-effect hook at module evaluation based on `globalThis.document`. Without a baseline
-// document here, that hook becomes a permanent noop for every later UI suite in the process.
-import "../../../tests/ui/dom";
 import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
 import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
