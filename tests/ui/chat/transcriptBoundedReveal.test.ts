@@ -118,28 +118,55 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
       });
       expect(scrolledTo).toEqual([]);
 
+      // The target sits in the next chunk up: releasing one frame mounts it and the pending
+      // navigation fires then, not before.
+      let steps = 0;
+      const mountedBefore = mountedRowIds(app.view.container).length;
+      const releaseFrame = () => {
+        if (++steps > 50) throw new Error("reveal did not finish within 50 steps");
+        const frame = heldFrames.shift()!;
+        act(() => frame());
+        expect(mountedRowIds(app.view.container).length).toBeGreaterThan(mountedBefore);
+      };
+      expect(heldFrames.length).toBeGreaterThan(0);
+      releaseFrame();
+      expect(mountedRowIds(app.view.container)).toContain(targetId);
+      await waitFor(() => expect(scrolledTo).toEqual([targetId]));
+
       // A stream started mid-reveal renders at the tail while the oldest rows are still unmounted.
+      expect(heldFrames.length).toBeGreaterThan(0);
       const midReveal = "Sent while older rows are still mounting";
       await app.chat.send(midReveal);
       await app.chat.expectTranscriptContains(`Mock response: ${midReveal}`);
       expect(transcript()).not.toContain(seedText(0));
       expect(mountedRowIds(app.view.container)).not.toContain(seedId(0));
 
-      // Release frames one at a time; each step mounts one more chunk until fully revealed.
-      let steps = 0;
-      const mountedBefore = mountedRowIds(app.view.container).length;
-      while (heldFrames.length > 0) {
-        if (++steps > 50) throw new Error("reveal did not finish within 50 steps");
-        const frame = heldFrames.shift()!;
-        act(() => frame());
-        expect(mountedRowIds(app.view.container).length).toBeGreaterThan(mountedBefore);
-      }
+      // A navigation still waiting for its chunk is superseded by a send: returning to the live
+      // tail must not be undone once that chunk mounts.
+      const earliestMountedAfterSend = Array.from(
+        app.view.container.querySelectorAll<HTMLButtonElement>(
+          'button[aria-label="Previous message"]'
+        )
+      ).filter((button) => !button.disabled)[0];
+      fireEvent.click(earliestMountedAfterSend);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const cancelled = "Sent while a navigation was still pending";
+      await app.chat.send(cancelled);
+      await app.chat.expectTranscriptContains(`Mock response: ${cancelled}`);
+
+      // Release the remaining frames one at a time; each step mounts one more chunk.
+      while (heldFrames.length > 0) releaseFrame();
       expect(steps).toBeGreaterThan(1);
       await app.chat.expectTranscriptContains(seedText(0));
       expect(mountedRowIds(app.view.container)).toContain(seedId(0));
       await waitFor(() => expect(transcript()).toContain("Load older messages"));
-      // The pending navigation scrolled to its target once the target's chunk had mounted.
-      await waitFor(() => expect(scrolledTo).toEqual([targetId]));
+      // Only the navigation that mounted before the send scrolled; the superseded one never did.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(scrolledTo).toEqual([targetId]);
     } finally {
       transcriptRevealFrameScheduler.schedule = originalSchedule;
       Element.prototype.scrollIntoView = originalScrollIntoView;

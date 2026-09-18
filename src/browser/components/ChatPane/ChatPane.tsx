@@ -197,6 +197,7 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // layout by a frame and tear. The dock must never be a scroll-anchoring
 // candidate: while locked the sentinel owns anchoring, and while released the
 // browser must anchor to a transcript row, not the sticky dock.
+const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
 
 function findTranscriptMessageElement(
@@ -589,9 +590,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const operationalBundle = operationalBundleInfos?.[index];
     return operationalBundle === undefined || operationalBundle.position === "head";
   };
+  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
+  // workspace switches feel stable; rows known to be missing backend content hide behind
+  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
+  // lives in the composer dock, so it never vetoes the skeleton. The skeleton
+  // additionally holds until decoration data sources are known so the transcript and all
+  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
+  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
+    computeChatViewReveal({
+      isHydratingTranscript,
+      chatViewDataReady,
+      hasRenderableMessages: deferredMessages.length > 0,
+      isTranscriptStale: workspaceState.isTranscriptStale,
+    });
+  // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
+  // it: it would otherwise mount the whole transcript in the one commit that replaces the
+  // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
   const { fromIndex: revealFromIndex, isFullyRevealed } = useBoundedTranscriptReveal({
     workspaceId,
-    messages: deferredMessages,
+    messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
     isSafeCut: isSafeRevealCut,
     rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
   });
@@ -802,6 +819,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // otherwise the historical chunk mounting later would scroll away from the tail again.
   const handleJumpToBottom = useCallback(() => {
     setPendingScrollTarget(null);
+    setPendingTimelineReveal(null);
     jumpToBottom();
   }, [jumpToBottom]);
 
@@ -1185,19 +1203,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
   // show its "waiting on monitor" state instead of the chat looking idle.
   const shouldMountStreamingBarrier = shouldShowStreamingBarrier || activeBashMonitorCount > 0;
-  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
-  // workspace switches feel stable; rows known to be missing backend content hide behind
-  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
-  // lives in the composer dock, so it never vetoes the skeleton. The skeleton
-  // additionally holds until decoration data sources are known so the transcript and all
-  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
-  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
-    computeChatViewReveal({
-      isHydratingTranscript,
-      chatViewDataReady,
-      hasRenderableMessages: deferredMessages.length > 0,
-      isTranscriptStale: workspaceState.isTranscriptStale,
-    });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
