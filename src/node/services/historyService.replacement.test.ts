@@ -3040,10 +3040,13 @@ describe("compaction replacement acceptance", () => {
       ).join("\n") + "\n";
     await fs.writeFile(archivePath, archived);
     let holdingLock = false;
+    let observedHistoryLock = false;
     let archiveBytesReadUnderLock = 0;
     const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
     spyOn(workspaceFileLocks, "withLock").mockImplementation((key, operation) =>
       withLock(key, async () => {
+        if (key !== workspaceId) return operation();
+        observedHistoryLock = true;
         holdingLock = true;
         try {
           return await operation();
@@ -3055,11 +3058,25 @@ describe("compaction replacement acceptance", () => {
     beforeFileRead(archivePath, (args) => {
       if (holdingLock && typeof args[2] === "number") archiveBytesReadUnderLock += args[2];
     });
-    expect(await history.findCompactionReplacementWitness(workspaceId, expected.nonce!)).toEqual(
-      Ok({ nonce: expected.nonce! })
-    );
-    expect(await stop.retireReplacement({ nonce: expected.nonce! })).toBe("applied");
-    expect(archiveBytesReadUnderLock).toBe(0);
+    // Other services can hold a different workspace's mutex during this scan in a shared run.
+    const foreignEntered = Promise.withResolvers<void>();
+    const releaseForeign = Promise.withResolvers<void>();
+    const foreignLock = workspaceFileLocks.withLock("history-observer-unrelated", async () => {
+      foreignEntered.resolve();
+      await releaseForeign.promise;
+    });
+    await foreignEntered.promise;
+    try {
+      expect(await history.findCompactionReplacementWitness(workspaceId, expected.nonce!)).toEqual(
+        Ok({ nonce: expected.nonce! })
+      );
+      expect(await stop.retireReplacement({ nonce: expected.nonce! })).toBe("applied");
+      expect(observedHistoryLock).toBe(true);
+      expect(archiveBytesReadUnderLock).toBe(0);
+    } finally {
+      releaseForeign.resolve();
+      await foreignLock;
+    }
   });
 
   it.each(["Stop", "append"] as const)(
