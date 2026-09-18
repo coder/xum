@@ -56,6 +56,10 @@ export class SummarizeStrategy {
         goalId: streamContext.goalId,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
+        // The post-compaction "Continue" streams on the routed options and can
+        // still carry the routed turn's project content (tail copies,
+        // post-compaction skill attachments): it inherits the obligation.
+        routedProjectConsent: streamContext.routedConsentRejection != null,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {
@@ -66,7 +70,10 @@ export class SummarizeStrategy {
       if (admissionStale()) return;
       const autoCompactionRequest = this.host.buildAutoCompactionRequest({
         followUpContent,
-        baseOptions: streamContext.options,
+        // Pre-routing options when the stream was skill-routed: the compaction
+        // request must never inherit a routed small model (it has to read the
+        // full uncompacted history) — mirrors the on-send compaction site.
+        baseOptions: streamContext.compactionBaseOptions ?? streamContext.options,
         reason: "mid-stream",
       });
 

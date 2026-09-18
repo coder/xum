@@ -10,7 +10,13 @@ import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/message
 import {
   extractLoadedSkillSnapshotsFromMessages,
   mergeLoadedSkillSnapshots,
+  messagesCarryProjectSkillContent,
+  withholdProjectSkillContentFromRequest,
 } from "../../agentSkills/loadedSkillSnapshots";
+import {
+  attachmentsCarryProjectSkillContent,
+  excludeProjectSkillContentFromAttachments,
+} from "../../postCompactionAttachmentProvenance";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "../../continuousCompactor";
 import { summarizeContinuousCompaction } from "../../continuousCompactionSummary";
 import type { CompactionHandler } from "../../compactionHandler";
@@ -24,7 +30,15 @@ import type { ContextManagementDependencies } from "../contextManagementService"
 import type { SessionContextHost } from "../sessionContextHost";
 import type { StreamContextSnapshot } from "../types";
 
-type SessionCompactionContext = ContinuousCompactionContext & { sendOptions?: SendMessageOptions };
+type SessionCompactionContext = ContinuousCompactionContext & {
+  sendOptions?: SendMessageOptions;
+  /**
+   * The observed turn is skill-routed (its compactionBaseOptions were set):
+   * its summaries and swapped prefixes leave for the routed/compact provider
+   * under the routed request's consent rules.
+   */
+  routedTurn?: boolean;
+};
 
 function is1MContextEnabledForModel(
   model: string,
@@ -82,29 +96,69 @@ export class ContinuousStrategy {
       },
       prepareSwap: async (head) => {
         // A consumed swap may need the fast-stop fallback on a provider-family hop.
-        if (!this.host.state.stream?.options) return null;
+        const stream = this.host.state.stream;
+        if (!stream?.options) return null;
         const prepared = this.host.streams.getPrefixSwapPreparation?.(this.host.workspaceId);
         if (!prepared) return null;
-        const attachments = await this.buildContinuousCompactionAttachments(head);
-        return { ...prepared, attachments };
+        // The swapped prefix is rebuilt from history copies and ships to the
+        // live (possibly routed) provider mid-stream: the same provider-copy
+        // rules as the summarizer head, applied at rebuild time so the durable
+        // journal keeps the unfiltered sources. Post-compaction loaded-skill
+        // attachments are a second channel for the same content.
+        const eligible = await this.host.prepareContinuousCompactionRows(
+          head,
+          stream.compactionBaseOptions != null
+        );
+        if (eligible === null) return null;
+        const attachments = await this.buildContinuousCompactionAttachments(eligible.rows);
+        const swapAttachments = eligible.projectContentWithheld
+          ? (excludeProjectSkillContentFromAttachments(attachments) ?? [])
+          : attachments;
+        return {
+          ...prepared,
+          attachments: swapAttachments,
+          prefixRows: (rows: MuxMessage[]) => {
+            const filtered = this.host.excludeRejectedRows(rows);
+            return eligible.projectContentWithheld
+              ? withholdProjectSkillContentFromRequest(filtered)
+              : filtered;
+          },
+          // The swap's own consent verdict for the per-step gate: content kept
+          // under trust arms it (a revocation before the swapped prefix ships
+          // then refuses the step); withheld content never does — withheld
+          // copies keep their provenance stamps, so they must not be rescanned.
+          prefixCarriesProjectSkillContent: eligible.projectContentWithheld
+            ? () => false
+            : (rows: MuxMessage[]) =>
+                messagesCarryProjectSkillContent(rows) ||
+                attachmentsCarryProjectSkillContent(swapAttachments),
+        };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: async (head, signal, context: SessionCompactionContext) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.host.buildAutoCompactionRequest({
           baseOptions,
           followUpContent: { text: "Continue", model: context.model, agentId: "exec" },
           reason: "on-send",
         });
+        // The compactor reads RAW history; what its summarizer sends is a
+        // provider request like any other (see prepareContinuousCompactionRows).
+        const eligible = await this.host.prepareContinuousCompactionRows(
+          head,
+          context.routedTurn === true
+        );
+        if (eligible === null || eligible.rows.length === 0) return null;
         return summarizeContinuousCompaction({
           workspaceId: this.host.workspaceId,
           config: this.deps.config,
           aiService: this.deps.aiService,
           sessionUsageService: this.deps.sessionUsageService,
-          head,
+          head: eligible.rows,
           signal,
           context,
           baseOptions,
           compactOptions: request.sendOptions,
+          beforeDispatch: () => this.host.continuousCompactionRowsStillEligible(eligible),
         });
       },
       fastApply: (apply) => this.interruptForContinuousCompaction(apply),
@@ -131,7 +185,8 @@ export class ContinuousStrategy {
 
   getContinuousCompactionContext(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    routedTurn = false
   ): SessionCompactionContext {
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
@@ -163,12 +218,14 @@ export class ContinuousStrategy {
         this.host.streams.getStreamInfo(this.host.workspaceId)?.initialMetadata
           ?.systemMessageTokens ?? this.host.state.systemMessageTokens,
       sendOptions: options,
+      routedTurn,
     };
   }
 
   async observeContinuousCompactionAtStreamEnd(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    routedTurn = false
   ): Promise<void> {
     // fastApply waits for this handler to reach IDLE; waiting on its latch here
     // (or re-entering it from the generated Continue send) would deadlock.
@@ -179,7 +236,7 @@ export class ContinuousStrategy {
     )
       return;
     try {
-      const context = this.getContinuousCompactionContext(model, options);
+      const context = this.getContinuousCompactionContext(model, options, routedTurn);
       if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
         this.continuousCompactor.reset("disabled");
         return;
@@ -311,6 +368,11 @@ export class ContinuousStrategy {
       goalKind: context.goalKind,
       goalId: context.goalId,
       muxMetadata: context.workspaceTurnMetadata,
+      // The continuation streams on the routed options with the folded
+      // history (tail copies, post-compaction attachments): it inherits the
+      // stream's consent obligation, durably — the fast-apply dispatch or a
+      // post-restart recovery reads it back from the summary row.
+      routedProjectConsent: context.routedConsentRejection != null,
     });
     followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
     return followUp;
@@ -389,7 +451,10 @@ export class ContinuousStrategy {
     const summaryId = this.host.coordinator.compactionIntent.summaryId;
     await this.host.dispatchPendingFollowUp(
       summaryId,
-      () => this.host.coordinator.compactionIntent.abandoned
+      () => this.host.coordinator.compactionIntent.abandoned,
+      // The stream's own gate is still in hand here; the persisted
+      // routedProjectConsent flag covers dispatches that are not.
+      context.routedConsentRejection
     );
     if (this.host.coordinator.compactionIntent.summaryId === summaryId)
       this.host.coordinator.recordCompactionSummary(null);

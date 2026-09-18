@@ -1,3 +1,5 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { tool } from "ai";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
@@ -200,6 +202,19 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // provenance reads and handle cleanup run to completion, so it is not a wall-clock bound.
       const deadline = performance.now() + SESSION_HISTORY_TOOL_DEADLINE_MS;
       const args = TOOL_DEFINITIONS.session_history.schema.parse(input);
+      // Rows behind a rollover can carry project skill content the request's
+      // own filter never saw (an earlier trusted agent_skill_read): a routed
+      // turn without trust leaves such rows out, and any returned row carrying
+      // it stamps the result for the per-step consent scan.
+      const excludeProjectSkillContent = await toolExcludesProjectSkillContent(config);
+      // Taint is tracked per context window in scan order (a source row precedes the replies
+      // that can quote it); recent_first would surface those replies first. A routed turn
+      // (trust re-read wired) or an excluding turn cannot classify such a page: refuse it.
+      if (
+        args.recent_first === true &&
+        (excludeProjectSkillContent || config.projectSkillContentStillReadable !== undefined)
+      )
+        return { success: false, error: "recent_first_unavailable" };
       if (args.action === "search" && !args.query)
         return { success: false, error: "query_required" };
       if (args.action === "read_item" && !args.item_id)
@@ -280,6 +295,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         const items = result.items!;
         const windows = result.windows!;
         const warnings = new Set<Warning>();
+        // Context windows in which a row carrying project skill content was already visited
+        // (scan order: a source row precedes the replies that can quote it). Rebuilt with every
+        // attempt: a restart discards the rows it classified along with everything else.
+        const taintedWindows = new Set<string>();
         // Any scan of this attempt (caller authorization or target) that had to skip rows
         // it could not read is reported; codes only, since chunks re-encounter rows.
         const noteSkippedRows = (page: { oversizedLines: number; malformedLines: number }) => {
@@ -385,7 +404,21 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                 deadline: chunkDeadline,
                 requireExistingHistory: foreign,
                 budget,
+                // A row skipped as oversized (a near-cap agent_skill_read result, say) is never
+                // classified: its window is tainted conservatively so the rows after it are
+                // withheld or stamped like the rows after a classified source.
+                onOversizedRow: ({ windowId }) => {
+                  taintedWindows.add(windowId);
+                },
                 visit: ({ message, itemId, windowId, windowBoundaryKind }) => {
+                  // Classified BEFORE every filter so the source row is seen even when the
+                  // response returns only later rows: once a row of this window carries project
+                  // skill content, every later row of the window can quote it — withheld for a
+                  // turn that excludes project content, otherwise the result is stamped for the
+                  // consent scan.
+                  if (messagesCarryProjectSkillContent([message])) taintedWindows.add(windowId);
+                  const rowTainted = taintedWindows.has(windowId);
+                  const rowWithheld = rowTainted && excludeProjectSkillContent;
                   if (args.action === "list_windows") {
                     if (pending?.windowId !== windowId) {
                       stop = finishPendingRun();
@@ -402,7 +435,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                         itemCount: 0,
                       };
                     }
-                    if (projectHistory(message).text) pending.itemCount++;
+                    // A withheld row is not one this turn's list_items would return.
+                    if (!rowWithheld && projectHistory(message).text) pending.itemCount++;
+                    return true;
+                  }
+                  if (rowWithheld) {
+                    result.withheldProjectSkillRows = (result.withheldProjectSkillRows ?? 0) + 1;
                     return true;
                   }
                   if (args.window_id != null && args.window_id !== windowId) return true;
@@ -465,6 +503,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                     stop = "payload";
                     return false;
                   }
+                  // Stamped once the row is known to stay in the response: the consent scan
+                  // treats the whole result as project skill content.
+                  if (rowTainted) result.carriesProjectSkillContent = true;
                   while (byteLength() > payloadBudget && item.text.length > 0) {
                     end = surrogateSafeOffset(text, start + Math.floor((end - start) * 0.8));
                     item.text = text.slice(start, end);

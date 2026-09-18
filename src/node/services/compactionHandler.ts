@@ -27,6 +27,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import {
   createMuxMessage,
+  excludeRejectedTurnRows,
   getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
@@ -56,6 +57,7 @@ import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageI
 import {
   mergeLoadedSkillSnapshots,
   extractLoadedSkillSnapshotsFromMessages,
+  messagesCarryProjectSkillContent,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 
 /**
@@ -204,6 +206,12 @@ interface CompactionHandlerOptions {
    * workspace whose compaction keeps failing even though the provider stream ended cleanly.
    */
   onIdleCompactionOutcome?: (success: boolean) => void;
+  /**
+   * Rows quarantined in memory after a failed durable pre-stream-rejection
+   * stamp (the session's unstampedRejectedRowIds). Excluded, together with
+   * stamped rows, from everything compaction carries forward.
+   */
+  getQuarantinedRowIds?: () => ReadonlySet<string>;
 }
 
 /**
@@ -224,6 +232,7 @@ export class CompactionHandler {
 
   private readonly onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   private readonly onIdleCompactionOutcome?: (success: boolean) => void;
+  private readonly getQuarantinedRowIds?: () => ReadonlySet<string>;
 
   constructor(options: CompactionHandlerOptions) {
     assert(options, "CompactionHandler requires options");
@@ -243,6 +252,7 @@ export class CompactionHandler {
     this.emitter = options.emitter;
     this.onCompactionComplete = options.onCompactionComplete;
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
+    this.getQuarantinedRowIds = options.getQuarantinedRowIds;
   }
 
   beginPreparation(isCurrent: () => boolean): CompactionPreparation {
@@ -283,6 +293,18 @@ export class CompactionHandler {
     await this.pendingLifecycle.discardAfterBoundary();
   }
 
+  /**
+   * Rows a provider request never carries (pre-stream rejected: durably
+   * stamped, quarantined in memory after a failed stamp, or named by an
+   * outstanding repair key whose rows the session has not stamped yet) must
+   * not re-enter one through compaction either — not as loaded-skill / diff /
+   * read carryover in the pending state, and not as keep-recent tail copies.
+   * Keys expand to the whole turn (snapshot prefix included).
+   */
+  private excludeRejectedRows(messages: MuxMessage[]): MuxMessage[] {
+    return excludeRejectedTurnRows(messages, this.getQuarantinedRowIds?.() ?? []);
+  }
+
   private async publishPreparedBoundary(
     preparation: CompactionPreparation,
     messages: MuxMessage[],
@@ -305,7 +327,9 @@ export class CompactionHandler {
     if (!retired.success) return retired;
     const pending = await this.peekPendingState();
     const warm = await this.peekCarryoverState();
-    const epoch = sliceMessagesFromLatestCompactionBoundary(messages);
+    // Rejected turns (stamped or quarantined) never reached the provider;
+    // nothing extracted from them may re-enter it as carryover.
+    const epoch = this.excludeRejectedRows(sliceMessagesFromLatestCompactionBoundary(messages));
     return this.pendingLifecycle.publish(preparation, {
       ...boundary,
       attachments: {
@@ -409,6 +433,9 @@ export class CompactionHandler {
         synthetic: true,
         uiVisible: true,
         compacted: "heartbeat",
+        // Provenance of the rows this boundary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent).
+        carriesProjectSkillContent: messagesCarryProjectSkillContent(messages),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         muxMetadata: {
@@ -807,6 +834,9 @@ export class CompactionHandler {
       {
         timestamp: Date.now(),
         compacted: "user",
+        // Provenance of the rows this boundary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent).
+        carriesProjectSkillContent: messagesCarryProjectSkillContent(params.messages),
         compactionBoundary: true,
         compactionEpoch: getNextCompactionEpoch(params.messages),
         model: params.model,
@@ -993,6 +1023,11 @@ export class CompactionHandler {
         // compaction cache/context token displays.
         timestamp,
         compacted: isIdleCompaction ? "idle" : "user",
+        // Provenance of the rows this summary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent): the summary text may
+        // quote a project skill a summarized turn loaded, and the consent scan
+        // recognizes only tagged rows.
+        carriesProjectSkillContent: messagesCarryProjectSkillContent(messages),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         model: metadata.model,
@@ -1129,8 +1164,11 @@ export class CompactionHandler {
 
     // Tail = rows between the stamped start and the compaction request.
     // Older compaction-request rows (failed prior attempts) are summarization
-    // prompts, not conversation — never preserve them.
-    const tailRows = messages.slice(0, requestIndex).filter((message) => {
+    // prompts, not conversation — never preserve them. Rejected rows are
+    // excluded outright: a copy gets a fresh ID the in-memory quarantine
+    // cannot match, and a stamped row's copy would only ever be filtered
+    // back out of every request.
+    const tailRows = this.excludeRejectedRows(messages.slice(0, requestIndex)).filter((message) => {
       const sequence = message.metadata?.historySequence;
       if (!isNonNegativeInteger(sequence) || sequence < startHistorySequence) {
         return false;

@@ -19,6 +19,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
 import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
+import { TASK_REPORT_WITHHELD_MESSAGE } from "@/node/services/tools/taskReportProvenance";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -199,6 +200,45 @@ describe("createCodeExecutionTool", () => {
 
       expect(withTask.description).toContain("xum.task_spawn");
       expect(withoutTask.description).not.toContain("task_spawn");
+    });
+  });
+
+  describe("project skill provenance", () => {
+    const skillResult = (scope: "project" | "global") => ({
+      success: true,
+      skill: {
+        scope,
+        directoryName: "repo-conventions",
+        frontmatter: { name: "repo-conventions", description: "Repository conventions" },
+        body: "SKILL BODY",
+      },
+    });
+
+    it("stamps the output when a nested skill read returned project content, not for global", async () => {
+      // The guest can copy the nested result anywhere in the output, so the
+      // routed-request consent scan classifies the WHOLE execution by this
+      // stamp rather than by the nested record alone.
+      for (const scope of ["project", "global"] as const) {
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            agent_skill_read: createMockTool(
+              "agent_skill_read",
+              z.object({ name: z.string() }),
+              mock(() => skillResult(scope))
+            ),
+          })
+        );
+        const result = (await tool.execute!(
+          {
+            code: 'const s = xum.agent_skill_read({name: "repo-conventions"}); return s.skill.body;',
+          },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(true);
+        expect(result.result).toBe("SKILL BODY");
+        expect(result.carriesProjectSkillContent).toBe(scope === "project" ? true : undefined);
+      }
     });
   });
 
@@ -2433,6 +2473,69 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(empty.result).toEqual([]);
       await host.disposeScope("ws-kernel");
+    });
+
+    it("classifies a drained terminal report by its provenance: withheld for a turn that excludes project skill content, stamped and mount-tainting under trust", async () => {
+      using tmp = new DisposableTempDir("code-exec-kernel-provenance");
+      const host = new SandboxHostService();
+      const bridge = () =>
+        new ToolBridge({
+          task: createMockTool("task", taskSchema, () => ({ status: "queued", taskId: "child-1" })),
+        });
+      const excluding = await createCodeExecutionTool(
+        runtimeFactory,
+        bridge(),
+        undefined,
+        kernelRunner(host, "ws-kernel-prov", tmp.path),
+        { excludesProjectSkillContent: () => Promise.resolve(true) }
+      );
+      const trusted = await createCodeExecutionTool(
+        runtimeFactory,
+        bridge(),
+        undefined,
+        kernelRunner(host, "ws-kernel-prov", tmp.path)
+      );
+      const post = () =>
+        host.postTaskTerminalEvent("ws-kernel-prov", {
+          taskId: "child-1",
+          status: "completed",
+          reportMarkdown: "quotes the skill",
+          carriesProjectSkillContent: true,
+        });
+
+      // The mount exists once a call ran; a post before that is a no-op.
+      await trusted.execute!({ code: "return 1;" }, mockToolCallOptions);
+      await post();
+      const withheld = (await excluding.execute!(
+        { code: "return mux.events();" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(withheld.success).toBe(true);
+      expect(withheld.result).toEqual([
+        {
+          type: "task-terminal",
+          taskId: "child-1",
+          status: "completed",
+          reportMarkdown: TASK_REPORT_WITHHELD_MESSAGE,
+        },
+      ]);
+      expect(withheld.carriesProjectSkillContent).toBeUndefined();
+
+      await post();
+      const delivered = (await trusted.execute!(
+        { code: "vars.report = mux.events()[0].reportMarkdown; return vars.report;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(delivered.success).toBe(true);
+      expect(delivered.result).toBe("quotes the skill");
+      expect(delivered.carriesProjectSkillContent).toBe(true);
+      // vars can hold the report for later calls: the mount stays tainted.
+      const later = (await trusted.execute!(
+        { code: "return vars.report.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(later.carriesProjectSkillContent).toBe(true);
+      await host.disposeScope("ws-kernel-prov");
     });
 
     it("RLM off (no mount): task_spawn and events are absent from namespace, types, and description", async () => {

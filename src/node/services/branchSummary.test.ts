@@ -296,6 +296,7 @@ describe("getSideChannelModelCandidates (r23: provider confinement)", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Must never be generated."), {
           workspaceModel: null,
@@ -391,6 +392,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: unreachableAiService(),
         workspaceId: "ws-off",
@@ -411,6 +413,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     try {
       const tiny = [createMuxMessage("tiny-user", "user", "one line", { timestamp: 1 })];
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: unreachableAiService(),
         workspaceId: "ws-tiny",
@@ -425,11 +428,120 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("stamps the summary with the provenance of project skill content in the abandoned rows", async () => {
+    // The summary distills the abandoned rows; a trusted project-skill turn
+    // among them can be quoted, so the row carries the rows' provenance for
+    // routed requests after a trust revocation to withhold it. Clean rows
+    // stamp FALSE so the summary is distinguishable from a legacy one.
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const clean = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
+        historyService,
+        aiService: fakeAiService(summaryModel("Clean summary of the exchange.")),
+        workspaceId: "ws-provenance-clean",
+        abandonedMessages: meatyExchange("clean"),
+        experiments: RLM_ON,
+      });
+      expect(clean?.metadata?.carriesProjectSkillContent).toBe(false);
+
+      const tainted = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-tainted",
+        abandonedMessages: [
+          createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+            timestamp: 1,
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+          }),
+          ...meatyExchange("tainted"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(tainted?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // A repeated project skill invocation whose snapshot deduplicated
+      // leaves no snapshot row in the abandoned branch; its reply can still
+      // quote the skill, so the invocation itself carries the provenance.
+      const deduplicated = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-dedup",
+        abandonedMessages: [
+          createMuxMessage("u-dedup", "user", "Using skill done", {
+            timestamp: 1,
+            muxMetadata: {
+              type: "agent-skill",
+              rawCommand: "/done",
+              skillName: "done",
+              scope: "project",
+            },
+          }),
+          ...meatyExchange("dedup"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(deduplicated?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // The abandoned replies were generated with the RETAINED context in the
+      // model's context: a project skill before the branch point taints the
+      // summary even when no abandoned row carries it itself.
+      const inherited = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-inherited",
+        abandonedMessages: meatyExchange("inherited"),
+        priorContextCarriesProjectSkillContent: true,
+        experiments: RLM_ON,
+      });
+      expect(inherited?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // Without Project Trust the summarizer (possibly another provider) sees
+      // a copy that withholds project content, and the row is stamped clean.
+      const untrusted = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: false,
+        historyService,
+        aiService: fakeAiService(summaryModel("Clean summary.")),
+        workspaceId: "ws-provenance-untrusted",
+        abandonedMessages: [
+          createMuxMessage("snap-project-u", "user", "PROJECT SKILL BODY", {
+            timestamp: 1,
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+          }),
+          ...meatyExchange("untrusted"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(untrusted?.metadata?.carriesProjectSkillContent).toBe(false);
+
+      // Content kept under trust: a revocation right before the request abandons the summary.
+      const revoked = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
+        recheckProjectTrust: () => Promise.resolve(false),
+        historyService,
+        aiService: fakeAiService(summaryModel("Never generated.")),
+        workspaceId: "ws-provenance-revoked",
+        abandonedMessages: meatyExchange("revoked"),
+        priorContextCarriesProjectSkillContent: true,
+        experiments: RLM_ON,
+      });
+      expect(revoked).toBeNull();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("meaty segment appends exactly one labeled durable row", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       let seenPrompt = "";
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(
           summaryModel("Explored the flaky test; root cause was a race in setup.", (prompt) => {
@@ -489,6 +601,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         },
       });
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(model),
         workspaceId: "ws-roles",
@@ -525,6 +638,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       // caller must snapshot the SOURCE workspace's settings instead.
       const usedModels: string[] = [];
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Summarized from the source snapshot."), {
           // Fork target: metadata exists but has no aiSettings/aiSettingsByAgent.
@@ -553,6 +667,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         options?: { analyticsSource?: string; metadataModel?: string };
       }> = [];
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Explored the race; found the fix.")),
         workspaceId: "ws-usage",
@@ -609,6 +724,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       });
       let usageRecorded = 0;
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(stallingModel),
         workspaceId: "ws-usage-salvage",
@@ -639,6 +755,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       // recordUsage unbounded AFTER the stream finished, so this hung).
       const startedAt = Date.now();
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Usage sink wedged. Summary still lands.")),
         workspaceId: "ws-usage-wedged",
@@ -673,6 +790,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       });
       let writeSettled = false;
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Summary lands; the usage write lags behind.")),
         workspaceId: "ws-usage-drain",
@@ -729,6 +847,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
 
       let seenPrompt = "";
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(
           summaryModel("Summarized only the unique abandoned work.", (prompt) => {
@@ -754,6 +873,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         // createModel fails for every candidate (no API key configured).
         aiService: fakeAiService(null),
@@ -783,6 +903,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       });
       const startedAt = Date.now();
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(stalledModel),
         workspaceId: "ws-stall",
@@ -818,6 +939,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       });
       const startedAt = Date.now();
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(wedgedCancel),
         workspaceId: "ws-wedged-cancel",
@@ -847,6 +969,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       };
       const startedAt = Date.now();
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: wedgedCreation,
         workspaceId: "ws-wedged-create",
@@ -884,6 +1007,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           }),
       });
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(slowModel),
         workspaceId: "ws-salvage",
@@ -932,6 +1056,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           }),
       });
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(runawayModel),
         workspaceId: "ws-runaway",
@@ -988,6 +1113,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           }),
       });
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(floodModel),
         workspaceId: "ws-flood",
@@ -1028,6 +1154,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           }),
       });
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(giantModel),
         workspaceId: "ws-giant-delta",
@@ -1054,6 +1181,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(
           summaryModel("Fixed the flaky test. The remaining work cov", undefined, "length")
@@ -1081,6 +1209,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       expect((await historyService.appendToHistory(ws, firstTurn)).success).toBe(true);
 
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Summary that must be dropped.")),
         workspaceId: ws,
@@ -1132,6 +1261,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       ]);
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("The abandoned attempt explored a race condition.")),
         workspaceId: fork,
@@ -1206,6 +1336,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
@@ -1291,6 +1422,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
 
       const inlinePromise = runInlineAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
@@ -1336,6 +1468,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("The abandoned attempt found the root cause.")),
         workspaceId: ws,
@@ -1392,6 +1525,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: gatedAiService,
         workspaceId: ws,
@@ -1450,6 +1584,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("A summary nobody ever consumes.")),
         workspaceId: ws,
@@ -1493,6 +1628,7 @@ describe("branch summary placement on fork/truncate flows", () => {
           }),
       });
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(slowModel),
         workspaceId: ws,
@@ -1541,6 +1677,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       };
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: gatedAiService,
         workspaceId: ws,
@@ -1597,6 +1734,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
       await startAbandonedBranchSummaryInBackground({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(summaryModel("Summary appended mid-removal.")),
         workspaceId: ws,
@@ -1653,6 +1791,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       ]);
 
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: fakeAiService(
           summaryModel("Previous attempt hit a dead end in config parsing.")
@@ -1693,6 +1832,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         ),
       ];
       const appended = await maybeAppendAbandonedBranchSummary({
+        projectTrusted: true,
         historyService,
         aiService: unreachableAiService(),
         workspaceId: "ws-near",

@@ -11,6 +11,7 @@ import type { BeforeSendInput, BeforeSendOutcome } from "./types";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
 import { log } from "../log";
 import { ContinuousStrategy } from "./strategies/continuous";
 import { SummarizeStrategy } from "./strategies/summarize";
@@ -51,6 +52,7 @@ export class SessionContextController {
       sessionDir: host.sessionDir,
       telemetryService: deps.telemetryService,
       emitter: host.emitter,
+      getQuarantinedRowIds: () => host.getQuarantinedRowIds(),
       onCompactionComplete: (metadata) => {
         // RLM keep-recent floor: tail copies make the summary no longer the last row.
         // Record before notifying the session's external observer, including clearing a
@@ -120,8 +122,17 @@ export class SessionContextController {
     return this.continuous.recoverCompaction();
   }
 
-  onStreamSettled(input: { model: string; options?: SendMessageOptions }): Promise<void> {
-    return this.continuous.observeContinuousCompactionAtStreamEnd(input.model, input.options);
+  onStreamSettled(input: {
+    model: string;
+    options?: SendMessageOptions;
+    /** The settled stream was skill-routed (its compactionBaseOptions were set). */
+    routedTurn?: boolean;
+  }): Promise<void> {
+    return this.continuous.observeContinuousCompactionAtStreamEnd(
+      input.model,
+      input.options,
+      input.routedTurn === true
+    );
   }
 
   isTokenBudgetActive(options?: SendMessageOptions): boolean {
@@ -161,7 +172,11 @@ export class SessionContextController {
         return;
       await this.continuous.runContinuousCompactionObservation(async (token) => {
         const result = await this.continuous.observeCompaction(0, {
-          ...this.continuous.getContinuousCompactionContext(context.modelString, context.options),
+          ...this.continuous.getContinuousCompactionContext(
+            context.modelString,
+            context.options,
+            context.compactionBaseOptions != null
+          ),
           phase: "mid-stream",
         });
         // The observation's finally settles the pending window only after this dispatches the
@@ -193,9 +208,11 @@ export class SessionContextController {
     const streamContext = input.stream;
     const streamOptions = streamContext?.options;
     if (streamContext?.modelString !== modelForUsage) return;
+    const routedTurn = streamContext?.compactionBaseOptions != null;
     const continuousContext = this.continuous.getContinuousCompactionContext(
       modelForUsage,
-      streamOptions
+      streamOptions,
+      routedTurn
     );
     const usagePercent =
       continuousContext.contextWindowTokens > 0
@@ -244,6 +261,13 @@ export class SessionContextController {
       ),
       providersConfig: streamContext?.providersConfig ?? null,
       openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
+      // A routed turn (compactionBaseOptions set) uses the routed-send
+      // policy mid-stream too: the ordinary threshold+buffer against the
+      // (usually smaller) routed window would immediately force the exact
+      // workspace-wide compaction the pre-send band declined to run.
+      ...(routedTurn
+        ? { forceThresholdPercentOverride: 100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT }
+        : {}),
     });
 
     if (shouldInterruptForCompaction) {
@@ -269,9 +293,11 @@ export class SessionContextController {
       openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
     });
 
+    const routed = input.routed != null;
     const continuousContext = this.continuous.getContinuousCompactionContext(
       modelForStream,
-      optionsForStream
+      optionsForStream,
+      routed
     );
     if (!continuousContext.enabled) this.reset("disabled");
     const continuousResult = continuousContext.enabled
@@ -285,11 +311,26 @@ export class SessionContextController {
 
     // A staged fold needs no compact turn. Without one, the experiment waits
     // until the force threshold; the legacy path retains its on-send threshold.
+    //
+    // Skill-routed sends compact only when the content genuinely risks
+    // overrunning the routed model's window: applying the threshold (or the
+    // experiment's force bar) to the (smaller) routed window would let a
+    // one-off cheap-skill invocation force an unrequested, irreversible,
+    // workspace-wide compaction of a session far under its own model's
+    // limit. The headroom accounts for the pending turn (new message,
+    // attachments, skill snapshot), which the recorded usage doesn't
+    // include yet (BeforeSendInput.routed.pendingPercent).
+    const routedSendNearsWindow =
+      compactionResult.usagePercentage + (input.routed?.pendingPercent ?? 0) >=
+      100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT;
     const shouldCompactBeforeSend =
       this.autoCompactionThreshold < 1 &&
       (continuousContext.enabled
-        ? continuousResult === "fallback" && compactionResult.shouldForceCompact
-        : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
+        ? continuousResult === "fallback" &&
+          (routed ? routedSendNearsWindow : compactionResult.shouldForceCompact)
+        : routed
+          ? routedSendNearsWindow
+          : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
     // A new boundary would hide the summary needed to retire scoped Stop debt.
     // Keep ordinary input flowing, but defer legacy compaction until cleanup succeeds.
     // An explicit replacement instead publishes its witness before compaction can hide debt.
@@ -331,10 +372,13 @@ export class SessionContextController {
         }
       }
 
+      // The follow-up re-enters sendMessage with the same skill metadata: it is
+      // built from the pre-routing options so routing re-resolves at dispatch.
+      const followUpOptions = input.followUpOptions ?? optionsForStream;
       const followUpContent = buildAutoCompactionFollowUp({
         messageText: input.messageText,
-        options: optionsForStream,
-        modelForStream,
+        options: followUpOptions,
+        modelForStream: followUpOptions.model,
         fileParts: followUpFileParts,
         agentInitiated: input.agentInitiated,
         goalKind: input.goalKind,
@@ -352,7 +396,9 @@ export class SessionContextController {
 
       const autoCompactionRequest = this.host.buildAutoCompactionRequest({
         followUpContent,
-        baseOptions: optionsForStream,
+        // A routed turn compacts on the model able to read the full history
+        // (BeforeSendInput.routed.compactionBaseOptions), never the class model.
+        baseOptions: input.routed?.compactionBaseOptions ?? optionsForStream,
         reason: "on-send",
       });
 

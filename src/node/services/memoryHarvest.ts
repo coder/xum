@@ -202,6 +202,10 @@ async function deleteInboxIfPresent(args: {
   }
 }
 
+/** Retryable harvest failure: trust or quarantine changed under the built input. */
+export const HARVEST_INPUT_STALE_MESSAGE =
+  "harvest input changed before dispatch (trust or rejected-turn quarantine); retry";
+
 export async function runMemoryHarvest(args: {
   model: LanguageModel;
   agentBody: string;
@@ -211,6 +215,14 @@ export async function runMemoryHarvest(args: {
   messages: MuxMessage[];
   summary: MuxMessage;
   abortSignal?: AbortSignal;
+  /**
+   * Re-verification run immediately before EACH chunk's provider request
+   * (model construction and earlier chunks are awaits the caller cannot see
+   * past): the harvest input was filtered by trust and quarantine when it was
+   * built, and either can change meanwhile. `false` ends the harvest with a
+   * retryable stream error instead of sending the stale input.
+   */
+  beforeDispatch?: () => Promise<boolean>;
   /**
    * Best-effort cost telemetry: headless harvest bypasses the chat cost
    * pipeline, so the caller records each clean chunk stream's full usage
@@ -265,7 +277,16 @@ export async function runMemoryHarvest(args: {
   const streamErrors: string[] = [];
   let usage: MemoryHarvestResult["usage"];
   for (const [index, chunk] of chunks.entries()) {
+    if (args.beforeDispatch !== undefined && !(await args.beforeDispatch())) {
+      streamErrors.push(HARVEST_INPUT_STALE_MESSAGE);
+      break;
+    }
     activeEvidenceIds = chunk.evidenceIds;
+    // Per-step gate outcome. A throw inside prepareStep is swallowed by the
+    // SDK's step loop (logged, no error part), so the gate aborts the stream
+    // and flags the chunk instead; the flag decides the outcome below.
+    let stale = false;
+    const gate = new AbortController();
     const stream = streamText({
       model: args.model,
       system: args.agentBody,
@@ -276,12 +297,29 @@ export async function runMemoryHarvest(args: {
         `Transcript chunk ${index + 1}/${chunks.length} as JSON evidence rows:\n${chunk.transcript}`,
       tools: { submit_memory_candidates: submitCandidates },
       stopWhen: stepCountIs(HARVEST_MAX_STEPS),
-      abortSignal: args.abortSignal,
+      abortSignal:
+        args.abortSignal === undefined
+          ? gate.signal
+          : AbortSignal.any([args.abortSignal, gate.signal]),
+      // Each chunk is a multi-step tool loop: the gate runs again before every
+      // provider step, so a revocation after the first step stops the next
+      // request instead of retransmitting the input.
+      prepareStep:
+        args.beforeDispatch === undefined
+          ? undefined
+          : async () => {
+              if (!stale && !(await args.beforeDispatch!())) {
+                stale = true;
+                gate.abort(new Error(HARVEST_INPUT_STALE_MESSAGE));
+              }
+              return undefined;
+            },
     });
 
     await stream.consumeStream({
       onError: (error) => streamErrors.push(getErrorMessage(error)),
     });
+    if (stale) streamErrors.unshift(HARVEST_INPUT_STALE_MESSAGE);
     if (streamErrors.length > 0) break;
 
     try {

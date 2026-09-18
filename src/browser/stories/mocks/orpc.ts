@@ -160,6 +160,8 @@ export interface MockORPCClientOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** Agent definitions to expose via agents.list */
   agentDefinitions?: AgentDefinitionDescriptor[];
+  /** Initial model classes for config.getConfig (Settings → Models → Model Classes) */
+  modelClasses?: Record<string, string>;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   /** What to do with xum-managed worktrees when archiving a chat. */
@@ -415,6 +417,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
     agentAiDefaults: initialAgentAiDefaults,
+    modelClasses: initialModelClasses,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
@@ -660,6 +663,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   };
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
+  let modelClasses: Record<string, string> | undefined = initialModelClasses;
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -795,6 +799,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           runtimeEnablement,
           defaultRuntime,
           agentAiDefaults,
+          modelClasses,
           muxGovernorUrl,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
@@ -844,6 +849,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateAgentAiDefaults: (input: { agentAiDefaults: unknown }) => {
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateModelClass: (input: { className: string; model: string | null }) => {
+        const merged = { ...modelClasses };
+        if (input.model == null) {
+          delete merged[input.className];
+        } else {
+          merged[input.className] = input.model;
+        }
+        modelClasses = Object.keys(merged).length > 0 ? merged : undefined;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

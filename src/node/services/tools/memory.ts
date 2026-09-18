@@ -1,3 +1,4 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -89,6 +90,9 @@ export function memoryScopeContextFromToolConfig(config: ToolConfiguration): Mem
     // so "" disables project-keyed memory (same resolution as
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
+    ...(config.memoryWriteCarriesProjectSkillContent === true
+      ? { writeProvenance: { carriesProjectSkillContent: true as const } }
+      : {}),
   };
 }
 
@@ -102,7 +106,16 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   assert(memoryService != null, "memory tool requires config.memoryService");
   const access = config.memoryAccess ?? READ_ONLY_ACCESS;
 
-  const ctx = memoryScopeContextFromToolConfig(config);
+  const baseCtx = memoryScopeContextFromToolConfig(config);
+  // Write provenance can also arise DURING the turn: a view of a file carrying
+  // project skill provenance puts that content in the model's context, so
+  // every later write of this tool instance (one provider request) inherits
+  // it — the assembly-time flag alone would let a view-then-create launder it.
+  let contextTainted = baseCtx.writeProvenance?.carriesProjectSkillContent === true;
+  const commandCtx = (): MemoryScopeContext =>
+    contextTainted || config.projectSkillContentInContext?.() === true
+      ? { ...baseCtx, writeProvenance: { carriesProjectSkillContent: true as const } }
+      : baseCtx;
   // Normalized once so trailing slashes or whitespace in a call cannot bypass the pin.
   const writePath = config.memoryWritePath;
   const writePin = writePath != null ? parseMemoryPath(writePath) : null;
@@ -197,7 +210,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
           const result =
             checkWriteAccess(input.path!) ??
             (await memoryService.writePinnedFile(
-              ctx,
+              commandCtx(),
               input.path!,
               input.command === "create"
                 ? { command: "create", fileText: input.file_text! }
@@ -218,7 +231,17 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
           return result;
         }
       }
-      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId);
+      const result = await executeMemoryCommand(
+        memoryService,
+        commandCtx(),
+        input,
+        checkWriteAccess,
+        toolCallId,
+        // Re-evaluated per call: a routed turn's trust can be revoked mid-turn.
+        { excludeProjectSkillContent: await toolExcludesProjectSkillContent(config) }
+      );
+      if (result.success && result.carriesProjectSkillContent === true) contextTainted = true;
+      return result;
     },
   });
 };
@@ -261,6 +284,8 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
+    /** See ToolConfiguration.excludeProjectSkillContent. */
+    excludeProjectSkillContent?: boolean;
     /**
      * Consolidation's pin protection (pinned files are editable but never
      * deleted/renamed), enforced by MemoryService INSIDE its target mutation
@@ -279,6 +304,7 @@ export async function executeMemoryCommand(
         return await memoryService.view(ctx, input.path, {
           offset: input.offset ?? undefined,
           limit: input.limit ?? undefined,
+          excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
         });
       }
       case "create": {

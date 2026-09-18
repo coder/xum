@@ -189,6 +189,40 @@ describe("runMemoryHarvest", () => {
     }
   });
 
+  it("re-verifies before every provider step and drops the chunk when trust changes mid-loop", async () => {
+    // The pre-chunk check passes; the model's tool-call step makes the loop
+    // continue, and the gate runs again before that next request.
+    using fixture = createFixture();
+    let checks = 0;
+    const result = await runMemoryHarvest({
+      model: modelFromChunks([
+        harvestToolCall([
+          {
+            category: "preference",
+            memoryText: "The user prefers concise tests.",
+            evidenceMessageIds: ["m1"],
+            confidence: 0.95,
+            rationale: "The user stated this as a durable preference.",
+          },
+        ]),
+        toolFinishChunk(),
+      ]),
+      agentBody: "Harvest durable memories from the transcript.",
+      memoryService: fixture.memoryService,
+      ctx: fixture.ctx,
+      completionMetadata: fixture.metadata,
+      messages: fixture.messages,
+      summary: fixture.summary,
+      // pre-chunk + first step pass; the second provider step is refused.
+      beforeDispatch: () => Promise.resolve(++checks < 3),
+    });
+    expect(checks).toBeGreaterThanOrEqual(3);
+    expect(result.streamError).toContain("harvest input changed before dispatch");
+    expect((await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).success).toBe(
+      false
+    );
+  });
+
   it("rejects low-confidence, out-of-evidence, and secret-looking candidates", async () => {
     using fixture = createFixture();
 

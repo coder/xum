@@ -9,7 +9,8 @@ import type { CompactionFollowUpRequest, MuxMessageMetadata } from "@/common/typ
 import type { LoadedSkillSnapshot, PostCompactionAttachment } from "@/common/types/attachment";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
-import type { AgentSessionStreamManager } from "../agentSession";
+import type { AgentSessionStreamManager, RoutedConsentRejection } from "../agentSession";
+import type { MuxMessage } from "@/common/types/message";
 import type { TurnCoordinator } from "../turnCoordinator";
 import type { TurnAcceptanceOrigin } from "../taskWorkspaceSeam";
 import type {
@@ -81,7 +82,39 @@ export interface SessionContextHost {
     request: ContextDispatchRequest,
     continuation: CompactionContinuation
   ): Promise<void>;
-  dispatchPendingFollowUp(summaryId: string | null, admissionStale: () => boolean): Promise<void>;
+  dispatchPendingFollowUp(
+    summaryId: string | null,
+    admissionStale: () => boolean,
+    /** The interrupted routed stream's own gate when the dispatch still has it in hand. */
+    inheritedConsentRejection?: RoutedConsentRejection
+  ): Promise<void>;
+  /**
+   * Durably stamped and quarantined rejected rows: the compaction handler keeps
+   * them out of carried-over pending state, the compactor out of its heads.
+   */
+  getQuarantinedRowIds(): ReadonlySet<string>;
+  /**
+   * Provider-facing copy of continuous-compaction rows (the summarizer's head,
+   * the swapped prefix's sources): rejected rows never ride it, and during a
+   * ROUTED turn an untrusted workspace's project skill content is withheld the
+   * way the routed request's own assembly withholds it. Null: the compactor
+   * stands down (see AgentSession.prepareContinuousCompactionRows).
+   */
+  prepareContinuousCompactionRows(
+    rows: MuxMessage[],
+    routedTurn: boolean
+  ): Promise<{
+    rows: MuxMessage[];
+    trustedProjectContent: boolean;
+    projectContentWithheld: boolean;
+  } | null>;
+  /** Dispatch-time recheck of prepareContinuousCompactionRows' verdict. */
+  continuousCompactionRowsStillEligible(prepared: {
+    rows: MuxMessage[];
+    trustedProjectContent: boolean;
+  }): Promise<boolean>;
+  /** Request-copy filter for rejected rows (the swapped prefix is rebuilt from history). */
+  excludeRejectedRows(rows: MuxMessage[]): MuxMessage[];
   buildAttachments(input: {
     diffs: FileEditDiff[];
     loadedSkills: LoadedSkillSnapshot[];

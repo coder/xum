@@ -213,6 +213,32 @@ export interface ToolConfiguration {
    * (context-budget flush turns may only write the workspace context notes).
    */
   memoryWritePath?: string;
+  /**
+   * Memory writes of this turn are made with project skill content in the
+   * model's context; MemoryService records the provenance in its sidecar so
+   * routed requests after a Project Trust revocation can withhold the files.
+   */
+  memoryWriteCarriesProjectSkillContent?: boolean;
+  /**
+   * Live per-stream counterpart of memoryWriteCarriesProjectSkillContent: true once a step of
+   * THIS stream carried project skill content (a project skill read in an earlier step), so a
+   * memory write in a later step records the provenance even though the pre-stream rows were clean.
+   */
+  projectSkillContentInContext?: () => boolean;
+  /**
+   * Routed turn without Project Trust: reads of project skill content are
+   * refused or left out — `memory view` of a file carrying (or of unknown)
+   * provenance, tainted entries of the intuition index and directory
+   * listings, tainted session_history rows.
+   */
+  excludeProjectSkillContent?: boolean;
+  /**
+   * Routed turn under trust: re-reads Project Trust at a tool call (see
+   * toolExcludesProjectSkillContent) — a revocation between request assembly
+   * and a tool that dispatches to another provider or reads history cannot
+   * wait for the next step's consent gate. Undefined for unrouted turns.
+   */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */

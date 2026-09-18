@@ -23,6 +23,8 @@ export function buildAutoCompactionFollowUp(params: {
   goalId?: string;
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /** The interrupted stream ran with a routed consent gate (see CompactionFollowUpRequest). */
+  routedProjectConsent?: boolean;
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
@@ -53,6 +55,10 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.workspaceTurnMetadata) {
     followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
+  }
+
+  if (params.routedProjectConsent === true) {
+    followUp.routedProjectConsent = true;
   }
 
   return followUp;

@@ -41,11 +41,12 @@ import {
   normalizeUsage,
 } from "@/common/utils/tokens/usageHelpers";
 import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import type {
-  MemoryIndexEntry,
-  MemoryReadFileResult,
-  MemoryScopeContext,
-  MemoryService,
+import {
+  MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  type MemoryIndexEntry,
+  type MemoryReadFileResult,
+  type MemoryScopeContext,
+  type MemoryService,
 } from "./memoryService";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
@@ -186,7 +187,12 @@ export async function classifyIntuitionReport(args: {
 }
 
 export type MemoryIntuitionResult =
-  | ({ kind: "report"; stats: IntuitionStats } & ClassifiedMemories)
+  | ({
+      kind: "report";
+      stats: IntuitionStats;
+      /** A recognized memory or lead carries project skill provenance (sidecar). */
+      carriesProjectSkillContent: boolean;
+    } & ClassifiedMemories)
   | { kind: "no_report"; stats: IntuitionStats }
   | { kind: "error"; message: string; stats: IntuitionStats };
 
@@ -298,6 +304,10 @@ async function authorizeIntuitionIndex(
   return authorized.filter((entry): entry is MemoryIndexEntry => entry !== undefined);
 }
 
+/** Intuition aborted: Project Trust was revoked while the selected index still carried project skill content. */
+export const INTUITION_INPUT_STALE_MESSAGE =
+  "intuition input changed before dispatch (Project Trust); retry";
+
 /** Headless, read-only recall. The public tool records recalls only for recognized paths it returns. */
 export async function runMemoryIntuition(args: {
   createModel: () => Promise<IntuitionModel>;
@@ -309,6 +319,18 @@ export async function runMemoryIntuition(args: {
   ctx: MemoryScopeContext;
   cue: string;
   abortSignal?: AbortSignal;
+  /**
+   * Routed turn without Project Trust: memories carrying (or of unknown)
+   * project skill provenance stay out of the index the intuition model sees
+   * and therefore out of its reads (reads are bound to the selected index).
+   */
+  excludeProjectSkillContent?: boolean;
+  /**
+   * Routed turn under trust: trust re-read right before the intuition prompt
+   * is built and before every provider step (index loading, hooks, model
+   * creation and body loading are all revocation windows).
+   */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   recordUsage?: (
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>,
@@ -347,7 +369,9 @@ export async function runMemoryIntuition(args: {
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS);
     let selection = selectIndexForCue(
-      await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx)),
+      (await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx))).filter(
+        (entry) => args.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+      ),
       cue
     );
     stats.indexEntriesConsidered = selection.indexEntriesConsidered;
@@ -381,7 +405,30 @@ export async function runMemoryIntuition(args: {
     const body = await untilAborted(signal, args.resolveAgentBody);
     if (!body?.trim())
       return { kind: "error", message: "Intuition agent definition is missing", stats };
+    // Trust can be revoked during the awaits above: re-read it right before the
+    // prompt is built (and again before every provider step below), narrowing
+    // the index to files without project skill provenance.
+    const excludeAtDispatch = async (): Promise<boolean> =>
+      args.excludeProjectSkillContent === true ||
+      (args.projectSkillContentStillReadable !== undefined &&
+        !(await args.projectSkillContentStillReadable()));
+    if (
+      selection.entries.some((entry) => entry.carriesProjectSkillContent) &&
+      (await excludeAtDispatch())
+    ) {
+      selection = selectIndexForCue(
+        selection.entries.filter((entry) => !entry.carriesProjectSkillContent),
+        cue
+      );
+      if (selection.entries.length === 0) return { kind: "no_report", stats };
+    }
     const allowed = new Set(selection.entries.map((entry) => entry.path));
+    // Paths whose LIVE provenance carried project skill content when their
+    // content was delivered to the provider: the index snapshot above is stale
+    // by then (another workspace can replace a selected clean memory with
+    // project-derived content), so the read's own verdict gates the provider
+    // and classifies the report, not the snapshot.
+    const taintedPaths = new Set<string>();
     const physicalReads = new Map<string, Promise<MemoryReadFileResult>>();
     let reservedBytes = 0;
     let returnedBytes = 0;
@@ -412,7 +459,9 @@ export async function runMemoryIntuition(args: {
             read = Promise.resolve()
               .then(async (): Promise<MemoryReadFileResult> => {
                 if (signal.aborted) return { success: false, error: "Intuition aborted" };
-                const result = await args.memoryService.readFileWithSha(args.ctx, currentPath);
+                const result = await args.memoryService.readFileWithSha(args.ctx, currentPath, {
+                  withProvenance: true,
+                });
                 stats.bytesRead += result.success
                   ? Buffer.byteLength(result.data.content)
                   : reservation;
@@ -426,6 +475,15 @@ export async function runMemoryIntuition(args: {
           }
           const result = await read;
           if (!result.success) return result;
+          if (result.data.carriesProjectSkillContent === true) {
+            // Refused under exclusion — nothing of it reaches the provider, so
+            // the loop continues on the other memories. Delivered under trust,
+            // the path is tainted: a later revocation aborts the loop before
+            // the next step and the report inherits the provenance.
+            if (await excludeAtDispatch())
+              return { success: false, error: MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE };
+            taintedPaths.add(currentPath);
+          }
           const content = result.data.content;
           rawContent = content;
           const start = (current.offset ?? 1) - 1;
@@ -471,6 +529,7 @@ export async function runMemoryIntuition(args: {
     };
     const report: { items?: IntuitionReportToolArgs["items"] } = {};
     const errors: string[] = [];
+    let stale = false;
     assert(typeof model !== "string", "intuition requires a pinned model instance");
     const stream = streamText({
       model: wrapLanguageModel({
@@ -546,6 +605,21 @@ export async function runMemoryIntuition(args: {
         }),
       },
       stopWhen: [stepCountIs(MEMORY_INTUITION_MAX_STEPS), hasToolCall("intuition_report")],
+      // Per provider step: a revocation mid-loop must not ship the (still
+      // tainted) index and reads on the next request. A throw here would be
+      // swallowed by the SDK's step loop, so the gate aborts and flags instead.
+      prepareStep: async () => {
+        if (
+          !stale &&
+          (selection.entries.some((entry) => entry.carriesProjectSkillContent) ||
+            taintedPaths.size > 0) &&
+          (await excludeAtDispatch())
+        ) {
+          stale = true;
+          abort();
+        }
+        return undefined;
+      },
       maxOutputTokens: MEMORY_INTUITION_MAX_OUTPUT_TOKENS,
       maxRetries: 0,
       abortSignal: signal,
@@ -576,6 +650,7 @@ export async function runMemoryIntuition(args: {
     } catch (error) {
       errors.push(getErrorMessage(error));
     }
+    if (stale) return { kind: "error", message: INTUITION_INPUT_STALE_MESSAGE, stats };
     const classified =
       report.items === undefined
         ? undefined
@@ -584,7 +659,17 @@ export async function runMemoryIntuition(args: {
             entries: selection.entries,
             readFile: readMemoryView,
           });
-    if (classified) return { kind: "report", ...classified, stats };
+    if (classified) {
+      // Provenance of what the report carries (excerpts and leads alike): the
+      // routed turn's consent gate arms on it.
+      const entryByPath = new Map(selection.entries.map((entry) => [entry.path, entry]));
+      const carriesProjectSkillContent = [...classified.memories, ...classified.candidates].some(
+        (item) =>
+          entryByPath.get(item.path)?.carriesProjectSkillContent === true ||
+          taintedPaths.has(item.path)
+      );
+      return { kind: "report", ...classified, carriesProjectSkillContent, stats };
+    }
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
     return { kind: "no_report", stats };
   } catch (error) {

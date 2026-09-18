@@ -521,6 +521,12 @@ export interface BoundedHistoryScanOptions {
   recentFirst?: boolean;
   /** Return false to leave this row unconsumed for the next page. */
   visit: (row: BoundedHistoryRow) => boolean;
+  /**
+   * A row skipped as oversized (never parsed, so never visited) still
+   * belongs to a window: callers that track per-window provenance must treat
+   * such a row as unclassifiable rather than absent.
+   */
+  onOversizedRow?: (row: { windowId: string }) => void;
 }
 export interface BoundedHistoryScanResult {
   cursor?: HistoryScanState;
@@ -966,7 +972,9 @@ export async function scanHistoryFilesBounded(
         true,
         state.snapshots[artifact].endOffsetSnapshot,
         lower,
-        (message, start, _finish, _oversized, _possibleReset, raw) => {
+        (message, start, _finish, oversized, _possibleReset, raw) => {
+          if (oversized && span.windowId !== null)
+            options.onOversizedRow?.({ windowId: span.windowId });
           if (!message) return true;
           assert(raw, "readable browse rows retain their bounded raw bytes");
           // Unaddressable windows are consumed silently, as in the forward walk.
@@ -1039,7 +1047,7 @@ export async function scanHistoryFilesBounded(
         reverse,
         end,
         0,
-        (message, start, finish, _oversized, possibleReset, raw) => {
+        (message, start, finish, oversized, possibleReset, raw) => {
           if (reverse) {
             // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
@@ -1056,6 +1064,11 @@ export async function scanHistoryFilesBounded(
               return false;
             }
             return true;
+          }
+          // An oversized row cannot be a boundary (never parsed), so it sits in
+          // the current window.
+          if (oversized && state.windowId !== null) {
+            options.onOversizedRow?.({ windowId: state.windowId });
           }
           if (!message) return true;
           assert(raw, "readable browse rows retain their bounded raw bytes");

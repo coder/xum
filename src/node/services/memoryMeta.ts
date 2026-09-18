@@ -17,6 +17,7 @@ import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /**
  * Escape the ':' separator (and the escape character itself) inside a key
@@ -63,6 +64,27 @@ export interface MemoryMetaEntry {
   accessCount: number;
   lastAccessedAt: number | null;
   lastWriteAt: number | null;
+  /**
+   * Provenance: the file was written while repository-controlled PROJECT
+   * skill content was in the writer's context — a harvest inbox distilled
+   * from a trusted project-skill epoch, a consolidation sweep over such an
+   * inbox, a chat turn whose request carried it. Sticky for the file's life
+   * (pins and stats follow renames). Routed requests after a Project Trust
+   * revocation withhold such memories (MemoryScopeContext.writeProvenance,
+   * MemorySessionContext.carriesProjectSkillContent).
+   *
+   * Tri-state: `true` tainted, `false` verified clean (the file's whole
+   * content was written by this build with a clean context), ABSENT unknown —
+   * a legacy entry or file nobody classified, treated as tainted
+   * (memoryEntryCarriesProjectSkillContent). Edits keep the state; only a
+   * full-content clean write can establish `false`.
+   */
+  carriesProjectSkillContent?: boolean;
+}
+
+/** Unknown provenance is tainted: only a verified-clean entry reads as clean. */
+export function memoryEntryCarriesProjectSkillContent(entry: MemoryMetaEntry | undefined): boolean {
+  return entry?.carriesProjectSkillContent !== false;
 }
 
 function maxTimestamp(a: number | null, b: number | null): number | null {
@@ -83,7 +105,8 @@ function isEmptyEntry(entry: MemoryMetaEntry): boolean {
     !entry.pinned &&
     entry.accessCount === 0 &&
     entry.lastAccessedAt === null &&
-    entry.lastWriteAt === null
+    entry.lastWriteAt === null &&
+    entry.carriesProjectSkillContent === undefined
   );
 }
 
@@ -118,6 +141,10 @@ function sanitizeMetaFile(raw: unknown): MemoryMetaFile {
       accessCount: sanitizeCount(record.accessCount),
       lastAccessedAt: sanitizeTimestamp(record.lastAccessedAt),
       lastWriteAt: sanitizeTimestamp(record.lastWriteAt),
+      // Legacy entries carry no marker: unknown, never coerced to clean.
+      ...(typeof record.carriesProjectSkillContent === "boolean"
+        ? { carriesProjectSkillContent: record.carriesProjectSkillContent }
+        : {}),
     };
     if (isEmptyEntry(entry)) continue;
     entries[key] = entry;
@@ -142,6 +169,9 @@ export class MemoryMetaWriteError extends Schema.TaggedError<MemoryMetaWriteErro
   }
 ) {}
 
+/** Cross-process sidecar lock wait; the critical section is one small read + atomic write. */
+const MEMORY_META_LOCK_TIMEOUT_MS = 5_000;
+
 export class MemoryMetaService {
   private readonly metaPath: string;
   /**
@@ -151,7 +181,6 @@ export class MemoryMetaService {
    * waiting for the permit never runs its critical section.
    */
   private readonly writeLock = Semaphore.makeUnsafe(1);
-  private cache: MemoryMetaFile | null = null;
 
   /**
    * Effect-native API. The Promise methods below are thin `Effect.runPromise`
@@ -201,17 +230,42 @@ export class MemoryMetaService {
     /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
     recordAccess: (
       logicalKey: string,
-      options: { write: boolean }
+      options: { write: boolean; carriesProjectSkillContent?: boolean; replacesContent?: boolean }
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
         const current = entries[logicalKey] ?? EMPTY_ENTRY;
         const now = Date.now();
+        // A tainted write marks the file for good; a clean write that
+        // REPLACES the whole content (create, UI save) verifies it clean;
+        // reads and edits keep the state — an edited legacy file stays unknown.
+        const provenance =
+          current.carriesProjectSkillContent === true ||
+          (options.write && options.carriesProjectSkillContent === true)
+            ? true
+            : options.write && options.replacesContent === true
+              ? false
+              : current.carriesProjectSkillContent;
         entries[logicalKey] = {
           ...current,
           accessCount: current.accessCount + 1,
           lastAccessedAt: now,
           lastWriteAt: options.write ? now : current.lastWriteAt,
+          ...(provenance === undefined ? {} : { carriesProjectSkillContent: provenance }),
         };
+      }),
+
+    /**
+     * Provenance-only marker for a write about to land from a context that
+     * carries project skill content, committed BEFORE the content: the
+     * post-write stats update is best-effort, and a marker that failed to
+     * persist would leave tainted content beside a verified-clean marker.
+     */
+    markCarriesProjectSkillContent: (
+      logicalKey: string
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        const current = entries[logicalKey] ?? EMPTY_ENTRY;
+        entries[logicalKey] = { ...current, carriesProjectSkillContent: true };
       }),
 
     /**
@@ -223,6 +277,12 @@ export class MemoryMetaService {
       newLogicalKey: string
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
+        // The destination subtree is cleared first: a stale entry left there
+        // by an external or crashed deletion (a verified-clean marker, say)
+        // must not survive beside content whose own provenance is unknown.
+        for (const key of Object.keys(entries)) {
+          if (keyInSubtree(key, newLogicalKey)) delete entries[key];
+        }
         for (const [key, entry] of Object.entries(entries)) {
           if (!keyInSubtree(key, oldLogicalKey)) continue;
           delete entries[key];
@@ -279,10 +339,12 @@ export class MemoryMetaService {
   }
 
   /**
-   * Load + cache the sidecar. The error channel is `never` by design, not an
-   * oversight: per the self-healing rule, a missing or unreadable sidecar must
-   * never brick memory routes, so read failures degrade to "no metadata"
-   * (logged for diagnosis) and only writes can fail.
+   * Read the sidecar from disk. Never cached: several backends can share one
+   * Xum home, and a cached copy would let this process treat a file another
+   * process marked as carrying project skill content as clean. The error
+   * channel is `never` by design: per the self-healing rule, a missing or
+   * unreadable sidecar must never brick memory routes, so read failures
+   * degrade to "no metadata" (logged for diagnosis) and only writes can fail.
    */
   private load(): Effect.Effect<MemoryMetaFile> {
     return Effect.map(this.loadWithHealth(), (loaded) => loaded.meta);
@@ -291,51 +353,43 @@ export class MemoryMetaService {
   /**
    * `load()` plus whether this view is a healed substitute for a sidecar that
    * exists but could not be read. Reads may serve that substitute; a mutation
-   * must not (see mutate()).
+   * must not (see mutateLocked()). Read fresh from disk every time (see load()).
    */
   private loadWithHealth(): Effect.Effect<{ meta: MemoryMetaFile; readFailed: boolean }> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
-    const self = this;
-    return Effect.gen(function* () {
-      if (self.cache !== null) return { meta: self.cache, readFailed: false };
-      let readFailed = false;
-      const raw = yield* Effect.tryPromise({
-        try: (): Promise<string | null> => fsPromises.readFile(self.metaPath, "utf-8"),
-        catch: (error) => error,
-      }).pipe(
-        Effect.catch((error) => {
-          // Missing file is the normal first-run case; anything else is healed to empty.
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
-            readFailed = true;
-          }
-          return Effect.succeed<string | null>(null);
-        })
-      );
-      let parsed: unknown = null;
-      if (raw !== null) {
-        try {
-          parsed = JSON.parse(raw);
-        } catch (error) {
-          // Corrupt content (unlike a failed read) IS the file's state: healing
-          // it to empty and letting the next mutation rewrite it is the fix.
-          log.debug("[MemoryMetaService] healing corrupt sidecar", { error });
-        }
+    return Effect.promise(() => this.loadFromDisk());
+  }
+
+  private async loadFromDisk(): Promise<{ meta: MemoryMetaFile; readFailed: boolean }> {
+    let raw: string | null = null;
+    let readFailed = false;
+    try {
+      raw = await fsPromises.readFile(this.metaPath, "utf-8");
+    } catch (error) {
+      // Missing file is the normal first-run case; anything else is healed to empty.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
+        readFailed = true;
       }
-      const meta = sanitizeMetaFile(parsed);
-      // A transiently unreadable sidecar (EACCES interval, a writer mid-swap)
-      // heals to empty for THIS call only: caching that empty view would keep
-      // serving it once readable again — and the next mutation would write
-      // the pins and stats away.
-      if (!readFailed) self.cache = meta;
-      return { meta, readFailed };
-    });
+    }
+    let parsed: unknown = null;
+    if (raw !== null) {
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        // Corrupt content (unlike a failed read) IS the file's state: healing
+        // it to empty and letting the next mutation rewrite it is the fix.
+        log.debug("[MemoryMetaService] healing corrupt sidecar", { error });
+      }
+    }
+    return { meta: sanitizeMetaFile(parsed), readFailed };
   }
 
   /**
-   * Read-modify-write cycle under the sidecar semaphore. Persists before
-   * updating the in-memory cache so observers never see state that didn't make
-   * it to disk. Entries that end up entirely default are dropped.
+   * Read-modify-write cycle under the in-process semaphore AND the
+   * cross-process sidecar lock: the current file is re-read inside the lock,
+   * so a marker another backend persisted meanwhile (a file stamped as
+   * carrying project skill content) is folded in, never overwritten from a
+   * stale copy. Entries that end up entirely default are dropped.
    */
   private mutate(
     update: (entries: Record<string, MemoryMetaEntry>) => void
@@ -343,49 +397,44 @@ export class MemoryMetaService {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return this.writeLock.withPermit(
-      Effect.gen(function* () {
-        const { meta, readFailed } = yield* self.loadWithHealth();
-        // A read that healed to empty is fine to serve, but rewriting the
-        // sidecar from it would erase every existing pin and usage stat the
-        // moment the file becomes readable again. Fail the mutation instead;
-        // the caller retries on a later call, which re-reads.
-        if (readFailed) {
-          return yield* Effect.fail(
-            new MemoryMetaWriteError({
-              metaPath: self.metaPath,
-              reason: "sidecar exists but could not be read; refusing to overwrite it",
-            })
-          );
-        }
-        const entries = { ...meta.entries };
-        update(entries);
-        for (const [key, entry] of Object.entries(entries)) {
-          if (isEmptyEntry(entry)) delete entries[key];
-        }
-        const next: MemoryMetaFile = { entries };
-        // The atomic write cannot be cancelled once started, so the write and
-        // the cache update form one uninterruptible unit: a fiber interrupted
-        // mid-write (e.g. client abort) must still reconcile the in-memory
-        // cache with what landed on disk. Otherwise the next mutation would
-        // rebuild disk state from a stale cache and silently lose this write.
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* Effect.tryPromise({
-              try: () =>
-                writeFileAtomic(self.metaPath, JSON.stringify(next, null, 2), {
-                  encoding: "utf-8",
-                }),
-              catch: (cause) =>
-                new MemoryMetaWriteError({
-                  metaPath: self.metaPath,
-                  reason: getErrorMessage(cause),
-                }),
-            });
-            self.cache = next;
-          })
-        );
+      Effect.tryPromise({
+        try: () => self.mutateLocked(update),
+        catch: (cause) =>
+          cause instanceof MemoryMetaWriteError
+            ? cause
+            : new MemoryMetaWriteError({ metaPath: self.metaPath, reason: getErrorMessage(cause) }),
       })
     );
+  }
+
+  private async mutateLocked(update: (entries: Record<string, MemoryMetaEntry>) => void) {
+    await using _lock = await acquireProcessFileLock({
+      lockPath: `${this.metaPath}.lock`,
+      timeoutMs: MEMORY_META_LOCK_TIMEOUT_MS,
+      label: "memory sidecar lock",
+    });
+    const { meta, readFailed } = await this.loadFromDisk();
+    // A read that healed to empty is fine to serve, but rewriting the sidecar
+    // from it would erase every existing pin and usage stat the moment the
+    // file becomes readable again. Fail the mutation instead; the caller
+    // retries on a later call, which re-reads.
+    if (readFailed) {
+      throw new MemoryMetaWriteError({
+        metaPath: this.metaPath,
+        reason: "sidecar exists but could not be read; refusing to overwrite it",
+      });
+    }
+    const entries = { ...meta.entries };
+    update(entries);
+    for (const [key, entry] of Object.entries(entries)) {
+      if (isEmptyEntry(entry)) delete entries[key];
+    }
+    const next: MemoryMetaFile = { entries };
+    try {
+      await writeFileAtomic(this.metaPath, JSON.stringify(next, null, 2), { encoding: "utf-8" });
+    } catch (cause) {
+      throw new MemoryMetaWriteError({ metaPath: this.metaPath, reason: getErrorMessage(cause) });
+    }
   }
 
   // Legacy Promise facade — signatures unchanged for pre-Effect callers.
@@ -422,8 +471,16 @@ export class MemoryMetaService {
   }
 
   /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
-  async recordAccess(logicalKey: string, options: { write: boolean }): Promise<void> {
+  async recordAccess(
+    logicalKey: string,
+    options: { write: boolean; carriesProjectSkillContent?: boolean; replacesContent?: boolean }
+  ): Promise<void> {
     await Effect.runPromise(this.effects.recordAccess(logicalKey, options));
+  }
+
+  /** Commit the tainted-provenance marker ahead of the content write (see effects). */
+  async markCarriesProjectSkillContent(logicalKey: string): Promise<void> {
+    await Effect.runPromise(this.effects.markCarriesProjectSkillContent(logicalKey));
   }
 
   /**

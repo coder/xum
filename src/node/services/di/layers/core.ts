@@ -616,6 +616,12 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    // Rejected-row quarantine reaches the dream-harvest boundary (r-consent):
+    // WorkspaceService owns the per-session sets. Wired in the shared core so
+    // headless `xum run` harvests honor it like the desktop does.
+    memoryConsolidationService.setQuarantinedRowIdsLookup((workspaceId) =>
+      workspaceService.getQuarantinedRejectedRowIds(workspaceId)
+    );
     workspaceService.setSharedWorkspaceMemoryStore(memoryService);
     // Workspace-scope change events carry the memory OWNER (task-tree root);
     // every live session resolving to that owner reads the same notebook.
