@@ -957,6 +957,60 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, spawnedId)?.taskAttemptId).toBe(attemptId);
     });
 
+    test("while a producer's closing write is in flight the attempt reads cleanup-pending and refuses continuations", async () => {
+      const spawnedId = "closingwindow1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      spyOn(svc, "startReservedAgentTask").mockImplementation(() => new Promise(() => undefined));
+      const created = await taskService.createMany([
+        { parentWorkspaceId: rootId, kind: "agent", agentId: "explore", prompt: "p", title: "T" },
+      ]);
+      expect(created.success).toBe(true);
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      // Hold the launch-failure config write open: closure is recorded inside the updater, the
+      // in-memory settlement only after the write completes.
+      const gate = Promise.withResolvers<void>();
+      const originalEdit = config.editConfig.bind(config);
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator) => {
+        const result = await originalEdit(mutator);
+        await gate.promise;
+        return result;
+      });
+      const failing = svc.markTaskLaunchFailed(spawnedId, "fork failed");
+      const deadline = Date.now() + 2_000;
+      while (svc.attemptSettlementByTaskId.get(spawnedId)?.phase !== "closing") {
+        if (Date.now() > deadline) throw new Error("closure was not recorded");
+        await settle();
+      }
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "closing",
+      });
+      // Closing, not settled: the owned read is cleanup-pending (a bounded, observable state,
+      // not a lock wait) and a continuation is refused before any settlement exists.
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "cleanup-pending",
+      });
+      expect(
+        taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "automatic" })
+      ).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      gate.resolve();
+      await failing;
+      editSpy.mockRestore();
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "settled",
+      });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+    });
+
     test("an idle stop treats a pending admission as live and closes the attempt only once it is dispositioned", async () => {
       const taskId = "idle-stop-pending";
       const { config } = await setupTree([
