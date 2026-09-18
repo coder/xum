@@ -116,8 +116,8 @@ export interface ChatViewRevealState {
  * - Stale cached rows or an empty transcript hold the skeleton until caught-up,
  *   even with an active stream/monitor barrier: an active turn does not mean
  *   history has loaded, and painting rows that are known to be incomplete would
- *   jump when the missing content lands. The barrier keeps rendering in the tail
- *   lane below the skeleton so Stop stays reachable.
+ *   jump when the missing content lands. Live status stays in the composer dock
+ *   so Stop remains reachable without following the skeleton or history height.
  */
 export function computeChatViewReveal(inputs: ChatViewRevealInputs): ChatViewRevealState {
   const showHydrationPlaceholder =

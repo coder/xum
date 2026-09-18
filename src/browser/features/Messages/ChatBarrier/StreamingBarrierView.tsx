@@ -3,7 +3,6 @@ import { CircleStopIcon } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
-import { BaseBarrier } from "./BaseBarrier";
 
 export interface StreamingBarrierViewProps {
   statusText: string;
@@ -41,9 +40,18 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
   return (
     // @container scopes the narrow-hint query to the barrier's own width, so it
     // tracks the chat pane (which can be narrow on wide desktops), not the viewport.
-    <div className={`@container flex items-center justify-between gap-4 ${props.className ?? ""}`}>
-      <div className="flex flex-1 items-center gap-2">
-        <BaseBarrier text={props.statusText} color="var(--color-assistant-border)" animate />
+    <div
+      className={cn(
+        "@container grid min-h-10 grid-cols-[minmax(0,1fr)_auto] items-center gap-4",
+        props.className
+      )}
+    >
+      {/* A live status is left-anchored chrome, not a centered transcript divider.
+          Let long labels truncate and secondary stats yield before Stop is squeezed. */}
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="text-assistant-border min-w-0 animate-pulse truncate font-mono text-[10px] tracking-wide uppercase">
+          {props.statusText}
+        </span>
         {props.hintElement}
         {/* Render the stats slot for streaming-bound phases so the row geometry is
             identical across the starting -> streaming transition; only its visibility
@@ -55,7 +63,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
             data-testid="streaming-barrier-stats"
             aria-hidden={props.tokenCount === undefined}
             className={cn(
-              "text-assistant-border counter-nums-mono inline-flex min-w-[14ch] items-baseline justify-end text-[11px] whitespace-nowrap select-none",
+              "text-assistant-border counter-nums-mono hidden min-w-[14ch] shrink-0 @lg:inline-flex items-baseline justify-end text-[11px] whitespace-nowrap select-none",
               props.tokenCount === undefined && "invisible"
             )}
           >
@@ -68,7 +76,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
           </span>
         )}
       </div>
-      <div className="ml-auto">
+      <div className="flex items-center whitespace-nowrap">
         {props.onCancel && props.cancelText.length > 0 ? (
           <TooltipIfPresent tooltip={props.cancelShortcutText} side="top">
             <button
@@ -80,7 +88,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
               <CircleStopIcon className="h-3.5 w-3.5 shrink-0" strokeWidth={2.2} />
               <span className="ml-1 leading-none">Stop</span>
               {props.cancelShortcutText && (
-                <span className="border-border-medium text-muted ml-2 hidden items-center rounded border px-1 py-[1px] text-[10px] leading-none sm:inline-flex">
+                <span className="border-border-medium text-muted ml-2 hidden items-center rounded border px-1 py-[1px] text-[10px] leading-none @lg:inline-flex">
                   {props.cancelShortcutText}
                 </span>
               )}

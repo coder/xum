@@ -1102,7 +1102,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Keep rendering trustworthy cached transcript rows during incremental catch-up so
   // workspace switches feel stable; rows known to be missing backend content hide behind
   // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
-  // renders in the tail lane below the skeleton, so it never vetoes it. The skeleton
+  // lives in the composer dock, so it never vetoes the skeleton. The skeleton
   // additionally holds until decoration data sources are known so the transcript and all
   // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
   const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
@@ -1171,26 +1171,23 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     !showRetryBarrierUI &&
     lastRetryCandidateMessage != null &&
     interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
+  // Live status belongs beside the input, below async decorations: neither history
+  // reveal nor banners arriving should bump the label and Stop across the screen.
+  const turnStatus = shouldMountStreamingBarrier ? (
+    <ChatDockSurface>
+      <StreamingBarrier
+        workspaceId={workspaceId}
+        vimEnabled={vimEnabled}
+        onCancelCompaction={handleCancelCompactionFromBarrier}
+      />
+    </ChatDockSurface>
+  ) : null;
   const transcriptTailItems: TranscriptTailStackItem[] = [];
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
         key: "retry-barrier",
         node: <RetryBarrier workspaceId={workspaceId} visible={showRetryBarrierUI} />,
-      })
-    );
-  }
-  if (shouldMountStreamingBarrier) {
-    transcriptTailItems.push(
-      createTranscriptTailStackItem({
-        key: "streaming-barrier",
-        node: (
-          <StreamingBarrier
-            workspaceId={workspaceId}
-            vimEnabled={vimEnabled}
-            onCancelCompaction={handleCancelCompactionFromBarrier}
-          />
-        ),
       })
     );
   }
@@ -1708,9 +1705,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
                     // composer surface is replaced with a single read-only notice.
-                    <TranscriptOnlyNoticePane />
+                    <>
+                      {turnStatus}
+                      <TranscriptOnlyNoticePane />
+                    </>
                   ) : (
                     <ChatInputPane
+                      turnStatus={turnStatus}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1783,6 +1784,7 @@ const TranscriptOnlyNoticePane: React.FC = () => {
 };
 
 interface ChatInputPaneProps {
+  turnStatus: React.ReactNode;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
@@ -1946,6 +1948,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       <ChatInputDecorationStackLane
         items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
       />
+      {props.turnStatus}
       <ChatInput
         key={props.workspaceId}
         variant="workspace"
