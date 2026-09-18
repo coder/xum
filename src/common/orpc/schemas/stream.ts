@@ -865,12 +865,12 @@ export const ExperimentsSchema = z.preprocess(
 export const GoalInterventionPolicySchema = z.enum(["steer", "pause"]);
 
 /**
- * Content evidence for the range an edit deletes: the truncation target (the edited row or the
- * synthetic snapshot rows immediately preceding it, see `getEditTruncateTargetFromMessages`)
- * through the newest committed row, as the client held it when editing began. The backend
- * recomputes the same evidence over the rows it is about to delete, under the history write
- * lock, and refuses with `history-changed` on any difference (missing rows, extra rows,
- * rewritten rows, a different truncation target or a different newest row).
+ * Content evidence for the range an edit deletes: from the first committed row at or after the
+ * truncation target (the edited row or the synthetic snapshot rows immediately preceding it,
+ * see `getEditTruncateTargetFromMessages`) through the newest committed row, as the client
+ * held it when editing began. The backend recomputes the same evidence over its own view of
+ * history, under the history write lock, and refuses with `history-changed` on any difference
+ * (missing rows, extra rows, rewritten rows, a different range start or a different newest row).
  */
 export const HistoryEditPreconditionSchema = z.object({
   editMessageId: z.string().min(1),

@@ -39,11 +39,13 @@ export function getEditTruncateTargetFromMessages(
  * Content evidence for an edit over the wire rows a client holds when editing begins. The
  * truncation target is derived over EVERY row (a row with a malformed `historySequence` still
  * separates a snapshot from the edited message, exactly as it does for the backend's cut);
- * the fingerprint, newest row and row count then cover only committed rows — rows with a valid
- * `historySequence` (a missing or malformed one the wire schema still admits is not evidence;
- * see computeHistoryRangeFingerprint). The range runs from the truncation target through the
- * newest committed row. Returns `undefined` when the edited message is not held or the range
- * start is not committed: the caller cannot fence what it does not hold.
+ * the range then covers only committed rows — rows with a valid `historySequence` (a missing
+ * or malformed one the wire schema still admits is not evidence; see
+ * computeHistoryRangeFingerprint) — from the first committed row at or after the target
+ * through the newest committed row. A snapshot with a malformed sequence directly before the
+ * edited message is therefore cut without being evidence, like a wire-unparseable one.
+ * Returns `undefined` when the edited message is not held or nothing committed remains from
+ * the target on: the caller cannot fence what it does not hold.
  *
  * The backend verifies an edit by building the same evidence over its own wire projection of
  * history and comparing field by field, so both sides agree by construction.
@@ -52,13 +54,16 @@ export function buildHistoryEditPrecondition(
   messages: readonly MuxMessage[],
   editMessageId: string
 ): HistoryEditPrecondition | undefined {
-  const rangeStartMessageId = getEditTruncateTargetFromMessages(messages, editMessageId);
-  if (rangeStartMessageId === undefined) return undefined;
-  const committed = messages.filter((message) =>
-    isNonNegativeInteger(message.metadata?.historySequence)
-  );
-  const rangeStart = committed.find((message) => message.id === rangeStartMessageId);
+  const truncateTargetId = getEditTruncateTargetFromMessages(messages, editMessageId);
+  if (truncateTargetId === undefined) return undefined;
+  const targetIndex = messages.findIndex((message) => message.id === truncateTargetId);
+  assert(targetIndex !== -1, "the truncation target is one of the rows");
+  const isCommitted = (message: MuxMessage) =>
+    isNonNegativeInteger(message.metadata?.historySequence);
+  const committed = messages.filter(isCommitted);
+  const rangeStart = messages.slice(targetIndex).find(isCommitted);
   if (rangeStart === undefined) return undefined;
+  const rangeStartMessageId = rangeStart.id;
   assert(isNonNegativeInteger(rangeStart.metadata?.historySequence), "range start is committed");
   let newest = rangeStart;
   for (const message of committed) {

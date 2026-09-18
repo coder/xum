@@ -5742,7 +5742,7 @@ export function addEphemeralMessage(workspaceId: string, message: MuxMessage): v
   const store = getStoreInstance();
   const aggregator = store.getAggregator(workspaceId);
   if (aggregator) {
-    aggregator.addMessage(message);
+    aggregator.addEphemeralMessage(message);
     store.bumpState(workspaceId);
   }
 }

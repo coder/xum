@@ -2389,6 +2389,21 @@ describe("WorkspaceStore", () => {
         expect(store.captureHistoryEditPrecondition(workspaceId, "missing")).toBeUndefined();
       });
 
+      it("does not fence an ephemeral frontend-only row (a /plan show preview)", async () => {
+        const rows = [row("h1", 1), row("h2", 2)];
+        await hydrateRows(rows);
+        const before = store.captureHistoryEditPrecondition(workspaceId, "h2")!;
+        // Displayed with a far-future sequence so it sorts last; the backend never held it, so
+        // naming it as the newest row would refuse every edit while the preview is visible.
+        store.getAggregator(workspaceId)!.addEphemeralMessage({
+          id: "plan-display-preview",
+          role: "assistant",
+          parts: [{ type: "text", text: "# Plan" }],
+          metadata: { historySequence: Number.MAX_SAFE_INTEGER, timestamp: 9 },
+        });
+        expect(store.captureHistoryEditPrecondition(workspaceId, "h2")).toEqual(before);
+      });
+
       it("does not fence a pre-stream error's synthetic row, which has no persisted counterpart", async () => {
         const rows = [row("h1", 1), row("h2", 2)];
         await hydrateRows(rows);
