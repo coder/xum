@@ -21,6 +21,9 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
     <div className={props.className}>{props.children}</div>
   ),
   DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
+  DialogDescription: (props: { children: ReactNode; className?: string }) => (
+    <p className={props.className}>{props.children}</p>
+  ),
   DialogTitle: (props: { children: ReactNode; className?: string }) => (
     <h2 className={props.className}>{props.children}</h2>
   ),
