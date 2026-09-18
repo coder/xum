@@ -255,6 +255,32 @@ export const WorkspaceConfigSchema = z.object({
     .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
     .optional()
     .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
+  // Attempt identity is owned by the backend's task admissions: every admission that can start
+  // a publishing execution (reservation commit, queue launch, reawaken, reactivation, startup
+  // re-drive) rotates it in the same config write. Identity only — no other code branches on it.
+  taskAttemptId: z.string().optional().meta({
+    description:
+      "Opaque identity of the agent task's current execution attempt (att_ + 16 hex). Rotated by every admission and never reused; absent on entries written before attempt identity existed.",
+  }),
+  taskAttemptUnproven: z.literal(true).optional().meta({
+    description:
+      "Set when the attempt's lineage cannot be proven settled (startup re-drive, stale-starting relaunch, pre-upgrade entry, or reawakened from such an attempt). Inherited by every successor; cleared only by a new reservation.",
+  }),
+  taskAttemptRetiredBy: z
+    .object({
+      runId: z.string(),
+      stepId: z.string(),
+      inputHash: z.string(),
+      childTaskId: z.string(),
+      attemptId: z.string(),
+      mode: z.enum(["no-report", "retire-reported"]),
+      at: z.string(),
+    })
+    .optional()
+    .meta({
+      description:
+        "Monotonic workflow claim that retired this attempt for replacement. Never cleared; every later admission of the task refuses while it is set.",
+    }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +
