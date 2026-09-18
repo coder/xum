@@ -307,6 +307,25 @@ describe("useBoundedTranscriptReveal", () => {
     expect(result.current.fromIndex).toBe(initialFrom - TRANSCRIPT_REVEAL_CHUNK_ROWS);
   });
 
+  test("an empty transcript that fills starts tail-first, judged by the initial-tail limits", () => {
+    const frames = manualFrames();
+    let props = { workspaceId: "ws", messages: rows(0) };
+    const { result, rerender } = renderHook(() =>
+      useBoundedTranscriptReveal({
+        ...props,
+        isSafeCut: alwaysSafe,
+        scheduleFrame: frames.scheduleFrame,
+      })
+    );
+    expect(result.current.fromIndex).toBe(0);
+    // 50 rows fit one 60-row chunk but not the 40-row initial tail: the skeleton clearing must
+    // paint the tail, not everything at once.
+    props = { ...props, messages: rows(50) };
+    rerender();
+    expect(result.current.fromIndex).toBe(50 - TRANSCRIPT_REVEAL_TAIL_ROWS);
+    expect(result.current.isFullyRevealed).toBe(false);
+  });
+
   test("(j) across randomized appends, deletions and grouping changes, eligible ids only grow", () => {
     const frames = manualFrames();
     let seed = 7;

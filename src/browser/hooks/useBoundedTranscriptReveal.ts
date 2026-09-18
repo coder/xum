@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
@@ -195,13 +195,15 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   let restart = current.workspaceId !== args.workspaceId;
   if (!restart && newestMessageId !== current.newestMessageId) {
     // The tail moved. Rows after the previous newest row are the appended suffix; a previous
-    // newest row that is gone means the tail was replaced (or the transcript was empty).
+    // newest row that is gone means the tail was replaced. An empty transcript that filled
+    // (the hydration skeleton hands this hook no rows until it clears) is a fresh transcript,
+    // judged by the initial-tail limits in startState rather than the chunk ceiling.
     const previousNewestIndex =
       current.newestMessageId === null
         ? -1
         : args.messages.findIndex((row) => row.id === current.newestMessageId);
     restart =
-      previousNewestIndex === -1 && current.newestMessageId !== null
+      previousNewestIndex === -1
         ? true
         : exceedsOneStep(previousNewestIndex + 1, length, stepInputs);
   }
@@ -240,10 +242,14 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
 
-  // The scheduled step reads the latest committed inputs when it runs, not what it captured
-  // when scheduled: grouping can change while a frame is pending.
+  // The scheduled step reads the latest COMMITTED inputs when it runs, not what it captured
+  // when scheduled: grouping can change while a frame is pending. Published from a layout
+  // effect, not during render, so a concurrent render that is abandoned (the caller feeds
+  // deferred values) can never hand a pending frame an uncommitted snapshot.
   const latest = useRef({ messages: args.messages, stepInputs, fromIndex });
-  latest.current = { messages: args.messages, stepInputs, fromIndex };
+  useLayoutEffect(() => {
+    latest.current = { messages: args.messages, stepInputs, fromIndex };
+  });
   const scheduleFrame = args.scheduleFrame ?? transcriptRevealFrameScheduler.schedule;
 
   const anchorMessageId = current.anchorMessageId;
