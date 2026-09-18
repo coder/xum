@@ -220,28 +220,31 @@ describe("McpIconRefCache", () => {
     // 2 and 3, miss 5 evicts the pending 4, then 4 again.
     const first = cache.resolve(ref(4), api);
     const firstSettled = observe(first);
-    void cache.resolve(ref(2), api);
-    void cache.resolve(ref(3), api);
+    const touchTwo = cache.resolve(ref(2), api);
+    const touchThree = cache.resolve(ref(3), api);
     const fifth = cache.resolve(ref(5), api);
     expect(cache.peek(ref(4))).toBeUndefined();
     const again = cache.resolve(ref(4), api);
     expect(again).not.toBe(first);
     await Promise.resolve();
-    // The open batch holding the evicted request is sent before 4 is queued anew.
-    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
-    expect(cache.size).toBe(3);
+    expect(await touchTwo).toBe(PNG);
+    expect(await touchThree).toBe(PNG);
 
-    // Settle the replacement first, then the original: every caller is answered.
-    batches[4].resolve(icons([ref(4)]));
+    // Settle the newest open batch (the replacement's), then the original one.
+    batches[batches.length - 1].resolve({ [ref(4)]: PNG, [ref(5)]: null });
     expect(await again).toBe(PNG);
-    expect(cache.peek(ref(4))).toBe(PNG);
     batches[3].resolve({ [ref(4)]: "data:image/png;base64,old=", [ref(5)]: null });
     expect(await fifth).toBeNull();
-    expect(await first).toBe("data:image/png;base64,old=");
+    await Promise.resolve();
+    // The decisive check: the first caller must have been answered too.
     expect(firstSettled.settled).toBe(true);
+    expect(await first).toBe("data:image/png;base64,old=");
     // The late original completion cannot overwrite the current entry.
     expect(cache.peek(ref(4))).toBe(PNG);
     expect(cache.peek(ref(5))).toBeNull();
+    // The open batch holding the evicted request was sent before 4 was queued anew.
+    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
+    expect(cache.size).toBe(3);
   });
 
   test("an evicted-then-re-requested ref whose original batch rejects still resolves through the new one", async () => {
@@ -264,24 +267,30 @@ describe("McpIconRefCache", () => {
       () => (outcome.first = "resolved"),
       () => (outcome.first = "rejected")
     );
-    void cache.resolve(ref(2), api);
-    void cache.resolve(ref(3), api);
+    const touchTwo = cache.resolve(ref(2), api);
+    const touchThree = cache.resolve(ref(3), api);
     const fifth = cache.resolve(ref(5), api);
     const again = cache.resolve(ref(4), api);
+    // Handled up front: without the fix `again` shares the rejected batch.
+    const againSettled = Promise.allSettled([again]);
     await Promise.resolve();
-    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
+    expect(await touchTwo).toBe(PNG);
+    expect(await touchThree).toBe(PNG);
 
     batches[3].reject(new Error("socket closed"));
     await fifth.catch(() => undefined);
     await Promise.resolve();
+    // The decisive check: the first caller was answered (with the rejection).
     expect(outcome.first).toBe("rejected");
+    expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
     // The rejection deleted only its own surviving entry (5); the replacement
     // request for 4 and the resolved 3 are untouched.
     expect(cache.peek(ref(5))).toBeUndefined();
     expect(cache.peek(ref(3))).toBe(PNG);
     expect(cache.size).toBe(2);
-    batches[4].resolve(icons([ref(4)]));
+    batches[batches.length - 1].resolve(icons([ref(4)]));
     expect(await again).toBe(PNG);
+    expect((await againSettled)[0].status).toBe("fulfilled");
     expect(cache.peek(ref(4))).toBe(PNG);
   });
 
