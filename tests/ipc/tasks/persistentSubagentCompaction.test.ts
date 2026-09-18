@@ -63,7 +63,7 @@ describe("Persistent sub-agent compaction", () => {
   });
 
   test.each([false, true])(
-    "rejected reactivation preserves settlement (busy at creation: %s)",
+    "rejected reactivation keeps its published attempt until a Stop settles it (busy at creation: %s)",
     async (busyAtCreation) => {
       if (!env || !repoPath) throw new Error("Test environment not initialized");
       const parent = await createWorkspace(
@@ -94,9 +94,14 @@ describe("Persistent sub-agent compaction", () => {
       expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
+      const retiredAttemptId = findWorkspace(env, childId)?.taskAttemptId;
+      expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
 
-      // Keep TaskService, WorkspaceTurnManager and WorkspaceService real. The latter used to
-      // create a second owned attempt before this refusal, defeating outer ownership rollback.
+      // Keep TaskService, WorkspaceTurnManager and WorkspaceService real: the refusal comes from
+      // the real createWorkspaceTurn path, which fails only AFTER the reactivation published its
+      // fresh attempt. A refusal there proves nothing about admission (the send may already have
+      // happened), so the fresh identity is never rolled back to the retired attempt: it reads as
+      // owned-but-unsettled until a Stop settles it.
       const session = workspaceService.getOrCreateSession(childId);
       // The WTM busy snapshot may become idle before WorkspaceService reaches admission.
       const busy = jest
@@ -115,9 +120,20 @@ describe("Persistent sub-agent compaction", () => {
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
         expect(send).toHaveBeenCalledTimes(1);
+        const published = findWorkspace(env, childId)?.taskAttemptId;
+        expect(published).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(published).not.toBe(retiredAttemptId);
+        const outcome = await taskService.readAttemptOutcome(childId, requesting);
+        expect(outcome.kind).toBe("indeterminate");
+        if (outcome.kind === "indeterminate") {
+          expect(outcome.reason).toContain("without settlement evidence");
+        }
+        // Only a Stop settles the published attempt; its id stays exactly as published.
+        await taskService.terminateAllDescendantAgentTasks(parentId);
         expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
           kind: "terminal-no-report",
         });
+        expect(findWorkspace(env, childId)?.taskAttemptId).toBe(published);
       } finally {
         send.mockRestore();
         busy.mockRestore();
