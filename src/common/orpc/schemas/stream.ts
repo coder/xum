@@ -211,6 +211,10 @@ export const StreamStartEventSchema = z.object({
     .string()
     .optional()
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
+  // Same turn metadata that stream-end and the persisted row carry. Sent at start so the
+  // renderer can classify the turn (e.g. hide a token-budget maintenance flush) before the
+  // first delta paints, instead of only once the turn has settled.
+  muxMetadata: z.custom<MuxMessageMetadata>().optional(),
 });
 
 export const StreamDeltaEventSchema = z.object({

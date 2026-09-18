@@ -3411,6 +3411,12 @@ export class StreamManager {
       ...(streamInfo.initialMetadata?.acpPromptId != null
         ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
         : {}),
+      // The renderer decides at stream start whether this turn belongs in the transcript
+      // (a token-budget flush is maintenance output, not an answer), so it needs the turn
+      // metadata before the first delta rather than only on stream-end.
+      ...(streamInfo.initialMetadata?.muxMetadata != null
+        ? { muxMetadata: streamInfo.initialMetadata.muxMetadata }
+        : {}),
     } as StreamStartEvent);
     // Lifecycle spine event: skipped on replay — a reconnecting subscriber
     // re-observes an already-running stream, and observers must see exactly
