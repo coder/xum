@@ -22,8 +22,7 @@ import {
 } from "@/node/services/sandbox/sandboxHostService";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
-import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
-import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
+import { analyzeCode, normalizeMultilineStrings } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
 import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
 import {
@@ -576,8 +575,7 @@ ${xumTypes}
         .string()
         .min(1)
         .describe(
-          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result. " +
-            CODE_EXECUTION_STRING_GUIDANCE
+          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result."
         ),
       timeout_secs: z
         .number()
@@ -604,7 +602,8 @@ ${xumTypes}
 
       // Static analysis before execution - catch syntax errors and sandbox-forbidden patterns.
       // TypeScript typing issues are intentionally non-blocking for one-off runtime scripts.
-      const analysis = await analyzeCode(code);
+      const executableCode = normalizeMultilineStrings(code);
+      const analysis = await analyzeCode(executableCode);
       if (!analysis.valid) {
         const errorMessages = analysis.errors.map((e) => {
           const location =
@@ -685,7 +684,7 @@ ${xumTypes}
           // net for pre-eval throws (removeEventListener is idempotent).
           let result: PTCExecutionResult;
           try {
-            result = await runtime.eval(code);
+            result = await runtime.eval(executableCode);
           } finally {
             abortSignal?.removeEventListener("abort", onAbort);
           }

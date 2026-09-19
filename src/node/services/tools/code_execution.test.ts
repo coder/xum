@@ -18,7 +18,6 @@ import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
-import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -203,7 +202,7 @@ describe("createCodeExecutionTool", () => {
   });
 
   describe("static analysis", () => {
-    it("rejects raw heredoc strings without side effects and accepts a correctly quoted retry", async () => {
+    it("rejects unescaped matching quotes without side effects and accepts a correctly quoted retry", async () => {
       const executeBash = mock(() => mockResults.bash);
       const tool = await createCodeExecutionTool(
         runtimeFactory,
@@ -226,8 +225,7 @@ describe("createCodeExecutionTool", () => {
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(invalid.success).toBe(false);
-      expect(invalid.error).toContain(CODE_EXECUTION_STRING_GUIDANCE);
-      expect(invalid.error).toContain("(line 2)");
+      expect(invalid.error).toContain("Code analysis failed");
       expect(invalid.toolCalls).toHaveLength(0);
       expect(executeBash).not.toHaveBeenCalled();
 
@@ -255,6 +253,98 @@ describe("createCodeExecutionTool", () => {
       expect(templateResult.success).toBe(true);
       expect(executeBash).toHaveBeenCalledTimes(2);
       expect(executeBash).toHaveBeenLastCalledWith({ script });
+    });
+
+    it.each(["'", '"'])(
+      "passes raw multiline %s-quoted scripts to tools unchanged",
+      async (quote) => {
+        const executeBash = mock(() => mockResults.bash);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+          })
+        );
+        const script = [
+          "cat <<'SQL'",
+          "SELECT * FROM `project.dataset.table`",
+          "SQL",
+          'echo "${USER}"',
+          "printf '%s\\n' done",
+        ].join("\n");
+        // Escape quotes/backslashes, but deliberately leave newlines literal.
+        const literal =
+          quote + script.replaceAll("\\", "\\\\").replaceAll(quote, "\\" + quote) + quote;
+        const result = (await tool.execute!(
+          { code: "return xum.bash({script: " + literal + "});" },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(true);
+        expect(result.result).toEqual(mockResults.bash);
+        expect(executeBash).toHaveBeenCalledTimes(1);
+        expect(executeBash).toHaveBeenCalledWith({ script });
+      }
+    );
+
+    it.each([
+      ['return "first\nsecond";', "first\nsecond"],
+      ["return 'first\r\nsecond\rthird';", "first\r\nsecond\rthird"],
+      ['return "first\\\nsecond\nthird";', "firstsecond\nthird"],
+      ['return "first\\\r\nsecond\nthird";', "firstsecond\nthird"],
+      ['return "slash\\\\\nnext";', "slash\\\nnext"],
+      ['return "say \\"hello\\"\nworld\\t!";', 'say "hello"\nworld\t!'],
+      ["return \"a\nb\" + 'c\nd';", "a\nbc\nd"],
+      ['return `prefix ${"a\nb"} suffix`;', "prefix a\nb suffix"],
+      ['const r = /"/; /* \'\n */ return "a\nb" + r.test(\'"\');', "a\nbtrue"],
+    ])("executes multiline strings while retaining JS semantics: %j", async (code, expected) => {
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
+      const result = (await tool.execute!({ code }, mockToolCallOptions)) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(expected);
+    });
+
+    it.each([
+      ["return process.env;", "process"],
+      ['return require("fs");', "require"],
+      ['return import("fs");', "import"],
+      ['return "unfinished\n', "Code analysis failed"],
+      ["return @;", "Code analysis failed"],
+    ])(
+      "still checks the whole normalized program before side effects: %s",
+      async (suffix, error) => {
+        const executeBash = mock(() => mockResults.bash);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+          })
+        );
+        const result = (await tool.execute!(
+          { code: 'xum.bash({script: "first\nsecond"});\n' + suffix },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(error);
+        expect(result.error).toContain("(line 3)");
+        expect(result.toolCalls).toHaveLength(0);
+        expect(executeBash).not.toHaveBeenCalled();
+      }
+    );
+
+    it("rejects an exhausted normalization budget before running any tools", async () => {
+      const executeBash = mock(() => mockResults.bash);
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+        })
+      );
+      const code = 'xum.bash({script: "must not run"});\n' + '"a\nb";\n'.repeat(1000);
+      const result = (await tool.execute!({ code }, mockToolCallOptions)) as PTCExecutionResult;
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Code analysis failed");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(executeBash).not.toHaveBeenCalled();
     });
 
     it("rejects code with syntax errors", async () => {
