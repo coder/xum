@@ -1747,9 +1747,11 @@ export class TaskService implements AgentTaskIntegration {
   private readonly attemptSettlementByTaskId = new Map<string, AttemptSettlementEntry>();
   private readonly attemptSettlementListenersByTaskId = new Map<string, Set<() => void>>();
   /**
-   * In-memory mirror of each task's current persisted taskAttemptId, published synchronously by
-   * every local rotation (owned or not) so a token minted for an older id is refused at its gate
-   * even before the rotating write is visible in the config snapshot. Seeded lazily from config.
+   * The last attempt id THIS process published for each task (every local rotation, owned or
+   * not). Not an authority on the current id — currentTaskAttemptId reads the persisted row, so
+   * a rotation committed by another process is honored and a row that is missing or unreadable
+   * yields no id at all. Its one read is the fence's fail-closed path: a task this process
+   * rotated must never proceed on an unreadable registry (admitTaskWorkspaceTurn).
    */
   private readonly currentAttemptIdByTaskId = new Map<string, string>();
   /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
@@ -2427,6 +2429,17 @@ export class TaskService implements AgentTaskIntegration {
     if (this.attemptSettlementByTaskId.get(taskId)?.attemptId !== identity.attemptId) {
       this.attemptSettlementByTaskId.delete(taskId);
     }
+    // A Stop cascade latched on this task before this attempt was installed (its Phase A ran
+    // between the rotating CAS and this block) captured either the superseded predecessor or the
+    // fresh id unowned. It stops the CURRENT attempt: rebind its record so its release settles
+    // this owner — a closure alone would leave an owned attempt without settlement evidence
+    // (permanently indeterminate), and a predecessor settlement would leave this id open. Nothing
+    // can run under this attempt meanwhile: the latch refuses every admission until release.
+    const stopRecord = this.workspaceStopRecords.get(taskId);
+    if (stopRecord != null) {
+      stopRecord.attemptId = identity.attemptId;
+      stopRecord.ownedAttempt = attempt;
+    }
     return attempt;
   }
 
@@ -2530,26 +2543,26 @@ export class TaskService implements AgentTaskIntegration {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * The task's current attempt id: the persisted value (the given entry or the config snapshot,
-   * which re-reads the file whenever it changed) — the row is the source of truth every CAS
-   * writer compares against, and another process's committed rotation is only visible there.
-   * The in-memory mirror is a fallback for a row that lost its id (or vanished) after this
-   * process rotated it; it never overrides a valid persisted id. Undefined for pre-identity
-   * entries.
+   * The task's current attempt id: the persisted value only (the given entry or the config
+   * snapshot, which re-reads the file whenever it changed). The row is the source of truth every
+   * CAS writer compares against, and another process's committed rotation is visible only there.
+   * Undefined for pre-identity entries AND for a row that is missing, lost its id, or could not
+   * be read (lenient load → default view): every token then reads stale and every fence refuses,
+   * never falling back to an id this process remembers — a stale memory must not revive an
+   * attempt the registry no longer names (see currentAttemptIdByTaskId for the one read it has).
    */
   private currentTaskAttemptId(taskId: string, entry?: WorkspaceConfigEntry): string | undefined {
     const persisted =
       entry?.taskAttemptId ??
       findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskAttemptId;
-    if (isTaskAttemptId(persisted)) return persisted;
-    return this.currentAttemptIdByTaskId.get(taskId);
+    return isTaskAttemptId(persisted) ? persisted : undefined;
   }
 
   /**
-   * Publish a committed identity rotation to in-memory state: the mirror keeps naming the id
-   * this process committed should the row lose it, and a closure recorded for a previous attempt
-   * no longer applies (a closure for the NEW id, recorded between the CAS and this call, stays).
-   * Tokens minted for an older id are revoked by the persisted row itself at their next gate.
+   * Publish a committed identity rotation to in-memory state: record the id this process
+   * committed (currentAttemptIdByTaskId), and drop a closure recorded for a previous attempt (a
+   * closure for the NEW id, recorded between the CAS and this call, stays). Tokens minted for an
+   * older id are revoked by the persisted row itself at their next gate.
    */
   private publishAttemptRotation(taskId: string, attemptId: string): void {
     assertTaskAttemptId(attemptId, "publishAttemptRotation");

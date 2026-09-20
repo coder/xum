@@ -66,6 +66,8 @@ interface Internals {
   workspaceStopRecords: Map<
     string,
     {
+      attemptId: string | undefined;
+      ownedAttempt: unknown;
       capturedTurns: Set<symbol>;
       pendingAdmissions: Set<unknown>;
       cleanupInFlight: number;
@@ -950,6 +952,152 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(next.admissionStale()).toBe(false);
       next.onDisposed("no-work");
     });
+
+    test.each(["before", "after"] as const)(
+      "a Stop capturing the task %s its reawaken's commit becomes visible, before the owner is installed, settles the fresh attempt on release",
+      async (timing) => {
+        const taskId = "reawaken-stop-window";
+        const previous = "att_00000000000000b1";
+        const { config } = await setupTree([
+          { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+        ]);
+        // Proven predecessor, so the settlement chain (fresh attempt settled → next reawaken
+        // proven by this process) is observable end to end.
+        await writeSubagentAttemptSettlementReceipt({
+          ownerWorkspaceSessionDirs: [path.join(config.sessionsDir, rootId)],
+          receipt: {
+            taskId,
+            attemptId: previous,
+            parentWorkspaceId: rootId,
+            source: "idle-settled",
+            settledAt: "2026-09-18T00:00:00.000Z",
+          },
+        });
+        // Phase B blocks on the gate so the cascade is provably still in progress when the
+        // reawaken installs its owner; released only afterwards.
+        const cleanupGate = Promise.withResolvers<void>();
+        const { aiService } = createAIServiceMocks(config, {
+          stopStream: mock(() => cleanupGate.promise.then(() => Ok(undefined))),
+        });
+        const { taskService } = createHarness(config, { aiService });
+        const svc = internals(taskService);
+        let stop: Promise<string[]> | undefined;
+        let captured: { attemptId: string | undefined; ownedAttempt: unknown } | undefined;
+        const edit = svc.editActiveWorkspaceEntry.bind(taskService);
+        spyOn(svc, "editActiveWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+          // Only the first reawaken's CAS is raced; the closing reawaken below passes through.
+          if (stop != null) return edit(id, updater, options);
+          if (timing === "before") {
+            // Phase A runs while the CAS write is still in flight: the row it reads names the
+            // predecessor, and the status it persists lands behind the CAS (FIFO edits).
+            const result = await edit(
+              id,
+              (ws) => {
+                updater(ws);
+                // The mutator may be re-run by the edit queue; one cascade is enough.
+                stop ??= taskService.terminateAllDescendantAgentTasks(rootId);
+              },
+              options
+            );
+            await waitForCondition(() => svc.workspaceStopRecords.has(id));
+            const record = svc.workspaceStopRecords.get(id)!;
+            captured = { attemptId: record.attemptId, ownedAttempt: record.ownedAttempt };
+            return result;
+          }
+          // Phase A runs after the commit is visible but before the owner is installed: the row
+          // it reads names the fresh id, which nobody owns yet.
+          const result = await edit(id, updater, options);
+          stop = taskService.terminateAllDescendantAgentTasks(rootId);
+          await waitForCondition(() => svc.workspaceStopRecords.has(id));
+          const record = svc.workspaceStopRecords.get(id)!;
+          captured = { attemptId: record.attemptId, ownedAttempt: record.ownedAttempt };
+          return result;
+        });
+
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const fresh = entryOf(config, taskId)!.taskAttemptId!;
+        expect(fresh).toMatch(ATTEMPT_ID);
+        expect(fresh).not.toBe(previous);
+        expect(captured).toEqual({
+          attemptId: timing === "before" ? previous : fresh,
+          ownedAttempt: undefined,
+        });
+        // The reawaken's own send meets the latch; the cascade is still cleaning up.
+        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+          kind: "refused",
+          message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+        });
+        expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+          source: "reawaken",
+          attemptId: fresh,
+          receiptEligible: true,
+        });
+
+        cleanupGate.resolve();
+        await stop!;
+        // Release: the latch drops and the cascade settles the attempt that is current — the one
+        // installed after its capture — not merely the identity it captured.
+        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "interrupted",
+          taskAttemptId: fresh,
+        });
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+          attemptId: fresh,
+          phase: "settled",
+          source: "stop-settled",
+        });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+          kind: "refused",
+          message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+        });
+        // ...and that settlement proves the next reawaken's lineage.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({ receiptEligible: true });
+        expect(entryOf(config, taskId)?.taskAttemptUnproven).toBeUndefined();
+      }
+    );
+
+    test.each(["deleted", "unreadable"] as const)(
+      "a %s registry row never revives this process's remembered id: its tokens read stale",
+      async (row) => {
+        const taskId = "mirror-no-revival";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000d3" },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        const svc = internals(taskService);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const owned = entryOf(config, taskId)!.taskAttemptId!;
+        const token = admitted(
+          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        );
+        expect(token.admissionStale()).toBe(false);
+        const load =
+          row === "unreadable"
+            ? spyOn(config, "loadConfigOrDefault").mockImplementation(
+                () =>
+                  ({ projects: new Map() }) as unknown as ReturnType<Config["loadConfigOrDefault"]>
+              )
+            : undefined;
+        try {
+          if (row === "deleted") await config.removeWorkspace(taskId);
+          expect(svc.currentAttemptIdByTaskId.get(taskId)).toBe(owned);
+          expect(token.admissionStale()).toBe(true);
+        } finally {
+          load?.mockRestore();
+          token.onDisposed("refused");
+        }
+      }
+    );
 
     test("the fence and its tokens follow the persisted id when another writer rotated it behind this process's mirror", async () => {
       const taskId = "foreign-rotation";
