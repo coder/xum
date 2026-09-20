@@ -52,6 +52,17 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     expect(lines[1]).not.toContain("GPT-5.5 Mini");
   });
 
+  test("fallback reason that is already a sentence does not double the period", () => {
+    const [line] = buildAutoModelRoutingTooltipLines({
+      requestedFallbackModel: "anthropic:claude-opus-4-6",
+      model: "anthropic:claude-opus-4-6",
+      status: "fallback",
+      reason: "Model xai:grok-3 does not support PDF input.",
+    });
+    expect(line).not.toContain("..");
+    expect(line).toContain("does not support PDF input.");
+  });
+
   test("fallback carries the failure reason and omits probabilities when absent", () => {
     const lines = buildAutoModelRoutingTooltipLines({
       requestedFallbackModel: "anthropic:claude-opus-4-6",

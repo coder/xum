@@ -34,8 +34,10 @@ export function formatPercent(value: number): string {
 export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord): string[] {
   const lines: string[] = [];
   if (record.status === "fallback") {
+    // Attachment reasons arrive as full sentences; avoid a doubled period.
+    const reason = record.reason?.replace(/\.$/, "");
     lines.push(
-      `Classification failed${record.reason ? `: ${record.reason}` : ""}. Used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
+      `Classification failed${reason ? `: ${reason}` : ""}. Used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
     );
   } else {
     const tierLabel = describeTier(record);
