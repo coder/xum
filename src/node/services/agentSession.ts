@@ -950,16 +950,20 @@ export class AgentSession {
       this.activeToolCallIds.clear();
     },
     phaseChanged: (phase, isCurrent) => {
-      this.publishTurnPhase(phase, isCurrent);
+      // Lifecycle listeners can synchronously admit or settle a successor. Capture this transition
+      // and publish its ownership first, so nested callbacks cannot overwrite or settle that turn.
       const turnId = this.coordinator.turnId;
+      const previous = this.observedTurn;
+      this.observedTurn = { id: turnId, idle: phase === "idle" };
       // A fresh admission while a generation is still live (queue dispatch at a step boundary,
       // handoff) replaces the id without an idle transition: report the supersession so waits
       // bound to the predecessor are not stranded (it will never settle on its own).
-      const previous = this.observedTurn;
       if (previous != null && previous.id !== turnId && !previous.idle) {
         this.onTurnSuperseded?.(previous.id, turnId);
       }
-      this.observedTurn = { id: turnId, idle: phase === "idle" };
+      if (this.coordinator.turnId === turnId && this.coordinator.phase === phase) {
+        this.publishTurnPhase(phase, isCurrent);
+      }
       // The coordinator transitions a generation to idle only from its owner's completion paths
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
       // settlement — a stop cascade waiting on the captured generation may release its latch.

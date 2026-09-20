@@ -152,6 +152,88 @@ describe("AgentSession turn admission tokens", () => {
     expect(token.events).toEqual(["admitted"]);
   });
 
+  test("an idle lifecycle listener cannot settle or overwrite a synchronously admitted successor", async () => {
+    const { session } = await harness();
+    const coordinator = internal(session).coordinator;
+    const first = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+    });
+    if (first.status !== "admitted") throw new Error("first preparation refused");
+    const token = recordingToken();
+    let successor: symbol | undefined;
+    const unsubscribe = session.onChatEvent(({ message }) => {
+      if (message.type !== "stream-lifecycle" || message.phase !== "idle" || successor != null)
+        return;
+      const admission = coordinator.prepare(
+        { kind: "fresh", intent: "direct", expectedTurnId: coordinator.turnId },
+        undefined,
+        (turnId) => {
+          successor = turnId;
+          token.onAdmitted(turnId);
+        }
+      );
+      expect(admission.status).toBe("admitted");
+    });
+    try {
+      coordinator.finishPreparation(first.turnId);
+      if (successor == null) throw new Error("idle listener did not admit a successor");
+      expect(token.admittedTurns).toEqual([successor]);
+      expect(coordinator.phase).toBe("preparing");
+      expect(settled).toEqual([first.turnId]);
+      expect(superseded).toEqual([]);
+      // The nested successor must still be observed as live when another turn replaces it.
+      const replacement = coordinator.prepare({
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId: coordinator.turnId,
+      });
+      if (replacement.status !== "admitted") throw new Error("replacement refused");
+      expect(superseded).toEqual([[successor, replacement.turnId]]);
+      coordinator.finishPreparation(replacement.turnId);
+      expect(settled).toEqual([first.turnId, replacement.turnId]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  test("a supersession listener can settle the successor without losing that idle observation", async () => {
+    const settlements: symbol[] = [];
+    const replacements: Array<[symbol, symbol]> = [];
+    h = await createAgentSessionHarness({
+      workspaceId,
+      onTurnSettled: (id) => settlements.push(id),
+      onTurnSuperseded: (previous, next) => {
+        replacements.push([previous, next]);
+        // A Stop listener can synchronously retire the newly observed preparation.
+        internal(h!.session).coordinator.finishPreparation(next);
+      },
+    });
+    const coordinator = internal(h.session).coordinator;
+    const first = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+    });
+    if (first.status !== "admitted") throw new Error("first preparation refused");
+    coordinator.prepare({ kind: "fresh", intent: "handoff", expectedTurnId: first.turnId });
+    expect(coordinator.phase).toBe("idle");
+    const stopped = coordinator.turnId;
+    expect(settlements).toEqual([stopped]);
+    expect(replacements).toEqual([[first.turnId, stopped]]);
+    const next = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: stopped,
+    });
+    expect(next.status).toBe("admitted");
+    expect(coordinator.phase).toBe("preparing");
+    // A settled predecessor is not superseded again, so the listener must not stop this turn.
+    expect(replacements).toEqual([[first.turnId, stopped]]);
+    if (next.status === "admitted") coordinator.finishPreparation(next.turnId);
+  });
+
   test("a stale token is refused at the PREPARING gate without admission or a stream", async () => {
     const { session, aiService } = await harness();
     const token = recordingToken();
