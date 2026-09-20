@@ -673,7 +673,7 @@ function createStreamingHydrationStory(workspaceId: string): AppStory {
             historySequence: 2,
             startTime: STABLE_TIMESTAMP,
           });
-          emitChat({ type: "caught-up", hasOlderHistory: false });
+          emitChat({ type: "caught-up", hasOlderHistory: false, historyReplayStatus: "complete" });
           await expect(await canvas.findByText("Replayed response.")).toBeVisible();
           await waitFor(() => expect(scrollport).toHaveAttribute("data-loaded", "true"));
           await new Promise<void>((resolve) =>
