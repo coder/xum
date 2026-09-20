@@ -701,6 +701,82 @@ describe("ACP session list/resume/fork support", () => {
     await expect(secondPrompt).resolves.toMatchObject({ stopReason: "cancelled" });
   });
 
+  it("re-verifies a failed session with a full replay even after a live-mode resume", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-failed-then-live",
+      projectPath: "/repo/failed-then-live",
+      namedWorkspacePath: "/repo/failed-then-live/.mux/ws-failed-then-live",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatStreamByCall: [
+        () =>
+          createChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "failed",
+            } as WorkspaceChatMessage,
+          ]),
+        // The resume's live subscription: reads no history, so it can neither fail nor clear.
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "live",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+        // The forced full re-verification.
+        () =>
+          createNeverEndingChatStream([
+            {
+              type: "caught-up",
+              replay: "full",
+              historyReplayStatus: "complete",
+            } as WorkspaceChatMessage,
+          ]),
+      ],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.loadSession({
+      sessionId: "ws-failed-then-live",
+      cwd: "/repo/failed-then-live",
+      mcpServers: [],
+    });
+    await expect(
+      harness.agent.prompt({
+        sessionId: "ws-failed-then-live",
+        prompt: [{ type: "text", text: "first" }],
+      })
+    ).rejects.toThrow(/history could not be read/);
+
+    // A resume switches the session to live mode; a live subscription replays no history, so
+    // the next prompt must still replay in full to clear the failed verdict.
+    await harness.agent.resumeSession({
+      sessionId: "ws-failed-then-live",
+      cwd: "/repo/failed-then-live",
+      mcpServers: [],
+    });
+    const secondPrompt = harness.agent.prompt({
+      sessionId: "ws-failed-then-live",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (harness.sendMessageCalls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(harness.sendMessageCalls.map((call) => call.message)).toEqual(["second"]);
+    // The resume subscribed live; the prompt re-verified with a full replay.
+    expect(harness.onChatCalls.slice(1).map((call) => call.mode)).toEqual([
+      { type: "live" },
+      { type: "full" },
+    ]);
+    await harness.agent.cancel({ sessionId: "ws-failed-then-live" });
+    await expect(secondPrompt).resolves.toMatchObject({ stopReason: "cancelled" });
+  });
+
   it("refuses a prompt when the full subscription ends before reporting its replay", async () => {
     const workspace = createWorkspaceInfo({
       id: "ws-dropped",

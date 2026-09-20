@@ -782,7 +782,12 @@ export class MuxAgent implements Agent {
    * again on its own; the next prompt re-subscribes and replays afresh.
    */
   private async assertTranscriptVerified(sessionId: string, workspaceId: string): Promise<void> {
-    await this.ensureChatSubscription(sessionId, workspaceId, this.getSessionOnChatMode(sessionId));
+    // A session whose last replay failed must replay again to be verified, whatever mode a
+    // later resume chose: a live subscription reads no history and could never clear the flag.
+    const onChatMode = this.historyReplayFailedSessionIds.has(sessionId)
+      ? ON_CHAT_MODE_FULL
+      : this.getSessionOnChatMode(sessionId);
+    await this.ensureChatSubscription(sessionId, workspaceId, onChatMode);
     await this.firstCaughtUpBySessionId.get(sessionId);
     if (!this.historyReplayFailedSessionIds.has(sessionId)) {
       return;
