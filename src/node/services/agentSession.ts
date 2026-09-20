@@ -10160,7 +10160,7 @@ export class AgentSession {
     // removed (its own token disposed as refused, its cancel callbacks notified) and the drain
     // continues with the next head; every pass removes one entry, so this recursion is bounded.
     if (candidate.turnAdmission?.admissionStale() === true) {
-      const removed = this.messageQueue.removeEntry(candidate.identity, "refused");
+      const removed = this.messageQueue.removeEntry(candidate.identity);
       if (removed != null) {
         this.emitQueuedMessageChanged();
         this.notifyQueuedMessageCleared(removed, SEND_ADMISSION_STALE_MESSAGE);

@@ -2298,7 +2298,7 @@ export class TaskService implements AgentTaskIntegration {
     // in Phase A. An unknown (legacy) attempt has none to settle — stopping it proves nothing,
     // but its id is closed to further sends until a new admission rotates it.
     if (record.ownedAttempt == null && record.attemptId != null) {
-      this.closeAttemptAdmission(workspaceId, { attemptId: record.attemptId }, "stop-settled");
+      this.closeAttemptAdmission(workspaceId, record.attemptId, undefined, "stop-settled");
     }
     this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
   }
@@ -2409,18 +2409,21 @@ export class TaskService implements AgentTaskIntegration {
    * the producer's first awaited write, so no send can be admitted for an id whose settlement is
    * under way. Synchronous — the admission fence (admitTaskWorkspaceTurn) is synchronous too, so
    * the two can never interleave and no lock is needed. Never downgrades a `settled` entry and
-   * never touches an entry naming another attempt.
+   * never touches an entry naming another attempt. `ownedAttempt` (the producer's snapshot of
+   * this process's owner) is recorded only when it holds exactly `attemptId`.
    */
   private closeAttemptAdmission(
     taskId: string,
-    identity: { attemptId: string | undefined; attempt?: OwnedTaskAttempt },
+    attemptId: string | undefined,
+    ownedAttempt: OwnedTaskAttempt | undefined,
     source: string
   ): void {
     const existing = this.attemptSettlementByTaskId.get(taskId);
-    if (existing != null && existing.attemptId === identity.attemptId) return;
+    if (existing != null && existing.attemptId === attemptId) return;
+    const attempt = ownedAttempt?.attemptId === attemptId ? ownedAttempt : undefined;
     this.attemptSettlementByTaskId.set(taskId, {
-      attemptId: identity.attemptId,
-      ...(identity.attempt != null ? { attempt: identity.attempt } : {}),
+      attemptId,
+      ...(attempt != null ? { attempt } : {}),
       phase: "closing",
       source,
     });
@@ -5332,14 +5335,7 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = message;
-        this.closeAttemptAdmission(
-          taskId,
-          {
-            attemptId: ws.taskAttemptId,
-            ...(ownedAttempt?.attemptId === ws.taskAttemptId ? { attempt: ownedAttempt } : {}),
-          },
-          "launch-failed"
-        );
+        this.closeAttemptAdmission(taskId, ws.taskAttemptId, ownedAttempt, "launch-failed");
       },
       { allowMissing: true }
     );
@@ -13047,7 +13043,8 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     if (!transitionedToRunning) {
-      // Nothing was published: restore the speculative ownership exactly as reactivation does.
+      // Nothing was published: undo the speculative ownership taken before the CAS (reactivation
+      // needs no such undo — it begins its attempt only after its CAS committed).
       if (this.ownedAttemptByTaskId.get(workspaceId) === attempt) {
         if (previousAttempt != null) this.ownedAttemptByTaskId.set(workspaceId, previousAttempt);
         else this.ownedAttemptByTaskId.delete(workspaceId);
@@ -14019,14 +14016,7 @@ export class TaskService implements AgentTaskIntegration {
         transitionedToInterrupted = this.applyInterruptedTaskStatus(ws) === "interrupted";
         // Idle producer: close the attempt synchronously with the decision, before the write.
         if (transitionedToInterrupted) {
-          this.closeAttemptAdmission(
-            workspaceId,
-            {
-              attemptId: ws.taskAttemptId,
-              ...(ownedAttempt?.attemptId === ws.taskAttemptId ? { attempt: ownedAttempt } : {}),
-            },
-            "user-stop-idle"
-          );
+          this.closeAttemptAdmission(workspaceId, ws.taskAttemptId, ownedAttempt, "user-stop-idle");
         }
       },
       { allowMissing: true }
@@ -14220,10 +14210,8 @@ export class TaskService implements AgentTaskIntegration {
         if (stopRecord == null) {
           this.closeAttemptAdmission(
             workspaceId,
-            {
-              attemptId: ws.taskAttemptId,
-              ...(ownedAttempt?.attemptId === ws.taskAttemptId ? { attempt: ownedAttempt } : {}),
-            },
+            ws.taskAttemptId,
+            ownedAttempt,
             "terminal-failure"
           );
         }

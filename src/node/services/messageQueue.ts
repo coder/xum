@@ -985,17 +985,15 @@ export class MessageQueue {
 
   /**
    * Remove exactly the queued entry identified by a {@link peekNext} capture (the dequeue gate
-   * refusing a stale task-attempt obligation before any turn is claimed). Returns the entry's
-   * cancellation callbacks, or null when the head moved since the capture.
+   * refusing a stale task-attempt obligation before any turn is claimed); its token is disposed
+   * as refused. Returns the entry's cancellation callbacks, or null when the head moved since
+   * the capture.
    */
-  removeEntry(
-    identity: unknown,
-    disposition: "refused" | "canceled-before-admission"
-  ): QueueClearCallbacks | null {
+  removeEntry(identity: unknown): QueueClearCallbacks | null {
     const index = this.entries.findIndex((entry) => entry === identity);
     if (index === -1) return null;
     const [entry] = this.entries.splice(index, 1);
-    entry.turnAdmission?.onDisposed(disposition);
+    entry.turnAdmission?.onDisposed("refused");
     return clearCallbacksFor(entry);
   }
 

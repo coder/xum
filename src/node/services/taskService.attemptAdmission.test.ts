@@ -74,7 +74,8 @@ interface Internals {
   markTaskLaunchFailed: (taskId: string, message: string) => Promise<void>;
   closeAttemptAdmission: (
     taskId: string,
-    identity: { attemptId: string | undefined },
+    attemptId: string | undefined,
+    ownedAttempt: undefined,
     source: string
   ) => void;
   releaseSharedDesktopTaskOnUserStop: (taskId: string) => Promise<void>;
@@ -723,7 +724,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const [send] = [...svc.admittedSendsByTaskId.get(owned)!];
       expect(send).toMatchObject({ state: "pending", attemptId });
       // A closure recorded for the current id refuses further sends and marks the token stale.
-      svc.closeAttemptAdmission(owned, { attemptId }, "test");
+      svc.closeAttemptAdmission(owned, attemptId, undefined, "test");
       expect(token.admissionStale()).toBe(true);
       expect(taskService.admitTaskWorkspaceTurn(owned, { acceptanceOrigin: "automatic" })).toEqual({
         kind: "refused",
