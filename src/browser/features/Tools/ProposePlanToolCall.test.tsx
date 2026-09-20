@@ -14,9 +14,11 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
+  getAutoModelRoutingKey,
   getModelKey,
   getPlanContentKey,
   getThinkingLevelKey,
@@ -518,6 +520,26 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
+  });
+
+  test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
+    // Same model in plan and exec: the agent switch persists nothing, so only the send can
+    // drop the Auto flag.
+    const execModel = "openai:gpt-5.2";
+    startInPlanMode(WORKSPACE_ID, execModel, "high");
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

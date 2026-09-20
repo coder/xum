@@ -563,6 +563,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           agentId: targetAgentId,
           model: resolvedModel,
           thinkingLevel: resolvedThinking,
+          // The target agent's model is explicit; classifying "Implement the plan" would
+          // reroute it based on a prompt that says nothing about the plan's difficulty.
+          autoModelRouting: false,
         },
       });
     } catch {
@@ -616,6 +619,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           agentId: targetAgentId,
           model: resolvedModel,
           thinkingLevel: resolvedThinking,
+          autoModelRouting: false,
         },
       });
     } catch {

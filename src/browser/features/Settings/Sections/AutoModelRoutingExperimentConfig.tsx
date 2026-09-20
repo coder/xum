@@ -235,7 +235,8 @@ export function AutoModelRoutingExperimentConfig() {
   return (
     <div className="bg-background-secondary space-y-4 px-4 py-3" data-auto-model-routing-config>
       <p className="text-muted text-xs">
-        Prompt text is sent to TypeSafe (api.typesafe.ai) for classification when Auto is selected.
+        When Auto is selected, the prompt and up to three of your previous prompts in the workspace
+        are sent to TypeSafe (api.typesafe.ai) for classification.
       </p>
 
       <div className="space-y-2">

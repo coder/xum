@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -614,6 +615,11 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       parseCodexOauthAuth((rawConfig as { codexOauth?: unknown }).codexOauth) !== null
     ) {
       return true;
+    }
+
+    // The TypeSafe classifier key cannot serve a chat model.
+    if (providerKey === TYPESAFE_PROVIDER_KEY) {
+      continue;
     }
 
     if (!(providerKey in PROVIDER_DEFINITIONS)) {

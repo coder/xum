@@ -3838,39 +3838,9 @@ export class AgentSession {
 
     // Defense-in-depth: reject PDFs for models we know don't support them.
     // (Frontend should also block this, but it's easy to bypass via IPC / older clients.)
-    if (effectiveFileParts && effectiveFileParts.length > 0) {
-      const pdfParts = effectiveFileParts.filter(
-        (part) => normalizeMediaType(part.mediaType) === PDF_MEDIA_TYPE
-      );
-
-      if (pdfParts.length > 0) {
-        const caps = getModelCapabilitiesResolved(
-          options.model,
-          this.aiService.getProvidersConfig()
-        );
-
-        if (caps && !caps.supportsPdfInput) {
-          return Err(
-            createUnknownSendMessageError(`Model ${options.model} does not support PDF input.`)
-          );
-        }
-
-        if (caps?.maxPdfSizeMb !== undefined) {
-          const maxBytes = caps.maxPdfSizeMb * 1024 * 1024;
-          for (const part of pdfParts) {
-            const bytes = estimateBase64DataUrlBytes(part.url);
-            if (bytes !== null && bytes > maxBytes) {
-              const actualMb = (bytes / (1024 * 1024)).toFixed(1);
-              const label = part.filename ?? "PDF";
-              return Err(
-                createUnknownSendMessageError(
-                  `${label} is ${actualMb}MB, but ${options.model} allows up to ${caps.maxPdfSizeMb}MB per PDF.`
-                )
-              );
-            }
-          }
-        }
-      }
+    const pdfIssue = this.findPdfAttachmentIssue(options.model, effectiveFileParts);
+    if (pdfIssue) {
+      return Err(createUnknownSendMessageError(pdfIssue));
     }
 
     // Validate the actual payload before truncate+replace, including non-PDF attachment shape.
@@ -4111,6 +4081,7 @@ export class AgentSession {
         optionsForStream = await this.resolveAutoModelRouting(
           trimmedMessage,
           optionsForStream,
+          effectiveFileParts,
           cancelSignal
         );
       }
@@ -6918,6 +6889,7 @@ export class AgentSession {
   private async resolveAutoModelRouting(
     prompt: string,
     options: ResolvedSendMessageOptions,
+    fileParts: FilePart[] | undefined,
     signal: AbortSignal | undefined
   ): Promise<ResolvedSendMessageOptions> {
     const experimentEnabled =
@@ -6942,9 +6914,13 @@ export class AgentSession {
     const { tiers } = normalizeAutoModelRoutingConfig(
       this.config.loadConfigOrDefault().autoModelRouting
     );
-    // Without a mapped model no answer can change the turn, so skip the paid round-trip.
-    if (tiers.every((tier) => tier.model == null)) {
-      return fallback({ status: "fallback", reason: "No difficulty tier has a model mapped" });
+    // Without a mapped model or thinking level no answer can change the turn, so skip the
+    // paid round-trip.
+    if (tiers.every((tier) => tier.model == null && tier.thinkingLevel == null)) {
+      return fallback({
+        status: "fallback",
+        reason: "No difficulty tier has a model or thinking level mapped",
+      });
     }
     const decision = await this.autoModelRouter.classify({
       prompt,
@@ -6962,33 +6938,65 @@ export class AgentSession {
       confidence: decision.data.confidence,
       probabilities: decision.data.probabilities,
     };
-    if (chosen?.model == null) {
+    if (!chosen || (chosen.model == null && chosen.thinkingLevel == null)) {
       return fallback({ ...provenance, status: "unmapped-tier" });
     }
-    // The send-time pricing gate only saw the composer model; a budgeted goal must not
-    // spend on a tier model it cannot price.
-    const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
-      this.workspaceId,
-      chosen.model
-    );
-    if (pricingGate && !pricingGate.success) {
-      return fallback({
-        ...provenance,
-        status: "fallback",
-        reason: `${chosen.model} has no pricing data for the budgeted goal`,
-      });
+    if (chosen.model != null) {
+      // The send-time checks only saw the composer model: attachments must still fit the
+      // tier model, and a budgeted goal must not spend on a model it cannot price.
+      const pdfIssue = this.findPdfAttachmentIssue(chosen.model, fileParts);
+      if (pdfIssue) {
+        return fallback({ ...provenance, status: "fallback", reason: pdfIssue });
+      }
+      const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
+        this.workspaceId,
+        chosen.model
+      );
+      if (pricingGate && !pricingGate.success) {
+        return fallback({
+          ...provenance,
+          status: "fallback",
+          reason: `${chosen.model} has no pricing data for the budgeted goal`,
+        });
+      }
     }
+    // A tier without a model keeps the composer model and only changes the thinking level.
+    const model = chosen.model ?? options.model;
     return {
       ...options,
-      model: chosen.model,
+      model,
       thinkingLevel: chosen.thinkingLevel ?? options.thinkingLevel,
       autoModelRoutingRecord: {
         ...provenance,
         requestedFallbackModel: options.model,
-        model: chosen.model,
+        model,
         status: "routed",
       },
     };
+  }
+
+  /** Error text when a PDF attachment cannot be sent to `model`, else null. */
+  private findPdfAttachmentIssue(model: string, fileParts: FilePart[] | undefined): string | null {
+    const pdfParts = (fileParts ?? []).filter(
+      (part) => normalizeMediaType(part.mediaType) === PDF_MEDIA_TYPE
+    );
+    if (pdfParts.length === 0) return null;
+    const caps = getModelCapabilitiesResolved(model, this.aiService.getProvidersConfig());
+    if (caps && !caps.supportsPdfInput) {
+      return `Model ${model} does not support PDF input.`;
+    }
+    if (caps?.maxPdfSizeMb !== undefined) {
+      const maxBytes = caps.maxPdfSizeMb * 1024 * 1024;
+      for (const part of pdfParts) {
+        const bytes = estimateBase64DataUrlBytes(part.url);
+        if (bytes !== null && bytes > maxBytes) {
+          const actualMb = (bytes / (1024 * 1024)).toFixed(1);
+          const label = part.filename ?? "PDF";
+          return `${label} is ${actualMb}MB, but ${model} allows up to ${caps.maxPdfSizeMb}MB per PDF.`;
+        }
+      }
+    }
+    return null;
   }
 
   /** Tail of the transcript for routing decisions; a read failure reads as empty. */

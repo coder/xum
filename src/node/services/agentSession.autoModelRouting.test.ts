@@ -22,7 +22,15 @@ import {
 const COMPOSER_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const HARD_MODEL = "openai:gpt-5.5";
 
-const TIERS = [
+interface TierInput {
+  id: string;
+  label: string;
+  description: string;
+  model?: string;
+  thinkingLevel?: string;
+}
+
+const TIERS: TierInput[] = [
   { id: "easy", label: "Easy", description: "Trivial", model: "anthropic:claude-3-5-haiku-latest" },
   { id: "hard", label: "Hard", description: "Complex", model: HARD_MODEL, thinkingLevel: "high" },
   { id: "extreme", label: "Extreme", description: "Architecture" },
@@ -45,7 +53,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     classify?: (
       input: AutoModelRouterClassifyInput
     ) => Promise<Result<AutoModelRoutingDecision, string>>;
-    tiers?: typeof TIERS;
+    tiers?: TierInput[];
     /** Models the budgeted-goal pricing gate refuses. */
     unpricedModels?: string[];
   }) {
@@ -82,6 +90,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+      getProvidersConfig: mock(() => ({})),
       isExperimentEnabled: mock(
         (id: ExperimentId) => id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && options.experimentEnabled
       ),
@@ -264,6 +273,63 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(streamMessage.mock.calls[0]?.[0]?.autoModelRouting).toMatchObject({
       status: "fallback",
       model: COMPOSER_MODEL,
+    });
+  });
+
+  it("classifies when a model-less tier sets a thinking level and applies it to the composer model", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      classify: () => Promise.resolve(Ok(decision("extreme"))),
+      tiers: TIERS.map(({ model: _model, thinkingLevel: _level, ...tier }) =>
+        tier.id === "extreme" ? { ...tier, thinkingLevel: "high" } : tier
+      ),
+    });
+
+    await session.sendMessage("design it", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("high");
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "extreme",
+      model: COMPOSER_MODEL,
+    });
+  });
+
+  it("falls back when a PDF attachment cannot be sent to the chosen tier's model", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      // xai:grok-3 is catalogued without PDF support; the composer model has no catalog entry.
+      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+    });
+
+    const result = await session.sendMessage("Summarize this", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+      fileParts: [
+        { url: "data:application/pdf;base64,JVBERi0xLjQK", mediaType: "application/pdf" },
+      ],
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
+      model: COMPOSER_MODEL,
+      reason: "Model xai:grok-3 does not support PDF input.",
     });
   });
 

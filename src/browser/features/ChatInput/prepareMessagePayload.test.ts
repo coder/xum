@@ -48,6 +48,17 @@ describe("prepareMessagePayload", () => {
   });
 
   it.each([
+    ["a normal send", {}, true],
+    ["a one-shot model command", { messageText: "/opus+high hello", modelOneShot: oneShot }, false],
+  ])("keeps the Auto routing flag only for %s", (_name, input, expected) => {
+    const result = prepare({
+      ...input,
+      sendMessageOptions: { ...options, autoModelRouting: true },
+    });
+    expect(result.options.autoModelRouting).toBe(expected);
+  });
+
+  it.each([
     ["normal", undefined, ["demo"]],
     [
       "compaction-request",
