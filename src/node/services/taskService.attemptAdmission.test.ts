@@ -82,6 +82,11 @@ interface Internals {
   startReservedAgentTask: (plan: unknown) => Promise<void>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
   cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
+  editActiveWorkspaceEntry: (
+    taskId: string,
+    updater: (workspace: WorkspaceConfigEntry) => void,
+    options?: { allowMissing?: boolean }
+  ) => Promise<boolean>;
   evaluateAttemptLineage: (
     taskId: string,
     entry: WorkspaceConfigEntry
@@ -528,6 +533,195 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(svc.ownedAttemptByTaskId.get(unreadable)?.receiptEligible).toBe(false);
       expect(entryOf(config, unreadable)?.taskAttemptUnproven).toBe(true);
     });
+
+    test("manual recovery rotates a settled reported attempt without reviving its report or old tokens", async () => {
+      const taskId = "reported-recovery";
+      const attemptId = "att_00000000000000aa";
+      const reportedAt = "2026-09-20T00:00:00.000Z";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: {
+            taskStatus: "reported",
+            taskAttemptId: attemptId,
+            reportedAt,
+            taskAttemptUnproven: true,
+          },
+        },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      const oldToken = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      svc.attemptSettlementByTaskId.set(taskId, {
+        attemptId,
+        phase: "settled",
+        source: "idle-settled",
+      });
+      try {
+        // false means no status rollback is needed on send failure, not that no attempt was minted.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+        const current = entryOf(config, taskId);
+        expect(current).toMatchObject({
+          taskStatus: "reported",
+          reportedAt,
+          taskAttemptUnproven: true,
+        });
+        expect(current?.taskAttemptId).toMatch(ATTEMPT_ID);
+        expect(current?.taskAttemptId).not.toBe(attemptId);
+        expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+          attemptId: current?.taskAttemptId,
+          receiptEligible: false,
+        });
+        expect(oldToken.admissionStale()).toBe(true);
+        const freshToken = admitted(
+          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        );
+        expect(freshToken.admissionStale()).toBe(false);
+        freshToken.onDisposed("no-work");
+        // Ordinary manual follow-ups keep the fresh, unsettled attempt rather than rotating again.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+        expect(entryOf(config, taskId)?.taskAttemptId).toBe(current?.taskAttemptId);
+      } finally {
+        oldToken.onDisposed("refused");
+      }
+    });
+
+    test.each(["missing-id", "unsettled", "closing", "stale", "retired"] as const)(
+      "manual recovery of a reported child refuses %s settlement evidence",
+      async (evidence) => {
+        const taskId = "reported-recovery";
+        const attemptId = evidence === "missing-id" ? undefined : "att_00000000000000aa";
+        const { config } = await setupTree([
+          { id: taskId, overrides: { taskStatus: "reported", taskAttemptId: attemptId } },
+        ]);
+        const { taskService } = createHarness(config);
+        const svc = internals(taskService);
+        if (evidence !== "unsettled") {
+          svc.attemptSettlementByTaskId.set(taskId, {
+            attemptId: evidence === "stale" ? "att_00000000000000bb" : attemptId,
+            phase: evidence === "closing" ? "closing" : "settled",
+            source: "idle-settled",
+          });
+        }
+        if (evidence === "retired") {
+          await config.editConfig((cfg) => {
+            const ws = findWorkspaceInConfig(config, taskId);
+            if (!ws?.taskAttemptId) throw new Error("missing attempt");
+            for (const project of cfg.projects.values()) {
+              const entry = project.workspaces.find((w) => w.id === taskId);
+              if (entry) {
+                entry.taskAttemptRetiredBy = {
+                  runId: "wfr_claim",
+                  stepId: "step",
+                  inputHash: "input",
+                  childTaskId: taskId,
+                  attemptId: ws.taskAttemptId,
+                  mode: "retire-reported",
+                  at: "2026-09-20T00:00:00.000Z",
+                };
+              }
+            }
+            return cfg;
+          });
+        }
+        const before = entryOf(config, taskId);
+        const settlement = svc.attemptSettlementByTaskId.get(taskId);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+        expect(entryOf(config, taskId)).toEqual(before);
+        expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toBe(settlement);
+      }
+    );
+
+    test.each([
+      "stop",
+      "stop-before-cas",
+      "supersession",
+      "claim",
+      "status",
+      "settlement",
+    ] as const)(
+      "manual recovery of a settled reported child rechecks %s after lineage awaits",
+      async (race) => {
+        const taskId = "reported-race";
+        const attemptId = "att_00000000000000aa";
+        const reportedAt = "2026-09-20T00:00:00.000Z";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "reported", taskAttemptId: attemptId, reportedAt },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        const svc = internals(taskService);
+        const oldToken = admitted(
+          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        );
+        const settlement = { attemptId, phase: "settled" as const, source: "idle-settled" };
+        svc.attemptSettlementByTaskId.set(taskId, settlement);
+        const original = svc.evaluateAttemptLineage.bind(taskService);
+        let releaseStop: (() => void) | undefined;
+        const proof = spyOn(svc, "evaluateAttemptLineage").mockImplementation(async (id, entry) => {
+          const lineage = await original(id, entry);
+          if (race === "stop") {
+            releaseStop = taskService.latchHardInterruptCascade(taskId);
+          } else if (race === "settlement") {
+            svc.attemptSettlementByTaskId.set(taskId, { ...settlement, phase: "closing" });
+          } else if (race !== "stop-before-cas") {
+            await config.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                const ws = project.workspaces.find((w) => w.id === taskId);
+                if (!ws) continue;
+                if (race === "supersession") ws.taskAttemptId = "att_00000000000000bb";
+                if (race === "status") ws.taskStatus = "interrupted";
+                if (race === "claim") {
+                  ws.taskAttemptRetiredBy = {
+                    runId: "wfr_claim",
+                    stepId: "step",
+                    inputHash: "input",
+                    childTaskId: taskId,
+                    attemptId,
+                    mode: "retire-reported",
+                    at: reportedAt,
+                  };
+                }
+              }
+              return cfg;
+            });
+          }
+          return lineage;
+        });
+        const edit = svc.editActiveWorkspaceEntry.bind(taskService);
+        const cas = spyOn(svc, "editActiveWorkspaceEntry").mockImplementation((...args) => {
+          if (race === "stop-before-cas") {
+            releaseStop = taskService.latchHardInterruptCascade(taskId);
+          }
+          return edit(...args);
+        });
+        try {
+          expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+          expect(proof).toHaveBeenCalledTimes(1);
+          expect(entryOf(config, taskId)?.taskAttemptId).toBe(
+            race === "supersession" ? "att_00000000000000bb" : attemptId
+          );
+          expect(entryOf(config, taskId)?.taskStatus).toBe(
+            race === "status" ? "interrupted" : "reported"
+          );
+          expect(svc.attemptSettlementByTaskId.get(taskId)).toEqual(
+            race === "settlement" ? { ...settlement, phase: "closing" } : settlement
+          );
+          expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+          expect(oldToken.admissionStale()).toBe(true);
+        } finally {
+          cas.mockRestore();
+          proof.mockRestore();
+          releaseStop?.();
+          oldToken.onDisposed("refused");
+        }
+      }
+    );
 
     test("marker race: an unproven marker appearing between the proof snapshot and the CAS downgrades the committed attempt", async () => {
       const taskId = "reawaken-race";

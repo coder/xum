@@ -358,6 +358,9 @@ describe("Persistent sub-agent compaction", () => {
     const recoveredAttemptId = findWorkspace(env, childId)?.taskAttemptId;
     expect(recoveredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
     expect(recoveredAttemptId).not.toBe(reactivationAttemptId);
+    if (predecessorStatus === "reported") {
+      expect(findWorkspace(env, childId)).toMatchObject({ taskStatus: "reported", reportedAt });
+    }
     // The recovered turn runs to completion under the fresh attempt.
     expect(
       await waitFor(
@@ -378,12 +381,7 @@ describe("Persistent sub-agent compaction", () => {
     40_000
   );
 
-  // Known G1 gap (remote UAT round 5, reproduced here on the real path): the reactivation of a
-  // `reported` child never publishes an active stable status, so the cascade's
-  // applyInterruptedTaskStatus preserves `reported`, markInterruptedTaskRunning refuses to mint a
-  // fresh attempt for a non-desktop reported child, and the admission fence keeps refusing the
-  // settled reactivation attempt. Pinned as failing so a fix flips these to plain `test.each`.
-  test.failing.each([
+  test.each([
     ["reported", "sendMessage"],
     ["reported", "resumeStream"],
   ] as const)(

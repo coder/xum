@@ -12960,7 +12960,9 @@ export class TaskService implements AgentTaskIntegration {
    * Shared-desktop reported tasks also need this durable reservation for direct sends that have
    * no workspace-turn handle. Their original binding is never inferred again on reawakening.
    *
-   * Returns true only when a state transition happened.
+   * A reported child's stopped continuation also needs a fresh attempt, but keeps its completed
+   * status: manual follow-ups must not turn a historical report back into an active task.
+   * Returns true only when taskStatus changed to running (and needs restoring on send failure).
    */
   async markInterruptedTaskRunning(workspaceId: string): Promise<boolean> {
     assert(workspaceId.length > 0, "markInterruptedTaskRunning: workspaceId must be non-empty");
@@ -12975,7 +12977,17 @@ export class TaskService implements AgentTaskIntegration {
     if (!entryAtStart?.workspace.parentWorkspaceId) {
       return false;
     }
+    const settledPredecessor = this.attemptSettlementByTaskId.get(workspaceId);
+    // A parent continuation preserves `reported`; Stop then closes its attempt without changing
+    // that status. Explicit manual recovery must rotate the settled identity, not reopen it.
+    const resumeSettledReportedTask =
+      entryAtStart.workspace.taskStatus === "reported" &&
+      entryAtStart.workspace.taskDesktopOwnerWorkspaceId == null &&
+      entryAtStart.workspace.taskAttemptId != null &&
+      settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
+      settledPredecessor.phase === "settled";
     if (
+      !resumeSettledReportedTask &&
       entryAtStart.workspace.taskStatus !== "interrupted" &&
       !(
         entryAtStart.workspace.taskStatus === "reported" &&
@@ -12997,6 +13009,13 @@ export class TaskService implements AgentTaskIntegration {
     // id (refusing when the id moved or a claim landed) and decides the marker from the fresh row.
     const previousAttemptId = entryAtStart.workspace.taskAttemptId;
     const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
+    if (
+      this.isWorkspaceStopInProgress(workspaceId) ||
+      (resumeSettledReportedTask &&
+        this.attemptSettlementByTaskId.get(workspaceId) !== settledPredecessor)
+    ) {
+      return false;
+    }
     const attemptId = newTaskAttemptId();
     // Reawakening is a new attempt of this process: invalidate the previous attempt's
     // settlement before the admission that follows (current ownership wins).
@@ -13006,18 +13025,20 @@ export class TaskService implements AgentTaskIntegration {
       attemptId,
       receiptEligible: lineage.proven,
     });
-    let transitionedToRunning = false;
+    let published = false;
     let committedProven = false;
     await this.editActiveWorkspaceEntry(
       workspaceId,
       (ws) => {
         // Only descendant task workspaces have task lifecycle status.
-        if (!ws.parentWorkspaceId) {
+        if (!ws.parentWorkspaceId || this.isWorkspaceStopInProgress(workspaceId)) {
           return;
         }
         if (
-          ws.taskStatus !== "interrupted" &&
-          !(ws.taskStatus === "reported" && ws.taskDesktopOwnerWorkspaceId != null)
+          resumeSettledReportedTask
+            ? ws.taskStatus !== "reported" || ws.taskDesktopOwnerWorkspaceId != null
+            : ws.taskStatus !== "interrupted" &&
+              !(ws.taskStatus === "reported" && ws.taskDesktopOwnerWorkspaceId != null)
         ) {
           return;
         }
@@ -13028,7 +13049,7 @@ export class TaskService implements AgentTaskIntegration {
         // Preserve taskPrompt here: interrupted queued tasks store their only initial
         // prompt in config. If send/resume fails, restoreInterruptedTaskAfterResumeFailure
         // must be able to retain that original prompt for inspection/retry.
-        ws.taskStatus = "running";
+        if (!resumeSettledReportedTask) ws.taskStatus = "running";
         // A user-initiated resume is a fresh chance: clear the recovery budget so a
         // breaker-tripped task doesn't instantly re-fail on its first recovery prompt.
         delete ws.taskRecoveryAttempts;
@@ -13037,12 +13058,12 @@ export class TaskService implements AgentTaskIntegration {
         // downgrade the proof; a proven admission never carries it.
         committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
         if (!committedProven) ws.taskAttemptUnproven = true;
-        transitionedToRunning = true;
+        published = true;
       },
       { allowMissing: true }
     );
 
-    if (!transitionedToRunning) {
+    if (!published) {
       // Nothing was published: undo the speculative ownership taken before the CAS (reactivation
       // needs no such undo — it begins its attempt only after its CAS committed).
       if (this.ownedAttemptByTaskId.get(workspaceId) === attempt) {
@@ -13073,7 +13094,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.emitWorkspaceMetadata(workspaceId);
-    return true;
+    return !resumeSettledReportedTask;
   }
 
   /**
