@@ -49,6 +49,6 @@ export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMes
     experiments: { ...input.experiments },
     allowAgentSetGoal: true,
     disableWorkspaceAgents: input.disableWorkspaceAgents ? true : undefined,
-    ...(input.autoModelRouting ? { autoModelRouting: true } : {}),
+    autoModelRouting: input.autoModelRouting ? true : undefined,
   };
 }

@@ -33,6 +33,7 @@ import {
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import {
+  getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
 } from "@/common/types/autoModelRouting";
@@ -2549,7 +2550,7 @@ export class Config {
       routeOverrides: config.routeOverrides,
       minThinkingLevelByModel: config.minThinkingLevelByModel,
       modelFallbacks: config.modelFallbacks,
-      autoModelRouting: config.autoModelRouting ?? normalizeAutoModelRoutingConfig(undefined),
+      autoModelRouting: config.autoModelRouting ?? getDefaultAutoModelRoutingConfig(),
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,

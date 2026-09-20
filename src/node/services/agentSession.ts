@@ -127,7 +127,6 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
-import { AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT } from "@/constants/autoModelRouting";
 import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingRecord,
@@ -6992,13 +6991,17 @@ export class AgentSession {
     };
   }
 
-  /** Prior user prompts (oldest first) so the classifier sees conversational context. */
-  private async collectRecentUserPrompts(): Promise<string[]> {
+  /** Tail of the transcript for routing decisions; a read failure reads as empty. */
+  private async loadRecentRoutingRows(): Promise<MuxMessage[]> {
     const recent = await this.historyService
       .getLastMessages(this.workspaceId, 20)
       .catch(() => null);
-    if (!recent?.success) return [];
-    return recent.data
+    return recent?.success ? recent.data : [];
+  }
+
+  /** Prior user prompts (oldest first) so the classifier sees conversational context. */
+  private async collectRecentUserPrompts(): Promise<string[]> {
+    return (await this.loadRecentRoutingRows())
       .filter((message) => message.role === "user" && message.metadata?.synthetic !== true)
       .map((message) =>
         message.parts
@@ -7007,8 +7010,7 @@ export class AgentSession {
           .join("\n")
           .trim()
       )
-      .filter((text) => text.length > 0)
-      .slice(-AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT);
+      .filter((text) => text.length > 0);
   }
 
   /**
@@ -7039,11 +7041,7 @@ export class AgentSession {
   }
 
   private async findLastUserRow(): Promise<MuxMessage | undefined> {
-    const recent = await this.historyService
-      .getLastMessages(this.workspaceId, 20)
-      .catch(() => null);
-    if (!recent?.success) return undefined;
-    return recent.data.findLast((message) => message.role === "user");
+    return (await this.loadRecentRoutingRows()).findLast((message) => message.role === "user");
   }
 
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {

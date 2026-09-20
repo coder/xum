@@ -136,7 +136,7 @@ export class AutoModelRouter {
     }
     const parsed = SystemOneResponseSchema.safeParse(json);
     const answer = parsed.success ? parsed.data.answers[QUESTION_ID] : undefined;
-    if (!answer) {
+    if (!parsed.success || !answer) {
       return this.fail("Classifier response did not contain the difficulty answer");
     }
     if (!input.tiers.some((tier) => tier.id === answer.choice)) {
@@ -147,7 +147,7 @@ export class AutoModelRouter {
       tierId: answer.choice,
       confidence: answer.confidence ?? 0,
       probabilities: answer.probabilities ?? {},
-      classifierModel: parsed.success && parsed.data.model ? parsed.data.model : "",
+      classifierModel: parsed.data.model ?? "",
     };
     log.debug("Auto model routing classified prompt", {
       tierId: decision.tierId,

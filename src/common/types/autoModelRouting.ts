@@ -65,6 +65,8 @@ export function getDefaultAutoModelRoutingConfig(): AutoModelRoutingConfig {
   return { tiers: DEFAULT_AUTO_MODEL_ROUTING_TIERS.map((tier) => ({ ...tier })) };
 }
 
+const RawTierListSchema = z.object({ tiers: z.array(z.unknown()) });
+
 /**
  * Lenient-on-read normalization shared by config load and the Settings editor:
  * tiers with invalid ids, labels, descriptions, or models are dropped, duplicate
@@ -72,15 +74,10 @@ export function getDefaultAutoModelRoutingConfig(): AutoModelRoutingConfig {
  * fewer than the minimum falls back to the defaults.
  */
 export function normalizeAutoModelRoutingConfig(value: unknown): AutoModelRoutingConfig {
-  const rawTiers =
-    typeof value === "object" &&
-    value !== null &&
-    Array.isArray((value as { tiers?: unknown }).tiers)
-      ? (value as { tiers: unknown[] }).tiers
-      : [];
+  const tierList = RawTierListSchema.safeParse(value);
   const seen = new Set<string>();
   const tiers: AutoModelRoutingTier[] = [];
-  for (const raw of rawTiers) {
+  for (const raw of tierList.success ? tierList.data.tiers : []) {
     const parsed = AutoModelRoutingTierSchema.safeParse(raw);
     if (!parsed.success || seen.has(parsed.data.id)) continue;
     seen.add(parsed.data.id);

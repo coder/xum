@@ -1,12 +1,16 @@
 import React from "react";
 import { Route } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { cn } from "@/common/lib/utils";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 
-/** Badge text per routing outcome. */
+function describeTier(record: AutoModelRoutingRecord): string {
+  return record.tierLabel ?? record.tierId ?? "unknown tier";
+}
+
 export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord): string {
-  const tierLabel = record.tierLabel ?? record.tierId ?? "unknown tier";
+  const tierLabel = describeTier(record);
   switch (record.status) {
     case "routed":
       return `Auto: ${tierLabel}`;
@@ -34,7 +38,7 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
       `Classification failed${record.reason ? `: ${record.reason}` : ""}. Used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
     );
   } else {
-    const tierLabel = record.tierLabel ?? record.tierId ?? "unknown tier";
+    const tierLabel = describeTier(record);
     lines.push(
       record.confidence != null
         ? `Jev chose ${tierLabel} (${formatPercent(record.confidence)} confidence).`
@@ -70,11 +74,10 @@ export const AutoModelRoutingBadge: React.FC<AutoModelRoutingBadgeProps> = (prop
         {/* tabIndex makes the explanation keyboard-reachable (Radix opens tooltips on focus). */}
         <span
           tabIndex={0}
-          className={
-            isFallback
-              ? "text-warning bg-warning/10 inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase"
-              : "text-accent bg-accent/10 inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase"
-          }
+          className={cn(
+            "inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase",
+            isFallback ? "text-warning bg-warning/10" : "text-accent bg-accent/10"
+          )}
           data-auto-model-routing-badge={props.record.status}
         >
           <Route aria-hidden="true" className="h-3 w-3" />
