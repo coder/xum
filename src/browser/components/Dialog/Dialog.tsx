@@ -4,6 +4,7 @@ import * as VisuallyHiddenPrimitive from "@radix-ui/react-visually-hidden";
 import { X } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
+import { MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
 
 /**
  * VisuallyHidden component for accessibility - hides content visually but keeps it available to screen readers.
@@ -25,6 +26,10 @@ const DialogOverlay = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
+    // Lets isDialogOpen() recognise this modal: Radix mounts the overlay only for modal roots
+    // (with data-state) and never sets aria-modal on the content, so the content alone is
+    // indistinguishable from a non-modal dialog.
+    {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }}
     className={cn(
       // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
       // sampler ignores this fixed overlay (it samples background-color/backdrop-filter

@@ -1,4 +1,4 @@
-import type { FilePart } from "@/common/orpc/types";
+import type { FilePart, HistoryEditPrecondition } from "@/common/orpc/types";
 import type { StagedChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
 import {
   displayStagedAttachmentsToChatAttachments,
@@ -30,7 +30,28 @@ export interface EditingMessageState {
    * composer must confirm before discarding the compaction/reset summary.
    */
   isBeforeLatestContextBoundary?: boolean;
+  /**
+   * Content evidence of the rows this edit deletes, captured when editing began. Every UI
+   * edit send carries it; the backend refuses with `history-changed` if the rows differ.
+   */
+  precondition?: HistoryEditPrecondition;
+  /**
+   * The backend refused the last send with `history-changed` and a transcript refresh is
+   * pending or failed: Send stays disabled until a fresh candidate arrives (after a failure
+   * the composer offers a retry in the edit-mode indicator as well as in the toast).
+   */
+  preconditionInvalidated?: boolean;
+  /**
+   * Fresh evidence from a completed transcript refresh. The next explicit Send carries exactly
+   * this candidate (it is not re-captured against rows that arrived meanwhile).
+   */
+  pendingReconfirmation?: HistoryEditPrecondition;
 }
+
+/** The evidence an edit send must carry: the refreshed candidate when one exists. */
+export const getEditSendPrecondition = (
+  state: Pick<EditingMessageState, "precondition" | "pendingReconfirmation">
+): HistoryEditPrecondition | undefined => state.pendingReconfirmation ?? state.precondition;
 
 function stagedAttachmentsFromText(
   text: string | undefined,

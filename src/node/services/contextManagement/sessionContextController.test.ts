@@ -4,7 +4,11 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import { createAgentSessionHarness, type AgentSessionHarness } from "../agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  seedAutoCompactionThreshold,
+  type AgentSessionHarness,
+} from "../agentSession.testHarness";
 import type { CompactionMonitor } from "../compactionMonitor";
 import type { ContinuousCompactor } from "../continuousCompactor";
 import type { SessionContextController } from "./sessionContextController";
@@ -50,32 +54,39 @@ function monitorOf(controller: SessionContextController): CompactionMonitor {
   return Reflect.get(controller, "compactionMonitor") as CompactionMonitor;
 }
 
-test("one factory gives each controller independent pressure latches and thresholds", async () => {
+test("one factory gives each controller independent pressure latches over one persisted threshold", async () => {
   const h = (harness = await createAgentSessionHarness({ workspaceId: "factory" }));
+  const model = "openai:gpt-4o";
+  await seedAutoCompactionThreshold(h.config, model, 70);
   const events: WorkspaceChatMessage[] = [];
   const first = h.contextManagement.openSession(
     host(h, "first", { emitChatEvent: (event) => events.push(event) })
   );
   const second = h.contextManagement.openSession(host(h, "second"));
-  expect(first.setAutoCompactionThreshold(0.7)).toBeUndefined();
-  second.setAutoCompactionThreshold(1);
+  // The threshold is per model in config.json, so both controllers resolve the same value.
+  expect(first.autoCompactionThreshold(model)).toBe(0.7);
+  expect(second.autoCompactionThreshold(model)).toBe(0.7);
   const pressure = {
-    model: "openai:gpt-4o",
+    model,
+    threshold: first.autoCompactionThreshold(model),
     usage: { inputTokens: 120_000, outputTokens: 1, totalTokens: 120_001 },
     use1MContext: false,
     providersConfig: null,
   };
   expect(monitorOf(first).checkMidStream(pressure)).toBe(true);
   expect(monitorOf(first).checkMidStream(pressure)).toBe(false);
-  expect(monitorOf(second).checkMidStream(pressure)).toBe(false);
-  expect(second.autoCompactionThreshold).toBe(1);
+  // A disabled threshold never interrupts, whatever the latch state.
+  expect(monitorOf(second).checkMidStream({ ...pressure, threshold: 1 })).toBe(false);
   expect(first.onStreamStarting()).toBeUndefined();
   expect(monitorOf(first).checkMidStream(pressure)).toBe(true);
   expect(events).toHaveLength(2);
   // A different session's start must not re-arm the first session's pressure latch.
   second.onStreamStarting();
   expect(monitorOf(first).checkMidStream(pressure)).toBe(false);
-  expect(first.autoCompactionThreshold).toBe(0.7);
+  // A slider change lands in config and is visible to every controller on its next decision.
+  await seedAutoCompactionThreshold(h.config, model, 100);
+  expect(first.autoCompactionThreshold(model)).toBe(1);
+  expect(second.autoCompactionThreshold(model)).toBe(1);
 });
 
 test("durable completion records the tail summary before notifying the external observer", async () => {

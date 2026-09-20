@@ -1774,17 +1774,11 @@ export const router = (authToken?: string) => {
             input.persist ?? true
           )
         ),
-      getStartupAutoRetryModel: t
-        .input(schemas.workspace.getStartupAutoRetryModel.input)
-        .output(schemas.workspace.getStartupAutoRetryModel.output)
+      setUnrelatedWorkspaceConsent: t
+        .input(schemas.workspace.setUnrelatedWorkspaceConsent.input)
+        .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
         .handler(({ context, input }) =>
-          context.workspaceService.getStartupAutoRetryModel(input.workspaceId)
-        ),
-      setAutoCompactionThreshold: t
-        .input(schemas.workspace.setAutoCompactionThreshold.input)
-        .output(schemas.workspace.setAutoCompactionThreshold.output)
-        .handler(({ context, input }) =>
-          context.workspaceService.setAutoCompactionThreshold(input.workspaceId, input.threshold)
+          context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
         ),
       interruptStream: t
         .input(schemas.workspace.interruptStream.input)

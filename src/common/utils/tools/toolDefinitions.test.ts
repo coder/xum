@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { RUNTIME_MODE } from "@/common/types/runtime";
+import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
   buildTaskToolAgentArgsSchema,
   buildTaskToolDescription,
@@ -901,6 +902,66 @@ describe("TOOL_DEFINITIONS", () => {
       advertise: false,
     });
     expect(parsed.success).toBe(false);
+  });
+
+  describe("task_list instance discovery schema", () => {
+    const schema = TOOL_DEFINITIONS.task_list.schema;
+
+    it("accepts scope instance with bounded query/limit/offset paging inputs", () => {
+      expect(
+        schema.safeParse({ scope: "instance", query: "release", limit: 5, offset: 20 }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance" }).success).toBe(true);
+      // Strict-mode providers send null for omitted optional fields; null must mean "absent".
+      expect(
+        schema.safeParse({ scope: "instance", query: null, limit: null, offset: null }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", limit: 1 }).success).toBe(true);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT }).success
+      ).toBe(true);
+      expect(schema.safeParse({ scope: "instance", offset: 0 }).success).toBe(true);
+    });
+
+    it("rejects out-of-range or non-integer paging inputs", () => {
+      expect(schema.safeParse({ scope: "instance", limit: 0 }).success).toBe(false);
+      expect(
+        schema.safeParse({ scope: "instance", limit: INSTANCE_DISCOVERY_MAX_LIMIT + 1 }).success
+      ).toBe(false);
+      expect(schema.safeParse({ scope: "instance", limit: 2.5 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: -1 }).success).toBe(false);
+      expect(schema.safeParse({ scope: "instance", offset: 1.5 }).success).toBe(false);
+    });
+
+    it("keeps the default and tree scopes parseable without paging inputs", () => {
+      expect(schema.safeParse({}).success).toBe(true);
+      expect(schema.safeParse({ scope: "tree" }).success).toBe(true);
+      expect(schema.safeParse({ scope: "everywhere" }).success).toBe(false);
+    });
+
+    it("result rows carry instance-only fields and the paging cursor", () => {
+      const result = TOOL_DEFINITIONS.task_list.resultSchema;
+      const parsed = result.safeParse({
+        tasks: [
+          {
+            taskId: "ws-other",
+            status: "workspace",
+            relationship: "unrelated",
+            projectPath: "/home/alice/projects/api",
+            activity: "busy",
+            depth: 0,
+          },
+        ],
+        nextOffset: 20,
+      });
+      expect(parsed.success).toBe(true);
+      expect(
+        result.safeParse({
+          tasks: [{ taskId: "ws-other", status: "workspace", activity: "asleep", depth: 0 }],
+        }).success
+      ).toBe(false);
+      expect(result.safeParse({ tasks: [], nextOffset: -1 }).success).toBe(false);
+    });
   });
 
   describe("skills_catalog_read schema", () => {

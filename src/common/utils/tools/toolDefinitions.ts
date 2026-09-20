@@ -84,6 +84,10 @@ import {
   HEARTBEAT_WHEN_BUSY_VALUES,
 } from "@/constants/heartbeat";
 import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
+import {
+  INSTANCE_DISCOVERY_DEFAULT_LIMIT,
+  INSTANCE_DISCOVERY_MAX_LIMIT,
+} from "@/constants/agentMessaging";
 
 // -----------------------------------------------------------------------------
 // ask_user_question (plan-mode interactive questions)
@@ -1068,7 +1072,7 @@ export const TaskSendMessageToolArgsSchema = z
       .string()
       .min(1)
       .describe(
-        'Tree target ID returned by task or task_list — a descendant sub-agent task ID or, for sibling/upward messages, a same-tree peer, ancestor, or root workspace ID (task_list scope:"tree").'
+        'Target workspace ID: a descendant sub-agent task ID returned by task, a same-tree row from task_list scope:"tree" (peer, ancestor, or root), an opted-in root workspace row from task_list scope:"instance", or any other workspace ID in this Xum instance that you already know — an envelope "from" reply address or an ID the user provided. Unrelated (cross-tree) targets may be root workspaces or live sub-agents of other trees, but both sender and target must use local or worktree runtimes and the actual recipient must opt in through its workspace settings.'
       ),
     message: z
       .string()
@@ -1081,13 +1085,21 @@ export const TaskSendMessageToolArgsSchema = z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor targets (often human-driven; do not cut into their active turn).'
+        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor and unrelated targets (often human-driven; do not cut into their active turn).'
       ),
   })
   .strict();
 
-/** Target's relation to the sender, computed server-side; a sender cannot claim it. */
-const TaskSendMessageTargetRelationSchema = z.enum(["descendant", "sibling", "ancestor"]);
+/**
+ * Target's relation to the sender, computed server-side; a sender cannot claim it. "unrelated"
+ * means no shared task-tree ancestry (another root or another tree's sub-agent).
+ */
+const TaskSendMessageTargetRelationSchema = z.enum([
+  "descendant",
+  "sibling",
+  "ancestor",
+  "unrelated",
+]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
   .object({
@@ -1578,16 +1590,41 @@ export const TaskListToolArgsSchema = z
       .array(TaskListStatusSchema)
       .nullish()
       .describe(
-        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus the root row under scope:"tree"). ' +
+        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus workspace rows under scope:"tree" or scope:"instance"). ' +
+          'Instance rows all have status "workspace"; an explicit statuses list must include "workspace" to return them. ' +
           "Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. " +
           "Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. " +
           "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow."
       ),
     scope: z
-      .enum(["descendants", "tree"])
+      .enum(["descendants", "tree", "instance"])
       .nullish()
       .describe(
-        'Listing scope. "descendants" (default) lists this workspace\'s own tasks, workflow runs, and bash processes. "tree" lists every agent workspace in this task tree — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you; use it to discover task_send_message peer targets.'
+        'Listing scope. "descendants" (default) lists this workspace\'s own tasks, workflow runs, and bash processes. "tree" lists every agent workspace in this task tree — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you; use it to discover task_send_message peer targets. ' +
+          '"instance" is the on-demand address book for local/worktree callers: eligible local/worktree root workspaces across projects in this Xum instance, requiring recipient opt-in outside your task tree (never another tree\'s sub-agents), newest first, paged with `limit`/`offset` and narrowed with `query`; each row carries `projectPath`, an `activity` snapshot, and its relationship to you (self, ancestor, or unrelated).'
+      ),
+    query: z
+      .string()
+      .nullish()
+      .describe(
+        'scope:"instance" only — case-insensitive filter matched against workspace ID, title, name, and project path. Blank or null means no filter. Passing it with any other scope is an error.'
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(INSTANCE_DISCOVERY_MAX_LIMIT)
+      .nullish()
+      .describe(
+        `scope:"instance" only — page size (default ${INSTANCE_DISCOVERY_DEFAULT_LIMIT}, max ${INSTANCE_DISCOVERY_MAX_LIMIT}). Passing it with any other scope is an error.`
+      ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .nullish()
+      .describe(
+        'scope:"instance" only — number of matching rows to skip; pass the previous result\'s `nextOffset` to continue paging. Passing it with any other scope is an error.'
       ),
     includeArchived: z
       .boolean()
@@ -1614,8 +1651,15 @@ export const TaskListToolTaskSchema = z
     thinkingLevel: TaskThinkingLevelSchema.optional(),
     bestOf: BestOfGroupSchema.optional(),
     workflowProgress: WorkflowProgressSummarySchema.optional(),
-    /** Present under scope:"tree": this row's relationship to the calling workspace. */
-    relationship: z.enum(["self", "ancestor", "sibling", "descendant"]).optional(),
+    /**
+     * Present under scope:"tree" and scope:"instance": this row's relationship to the calling
+     * workspace. "unrelated" (instance scope) means no shared task-tree ancestry.
+     */
+    relationship: z.enum(["self", "ancestor", "sibling", "descendant", "unrelated"]).optional(),
+    /** scope:"instance" only — the project the root workspace belongs to. */
+    projectPath: z.string().optional(),
+    /** scope:"instance" only — availability snapshot at listing time, not a guarantee. */
+    activity: z.enum(["busy", "idle"]).optional(),
     depth: z.number().int().min(0),
   })
   .strict();
@@ -1624,6 +1668,8 @@ export const TaskListToolResultSchema = z
   .object({
     tasks: z.array(TaskListToolTaskSchema),
     note: z.string().optional(),
+    /** scope:"instance" only — present when more rows match; pass it back as `offset`. */
+    nextOffset: z.number().int().min(0).optional(),
   })
   .strict();
 
@@ -3077,10 +3123,11 @@ export const TOOL_DEFINITIONS = {
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send a plain-text message to another agent workspace in this task tree: a descendant sub-agent, a sibling/cousin, or an ancestor (including the root workspace). The relationship is computed server-side from the tree — you can never claim parent authority you do not have. Discover addressable peers with task_list scope:"tree". ' +
+      'Send a plain-text message to another agent workspace in this Xum instance: a descendant sub-agent, a sibling/cousin, an ancestor (including the root workspace), or an unrelated workspace outside your task tree. The relationship is computed server-side — you can never claim parent authority you do not have. Same-tree peers are discoverable with task_list scope:"tree"; an unrelated workspace ID you already know (an envelope "from" reply address, or an ID the user provided) is addressable only when that recipient has opted in. ' +
       "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
-      "Sibling and ancestor targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; they must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only). Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
-      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces outside this task tree.",
+      "Sibling, ancestor, and unrelated targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; sub-agent targets must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only), while idle root workspaces wake. Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
+      "Unrelated messaging is off by default: the actual recipient must enable it in its workspace settings; knowing its ID or its parent's consent does not grant access. Revocation cancels input not yet admitted, even after re-enabling; an already admitted turn may finish. Unrelated-message turns need user action to resume after an app restart. This tool cannot grant consent. Both endpoints must use local or worktree runtimes; SSH (including Coder), Docker, devcontainer, and unresolved runtimes are refused. Same-tree messaging is unchanged. Unrelated targets default to turn-end dispatch and keep their own agent, model, and thinking settings — your settings are never applied or persisted there. Messaging grants no additional control: your existing rights over task-tree descendants and over workspace-turn handles you already own remain exactly as before, and no other rights are added. An unrelated root that is inside a delegated workspace turn is temporarily unavailable and returns refused with a retry-after reason; retry once that turn finishes. " +
+      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces in other Xum instances.",
     schema: TaskSendMessageToolArgsSchema,
   },
   task_message_parent: {
@@ -3137,6 +3184,7 @@ export const TOOL_DEFINITIONS = {
       "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
       "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
       'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to keep candidates independent), and non-descendant rows in terminal states (peers cannot reactivate an inactive task — only its parent can); the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
+      'Pass scope:"instance" from a local/worktree workspace for the on-demand address book of this Xum instance: eligible local/worktree root workspaces across projects (status "workspace", never another tree\'s sub-agents), tagged self, ancestor, or unrelated, ordered newest first by createdAt. Unrelated roots must opt in through their workspace settings; absent or revoked consent hides them before searching, counting, and paging. Consent does not hide your own task-tree root. Narrow with `query` (ID, title, name, project path), page with `limit`/`offset`, and continue from `nextOffset` when it is returned; `activity` (busy/idle) is a snapshot taken at listing time. Rows are addressable via task_send_message — unrelated targets receive your text as an untrusted agent message, queued to turn-end while they are busy, under their own agent/model settings; discovery grants no additional control, and existing ownership rights remain unchanged. ' +
       "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
       "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
     schema: TaskListToolArgsSchema,

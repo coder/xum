@@ -117,6 +117,29 @@ export const WorkflowTaskMetadataSchema = z.object({
   }),
 });
 
+/**
+ * Shared description for the recipient-consent field on persisted config and published metadata.
+ * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
+ * it; the backend compares the generation captured at admission with the current one so an
+ * off→on flip cannot revive work queued under the previous consent. Absent means off. Only the
+ * app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * application-level opt-in, not an isolation boundary.
+ */
+export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. Absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+
+/**
+ * Fail-closed reader for the persisted consent generation. Config entries are loaded without
+ * per-field schema validation, so a corrupted, blank, or whitespace-padded value must read as
+ * "off" rather than as a permissive default — and must never make the workspace unloadable.
+ */
+export function getValidUnrelatedWorkspaceConsent(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  return value.trim() === value ? value : undefined;
+}
+
 export const WorkspaceMetadataSchema = z.object({
   kind: z.literal("scratch").optional().meta({
     description: "Marks an app-owned project-less scratch chat workspace.",
@@ -165,6 +188,11 @@ export const WorkspaceMetadataSchema = z.object({
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults (budget, turn cap, explicit-budget). Layered on top of the global `goalDefaults` from app config.",
+  }),
+  // Passed through from config so the settings UI reads consent from metadata instead of
+  // keeping a duplicate copy; only a validated (non-blank) generation is published.
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:

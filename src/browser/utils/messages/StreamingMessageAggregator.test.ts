@@ -265,6 +265,65 @@ function historicalTodoMessage(
 }
 
 describe("StreamingMessageAggregator", () => {
+  describe("history edit evidence", () => {
+    const row = (id: string, seq: number, text: string) =>
+      createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", text, {
+        historySequence: seq,
+        timestamp: seq + 1,
+      });
+
+    test("a projection over a persisted row keeps the persisted version as evidence", () => {
+      const aggregator = new StreamingMessageAggregator(new Date().toISOString());
+      const persistedCard = row("workflow-run-1", 1, "workflow running");
+      aggregator.loadHistoricalMessages([row("u0", 0, "hi"), persistedCard, row("u2", 2, "next")]);
+      const before = aggregator.getHistoryEvidenceMessages();
+
+      // The projection (same id, live status) is displayed; the backend still holds the card.
+      aggregator.addEphemeralMessage(row("workflow-run-1", 1, "workflow completed"));
+      expect(aggregator.getAllMessages().find((m) => m.id === "workflow-run-1")?.parts).toEqual(
+        row("workflow-run-1", 1, "workflow completed").parts
+      );
+      expect(aggregator.getHistoryEvidenceMessages()).toEqual(before);
+
+      // A newer persisted version from the backend becomes the evidence, projection or not.
+      const republished = row("workflow-run-1", 1, "workflow finished (persisted)");
+      aggregator.addMessage(republished);
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(republished.parts);
+
+      // Every active stream's row is fenced by identity only (two can overlap briefly).
+      startTestStream(aggregator, { messageId: "s3", historySequence: 3 });
+      startTestStream(aggregator, { messageId: "s4", historySequence: 4 });
+      expect(
+        aggregator
+          .getHistoryEvidenceMessages()
+          .filter((m) => m.id === "s3" || m.id === "s4")
+          .map((m) => m.metadata?.partial)
+      ).toEqual([true, true]);
+
+      // A since replay that rewrites the row (the backend updated the persisted card) refreshes
+      // the evidence too — that path bypasses addMessage and loadHistoricalMessages.
+      const rewritten = row("workflow-run-1", 1, "workflow finished (since replay)");
+      aggregator.reconcileSinceReplay({
+        messages: [rewritten],
+        requestedAnchorSequence: 0,
+        hasActiveStream: false,
+      });
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(rewritten.parts);
+
+      // A frontend-only row with no persisted counterpart is not evidence at all.
+      aggregator.addEphemeralMessage(
+        row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
+      );
+      expect(
+        aggregator.getHistoryEvidenceMessages().some((m) => m.id === "plan-display-preview")
+      ).toBe(false);
+    });
+  });
+
   describe("workflow run attachments", () => {
     test("preserves persisted workflow run attachments on displayed tool rows", () => {
       const aggregator = createTestAggregator();

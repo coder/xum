@@ -1,5 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { waitFor, within } from "@storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { isDialogOpen } from "@/browser/utils/ui/keybinds";
 import { Button } from "../Button/Button.js";
 import {
   Dialog,
@@ -45,6 +47,19 @@ export const Default: Story = {
       </Dialog>
     </div>
   ),
+  // Portaled modal contract for global shortcut guards: Radix sets no aria-modal on the
+  // content, so isDialogOpen() must still see this open dialog (through its overlay).
+  play: async () => {
+    const dialog = await waitFor(() =>
+      within(document.body).getByRole("dialog", { name: "Rename workspace" })
+    );
+    if (dialog.getAttribute("data-state") !== "open") {
+      throw new Error("dialog content must be open for the guard contract to be meaningful");
+    }
+    if (!isDialogOpen()) {
+      throw new Error("isDialogOpen() must report the open modal Dialog");
+    }
+  },
 };
 
 export const Destructive: Story = {

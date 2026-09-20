@@ -3,6 +3,11 @@ import React from "react";
 import { StartHereModal } from "@/browser/components/StartHereModal/StartHereModal";
 import { createMuxMessage } from "@/common/types/message";
 import { useAPI } from "@/browser/contexts/API";
+import {
+  isTranscriptMutationAllowed,
+  useTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 /**
  * Hook for managing Start Here button state and modal.
@@ -22,10 +27,16 @@ export function useStartHere(
   const { api } = useAPI();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isStartingHere, setIsStartingHere] = useState(false);
+  // Rendered disabled state follows the barrier, so the button never offers a click that
+  // `openModal`/`executeStartHere` would refuse.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
 
   // Opens the confirmation modal
   const openModal = () => {
     if (!workspaceId || isCompacted) return;
+    // Start Here rewrites the request window around a row the user sees; refuse while the
+    // transcript is not yet a verified copy of history (same barrier as sends and edits).
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
     setIsModalOpen(true);
   };
 
@@ -36,6 +47,12 @@ export function useStartHere(
   // Executes the Start Here operation
   const executeStartHere = async () => {
     if (!workspaceId || isStartingHere || isCompacted || !api) return;
+    // Re-checked at dispatch: the replay can drop out between opening the modal and confirming.
+    // Thrown (not silently resolved) so the modal stays open instead of closing as if it worked;
+    // the rendered OK button is already disabled through `confirmDisabled` by then.
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+    }
 
     setIsStartingHere(true);
     try {
@@ -74,13 +91,16 @@ export function useStartHere(
     isOpen: isModalOpen,
     onClose: closeModal,
     onConfirm: executeStartHere,
+    // The open dialog follows the barrier too: a replay that drops out after it opened
+    // disables OK rather than letting a click resolve to nothing.
+    confirmDisabled: !transcriptMutationAllowed,
   });
 
   return {
     openModal,
     isStartingHere,
     buttonLabel: `Start Here`,
-    disabled: !workspaceId || isStartingHere || isCompacted,
+    disabled: !workspaceId || isStartingHere || isCompacted || !transcriptMutationAllowed,
     modal, // Pre-configured modal to render
   };
 }

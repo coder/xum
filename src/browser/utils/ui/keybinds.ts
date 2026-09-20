@@ -225,16 +225,27 @@ export function isBrowserViewportFocused(target: EventTarget | null): boolean {
 }
 
 /**
+ * Marker the shared Dialog primitive puts on its overlay so isDialogOpen() can see it. Radix
+ * renders the overlay only for modal roots and sets no aria-modal on dialog content, so an OPEN
+ * marked overlay is the reliable "a modal is up" signal for every dialog built on that primitive.
+ */
+export const MODAL_DIALOG_OVERLAY_ATTRIBUTE = "data-modal-dialog-overlay";
+
+/**
  * Check if a modal dialog is currently open.
  * Used by capture-phase keyboard handlers to skip shortcuts while a modal is active,
  * since bubble-phase stopPropagation from dialog onKeyDown can't block capture-phase listeners.
  *
- * Only matches true modal dialogs (aria-modal="true"), not non-modal Radix popovers
- * which also use role="dialog" but should not suppress global shortcuts.
+ * Matches an open overlay of the shared Dialog primitive (see MODAL_DIALOG_OVERLAY_ATTRIBUTE) or
+ * an explicit aria-modal="true" dialog built outside it. Non-modal Radix popovers also use
+ * role="dialog" but render neither, so they do not suppress global shortcuts.
  */
 export function isDialogOpen(): boolean {
   if (typeof document === "undefined") return false;
-  return document.querySelector('[role="dialog"][aria-modal="true"]') !== null;
+  return (
+    document.querySelector(`[${MODAL_DIALOG_OVERLAY_ATTRIBUTE}][data-state="open"]`) !== null ||
+    document.querySelector('[role="dialog"][aria-modal="true"]') !== null
+  );
 }
 
 /**
@@ -406,6 +417,10 @@ export const KEYBINDS = {
   /** Configure heartbeat settings for current workspace */
   // macOS: Cmd+Shift+H, Win/Linux: Ctrl+Shift+H
   CONFIGURE_HEARTBEAT: { key: "H", ctrl: true, shift: true },
+
+  /** Configure whether unrelated workspaces may discover/message the current workspace */
+  // macOS: Cmd+Shift+U, Win/Linux: Ctrl+Shift+U
+  CONFIGURE_UNRELATED_MESSAGING: { key: "U", ctrl: true, shift: true },
 
   /** Open Command Palette */
   // VS Code-style palette

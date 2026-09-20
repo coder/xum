@@ -1,7 +1,7 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { FilePart, HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -26,6 +26,8 @@ interface PrepareMessagePayloadInput {
   reviews?: ReviewNoteDataForDisplay[];
   reviewIds: string[];
   editMessageId?: string;
+  /** Required with editMessageId: the RPC refuses an unfenced UI edit. */
+  historyEditPrecondition?: HistoryEditPrecondition;
   baseMetadata?: MuxMessageMetadata;
   agentSkillRefs: AgentSkillReference[];
   mcpPromptRefs: MCPPromptReference[];
@@ -137,6 +139,9 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       additionalSystemInstructions,
       editMessageId: input.editMessageId,
+      ...(input.editMessageId && input.historyEditPrecondition
+        ? { historyEditPrecondition: input.historyEditPrecondition }
+        : {}),
       fileParts: sendFileParts,
       muxMetadata: metadata,
     },

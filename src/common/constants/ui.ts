@@ -159,3 +159,21 @@ export function resolveSectionColor(color: string | null | undefined): string {
 
   return DEFAULT_SECTION_COLOR;
 }
+
+/**
+ * Bundle-granular tail-first transcript reveal (ChatPane): the newest rows mount first, the
+ * rest in frame-yielded chunks. A step stops at whichever ceiling it reaches first: the row
+ * count, or the summed row weight (text characters, a proxy for render + layout cost — rows
+ * are wildly heterogeneous: a 50-char prompt versus a 33 KB code block). Every step still
+ * mounts at least one row, and a bundle larger than a step mounts whole (the reveal never
+ * cuts inside one). Measured against the 1000-row fixture (D6): per-step fixed cost is
+ * ~150 ms (React reconciliation of all mounted rows + paint-tree update of the scroller), so
+ * small row ceilings crawl on prompt-heavy histories, while unbounded weight makes a step of
+ * 20 code-block rows a ~900 ms task.
+ */
+export const TRANSCRIPT_REVEAL_TAIL_ROWS = 40;
+export const TRANSCRIPT_REVEAL_CHUNK_ROWS = 60;
+/** Weight ceiling shared by the tail and every chunk (about three 33 KB code-block rows). */
+export const TRANSCRIPT_REVEAL_STEP_CHARS = 128_000;
+/** Weight assumed for rows without a text body (tool cards render collapsed by default). */
+export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;

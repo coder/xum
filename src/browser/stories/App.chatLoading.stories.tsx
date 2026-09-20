@@ -232,6 +232,7 @@ function createHydrationStory(workspaceId: string): AppStory {
             emit(history);
             emit({
               type: "caught-up",
+              historyReplayStatus: "complete",
               hasOlderHistory: false,
               cursor: { history: { messageId: history.id, historySequence: 1 } },
             });
@@ -242,7 +243,7 @@ function createHydrationStory(workspaceId: string): AppStory {
               historySequence: 1,
             })
           );
-          emit({ type: "caught-up", hasOlderHistory: false });
+          emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false });
         }
       },
     });
@@ -299,6 +300,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       emitChat(history);
       emitChat({
         type: "caught-up",
+        historyReplayStatus: "complete",
         hasOlderHistory: false,
         cursor: { history: { messageId: history.id, historySequence: 1 } },
       });
@@ -339,6 +341,7 @@ function createHydrationStory(workspaceId: string): AppStory {
           emitChat(history);
           emitChat({
             type: "caught-up",
+            historyReplayStatus: "complete",
             replay: "since",
             hasOlderHistory: false,
             cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -397,6 +400,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       emitChat(history);
       emitChat({
         type: "caught-up",
+        historyReplayStatus: "complete",
         replay: "since",
         hasOlderHistory: false,
         cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -457,6 +461,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         emitTranscript(history);
         emitTranscript({
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "since",
           hasOlderHistory: false,
           cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -492,6 +497,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         emitChat(history);
         emitChat({
           type: "caught-up",
+          historyReplayStatus: "complete",
           replay: "since",
           hasOlderHistory: false,
           cursor: { history: { messageId: history.id, historySequence: 1 } },
@@ -667,7 +673,7 @@ function createStreamingHydrationStory(workspaceId: string): AppStory {
             historySequence: 2,
             startTime: STABLE_TIMESTAMP,
           });
-          emitChat({ type: "caught-up", hasOlderHistory: false });
+          emitChat({ type: "caught-up", hasOlderHistory: false, historyReplayStatus: "complete" });
           await expect(await canvas.findByText("Replayed response.")).toBeVisible();
           await waitFor(() => expect(scrollport).toHaveAttribute("data-loaded", "true"));
           await new Promise<void>((resolve) =>
@@ -780,7 +786,12 @@ function createCreationPendingStory(): AppStory {
           isError: false,
           timestamp: STABLE_TIMESTAMP,
         });
-        emit({ type: "caught-up", replay: "full", hasOlderHistory: false });
+        emit({
+          type: "caught-up",
+          historyReplayStatus: "complete",
+          replay: "full",
+          hasOlderHistory: false,
+        });
       },
     });
     client.nameGeneration.generate = async () => {

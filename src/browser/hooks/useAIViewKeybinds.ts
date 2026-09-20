@@ -26,7 +26,8 @@ interface UseAIViewKeybindsParams {
   handleOpenTerminal: () => void;
   handleOpenInEditor: () => void;
   aggregator: StreamingMessageAggregator | undefined; // For compaction detection
-  setEditingMessage: (editing: EditingMessageState | undefined) => void;
+  /** Enters edit mode for the cancelled compaction request (the owner captures its edit fence). */
+  setEditingMessage: (editing: EditingMessageState) => void;
   vimEnabled: boolean; // For vim-aware interrupt keybind
   // RESUME_STREAM keybind: continue an interrupted stream. Optional so the hook
   // stays drop-in for callers/tests that don't surface a resume affordance.

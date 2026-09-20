@@ -280,8 +280,6 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
           })),
           checkMidStream: mock(() => false),
           resetForNewStream: mock(() => undefined),
-          setThreshold: mock(() => undefined),
-          getThreshold: mock(() => 0.85),
         };
 
         const result = await session.sendMessage(

@@ -3,6 +3,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  seedAutoCompactionThreshold,
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import { Ok } from "@/common/types/result";
@@ -53,8 +54,6 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
     contextBudgetGeneration: number;
     pendingBudgetPrompt?: "warn" | "handoff";
   };
-  continuous.session.setAutoCompactionThreshold(0.6);
-  budget.session.setAutoCompactionThreshold(0.7);
   const model = "openai:gpt-4o";
   expect(
     (
@@ -93,7 +92,9 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   expect(budgetState.pendingBudgetPrompt).toBe("warn");
 
   const budgetGeneration = budgetState.contextBudgetGeneration;
-  continuous.session.setAutoCompactionThreshold(0.8);
+  // The threshold is a per-model user preference in the shared config, not session state:
+  // this change reaches both sessions, but only the continuous compactor has anything to reset.
+  await seedAutoCompactionThreshold(continuous.config, model, 80);
   expect(budgetState.contextBudgetGeneration).toBe(budgetGeneration);
   expect(budgetState.pendingBudgetPrompt).toBe("warn");
   const continuousGeneration: unknown = Reflect.get(

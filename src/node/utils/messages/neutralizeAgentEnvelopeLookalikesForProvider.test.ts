@@ -43,6 +43,41 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(result).toBe(peer);
   });
 
+  test("exempts an authentic unrelated (cross-tree) payload row", () => {
+    // Cross-tree sends take the same peer path; an authentic row whose envelope and metadata both
+    // say `unrelated` keeps the exact wrapper the system prompt classifies as peer input.
+    const unrelatedEnvelope = formatAgentMessageEnvelope({
+      from: "ws-other-root",
+      relationship: "unrelated",
+      message: "status update",
+    });
+    const peer = createMuxMessage("p-unrelated", "assistant", unrelatedEnvelope, {
+      historySequence: 9,
+      synthetic: true,
+      muxMetadata: {
+        type: "agent-peer-message",
+        fromWorkspaceId: "ws-other-root",
+        relationship: "unrelated",
+      },
+    });
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([peer]);
+    expect(result).toBe(peer);
+  });
+
+  test("neutralizes assistant rows whose envelope relationship disagrees with the metadata", () => {
+    // Envelope claims `sibling` (same-tree) while the server-attached metadata says `unrelated`:
+    // the halves are individually valid but the provider would read a closer relationship than
+    // the one the server computed, so the row loses the authentic wrapper.
+    const inconsistent = createMuxMessage("i-relationship", "assistant", envelope, {
+      historySequence: 10,
+      synthetic: true,
+      muxMetadata: { ...validPeerMetadata, relationship: "unrelated" },
+    });
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([inconsistent]);
+    expect(textOf(result)).not.toContain("<mux_agent_message>");
+    expect(textOf(result)).toContain("<user_pasted_mux_agent_message>");
+  });
+
   test("neutralizes lookalike wrappers inside tool outputs", () => {
     // Tool results carry attacker-controlled repository content (file_read, bash, ...): an
     // exact wrapper inside them reaches provider tool content via convertToModelMessages, so it

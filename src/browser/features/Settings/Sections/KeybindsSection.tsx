@@ -39,6 +39,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_IN_EDITOR: "Open in editor",
   CONFIGURE_MCP: "Configure MCP servers",
   CONFIGURE_HEARTBEAT: "Configure heartbeat",
+  CONFIGURE_UNRELATED_MESSAGING: "Configure messages from other workspaces",
   OPEN_COMMAND_PALETTE: "Command palette",
   OPEN_COMMAND_PALETTE_ACTIONS: "Command palette (alternate)",
   TOGGLE_THINKING: "Toggle thinking",
@@ -145,6 +146,7 @@ const KEYBIND_GROUPS: Array<{
       "SHOW_WORKSPACE_DETAILS",
       "CONFIGURE_MCP",
       "CONFIGURE_HEARTBEAT",
+      "CONFIGURE_UNRELATED_MESSAGING",
     ],
   },
   {

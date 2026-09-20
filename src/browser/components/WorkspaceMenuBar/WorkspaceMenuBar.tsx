@@ -12,6 +12,7 @@ import {
   getNotifyOnResponseAutoEnableKey,
 } from "@/common/constants/storage";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
+import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
@@ -26,7 +27,13 @@ import {
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  isDevcontainerRuntime,
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -131,6 +138,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // Keyed by workspace (same pattern as the timeline dialog below): consent is granted per
+  // recipient workspace, so switching workspaces while the dialog is open must close it
+  // rather than let the switch be flipped against the workspace the user navigated to.
+  const [unrelatedMessagingWorkspaceId, setUnrelatedMessagingWorkspaceId] = useState<string | null>(
+    null
+  );
+  if (unrelatedMessagingWorkspaceId !== null && unrelatedMessagingWorkspaceId !== workspaceId) {
+    setUnrelatedMessagingWorkspaceId(null);
+  }
+  const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
   // workspace" action) implicitly closes the dialog instead of covering the new view.
   const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
@@ -270,6 +287,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
+  // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
+  // worktree runtimes on both endpoints, so remote/container workspaces get no consent entry
+  // point (menu action or shortcut) — a grant there could never be honoured. An unset config
+  // resolves to the same canonical default the backend applies.
+  const unrelatedMessagingRuntime = runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+  const unrelatedMessagingSupported =
+    isLocalProjectRuntime(unrelatedMessagingRuntime) ||
+    isWorktreeRuntime(unrelatedMessagingRuntime);
 
   const getMoreMenuAnchor = useCallback(() => {
     const rect = moreActionsButtonRef.current?.getBoundingClientRect();
@@ -523,6 +548,23 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [workspaceHeartbeatsEnabled]);
+
+  // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
+  // a window listener subscribing to an external event source, not derived state). Like the
+  // timeline shortcut, it yields to any modal already open so it cannot stack a consent dialog
+  // over another dialog's focus trap.
+  useEffect(() => {
+    if (!unrelatedMessagingSupported) return;
+
+    const handler = (e: KeyboardEvent) => {
+      if (matchesKeybind(e, KEYBINDS.CONFIGURE_UNRELATED_MESSAGING) && !isDialogOpen()) {
+        e.preventDefault();
+        setUnrelatedMessagingWorkspaceId(workspaceId);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [workspaceId, unrelatedMessagingSupported]);
 
   useEffect(() => {
     isSkillsMountedRef.current = true;
@@ -832,6 +874,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onConfigureHeartbeat={
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
+              onConfigureUnrelatedMessaging={
+                unrelatedMessagingSupported
+                  ? () => setUnrelatedMessagingWorkspaceId(workspaceId)
+                  : null
+              }
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
@@ -883,6 +930,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           workspaceId={workspaceId}
           open={heartbeatModalOpen}
           onOpenChange={setHeartbeatModalOpen}
+        />
+      )}
+      {unrelatedMessagingSupported && (
+        <WorkspaceUnrelatedMessagingModal
+          // Remount per workspace: the keyed open state above only closes the dialog, while
+          // the modal's own pending/error state and in-flight request id would otherwise
+          // survive the switch and surface in the next workspace's dialog.
+          key={workspaceId}
+          open={unrelatedMessagingModalOpen}
+          onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
+          // Read straight from published metadata: the switch moves only after the backend
+          // commits and republishes, never on the local ack alone.
+          enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
+          onSetEnabled={(enabled) =>
+            api
+              ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
+              : Promise.resolve({ success: false as const, error: "Not connected to server" })
+          }
         />
       )}
       <WorkspaceMCPModal

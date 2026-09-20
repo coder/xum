@@ -84,6 +84,8 @@ import {
   UNPRICED_CURRENT_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 export interface BuildSourcesParams {
   api: APIClient | null;
@@ -1164,6 +1166,15 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const list: CommandAction[] = [];
     if (p.selectedWorkspace) {
       const id = p.selectedWorkspace.workspaceId;
+      // Reset/truncate rewrite history based on what the user currently sees, so both refuse
+      // through the palette's normal error path until the transcript is a verified copy.
+      const assertTranscriptMutationAllowed = () => {
+        if (isTranscriptMutationAllowed(id)) {
+          return;
+        }
+        showCommandFeedbackToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+        throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      };
       list.push({
         id: CommandIds.chatResetContext(),
         title: "Reset Context, Preserve History",
@@ -1171,6 +1182,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["context reset", "soft clear", "preserve history", "reset chat"],
         run: async () => {
           assert(p.api, "Reset Context palette action requires a connected backend");
+          assertTranscriptMutationAllowed();
           const result = await p.api.workspace.resetContext({ workspaceId: id });
           if (!result.success) {
             showCommandFeedbackToast({ type: "error", message: result.error });
@@ -1192,6 +1204,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // failed — must surface instead of silently resolving as success
       // (mirrors the Reset Context action above).
       const runTruncate = async (percentage: number) => {
+        assertTranscriptMutationAllowed();
         const result = await p.api?.workspace.truncateHistory({ workspaceId: id, percentage });
         if (result && !result.success) {
           showCommandFeedbackToast({ type: "error", message: result.error });

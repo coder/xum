@@ -17,6 +17,7 @@ import {
   PROJECT_ORDER_KEY,
   UI_THEME_KEY,
   VIM_ENABLED_KEY,
+  getAutoCompactionThresholdKey,
 } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 
@@ -50,6 +51,48 @@ class MemoryStorage implements Storage {
   setJSON(key: string, value: unknown): void {
     this.setItem(key, JSON.stringify(value));
   }
+}
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+}
+
+function createDeferred(): Deferred {
+  let resolve: () => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** saveConfig double whose attempts settle only when the test releases them. */
+function createControllableSaveConfig() {
+  const attempts: Deferred[] = [];
+  const saveConfig = () => {
+    const attempt = createDeferred();
+    attempts.push(attempt);
+    return attempt.promise;
+  };
+  return { attempts, saveConfig };
+}
+
+/** Tracks a waitForPersisted promise without leaving unhandled rejections behind. */
+function observe(promise: Promise<void>) {
+  const state = { settled: false, error: undefined as unknown };
+  const tracked = promise.then(
+    () => {
+      state.settled = true;
+    },
+    (error: unknown) => {
+      state.settled = true;
+      state.error = error;
+    }
+  );
+  return { state, tracked };
 }
 
 async function waitUntil(assertion: () => void): Promise<void> {
@@ -373,7 +416,7 @@ describe("UserPreferencesProvider bridge helpers", () => {
       },
     });
 
-    queue(currentPreferences);
+    queue.enqueue(currentPreferences);
 
     await waitUntil(() => expect(saves).toEqual([currentPreferences]));
     expect(saveAttempts).toBe(2);
@@ -405,7 +448,7 @@ describe("UserPreferencesProvider bridge helpers", () => {
       },
     });
 
-    queue(currentPreferences);
+    queue.enqueue(currentPreferences);
 
     await waitUntil(() => expect(errors).toHaveLength(1));
     controller.abort();
@@ -445,9 +488,9 @@ describe("UserPreferencesProvider bridge helpers", () => {
       },
     });
 
-    queue({ appearance: { theme: "dark" } });
+    queue.enqueue({ appearance: { theme: "dark" } });
     currentPreferences = { appearance: { theme: "light" } };
-    queue(currentPreferences);
+    queue.enqueue(currentPreferences);
 
     await waitUntil(() => expect(firstSave.release).toBeDefined());
     const releaseFirst = firstSave.release;
@@ -459,5 +502,231 @@ describe("UserPreferencesProvider bridge helpers", () => {
     await waitUntil(() => expect(saves).toHaveLength(2));
     expect(saves).toEqual([{ appearance: { theme: "dark" } }, { appearance: { theme: "light" } }]);
     expect(dirtyClears).toBe(1);
+  });
+
+  describe("save queue waitForPersisted", () => {
+    const THRESHOLD_KEY = getAutoCompactionThresholdKey("anthropic:claude-sonnet-4-5");
+    const preferences: UserPreferences = { appearance: { theme: "dark" } };
+
+    function createQueue(params?: { onError?: (message: string, error: unknown) => void }) {
+      const controller = new AbortController();
+      const saveConfig = createControllableSaveConfig();
+      const queue = createUserPreferenceSaveQueue({
+        signal: controller.signal,
+        configClient: {
+          getConfig: () => Promise.resolve({}),
+          saveConfig: saveConfig.saveConfig,
+        },
+        getCurrentPreferences: () => preferences,
+        clearDirtyKeys: () => undefined,
+        onError:
+          params?.onError ??
+          ((message, error) => {
+            throw new Error(`${message} ${String(error)}`);
+          }),
+      });
+      return { controller, queue, attempts: saveConfig.attempts };
+    }
+
+    test("resolves immediately when nothing is pending for the key", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      await queue.waitForPersisted(THRESHOLD_KEY, signal);
+      expect(attempts).toHaveLength(0);
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      attempts[0].resolve();
+      await queue.waitForPersisted(THRESHOLD_KEY, signal);
+
+      // Acknowledged versions are sticky: a later wait for the same key is free.
+      await queue.waitForPersisted(THRESHOLD_KEY, signal);
+      expect(attempts).toHaveLength(1);
+    });
+
+    test("resolves after the matching version is acknowledged", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(wait.state.settled).toBe(false);
+
+      attempts[0].resolve();
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+    });
+
+    test("a reserved (pre-hydration) write keeps waiters pending until a save carries it", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      queue.reserve([THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Nothing was enqueued, yet the write is not acknowledged either.
+      expect(attempts).toHaveLength(0);
+      expect(wait.state.settled).toBe(false);
+
+      // The hydration save carries the dirty key; its acknowledgement releases the waiter.
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      attempts[0].resolve();
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+    });
+
+    test("settle releases reserved writes the backend already holds", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      queue.reserve([THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+      queue.settle([THRESHOLD_KEY]);
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+      expect(attempts).toHaveLength(0);
+      // Settling a key with nothing reserved is a no-op.
+      queue.settle([THRESHOLD_KEY]);
+      await queue.waitForPersisted(THRESHOLD_KEY, signal);
+    });
+
+    test("is not blocked by a pending save for another key", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      // The threshold write is in flight; a theme write queues behind it.
+      queue.enqueue(preferences, [UI_THEME_KEY]);
+
+      const thresholdWait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+      const themeWait = observe(queue.waitForPersisted(UI_THEME_KEY, signal));
+
+      attempts[0].resolve();
+      await thresholdWait.tracked;
+      expect(thresholdWait.state.error).toBeUndefined();
+
+      // The theme save is still pending; only the theme waiter stays blocked.
+      await waitUntil(() => expect(attempts).toHaveLength(2));
+      expect(themeWait.state.settled).toBe(false);
+
+      attempts[1].resolve();
+      await themeWait.tracked;
+      expect(themeWait.state.error).toBeUndefined();
+    });
+
+    test("a superseded version resolves once the newer write is acknowledged", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      // Hold an unrelated save in flight so the two threshold writes coalesce.
+      queue.enqueue(preferences, [UI_THEME_KEY]);
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+
+      attempts[0].resolve();
+      await waitUntil(() => expect(attempts).toHaveLength(2));
+      expect(wait.state.settled).toBe(false);
+
+      attempts[1].resolve();
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+      // Both threshold writes rode a single save.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(attempts).toHaveLength(2);
+    });
+
+    test("rejects when the save carrying the version fails while the queue keeps retrying", async () => {
+      const errors: string[] = [];
+      const { queue, attempts } = createQueue({
+        onError: (message) => {
+          errors.push(message);
+        },
+      });
+      const signal = new AbortController().signal;
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      attempts[0].reject(new Error("disk full"));
+
+      await wait.tracked;
+      expect(wait.state.error).toBeInstanceOf(Error);
+      expect((wait.state.error as Error).message).toContain("Settings could not be saved");
+      expect(signal.aborted).toBe(false);
+      expect(errors[0]).toContain("retrying");
+
+      // The queue retries in the background and a later attempt succeeds.
+      await waitUntil(() => expect(attempts).toHaveLength(2));
+      attempts[1].resolve();
+      await queue.waitForPersisted(THRESHOLD_KEY, signal);
+    });
+
+    test("a version enqueued after a failing attempt is not rejected by that failure", async () => {
+      const errors: string[] = [];
+      const { queue, attempts } = createQueue({
+        onError: (message) => {
+          errors.push(message);
+        },
+      });
+      const signal = new AbortController().signal;
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      // Newer write while the first attempt is in flight; the waiter observes the newer version.
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+
+      attempts[0].reject(new Error("disk full"));
+      await waitUntil(() => expect(errors).toHaveLength(1));
+      await waitUntil(() => expect(attempts).toHaveLength(2));
+      expect(wait.state.settled).toBe(false);
+
+      attempts[1].resolve();
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+    });
+
+    test("rejects when the caller's signal aborts", async () => {
+      const { queue, attempts } = createQueue();
+      const controller = new AbortController();
+
+      queue.enqueue(preferences, [THRESHOLD_KEY]);
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, controller.signal));
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+
+      controller.abort();
+      await wait.tracked;
+      expect(controller.signal.aborted).toBe(true);
+      expect(wait.state.error).toBe(controller.signal.reason);
+
+      // The save itself is unaffected by the caller giving up.
+      attempts[0].resolve();
+      await queue.waitForPersisted(THRESHOLD_KEY, new AbortController().signal);
+    });
+
+    test("a multi-key enqueue (hydration save) bumps every given key", async () => {
+      const { queue, attempts } = createQueue();
+      const signal = new AbortController().signal;
+
+      queue.enqueue(preferences, new Set([THRESHOLD_KEY, UI_THEME_KEY]));
+      const wait = observe(queue.waitForPersisted(THRESHOLD_KEY, signal));
+      await waitUntil(() => expect(attempts).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(wait.state.settled).toBe(false);
+
+      attempts[0].resolve();
+      await wait.tracked;
+      expect(wait.state.error).toBeUndefined();
+    });
   });
 });

@@ -64,6 +64,8 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  hasExactlyOneEditFence,
+  EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
   ToolPolicySchema,
   UpdateStatusSchema,
@@ -1652,6 +1654,9 @@ export const workspace = {
       message: z.string(),
       options: SendMessageOptionsSchema.extend({
         fileParts: z.array(FilePartSchema).optional(),
+      }).refine(hasExactlyOneEditFence, {
+        message: EDIT_FENCE_REQUIRED_MESSAGE,
+        path: ["historyEditPrecondition"],
       }),
     }),
     output: ResultSchema(z.object({}), SendMessageErrorSchema),
@@ -1703,14 +1708,12 @@ export const workspace = {
       z.string()
     ),
   },
-  getStartupAutoRetryModel: {
-    input: z.object({ workspaceId: z.string() }),
-    output: ResultSchema(z.string().nullable(), z.string()),
-  },
-  setAutoCompactionThreshold: {
+  // Recipient opt-in for cross-tree discovery/messaging. The caller only says on/off; the
+  // backend mints and owns the generation (see WorkspaceMetadata.unrelatedWorkspaceConsent).
+  setUnrelatedWorkspaceConsent: {
     input: z.object({
       workspaceId: z.string(),
-      threshold: z.number().finite().min(0.1).max(1.0),
+      enabled: z.boolean(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },

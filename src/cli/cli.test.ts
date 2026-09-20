@@ -71,6 +71,9 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
     tempDir,
     close: async () => {
       await server.close();
+      // Closing HTTP leaves service fibers and intervals alive; stop them before deleting config.
+      await services.dispose();
+      await services.shutdown();
       // Cleanup temp directory
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     },

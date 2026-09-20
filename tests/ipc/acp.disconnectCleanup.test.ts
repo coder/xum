@@ -229,7 +229,9 @@ function createHarness(options?: HarnessOptions): Harness {
       getInfo: async ({ workspaceId }: { workspaceId: string }) =>
         workspacesById.get(workspaceId) ?? null,
       onChat: async (_input: { workspaceId: string; mode?: OnChatMode }) =>
-        createChatStream([{ type: "caught-up" } as WorkspaceChatMessage]),
+        createChatStream([
+          { type: "caught-up", historyReplayStatus: "complete" } as WorkspaceChatMessage,
+        ]),
       updateModeAISettings: async () => ({ success: true as const, data: undefined }),
       updateAgentAISettings: async () => ({ success: true as const, data: undefined }),
       getFullReplay: async ({ workspaceId }: { workspaceId: string }) => {

@@ -97,8 +97,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
@@ -277,8 +275,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const result = await session.sendMessage("use my-skill", {
@@ -331,8 +327,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         })),
         checkMidStream: mock(() => false),
         resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
       } as unknown as CompactionMonitor;
 
       const result = await session.sendMessage("next question", {
@@ -415,8 +409,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.7),
     } as unknown as CompactionMonitor;
 
     const result = await session.sendMessage("hello", {
@@ -471,8 +463,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.7),
     } as unknown as CompactionMonitor;
 
     const result = await session.sendMessage("hello", {
@@ -931,8 +921,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       checkBeforeSend,
       checkMidStream,
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const result = await session.sendMessage("hello", {
@@ -1057,8 +1045,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       checkBeforeSend,
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const result = await session.sendMessage("new prompt after restart", {
@@ -1173,8 +1159,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         return midStreamChecks === 1;
       }),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const originalSendMessage = session.sendMessage.bind(session);
@@ -1323,8 +1307,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })),
       checkMidStream,
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
     const workspaceTurnMetadata = {
@@ -1476,8 +1458,6 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.7),
     } as unknown as CompactionMonitor;
 
     return {
