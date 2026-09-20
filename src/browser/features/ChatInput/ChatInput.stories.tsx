@@ -3,7 +3,12 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar, setWorkspaceInput } from "@/browser/stories/helpers/uiState";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey, getReasoningModeKey } from "@/common/constants/storage";
+import {
+  getAutoModelRoutingKey,
+  getModelKey,
+  getReasoningModeKey,
+} from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
@@ -839,5 +844,57 @@ export const CenteredTranscriptAlignment: AppStory = {
     blurActiveElement();
 
     await assertDockSurfacesMatchTranscript(storyRoot, "capped");
+  },
+};
+
+export const AutoModelRoutingActive: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        window.localStorage.setItem(
+          getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING),
+          JSON.stringify(true)
+        );
+        updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
+        updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
+        return setupSimpleChatStory({
+          workspaceId: "ws-auto-routing",
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone", "laptop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Composer with the auto-model-routing experiment on and Auto selected: the model trigger reads Auto and the picker pins the Auto row above the concrete models.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("combobox");
+    await waitFor(() => {
+      if (!trigger.textContent?.includes("Auto")) throw new Error("Trigger does not read Auto");
+    });
+    await userEvent.click(trigger);
+    await waitFor(() => {
+      const autoRow = storyRoot.querySelector<HTMLElement>("[data-auto-routing-option]");
+      if (autoRow?.getAttribute("aria-selected") !== "true") {
+        throw new Error("Auto row is not the selected option");
+      }
+    });
   },
 };

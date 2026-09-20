@@ -8,7 +8,6 @@ import {
 
 export interface AutoModelRoutingState {
   config: AutoModelRoutingConfig;
-  loaded: boolean;
   // Arrow-function property type so consumers can destructure without
   // tripping @typescript-eslint/unbound-method.
   /** Full replacement of the tier list; the backend normalizes before persisting. */
@@ -26,7 +25,6 @@ export function useAutoModelRouting(): AutoModelRoutingState {
   const [config, setLocalConfig] = useState<AutoModelRoutingConfig>(() =>
     getDefaultAutoModelRoutingConfig()
   );
-  const [loaded, setLoaded] = useState(false);
   // Ignore stale config fetches so backend refreshes can't overwrite newer optimistic edits.
   const fetchVersionRef = useRef(0);
 
@@ -44,7 +42,6 @@ export function useAutoModelRouting(): AutoModelRoutingState {
         return;
       }
       setLocalConfig(normalizeAutoModelRoutingConfig(loadedConfig.autoModelRouting));
-      setLoaded(true);
     } catch {
       // Best-effort only.
     }
@@ -100,5 +97,5 @@ export function useAutoModelRouting(): AutoModelRoutingState {
     [api, fetchConfig]
   );
 
-  return { config, loaded, setConfig };
+  return { config, setConfig };
 }

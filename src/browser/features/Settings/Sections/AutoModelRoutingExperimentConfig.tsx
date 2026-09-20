@@ -161,8 +161,7 @@ export function AutoModelRoutingExperimentConfig() {
   return (
     <div className="bg-background-secondary space-y-4 px-4 py-3" data-auto-model-routing-config>
       <p className="text-muted text-xs">
-        Prompt text is sent to TypeSafe (api.typesafe.ai) for classification when Auto is
-        selected.
+        Prompt text is sent to TypeSafe (api.typesafe.ai) for classification when Auto is selected.
       </p>
 
       <div className="space-y-2">
@@ -268,7 +267,9 @@ export function AutoModelRoutingExperimentConfig() {
                   className="h-8 w-8"
                   aria-label={`Remove tier ${index + 1}`}
                   disabled={tiers.length <= AUTO_MODEL_ROUTING_MIN_TIERS}
-                  onClick={() => replaceTiers(tiers.filter((candidate) => candidate.id !== tier.id))}
+                  onClick={() =>
+                    replaceTiers(tiers.filter((candidate) => candidate.id !== tier.id))
+                  }
                 >
                   <Trash2 aria-hidden="true" />
                 </Button>
@@ -346,7 +347,11 @@ export function AutoModelRoutingExperimentConfig() {
             const id = nextTierId(tiers);
             replaceTiers([
               ...tiers,
-              { id, label: `Tier ${tiers.length + 1}`, description: "Describe the work this tier covers" },
+              {
+                id,
+                label: `Tier ${tiers.length + 1}`,
+                description: "Describe the work this tier covers",
+              },
             ]);
           }}
         >

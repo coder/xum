@@ -81,6 +81,10 @@ import {
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
@@ -176,6 +180,8 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
+  autoModelRouting?: AutoModelRoutingConfig;
   /**
    * Pre-seeded goal-board snapshots per workspaceId. Stories that want
    * the GoalTab's Upcoming / Completed / Archived sections to render
@@ -423,6 +429,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
     memoryFiles = [],
@@ -569,6 +576,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
+  let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
   let routeOverrides = { ...initialRouteOverrides };
   const configChangeSubscribers = new Set<(value: void) => void>();
@@ -799,6 +807,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
+          autoModelRouting,
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
@@ -846,6 +855,36 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
         notifyConfigChanged();
         return Promise.resolve(undefined);
+      },
+      updateAutoModelRouting: (input: { autoModelRouting: unknown }) => {
+        autoModelRouting = normalizeAutoModelRoutingConfig(input.autoModelRouting);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      getAutoModelRoutingClassifierStatus: () => Promise.resolve({ apiKeySource: "env" as const }),
+      previewAutoModelRouting: (input: { prompt: string }) => {
+        // Deterministic stand-in for Jev: longer prompts land on later tiers.
+        const { tiers } = autoModelRouting;
+        const index = Math.min(tiers.length - 1, Math.floor(input.prompt.length / 40));
+        const chosen = tiers[index];
+        const probabilities = Object.fromEntries(
+          tiers.map((tier, tierIndex) => [
+            tier.id,
+            tierIndex === index ? 0.7 : 0.3 / (tiers.length - 1),
+          ])
+        );
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            tierId: chosen.id,
+            tierLabel: chosen.label,
+            confidence: 0.7,
+            probabilities,
+            classifierModel: "jev-1.13.0",
+            ...(chosen.model != null ? { model: chosen.model } : {}),
+            ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+          },
+        });
       },
       updateMuxGatewayPrefs: (input: {
         muxGatewayEnabled: boolean;

@@ -75,7 +75,7 @@ export function normalizeAutoModelRoutingConfig(value: unknown): AutoModelRoutin
     typeof value === "object" &&
     value !== null &&
     Array.isArray((value as { tiers?: unknown }).tiers)
-      ? ((value as { tiers: unknown[] }).tiers as unknown[])
+      ? (value as { tiers: unknown[] }).tiers
       : [];
   const seen = new Set<string>();
   const tiers: AutoModelRoutingTier[] = [];

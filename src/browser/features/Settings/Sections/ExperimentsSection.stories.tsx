@@ -128,3 +128,29 @@ export const HeartbeatSettingsEnabled: Story = {
     );
   },
 };
+
+export const AutoModelRoutingEnabled: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+          providersConfig: {
+            anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+        })
+      }
+    >
+      <ExperimentsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // The nested panel renders the key field, the default tier rows, and the preview control.
+    await canvas.findByLabelText("TypeSafe API key");
+    await canvas.findByLabelText("Tier 4 description");
+    await canvas.findByRole("button", { name: "Add tier" });
+  },
+};

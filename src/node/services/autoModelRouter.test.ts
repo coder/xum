@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import * as fs from "fs";
+import * as fsp from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { AutoModelRouter, type AutoModelRouterDeps } from "./autoModelRouter";
@@ -81,7 +82,7 @@ describe("AutoModelRouter.classify", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0]!;
+    const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe(TYPESAFE_SYSTEM_ONE_URL);
     expect(init.method).toBe("POST");
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
@@ -168,7 +169,7 @@ describe("AutoModelRouter credential resolution", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-model-routing-"));
     tempPaths.push(dir);
     const keyFile = path.join(dir, "typesafe.key");
-    fs.writeFileSync(keyFile, "file-key\n");
+    await fsp.writeFile(keyFile, "file-key\n");
     const env = { TYPESAFE_API_KEY: "env-key" };
 
     const withConfig = createRouter({
@@ -183,7 +184,7 @@ describe("AutoModelRouter credential resolution", () => {
     });
     expect(withFile.router.getClassifierStatus()).toEqual({ apiKeySource: "file" });
     await withFile.router.classify({ prompt: "x", tiers: TIERS });
-    const [, init] = withFile.fetchMock.mock.calls[0]!;
+    const [, init] = withFile.fetchMock.mock.calls[0];
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer file-key");
 
     const withEnv = createRouter({ providers: null, env });
