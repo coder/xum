@@ -3,6 +3,7 @@ import {
   SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 export const CUSTOM_PROVIDER_TYPES = [
   "openai-compatible",
   "openai-responses",
@@ -24,6 +25,8 @@ const RESERVED_CUSTOM_PROVIDER_IDS = new Set<string>([
   "prototype",
   "constructor",
   "hasOwnProperty",
+  // Holds the auto-model-routing classifier key in providers.jsonc.
+  TYPESAFE_PROVIDER_KEY,
 ]);
 
 const SUPPORTED_PROVIDER_NAMES: ReadonlySet<string> = new Set(SUPPORTED_PROVIDERS);

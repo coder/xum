@@ -4227,6 +4227,7 @@ export class AgentSession {
         goalKind,
         goalId: internal?.goalId,
         muxMetadata: typedMuxMetadata,
+        autoModelRouting: optionsForStream.autoModelRoutingRecord,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -10764,13 +10765,15 @@ export class AgentSession {
 
     // Build options for the follow-up message from the preserved send settings captured
     // when the compaction handoff was staged. Avoid forwarding internal-only recovery flags.
-    const options: SendMessageOptions & {
+    const options: ResolvedSendMessageOptions & {
       fileParts?: FilePart[];
       muxMetadata?: MuxMessageMetadata;
     } = {
       model: effectiveModel,
       agentId: effectiveAgentId,
       thinkingLevel: followUp.thinkingLevel,
+      // Restores the Auto badge and the routed-model resume path without reclassifying.
+      autoModelRoutingRecord: followUp.autoModelRouting,
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,

@@ -3846,6 +3846,13 @@ export class StreamManager {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
       },
+      // The routing record names the model that actually answered, not the refused tier model.
+      ...(streamInfo.initialMetadata?.autoModelRouting != null && {
+        autoModelRouting: {
+          ...streamInfo.initialMetadata.autoModelRouting,
+          model: prepared.data.modelString,
+        },
+      }),
     };
     // Release the refused model's transport resources now: the stream-exit
     // finally only cleans the final request's model, so without this the

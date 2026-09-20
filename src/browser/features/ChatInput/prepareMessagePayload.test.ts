@@ -50,6 +50,14 @@ describe("prepareMessagePayload", () => {
   it.each([
     ["a normal send", {}, true],
     ["a one-shot model command", { messageText: "/opus+high hello", modelOneShot: oneShot }, false],
+    [
+      "a thinking-only one-shot command",
+      {
+        messageText: "/+2 hello",
+        modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
+      },
+      false,
+    ],
   ])("keeps the Auto routing flag only for %s", (_name, input, expected) => {
     const result = prepare({
       ...input,

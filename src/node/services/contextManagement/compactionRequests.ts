@@ -12,6 +12,7 @@ import {
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 export function buildAutoCompactionFollowUp(params: {
   messageText: string;
@@ -23,6 +24,7 @@ export function buildAutoCompactionFollowUp(params: {
   goalId?: string;
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  autoModelRouting?: AutoModelRoutingRecord;
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
@@ -53,6 +55,10 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.workspaceTurnMetadata) {
     followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
+  }
+
+  if (params.autoModelRouting) {
+    followUp.autoModelRouting = params.autoModelRouting;
   }
 
   return followUp;

@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import type { CompactionMonitor } from "./compactionMonitor";
 import type { Config } from "@/node/config";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type {
@@ -330,6 +331,50 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       tierId: "hard",
       model: COMPOSER_MODEL,
       reason: "Model xai:grok-3 does not support PDF input.",
+    });
+  });
+
+  it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    const internals = session as unknown as {
+      contextController: { compactionMonitor: CompactionMonitor };
+    };
+    internals.contextController.compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.85),
+    } as unknown as CompactionMonitor;
+
+    const result = await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const history = await historyService.getHistoryFromLatestBoundary("ws-auto-routing");
+    if (!history.success) throw new Error(history.error);
+    const compactionRow = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    const muxMetadata = compactionRow?.metadata?.muxMetadata;
+    const followUp =
+      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+    expect(followUp?.model).toBe(HARD_MODEL);
+    expect(followUp?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      model: HARD_MODEL,
     });
   });
 

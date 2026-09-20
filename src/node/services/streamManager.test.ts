@@ -4804,6 +4804,7 @@ describe("StreamManager - empty stream completions", () => {
       metadata?: {
         model?: string;
         modelFallback?: { requestedModel: string; refusedModels: string[] };
+        autoModelRouting?: { tierId?: string; model: string };
         toolModelUsages?: Array<{
           toolName: string;
           model: string;
@@ -4891,7 +4892,16 @@ describe("StreamManager - empty stream completions", () => {
       model: KNOWN_MODELS.SONNET.id,
       metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
+      initialMetadata: {
+        agentId: "plan",
+        // An Auto-routed turn: the record must follow the swap to the model that answered.
+        autoModelRouting: {
+          status: "routed",
+          tierId: "hard",
+          model: KNOWN_MODELS.SONNET.id,
+          requestedFallbackModel: "anthropic:claude-3-5-haiku-latest",
+        },
+      },
       runtime,
       request: { model: refusedLanguageModel, messages: [], providerOptions: undefined },
       modelFallback: {
@@ -4918,6 +4928,7 @@ describe("StreamManager - empty stream completions", () => {
       requestedModel: KNOWN_MODELS.SONNET.id,
       refusedModels: [KNOWN_MODELS.SONNET.id],
     });
+    expect(metadata?.autoModelRouting).toMatchObject({ tierId: "hard", model: fallbackModel });
     // Pin the IPC passthrough: the oRPC schema strips unknown metadata keys, so
     // modelFallback must survive StreamEndEventSchema or the live transcript
     // never learns about the swap.

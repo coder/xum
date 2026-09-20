@@ -2443,7 +2443,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly appFiberScope?: Scope.Scope
   ) {
     super();
-    this.autoModelRouter = new AutoModelRouter({ providersConfigStore });
+    this.autoModelRouter = new AutoModelRouter({ providersConfigStore, policyService });
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     // Narrow WorkspaceService test doubles construct partial manager stubs (see the
     // typeof guard on subscriptions below); a missing method reads as "no live monitor

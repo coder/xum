@@ -16,7 +16,9 @@ import {
   TYPESAFE_PROVIDER_KEY,
   TYPESAFE_SYSTEM_ONE_URL,
 } from "@/constants/autoModelRouting";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
+import type { PolicyService } from "@/node/services/policyService";
 import { resolveApiKeyCandidate } from "@/node/utils/providerRequirements";
 import { log } from "@/node/services/log";
 
@@ -49,6 +51,8 @@ export interface AutoModelRouterClassifyInput {
 
 export interface AutoModelRouterDeps {
   providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig">;
+  /** Prompts are third-party egress, so provider policy gates the classifier like any provider. */
+  policyService?: Pick<PolicyService, "isEnforced" | "isProviderAllowed">;
   env?: Record<string, string | undefined>;
   fetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
@@ -71,6 +75,12 @@ export class AutoModelRouter {
   ): Promise<Result<AutoModelRoutingDecision, string>> {
     if (input.tiers.length < 2) {
       return Err("Auto model routing needs at least two tiers");
+    }
+    if (
+      this.deps.policyService?.isEnforced() &&
+      !this.deps.policyService.isProviderAllowed(TYPESAFE_PROVIDER_KEY)
+    ) {
+      return Err("Provider policy does not allow TypeSafe");
     }
     const resolved = this.resolveApiKey();
     if (resolved.kind !== "resolved") {
@@ -167,8 +177,10 @@ export class AutoModelRouter {
   private resolveApiKey() {
     const providersConfig = this.deps.providersConfigStore.loadProvidersConfig() ?? {};
     const entry = (providersConfig as Record<string, unknown>)[TYPESAFE_PROVIDER_KEY];
+    // The id is reserved for new custom providers, but an older install may still hold a
+    // custom chat provider under it; never send that provider's key to TypeSafe.
     const config =
-      typeof entry === "object" && entry !== null
+      typeof entry === "object" && entry !== null && !isCustomProviderConfig(entry)
         ? (entry as { apiKey?: unknown; apiKeyFile?: unknown })
         : {};
     return resolveApiKeyCandidate(config, {

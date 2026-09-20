@@ -119,12 +119,11 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ...(input.transferredDraftProjectDiscovery && hasProjectScopedSkillRef(input.agentSkillRefs)
         ? { disableWorkspaceAgents: true }
         : {}),
-      // An explicit one-shot model is the user's choice for this turn; Auto must not override it.
-      ...(input.modelOneShot?.modelString
-        ? { model: input.modelOneShot.modelString, autoModelRouting: false }
-        : {}),
+      ...(input.modelOneShot?.modelString ? { model: input.modelOneShot.modelString } : {}),
       ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-      ...(input.modelOneShot ? { skipAiSettingsPersistence: true } : {}),
+      // A one-shot model or thinking override is the user's explicit choice for this turn;
+      // Auto must not replace either.
+      ...(input.modelOneShot ? { skipAiSettingsPersistence: true, autoModelRouting: false } : {}),
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),

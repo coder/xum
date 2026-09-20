@@ -26,6 +26,7 @@ function createRouter(options: {
   providers?: Record<string, unknown> | null;
   env?: Record<string, string | undefined>;
   fetch?: NonNullable<AutoModelRouterDeps["fetch"]>;
+  policyService?: AutoModelRouterDeps["policyService"];
 }) {
   const fetchMock = mock<NonNullable<AutoModelRouterDeps["fetch"]>>(
     options.fetch ?? (() => Promise.resolve(jsonResponse(validBody())))
@@ -34,6 +35,7 @@ function createRouter(options: {
     providersConfigStore: {
       loadProvidersConfig: () => (options.providers ?? null) as ProvidersConfig | null,
     },
+    policyService: options.policyService,
     env: options.env ?? {},
     fetch: fetchMock,
   });
@@ -152,6 +154,36 @@ describe("AutoModelRouter.classify", () => {
     });
     const result = await router.classify({ prompt: "x", tiers: TIERS, signal: controller.signal });
     expect(result.success).toBe(false);
+  });
+
+  it("refuses to call the API when provider policy excludes typesafe", async () => {
+    const { router, fetchMock } = createRouter({
+      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
+      policyService: { isEnforced: () => true, isProviderAllowed: (id) => id !== "typesafe" },
+    });
+
+    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
+
+    expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(router.getClassifierStatus()).toEqual({ apiKeySource: "config" });
+  });
+
+  it("ignores a legacy custom chat provider stored under the typesafe id", async () => {
+    const { router, fetchMock } = createRouter({
+      providers: {
+        [TYPESAFE_PROVIDER_KEY]: {
+          providerType: "openai-compatible",
+          baseUrl: "http://localhost:8000/v1",
+          apiKey: "chat-provider-key",
+        },
+      },
+    });
+
+    expect(router.getClassifierStatus()).toEqual({ apiKeySource: "none" });
+    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
+    expect(result).toEqual({ success: false, error: "No TypeSafe API key configured" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("requires at least two tiers", async () => {

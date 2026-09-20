@@ -231,6 +231,11 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * AgentSession.inheritOpenWorkspaceTurnMetadata).
    */
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Auto routing decision made for the diverted send. The redispatched turn
+   * persists it instead of classifying (and billing) again.
+   */
+  autoModelRouting?: AutoModelRoutingRecord;
 }
 
 /**

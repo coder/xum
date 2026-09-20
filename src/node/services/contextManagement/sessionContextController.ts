@@ -341,6 +341,7 @@ export class SessionContextController {
         goalId: input.goalId,
         muxMetadata: input.muxMetadata,
         workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
+        autoModelRouting: input.autoModelRouting,
       });
 
       // Waterfall hook point: lets registered middleware (e.g. refinement

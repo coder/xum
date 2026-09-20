@@ -617,8 +617,9 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       return true;
     }
 
-    // The TypeSafe classifier key cannot serve a chat model.
-    if (providerKey === TYPESAFE_PROVIDER_KEY) {
+    // The TypeSafe classifier key cannot serve a chat model (a legacy custom provider
+    // under the same id still counts).
+    if (providerKey === TYPESAFE_PROVIDER_KEY && !isCustomProviderConfig(rawConfig)) {
       continue;
     }
 

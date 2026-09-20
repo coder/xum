@@ -365,6 +365,7 @@ export const router = (authToken?: string) => {
             return yield* Effect.sync(() =>
               new AutoModelRouter({
                 providersConfigStore: context.providersConfigStore,
+                policyService: context.policyService,
               }).getClassifierStatus()
             );
           })
@@ -381,6 +382,7 @@ export const router = (authToken?: string) => {
               );
               const router = new AutoModelRouter({
                 providersConfigStore: context.providersConfigStore,
+                policyService: context.policyService,
               });
               const decision = await router.classify({ prompt: input.prompt, tiers });
               if (!decision.success) return decision;
