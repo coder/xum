@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey } from "@/common/constants/storage";
+import { getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
@@ -33,6 +33,23 @@ describe("getSendOptionsFromStorage", () => {
         SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).experiments
           ?.memoryIntuition
       ).toBe(enabled);
+    }
+  );
+
+  test.each([
+    { experiment: true, selected: true, expected: true },
+    { experiment: false, selected: true, expected: undefined },
+    { experiment: true, selected: false, expected: undefined },
+  ])(
+    "carries the Auto flag only while the experiment is on and Auto is selected (%j)",
+    ({ experiment, selected, expected }) => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), experiment);
+      updatePersistedState(getAutoModelRoutingKey("ws-auto"), selected);
+      const options = getSendOptionsFromStorage("ws-auto");
+      expect(options.autoModelRouting).toBe(expected);
+      expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).model).toBe(
+        options.model
+      );
     }
   );
 

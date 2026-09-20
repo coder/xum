@@ -22,6 +22,7 @@ import {
   getAgentIdKey,
   getInputKey,
   getInputAttachmentsKey,
+  getAutoModelRoutingKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
@@ -117,6 +118,11 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
   const projectModel = readPersistedState<string | null>(getModelKey(projectScopeId), null);
   if (projectModel) {
     setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
+  }
+  // The creation composer's Auto choice is keyed to the project scope; the new
+  // workspace's composer must keep reading Auto rather than the fallback model.
+  if (readPersistedState<boolean>(getAutoModelRoutingKey(projectScopeId), false) === true) {
+    updatePersistedState(getAutoModelRoutingKey(workspaceId), true);
   }
 
   const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);

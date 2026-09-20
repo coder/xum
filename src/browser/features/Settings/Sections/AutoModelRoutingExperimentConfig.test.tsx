@@ -185,7 +185,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     ]);
   });
 
-  test("commits label edits on blur and ignores empty drafts", async () => {
+  test("commits a label edit on blur", async () => {
     const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
@@ -195,18 +195,41 @@ describe("AutoModelRoutingExperimentConfig", () => {
     await userEvent.type(label, "Quick", replaceAll);
     expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
     fireEvent.blur(label);
-    let lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
+    const lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
       autoModelRouting: AutoModelRoutingConfig;
     };
     expect(lastUpdate.autoModelRouting.tiers[0].label).toBe("Quick");
+    expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
+  });
 
-    await userEvent.type(label, "   ", replaceAll);
-    fireEvent.blur(label);
-    lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
+  test("a paused edit commits without blur; a duplicate label is flagged and never written", async () => {
+    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
+    const label = getByLabelText("Tier 1 label") as HTMLInputElement;
+    const replaceAll = { initialSelectionStart: 0, initialSelectionEnd: label.value.length };
+    await userEvent.type(label, "Fast", replaceAll);
+    expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
+    await waitFor(() => expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1), {
+      timeout: 2000,
+    });
+    const committed = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
       autoModelRouting: AutoModelRoutingConfig;
     };
-    expect(lastUpdate.autoModelRouting.tiers[0].label).toBe("Quick");
-    expect(label.value).toBe("Quick");
+    expect(committed.autoModelRouting.tiers[0].label).toBe("Fast");
+
+    // Tier 2 is still labelled "Medium"; reusing it must not persist.
+    await userEvent.type(label, "medium", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: label.value.length,
+    });
+    expect(container.querySelector("[data-auto-model-routing-text-error]")?.textContent).toBe(
+      "Another tier already uses this label"
+    );
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
+    fireEvent.blur(label);
+    expect(label.value).toBe("Fast");
   });
 
   test("saving and clearing the key writes the typesafe provider entry", async () => {

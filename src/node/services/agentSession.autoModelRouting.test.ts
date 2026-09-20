@@ -292,6 +292,71 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("a manual resume under Auto continues on the routed model and keeps the record", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    // The renderer resumes with the composer's current options; Auto is still selected.
+    const resumed = await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    expect(resumed).toEqual(Ok({ started: true }));
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(streamMessage).toHaveBeenCalledTimes(2);
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(HARD_MODEL);
+    expect(resumeOptions?.thinkingLevel).toBe("high");
+    expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
+  });
+
+  it("a resume after leaving Auto uses the explicit model and drops the record", async () => {
+    const { session, streamMessage } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    await session.resumeStream({ model: COMPOSER_MODEL, agentId: "exec" });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("a resume that names the routed model itself keeps the record", async () => {
+    const { session, streamMessage } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    // Startup retries replay retrySendOptions, which already hold the routed model.
+    await session.resumeStream({ model: HARD_MODEL, agentId: "exec", thinkingLevel: "high" });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(HARD_MODEL);
+    expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
+  });
+
   it("never calls the classifier when the flag is absent", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,

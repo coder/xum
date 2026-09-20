@@ -69,6 +69,8 @@ interface ModelSelectorProps {
    * selected; picking a concrete model still calls onChange (the owner turns Auto off).
    */
   autoRouting?: { active: boolean; onSelect: () => void };
+  /** Accessible name for the trigger when no visible label identifies the picker. */
+  triggerAriaLabel?: string;
 }
 
 export interface ModelSelectorRef {
@@ -94,6 +96,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       className,
       tooltipExtraContent,
       autoRouting,
+      triggerAriaLabel,
     },
     ref
   ) => {
@@ -368,6 +371,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               )}
               role="combobox"
               aria-expanded={isOpen}
+              aria-label={triggerAriaLabel}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}

@@ -4135,6 +4135,11 @@ export class AgentSession {
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
+        // Resumes of this turn re-attach the routing record from here (the whitelist above
+        // deliberately keeps it out of retrySendOptions).
+        ...(optionsForStream.autoModelRoutingRecord != null
+          ? { autoModelRouting: optionsForStream.autoModelRoutingRecord }
+          : {}),
         muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
@@ -4989,10 +4994,11 @@ export class AgentSession {
     };
 
     assert(options, "resumeStream requires options");
-    const { model } = options;
+    const resumeOptions = await this.applyAutoRoutedResume(options);
+    const { model } = resumeOptions;
     assert(typeof model === "string" && model.trim().length > 0, "resumeStream requires a model");
 
-    const normalizedOptions = this.normalizeGatewaySendOptions(options);
+    const normalizedOptions = this.normalizeGatewaySendOptions(resumeOptions);
     const modelForStream = normalizedOptions.model;
     const optionsForStream = normalizedOptions;
 
@@ -7005,7 +7011,42 @@ export class AgentSession {
       .slice(-AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT);
   }
 
-  private normalizeGatewaySendOptions(options: SendMessageOptions): SendMessageOptions {
+  /**
+   * A manual resume sends the composer's current options, but while Auto is active the
+   * composer model is only the routing fallback: continue on the model this turn was
+   * routed to and keep its badge. Without the flag the caller chose a concrete model,
+   * so the badge is kept only when that model is the routed one (startup retries).
+   */
+  private async applyAutoRoutedResume(
+    options: SendMessageOptions
+  ): Promise<ResolvedSendMessageOptions> {
+    const { autoModelRouting, ...resumeOptions } = options;
+    const lastUserRow = await this.findLastUserRow();
+    const record = lastUserRow?.metadata?.autoModelRouting;
+    if (record == null) return resumeOptions;
+    if (autoModelRouting !== true) {
+      return normalizeToCanonical(resumeOptions.model) === normalizeToCanonical(record.model)
+        ? { ...resumeOptions, autoModelRoutingRecord: record }
+        : resumeOptions;
+    }
+    const retry = lastUserRow?.metadata?.retrySendOptions;
+    return {
+      ...resumeOptions,
+      model: typeof retry?.model === "string" ? retry.model : record.model,
+      thinkingLevel: coerceThinkingLevel(retry?.thinkingLevel) ?? resumeOptions.thinkingLevel,
+      autoModelRoutingRecord: record,
+    };
+  }
+
+  private async findLastUserRow(): Promise<MuxMessage | undefined> {
+    const recent = await this.historyService
+      .getLastMessages(this.workspaceId, 20)
+      .catch(() => null);
+    if (!recent?.success) return undefined;
+    return recent.data.findLast((message) => message.role === "user");
+  }
+
+  private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
       // Preserve explicit gateway prefixes as user intent; otherwise keep persisted IDs canonical.
