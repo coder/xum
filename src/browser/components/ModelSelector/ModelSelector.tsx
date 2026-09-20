@@ -159,14 +159,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setInputValue(""); // Clear input to show all models
       setShowAllModels(false);
 
-      // Start with current value highlighted
+      // Start with current value highlighted (the Auto row while Auto is active, so
+      // Enter keeps the routing choice instead of committing the fallback model).
       const currentIndex = models.indexOf(value);
-      setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      setHighlightedIndex(autoRouting?.active === true ? -1 : currentIndex >= 0 ? currentIndex : 0);
 
       // Focus input after dropdown renders.
       const timer = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(timer);
-    }, [isOpen, models, value]);
+    }, [isOpen, models, value, autoRouting?.active]);
 
     // Build model list: visible models + (if showAllModels) hidden models
     const baseModels = showAllModels ? [...models, ...hiddenModels] : models;
@@ -191,18 +192,33 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       }
     }
 
+    // The pinned Auto row lives at index -1 so ArrowUp from the first model reaches it.
+    const autoRowIndex = autoRouting ? -1 : 0;
+    const autoRowHighlighted = autoRouting != null && highlightedIndex === -1;
+
     // If the list shrinks (e.g., a model is hidden), keep the highlight in-bounds.
     useEffect(() => {
+      if (highlightedIndex < autoRowIndex) {
+        setHighlightedIndex(autoRowIndex);
+        return;
+      }
       if (filteredModels.length === 0) {
-        setHighlightedIndex(0);
+        if (highlightedIndex > 0) setHighlightedIndex(0);
         return;
       }
       if (highlightedIndex >= filteredModels.length) {
         setHighlightedIndex(filteredModels.length - 1);
       }
-    }, [filteredModels.length, highlightedIndex]);
+    }, [autoRowIndex, filteredModels.length, highlightedIndex]);
+
+    const canSave = autoRowHighlighted || filteredModels.length > 0;
 
     const handleSave = () => {
+      if (autoRowHighlighted) {
+        autoRouting.onSelect();
+        handleCancel();
+        return;
+      }
       // No matches - do nothing, let user keep typing or cancel
       if (filteredModels.length === 0) {
         return;
@@ -227,7 +243,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       if (e.key === "Enter") {
         e.preventDefault();
         // Only call onComplete if save succeeded (had matches)
-        if (filteredModels.length > 0) {
+        if (canSave) {
           handleSave();
           onComplete?.();
         }
@@ -252,7 +268,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setHighlightedIndex((prev) => Math.max(prev - 1, 0));
+        setHighlightedIndex((prev) => Math.max(prev - 1, autoRowIndex));
         return;
       }
     };
@@ -445,7 +461,9 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                 role="option"
                 aria-selected={autoActive}
                 data-auto-routing-option
+                data-highlighted={autoRowHighlighted}
                 onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setHighlightedIndex(-1)}
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -454,7 +472,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                 }}
                 className={cn(
                   composerPickerOptionClass(
-                    { isHighlighted: false, isSelected: autoActive },
+                    { isHighlighted: autoRowHighlighted, isSelected: autoActive },
                     "py-1"
                   ),
                   "border-border-light w-full shrink-0 border-b text-left"

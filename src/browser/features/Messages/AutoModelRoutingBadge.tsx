@@ -17,7 +17,7 @@ export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord):
   }
 }
 
-function formatPercent(value: number): string {
+export function formatPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 

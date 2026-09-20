@@ -14,9 +14,8 @@ import {
 import { useAPI } from "@/browser/contexts/API";
 import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import { formatPercent } from "@/browser/features/Messages/AutoModelRoutingBadge";
 import {
-  AUTO_MODEL_ROUTING_MAX_TIERS,
-  AUTO_MODEL_ROUTING_MIN_TIERS,
   getDefaultAutoModelRoutingConfig,
   type AutoModelRoutingApiKeySource,
   type AutoModelRoutingTier,
@@ -24,7 +23,11 @@ import {
 import { THINKING_LEVELS, isThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
-import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
+import {
+  AUTO_MODEL_ROUTING_MAX_TIERS,
+  AUTO_MODEL_ROUTING_MIN_TIERS,
+  TYPESAFE_PROVIDER_KEY,
+} from "@/constants/autoModelRouting";
 
 const INHERIT_THINKING = "inherit";
 
@@ -60,7 +63,7 @@ function nextTierId(tiers: AutoModelRoutingTier[]): string {
 export function AutoModelRoutingExperimentConfig() {
   const { api } = useAPI();
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
-  const { config, setConfig } = useAutoModelRouting();
+  const { config, setConfig, writeError } = useAutoModelRouting();
   const tiers = config.tiers;
 
   // Text fields commit on blur: a per-keystroke write would reject empty
@@ -358,6 +361,11 @@ export function AutoModelRoutingExperimentConfig() {
           <Plus aria-hidden="true" />
           Add tier
         </Button>
+        {writeError ? (
+          <div className="text-danger-light text-xs" data-auto-model-routing-write-error>
+            Could not save tiers: {writeError}
+          </div>
+        ) : null}
       </div>
 
       <div className="space-y-2">
@@ -389,7 +397,7 @@ export function AutoModelRoutingExperimentConfig() {
         {preview ? (
           <div className="text-xs" data-auto-model-routing-preview>
             <div className="text-foreground">
-              {preview.tierLabel} ({Math.round(preview.confidence * 100)}% confidence)
+              {preview.tierLabel} ({formatPercent(preview.confidence)} confidence)
               {preview.model
                 ? ` on ${formatModelStringForDisplay(preview.model)}`
                 : " (no model mapped; the composer model would be used)"}
@@ -398,7 +406,7 @@ export function AutoModelRoutingExperimentConfig() {
             <div className="text-muted">
               {Object.entries(preview.probabilities)
                 .sort(([, a], [, b]) => b - a)
-                .map(([tierId, probability]) => `${tierId}: ${Math.round(probability * 100)}%`)
+                .map(([tierId, probability]) => `${tierId}: ${formatPercent(probability)}`)
                 .join(", ")}
             </div>
           </div>

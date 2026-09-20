@@ -94,6 +94,9 @@ describe("ModelSelector auto routing", () => {
     expect(container.querySelector("[data-auto-routing-option]")).toBeNull();
   });
 
+  // Keyboard reachability of the Auto row (ArrowUp past the first model, Enter) is
+  // covered by the ChatInput AutoModelRoutingKeyboard story: React key handlers do not
+  // receive fireEvent.keyDown under happy-dom.
   test("while Auto is active the trigger reads Auto and no concrete row is selected", () => {
     const onChange = mock((_model: string) => undefined);
     const { container } = render(

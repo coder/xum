@@ -4,6 +4,7 @@ import type { AIService, StreamMessageOptions } from "@/node/services/aiService"
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
+import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type {
   AutoModelRouter,
   AutoModelRouterClassifyInput,
@@ -44,6 +45,9 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     classify?: (
       input: AutoModelRouterClassifyInput
     ) => Promise<Result<AutoModelRoutingDecision, string>>;
+    tiers?: typeof TIERS;
+    /** Models the budgeted-goal pricing gate refuses. */
+    unpricedModels?: string[];
   }) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -51,8 +55,25 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
-      loadConfigOrDefault: () => ({ autoModelRouting: { tiers: TIERS } }),
+      loadConfigOrDefault: () => ({ autoModelRouting: { tiers: options.tiers ?? TIERS } }),
     } as unknown as Config;
+    // Goal service stub: only the pricing gate has behavior; every other method the
+    // send path touches is a no-op resolving to undefined (no goal exists here).
+    const unpriced = new Set(options.unpricedModels ?? []);
+    const workspaceGoalService =
+      options.unpricedModels == null
+        ? undefined
+        : (new Proxy(
+            {
+              assertPricedModelForBudgetedGoal: (_workspaceId: string, model: string | undefined) =>
+                Promise.resolve(
+                  model != null && unpriced.has(model)
+                    ? Err({ type: "unknown" as const, raw: "unpriced" })
+                    : Ok(undefined)
+                ),
+            } as Record<PropertyKey, unknown>,
+            { get: (target, prop) => target[prop] ?? (() => Promise.resolve(undefined)) }
+          ) as unknown as WorkspaceGoalService);
 
     const streamMessage = mock((opts: StreamMessageOptions) =>
       Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
@@ -83,6 +104,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         }),
       } as unknown as BackgroundProcessManager,
       autoModelRouter: { classify } satisfies Pick<AutoModelRouter, "classify">,
+      workspaceGoalService,
     });
     return { session, historyService, streamMessage, classify };
   }
@@ -205,6 +227,69 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const streamOptions = streamMessage.mock.calls[0]?.[0];
     expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
     expect(streamOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("never classifies synthetic or agent-initiated turns that carry the flag", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+    });
+
+    await session.sendMessage(
+      "continue",
+      { model: COMPOSER_MODEL, agentId: "exec", autoModelRouting: true },
+      { synthetic: true, agentInitiated: true }
+    );
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("skips the classifier entirely when no tier has a model mapped", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS.map(({ model: _model, thinkingLevel: _level, ...tier }) => tier),
+    });
+
+    await session.sendMessage("hello", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    expect(streamMessage.mock.calls[0]?.[0]?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
+    });
+  });
+
+  it("falls back when a budgeted goal cannot price the chosen tier's model", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [HARD_MODEL],
+    });
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("low");
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
+      model: COMPOSER_MODEL,
+    });
   });
 
   it("never calls the classifier when the flag is absent", async () => {

@@ -1,4 +1,4 @@
-import { getModelKey } from "@/common/constants/storage";
+import { getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
@@ -76,4 +76,9 @@ export function setWorkspaceModelWithOrigin(
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
   updatePersistedState(getModelKey(workspaceId), model);
+  // An explicit concrete pick (user or agent, e.g. an accepted plan's model) leaves Auto;
+  // sync-driven mode defaults keep the user's routing choice.
+  if (origin !== "sync") {
+    updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
+  }
 }

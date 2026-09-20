@@ -6937,6 +6937,10 @@ export class AgentSession {
     const { tiers } = normalizeAutoModelRoutingConfig(
       this.config.loadConfigOrDefault().autoModelRouting
     );
+    // Without a mapped model no answer can change the turn, so skip the paid round-trip.
+    if (tiers.every((tier) => tier.model == null)) {
+      return fallback({ status: "fallback", reason: "No difficulty tier has a model mapped" });
+    }
     const decision = await this.autoModelRouter.classify({
       prompt,
       recentUserMessages: await this.collectRecentUserPrompts(),
@@ -6955,6 +6959,19 @@ export class AgentSession {
     };
     if (chosen?.model == null) {
       return fallback({ ...provenance, status: "unmapped-tier" });
+    }
+    // The send-time pricing gate only saw the composer model; a budgeted goal must not
+    // spend on a tier model it cannot price.
+    const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
+      this.workspaceId,
+      chosen.model
+    );
+    if (pricingGate && !pricingGate.success) {
+      return fallback({
+        ...provenance,
+        status: "fallback",
+        reason: `${chosen.model} has no pricing data for the budgeted goal`,
+      });
     }
     return {
       ...options,

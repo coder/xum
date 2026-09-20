@@ -5,6 +5,7 @@ import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
 } from "@/common/types/autoModelRouting";
+import { getErrorMessage } from "@/common/utils/errors";
 
 export interface AutoModelRoutingState {
   config: AutoModelRoutingConfig;
@@ -12,6 +13,8 @@ export interface AutoModelRoutingState {
   // tripping @typescript-eslint/unbound-method.
   /** Full replacement of the tier list; the backend normalizes before persisting. */
   setConfig: (config: AutoModelRoutingConfig) => void;
+  /** Last rejected write, cleared by the next successful one; the optimistic edit is reverted. */
+  writeError: string | null;
 }
 
 /**
@@ -84,18 +87,23 @@ export function useAutoModelRouting(): AutoModelRoutingState {
     };
   }, [api, fetchConfig]);
 
+  const [writeError, setWriteError] = useState<string | null>(null);
   const setConfig = useCallback(
     (next: AutoModelRoutingConfig) => {
       fetchVersionRef.current++;
       setLocalConfig(next);
 
-      api?.config?.updateAutoModelRouting({ autoModelRouting: next }).catch(() => {
-        // If the write fails, re-fetch so the UI reverts to what the send path applies.
-        void fetchConfig();
-      });
+      api?.config
+        ?.updateAutoModelRouting({ autoModelRouting: next })
+        .then(() => setWriteError(null))
+        .catch((error: unknown) => {
+          // If the write fails, re-fetch so the UI reverts to what the send path applies.
+          setWriteError(getErrorMessage(error));
+          void fetchConfig();
+        });
     },
     [api, fetchConfig]
   );
 
-  return { config, setConfig };
+  return { config, setConfig, writeError };
 }

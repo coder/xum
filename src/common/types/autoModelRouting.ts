@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { ThinkingLevelSchema } from "./thinking";
 import { isValidModelFormat } from "@/common/utils/ai/models";
+import {
+  AUTO_MODEL_ROUTING_MAX_TIERS,
+  AUTO_MODEL_ROUTING_MIN_TIERS,
+} from "@/constants/autoModelRouting";
 
 /**
  * Auto model routing (auto-model-routing experiment). The user defines ordered
@@ -8,9 +12,6 @@ import { isValidModelFormat } from "@/common/utils/ai/models";
  * that tier's model. Field names deliberately avoid a bare `tier` (that name is
  * taken by AiSettingTier).
  */
-
-export const AUTO_MODEL_ROUTING_MIN_TIERS = 2;
-export const AUTO_MODEL_ROUTING_MAX_TIERS = 8;
 
 /** Tier ids double as Jev choice keys, so they must be plain slugs. */
 const TIER_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;

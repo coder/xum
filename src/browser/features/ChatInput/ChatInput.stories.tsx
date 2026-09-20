@@ -848,14 +848,14 @@ export const CenteredTranscriptAlignment: AppStory = {
 };
 
 export const AutoModelRoutingActive: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   render: () => (
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        window.localStorage.setItem(
-          getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING),
-          JSON.stringify(true)
-        );
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
         updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
         updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
         return setupSimpleChatStory({
@@ -895,6 +895,58 @@ export const AutoModelRoutingActive: AppStory = {
       if (autoRow?.getAttribute("aria-selected") !== "true") {
         throw new Error("Auto row is not the selected option");
       }
+    });
+  },
+};
+
+/** Keyboard-only path onto Auto: the row sits above the first model in the arrow-key order. */
+export const AutoModelRoutingKeyboard: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+        updatePersistedState(getModelKey("ws-auto-routing-keyboard"), "openai:gpt-5.6-sol");
+        return setupSimpleChatStory({
+          workspaceId: "ws-auto-routing-keyboard",
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    docs: {
+      description: {
+        story:
+          "Opens the model picker with Auto off, moves the highlight above the first model with ArrowUp, and selects Auto with Enter.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("combobox");
+    if (trigger.textContent?.includes("Auto")) throw new Error("Auto should start inactive");
+    await userEvent.click(trigger);
+    await within(storyRoot).findByPlaceholderText(/Search \[provider:model-name\]/i);
+
+    await userEvent.keyboard("{ArrowUp}");
+    await waitFor(() => {
+      const autoRow = storyRoot.querySelector<HTMLElement>("[data-auto-routing-option]");
+      if (autoRow?.getAttribute("data-highlighted") !== "true") {
+        throw new Error("ArrowUp did not highlight the Auto row");
+      }
+    });
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => {
+      const nextTrigger = within(storyRoot).getByRole("combobox");
+      if (!nextTrigger.textContent?.includes("Auto")) throw new Error("Enter did not select Auto");
     });
   },
 };

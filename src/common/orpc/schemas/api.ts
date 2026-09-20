@@ -2705,8 +2705,8 @@ export const config = {
   },
   updateAutoModelRouting: {
     input: z.object({
-      // Full replacement; the backend normalizes (drops invalid tiers, dedupes ids,
-      // caps the list, falls back to defaults below the minimum) before persisting.
+      // Full replacement. This schema enforces tier shape and count; the backend only
+      // dedupes ids before persisting.
       autoModelRouting: AutoModelRoutingConfigSchema,
     }),
     output: z.void(),

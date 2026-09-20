@@ -119,10 +119,13 @@ export class AutoModelRouter {
     }
 
     if (!response.ok) {
+      // The reason is persisted in message metadata, so keep upstream body text out of it.
       const text = await response.text().catch(() => "");
-      return this.fail(
-        `Classifier returned HTTP ${response.status}${text ? `: ${text.slice(0, ERROR_BODY_MAX_CHARS)}` : ""}`
-      );
+      log.debug("Auto model routing classifier error body", {
+        status: response.status,
+        body: text.slice(0, ERROR_BODY_MAX_CHARS),
+      });
+      return this.fail(`Classifier returned HTTP ${response.status}`);
     }
 
     let json: unknown;

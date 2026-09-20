@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   consumeWorkspaceModelChange,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
+import { getAutoModelRoutingKey } from "@/common/constants/storage";
 
 let workspaceCounter = 0;
 
@@ -25,6 +27,22 @@ describe("modelChange", () => {
     globalThis.window = undefined as unknown as Window & typeof globalThis;
     globalThis.document = undefined as unknown as Document;
     globalThis.localStorage = undefined as unknown as Storage;
+  });
+
+  test("explicit user and agent picks turn Auto off; sync keeps it", () => {
+    const workspaceId = nextWorkspaceId();
+    const autoKey = getAutoModelRoutingKey(workspaceId);
+
+    updatePersistedState(autoKey, true);
+    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "sync");
+    expect(readPersistedState(autoKey, false)).toBe(true);
+
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "agent");
+    expect(readPersistedState(autoKey, false)).toBe(false);
+
+    updatePersistedState(autoKey, true);
+    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
+    expect(readPersistedState(autoKey, false)).toBe(false);
   });
 
   test("does not record explicit entries for no-op model changes", () => {
