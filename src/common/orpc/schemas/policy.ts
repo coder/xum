@@ -3,14 +3,18 @@ import {
   isBuiltInProvider,
   isValidCustomProviderId,
 } from "@/common/utils/providers/customProviders";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
 export const PolicyFormatVersionSchema = z.literal("0.1");
 
+// The auto-routing classifier is gated by provider_access like a chat provider, but its id
+// is reserved (not a valid custom provider id), so admit it here explicitly.
 export const PolicyProviderIdSchema = z
   .string()
-  .refine((id) => isBuiltInProvider(id) || isValidCustomProviderId(id), {
-    message: "Invalid provider id",
-  });
+  .refine(
+    (id) => isBuiltInProvider(id) || id === TYPESAFE_PROVIDER_KEY || isValidCustomProviderId(id),
+    { message: "Invalid provider id" }
+  );
 
 export const PolicyProviderNameSchema = PolicyProviderIdSchema;
 

@@ -4733,6 +4733,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Branch-summary side-channel spend recording (edit-resend path).
       sessionUsageService: this.sessionUsageService,
       autoModelRouter: this.autoModelRouter,
+      policyService: this.policyService,
       sanitizeCliWorkspaceRegistration: (args) =>
         this.sanitizeCliRegisteredWorkspace(
           args.workspaceId,
