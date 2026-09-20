@@ -301,9 +301,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     editMessageId: string;
     precondition: HistoryEditPrecondition;
   } | null>(null);
-  useEffect(() => {
-    editingMessageIdRef.current = editingMessage?.id;
-  }, [editingMessage?.id]);
+  // Assigned during render, not in a passive effect: a refresh that settles between a commit
+  // that changed the edit and that effect must already see the new edit as current.
+  editingMessageIdRef.current = editingMessage?.id;
   const [pendingBoundaryEditConfirmation, setPendingBoundaryEditConfirmation] =
     useState<SendOverrides | null>(null);
   // Hide edit-mode chrome as soon as an edit send starts so the input doesn't sit blank

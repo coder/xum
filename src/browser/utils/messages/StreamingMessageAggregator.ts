@@ -1403,6 +1403,11 @@ export class StreamingMessageAggregator {
       if (existing) {
         removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
       }
+      // A backend row for an overlaid id is the persisted version the edit fence must see
+      // (this path bypasses addMessage/loadHistoricalMessages, which refresh it too).
+      if (this.overlaidPersistedRows.has(incoming.id)) {
+        this.overlaidPersistedRows.set(incoming.id, incoming);
+      }
       this.messages.set(incoming.id, incoming);
       this.bumpMessageVersion(incoming.id);
       this.displayedMessageCache.delete(incoming.id);

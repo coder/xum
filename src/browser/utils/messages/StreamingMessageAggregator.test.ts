@@ -302,6 +302,18 @@ describe("StreamingMessageAggregator", () => {
           .map((m) => m.metadata?.partial)
       ).toEqual([true, true]);
 
+      // A since replay that rewrites the row (the backend updated the persisted card) refreshes
+      // the evidence too — that path bypasses addMessage and loadHistoricalMessages.
+      const rewritten = row("workflow-run-1", 1, "workflow finished (since replay)");
+      aggregator.reconcileSinceReplay({
+        messages: [rewritten],
+        requestedAnchorSequence: 0,
+        hasActiveStream: false,
+      });
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(rewritten.parts);
+
       // A frontend-only row with no persisted counterpart is not evidence at all.
       aggregator.addEphemeralMessage(
         row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
