@@ -75,6 +75,39 @@ describe("task_send_message tool", () => {
     ).toEqual({ status: "accepted", taskId: "sib-b", targetRelation: "sibling" });
   });
 
+  it("labels cross-tree deliveries as unrelated on accepted and queued results", async () => {
+    using tempDir = new TestTempDir("task-send-message-unrelated");
+    const outcomes: TreeSendResult[] = [
+      Ok({ delivery: "accepted", relation: "target_unrelated" }),
+      Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation: "target_unrelated" }),
+    ];
+    const taskService = {
+      sendAgentTreeMessage: mock((): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)),
+    } as unknown as TaskService;
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "ws-root-a" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({ status: "accepted", taskId: "ws-root-b", targetRelation: "unrelated" });
+
+    // The service owns the turn-end default for unrelated targets; the tool only echoes it.
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({
+      status: "queued",
+      taskId: "ws-root-b",
+      queueDispatchMode: "turn-end",
+      targetRelation: "unrelated",
+    });
+  });
+
   it("maps inactive child reawakening without exposing the internal execution handle", async () => {
     using tempDir = new TestTempDir("task-send-message-reactivated");
     const sendAgentTreeMessage = mock(

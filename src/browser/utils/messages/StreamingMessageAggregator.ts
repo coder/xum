@@ -559,6 +559,21 @@ export class StreamingMessageAggregator {
   private lastResponseCompletedAt: number | null = null;
   private historyEpoch = 0;
 
+  /**
+   * Rows this aggregator created without a server row behind them (a pre-stream error's
+   * synthetic assistant row carries a locally assigned historySequence for ordering). They are
+   * not evidence for an edit fence; a server row with the same id replaces the object, so the
+   * membership expires with the fabricated row itself.
+   */
+  private readonly locallyFabricatedRows = new WeakSet<MuxMessage>();
+  /**
+   * Persisted rows a frontend projection currently overlays under the same id (a workflow-run
+   * card refreshed with the run's live status, see `addEphemeralMessage`): the projection is
+   * displayed, the persisted row stays the edit evidence — it is what the backend fingerprints.
+   * Refreshed when the backend sends a newer version of the row, dropped with the row.
+   */
+  private readonly overlaidPersistedRows = new Map<string, MuxMessage>();
+
   /** Oldest historySequence from the server's last replay window.
    *  Used for reconnect cursors instead of the absolute minimum (which
    *  includes user-loaded older pages via loadOlderHistory). */
@@ -867,6 +882,7 @@ export class StreamingMessageAggregator {
 
   private deleteMessage(messageId: string): boolean {
     const didDelete = this.messages.delete(messageId);
+    this.overlaidPersistedRows.delete(messageId);
     if (didDelete) {
       this.displayedMessageCache.delete(messageId);
       this.messageVersions.delete(messageId);
@@ -1028,6 +1044,15 @@ export class StreamingMessageAggregator {
 
   addMessage(message: MuxMessage): void {
     const normalizedMessage = normalizeMessageRouteProvider(message);
+    // A backend row for an overlaid id is the persisted version the fence must see, whether or
+    // not the richer displayed projection below keeps its place.
+    if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+    }
+    this.upsertMessage(normalizedMessage);
+  }
+
+  private upsertMessage(normalizedMessage: MuxMessage): void {
     const existing = this.messages.get(normalizedMessage.id);
     if (existing) {
       const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
@@ -1048,6 +1073,29 @@ export class StreamingMessageAggregator {
     // Just store the message - backend assigns historySequence
     this.messages.set(normalizedMessage.id, normalizedMessage);
     this.markMessageDirty(normalizedMessage.id);
+  }
+
+  /**
+   * Add a frontend-only row (a `/plan show` preview, a projected workflow-run card): displayed
+   * like any other row but never persisted, so it is not evidence a server-side history check
+   * can be asked about (see `getHistoryEvidenceMessages`).
+   */
+  addEphemeralMessage(message: MuxMessage): void {
+    const normalizedMessage = normalizeMessageRouteProvider(message);
+    const existing = this.messages.get(normalizedMessage.id);
+    const overlaysPersistedRow =
+      existing !== undefined &&
+      !this.locallyFabricatedRows.has(existing) &&
+      !this.overlaidPersistedRows.has(normalizedMessage.id);
+    if (overlaysPersistedRow) {
+      // A projection over a persisted row (same id): keep the persisted version as evidence.
+      this.overlaidPersistedRows.set(normalizedMessage.id, existing);
+    }
+    this.upsertMessage(normalizedMessage);
+    const stored = this.messages.get(normalizedMessage.id);
+    if (stored !== undefined && !this.overlaidPersistedRows.has(normalizedMessage.id)) {
+      this.locallyFabricatedRows.add(stored);
+    }
   }
 
   /**
@@ -1081,6 +1129,7 @@ export class StreamingMessageAggregator {
       this.historyEpoch++;
       // Clear existing state to prevent stale messages from persisting.
       this.messages.clear();
+      this.overlaidPersistedRows.clear();
       this.displayedMessageCache.clear();
       this.messageVersions.clear();
       this.deltaHistory.clear();
@@ -1108,6 +1157,9 @@ export class StreamingMessageAggregator {
     // Add/overwrite messages in the map
     for (const message of messages) {
       const normalizedMessage = normalizeMessageRouteProvider(message);
+      if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
+        this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+      }
       const existing = mode === "append" ? this.messages.get(normalizedMessage.id) : undefined;
 
       if (existing) {
@@ -1351,6 +1403,11 @@ export class StreamingMessageAggregator {
       if (existing) {
         removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
       }
+      // A backend row for an overlaid id is the persisted version the edit fence must see
+      // (this path bypasses addMessage/loadHistoricalMessages, which refresh it too).
+      if (this.overlaidPersistedRows.has(incoming.id)) {
+        this.overlaidPersistedRows.set(incoming.id, incoming);
+      }
       this.messages.set(incoming.id, incoming);
       this.bumpMessageVersion(incoming.id);
       this.displayedMessageCache.delete(incoming.id);
@@ -1408,6 +1465,35 @@ export class StreamingMessageAggregator {
 
   setEstablishedOldestHistorySequence(sequence: number | null): void {
     this.establishedOldestHistorySequence = sequence;
+  }
+
+  /** Oldest sequence of the server's replay window; rows below it are paginated older pages. */
+  getEstablishedOldestHistorySequence(): number | null {
+    return this.establishedOldestHistorySequence;
+  }
+
+  /**
+   * Drop the paginated rows below the server replay window. A since replay never re-sends
+   * or verifies them, so a caller that needs a fresh copy of older history (an edit whose
+   * range starts in an earlier compaction epoch) discards them and re-pages from the floor.
+   * Returns the number of rows removed.
+   */
+  discardMessagesBelowSequence(sequence: number): number {
+    assert(Number.isInteger(sequence), `discardMessagesBelowSequence requires an integer floor`);
+    let removed = 0;
+    for (const [messageId, message] of Array.from(this.messages.entries())) {
+      const historySequence = message.metadata?.historySequence;
+      if (historySequence !== undefined && historySequence < sequence) {
+        this.deleteMessage(messageId);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
+      this.historyEpoch++;
+      this.invalidateCache();
+    }
+    return removed;
   }
 
   getHistoryEpoch(): number {
@@ -1771,6 +1857,27 @@ export class StreamingMessageAggregator {
     return this.getActiveStreamEntry()?.[0];
   }
 
+  /**
+   * Committed rows a server-side history check can be asked about: every held row except a
+   * locally fabricated one (`locallyFabricatedRows`: the pre-stream error row and ephemeral
+   * frontend-only rows, whose display-only `historySequence` the backend can never reproduce).
+   * An active stream's row IS evidence —
+   * its persisted counterpart is the empty placeholder the turn appended before streaming, and
+   * an edit that interrupts the turn deletes that placeholder, so the fence must name it as
+   * the newest row. It is presented as `partial` so both sides hash it by identity only (see
+   * computeHistoryRangeFingerprint): the client holds whatever streamed so far, the server
+   * holds the placeholder, and neither is settled content the fence protects.
+   */
+  getHistoryEvidenceMessages(): MuxMessage[] {
+    return this.getAllMessages().flatMap((displayed) => {
+      if (this.locallyFabricatedRows.has(displayed)) return [];
+      const message = this.overlaidPersistedRows.get(displayed.id) ?? displayed;
+      // Every active stream's row (two can overlap briefly around a terminal event).
+      if (!this.isStreamActive(message.id)) return [message];
+      return [{ ...message, metadata: { ...message.metadata, partial: true } }];
+    });
+  }
+
   isStreamActive(messageId: string): boolean {
     return this.activeStreams.has(messageId);
   }
@@ -1928,6 +2035,7 @@ export class StreamingMessageAggregator {
 
   clear(): void {
     this.messages.clear();
+    this.overlaidPersistedRows.clear();
     this.activeStreams.clear();
     this.displayedMessageCache.clear();
     this.messageVersions.clear();
@@ -2323,6 +2431,7 @@ export class StreamingMessageAggregator {
         },
       };
       this.messages.set(data.messageId, errorMessage);
+      this.locallyFabricatedRows.add(errorMessage);
       this.markMessageDirty(data.messageId);
     }
   }
@@ -2765,7 +2874,12 @@ export class StreamingMessageAggregator {
             // Create new objects to trigger React re-render (immutable update pattern)
             const updatedNestedCalls = parentPart.nestedCalls.map((nc, i) =>
               i === nestedIndex
-                ? { ...nc, state: "output-available" as const, output: data.result }
+                ? {
+                    ...nc,
+                    state: "output-available" as const,
+                    output: data.result,
+                    ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
+                  }
                 : nc
             );
             message.parts[parentIndex] = { ...parentPart, nestedCalls: updatedNestedCalls };
@@ -2786,6 +2900,7 @@ export class StreamingMessageAggregator {
           ...toolPart,
           state: "output-available",
           output: data.result,
+          ...(data.mcpServer ? { mcpServer: data.mcpServer } : {}),
         };
 
         // Process tool result to update derived state (todos, agentStatus, etc.)

@@ -1,5 +1,6 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
@@ -68,6 +69,8 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  INSTANCE_DISCOVERY_DEFAULT_LIMIT,
+  INSTANCE_DISCOVERY_MAX_LIMIT,
   agentReportProgressDedupePrefix,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
@@ -127,7 +130,12 @@ import { defaultModel, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  isLocalProjectRuntime,
+  isWorktreeRuntime,
+  runtimeModeSupportsSharedTaskWorkspace,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import type {
   ProjectRef,
   WorkspaceMetadata,
@@ -694,11 +702,15 @@ export type SendParentAgentMessageError =
   | { code: "send_failed"; message: string };
 
 /**
- * How the target relates to the sender within one task tree (parentWorkspaceId chains only).
- * "target_descendant" routes to the trusted parent→child guidance path; "peer" (sibling/cousin)
- * and "target_ancestor" take the untrusted <mux_agent_message> envelope path.
+ * Ancestry, not ownership: only descendants receive trusted parent→child guidance.
+ * Siblings/cousins, ancestors and unrelated workspaces receive untrusted envelopes.
+ * Workspace-turn ownership is a separate graph and grants no message authority.
  */
-export type AgentTreeTargetRelation = "target_descendant" | "target_ancestor" | "peer";
+export type AgentTreeTargetRelation =
+  | "target_descendant"
+  | "target_ancestor"
+  | "peer"
+  | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
 
@@ -722,7 +734,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       targetId: string;
       message: string;
-      targetRelation: "peer" | "target_ancestor";
+      targetRelation: "peer" | "target_ancestor" | "target_unrelated";
       queueDispatchMode?: TaskMessageQueueDispatchMode;
     }
   | {
@@ -777,6 +789,20 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
+}
+
+export interface InstanceWorkspacesResult {
+  rows: Array<
+    Pick<WorkspaceConfigEntry, "title" | "name" | "createdAt"> & {
+      workspaceId: string;
+      projectPath: string;
+      relationship: "self" | "ancestor" | "unrelated";
+      busy: boolean;
+    }
+  >;
+  totalMatching: number;
+  nextOffset?: number;
+  callerPeerMessagingRestricted?: true;
 }
 
 export interface TerminateAgentTaskResult {
@@ -6992,9 +7018,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Routes a task_send_message send by the target's relation to the sender within one task tree.
+   * Routes a task_send_message send by ancestry, without widening lifecycle ownership.
    * Descendant targets take the unchanged trusted guidance path (framing, reactivation, durable
-   * pending guidance); siblings/cousins and ancestors (including the root workspace) receive an
+   * pending guidance); siblings/cousins, ancestors and unrelated workspaces receive an
    * untrusted <mux_agent_message> envelope. The relation is computed server-side so a sender can
    * never claim parent authority it does not have.
    */
@@ -7024,7 +7050,7 @@ export class TaskService implements AgentTaskIntegration {
       targetId
     );
     if (relation == null) {
-      // Cross-tree targets and self-sends are out of scope for tree messaging.
+      // Self-sends are out of scope; cross-tree targets take the untrusted peer path.
       return Err({ code: "invalid_scope" as const });
     }
 
@@ -7281,6 +7307,28 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "invalid_scope" as const });
       }
 
+      // Recipient consent is separate from knowing its ID. Refuse before exposing target state
+      // or reserving budget, using the same response as an unknown workspace.
+      const unrelatedConsent = getValidUnrelatedWorkspaceConsent(
+        targetEntry.workspace.unrelatedWorkspaceConsent
+      );
+      if (relation === "target_unrelated" && unrelatedConsent == null) {
+        return Err({ code: "not_found" as const });
+      }
+
+      const unrelatedRuntimeRefusal = {
+        code: "refused" as const,
+        reason: "Unrelated messages require local or worktree runtimes on both endpoints.",
+      };
+      // Preserve remote/container isolation without changing the existing same-tree policy.
+      if (
+        relation === "target_unrelated" &&
+        (!this.isLocalUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+          !this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace))
+      ) {
+        return Err(unrelatedRuntimeRefusal);
+      }
+
       // Terminal and archived senders cannot wake peers. A reawakened child may send only while
       // its mirrored workspace-turn execution is running and backed by an accepted live handle;
       // queued/starting reservations still belong to the previous terminal execution.
@@ -7305,16 +7353,17 @@ export class TaskService implements AgentTaskIntegration {
         );
       };
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
+        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
+        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
         if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
           // Root workspaces have no task lifecycle to go terminal.
           return false;
         }
         const status = workspace.taskStatus ?? "running";
         return (
-          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
-          (!hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-            status !== "running" &&
-            status !== "awaiting_report")
+          !hasLiveRunningExecution(workspace, senderWorkspaceId) &&
+          status !== "running" &&
+          status !== "awaiting_report"
         );
       };
       if (isInactivePeerSender(senderEntry.workspace)) {
@@ -7362,6 +7411,17 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
+      const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
+      const delegatedRootUnavailable = (): boolean =>
+        unrelatedRoot &&
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null;
+      const delegatedRootRefusal = {
+        code: "refused" as const,
+        reason: "Retry after the target's delegated workspace turn finishes.",
+      };
+      // Persisted defaults describe a NEW synthetic turn, never someone else's delegated execution.
+      // Pending registrations count too: accepting peer input must not steal a reserved turn.
+      if (delegatedRootUnavailable()) return Err(delegatedRootRefusal);
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
@@ -7514,10 +7574,14 @@ export class TaskService implements AgentTaskIntegration {
       // the catch below, or transient failures would consume the pair/target budgets without
       // delivering anything — eventually refusing valid peer messages until restart.
       try {
-        // Ancestor targets are often human-driven: default to turn-end so a peer message does not
-        // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
-        const effectiveDispatchMode =
-          spec.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
+        // Ancestor and unrelated targets can be human-driven. Do not cut into their turns
+        // unless explicitly requested; sibling sends retain their existing boundary.
+        const defaultDispatchModes: Record<typeof relation, TaskMessageQueueDispatchMode> = {
+          target_ancestor: "turn-end",
+          target_unrelated: "turn-end",
+          peer: "tool-end",
+        };
+        const effectiveDispatchMode = spec.queueDispatchMode ?? defaultDispatchModes[relation];
 
         // Delegated-turn correlation: if the target is currently executing a delegated workspace
         // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
@@ -7525,11 +7589,12 @@ export class TaskService implements AgentTaskIntegration {
         // stream end settles the owner's delegated turn as interrupted/superseded. Peer
         // attribution stays on the assistant payload row, so no provenance is lost; the queue
         // still counts these entries by their dedupe-key prefix.
-        const workspaceTurnMuxMetadata =
-          await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-            targetId,
-            { requireAcceptedRegistration: true }
-          );
+        const workspaceTurnMuxMetadata = unrelatedRoot
+          ? null
+          : await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+              targetId,
+              { requireAcceptedRegistration: true }
+            );
         // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
         // renders machine notifications from metadata, so a bare workspace-turn replacement would
         // present the backend trigger as a human prompt (and re-enter prompt navigation).
@@ -7550,6 +7615,22 @@ export class TaskService implements AgentTaskIntegration {
             agentId: resumeOptions.agentId,
             thinkingLevel: resumeOptions.thinkingLevel,
             reasoningMode: resumeOptions.reasoningMode,
+            muxMetadata: triggerMuxMetadata,
+            queueDispatchMode: effectiveDispatchMode,
+          };
+        } else if (unrelatedRoot) {
+          assert(!targetIsAgentTask);
+          // Honor the recipient's selected identity (including plan), not the sender's or an
+          // older history row. Without a selection, the shared history → exec fallback applies.
+          const persistedAgentId = resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
+          const resumeOptions = await this.resolveParentAutoResumeOptions(
+            targetId,
+            targetEntry,
+            defaultModel,
+            persistedAgentId ? { agentId: persistedAgentId } : undefined
+          );
+          sendOptions = {
+            ...resumeOptions,
             muxMetadata: triggerMuxMetadata,
             queueDispatchMode: effectiveDispatchMode,
           };
@@ -7611,6 +7692,10 @@ export class TaskService implements AgentTaskIntegration {
             admissionRefusal = interruptedRefusal;
             return true;
           }
+          if (delegatedRootUnavailable()) {
+            admissionRefusal = delegatedRootRefusal;
+            return true;
+          }
           const freshCfg = this.config.loadConfigOrDefault();
           // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
           // workspace turn) must not wake an idle peer from its winding-down tool call. The
@@ -7629,6 +7714,25 @@ export class TaskService implements AgentTaskIntegration {
           const freshEntry = findWorkspaceEntry(freshCfg, targetId);
           if (freshEntry == null) {
             admissionRefusal = { code: "not_found" as const };
+            return true;
+          }
+          // An off/on cycle is a new grant, not permission to revive previously queued input.
+          // Recheck through the final synchronous session gate as well as after preparation awaits.
+          if (
+            relation === "target_unrelated" &&
+            getValidUnrelatedWorkspaceConsent(freshEntry.workspace.unrelatedWorkspaceConsent) !==
+              unrelatedConsent
+          ) {
+            admissionRefusal = { code: "not_found" as const };
+            return true;
+          }
+          // Runtime can change during preparation or while queued; recheck both ends at dispatch.
+          if (
+            relation === "target_unrelated" &&
+            (!this.isLocalUnrelatedMessagingEndpoint(freshSender.workspace) ||
+              !this.isLocalUnrelatedMessagingEndpoint(freshEntry.workspace))
+          ) {
+            admissionRefusal = unrelatedRuntimeRefusal;
             return true;
           }
           // Archive is reversible-only but stops delivery: a target archived after the initial
@@ -11963,10 +12067,26 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private isLocalUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
+    let runtimeConfig = workspace.runtimeConfig;
+    if (runtimeConfig === undefined) {
+      // Only complete inline metadata owns the default. A partly migrated entry can still
+      // resolve to SSH from metadata.json; wait for that migration rather than guessing local.
+      if (
+        coerceNonEmptyString(workspace.id) == null ||
+        coerceNonEmptyString(workspace.name) == null
+      ) {
+        return false;
+      }
+      runtimeConfig = DEFAULT_RUNTIME_CONFIG;
+    }
+    return isLocalProjectRuntime(runtimeConfig) || isWorktreeRuntime(runtimeConfig);
+  }
+
   /**
-   * Relation of `targetId` to `senderWorkspaceId` within one task tree, or null when the endpoints
-   * are the same workspace (self-sends are out of scope) or live in different trees. Only
-   * parentWorkspaceId chains define the tree; workspace-turn ownership tags are a separate graph.
+   * Relation of `targetId` to `senderWorkspaceId`, or null for self-sends. Different trees
+   * route as unrelated peers. Only parentWorkspaceId chains define ancestry;
+   * workspace-turn ownership tags are a separate, unchanged graph.
    */
   private resolveAgentTreeTargetRelation(
     parentById: Map<string, string>,
@@ -11984,7 +12104,9 @@ export class TaskService implements AgentTaskIntegration {
     // roots (including two unrelated plain workspaces, each its own root) are cross-tree.
     const senderRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, senderWorkspaceId);
     const targetRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, targetId);
-    return senderRoot === targetRoot ? "peer" : null;
+    const relation = senderRoot === targetRoot ? "peer" : "target_unrelated";
+    assert(relation !== "target_unrelated" || senderRoot !== targetRoot);
+    return relation;
   }
 
   /** True when the workspace or any agent-task ancestor carries best-of candidate metadata. */
@@ -12010,6 +12132,113 @@ export class TaskService implements AgentTaskIntegration {
     throw new Error(
       `findNearestBestOfGroupUsingIndex: possible parentWorkspaceId cycle starting at ${workspaceId}`
     );
+  }
+
+  /** An on-demand root-workspace address book, separate from either ownership graph. */
+  listInstanceWorkspaces(
+    callerWorkspaceId: string,
+    options: { query?: string | null; limit?: number | null; offset?: number | null }
+  ): InstanceWorkspacesResult {
+    assert(callerWorkspaceId.length > 0, "listInstanceWorkspaces: callerWorkspaceId required");
+    const limit = options.limit ?? INSTANCE_DISCOVERY_DEFAULT_LIMIT;
+    const offset = options.offset ?? 0;
+    assert(
+      Number.isInteger(limit) && limit >= 1 && limit <= INSTANCE_DISCOVERY_MAX_LIMIT,
+      "listInstanceWorkspaces: limit out of range"
+    );
+    assert(
+      Number.isSafeInteger(offset) && offset >= 0,
+      "listInstanceWorkspaces: offset must be a nonnegative integer"
+    );
+    const query = options.query?.trim().toLowerCase() ?? "";
+    const cfg = this.config.loadConfigOrDefault();
+    const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
+    // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
+    if (caller == null || !this.isLocalUnrelatedMessagingEndpoint(caller.workspace)) {
+      return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
+    }
+    const index = this.buildAgentTaskIndex(cfg);
+    if (
+      this.isWorkflowOwnedTaskUsingIndex(index, callerWorkspaceId) ||
+      this.isBestOfChainUsingIndex(index, callerWorkspaceId)
+    ) {
+      return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
+    }
+    const callerRoot = this.resolveRootWorkspaceIdUsingParentById(
+      index.parentById,
+      callerWorkspaceId
+    );
+    const candidates: Array<{
+      row: Omit<InstanceWorkspacesResult["rows"][number], "busy">;
+      createdAtMs: number;
+    }> = [];
+    for (const [projectConfigPath, project] of cfg.projects) {
+      for (const workspace of project.workspaces) {
+        const id = workspace.id;
+        if (
+          id == null ||
+          id.trim().length === 0 ||
+          workspace.parentWorkspaceId ||
+          // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
+          (id !== callerRoot &&
+            getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
+          !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
+          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
+          this.interruptedParentWorkspaceIds.has(id) ||
+          this.isWorkspaceStopInProgress(id) ||
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
+          // Match peer-path predicates, not a new raw-tag rule. The current index contains
+          // only task children, so ordinary roots cannot match these task restrictions.
+          this.isWorkflowOwnedTaskUsingIndex(index, id) ||
+          this.isBestOfChainUsingIndex(index, id)
+        )
+          continue;
+        // Match config metadata attribution: synthetic buckets are not searchable project paths.
+        const projectPath =
+          workspace.kind === "scratch"
+            ? workspace.path
+            : (workspace.projects?.[0]?.projectPath ?? projectConfigPath);
+        if (
+          query &&
+          ![id, workspace.title, workspace.name, projectPath].some((value) =>
+            value?.toLowerCase().includes(query)
+          )
+        )
+          continue;
+        assert(!workspace.parentWorkspaceId, "Instance discovery must only expose roots");
+        const createdAtMs = Date.parse(workspace.createdAt ?? "");
+        candidates.push({
+          row: {
+            workspaceId: id,
+            title: workspace.title,
+            name: workspace.name,
+            projectPath,
+            createdAt: workspace.createdAt,
+            relationship:
+              id === callerWorkspaceId ? "self" : id === callerRoot ? "ancestor" : "unrelated",
+          },
+          createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : -Infinity,
+        });
+      }
+    }
+    // Activity must not reorder pages. Missing/invalid dates sort last, including before-epoch histories.
+    candidates.sort(
+      (a, b) => b.createdAtMs - a.createdAtMs || a.row.workspaceId.localeCompare(b.row.workspaceId)
+    );
+    const totalMatching = candidates.length;
+    // No history reads or per-workspace disk access. Probe activity only for the bounded output.
+    const rows = candidates.slice(offset, offset + limit).map(({ row }) => ({
+      ...row,
+      busy:
+        this.workspaceService.isBusyForMessage(row.workspaceId) ||
+        this.aiService.isStreaming(row.workspaceId),
+    }));
+    const nextOffset = offset + rows.length < totalMatching ? offset + rows.length : undefined;
+    assert(rows.length <= limit);
+    assert(
+      nextOffset == null || (nextOffset === offset + rows.length && nextOffset < totalMatching)
+    );
+    return { rows, totalMatching, ...(nextOffset != null ? { nextOffset } : {}) };
   }
 
   /**

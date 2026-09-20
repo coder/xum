@@ -228,6 +228,31 @@ export interface AgentSessionHarness {
   events: WorkspaceChatMessage[];
 }
 
+/**
+ * Persists a per-model auto-compaction slider value the way the UI does (user preferences in
+ * config.json). The session resolves the threshold from config on every decision, so this is
+ * the only way a test changes it; the save also fires `onConfigChanged`.
+ */
+export async function seedAutoCompactionThreshold(
+  config: Config,
+  model: string,
+  percent: number
+): Promise<void> {
+  const current = config.loadConfigOrDefault().userPreferences;
+  await config.saveUserConfig({
+    userPreferences: {
+      ...current,
+      ai: {
+        ...current?.ai,
+        autoCompactionThresholdByModel: {
+          ...current?.ai?.autoCompactionThresholdByModel,
+          [model]: percent,
+        },
+      },
+    },
+  });
+}
+
 export async function createAgentSessionHarness(
   options: AgentSessionHarnessOptions
 ): Promise<AgentSessionHarness> {

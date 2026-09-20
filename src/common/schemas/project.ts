@@ -3,6 +3,7 @@ import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   BestOfGroupSchema,
   ProjectRefSchema,
+  UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   WorkflowTaskMetadataSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -100,6 +101,9 @@ export const WorkspaceConfigSchema = z.object({
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults. Sparse; each null field follows the global `goalDefaults`.",
+  }),
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:

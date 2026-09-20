@@ -1,4 +1,9 @@
 import { z } from "zod";
+import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { isHttpsOrigin, isHttpsUrlWithoutUserinfo } from "@/common/utils/mcp/httpsUrl";
+import { enforceUtf8ByteBudget } from "@/common/utils/mcp/utf8ByteBudget";
 
 /**
  * Per-workspace MCP overrides.
@@ -244,11 +249,83 @@ export const BearerChallengeSchema = z.object({
   resourceMetadataUrl: z.url().optional(),
 });
 
+/** Credential-free `https:` URL suitable for display and for opening externally. */
+export const HttpsUrlSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.websiteUrlMaxChars)
+  .refine(isHttpsUrlWithoutUserinfo, { message: "must be an https URL without credentials" });
+
+/** Exactly serialized https origin (`https://host[:port]`), ASCII only. */
+export const HttpsOriginSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.originMaxBytes)
+  .refine(isHttpsOrigin, { message: "must be an https origin" });
+
+/**
+ * Server-reported identity (MCP `Implementation`), display-only and never a
+ * verified identity: it must not drive namespacing, enablement, trust, or
+ * OAuth decisions. Required fields fail the whole value; optional fields that
+ * are malformed or over budget are dropped individually via `.catch`.
+ * Empty optional strings are dropped too, so `title ?? name` is always a
+ * usable display name.
+ */
+export const MCPServerIdentitySchema = z.object({
+  name: z.string().min(1).max(MCP_IDENTITY_LIMITS.nameMaxChars),
+  version: z.string().min(1).max(MCP_IDENTITY_LIMITS.versionMaxChars),
+  title: z.string().min(1).max(MCP_IDENTITY_LIMITS.titleMaxChars).optional().catch(undefined),
+  description: z
+    .string()
+    .min(1)
+    .max(MCP_IDENTITY_LIMITS.descriptionMaxChars)
+    .optional()
+    .catch(undefined),
+  websiteUrl: HttpsUrlSchema.optional().catch(undefined),
+});
+
+/**
+ * The configured connection an identity was observed on. Deliberately carries
+ * no command, args, path, query, headers, or userinfo — those can hold
+ * credentials and this value is persisted into chat history.
+ */
+export const MCPConnectionRefSchema = z.object({
+  /** Server key from mcp.jsonc. */
+  key: z.string().min(1).max(MCP_IDENTITY_LIMITS.connectionKeyMaxChars),
+  /** Actual transport in use (`auto` is resolved before a snapshot is taken). */
+  transport: z.enum(["stdio", "http", "sse"]),
+  /** http/sse only: origin of the configured URL when it is https. */
+  origin: HttpsOriginSchema.optional().catch(undefined),
+});
+
+export const MCPIconRefSchema = z.string().regex(/^[a-f0-9]{32}$/);
+export const PngDataUrlSchema = z
+  .string()
+  .max(MCP_ICON_LIMITS.pngDataUrlMaxChars)
+  .refine(isPngDataUrl);
+
+/**
+ * Per-tool-call identity snapshot authored by the host and frozen on the
+ * tool part. `source` records whether the identity came from this result's
+ * `_meta` or from the connection handshake. One aggregate byte budget bounds
+ * what every MCP tool call persists.
+ */
+export const MCPToolCallDisplaySchema = z
+  .object({
+    connection: MCPConnectionRefSchema,
+    identity: MCPServerIdentitySchema,
+    source: z.enum(["response", "connection"]),
+    /** Immutable session-local ref, never an icon URL or persisted image bytes. */
+    iconRef: MCPIconRefSchema.optional().catch(undefined),
+  })
+  .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
+
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
   z.object({
     success: z.literal(true),
     tools: z.array(z.string()),
     protocolVersion: z.string().optional(),
+    /** Handshake identity; optional so cached results from older builds still parse. */
+    serverInfo: MCPServerIdentitySchema.optional().catch(undefined),
+    icon: PngDataUrlSchema.optional().catch(undefined),
   }),
   z.object({
     success: z.literal(false),

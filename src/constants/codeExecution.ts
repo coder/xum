@@ -1,8 +1,4 @@
-// Heredocs still live inside JavaScript strings. Teach the same quoting rules before
-// execution and on parse failure rather than guessing repairs that could change a command.
-export const CODE_EXECUTION_STRING_GUIDANCE =
-  "For multiline strings (shell scripts, SQL, file contents), use a backtick template literal " +
-  "or escaped \\n sequences in single/double quotes; raw newlines are invalid in quoted strings. " +
-  "Escape matching quotes and backslashes. In template literals, also escape embedded backticks " +
-  "and literal ${...} (e.g. shell variables) to avoid JavaScript interpolation. " +
-  "When sending tool-call JSON, JSON-escape the entire code value as well.";
+// Multiline-string recovery reparses after each repair. Bound cumulative UTF-16
+// source characters parsed so a many-literal snippet cannot cause quadratic work
+// to stall the backend indefinitely. Unrepaired code still fails syntax validation.
+export const MAX_MULTILINE_STRING_PARSE_CHARACTERS = 1024 * 1024;

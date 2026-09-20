@@ -1,5 +1,23 @@
+import type { z } from "zod";
+import type {
+  MCPConnectionRefSchema,
+  MCPServerIdentitySchema,
+  MCPToolCallDisplaySchema,
+} from "@/common/orpc/schemas/mcp";
+
 /** Supported MCP server transports. */
 export type MCPServerTransport = "stdio" | "http" | "sse" | "auto";
+
+/** Server-reported, display-only identity (MCP `Implementation`); see MCPServerIdentitySchema. */
+export type MCPServerIdentity = z.infer<typeof MCPServerIdentitySchema>;
+
+/** Credential-free description of the configured connection an identity was seen on. */
+export type MCPConnectionRef = z.infer<typeof MCPConnectionRefSchema>;
+
+/** Host-authored per-tool-call identity snapshot frozen on the tool part. */
+export type MCPToolCallDisplay = z.infer<typeof MCPToolCallDisplaySchema>;
+
+export type MCPToolCallDisplaySource = MCPToolCallDisplay["source"];
 
 export type MCPHeaderValue = string | { secret: string };
 
@@ -94,6 +112,10 @@ export type MCPTestResult =
       tools: string[];
       /** MCP protocol revision negotiated during the test connection. */
       protocolVersion?: string;
+      /** Identity the server reported during the handshake, when it did. */
+      serverInfo?: MCPServerIdentity;
+      /** Host-decoded PNG, kept in renderer memory only. */
+      icon?: string;
     }
   | { success: false; error: string; oauthChallenge?: BearerChallenge };
 

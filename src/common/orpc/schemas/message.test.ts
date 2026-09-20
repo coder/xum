@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import { utf8JsonByteLength } from "@/common/utils/mcp/utf8ByteBudget";
 import { MuxMessageSchema } from "./message";
 
 function createMessage() {
@@ -186,4 +189,101 @@ describe("MuxMessageSchema compactionEpoch parsing", () => {
       expect(parsed.metadata?.compactionEpoch).toBeUndefined();
     }
   });
+});
+
+describe("MuxMessageSchema mcpServer snapshots", () => {
+  const validSnapshot: MCPToolCallDisplay = {
+    connection: { key: "identity", transport: "stdio" },
+    identity: { name: "Response identity", version: "2" },
+    source: "response",
+  };
+  // Every field individually valid, but the serialized whole exceeds the snapshot byte budget.
+  const overBudget: MCPToolCallDisplay = {
+    ...validSnapshot,
+    identity: {
+      ...validSnapshot.identity,
+      title: "字".repeat(80),
+      description: "字".repeat(300),
+      websiteUrl: `https://example.com/${"a".repeat(490)}`,
+    },
+    connection: {
+      key: "字".repeat(80),
+      transport: "http",
+      origin: `https://${"a".repeat(250)}:65535`,
+    },
+  };
+  expect(utf8JsonByteLength(overBudget)).toBeGreaterThan(
+    MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes
+  );
+  const toolMessage = (mcpServer: unknown, nestedMcpServer: unknown) => ({
+    ...createMessage(),
+    parts: [
+      {
+        type: "dynamic-tool" as const,
+        toolCallId: "code-exec",
+        toolName: "code_execution",
+        input: { code: "…" },
+        state: "output-available" as const,
+        output: { ok: true },
+        ...(mcpServer === "absent" ? {} : { mcpServer }),
+        nestedCalls: [
+          {
+            toolCallId: "nested-1",
+            toolName: "identity_identity_probe",
+            input: {},
+            output: { content: [] },
+            state: "output-available" as const,
+            ...(nestedMcpServer === "absent" ? {} : { mcpServer: nestedMcpServer }),
+          },
+        ],
+      },
+    ],
+  });
+  const parsedSnapshots = (mcpServer: unknown, nestedMcpServer: unknown) => {
+    const parsed = MuxMessageSchema.parse(toolMessage(mcpServer, nestedMcpServer));
+    const part = parsed.parts[0];
+    if (part?.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected the tool part to survive parsing");
+    }
+    expect(part.output).toEqual({ ok: true });
+    expect(part.nestedCalls?.[0]?.output).toEqual({ content: [] });
+    return { top: part.mcpServer, nested: part.nestedCalls?.[0]?.mcpServer };
+  };
+
+  test("rows written before the field existed and rows without a snapshot parse unchanged", () => {
+    expect(parsedSnapshots("absent", "absent")).toEqual({ top: undefined, nested: undefined });
+  });
+
+  test("valid snapshots are preserved on the part and on nested records", () => {
+    expect(parsedSnapshots(validSnapshot, validSnapshot)).toEqual({
+      top: validSnapshot,
+      nested: validSnapshot,
+    });
+  });
+
+  const malformed: unknown[] = [
+    null,
+    "snapshot",
+    [],
+    { connection: validSnapshot.connection, source: "response" },
+    { ...validSnapshot, identity: { name: "", version: "2" } },
+    { ...validSnapshot, connection: { key: "identity", transport: "auto" } },
+    { ...validSnapshot, source: "handshake" },
+    overBudget,
+  ];
+  // Rows are wrapped so an array value is one argument, not spread arguments.
+  test.each(malformed.map((bad) => [bad]))(
+    "malformed or over-budget snapshot %j degrades to absent without losing the message",
+    (bad) => {
+      // Each level degrades independently: a bad nested snapshot never taints the part and vice versa.
+      expect(parsedSnapshots(bad, validSnapshot)).toEqual({
+        top: undefined,
+        nested: validSnapshot,
+      });
+      expect(parsedSnapshots(validSnapshot, bad)).toEqual({
+        top: validSnapshot,
+        nested: undefined,
+      });
+    }
+  );
 });

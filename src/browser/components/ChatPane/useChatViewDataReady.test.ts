@@ -163,7 +163,7 @@ describe("computeChatViewReveal", () => {
   });
 
   test("an empty hydrating transcript holds the skeleton; decorations still wait for data", () => {
-    // Reconnect-with-active-stream: the stream barrier renders below the skeleton
+    // Reconnect-with-active-stream: the stream barrier renders in the composer dock
     // rather than replacing it, so the reveal decision ignores the barrier entirely.
     const state = computeChatViewReveal({
       isHydratingTranscript: true,

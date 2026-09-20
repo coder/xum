@@ -26,7 +26,11 @@ import {
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
 import { HistoryService } from "./historyService";
-import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  seedAutoCompactionThreshold,
+  type AgentSessionHarness,
+} from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 import {
   createContextBudgetWarning,
@@ -41,6 +45,9 @@ import { log } from "./log";
 
 const workspaceId = "token-budget-session";
 const model = "openai:gpt-4o";
+/** Persist the slider value (percent) for the test model, as the UI would. */
+const seedThreshold = (h: AgentSessionHarness, fraction: number) =>
+  seedAutoCompactionThreshold(h.config, model, Math.round(fraction * 100));
 const options: SendMessageOptions = {
   model,
   agentId: "exec",
@@ -274,7 +281,7 @@ describe("AgentSession token-budget lifecycle", () => {
         runtimeConfig: { type: "local" },
       } as FrontendWorkspaceMetadata)
     );
-    h.session.setAutoCompactionThreshold(0.7);
+    await seedThreshold(h, 0.7);
     const settleStream = (
       index: number,
       metadata?: { finishReason?: string; contextUsage?: { inputTokens: number } }
@@ -441,7 +448,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "historical input usage is not a system floor for the next request (%s)",
     async (kind) => {
       const h = await setup();
-      h.session.setAutoCompactionThreshold(1);
+      await seedThreshold(h, 1);
       const previous = createMuxMessage("high-input-answer", "assistant", "Small useful response", {
         model,
         contextUsage: { inputTokens: 125_000, outputTokens: 20, totalTokens: 125_020 },
@@ -532,7 +539,6 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup({ previous: first });
       await h.session.ensureStartupAutoRetryCheck();
       expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-      expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
       expect((await h.session.resumeStream(options)).success).toBe(false);
       expect(h.requests).toHaveLength(0);
       expect((await allRows(h)).filter((row) => previous.some((old) => old.id === row.id))).toEqual(
@@ -545,7 +551,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("single-user token-budget sends use append-only storage even when automatic compaction is off", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 20_000);
     const before = await allRows(h);
     const append = spyOn(h.historyService, "acceptCompactionReplacement");
@@ -1359,13 +1365,13 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("a new_context request is ignored while automatic rollover is disabled or history is unavailable", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     expect(
       (await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true })))?.decision
     ).toBe("continue");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    h.session.setAutoCompactionThreshold(0.7);
+    await seedThreshold(h, 0.7);
     expect(
       (
         await h.requests[0].onStepSettled?.(
@@ -1420,7 +1426,7 @@ describe("AgentSession token-budget lifecycle", () => {
     // A hard block (only possible with automatic rollover disabled) stays authoritative: the
     // tool is not offered there, and a stray request cannot bypass it.
     const blocked = await setup();
-    blocked.session.setAutoCompactionThreshold(1);
+    await seedThreshold(blocked, 1);
     expect((await blocked.session.sendMessage("Work", options)).success).toBe(true);
     expect(
       (
@@ -1874,7 +1880,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
       const state = h.session as unknown as { contextBudgetHandoffClaimed: boolean };
       expect(state.contextBudgetHandoffClaimed).toBe(false);
-      h.session.setAutoCompactionThreshold(threshold);
+      await seedThreshold(h, threshold);
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
       await h.waitForRequest(2);
       const rows = await allRows(h);
@@ -2768,7 +2774,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup({ previous: first });
       expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
       expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      h.session.setAutoCompactionThreshold(1);
+      await seedThreshold(h, 1);
       if (ending === "settled-step")
         expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
       // The paired continuation survives as an ordinary same-turn continuation: the delegated
@@ -2783,7 +2789,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
       h.settleStream(1, { finishReason: "stop" });
       await h.session.waitForIdle();
-      h.session.setAutoCompactionThreshold(0.7);
+      await seedThreshold(h, 0.7);
       expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
       rows = await allRows(h);
       expect(rolloverRows(rows)).toHaveLength(0);
@@ -3335,7 +3341,7 @@ describe("AgentSession token-budget lifecycle", () => {
   ])("async terminal overflow rejects only unstarted budget requests (%s)", async (mode) => {
     const h = await setup();
     await seedHistory(h, 20_000);
-    if (mode === "auto-off" || mode === "assembled") h.session.setAutoCompactionThreshold(1);
+    if (mode === "auto-off" || mode === "assembled") await seedThreshold(h, 1);
     const sendOptions: SendMessageOptions = {
       ...options,
       ...(mode === "experiment-off" ? { experiments: { tokenBudget: false } } : {}),
@@ -3666,7 +3672,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "a rejected oversized input stays display-only after a shorter send (%s)",
     async (mode) => {
       const h = await setup();
-      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
+      if (mode === "auto-off") await seedThreshold(h, 1);
       const sendOptions: SendMessageOptions =
         mode === "history-disabled"
           ? { ...options, toolPolicy: [{ regex_match: "session_.*", action: "disable" }] }
@@ -3709,7 +3715,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup({
         failure: (attempt) => (attempt <= (mode === "retry" ? 2 : 1) ? exceeded : undefined),
       });
-      if (mode === "auto-off") h.session.setAutoCompactionThreshold(1);
+      if (mode === "auto-off") await seedThreshold(h, 1);
       if (mode !== "fresh") await seedHistory(h, mode === "on-send" ? 120_000 : 20_000);
       const sendOptions: SendMessageOptions =
         mode === "history-disabled"
@@ -3748,7 +3754,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (retry) => {
       const h = await setup({ failure: () => exceeded });
       if (retry) await seedHistory(h, 20_000);
-      else h.session.setAutoCompactionThreshold(1);
+      else await seedThreshold(h, 1);
       await fs.writeFile(path.join(h.config.rootDir, "rejected.txt"), "Rejected file payload");
       const skillDir = path.join(h.config.rootDir, ".xum", "skills", "rejected-skill");
       await fs.mkdir(skillDir, { recursive: true });
@@ -4130,7 +4136,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled budget never warns or rolls over", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 110_000);
     expect((await h.session.sendMessage("Manual only", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("continue");
@@ -4143,7 +4149,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled settled hard block creates no warning, reset, or queued continuation", async () => {
     const h = await setup();
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     expect((await h.session.sendMessage("Start this task", options)).success).toBe(true);
     expect(
       (
@@ -4164,7 +4170,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "token-dense fresh input is blocked before provider dispatch and a fitting follow-up remains usable",
     async (input) => {
       const h = await setup();
-      h.session.setAutoCompactionThreshold(1);
+      await seedThreshold(h, 1);
       expect(await h.session.sendMessage(input, options)).toMatchObject({
         success: false,
         error: { type: "context_budget_blocked" },
@@ -4180,7 +4186,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("auto-disabled still reports the hard preflight guard without resetting or retrying", async () => {
     const h = await setup({ failure: () => exceeded });
-    h.session.setAutoCompactionThreshold(1);
+    await seedThreshold(h, 1);
     await seedHistory(h, 20_000);
     expect(await h.session.sendMessage("Hard guard remains enabled", options)).toMatchObject({
       success: false,

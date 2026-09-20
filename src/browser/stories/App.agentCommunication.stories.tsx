@@ -128,6 +128,81 @@ export const Phone: AppStory = {
   },
 };
 
+// Replayed kernel history has compact records, not the full streamed nestedCalls.
+function setupCompactedCommunicationStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-compacted-agent-communication",
+    workspaceName: "compacted-communication",
+    projectName: "mux",
+    messages: [
+      createAssistantMessage("compacted-updates", "", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+        toolCalls: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "compacted-execution",
+            toolName: "code_execution",
+            state: "output-available",
+            input: { code: "// Send agent updates" },
+            output: {
+              success: true,
+              duration_ms: 2,
+              consoleOutput: [],
+              toolCalls: [
+                {
+                  toolName: "agent_report",
+                  args: { title: REPORT_TITLE, reportMarkdown: REPORT },
+                  ok: true,
+                  bytes: 32,
+                  duration_ms: 1,
+                },
+                {
+                  toolName: "task_send_message",
+                  args: { task_id: "b3947e259a", message: MESSAGE },
+                  ok: true,
+                  bytes: 64,
+                  duration_ms: 1,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    ],
+  });
+}
+
+export const Compacted: AppStory = {
+  render: () => <AppWithMocks setup={setupCompactedCommunicationStory} />,
+  parameters: Outgoing.parameters,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("button", { name: "Message to agent" });
+    if (toggle.getAttribute("aria-expanded") !== "true") await userEvent.click(toggle);
+    await expect(canvas.getByRole("region", { name: "Message content" })).toHaveTextContent(
+      MESSAGE.replace(/\s+/g, " ")
+    );
+    const cards = canvasElement.querySelectorAll('[data-component="AgentCommunicationCard"]');
+    await expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      const status = within(card as HTMLElement).getByRole("status");
+      await expect(status).not.toHaveClass("text-danger");
+      await expect(status).not.toHaveClass("text-success");
+      await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+    }
+  },
+};
+
+export const CompactedPhone: AppStory = {
+  ...Compacted,
+  globals: Phone.globals,
+  decorators: Phone.decorators,
+  parameters: Phone.parameters,
+};
+
 export const DeliveryFailures: AppStory = {
   render: () => <AppWithMocks setup={() => setupCommunicationStory(true)} />,
   parameters: {

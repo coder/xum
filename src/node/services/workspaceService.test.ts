@@ -2596,6 +2596,35 @@ function createFrontendWorkspaceMetadata(
   };
 }
 
+describe("WorkspaceService.getHistoryLoadMore", () => {
+  test("rejects on a failed page read instead of reporting an exhausted empty page", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "load-more-read-failure";
+    try {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "first", { historySequence: 0, timestamp: 1 })
+      );
+      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      // A legitimately empty read (nothing older) is still an exhausted page...
+      expect(
+        await workspaceService.getHistoryLoadMore(workspaceId, { beforeHistorySequence: 0 })
+      ).toEqual({ messages: [], nextCursor: null, hasOlder: false });
+      // ...but a read failure must not look like one: the client would take `hasOlder: false`
+      // as authoritative coverage (and edit-conflict recovery would report the row deleted).
+      spyOn(historyService, "getHistoryBoundaryWindow").mockResolvedValueOnce(
+        Err("EIO: disk unreadable")
+      );
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        workspaceService.getHistoryLoadMore(workspaceId, { beforeHistorySequence: 0 })
+      ).rejects.toThrow(/disk unreadable/);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService.stageAttachment", () => {
   test("waits for workspace init before writing into the workspace", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -15288,6 +15317,95 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
   });
 });
 
+describe("WorkspaceService sendMessage AI settings persistence", () => {
+  // Backend-initiated turns (peer messages, task wakes, heartbeats) carry the recipient's
+  // resolved agent/model/thinking as send options. The remembered selection must survive such a
+  // send unchanged while an otherwise identical user-authored send still updates it. The status
+  // clearing suite above only proves the persistence hook is skipped; this reads the real config.
+  test.each([true, false])(
+    "persists agent and AI settings only for non-synthetic sends (synthetic=%s)",
+    async (synthetic) => {
+      const { config, historyService, cleanup } = await createTestHistoryService();
+      try {
+        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}`;
+        const projectPath = "/tmp/settings-persistence-project";
+        const remembered = {
+          agentId: "exec",
+          aiSettings: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+          aiSettingsByAgent: {
+            exec: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+          },
+        };
+        await config.addWorkspace(projectPath, {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "settings-persistence-project",
+          projectPath,
+          runtimeConfig: { type: "local" },
+          ...remembered,
+        });
+
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          aiService: createMockAIService({ isStreaming: mock(() => false) }),
+        });
+        const fakeSession = {
+          ...createCompactionAdmissionMocks(),
+          isBusy: mock(() => false),
+          hasQueuedMessages: mock(() => false),
+          hasQueuedOrDispatchingEntry: mock(() => false),
+          dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
+          queueMessage: mock(() => "tool-end" as const),
+          sendMessage: mock(() => Promise.resolve(Ok(undefined))),
+          drainQueuedMessagesIfIdle: mock(() => undefined),
+        };
+        (
+          workspaceService as unknown as {
+            getOrCreateSession: (workspaceId: string) => AgentSession;
+          }
+        ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+
+        const result = await workspaceService.sendMessage(
+          workspaceId,
+          "hello",
+          { agentId: "plan", model: "openai:gpt-5.2", thinkingLevel: "high" },
+          synthetic ? { synthetic: true } : undefined
+        );
+
+        expect(result.success).toBe(true);
+        expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+        const entry = config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === workspaceId);
+        expect(entry).toBeDefined();
+        const persisted = {
+          agentId: entry?.agentId,
+          aiSettings: entry?.aiSettings,
+          aiSettingsByAgent: entry?.aiSettingsByAgent,
+        };
+        expect(persisted).toEqual(
+          synthetic
+            ? remembered
+            : {
+                agentId: "plan",
+                // The legacy root bucket is never rewritten by a send; only the per-agent
+                // bucket of the selected agent changes.
+                aiSettings: remembered.aiSettings,
+                aiSettingsByAgent: {
+                  ...remembered.aiSettingsByAgent,
+                  plan: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+                },
+              }
+        );
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});
+
 describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
@@ -22104,7 +22222,7 @@ describe("WorkspaceService fork", () => {
       getOrCreateSessionSpy.mockRestore();
     }
   });
-  test("fork inherits a paused goal snapshot with fresh accounting", async () => {
+  test("fork inherits a paused goal with fresh accounting but not unrelated-message consent", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -22116,6 +22234,7 @@ describe("WorkspaceService fork", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
       namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+      unrelatedWorkspaceConsent: "source-consent",
     };
 
     await fsPromises.mkdir(sourceProjectPath, { recursive: true });
@@ -22208,6 +22327,14 @@ describe("WorkspaceService fork", () => {
       if (!result.success) {
         throw new Error(`Expected success result, got error: ${result.error}`);
       }
+
+      const metadataAfterFork = await config.getAllWorkspaceMetadata();
+      expect(
+        metadataAfterFork.find((entry) => entry.id === sourceWorkspaceId)?.unrelatedWorkspaceConsent
+      ).toBe("source-consent");
+      expect(
+        metadataAfterFork.find((entry) => entry.id === newWorkspaceId)?.unrelatedWorkspaceConsent
+      ).toBeUndefined();
 
       const forkGoal = await goalService.getGoal(newWorkspaceId);
       expect(forkGoal).toMatchObject({

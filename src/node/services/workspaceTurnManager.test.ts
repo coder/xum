@@ -612,6 +612,55 @@ describe("WorkspaceTurnManager", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
+  test("workspace lifecycle refuses a valid handle owned by another workspace", async () => {
+    // Ownership is decided by the durable workspace-turn graph, never by whether the caller knows
+    // (or can message) the target. The same handle stays fully usable for its actual owner.
+    const { parentId, projectPath, config, taskService, taskHandleStore, archive } =
+      await createWorkspaceLifecycleHarness();
+    const otherOwnerId = "otherowner";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, "other-owner"),
+        id: otherOwnerId,
+        name: "other-owner",
+        createdAt: new Date().toISOString(),
+        runtimeConfig: { type: "local" },
+      });
+      return cfg;
+    });
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(otherOwnerId, "unownedworkspace", "wst_otherowned", "completed", {
+        turnId: "turn-other-owned",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        createdWorkspace: true,
+        title: "Other owner's child",
+      })
+    );
+
+    const refused = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+      parentId,
+      { taskId: "wst_otherowned" },
+      {}
+    );
+
+    // The record lives in the other owner's store, so it does not even resolve to a workspace.
+    expect(refused).toEqual(
+      Ok({ status: "invalid_scope", action: "archive", taskId: "wst_otherowned" })
+    );
+    expect(archive).not.toHaveBeenCalled();
+
+    const ownerArchive = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+      otherOwnerId,
+      { taskId: "wst_otherowned" },
+      {}
+    );
+    expect(ownerArchive.success && ownerArchive.data.status).toBe("archived");
+    expect(archive).toHaveBeenCalledTimes(1);
+  });
+
   test("workspace lifecycle returns archive confirmation and treats already archived as idempotent", async () => {
     const confirmationArchive = mock(
       (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
@@ -3317,6 +3366,42 @@ describe("WorkspaceTurnManager", () => {
     if (foreign.success) return;
     expect(foreign.error).toContain("invalid_scope");
     expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  test("createWorkspaceTurn mode=existing refuses an independently created root", async () => {
+    // A root nobody delegated to (no workspace-turn record, not a descendant) stays outside the
+    // ownership graph even though it is a perfectly valid instance workspace ID.
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, "foreign-root"),
+        id: "foreignroot",
+        name: "foreign-root",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+      return cfg;
+    });
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Should not run",
+      title: "Foreign root",
+      workspace: { mode: "existing", workspaceId: "foreignroot" },
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toContain("invalid_scope");
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test.each(["isolated", "shared", "busy"] as const)(

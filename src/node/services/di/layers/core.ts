@@ -71,6 +71,7 @@ import { MemoryService, type MemoryChangeEvent } from "@/node/services/memorySer
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
+import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -100,6 +101,11 @@ import { StoresFromCoreOptionsLive } from "./stores";
  * body's setter/listener wiring is replayed, in its original order, by
  * `CoreWiringLive` once every service exists.
  */
+
+class ToolCallDisplayRegistryTag extends Context.Service<
+  ToolCallDisplayRegistryTag,
+  ToolCallDisplayRegistry
+>()("xum/ToolCallDisplayRegistry") {}
 
 /** The core graph's inputs other than the stores (`CoreOptions` in coreServices.ts). */
 export class CoreOptionsTag extends Context.Service<CoreOptionsTag, CoreOptions>()(
@@ -272,7 +278,8 @@ export const StreamManagerLive = Layer.effect(
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
       // in-flight stream (StreamManager.superviseEngine).
-      yield* AppFiberScopeTag
+      yield* AppFiberScopeTag,
+      yield* ToolCallDisplayRegistryTag
     );
   })
 );
@@ -408,6 +415,10 @@ export const MCPServerManagerLive = Layer.effect(
             workspaceMcpOverridesService.acquireExclusiveLock(options),
         },
         ...opts.mcpServerManagerOptions,
+        // After the spread: the registry is a shared dependency the core graph
+        // owns (the stream manager consumes what the MCP manager publishes), so
+        // a caller-supplied instance must not silently split the two.
+        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
       },
       opts.policyService
     );
@@ -680,6 +691,7 @@ export const CoreWiringLive: Layer.Layer<
 // ---------------------------------------------------------------------------
 
 const S1 = Layer.mergeAll(
+  Layer.sync(ToolCallDisplayRegistryTag, () => new ToolCallDisplayRegistry()),
   HistoryLive,
   InitStateManagerLive,
   ProviderLive,

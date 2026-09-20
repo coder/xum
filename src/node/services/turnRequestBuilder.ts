@@ -1,3 +1,4 @@
+import { withExecutionScope } from "./tools/withExecutionScope";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
@@ -988,12 +989,13 @@ export class TurnRequestBuilder {
         return { modelString: canonical };
       }
       // The factory creates Coder instances from the wire alone (openai
-      // type → provider.responses, openai-chat types → provider.chat), so
-      // BOTH OpenAI wire kinds must override any pre-existing wireFormat:
-      // a refusal chain that starts on direct OpenAI Chat Completions and
-      // falls back to an openai-typed Coder instance would otherwise build
-      // Chat Completions tools/options for a Responses request.
-      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType);
+      // type and bedrock openai.* models → provider.responses, openai-chat
+      // types → provider.chat), so BOTH OpenAI wire kinds must override any
+      // pre-existing wireFormat: a refusal chain that starts on direct OpenAI
+      // Chat Completions and falls back to an openai-typed Coder instance
+      // would otherwise build Chat Completions tools/options for a Responses
+      // request.
+      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType, coderWire.modelId);
       return {
         modelString: `${coderWire.origin}:${coderWire.modelId}`,
         ...(wireProtocol === "openai-chat"
@@ -2172,6 +2174,9 @@ export class TurnRequestBuilder {
     // stay scoped to this specific assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
+    // Bind ownership before cached MCP tools are captured by the PTC bridge.
+    // A queued invocation must keep this turn's identity after a replacement starts.
+    const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
@@ -2421,7 +2426,7 @@ export class TurnRequestBuilder {
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
-        this.dependencies.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
+        this.dependencies.streamManager.emitNestedToolEvent(executionScope, event);
       }
     };
     const kernelFileLoader = createKernelFileLoader({
@@ -2483,7 +2488,7 @@ export class TurnRequestBuilder {
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
-            allTools,
+            withExecutionScope(allTools, executionScope),
             delegatedToolNames
           ),
           extraTools: this.dependencies.bindings.extraTools,
@@ -3217,6 +3222,7 @@ export class TurnRequestBuilder {
         maxOutputTokens,
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
+        executionScope,
         hasQueuedMessages,
         getQueuedInputStopCause,
         onStepSettled,

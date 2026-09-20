@@ -1,3 +1,4 @@
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
@@ -139,6 +140,7 @@ function endToolCall(
     toolCallId: string;
     toolName: string;
     result: unknown;
+    mcpServer?: MCPToolCallDisplay;
     timestamp?: number;
     parentToolCallId?: string;
     replay?: boolean;
@@ -151,6 +153,7 @@ function endToolCall(
     toolCallId: options.toolCallId,
     toolName: options.toolName,
     result: options.result,
+    mcpServer: options.mcpServer,
     timestamp: options.timestamp ?? Date.now(),
     parentToolCallId: options.parentToolCallId,
     replay: options.replay,
@@ -262,6 +265,65 @@ function historicalTodoMessage(
 }
 
 describe("StreamingMessageAggregator", () => {
+  describe("history edit evidence", () => {
+    const row = (id: string, seq: number, text: string) =>
+      createMuxMessage(id, seq % 2 === 0 ? "user" : "assistant", text, {
+        historySequence: seq,
+        timestamp: seq + 1,
+      });
+
+    test("a projection over a persisted row keeps the persisted version as evidence", () => {
+      const aggregator = new StreamingMessageAggregator(new Date().toISOString());
+      const persistedCard = row("workflow-run-1", 1, "workflow running");
+      aggregator.loadHistoricalMessages([row("u0", 0, "hi"), persistedCard, row("u2", 2, "next")]);
+      const before = aggregator.getHistoryEvidenceMessages();
+
+      // The projection (same id, live status) is displayed; the backend still holds the card.
+      aggregator.addEphemeralMessage(row("workflow-run-1", 1, "workflow completed"));
+      expect(aggregator.getAllMessages().find((m) => m.id === "workflow-run-1")?.parts).toEqual(
+        row("workflow-run-1", 1, "workflow completed").parts
+      );
+      expect(aggregator.getHistoryEvidenceMessages()).toEqual(before);
+
+      // A newer persisted version from the backend becomes the evidence, projection or not.
+      const republished = row("workflow-run-1", 1, "workflow finished (persisted)");
+      aggregator.addMessage(republished);
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(republished.parts);
+
+      // Every active stream's row is fenced by identity only (two can overlap briefly).
+      startTestStream(aggregator, { messageId: "s3", historySequence: 3 });
+      startTestStream(aggregator, { messageId: "s4", historySequence: 4 });
+      expect(
+        aggregator
+          .getHistoryEvidenceMessages()
+          .filter((m) => m.id === "s3" || m.id === "s4")
+          .map((m) => m.metadata?.partial)
+      ).toEqual([true, true]);
+
+      // A since replay that rewrites the row (the backend updated the persisted card) refreshes
+      // the evidence too — that path bypasses addMessage and loadHistoricalMessages.
+      const rewritten = row("workflow-run-1", 1, "workflow finished (since replay)");
+      aggregator.reconcileSinceReplay({
+        messages: [rewritten],
+        requestedAnchorSequence: 0,
+        hasActiveStream: false,
+      });
+      expect(
+        aggregator.getHistoryEvidenceMessages().find((m) => m.id === "workflow-run-1")?.parts
+      ).toEqual(rewritten.parts);
+
+      // A frontend-only row with no persisted counterpart is not evidence at all.
+      aggregator.addEphemeralMessage(
+        row("plan-display-preview", Number.MAX_SAFE_INTEGER, "# Plan")
+      );
+      expect(
+        aggregator.getHistoryEvidenceMessages().some((m) => m.id === "plan-display-preview")
+      ).toBe(false);
+    });
+  });
+
   describe("workflow run attachments", () => {
     test("preserves persisted workflow run attachments on displayed tool rows", () => {
       const aggregator = createTestAggregator();
@@ -4122,6 +4184,43 @@ describe("StreamingMessageAggregator", () => {
       }
       expect(toolMsg.nestedCalls).toHaveLength(1);
     });
+
+    test.each([undefined, "parent-tool-1"])(
+      "retains host-authored MCP display metadata from live completion (parent: %s)",
+      (parentToolCallId) => {
+        const aggregator = createTestAggregator();
+        startParentTool(aggregator);
+        const mcpServer = {
+          connection: { key: "configured", transport: "stdio" as const },
+          identity: { name: "display-server", version: "1" },
+          source: "response" as const,
+        };
+        startToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          args: {},
+          timestamp: 1100,
+          parentToolCallId,
+        });
+        endToolCall(aggregator, {
+          toolCallId: "mcp-call",
+          toolName: "mcp__configured__search",
+          result: { content: [{ type: "text", text: "answer" }] },
+          timestamp: 1200,
+          parentToolCallId,
+          mcpServer,
+        });
+        const parts = aggregator.getAllMessages().flatMap((message) => message.parts);
+        const parent = parts.find(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "parent-tool-1"
+        );
+        const call =
+          parentToolCallId && parent?.type === "dynamic-tool"
+            ? parent.nestedCalls?.find((nested) => nested.toolCallId === "mcp-call")
+            : parts.find((part) => part.type === "dynamic-tool" && part.toolCallId === "mcp-call");
+        expect(call).toMatchObject({ mcpServer });
+      }
+    );
 
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();

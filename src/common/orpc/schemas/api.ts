@@ -7,6 +7,7 @@ import {
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -63,6 +64,8 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  hasExactlyOneEditFence,
+  EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
   ToolPolicySchema,
   UpdateStatusSchema,
@@ -124,9 +127,11 @@ import {
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
   MCPSetToolAllowlistParamsSchema,
+  MCPIconRefSchema,
   MCPTestGlobalParamsSchema,
   MCPTestParamsSchema,
   MCPTestResultSchema,
+  PngDataUrlSchema,
   WorkspaceMCPOverridesSchema,
 } from "./mcp";
 import {
@@ -1039,6 +1044,21 @@ export const mcp = {
     input: MCPTestGlobalParamsSchema,
     output: MCPTestResultSchema,
   },
+  /** Session-local lookup of a tool-call snapshot's `iconRef`; null when unknown or expired. */
+  icon: {
+    input: z.object({ iconRef: MCPIconRefSchema }),
+    output: PngDataUrlSchema.nullable(),
+  },
+  /**
+   * Bulk form of `icon` for a visible transcript: one answer per requested ref.
+   * Lookup only, bounded by the renderer cache size so one call covers a screen.
+   */
+  icons: {
+    input: z.object({
+      iconRefs: z.array(MCPIconRefSchema).max(MCP_ICON_LIMITS.registryMaxEntries),
+    }),
+    output: z.record(MCPIconRefSchema, PngDataUrlSchema.nullable()),
+  },
   setEnabled: {
     input: MCPSetEnabledGlobalParamsSchema,
     output: ResultSchema(z.void(), z.string()),
@@ -1633,6 +1653,9 @@ export const workspace = {
       message: z.string(),
       options: SendMessageOptionsSchema.extend({
         fileParts: z.array(FilePartSchema).optional(),
+      }).refine(hasExactlyOneEditFence, {
+        message: EDIT_FENCE_REQUIRED_MESSAGE,
+        path: ["historyEditPrecondition"],
       }),
     }),
     output: ResultSchema(z.object({}), SendMessageErrorSchema),
@@ -1684,14 +1707,12 @@ export const workspace = {
       z.string()
     ),
   },
-  getStartupAutoRetryModel: {
-    input: z.object({ workspaceId: z.string() }),
-    output: ResultSchema(z.string().nullable(), z.string()),
-  },
-  setAutoCompactionThreshold: {
+  // Recipient opt-in for cross-tree discovery/messaging. The caller only says on/off; the
+  // backend mints and owns the generation (see WorkspaceMetadata.unrelatedWorkspaceConsent).
+  setUnrelatedWorkspaceConsent: {
     input: z.object({
       workspaceId: z.string(),
-      threshold: z.number().finite().min(0.1).max(1.0),
+      enabled: z.boolean(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },

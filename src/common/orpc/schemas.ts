@@ -130,6 +130,7 @@ export {
   ReasoningEndEventSchema,
   RuntimeStatusEventSchema,
   SendMessageOptionsSchema,
+  HistoryEditPreconditionSchema,
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,

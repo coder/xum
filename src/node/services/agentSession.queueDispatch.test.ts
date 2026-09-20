@@ -8,10 +8,11 @@ import * as path from "node:path";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
 import type { AIService } from "./aiService";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
@@ -1068,6 +1069,208 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // Peer-message triggers (TaskService.sendTreeMessage) enter the queue as hidden, sealed,
+  // synthetic entries with a caller admission probe and a payload row. The queue-boundary
+  // contract (turn-end never cuts a tool boundary; tool-end cuts the next one; a stale probe
+  // withdraws the entry at dispatch) is proven here through the real session and queue, not by
+  // asserting the options TaskService forwards.
+  const peerTriggerInternal = (
+    dedupeKey: string
+  ): NonNullable<Parameters<AgentSession["queueMessage"]>[2]> => ({
+    acceptanceOrigin: "automatic",
+    synthetic: true,
+    agentInitiated: true,
+    dedupeKey,
+    removableDedupeKey: true,
+    preTurnMessages: [
+      createMuxMessage(`${dedupeKey}-payload`, "assistant", "<mux_agent_message>…", {
+        timestamp: 0,
+        synthetic: true,
+      }),
+    ],
+  });
+
+  test("a synthetic turn-end entry never cuts a tool boundary and drains at stream-end", async () => {
+    const workspaceId = "queue-dispatch-synthetic-turn-end";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
+      () => undefined
+    );
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
+        peerTriggerInternal("agent-msg:sender:turn-end")
+      );
+      expect(mode).toBe("turn-end");
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+      // StreamManager's step-boundary stop policy consults these two probes for locally
+      // executed tools; a turn-end entry must satisfy neither.
+      expect(session.getQueuedInputStopCause()).toBeUndefined();
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      // bash_output early-return signal stays off for turn-end entries.
+      expect(queuedSignals).toEqual([false]);
+
+      // Provider-executed and local tool results both pass without a soft stop.
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolCallId: "tool-call-2",
+      });
+      expect(stopStream).not.toHaveBeenCalled();
+      expect(sendQueuedMessages).not.toHaveBeenCalled();
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+
+      void runSessionTerminalPolicy(session, aiEmitter, {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        parts: [],
+        metadata: {
+          model: TEST_MODEL,
+          contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          providerMetadata: {},
+          finishReason: "tool-calls",
+        },
+      });
+
+      const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
+      expect(didDispatch).toBe(true);
+      expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
+    } finally {
+      sendQueuedMessages.mockRestore();
+      stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a synthetic tool-end entry cuts the next tool boundary and dispatches after the abort", async () => {
+    const workspaceId = "queue-dispatch-synthetic-tool-end";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
+      () => undefined
+    );
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        peerTriggerInternal("agent-msg:sender:tool-end")
+      );
+      expect(mode).toBe("tool-end");
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+      // Local tool boundaries stop through the queued-input cause (StreamManager stopWhen).
+      expect(session.getQueuedInputStopCause()).toMatchObject({ kind: "queued-input" });
+      expect(queuedSignals).toEqual([true]);
+
+      // Provider-executed boundaries soft-stop the stream and dispatch once it aborts.
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledWith(workspaceId, {
+        soft: true,
+        abortReason: "system",
+      });
+
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
+      const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
+      expect(didDispatch).toBe(true);
+      expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
+      expect(sendQueuedMessages).toHaveBeenCalledWith("provider-tool");
+    } finally {
+      sendQueuedMessages.mockRestore();
+      stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a queued synthetic entry whose admission probe went stale is withdrawn at dispatch", async () => {
+    const workspaceId = "queue-dispatch-stale-probe-withdrawal";
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+
+    try {
+      // Stands in for the recipient-state recheck TaskService threads through the peer send
+      // (target archived/stopped or a delegated turn started while the entry waited).
+      let stale = false;
+      let accepted = 0;
+      let preStreamFailures = 0;
+      let canceled = 0;
+      const dedupeKey = "agent-msg:sender:stale-probe";
+      const mode = session.queueMessage(
+        "Peer agent sent an agent message",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
+        {
+          ...peerTriggerInternal(dedupeKey),
+          admissionStale: () => stale,
+          onAccepted: () => {
+            accepted += 1;
+          },
+          onAcceptedPreStreamFailure: () => {
+            preStreamFailures += 1;
+          },
+          onCanceled: () => {
+            canceled += 1;
+          },
+        }
+      );
+      expect(mode).toBe("turn-end");
+      expect(session.hasQueuedDedupeKey(dedupeKey)).toBe(true);
+
+      stale = true;
+      session.sendQueuedMessages();
+      await session.waitForIdle();
+
+      // Refused before acceptance: no turn, no payload or trigger row, and the queued-dispatch
+      // failure callback (the sender's budget refund) fires exactly once.
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(accepted).toBe(0);
+      expect(preStreamFailures).toBe(1);
+      expect(canceled).toBe(0);
+      expect(session.isBusy()).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(session.hasQueuedDedupeKey(dedupeKey)).toBe(false);
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
   test.each([
     ["turn-end", "tool-end"],
     ["tool-end", "turn-end"],
@@ -1832,8 +2035,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }),
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
-      setThreshold: () => undefined,
-      getThreshold: () => 0.85,
     } as unknown as CompactionMonitor;
 
     try {

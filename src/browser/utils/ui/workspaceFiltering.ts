@@ -1019,6 +1019,32 @@ export function buildSortedWorkspacesFlat(
 }
 
 /**
+ * Newest workspace by createdAt. Recency breaks ties because legacy rows share
+ * one default createdAt.
+ */
+export function findMostRecentlyCreatedWorkspace(
+  workspaces: readonly FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): FrontendWorkspaceMetadata | undefined {
+  let newest: FrontendWorkspaceMetadata | undefined;
+  for (const workspace of workspaces) {
+    if (!newest) {
+      newest = workspace;
+      continue;
+    }
+    const createdDiff = parseTimestampMs(workspace.createdAt) - parseTimestampMs(newest.createdAt);
+    if (
+      createdDiff > 0 ||
+      (createdDiff === 0 &&
+        (workspaceRecency[workspace.id] ?? 0) > (workspaceRecency[newest.id] ?? 0))
+    ) {
+      newest = workspace;
+    }
+  }
+  return newest;
+}
+
+/**
  * Order rows for the flat Multi-Project section. The rows are collected across
  * per-primary-project buckets of the sorted map, so without this pass two
  * pinned multi-project chats with different primary projects would render in

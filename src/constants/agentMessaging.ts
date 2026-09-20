@@ -1,6 +1,6 @@
 /**
- * Loop protection for intra-tree agent peer messaging: task_send_message sends whose target is
- * NOT the sender's descendant (siblings/cousins and ancestors, including the root workspace).
+ * Loop protection for instance-wide agent peer messaging: task_send_message sends whose target is
+ * NOT the sender's descendant (siblings/cousins, ancestors, or unrelated workspaces).
  * Parent→descendant guidance is unthrottled and unaffected by these constants.
  *
  * All counters live in-memory on TaskService (mirroring consecutiveAutoResumes): a restart clears
@@ -108,3 +108,7 @@ export function retiredAttemptMessage(claim: { runId: string; stepId: string }):
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 export const SEND_ADMISSION_STALE_MESSAGE =
   "Send refused: the target was stopped or interrupted while the message was being admitted.";
+
+/** Bound on-demand instance discovery without growing the default task list. */
+export const INSTANCE_DISCOVERY_DEFAULT_LIMIT = 20;
+export const INSTANCE_DISCOVERY_MAX_LIMIT = 100;

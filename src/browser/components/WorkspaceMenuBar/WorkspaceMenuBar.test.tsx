@@ -1,9 +1,11 @@
 import "../../../../tests/ui/dom";
 
-import type { ComponentProps, PropsWithChildren } from "react";
+import type { ComponentProps, PropsWithChildren, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import * as APIModule from "@/browser/contexts/API";
 import * as AgentContextModule from "@/browser/contexts/AgentContext";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -19,6 +21,7 @@ import * as TutorialContextModule from "@/browser/contexts/TutorialContext";
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { WorkspaceMenuBar as WorkspaceMenuBarComponent } from "./WorkspaceMenuBar";
 import * as WorkspaceMCPModalModule from "../WorkspaceMCPModal/WorkspaceMCPModal";
+import * as WorkspaceUnrelatedMessagingModalModule from "../WorkspaceUnrelatedMessagingModal";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as PopoverModule from "../Popover/Popover";
 import * as CheckboxModule from "../Checkbox/Checkbox";
@@ -33,10 +36,41 @@ import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
+import { Err, Ok, type Result } from "@/common/types/result";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
+
+// The consent dialog integration test renders the REAL modal inside the menu bar. Radix
+// Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
+// modal's own test) and restored after this suite so it cannot leak into later files.
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+void mock.module("@/browser/components/Dialog/Dialog", () => ({
+  Dialog: (props: { open: boolean; children: ReactNode }) =>
+    props.open ? <div>{props.children}</div> : null,
+  DialogContent: (props: { children: ReactNode; className?: string }) => (
+    <div className={props.className}>{props.children}</div>
+  ),
+  DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
+  DialogDescription: (props: { children: ReactNode; className?: string }) => (
+    <p className={props.className}>{props.children}</p>
+  ),
+  DialogTitle: (props: { children: ReactNode; className?: string }) => (
+    <h2 className={props.className}>{props.children}</h2>
+  ),
+}));
+
+// Captured before any spy is installed so the integration test can render the real modal
+// through the recording double without recursing into itself.
+const RealWorkspaceUnrelatedMessagingModal =
+  WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal;
+
+// The real Dialog primitives (distinct specifier, so the inline shell above does not apply):
+// the "another modal is open" test needs the actual overlay the MCP/heartbeat dialogs render.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const RealDialog = require("../Dialog/Dialog?real=1") as typeof RealDialogModule;
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
@@ -44,6 +78,9 @@ let workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
 let archivingWorkspaceIds = new Set<string>();
 let cleanupDom: (() => void) | null = null;
 const workspaceId = "workspace-1";
+// Per-test API double read by the useAPI spy (null = not connected), so a test can supply a
+// real-shaped client without stacking a second spy on the same hook.
+let mockApi: unknown = null;
 
 function TestWrapper(props: PropsWithChildren) {
   return <>{props.children}</>;
@@ -61,6 +98,7 @@ function getLastMenuContentProps() {
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
             onOpenTimeline?: (() => void) | null;
+            onConfigureUnrelatedMessaging?: (() => void) | null;
           },
         ]
       >;
@@ -140,7 +178,7 @@ function installWorkspaceMenuBarTestDoubles() {
   archiveShowErrorMock = mock(() => undefined);
 
   spyOn(APIModule, "useAPI").mockImplementation(
-    () => ({ api: null }) as unknown as ReturnType<typeof APIModule.useAPI>
+    () => ({ api: mockApi }) as unknown as ReturnType<typeof APIModule.useAPI>
   );
   spyOn(AgentContextModule, "useAgent").mockImplementation(
     () =>
@@ -283,6 +321,13 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(TimelineDialogModule, "TimelineDialog").mockImplementation(
     (() => null) as unknown as typeof TimelineDialogModule.TimelineDialog
   );
+  spyOn(
+    WorkspaceUnrelatedMessagingModalModule,
+    "WorkspaceUnrelatedMessagingModal"
+  ).mockImplementation(
+    (() =>
+      null) as unknown as typeof WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal
+  );
 }
 
 // Records render props like the WorkspaceActionsMenuContent double, so tests can
@@ -291,6 +336,15 @@ function getLastTimelineDialogProps() {
   const spy = TimelineDialogModule.TimelineDialog as unknown as {
     mock: { calls: Array<[{ workspaceId: string; open: boolean }]> };
   };
+  return spy.mock.calls.at(-1)?.[0];
+}
+
+// Same recording double for the consent dialog (Radix portals do not render in happy-dom).
+function getLastUnrelatedMessagingModalProps() {
+  const spy =
+    WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
+      mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+    };
   return spy.mock.calls.at(-1)?.[0];
 }
 
@@ -341,6 +395,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
     workspaceMetadata = new Map();
     archivingWorkspaceIds = new Set();
+    mockApi = null;
     mockTimelineExperimentEnabled = false;
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
@@ -585,6 +640,170 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     expect(getLastTimelineDialogProps()?.open).toBe(false);
   });
+
+  it.each([
+    {
+      opener: "More menu",
+      open: () => getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.(),
+    },
+    {
+      opener: "keyboard shortcut",
+      open: () => fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true }),
+    },
+  ])("closes the consent dialog opened from the $opener when switching workspaces", ({ open }) => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    act(() => {
+      open();
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
+
+    // Consent is granted per recipient workspace. Selecting another workspace while App
+    // reuses this menu bar must close the dialog so the switch cannot be flipped against
+    // the workspace the user navigated to.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    // A callback retained from the first workspace's dialog cannot reopen it here either.
+    act(() => {
+      staleOnOpenChange(true);
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+
+    // Returning does not resurrect it: the retained id is cleared on leave.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  });
+
+  it("gives each workspace its own consent dialog so a pending request cannot leak across a switch", async () => {
+    // Real-shaped client whose calls stay pending until the test settles them.
+    const requests: Array<{
+      input: { workspaceId: string; enabled: boolean };
+      settle: (result: Result<void, string>) => void;
+    }> = [];
+    mockApi = {
+      workspace: {
+        setUnrelatedWorkspaceConsent: (input: { workspaceId: string; enabled: boolean }) =>
+          new Promise<Result<void, string>>((settle) => requests.push({ input, settle })),
+      },
+    };
+    // Render the real modal through the recording double so its pending/error state is live.
+    (
+      WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
+        mockImplementation: (
+          impl: typeof WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal
+        ) => void;
+      }
+    ).mockImplementation((props) => <RealWorkspaceUnrelatedMessagingModal {...props} />);
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
+    });
+    // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
+    fireEvent.click(view.getByRole("switch"));
+    expect(requests).toHaveLength(1);
+    expect(requests[0].input).toEqual({ workspaceId, enabled: true });
+    await waitFor(() => {
+      expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(true);
+    });
+    expect(view.queryByRole("status")).not.toBeNull();
+
+    // Workspace B: the dialog opened here must be B's own, not A's still-saving instance.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    expect(view.queryByRole("switch")).toBeNull();
+    act(() => {
+      getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
+    });
+    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(view.queryByRole("status")).toBeNull();
+
+    // A's request settling (here: refused) belongs to A's dialog and must not surface in B.
+    await act(async () => {
+      requests[0].settle(Err("workspace-1 refused"));
+      await Promise.resolve();
+    });
+    expect(view.queryByRole("alert")).toBeNull();
+    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+
+    // B is fully usable and its request targets B.
+    fireEvent.click(view.getByRole("switch"));
+    expect(requests).toHaveLength(2);
+    expect(requests[1].input).toEqual({ workspaceId: "workspace-2", enabled: true });
+    await act(async () => {
+      requests[1].settle(Ok(undefined));
+      await Promise.resolve();
+    });
+    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(view.queryByRole("alert")).toBeNull();
+  });
+
+  it("ignores the consent shortcut while another modal is open", () => {
+    // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
+    // not render in happy-dom). Like the MCP and heartbeat dialogs at runtime, nothing here
+    // carries aria-modal, so the guard must recognise the overlay itself.
+    const view = render(
+      <>
+        <RealDialog.Dialog open>
+          <RealDialog.DialogOverlay data-testid="other-modal-overlay" />
+        </RealDialog.Dialog>
+        <WorkspaceMenuBar {...defaultProps} />
+      </>
+    );
+    expect(view.getByTestId("other-modal-overlay").getAttribute("data-state")).toBe("open");
+    expect(document.querySelector('[aria-modal="true"]')).toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  });
+
+  // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
+  // refuses otherwise), so remote/container workspaces get neither consent entry point: a
+  // grant there could never be honoured. An unset config means the canonical default.
+  it.each<{ runtime: string; runtimeConfig: RuntimeConfig | undefined }>([
+    { runtime: "worktree", runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" } },
+    { runtime: "project-dir local", runtimeConfig: { type: "local" } },
+    { runtime: "legacy local worktree", runtimeConfig: { type: "local", srcBaseDir: "/tmp/src" } },
+    { runtime: "canonical default (unset)", runtimeConfig: undefined },
+  ])("offers the consent action and shortcut for $runtime workspaces", ({ runtimeConfig }) => {
+    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+
+    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+  });
+
+  it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
+    { runtime: "SSH", runtimeConfig: { type: "ssh", host: "dev.example", srcBaseDir: "/srv/src" } },
+    {
+      runtime: "Coder",
+      runtimeConfig: { type: "ssh", host: CODER_RUNTIME_PLACEHOLDER, srcBaseDir: "~/src" },
+    },
+    { runtime: "Docker", runtimeConfig: { type: "docker", image: "node:20" } },
+    {
+      runtime: "devcontainer",
+      runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    },
+  ])(
+    "hides the consent action and ignores its shortcut for $runtime workspaces",
+    ({ runtimeConfig }) => {
+      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+
+      expect(getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBeNull();
+      act(() => {
+        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+      });
+      // Not rendered at all, or rendered closed: either way nothing can open here.
+      expect(getLastUnrelatedMessagingModalProps()?.open ?? false).toBe(false);
+    }
+  );
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
     mockTimelineExperimentEnabled = true;

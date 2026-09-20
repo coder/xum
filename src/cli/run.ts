@@ -959,6 +959,7 @@ async function main(): Promise<number> {
 
   const liveEvents: WorkspaceChatMessage[] = [];
   let readyForLive = false;
+  let historyReplayFailed = false;
 
   /**
    * Tracks whether stdout currently has an unfinished line (i.e. the last write was
@@ -1224,6 +1225,12 @@ async function main(): Promise<number> {
 
     if (!readyForLive) {
       if (isCaughtUpMessage(payload)) {
+        // caught-up is emitted even when history could not be read (it closes the replay);
+        // only a complete replay means the session is ready for a history-mutating send.
+        if (payload.historyReplayStatus === "failed") {
+          historyReplayFailed = true;
+          return;
+        }
         readyForLive = true;
         emitJsonLine({ type: "caught-up", workspaceId });
       }
@@ -1445,6 +1452,11 @@ async function main(): Promise<number> {
   const unsubscribe = await session.subscribeChat(chatListener);
 
   try {
+    if (historyReplayFailed) {
+      throw new Error(
+        `Workspace ${workspaceId} history could not be read; refusing to send into an unverified transcript`
+      );
+    }
     await sendAndAwait(message, buildSendOptions(initialMode));
 
     // Stop if budget was exceeded during first message

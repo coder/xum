@@ -317,6 +317,7 @@ import type {
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -7283,7 +7284,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private resolveHeartbeatWorkspaceEntry(
     workspaceId: string,
-    methodName: "getHeartbeatSettings" | "setHeartbeatSettings" | "unsetHeartbeatSettings"
+    methodName:
+      | "getHeartbeatSettings"
+      | "setHeartbeatSettings"
+      | "unsetHeartbeatSettings"
+      | "setUnrelatedWorkspaceConsent"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -7406,6 +7411,77 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to unset heartbeat settings: ${message}`);
+    }
+  }
+
+  /**
+   * Recipient consent for unrelated (cross-tree) workspaces to discover this workspace and send it
+   * untrusted agent messages. Persisted as an opaque revocation GENERATION, never a credential:
+   * off deletes the field; off→on mints a fresh `crypto.randomUUID()`; an already-on workspace
+   * keeps its value so a repeat enable is not a revocation. Messaging enforcement (TaskService)
+   * captures the generation at admission and treats a changed or absent value as stale, which is
+   * why every off→on transition must produce a new value. The returned Ok means the change is
+   * committed to config AND published on the metadata channel; the UI must not flip its switch
+   * before that ack. Application-level only: any same-UID process with config access can edit
+   * this field, so it is an opt-in, not an isolation boundary. Recency is deliberately not bumped
+   * (a settings toggle should not reorder the sidebar) and no timeline row is recorded.
+   */
+  async setUnrelatedWorkspaceConsent(
+    workspaceId: string,
+    enabled: boolean
+  ): Promise<Result<void, string>> {
+    try {
+      assert(typeof enabled === "boolean", "setUnrelatedWorkspaceConsent requires a boolean");
+      const resolved = this.resolveHeartbeatWorkspaceEntry(
+        workspaceId,
+        "setUnrelatedWorkspaceConsent"
+      );
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+
+      const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err("Workspace not found");
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err("Workspace not found");
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        if (!enabled) {
+          // Absent is the only "off" representation on disk. A malformed value already reads
+          // as off, but it is scrubbed here so the entry does not carry junk indefinitely.
+          delete entry.unrelatedWorkspaceConsent;
+          return freshConfig;
+        }
+        if (getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent) != null) {
+          // Already on: keep the generation (a repeat enable is not a revocation).
+          return freshConfig;
+        }
+        // Off (or malformed) → on: a NEW generation, so nothing admitted under an earlier
+        // consent can be revived by re-enabling.
+        entry.unrelatedWorkspaceConsent = crypto.randomUUID();
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after EVERY successful write, including on-disk no-ops. The write above is
+      // committed before this runs, so metadata readers never observe a generation that is
+      // not yet durable; and if publication throws (the Err below), the retry with the same
+      // value is a no-op on disk but is exactly what gets the authoritative state to the UI.
+      // Gating on "changed" would leave the switch stale forever after one failed publish.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
     }
   }
 
@@ -12771,28 +12847,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.withStartupSession(workspaceId, (session) => session.getStartupRecoveryState());
   }
 
-  async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {
-    try {
-      return Ok(await this.getOrCreateSession(workspaceId).getStartupAutoRetryModelHint());
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      log.error("Unexpected error in getStartupAutoRetryModel handler:", error);
-      return Err(`Failed to inspect startup auto-retry model: ${errorMessage}`);
-    }
-  }
-
-  setAutoCompactionThreshold(workspaceId: string, threshold: number): Result<void> {
-    try {
-      const session = this.getOrCreateSession(workspaceId);
-      session.setAutoCompactionThreshold(threshold);
-      return Ok(undefined);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      log.error("Unexpected error in setAutoCompactionThreshold handler:", error);
-      return Err(`Failed to set auto-compaction threshold: ${errorMessage}`);
-    }
-  }
-
   async interruptStream(
     workspaceId: string,
     options?: {
@@ -15441,6 +15495,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       hasOlder: false,
     };
 
+    // A failed read is reported as a failure, never as an empty page with `hasOlder: false`:
+    // the client treats that shape as authoritative exhaustion (edit-conflict recovery would
+    // report the edited row gone while it still sits on disk), whereas a rejection keeps its
+    // pagination cursor so the page can be retried.
     try {
       let beforeHistorySequence: number | undefined = cursor?.beforeHistorySequence;
 
@@ -15451,11 +15509,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           0
         );
         if (!latestBoundaryResult.success) {
-          log.warn("workspace.history.loadMore: failed to read latest boundary", {
-            workspaceId,
-            error: latestBoundaryResult.error,
-          });
-          return emptyResult;
+          throw new Error(
+            `workspace.history.loadMore: failed to read latest boundary: ${latestBoundaryResult.error}`
+          );
         }
 
         const oldestFromLatestBoundary = getOldestSequencedMessage(latestBoundaryResult.data);
@@ -15476,12 +15532,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         beforeHistorySequence
       );
       if (!historyWindowResult.success) {
-        log.warn("workspace.history.loadMore: failed to read boundary window", {
-          workspaceId,
-          beforeHistorySequence,
-          error: historyWindowResult.error,
-        });
-        return emptyResult;
+        throw new Error(
+          `workspace.history.loadMore: failed to read boundary window before ${beforeHistorySequence}: ${historyWindowResult.error}`
+        );
       }
 
       const messages: WorkspaceChatMessage[] = historyWindowResult.data.messages.map((message) => ({
@@ -15524,7 +15577,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceId,
         error: getErrorMessage(error),
       });
-      return emptyResult;
+      throw error;
     }
   }
 

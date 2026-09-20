@@ -4,6 +4,7 @@ import { getToolComponent } from "./getToolComponent";
 import { HookOutputDisplay, extractHookDuration, extractHookOutput } from "./HookOutputDisplay";
 import { ToolNameProvider } from "../../Messages/ToolNameContext";
 import type { WorkflowRunToolAttachment } from "@/common/orpc/schemas/message";
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
 
 interface NestedToolRendererProps {
   toolName: string;
@@ -15,6 +16,8 @@ interface NestedToolRendererProps {
   toolCallTimestamp?: number;
   /** Persisted run identity for nested workflow tool calls; only the workflow card consumes it. */
   workflowRunHint?: WorkflowRunToolAttachment;
+  /** Frozen MCP identity for this nested call; only GenericToolCall consumes it. */
+  mcpServer?: MCPToolCallDisplay;
 }
 
 /**
@@ -30,6 +33,7 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
   toolCallId,
   toolCallTimestamp,
   workflowRunHint,
+  mcpServer,
 }) => {
   const ToolComponent = getToolComponent(toolName, input);
   const hookOutput = extractHookOutput(output);
@@ -48,6 +52,7 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
           toolCallId={toolCallId}
           toolCallTimestamp={toolCallTimestamp}
           workflowRunHint={workflowRunHint}
+          mcpServer={mcpServer}
         />
       </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}

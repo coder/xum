@@ -13,6 +13,7 @@ import {
   resolveCoderWireCanonicalModel,
   resolveCoderMetadataCanonicalModel,
   coderGatewayWireProtocol,
+  bedrockOpenAIModelId,
 } from "./coderOAuth";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "./providers";
 import {
@@ -62,7 +63,95 @@ describe("coder gateway fuzz", () => {
         expect(colonIndex).toBeGreaterThan(0);
         expect(colonIndex).toBeLessThan(metadataCanonical.length - 1);
       }
+
+      // Bedrock is the only model-dependent wire: the wire and metadata
+      // identities of a bedrock-typed instance must agree on whether the
+      // model is OpenAI-namespaced.
+      const bedrockModelId =
+        pick(rng, ["", "global.", "us.", "eu-west-1."]) +
+        pick(rng, ["openai.", "anthropic.", "amazon.", ""]) +
+        randomFragmentString(rng, 2);
+      const bedrockGatewayModelId = `mantle/${bedrockModelId}`;
+      const bedrockMetadata = { additionalProviders: [{ name: "mantle", type: "bedrock" }] };
+      const bedrockWire = resolveCoderWireCanonicalModel(bedrockGatewayModelId, bedrockMetadata);
+      const bedrockCanonical = resolveCoderMetadataCanonicalModel(
+        bedrockGatewayModelId,
+        bedrockMetadata
+      );
+      const openaiModelId = bedrockModelId ? bedrockOpenAIModelId(bedrockModelId) : null;
+      if (openaiModelId != null) {
+        expect(coderGatewayWireProtocol("bedrock", bedrockModelId)).toBe("openai-responses");
+        expect(bedrockWire).toEqual({
+          origin: "openai",
+          modelId: bedrockModelId,
+          providerType: "bedrock",
+        });
+        expect(bedrockCanonical).toBe(`openai:${openaiModelId}`);
+      } else if (bedrockModelId) {
+        expect(coderGatewayWireProtocol("bedrock", bedrockModelId)).toBe("anthropic");
+        expect(bedrockWire?.origin).toBe("anthropic");
+        expect(bedrockCanonical).toBe(`bedrock:${bedrockModelId}`);
+      }
     }
+  });
+
+  test.each([
+    // Bedrock Mantle serves OpenAI models over /v1/responses and Anthropic
+    // models over /v1/messages on the same instance.
+    {
+      gatewayModelId: "bedrock-mantle-us-east-1/openai.gpt-5.6-sol",
+      wire: "openai-responses",
+      origin: "openai",
+      metadata: "openai:gpt-5.6-sol",
+    },
+    {
+      gatewayModelId: "bedrock-mantle-us-east-1/global.openai.gpt-5.6-sol",
+      wire: "openai-responses",
+      origin: "openai",
+      metadata: "openai:gpt-5.6-sol",
+    },
+    {
+      gatewayModelId: "bedrock-mantle-us-east-1/anthropic.claude-sonnet-5",
+      wire: "anthropic",
+      origin: "anthropic",
+      metadata: "bedrock:anthropic.claude-sonnet-5",
+    },
+    {
+      gatewayModelId: "bedrock-mantle-us-east-1/us.anthropic.claude-opus-5",
+      wire: "anthropic",
+      origin: "anthropic",
+      metadata: "bedrock:us.anthropic.claude-opus-5",
+    },
+  ] as const)(
+    "routes bedrock-typed instance models by namespace: $gatewayModelId",
+    ({ gatewayModelId, wire, origin, metadata }) => {
+      const providers = {
+        additionalProviders: [{ name: "bedrock-mantle-us-east-1", type: "bedrock" }],
+      };
+      const modelId = gatewayModelId.slice(gatewayModelId.indexOf("/") + 1);
+      expect(coderGatewayWireProtocol("bedrock", modelId)).toBe(wire);
+      expect(resolveCoderWireCanonicalModel(gatewayModelId, providers)).toEqual({
+        origin,
+        modelId,
+        providerType: "bedrock",
+      });
+      expect(resolveCoderMetadataCanonicalModel(gatewayModelId, providers)).toBe(metadata);
+    }
+  );
+
+  test("only bedrock-typed instances route by model namespace", () => {
+    // The catalog probe has no model: bedrock keeps its Anthropic default.
+    expect(coderGatewayWireProtocol("bedrock")).toBe("anthropic");
+    // An OpenAI-namespaced ID on any other type follows the type as before.
+    expect(coderGatewayWireProtocol("anthropic", "openai.gpt-5.6-sol")).toBe("anthropic");
+    expect(coderGatewayWireProtocol("openai-compat", "openai.gpt-5.6-sol")).toBe("openai-chat");
+    const providers = { additionalProviders: [{ name: "claude", type: "anthropic" }] };
+    expect(resolveCoderWireCanonicalModel("claude/openai.gpt-5.6-sol", providers)?.origin).toBe(
+      "anthropic"
+    );
+    expect(resolveCoderMetadataCanonicalModel("claude/openai.gpt-5.6-sol", providers)).toBe(
+      "anthropic:openai.gpt-5.6-sol"
+    );
   });
 
   test(`gateway model-id mappers roundtrip canonical identities (seed=${SEED})`, () => {

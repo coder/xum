@@ -85,6 +85,18 @@ const TREE_SCOPE_NOTE =
 const TREE_SCOPE_RESTRICTED_NOTE =
   "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";
 
+const INSTANCE_SCOPE_NOTE =
+  "Rows are local/worktree root workspaces in this Xum instance and an availability snapshot. Unrelated roots must opt in through their workspace settings; absent or revoked consent hides them, including from searches and counts. Non-local or unresolved runtimes, archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including consent, runtime, or a delegated turn starting on it). " +
+  'Message them with task_send_message — "unrelated" rows receive your text as an untrusted agent message, queued to turn-end while they are busy, under their own agent/model settings; discovery grants no additional control. Your own "self" row is not addressable.';
+
+// The tree note promises self/descendant rows, which would be false here: a restricted caller
+// gets no instance rows at all.
+const INSTANCE_SCOPE_RESTRICTED_NOTE =
+  "Instance discovery is unavailable from this workspace. Unrelated discovery and messaging require local/worktree runtimes and exclude best-of candidates and workflow-owned tasks. Existing same-tree messaging rules are unchanged; no instance rows are listed.";
+
+const INSTANCE_SCOPE_TRUNCATED_NOTE =
+  " More rows match; pass `nextOffset` as `offset` to continue. Paging is best-effort while workspaces are created, removed, or archived, so restart from offset 0 or deduplicate by ID when completeness matters.";
+
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;
 
 interface WorkspaceArchiveLookup {
@@ -314,6 +326,81 @@ async function executeTreeScope(
   );
 }
 
+/**
+ * scope:"instance" — the on-demand address book: root workspaces across every project in this
+ * instance, paged. Eligibility, query filtering, ordering, and paging live in the service; the
+ * tool only applies the status filter (before paging, so an excluded "workspace" status cannot
+ * advertise a cursor for rows that will never be shown) and maps rows onto the tool schema.
+ */
+function executeInstanceScope(
+  taskService: TaskService,
+  workspaceId: string,
+  args: {
+    statuses?: readonly TaskListStatus[] | null;
+    query?: string | null;
+    limit?: number | null;
+    offset?: number | null;
+  }
+): unknown {
+  // Instance rows are plain workspaces (status "workspace", same rule as the tree root row).
+  const explicitStatuses = args.statuses ?? [];
+  if (explicitStatuses.length > 0 && !explicitStatuses.includes("workspace")) {
+    return parseToolResult(
+      TaskListToolResultSchema,
+      { tasks: [], note: INSTANCE_SCOPE_NOTE },
+      "task_list"
+    );
+  }
+
+  const options = {
+    query: args.query ?? undefined,
+    limit: args.limit ?? undefined,
+    offset: args.offset ?? undefined,
+  };
+  const page = taskService.listInstanceWorkspaces(workspaceId, options);
+  if (page.callerPeerMessagingRestricted === true) {
+    assert(
+      page.rows.length === 0 && page.nextOffset == null,
+      "task_list: a restricted caller must receive no instance rows"
+    );
+  }
+  if (options.limit != null) {
+    assert(page.rows.length <= options.limit, "task_list: instance page exceeds the limit");
+  }
+  const nextOffset = page.nextOffset;
+  if (nextOffset != null) {
+    assert(
+      nextOffset > (options.offset ?? 0),
+      "task_list: instance nextOffset must advance past the requested offset"
+    );
+  }
+
+  const tasks: TaskListToolSuccessResult["tasks"] = page.rows.map((row) => ({
+    taskId: row.workspaceId,
+    status: "workspace" as const,
+    ...(row.name != null ? { workspaceName: row.name } : {}),
+    ...(row.title != null ? { title: row.title } : {}),
+    ...(row.createdAt != null ? { createdAt: row.createdAt } : {}),
+    projectPath: row.projectPath,
+    activity: row.busy ? ("busy" as const) : ("idle" as const),
+    relationship: row.relationship,
+    depth: 0,
+  }));
+
+  const note =
+    page.callerPeerMessagingRestricted === true
+      ? INSTANCE_SCOPE_RESTRICTED_NOTE
+      : nextOffset != null
+        ? `${INSTANCE_SCOPE_NOTE}${INSTANCE_SCOPE_TRUNCATED_NOTE}`
+        : INSTANCE_SCOPE_NOTE;
+
+  return parseToolResult(
+    TaskListToolResultSchema,
+    { tasks, note, ...(nextOffset != null ? { nextOffset } : {}) },
+    "task_list"
+  );
+}
+
 export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_list.description,
@@ -323,7 +410,24 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
       const taskService = requireTaskService(config, "task_list");
       const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_list");
 
-      if ((args.scope ?? "descendants") === "tree") {
+      const scope = args.scope ?? "descendants";
+      if (scope !== "instance") {
+        // Paging inputs are instance-only. Silently ignoring them would let a model believe a
+        // tree/descendants listing was filtered or paged when it was not; null counts as absent
+        // (strict-mode providers send null for omitted optional fields).
+        for (const field of ["query", "limit", "offset"] as const) {
+          if (args[field] != null) {
+            throw new Error(
+              `task_list: \`${field}\` is only valid with scope:"instance" (got scope:"${scope}")`
+            );
+          }
+        }
+      }
+
+      if (scope === "instance") {
+        return executeInstanceScope(taskService, workspaceId, args);
+      }
+      if (scope === "tree") {
         return executeTreeScope(taskService, workspaceId, args.statuses ?? null);
       }
 

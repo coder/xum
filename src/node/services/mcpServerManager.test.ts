@@ -2922,6 +2922,7 @@ describe("MCPServerManager", () => {
         return Promise.resolve({
           tools: mock(() => Promise.resolve({ crashy_tool: tool })),
           negotiatedProtocolVersion: () => "2025-11-25",
+          serverInfo: () => undefined,
           priorDiscovery: () => ({ kind: "legacy" as const }),
           close: mock(() => Promise.resolve(undefined)),
         } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>);
@@ -2972,6 +2973,7 @@ describe("MCPServerManager", () => {
       ({
         tools: mock(() => Promise.resolve({ upgraded_tool: tool })),
         negotiatedProtocolVersion: () => (era === "modern" ? "2026-07-28" : "2025-11-25"),
+        serverInfo: () => undefined,
         priorDiscovery: () =>
           era === "modern"
             ? { kind: "modern" as const, discover: {} }

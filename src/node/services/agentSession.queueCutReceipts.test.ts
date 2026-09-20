@@ -10,7 +10,11 @@ import {
   CONTEXT_WARNING_DEDUPE_KEY,
 } from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
-import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  seedAutoCompactionThreshold,
+  type AgentSessionHarness,
+} from "./agentSession.testHarness";
 import type { MessageQueue } from "./messageQueue";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 
@@ -88,7 +92,7 @@ async function setup(args?: { failure?: boolean }) {
       runtimeConfig: { type: "local" },
     } as FrontendWorkspaceMetadata)
   );
-  h.session.setAutoCompactionThreshold(0.7);
+  await seedAutoCompactionThreshold(h.config, BUDGET_MODEL, 70);
   /** Start a token-budget turn so requests[0].onStepSettled evaluates the real budget policy. */
   const startBudgetTurn = async () => {
     const sent = await h.session.sendMessage("Work through the task", {

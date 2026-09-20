@@ -4,7 +4,9 @@ import { GlobalWindow } from "happy-dom";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 
-import type { DisplayedMessage } from "@/common/types/message";
+import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displayedMessageBuilder";
+import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 
@@ -674,6 +676,62 @@ describe("TaskListToolCall", () => {
     fireEvent.click(view.getByText("task_list"));
     expect(view.getByText(note)).toBeDefined();
   });
+
+  test("instance rows show the project basename and activity; other rows are unchanged", () => {
+    const instanceArgs = { scope: "instance" as const };
+    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs);
+    const view = render(
+      <TooltipProvider>
+        <InstanceTaskListToolCall
+          args={instanceArgs}
+          status="completed"
+          result={{
+            tasks: [
+              {
+                taskId: "ws-release",
+                status: "workspace",
+                title: "Release cut",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/release-tooling",
+                activity: "busy",
+                depth: 0,
+              },
+              {
+                taskId: "ws-self",
+                status: "workspace",
+                title: "Coordinator",
+                relationship: "self",
+                projectPath: "C:\\Users\\alice\\projects\\mux\\",
+                activity: "idle",
+                depth: 0,
+              },
+              // A tree-scope row: no project/activity fields, so no extra text may appear.
+              {
+                taskId: "task-sib",
+                status: "running",
+                title: "Reviewer",
+                relationship: "sibling",
+                depth: 1,
+              },
+            ],
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task_list"));
+    // Only the last path segment is shown; the full path is noise in a compact row.
+    expect(view.getByText("release-tooling")).toBeDefined();
+    expect(view.queryByText("/home/alice/projects/release-tooling")).toBeNull();
+    // Windows separators and trailing separators still resolve to the project directory.
+    expect(view.getByText("mux")).toBeDefined();
+    expect(view.getByText("busy")).toBeDefined();
+    expect(view.getByText("idle")).toBeDefined();
+    expect(view.getAllByText("workspace")).toHaveLength(2);
+    expect(view.getByText("running")).toBeDefined();
+    expect(view.getByText("sibling")).toBeDefined();
+    expect(view.getByText("depth: 1")).toBeDefined();
+  });
 });
 
 const taskRetitleArgs = { task_id: "child-task", title: "Simplicity Auditor" };
@@ -885,6 +943,68 @@ describe("TaskSendMessageToolCall", () => {
       );
       expect(view.getByRole("status").className).toContain(
         status === "queued" ? "text-backgrounded" : "text-success"
+      );
+    }
+  );
+
+  test.each([
+    { ok: true, expectedStatus: "redacted" },
+    { ok: false, expectedStatus: "failed" },
+  ] as const)(
+    "renders compacted communication history without inventing delivery: $ok",
+    ({ ok, expectedStatus }) => {
+      const message = createMuxMessage("compacted", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "execution",
+          toolName: "code_execution",
+          input: { code: "// Send updates" },
+          state: "output-available",
+          output: {
+            success: true,
+            toolCalls: [
+              {
+                toolName: "task_send_message",
+                args: taskSendMessageArgs,
+                ok,
+                bytes: 64,
+                duration_ms: 1,
+              },
+              {
+                toolName: "agent_report",
+                args: { reportMarkdown: "Preserved findings" },
+                ok,
+                bytes: 32,
+                duration_ms: 1,
+              },
+            ],
+          },
+        },
+      ]);
+      const row = buildDisplayedMessagesForMessage({
+        message,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      }).find((part) => part.type === "tool");
+      if (row?.type !== "tool" || !row.nestedCalls) throw new Error("Expected nested tool calls");
+      const view = render(
+        <TooltipProvider>
+          <NestedToolsContainer
+            calls={row.nestedCalls.map((call) => ({ ...call, input: call.input }))}
+          />
+        </TooltipProvider>
+      );
+      const statuses = view.getAllByRole("status");
+      expect(statuses).toHaveLength(2);
+      for (const status of statuses) {
+        expect(status.className).not.toContain("text-success");
+        expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
+        expect(status.textContent).not.toContain("Result unavailable");
+      }
+      expect(view.getByText("Preserved findings")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
+      expect(view.getByRole("region", { name: "Message content" }).textContent).toBe(
+        taskSendMessageArgs.message
       );
     }
   );

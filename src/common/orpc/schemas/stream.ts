@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
@@ -80,6 +81,15 @@ export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
+  /**
+   * Whether the history read/emission this caught-up closes succeeded. `caught-up` is sent
+   * from a `finally` so clients never hang, which means it must say whether the transcript
+   * it closes is authoritative: only a `complete` full/since replay may open the client's
+   * mutation barrier (send/edit/clear). `failed` = the history read returned an error or
+   * emission threw; queue/retry snapshots still precede it. Required on purpose: an absent
+   * field must never read as success.
+   */
+  historyReplayStatus: z.enum(["complete", "failed"]),
   /**
    * Present only when the client requested since-mode and the server downgraded to
    * full replay. Silent downgrades defeat incremental reconnects, so this must stay
@@ -499,6 +509,7 @@ export const ToolCallEndEventSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
   result: z.unknown(),
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
   providerExecuted: z
     .boolean()
     .optional()
@@ -853,9 +864,51 @@ export const ExperimentsSchema = z.preprocess(
  */
 export const GoalInterventionPolicySchema = z.enum(["steer", "pause"]);
 
+/**
+ * Content evidence for the range an edit deletes: from the first committed row at or after the
+ * truncation target (the edited row or the synthetic snapshot rows immediately preceding it,
+ * see `getEditTruncateTargetFromMessages`) through the newest committed row, as the client
+ * held it when editing began. The backend recomputes the same evidence over its own view of
+ * history, under the history write lock, and refuses with `history-changed` on any difference
+ * (missing rows, extra rows, rewritten rows, a different range start or a different newest row).
+ */
+export const HistoryEditPreconditionSchema = z.object({
+  editMessageId: z.string().min(1),
+  rangeStartMessageId: z.string().min(1),
+  rangeStartHistorySequence: z.number().int().nonnegative(),
+  newestMessageId: z.string().min(1),
+  newestHistorySequence: z.number().int().nonnegative(),
+  rangeRowCount: z.number().int().positive(),
+  rangeFingerprint: z.string().min(1),
+});
+
+/**
+ * Every edit send must say how it is fenced: UI edits carry `historyEditPrecondition`;
+ * programmatic callers (debug CLI) opt out explicitly with `unfencedEdit`. Checked at the
+ * sendMessage RPC boundary (see api.ts) because `.pick`/`.extend` consumers of this schema
+ * must keep a plain object shape.
+ */
+export function hasExactlyOneEditFence(options: {
+  editMessageId?: string;
+  historyEditPrecondition?: unknown;
+  unfencedEdit?: boolean;
+}): boolean {
+  if (!options.editMessageId) return true;
+  const fenced = options.historyEditPrecondition !== undefined;
+  const unfenced = options.unfencedEdit === true;
+  return fenced !== unfenced;
+}
+
+export const EDIT_FENCE_REQUIRED_MESSAGE =
+  "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
+  /** See {@link HistoryEditPreconditionSchema}; required for UI edits. */
+  historyEditPrecondition: HistoryEditPreconditionSchema.optional(),
+  /** Programmatic edit without content evidence (debug CLI). Mutually exclusive with the above. */
+  unfencedEdit: z.boolean().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),

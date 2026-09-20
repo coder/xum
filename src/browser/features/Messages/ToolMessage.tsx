@@ -81,6 +81,8 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           taskReportLinking={taskReportLinking}
           // CodeExecution-specific
           nestedCalls={message.nestedCalls}
+          // MCP tools (GenericToolCall): frozen per-call server identity
+          mcpServer={message.mcpServer}
         />
       </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}

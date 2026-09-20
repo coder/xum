@@ -45,6 +45,7 @@ export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
             toolCallId={call.toolCallId}
             toolCallTimestamp={call.timestamp ?? toolCallTimestamp}
             workflowRunHint={call.workflowRun}
+            mcpServer={call.mcpServer}
           />
         );
       })}

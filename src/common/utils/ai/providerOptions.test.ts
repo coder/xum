@@ -515,6 +515,68 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     expect(headers).toBeUndefined();
   });
 
+  describe("bedrock-typed instance serving OpenAI-namespaced models", () => {
+    // Mantle keeps openai.<model> on the wire, so the SDK cannot classify the
+    // model as reasoning from its ID and Mantle only accepts summary "auto".
+    const mantleConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: "bedrock-mantle-us-east-1", type: "bedrock" }],
+      },
+    };
+    const build = (modelString: string, level: "off" | "high" | "max") =>
+      buildProviderOptions(
+        modelString,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder"
+      ) as { openai?: Record<string, unknown> };
+
+    test("forces the reasoning classification and Mantle's summary mode", () => {
+      const options = build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "high");
+      expect(options.openai).toMatchObject({
+        forceReasoning: true,
+        reasoningEffort: "high",
+        reasoningSummary: "auto",
+      });
+    });
+
+    test("resolves GPT-5.6 effort semantics from the metadata identity", () => {
+      // The wire identity (openai:openai.gpt-5.6-sol) misses the GPT-5.6 family
+      // matchers: "off" would be omitted (Mantle defaults to medium) and "max"
+      // downgraded to xhigh.
+      expect(
+        build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "off").openai
+      ).toMatchObject({ forceReasoning: true, reasoningEffort: "none" });
+      expect(
+        build("coder:bedrock-mantle-us-east-1/openai.gpt-5.6-sol", "max").openai
+      ).toMatchObject({ reasoningEffort: "max" });
+    });
+
+    test("openai-typed instances keep the default classification and summary", () => {
+      const options = buildProviderOptions(
+        "coder:openai/gpt-5.6-sol",
+        "high",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder"
+      ) as { openai?: Record<string, unknown> };
+      expect(options.openai).not.toHaveProperty("forceReasoning");
+      expect(options.openai).toMatchObject({ reasoningSummary: "detailed" });
+    });
+  });
+
   // Discovered metadata must win over the instance NAME: a valid instance can
   // use a canonical route name with a different type, and normalizing the name
   // before consulting metadata would emit options for the wrong wire.

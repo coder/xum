@@ -33,10 +33,20 @@ import { Switch } from "@/browser/components/Switch/Switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
-import type { CachedMCPTestResult, MCPServerInfo, MCPServerTransport } from "@/common/types/mcp";
+import type {
+  CachedMCPTestResult,
+  MCPServerIdentity,
+  MCPServerInfo,
+  MCPServerTransport,
+} from "@/common/types/mcp";
 import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeadersEditor";
+import {
+  MCPServerIdentityBadge,
+  describeConfiguredConnection,
+  stripBranding,
+} from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 import {
   mcpHeaderRowsToRecord,
   mcpHeadersRecordToRows,
@@ -45,6 +55,27 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+
+/** Expand/collapse header shared by the editable and read-only tool sections. */
+const ToolsDisclosureButton: React.FC<{
+  expanded: boolean;
+  onToggle: () => void;
+  summary: string;
+  testedAt: number;
+  saving?: boolean;
+}> = (props) => (
+  <button
+    type="button"
+    onClick={props.onToggle}
+    aria-expanded={props.expanded}
+    className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
+  >
+    {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+    <span>{props.summary}</span>
+    <span className="text-muted/60 ml-1">({formatRelativeTime(props.testedAt)})</span>
+    {props.saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
+  </button>
+);
 
 /** Component for managing tool allowlist for a single MCP server */
 const ToolAllowlistSection: React.FC<{
@@ -149,17 +180,13 @@ const ToolAllowlistSection: React.FC<{
 
   return (
     <div>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
-      >
-        {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-        <span>
-          Tools: {localAllowlist.length}/{availableTools.length}
-        </span>
-        <span className="text-muted/60 ml-1">({formatRelativeTime(testedAt)})</span>
-        {saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
-      </button>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${localAllowlist.length}/${availableTools.length}`}
+        testedAt={testedAt}
+        saving={saving}
+      />
 
       {expanded && (
         <div className="mt-2">
@@ -171,6 +198,44 @@ const ToolAllowlistSection: React.FC<{
             onSelectNone={() => void handleSelectNone()}
             disabled={saving}
           />
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Read-only discovered-tool list for plugin-provided servers. Plugin
+ * definitions cannot be edited from Settings (the backend rejects canonical
+ * plugin keys in setToolAllowlist) and their permissions are granted per
+ * workspace, so this only lets users inspect what a connection test found
+ * without offering allowlist controls.
+ */
+const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (props) => {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div>
+      <ToolsDisclosureButton
+        expanded={expanded}
+        onToggle={() => setExpanded(!expanded)}
+        summary={`Tools: ${props.tools.length}`}
+        testedAt={props.testedAt}
+      />
+      {expanded && (
+        <div className="mt-2">
+          <p className="text-muted mb-2 text-xs">
+            Discovered by the connection test. Tool permissions for plugin servers are chosen per
+            workspace via Configure MCP servers.
+          </p>
+          {/* wrap-anywhere: repo-controlled tool names can be long unbroken
+              tokens; let them wrap instead of overflowing at ~375px. */}
+          <ul className="grid gap-x-3 gap-y-0.5 sm:grid-cols-2">
+            {props.tools.map((tool) => (
+              <li key={tool} className="min-w-0 font-mono text-xs wrap-anywhere">
+                {tool}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -769,6 +834,16 @@ export const MCPSettingsSection: React.FC = () => {
     clearResult: clearTestResult,
   } = useMCPTestCache("__global__");
   const [testingServer, setTestingServer] = useState<string | null>(null);
+  // Server-reported identity is display-only and lives in memory for one
+  // configuration load: refresh() starts a new generation and drops all
+  // branding, and a test that started under an older generation may cache its
+  // tools but never brands the row. Every entry in `branding` therefore belongs
+  // to the current load. Persisting it would need a backend-produced binding to
+  // the tested configuration (follow-up); users re-test to see it again.
+  const loadGeneration = useRef(0);
+  const [branding, setBranding] = useState<
+    Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
+  >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
 
   interface EditableServer {
@@ -831,6 +906,8 @@ export const MCPSettingsSection: React.FC = () => {
   const refresh = useCallback(async () => {
     if (!api) return;
     const request = ++refreshRequest.current.id;
+    loadGeneration.current += 1;
+    setBranding({});
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
@@ -941,10 +1018,21 @@ export const MCPSettingsSection: React.FC = () => {
   const handleTest = useCallback(
     async (name: string) => {
       if (!api) return;
+      const generation = loadGeneration.current;
       setTestingServer(name);
+      // The new result replaces the old test, even if it fails or has no identity.
+      setBranding((prev) => {
+        const { [name]: _previous, ...remaining } = prev;
+        return remaining;
+      });
       try {
         const result = await api.mcp.test({ name });
-        cacheTestResult(name, result);
+        cacheTestResult(name, stripBranding(result));
+        const serverInfo = result.success ? result.serverInfo : undefined;
+        if (serverInfo && generation === loadGeneration.current) {
+          const icon = result.success ? result.icon : undefined;
+          setBranding((prev) => ({ ...prev, [name]: { serverInfo, icon } }));
+        }
       } catch (err) {
         cacheTestResult(name, {
           success: false,
@@ -1014,26 +1102,13 @@ export const MCPSettingsSection: React.FC = () => {
 
       // For remote servers, always run a test immediately after adding so OAuth-required servers can
       // surface an OAuth callout without requiring a manual Test click.
-      setTestingServer(serverName);
-      try {
-        const testResult = await api.mcp.test({
-          name: serverName,
-        });
-        cacheTestResult(serverName, testResult);
-      } catch (err) {
-        cacheTestResult(serverName, {
-          success: false,
-          error: err instanceof Error ? err.message : "Test failed",
-        });
-      } finally {
-        setTestingServer(null);
-      }
+      await handleTest(serverName);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add MCP server");
     } finally {
       setAddingServer(false);
     }
-  }, [api, newServer, newTestResult, refresh, cacheTestResult, globalSecretKeys]);
+  }, [api, newServer, newTestResult, refresh, cacheTestResult, handleTest, globalSecretKeys]);
 
   const handleStartEdit = useCallback((name: string, entry: MCPServerInfo) => {
     setEditing({
@@ -1183,7 +1258,9 @@ export const MCPSettingsSection: React.FC = () => {
             }),
       });
 
-      setNewTestResult({ result, testedAt: Date.now() });
+      // Adding reloads configuration, so only cacheable test data crosses that
+      // boundary. The saved row needs its own test before it can show branding.
+      setNewTestResult({ result: stripBranding(result), testedAt: Date.now() });
     } catch (err) {
       setNewTestResult({
         result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
@@ -1299,6 +1376,13 @@ export const MCPSettingsSection: React.FC = () => {
                               shrinks their min-content so they cannot starve the actions
                               column at ~375px. */}
                           <div className="flex flex-wrap items-center gap-2">
+                            {branding[name] && !isEditing && (
+                              <MCPServerIdentityBadge
+                                connection={describeConfiguredConnection(name, entry)}
+                                identity={branding[name].serverInfo}
+                                icon={branding[name].icon}
+                              />
+                            )}
                             <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
                               {displayName}
                             </span>
@@ -1514,21 +1598,26 @@ export const MCPSettingsSection: React.FC = () => {
                           )}
                         </div>
                       )}
-                      {/* Plugin servers are read-only here (setToolAllowlist rejects
-                          plugin keys); their allowlists live in Workspace MCP. */}
-                      {!isPluginEntry &&
-                        cached?.result.success &&
-                        cached.result.tools.length > 0 &&
-                        !isEditing && (
-                          <div className="border-border-medium border-t px-3 py-2">
+                      {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
+                        <div className="border-border-medium border-t px-3 py-2">
+                          {isPluginEntry ? (
+                            // Plugin servers are read-only here (setToolAllowlist rejects
+                            // plugin keys); their allowlists live in Workspace MCP. Users
+                            // can still inspect what the connection test discovered.
+                            <PluginToolListSection
+                              tools={cached.result.tools}
+                              testedAt={cached.testedAt}
+                            />
+                          ) : (
                             <ToolAllowlistSection
                               serverName={name}
                               availableTools={cached.result.tools}
                               currentAllowlist={entry.toolAllowlist}
                               testedAt={cached.testedAt}
                             />
-                          </div>
-                        )}
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })
