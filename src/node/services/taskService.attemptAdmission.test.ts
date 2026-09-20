@@ -59,7 +59,10 @@ interface Internals {
     string,
     { attemptId?: string; attempt?: unknown; phase: "closing" | "settled"; source: string }
   >;
-  admittedSendsByTaskId: Map<string, Set<{ state: string; turnId?: symbol; attemptId: string }>>;
+  admittedSendsByTaskId: Map<
+    string,
+    Set<{ state: string; turnId?: symbol; attemptId: string; attempt?: unknown }>
+  >;
   workspaceStopRecords: Map<
     string,
     {
@@ -91,6 +94,7 @@ interface Internals {
     taskId: string,
     entry: WorkspaceConfigEntry
   ) => Promise<{ proven: boolean; reason: string }>;
+  admitTaskDesktopRecovery: (taskId: string) => Promise<boolean>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -888,6 +892,236 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         receiptEligible: false,
       });
     });
+
+    test("a reawaken losing its CAS to a concurrent reawaken leaves the winner current; no send ever binds to an unpublished id", async () => {
+      const taskId = "reawaken-concurrent";
+      const previous = "att_00000000000000c1";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      const original = svc.evaluateAttemptLineage.bind(taskService);
+      const gate = Promise.withResolvers<void>();
+      let lineageCalls = 0;
+      spyOn(svc, "evaluateAttemptLineage").mockImplementation(async (id, entry) => {
+        // The first (losing) reawaken holds its snapshot while the second one commits.
+        if (++lineageCalls === 1) await gate.promise;
+        return original(id, entry);
+      });
+      // A manual send racing the winner's CAS: admitted against the persisted predecessor (and
+      // revoked by the commit), never against an id that is not published yet.
+      const edit = svc.editActiveWorkspaceEntry.bind(taskService);
+      const racing: TurnAdmissionToken[] = [];
+      spyOn(svc, "editActiveWorkspaceEntry").mockImplementation((...args) => {
+        if (args[0] === taskId && racing.length === 0) {
+          racing.push(
+            admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" }))
+          );
+        }
+        return edit(...args);
+      });
+
+      const loser = taskService.markInterruptedTaskRunning(taskId);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const winner = entryOf(config, taskId)!.taskAttemptId!;
+      expect(winner).toMatch(ATTEMPT_ID);
+      expect(winner).not.toBe(previous);
+      expect(racing).toHaveLength(1);
+      expect([...svc.admittedSendsByTaskId.get(taskId)!].map((s) => s.attemptId)).toEqual([
+        previous,
+      ]);
+      expect(racing[0].admissionStale()).toBe(true);
+      racing[0].onDisposed("refused");
+
+      gate.resolve();
+      expect(await loser).toBe(false);
+      // The loser published nothing: config, mirror and ownership all name the winner.
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(winner);
+      expect(svc.currentAttemptIdByTaskId.get(taskId)).toBe(winner);
+      expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+        source: "reawaken",
+        attemptId: winner,
+      });
+      const next = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect([...svc.admittedSendsByTaskId.get(taskId)!].map((s) => s.attemptId)).toEqual([winner]);
+      expect(next.admissionStale()).toBe(false);
+      next.onDisposed("no-work");
+    });
+
+    test("the fence and its tokens follow the persisted id when another writer rotated it behind this process's mirror", async () => {
+      const taskId = "foreign-rotation";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000d1" },
+        },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const owned = entryOf(config, taskId)!.taskAttemptId!;
+      expect(svc.currentAttemptIdByTaskId.get(taskId)).toBe(owned);
+      const beforeRotation = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect(beforeRotation.admissionStale()).toBe(false);
+
+      // Another process re-drives the task: its CAS rotates the persisted id while this
+      // process's mirror still names the attempt it owns.
+      const foreign = "att_00000000000000d2";
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === taskId);
+          if (ws) {
+            ws.taskAttemptId = foreign;
+            ws.taskAttemptUnproven = true;
+          }
+        }
+        return cfg;
+      });
+      expect(svc.currentAttemptIdByTaskId.get(taskId)).toBe(owned);
+
+      // The token of the superseded attempt is revoked; a new send binds to the persisted id,
+      // unowned (this process owns a different attempt).
+      expect(beforeRotation.admissionStale()).toBe(true);
+      beforeRotation.onDisposed("refused");
+      const afterRotation = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      const sends = [...svc.admittedSendsByTaskId.get(taskId)!];
+      expect(sends).toHaveLength(1);
+      expect(sends[0].attemptId).toBe(foreign);
+      expect(sends[0].attempt).toBeUndefined();
+      expect(afterRotation.admissionStale()).toBe(false);
+      afterRotation.onDisposed("no-work");
+    });
+
+    test("a direct (unqueued) create owns its attempt as the first admission by construction; a Stop settles it", async () => {
+      const spawnedId = "directchild01";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      const created = await taskService.create({
+        parentWorkspaceId: rootId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "go",
+        title: "Direct",
+        isolation: "none",
+      });
+      expect(created).toMatchObject({
+        success: true,
+        data: { taskId: spawnedId, status: "running" },
+      });
+      const entry = entryOf(config, spawnedId);
+      expect(entry?.taskAttemptId).toMatch(ATTEMPT_ID);
+      expect(entry?.taskAttemptUnproven).toBeUndefined();
+      expect(svc.ownedAttemptByTaskId.get(spawnedId)).toMatchObject({
+        source: "launch",
+        attemptId: entry!.taskAttemptId,
+        receiptEligible: true,
+      });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "live",
+        executionId: spawnedId,
+      });
+      // A Stop settles the owned attempt (terminal without report) instead of only closing an
+      // unowned id, and that settlement proves the next reawaken's lineage.
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+      expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
+      expect(svc.ownedAttemptByTaskId.get(spawnedId)).toMatchObject({
+        source: "reawaken",
+        receiptEligible: true,
+      });
+      expect(entryOf(config, spawnedId)?.taskAttemptUnproven).toBeUndefined();
+    });
+
+    test.each(["id", "status"] as const)(
+      "startup re-drive refuses to overwrite a row whose %s moved after the recovery snapshot",
+      async (moved) => {
+        const taskId = "redrive-moved";
+        const snapshot = "att_00000000000000e1";
+        const foreign = "att_00000000000000e2";
+        const { config } = await setupTree([
+          { id: taskId, overrides: { taskStatus: "running", taskAttemptId: snapshot } },
+        ]);
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        const moveRow = () =>
+          config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              const ws = project.workspaces.find((w) => w.id === taskId);
+              if (!ws) continue;
+              // Another process admitted the task (id) or stopped it (status) meanwhile.
+              if (moved === "id") ws.taskAttemptId = foreign;
+              else ws.taskStatus = "interrupted";
+            }
+            return cfg;
+          });
+        if (moved === "id") {
+          // Lands during the recovery awaits that precede the rotation.
+          const admit = svc.admitTaskDesktopRecovery.bind(taskService);
+          spyOn(svc, "admitTaskDesktopRecovery").mockImplementation(async (id) => {
+            await moveRow();
+            return admit(id);
+          });
+        } else {
+          // Lands between the dispatcher's status re-read and the rotating CAS.
+          const edit = taskService.editWorkspaceEntry.bind(taskService);
+          spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (...args) => {
+            if (args[0] === taskId) await moveRow();
+            return edit(...args);
+          });
+        }
+        await taskService.recoverInterruptedTasks();
+        const entry = entryOf(config, taskId);
+        expect(entry?.taskAttemptId).toBe(moved === "id" ? foreign : snapshot);
+        expect(entry?.taskStatus).toBe(moved === "id" ? "running" : "interrupted");
+        expect(entry?.taskAttemptUnproven).toBeUndefined();
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+        expect(svc.currentAttemptIdByTaskId.has(taskId)).toBe(false);
+      }
+    );
+
+    test("a settlement receipt naming another parent proves nothing", async () => {
+      const taskId = "reawaken-wrong-parent";
+      const attemptId = "att_00000000000000f9";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: attemptId } },
+      ]);
+      // The parent's expected path holds a receipt copied from another parent's session dir.
+      expect(
+        (
+          await writeSubagentAttemptSettlementReceipt({
+            ownerWorkspaceSessionDirs: [path.join(config.sessionsDir, rootId)],
+            receipt: {
+              taskId,
+              attemptId,
+              parentWorkspaceId: "another-parent",
+              source: "idle-settled",
+              settledAt: "2026-09-18T00:00:00.000Z",
+            },
+          })
+        ).success
+      ).toBe(true);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      expect((await svc.evaluateAttemptLineage(taskId, entryOf(config, taskId)!)).proven).toBe(
+        false
+      );
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(svc.ownedAttemptByTaskId.get(taskId)?.receiptEligible).toBe(false);
+      expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
+    });
   });
 
   describe("admission lifecycle", () => {
@@ -1380,6 +1614,34 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(fresh.kind).toBe("admitted");
       if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");
     });
+
+    test.each([undefined, "not-an-attempt-id"])(
+      "a retired task refuses sends even when its attempt id is %p",
+      async (taskAttemptId) => {
+        const taskId = "retired-partial-state";
+        const claim = {
+          runId: "wfr_9",
+          stepId: "s",
+          inputHash: "h",
+          childTaskId: taskId,
+          attemptId: "att_0000000000000901",
+          mode: "no-report" as const,
+          at: "2026-09-18T00:00:00.000Z",
+        };
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "interrupted", taskAttemptId, taskAttemptRetiredBy: claim },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+          kind: "refused",
+          message: retiredAttemptMessage(claim),
+        });
+        expect(internals(taskService).admittedSendsByTaskId.has(taskId)).toBe(false);
+      }
+    );
 
     test("an unreadable registry fails a task-workspace send closed", async () => {
       const taskId = "unreadable-registry";
