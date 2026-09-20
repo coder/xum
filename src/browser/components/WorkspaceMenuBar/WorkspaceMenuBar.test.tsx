@@ -67,6 +67,11 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
 const RealWorkspaceUnrelatedMessagingModal =
   WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal;
 
+// The real Dialog primitives (distinct specifier, so the inline shell above does not apply):
+// the "another modal is open" test needs the actual overlay the MCP/heartbeat dialogs render.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const RealDialog = require("../Dialog/Dialog?real=1") as typeof RealDialogModule;
+
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
 let workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
@@ -736,19 +741,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("ignores the consent shortcut while another modal is open", () => {
-    const modal = document.createElement("div");
-    modal.setAttribute("role", "dialog");
-    modal.setAttribute("aria-modal", "true");
-    document.body.appendChild(modal);
-
-    render(<WorkspaceMenuBar {...defaultProps} />);
+    // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
+    // not render in happy-dom). Like the MCP and heartbeat dialogs at runtime, nothing here
+    // carries aria-modal, so the guard must recognise the overlay itself.
+    const view = render(
+      <>
+        <RealDialog.Dialog open>
+          <RealDialog.DialogOverlay data-testid="other-modal-overlay" />
+        </RealDialog.Dialog>
+        <WorkspaceMenuBar {...defaultProps} />
+      </>
+    );
+    expect(view.getByTestId("other-modal-overlay").getAttribute("data-state")).toBe("open");
+    expect(document.querySelector('[aria-modal="true"]')).toBeNull();
 
     act(() => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
 
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
-    modal.remove();
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
