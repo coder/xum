@@ -28,6 +28,14 @@ export const AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS = 24_000;
 export const AUTO_MODEL_ROUTING_MIN_TIERS = 2;
 export const AUTO_MODEL_ROUTING_MAX_TIERS = 8;
 
+/**
+ * Tier labels ride in the transcript badge; descriptions are copied verbatim into
+ * the classifier criteria, so unbounded text could push every request past Jev's
+ * window and leave Auto permanently falling back.
+ */
+export const AUTO_MODEL_ROUTING_MAX_LABEL_CHARS = 32;
+export const AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS = 400;
+
 export const AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT = 3;
 export const AUTO_MODEL_ROUTING_RECENT_MESSAGE_MAX_CHARS = 500;
 

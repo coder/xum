@@ -1,6 +1,7 @@
 import type { TestEnvironment } from "../setup";
 import { cleanupTestEnvironment, createTestEnvironment } from "../setup";
 import { DEFAULT_AUTO_MODEL_ROUTING_TIERS } from "@/common/types/autoModelRouting";
+import { AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS } from "@/constants/autoModelRouting";
 
 describe("config.updateAutoModelRouting", () => {
   let env: TestEnvironment;
@@ -77,6 +78,26 @@ describe("config.updateAutoModelRouting", () => {
     }));
     const cfg = await env.orpc.config.getConfig();
     expect(cfg.autoModelRouting.tiers).toEqual(DEFAULT_AUTO_MODEL_ROUTING_TIERS);
+  });
+
+  it("drops a hand-edited tier whose description exceeds the cap", async () => {
+    const oversized = "x".repeat(AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS + 1);
+    await env.config.editConfig((config) => ({
+      ...config,
+      autoModelRouting: {
+        tiers: [
+          { id: "easy", label: "Easy", description: "short" },
+          {
+            id: "hard",
+            label: "Hard",
+            description: "x".repeat(AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS),
+          },
+          { id: "huge", label: "Huge", description: oversized },
+        ],
+      },
+    }));
+    const cfg = await env.orpc.config.getConfig();
+    expect(cfg.autoModelRouting.tiers.map((tier) => tier.id)).toEqual(["easy", "hard"]);
   });
 
   it("caps the tier list at eight", async () => {

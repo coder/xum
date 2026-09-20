@@ -245,6 +245,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
 import {
   getExplicitGatewayPrefix,
+  modelSelectionEqualityKey,
   normalizeToCanonical,
   normalizeSelectedModel,
   isValidModelFormat,
@@ -4135,18 +4136,18 @@ export class AgentSession {
       ...(acpPromptId != null ? { acpPromptId } : {}),
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
-    if (optionsForStream.autoModelRouting === true) {
-      // Strip before anything snapshots these options: retry rows, compaction follow-ups,
-      // and resumes must carry the concrete model and never re-classify (or re-bill).
-      delete optionsForStream.autoModelRouting;
-      if (!isCompactionRequest && !agentInitiated && internal?.synthetic !== true) {
-        optionsForStream = await this.resolveAutoModelRouting(
-          trimmedMessage,
-          optionsForStream,
-          effectiveFileParts,
-          cancelSignal
-        );
-      }
+    // Strip before anything snapshots these options: retry rows, compaction follow-ups,
+    // and resumes must carry the concrete model and never re-classify (or re-bill).
+    const classifyUserTurn =
+      optionsForStream.autoModelRouting === true && !agentInitiated && internal?.synthetic !== true;
+    delete optionsForStream.autoModelRouting;
+    if (classifyUserTurn && !isCompactionRequest) {
+      optionsForStream = await this.resolveAutoModelRouting(
+        trimmedMessage,
+        optionsForStream,
+        effectiveFileParts,
+        cancelSignal
+      );
     }
     let modelForStream = optionsForStream.model;
 
@@ -4155,7 +4156,12 @@ export class AgentSession {
     // row is persisted. No-op when RLM is off.
     const stampedMuxMetadata =
       isCompactionRequest && typedMuxMetadata?.type === "compaction-request"
-        ? await this.withKeepRecentTailStamp(typedMuxMetadata, optionsForStream)
+        ? await this.withKeepRecentTailStamp(
+            classifyUserTurn
+              ? await this.withAutoRoutedFollowUp(typedMuxMetadata, optionsForStream, cancelSignal)
+              : typedMuxMetadata,
+            optionsForStream
+          )
         : typedMuxMetadata;
 
     const userMessage = createMuxMessage(
@@ -6781,6 +6787,41 @@ export class AgentSession {
     );
   }
 
+  /**
+   * A user-built compaction request (`/compact` plus a follow-up, or compact-and-retry after
+   * a context overflow) is never routed itself, but the follow-up it carries is the user's
+   * real prompt and would otherwise redispatch on the composer model without a badge.
+   * Classify it once here; the redispatch reuses the stored decision.
+   */
+  private async withAutoRoutedFollowUp(
+    metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
+    options: ResolvedSendMessageOptions,
+    signal: AbortSignal | undefined
+  ): Promise<Extract<MuxMessageMetadata, { type: "compaction-request" }>> {
+    const followUp = metadata.parsed.followUpContent;
+    const prompt = followUp?.text?.trim();
+    if (followUp == null || !prompt || followUp.autoModelRouting != null) return metadata;
+    const routed = await this.resolveAutoModelRouting(
+      prompt,
+      { ...options, model: followUp.model, thinkingLevel: followUp.thinkingLevel },
+      followUp.fileParts,
+      signal
+    );
+    if (routed.autoModelRoutingRecord == null) return metadata;
+    return {
+      ...metadata,
+      parsed: {
+        ...metadata.parsed,
+        followUpContent: {
+          ...followUp,
+          model: routed.model,
+          ...(routed.thinkingLevel !== undefined ? { thinkingLevel: routed.thinkingLevel } : {}),
+          autoModelRouting: routed.autoModelRoutingRecord,
+        },
+      },
+    };
+  }
+
   /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
   private async withKeepRecentTailStamp(
     metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
@@ -7108,7 +7149,9 @@ export class AgentSession {
     const record = lastUserRow?.metadata?.autoModelRouting;
     if (record == null) return resumeOptions;
     if (autoModelRouting !== true) {
-      return normalizeToCanonical(resumeOptions.model) === normalizeToCanonical(record.model)
+      // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
+      return modelSelectionEqualityKey(resumeOptions.model) ===
+        modelSelectionEqualityKey(record.model)
         ? { ...resumeOptions, autoModelRoutingRecord: record }
         : resumeOptions;
     }

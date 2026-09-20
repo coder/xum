@@ -24,6 +24,8 @@ import { THINKING_LEVELS, isThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 import {
+  AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS,
+  AUTO_MODEL_ROUTING_MAX_LABEL_CHARS,
   AUTO_MODEL_ROUTING_MAX_TIERS,
   AUTO_MODEL_ROUTING_MIN_TIERS,
   TYPESAFE_PROVIDER_KEY,
@@ -305,6 +307,7 @@ export function AutoModelRoutingExperimentConfig() {
                 <Input
                   aria-label={`Tier ${index + 1} label`}
                   aria-invalid={textErrors[tier.id]?.label != null}
+                  maxLength={AUTO_MODEL_ROUTING_MAX_LABEL_CHARS}
                   value={textDrafts[tier.id]?.label ?? tier.label}
                   onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                     handleTextChange(tier.id, "label", event.target.value)
@@ -360,6 +363,7 @@ export function AutoModelRoutingExperimentConfig() {
               <Input
                 aria-label={`Tier ${index + 1} description`}
                 aria-invalid={textErrors[tier.id]?.description != null}
+                maxLength={AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS}
                 value={textDrafts[tier.id]?.description ?? tier.description}
                 onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                   handleTextChange(tier.id, "description", event.target.value)

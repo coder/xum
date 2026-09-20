@@ -505,6 +505,79 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
   });
 
+  it("a resume on the direct twin of a Coder-routed tier model drops the record", async () => {
+    const coderRouted = "coder:openai/gpt-5.5";
+    const { session, streamMessage } = await createHarness({
+      experimentEnabled: true,
+      tiers: [TIERS[0], { ...TIERS[1], model: coderRouted }, TIERS[2]],
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+    expect(streamMessage.mock.calls[0]?.[0]?.modelString).toBe(coderRouted);
+
+    // Same canonical model, different route: the badge must not claim the Coder run.
+    await session.resumeStream({ model: HARD_MODEL, agentId: "exec" });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(HARD_MODEL);
+    expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("classifies the user follow-up of a /compact request once and stores it on the follow-up", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+    });
+    const compactionModel = "anthropic:claude-3-5-haiku-latest";
+
+    const result = await session.sendMessage("/compact\nRefactor the scheduler", {
+      model: compactionModel,
+      agentId: "compact",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\nRefactor the scheduler",
+        commandPrefix: "/compact",
+        parsed: {
+          model: compactionModel,
+          followUpContent: {
+            text: "Refactor the scheduler",
+            model: COMPOSER_MODEL,
+            agentId: "exec",
+            thinkingLevel: "low",
+          },
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    // The compaction turn itself runs unrouted; only the follow-up is classified.
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(classify.mock.calls[0]?.[0]?.prompt).toBe("Refactor the scheduler");
+    const compactionStream = streamMessage.mock.calls[0]?.[0];
+    expect(compactionStream?.modelString).toBe(compactionModel);
+    expect(compactionStream?.autoModelRouting).toBeUndefined();
+
+    const row = await persistedUserRow(historyService);
+    const muxMetadata = row.metadata?.muxMetadata;
+    const followUp =
+      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+    expect(followUp?.model).toBe(HARD_MODEL);
+    expect(followUp?.thinkingLevel).toBe("high");
+    expect(followUp?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      model: HARD_MODEL,
+      requestedFallbackModel: COMPOSER_MODEL,
+    });
+  });
+
   it("never calls the classifier when the flag is absent", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,

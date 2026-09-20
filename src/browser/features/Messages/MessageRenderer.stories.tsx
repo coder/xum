@@ -1231,7 +1231,8 @@ export const AutoModelRoutingBadges: AppStory = {
             {
               requestedFallbackModel: "anthropic:claude-opus-4-6",
               tierId: "extreme",
-              tierLabel: "Extreme",
+              // Label at the schema cap: the badge truncates it, the tooltip keeps it whole.
+              tierLabel: "Architecture and cross-cutting w",
               confidence: 0.64,
               probabilities: { easy: 0.01, medium: 0.05, hard: 0.3, extreme: 0.64 },
               model: "anthropic:claude-opus-4-6",

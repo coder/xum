@@ -2,6 +2,8 @@ import { z } from "zod";
 import { ThinkingLevelSchema } from "./thinking";
 import { isValidModelFormat } from "@/common/utils/ai/models";
 import {
+  AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS,
+  AUTO_MODEL_ROUTING_MAX_LABEL_CHARS,
   AUTO_MODEL_ROUTING_MAX_TIERS,
   AUTO_MODEL_ROUTING_MIN_TIERS,
 } from "@/constants/autoModelRouting";
@@ -18,8 +20,8 @@ const TIER_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 export const AutoModelRoutingTierSchema = z.object({
   id: z.string().regex(TIER_ID_PATTERN),
-  label: z.string().min(1),
-  description: z.string().min(1),
+  label: z.string().min(1).max(AUTO_MODEL_ROUTING_MAX_LABEL_CHARS),
+  description: z.string().min(1).max(AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS),
   /** Canonical provider:model string; absent means "use the composer's model". */
   model: z.string().refine(isValidModelFormat).optional(),
   /** Absent means "inherit the composer's thinking level". */

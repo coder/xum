@@ -81,7 +81,9 @@ export const AutoModelRoutingBadge: React.FC<AutoModelRoutingBadgeProps> = (prop
           data-auto-model-routing-badge={props.record.status}
         >
           <Route aria-hidden="true" className="h-3 w-3" />
-          <span>{buildAutoModelRoutingBadgeLabel(props.record)}</span>
+          <span className="max-w-[12rem] truncate">
+            {buildAutoModelRoutingBadgeLabel(props.record)}
+          </span>
         </span>
       </TooltipTrigger>
       <TooltipContent align="center">
