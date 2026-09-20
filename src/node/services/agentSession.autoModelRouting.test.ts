@@ -12,6 +12,7 @@ import type {
 } from "@/node/services/autoModelRouter";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import {
@@ -341,6 +342,38 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       status: "fallback",
       tierId: "hard",
       model: COMPOSER_MODEL,
+      reason: "Model xai:grok-3 does not support PDF input.",
+    });
+  });
+
+  it("falls back when a PDF earlier in the conversation cannot be sent to the chosen tier's model", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+    });
+    const earlier = createMuxMessage("earlier-pdf", "user", "Read this", undefined, [
+      {
+        type: "file",
+        url: "data:application/pdf;base64,JVBERi0xLjQK",
+        mediaType: "application/pdf",
+      },
+    ]);
+    expect((await historyService.appendToHistory("ws-auto-routing", earlier)).success).toBe(true);
+
+    // Text-only turn, but the request still carries the earlier PDF.
+    await session.sendMessage("Now summarize it", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
       reason: "Model xai:grok-3 does not support PDF input.",
     });
   });

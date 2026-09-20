@@ -7044,9 +7044,13 @@ export class AgentSession {
       return fallback({ ...provenance, status: "unmapped-tier" });
     }
     if (chosen.model != null) {
-      // The send-time checks only saw the composer model: attachments must still fit the
-      // tier model, and a budgeted goal must not spend on a model it cannot price.
-      const pdfIssue = this.findPdfAttachmentIssue(chosen.model, fileParts);
+      // The send-time checks only saw the composer model: every attachment the request
+      // carries (this turn's and earlier ones still in the window) must fit the tier
+      // model, and a budgeted goal must not spend on a model it cannot price.
+      const pdfIssue = this.findPdfAttachmentIssue(chosen.model, [
+        ...(fileParts ?? []),
+        ...(await this.collectContextFileParts()),
+      ]);
       if (pdfIssue) {
         return fallback({ ...provenance, status: "fallback", reason: pdfIssue });
       }
@@ -7111,6 +7115,19 @@ export class AgentSession {
       }
     }
     return null;
+  }
+
+  /** Attachments of earlier user turns in the context window; a read failure reads as none. */
+  private async collectContextFileParts(): Promise<FilePart[]> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return [];
+    return history.data.flatMap((message) =>
+      message.role === "user"
+        ? message.parts
+            .filter((part): part is MuxFilePart => part.type === "file")
+            .map((part) => ({ url: part.url, mediaType: part.mediaType, filename: part.filename }))
+        : []
+    );
   }
 
   /** Tail of the transcript for routing decisions; a read failure reads as empty. */
