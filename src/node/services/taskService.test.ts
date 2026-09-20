@@ -85,7 +85,12 @@ import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/age
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  parseWorkspaceTurnTaskCorrelation,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   buildWorkflowRunCardMessage,
@@ -528,7 +533,7 @@ describe("TaskService", () => {
       childId,
       "Inspect the scratch files",
       expect.any(Object),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -5797,14 +5802,23 @@ describe("TaskService", () => {
       // The real WorkspaceService restores a reawakened child to running before dispatching;
       // the mock mirrors that and accepts the turn.
       const serviceRef: { current?: TaskService } = {};
+      // The real WorkspaceService skips its user-resume rescue for a correlated workspace-turn
+      // send (createWorkspaceTurn holds the task-creation lock across it, and the rescue's
+      // identity CAS serializes on that lock), so the mock only awaits the rescue for
+      // uncorrelated sends; for the reawakening turn it is applied once the turn was admitted.
+      let deferredRescue: Promise<boolean> | undefined;
       const sendMessage = mock(
         async (
           workspaceId: string,
           _message: string,
-          _options: unknown,
+          options: { muxMetadata?: unknown },
           internal?: { onAccepted?: () => Promise<void> | void }
         ): Promise<Result<void>> => {
-          await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          if (parseWorkspaceTurnTaskCorrelation(options?.muxMetadata) == null) {
+            await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          } else {
+            deferredRescue = serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          }
           await internal?.onAccepted?.();
           return Ok(undefined);
         }
@@ -5854,6 +5868,7 @@ describe("TaskService", () => {
           workspace: { mode: "existing", workspaceId: childId },
         });
         assert(continuation.success, "Expected the reawakening turn to be admitted");
+        expect(await deferredRescue).toBe(true);
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
         expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
         waiter = workspaceTurnManagerFor(taskService)
@@ -7582,7 +7597,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7641,7 +7656,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7695,7 +7710,7 @@ describe("TaskService", () => {
         reasoningMode: "pro",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     // Persisted child settings carry it too, so queued/restart resumes
@@ -7750,7 +7765,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with base pro",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7798,7 +7813,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with parent pro mode",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7853,7 +7868,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run with mapped alias max",
       expect.objectContaining({ model: "openai:team-sol", thinkingLevel: "max" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7899,7 +7914,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7961,7 +7976,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -8029,7 +8044,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run researcher with plan pro",
       expect.objectContaining({ agentId: "researcher", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8090,7 +8105,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -8163,7 +8178,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8196,7 +8211,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.aiSettings).toEqual({ model: "openai:gpt-5.2", thinkingLevel: "medium" });
@@ -8234,7 +8249,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8270,7 +8285,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8300,7 +8315,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8373,7 +8388,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -8413,7 +8428,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
@@ -8455,7 +8470,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -8500,7 +8515,7 @@ describe("TaskService", () => {
         agentId: "exec",
         thinkingLevel: "high",
       }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const child = findWorkspaceInConfig(config, created.data.taskId);
     expect(child?.taskModelString).toBe("openai:gpt-6-astra");
@@ -8567,7 +8582,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "check provenance",
       expect.objectContaining({ model: expected }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -8683,7 +8698,7 @@ describe("TaskService", () => {
       grandchild.data.taskId,
       "grandchild",
       expect.objectContaining({ model: "openai:gpt-5.3-codex" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     expect(findWorkspaceInConfig(config, grandchild.data.taskId)?.taskModelString).toBe(
       "openai:gpt-5.3-codex"
@@ -8723,7 +8738,7 @@ describe("TaskService", () => {
         created.data.taskId,
         "inherit Standard",
         expect.objectContaining({ reasoningMode: "standard" }),
-        { acceptanceOrigin: "automatic", agentInitiated: true }
+        expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
       );
     }
   );
@@ -8764,7 +8779,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "keep explicit overrides",
       expect.objectContaining(expected),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -8803,7 +8818,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -8844,7 +8859,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.2");
@@ -8883,7 +8898,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8922,7 +8937,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8964,7 +8979,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -9007,7 +9022,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -10862,7 +10877,7 @@ describe("TaskService", () => {
     expect(resumeStream).toHaveBeenCalledWith(
       parentWorkspaceId,
       expect.objectContaining({ agentId: "plan" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const parentHistory = await collectFullHistory(historyService, parentWorkspaceId);
@@ -32977,7 +32992,7 @@ describe("TaskService", () => {
       expect.objectContaining({
         muxMetadata: workspaceTurnMuxMetadata(parentId),
       }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -34994,10 +35009,13 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
-      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(async () => {
-        // Direct input can reawaken while the rejected task send is awaiting metadata.
-        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        return Err("owner metadata unavailable");
+      let reawaken: Promise<boolean> | undefined;
+      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(() => {
+        // Direct input can reawaken while the rejected task send is awaiting metadata. Its
+        // identity CAS serializes on the task-creation lock createWorkspaceTurn holds here, so
+        // it completes right after the rejected send releases it.
+        reawaken = taskService.markInterruptedTaskRunning(taskId);
+        return Promise.resolve(Err("owner metadata unavailable"));
       });
       try {
         expect(
@@ -35008,6 +35026,7 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
+        expect(await reawaken).toBe(true);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "live",
           executionId: taskId,

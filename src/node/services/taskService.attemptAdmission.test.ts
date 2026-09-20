@@ -5,7 +5,7 @@ import * as path from "path";
 
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { SecretsStore } from "@/node/config";
 import {
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
@@ -953,91 +953,103 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       next.onDisposed("no-work");
     });
 
-    test.each(["before", "after"] as const)(
-      "a Stop capturing the task %s its reawaken's commit becomes visible, before the owner is installed, settles the fresh attempt on release",
-      async (timing) => {
-        const taskId = "reawaken-stop-window";
-        const previous = "att_00000000000000b1";
-        const { config } = await setupTree([
-          { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
-        ]);
-        // Proven predecessor, so the settlement chain (fresh attempt settled → next reawaken
-        // proven by this process) is observable end to end.
-        await writeSubagentAttemptSettlementReceipt({
-          ownerWorkspaceSessionDirs: [path.join(config.sessionsDir, rootId)],
-          receipt: {
-            taskId,
-            attemptId: previous,
-            parentWorkspaceId: rootId,
-            source: "idle-settled",
-            settledAt: "2026-09-18T00:00:00.000Z",
-          },
-        });
-        // Phase B blocks on the gate so the cascade is provably still in progress when the
-        // reawaken installs its owner; released only afterwards.
-        const cleanupGate = Promise.withResolvers<void>();
-        const { aiService } = createAIServiceMocks(config, {
-          stopStream: mock(() => cleanupGate.promise.then(() => Ok(undefined))),
-        });
-        const { taskService } = createHarness(config, { aiService });
-        const svc = internals(taskService);
-        let stop: Promise<string[]> | undefined;
-        let captured: { attemptId: string | undefined; ownedAttempt: unknown } | undefined;
-        const edit = svc.editActiveWorkspaceEntry.bind(taskService);
-        spyOn(svc, "editActiveWorkspaceEntry").mockImplementation(async (id, updater, options) => {
-          // Only the first reawaken's CAS is raced; the closing reawaken below passes through.
-          if (stop != null) return edit(id, updater, options);
-          if (timing === "before") {
-            // Phase A runs while the CAS write is still in flight: the row it reads names the
-            // predecessor, and the status it persists lands behind the CAS (FIFO edits).
-            const result = await edit(
-              id,
-              (ws) => {
-                updater(ws);
-                // The mutator may be re-run by the edit queue; one cascade is enough.
-                stop ??= taskService.terminateAllDescendantAgentTasks(rootId);
-              },
-              options
-            );
-            await waitForCondition(() => svc.workspaceStopRecords.has(id));
-            const record = svc.workspaceStopRecords.get(id)!;
-            captured = { attemptId: record.attemptId, ownedAttempt: record.ownedAttempt };
-            return result;
-          }
-          // Phase A runs after the commit is visible but before the owner is installed: the row
-          // it reads names the fresh id, which nobody owns yet.
-          const result = await edit(id, updater, options);
-          stop = taskService.terminateAllDescendantAgentTasks(rootId);
-          await waitForCondition(() => svc.workspaceStopRecords.has(id));
-          const record = svc.workspaceStopRecords.get(id)!;
-          captured = { attemptId: record.attemptId, ownedAttempt: record.ownedAttempt };
-          return result;
-        });
+    /**
+     * Reawaken under a Stop race: the identity CAS, the row check and the ownership install run
+     * under the global mutex that every cascade's Phase A (stop-record capture) holds too. The
+     * harness pauses the reawaken INSIDE that critical section — `pause` is where the gate is held:
+     * before the CAS write ("during-write") or after the fresh id is durable ("after-durable") —
+     * requests a real Stop, proves it cannot capture until the owner is installed, then releases
+     * and awaits the Stop to completion OUTSIDE the section.
+     */
+    async function reawakenUnderStopRace(
+      pause: "during-write" | "after-durable",
+      configure: (config: Config) => Promise<void> | void = () => undefined
+    ) {
+      const taskId = "reawaken-stop-race";
+      const previous = "att_00000000000000b1";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      // Proven predecessor, so the chain (fresh attempt settled → next reawaken proven by this
+      // process) is observable end to end.
+      await writeSubagentAttemptSettlementReceipt({
+        ownerWorkspaceSessionDirs: [path.join(config.sessionsDir, rootId)],
+        receipt: {
+          taskId,
+          attemptId: previous,
+          parentWorkspaceId: rootId,
+          source: "idle-settled",
+          settledAt: "2026-09-18T00:00:00.000Z",
+        },
+      });
+      await configure(config);
+      // Phase B blocks on the cleanup gate so the Stop's capture is observable before release.
+      const cleanupGate = Promise.withResolvers<void>();
+      const { aiService } = createAIServiceMocks(config, {
+        stopStream: mock(() => cleanupGate.promise.then(() => Ok(undefined))),
+      });
+      const { taskService } = createHarness(config, { aiService });
+      const svc = internals(taskService);
+      const gate = Promise.withResolvers<void>();
+      const paused = Promise.withResolvers<void>();
+      let raced = false;
+      const edit = svc.editActiveWorkspaceEntry.bind(taskService);
+      spyOn(svc, "editActiveWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        if (raced) return edit(id, updater, options);
+        raced = true;
+        if (pause === "during-write") {
+          paused.resolve();
+          await gate.promise;
+          return edit(id, updater, options);
+        }
+        const result = await edit(id, updater, options);
+        paused.resolve();
+        await gate.promise;
+        return result;
+      });
+      const reawaken = taskService.markInterruptedTaskRunning(taskId);
+      await paused.promise;
+      return { config, taskService, svc, taskId, previous, reawaken, gate, cleanupGate };
+    }
 
-        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+    test.each(["during-write", "after-durable"] as const)(
+      "a Stop requested while a reawaken is paused %s cannot capture before the owner installs; it then settles exactly the fresh attempt",
+      async (pause) => {
+        const { config, taskService, svc, taskId, previous, reawaken, gate, cleanupGate } =
+          await reawakenUnderStopRace(pause);
+        // Paused inside the critical section (mutex held). A real Stop starts now: its Phase A
+        // blocks on the mutex, so no record exists and nothing is latched while we hold it.
+        const stop = taskService.terminateAllDescendantAgentTasks(rootId);
+        await settle();
+        await settle();
+        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+        expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        // "during-write": nothing is committed yet; "after-durable": the fresh id is already the
+        // row's id, yet no cascade can observe it before its owner exists.
+        const rowWhilePaused = entryOf(config, taskId)!;
+        if (pause === "during-write") expect(rowWhilePaused.taskAttemptId).toBe(previous);
+        else expect(rowWhilePaused.taskAttemptId).not.toBe(previous);
+
+        gate.resolve();
+        expect(await reawaken).toBe(true);
         const fresh = entryOf(config, taskId)!.taskAttemptId!;
         expect(fresh).toMatch(ATTEMPT_ID);
         expect(fresh).not.toBe(previous);
-        expect(captured).toEqual({
-          attemptId: timing === "before" ? previous : fresh,
-          ownedAttempt: undefined,
+        // Ownership was installed before the mutex was released; only now can Phase A capture,
+        // and it captures the fresh attempt OWNED.
+        await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+        expect(svc.workspaceStopRecords.get(taskId)).toMatchObject({
+          attemptId: fresh,
+          ownedAttempt: svc.ownedAttemptByTaskId.get(taskId),
         });
-        // The reawaken's own send meets the latch; the cascade is still cleaning up.
-        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
         expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
           kind: "refused",
           message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
         });
-        expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
-          source: "reawaken",
-          attemptId: fresh,
-          receiptEligible: true,
-        });
 
         cleanupGate.resolve();
-        await stop!;
-        // Release: the latch drops and the cascade settles the attempt that is current — the one
-        // installed after its capture — not merely the identity it captured.
+        await stop;
         expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
         expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
         expect(entryOf(config, taskId)).toMatchObject({
@@ -1062,6 +1074,142 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(entryOf(config, taskId)?.taskAttemptUnproven).toBeUndefined();
       }
     );
+
+    test("a send admitted in the CAS→owner gap binds to the committed id and is drained by the Stop before it releases", async () => {
+      const { config, taskService, svc, taskId, reawaken, gate, cleanupGate } =
+        await reawakenUnderStopRace("after-durable");
+      // The fresh id is durable and visible; the fence binds a concurrent send to it (unowned —
+      // nobody owns it yet) rather than refusing or binding to the predecessor.
+      const fresh = entryOf(config, taskId)!.taskAttemptId!;
+      const gapSend = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+      );
+      const sends = [...svc.admittedSendsByTaskId.get(taskId)!];
+      expect(sends.map((s) => s.attemptId)).toEqual([fresh]);
+      expect(sends[0].attempt).toBeUndefined();
+      gate.resolve();
+      expect(await reawaken).toBe(true);
+      // Same id, now owned; the pending obligation stays valid.
+      expect(gapSend.admissionStale()).toBe(false);
+      // The Stop captures the pending obligation and cannot release until it is dispositioned.
+      const stop = taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+      expect(svc.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(1);
+      expect(gapSend.admissionStale()).toBe(true);
+      await settle();
+      await settle();
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+      cleanupGate.resolve();
+      await settle();
+      await settle();
+      // Cleanup done, yet the record still waits for the pending obligation's disposition.
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+      gapSend.onDisposed("refused");
+      await stop;
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId: fresh,
+        phase: "settled",
+      });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+    });
+
+    test("a Stop that completes while a reawaken is still evaluating overtakes it: refused, nothing rotated or owned; a fresh reawaken then proceeds", async () => {
+      const taskId = "reawaken-overtaken";
+      const previous = "att_00000000000000b2";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      const original = svc.evaluateAttemptLineage.bind(taskService);
+      const gate = Promise.withResolvers<void>();
+      let parked = false;
+      spyOn(svc, "evaluateAttemptLineage").mockImplementation(async (id, entry) => {
+        if (!parked) {
+          parked = true;
+          await gate.promise;
+        }
+        return original(id, entry);
+      });
+      const reawaken = taskService.markInterruptedTaskRunning(taskId);
+      // Outside the critical section: a real Stop runs fully to completion.
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+      gate.resolve();
+      expect(await reawaken).toBe(false);
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskStatus: "interrupted",
+        taskAttemptId: previous,
+      });
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      expect(svc.currentAttemptIdByTaskId.has(taskId)).toBe(false);
+      // The predecessor is closed by that Stop; a recovery initiated afterwards is a new decision.
+      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(previous);
+    });
+
+    test("a successor published by a writer outside the mutex after the commit is never overwritten by the delayed install", async () => {
+      const { config, taskService, svc, taskId, reawaken, gate } =
+        await reawakenUnderStopRace("after-durable");
+      const committed = entryOf(config, taskId)!.taskAttemptId!;
+      // Another writer (a reactivation under its own locks, another backend) rotates the row
+      // again while the reawaken is paused after its commit.
+      const successor = "att_00000000000000b3";
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === taskId);
+          if (ws) ws.taskAttemptId = successor;
+        }
+        return cfg;
+      });
+      gate.resolve();
+      expect(await reawaken).toBe(false);
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(successor);
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      expect(svc.currentAttemptIdByTaskId.has(taskId)).toBe(false);
+      expect(committed).not.toBe(successor);
+      // Nothing of the successor's admission is touched: the fence binds to it, unowned.
+      const token = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect([...svc.admittedSendsByTaskId.get(taskId)!].map((s) => s.attemptId)).toEqual([
+        successor,
+      ]);
+      token.onDisposed("no-work");
+    });
+
+    test("a throwing CAS releases the mutex and installs no ownership", async () => {
+      const taskId = "reawaken-cas-throws";
+      const previous = "att_00000000000000b4";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      spyOn(svc, "editActiveWorkspaceEntry").mockImplementation(() =>
+        Promise.reject(new Error("registry write failed"))
+      );
+      const outcome = await taskService.markInterruptedTaskRunning(taskId).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+      expect(outcome).toBe("registry write failed");
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      expect(svc.currentAttemptIdByTaskId.has(taskId)).toBe(false);
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(previous);
+      // The mutex is free again: a cascade's Phase A (which needs it) runs to completion.
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+    });
 
     test.each(["deleted", "unreadable"] as const)(
       "a %s registry row never revives this process's remembered id: its tokens read stale",
@@ -1761,6 +1909,128 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
       expect(fresh.kind).toBe("admitted");
       if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");
+    });
+
+    test("a Stop requested while a reactivation is paused after its commit cannot capture before the owner installs; a reactivation during a Stop is refused before publishing", async () => {
+      const taskId = "reactivation-stop-race";
+      const previous = "att_0000000000000902";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      const cleanupGate = Promise.withResolvers<void>();
+      const { aiService } = createAIServiceMocks(config, {
+        stopStream: mock(() => cleanupGate.promise.then(() => Ok(undefined))),
+      });
+      // The real WorkspaceService fences the continuation send at its handoff; the fake host does
+      // the same so a send refused by the cascade's latch fails createWorkspaceTurn as in product.
+      const harness: { taskService?: TaskService } = {};
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage: mock(
+          async (
+            ...args: Parameters<WorkspaceHost["sendMessage"]>
+          ): ReturnType<WorkspaceHost["sendMessage"]> => {
+            const admission = harness.taskService!.admitTaskWorkspaceTurn(args[0], {
+              acceptanceOrigin: "automatic",
+            });
+            if (admission.kind === "refused") {
+              return Err({ type: "unknown", raw: admission.message });
+            }
+            if (admission.kind === "admitted") admission.token.onDisposed("no-work");
+            await args[3]?.onAccepted?.();
+            return Ok(undefined);
+          }
+        ),
+      });
+      const { taskService } = createHarness(config, { aiService, workspaceService });
+      harness.taskService = taskService;
+      const svc = internals(taskService);
+      // Pause the reactivation inside its critical section, right after its commit is durable.
+      const gate = Promise.withResolvers<void>();
+      const paused = Promise.withResolvers<void>();
+      let raced = false;
+      const edit = taskService.editWorkspaceEntry.bind(taskService);
+      spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        const result = await edit(id, updater, options);
+        if (id === taskId && !raced && entryOf(config, taskId)?.taskAttemptId !== previous) {
+          raced = true;
+          paused.resolve();
+          await gate.promise;
+        }
+        return result;
+      });
+      const reactivation = taskService.sendMessageToDescendantAgentTask(
+        rootId,
+        taskId,
+        "continue",
+        "tool-end"
+      );
+      await paused.promise;
+      const fresh = entryOf(config, taskId)!.taskAttemptId!;
+      expect(fresh).not.toBe(previous);
+      const stop = taskService.terminateAllDescendantAgentTasks(rootId);
+      await settle();
+      await settle();
+      // Phase A blocks on the mutex: nothing captured, nothing latched, no owner yet.
+      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      gate.resolve();
+      // createWorkspaceTurn runs after the section, behind the cascade's Phase A in the mutex
+      // queue: its send meets the latch, so the reactivation fails after publishing — and the
+      // attempt it published is owned and captured owned by the cascade.
+      expect(await reactivation).toMatchObject({
+        success: false,
+        error: { code: "send_failed" },
+      });
+      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+      expect(svc.workspaceStopRecords.get(taskId)).toMatchObject({
+        attemptId: fresh,
+        ownedAttempt: svc.ownedAttemptByTaskId.get(taskId),
+      });
+      expect(svc.ownedAttemptByTaskId.get(taskId)?.source).toBe("reactivation");
+      cleanupGate.resolve();
+      await stop;
+      await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId: fresh,
+        phase: "settled",
+        source: "stop-settled",
+      });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+    });
+
+    test("a reactivation while a Stop is in progress is refused before it publishes an attempt", async () => {
+      const taskId = "reactivation-during-stop";
+      const previous = "att_0000000000000903";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: previous } },
+      ]);
+      const cleanupGate = Promise.withResolvers<void>();
+      const { aiService } = createAIServiceMocks(config, {
+        stopStream: mock(() => cleanupGate.promise.then(() => Ok(undefined))),
+      });
+      const { taskService } = createHarness(config, { aiService });
+      const svc = internals(taskService);
+      const stop = taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(rootId, taskId, "again", "tool-end")
+      ).toEqual({
+        success: false,
+        error: { code: "send_failed", message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE },
+      });
+      // Nothing published: the cascade's record still names the predecessor it captured.
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(previous);
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      expect(svc.workspaceStopRecords.get(taskId)?.attemptId).toBe(previous);
+      cleanupGate.resolve();
+      await stop;
+      // Once settled, a reactivation proceeds under a fresh id.
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(rootId, taskId, "again", "tool-end")
+      ).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+      expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(previous);
     });
 
     test.each([undefined, "not-an-attempt-id"])(
