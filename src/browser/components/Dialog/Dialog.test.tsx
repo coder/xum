@@ -78,20 +78,25 @@ describe("isDialogOpen with the shared Dialog primitives", () => {
     expect(isDialogOpen()).toBe(false);
   });
 
-  test("closing the dialog clears the detection", () => {
+  test("closing the dialog clears the detection while its overlay is still in the DOM", () => {
+    // Radix Presence keeps a closing overlay mounted (data-state="closed") until its exit
+    // animation ends, so under the app's real styles the closed overlay is still in the DOM
+    // right after open→closed. Unmounting is therefore NOT the contract the guard may rely on;
+    // forceMount pins that retained-DOM state deterministically (no animation dependency).
     const view = render(
       <Dialog open>
-        <DialogOverlay data-testid="overlay" />
+        <DialogOverlay forceMount data-testid="overlay" />
       </Dialog>
     );
+    expect(view.getByTestId("overlay").getAttribute("data-state")).toBe("open");
     expect(isDialogOpen()).toBe(true);
 
     view.rerender(
       <Dialog open={false}>
-        <DialogOverlay data-testid="overlay" />
+        <DialogOverlay forceMount data-testid="overlay" />
       </Dialog>
     );
-    expect(view.queryByTestId("overlay")).toBeNull();
+    expect(view.getByTestId("overlay").getAttribute("data-state")).toBe("closed");
     expect(isDialogOpen()).toBe(false);
   });
 
