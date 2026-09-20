@@ -46,7 +46,10 @@ import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
-import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
+import {
+  useAutoModelRoutingSelection,
+  useSendMessageOptions,
+} from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
@@ -560,9 +563,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Get current send message options from shared hook (must be at component top level)
   // For creation variant, use project-scoped key; for workspace, use workspace ID
-  const sendMessageOptions = useSendMessageOptions(
-    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath)
-  );
+  const sendOptionsScopeId =
+    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath);
+  const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const [autoModelRoutingActive, setAutoModelRoutingActive] =
+    useAutoModelRoutingSelection(sendOptionsScopeId);
   const composerSuggestions = useComposerSuggestions({
     input,
     setInput,
@@ -647,6 +653,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
 
       ensureModelInSettings(selectedModel); // Ensure model exists in Settings
+      // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
+      setAutoModelRoutingActive(false);
 
       if (onModelChange) {
         // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -685,6 +693,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ensureModelInSettings,
       providersConfig,
       onModelChange,
+      setAutoModelRoutingActive,
       thinkingLevel,
       reasoningMode,
       variant,
@@ -2683,6 +2692,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       hiddenModels={hiddenModelsForSelector}
                       onOpenSettings={() => open("models")}
                       className="h-full max-w-[8rem] min-w-0"
+                      autoRouting={
+                        autoModelRoutingEnabled
+                          ? {
+                              active: autoModelRoutingActive,
+                              onSelect: () => setAutoModelRoutingActive(true),
+                            }
+                          : undefined
+                      }
                       tooltipExtraContent={
                         <>
                           <strong>Click to edit</strong>

@@ -24,6 +24,8 @@ export interface SendMessageOptionsInput {
   providerOptions: MuxProviderOptions;
   experiments: ExperimentValues;
   disableWorkspaceAgents?: boolean;
+  /** Composer Auto selection; only real user sends set it (compaction/resume paths leave it unset). */
+  autoModelRouting?: boolean;
 }
 
 /** Normalize a preferred model string for routing while preserving explicit gateway choices. */
@@ -47,5 +49,6 @@ export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMes
     experiments: { ...input.experiments },
     allowAgentSetGoal: true,
     disableWorkspaceAgents: input.disableWorkspaceAgents ? true : undefined,
+    ...(input.autoModelRouting ? { autoModelRouting: true } : {}),
   };
 }

@@ -304,7 +304,7 @@ export function isLegacyOpApiKey(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("op://");
 }
 
-function resolveApiKeyCandidate(
+export function resolveApiKeyCandidate(
   config: { apiKey?: unknown; apiKeyFile?: unknown },
   options: {
     envApiKeys?: string[];

@@ -7,10 +7,10 @@ import {
   buildSendMessageOptions,
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY, getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
-import { useExperimentOverrideValue } from "./useExperiments";
+import { useExperimentOverrideValue, useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
@@ -22,6 +22,23 @@ import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettin
 export interface SendMessageOptionsWithBase extends SendMessageOptions {
   /** Base model in canonical format (e.g., "openai:gpt-5.1-codex-max") for UI/policy checks */
   baseModel: string;
+}
+
+/**
+ * Composer Auto selection (auto-model-routing experiment), workspace-scoped and
+ * forced off while the experiment is disabled so a stale persisted true cannot
+ * reach the backend.
+ */
+export function useAutoModelRoutingSelection(
+  workspaceId: string
+): [active: boolean, setActive: (active: boolean) => void] {
+  const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const [persisted, setPersisted] = usePersistedState<boolean>(
+    getAutoModelRoutingKey(workspaceId),
+    false,
+    { listener: true }
+  );
+  return [experimentEnabled && persisted === true, setPersisted];
 }
 
 /**
@@ -63,6 +80,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
   const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
+  const [autoModelRouting] = useAutoModelRoutingSelection(workspaceId);
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const baseModel = resolveEffectiveComposerModel(
@@ -90,6 +108,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
       tokenBudget,
     },
     disableWorkspaceAgents,
+    autoModelRouting,
   });
 
   return {

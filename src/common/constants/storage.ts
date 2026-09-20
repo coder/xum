@@ -216,6 +216,15 @@ export function getModelKey(workspaceId: string): string {
 }
 
 /**
+ * Get the localStorage key for the composer's Auto selection (auto-model-routing
+ * experiment). Kept separate from the model key so the concrete model survives
+ * as the routing fallback.
+ */
+export function getAutoModelRoutingKey(workspaceId: string): string {
+  return `autoModelRouting:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for the input text for a workspace
  */
 export function getInputKey(workspaceId: string): string {
@@ -858,6 +867,7 @@ export function getAutoCompactionThresholdKey(model: string): string {
 const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string> = [
   getWorkspaceAISettingsByAgentKey,
   getModelKey,
+  getAutoModelRoutingKey,
   getInputKey,
   getAutoExpandPrefsKey,
   getWorkspaceNameStateKey,

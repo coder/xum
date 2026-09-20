@@ -32,6 +32,10 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
@@ -1899,6 +1903,11 @@ export class Config {
     }
 
     const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
+    // Absent stays absent so defaults are not written back to disk until the user edits tiers.
+    const autoModelRouting =
+      parsed.autoModelRouting === undefined
+        ? undefined
+        : normalizeAutoModelRoutingConfig(parsed.autoModelRouting);
 
     const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
     const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
@@ -2042,6 +2051,7 @@ export class Config {
       routeOverrides,
       minThinkingLevelByModel,
       modelFallbacks,
+      autoModelRouting,
       defaultModel,
       advisorModelString,
       advisorThinkingLevel,
@@ -2224,6 +2234,10 @@ export class Config {
       const modelFallbacks = normalizeModelFallbacks(config.modelFallbacks);
       if (modelFallbacks !== undefined) {
         data.modelFallbacks = modelFallbacks;
+      }
+
+      if (config.autoModelRouting !== undefined) {
+        data.autoModelRouting = normalizeAutoModelRoutingConfig(config.autoModelRouting);
       }
 
       const apiServerBindHost = parseOptionalNonEmptyString(config.apiServerBindHost);
@@ -2535,6 +2549,7 @@ export class Config {
       routeOverrides: config.routeOverrides,
       minThinkingLevelByModel: config.minThinkingLevelByModel,
       modelFallbacks: config.modelFallbacks,
+      autoModelRouting: config.autoModelRouting ?? normalizeAutoModelRoutingConfig(undefined),
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,
@@ -2677,6 +2692,11 @@ export class Config {
       ...config,
       modelFallbacks: Object.keys(sanitized).length > 0 ? sanitized : undefined,
     }));
+  }
+
+  async updateAutoModelRouting(autoModelRouting: AutoModelRoutingConfig): Promise<void> {
+    const normalized = normalizeAutoModelRoutingConfig(autoModelRouting);
+    await this.editConfig((config) => ({ ...config, autoModelRouting: normalized }));
   }
 
   async updateModelPreferences(input: {

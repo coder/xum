@@ -134,6 +134,18 @@ export const ModelFallbackRecordSchema = z.object({
   refusedModels: z.array(z.string()),
 });
 
+// Auto-model-routing provenance (which tier Jev chose, which model ran).
+export const AutoModelRoutingRecordSchema = z.object({
+  requestedFallbackModel: z.string(),
+  tierId: z.string().optional(),
+  tierLabel: z.string().optional(),
+  confidence: z.number().optional(),
+  probabilities: z.record(z.string(), z.number()).optional(),
+  model: z.string(),
+  status: z.enum(["routed", "unmapped-tier", "fallback"]),
+  reason: z.string().optional(),
+});
+
 const TranscriptAnchorSchema = z.object({
   messageId: z.string(),
   historySequence: z.number(),
@@ -180,6 +192,7 @@ export const MuxMessageSchema = z.object({
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"
       // instead of failing whole-chat loading at the oRPC output boundary.
       modelFallback: ModelFallbackRecordSchema.optional().catch(undefined),
+      autoModelRouting: AutoModelRoutingRecordSchema.optional().catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),

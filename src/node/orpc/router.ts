@@ -79,6 +79,8 @@ import {
 } from "@/node/services/workspaceOperations";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { AutoModelRouter } from "@/node/services/autoModelRouter";
+import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
@@ -341,6 +343,55 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () =>
               context.config.updateModelFallbacks(input.modelFallbacks)
             );
+          })
+        ),
+
+      updateAutoModelRouting: t
+        .input(schemas.config.updateAutoModelRouting.input)
+        .output(schemas.config.updateAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAutoModelRouting(input.autoModelRouting)
+            );
+          })
+        ),
+
+      getAutoModelRoutingClassifierStatus: t
+        .input(schemas.config.getAutoModelRoutingClassifierStatus.input)
+        .output(schemas.config.getAutoModelRoutingClassifierStatus.output)
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* Effect.sync(() =>
+              new AutoModelRouter({
+                providersConfigStore: context.providersConfigStore,
+              }).getClassifierStatus()
+            );
+          })
+        ),
+
+      previewAutoModelRouting: t
+        .input(schemas.config.previewAutoModelRouting.input)
+        .output(schemas.config.previewAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* atomicPromise(async () => {
+              const { tiers } = normalizeAutoModelRoutingConfig(
+                context.config.loadConfigOrDefault().autoModelRouting
+              );
+              const router = new AutoModelRouter({
+                providersConfigStore: context.providersConfigStore,
+              });
+              const decision = await router.classify({ prompt: input.prompt, tiers });
+              if (!decision.success) return decision;
+              const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+              return Ok({
+                ...decision.data,
+                tierLabel: chosen?.label ?? decision.data.tierId,
+                ...(chosen?.model != null ? { model: chosen.model } : {}),
+                ...(chosen?.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+              });
+            });
           })
         ),
 

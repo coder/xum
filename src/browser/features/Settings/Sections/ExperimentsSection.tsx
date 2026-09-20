@@ -25,6 +25,7 @@ import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { AdvisorToolExperimentConfig } from "./AdvisorToolExperimentConfig";
+import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 import { HeartbeatDefaultsControls } from "./HeartbeatSection";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
@@ -693,6 +694,7 @@ export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
   const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
@@ -788,6 +790,9 @@ export function ExperimentsSection() {
               />
               {exp.id === EXPERIMENT_IDS.ADVISOR_TOOL && advisorToolEnabled && (
                 <AdvisorToolExperimentConfig />
+              )}
+              {exp.id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && autoModelRoutingEnabled && (
+                <AutoModelRoutingExperimentConfig />
               )}
               {exp.id === EXPERIMENT_IDS.WORKSPACE_HEARTBEATS && workspaceHeartbeatsEnabled && (
                 <ExperimentSettingsPanel>

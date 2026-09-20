@@ -126,6 +126,12 @@ import {
 } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
+import { AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT } from "@/constants/autoModelRouting";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingRecord,
+} from "@/common/types/autoModelRouting";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -354,6 +360,14 @@ interface AutoRetryResumeRequest {
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
 }
+
+/**
+ * Send options after auto-model-routing resolution. The record is session-internal
+ * (never sourced from IPC) and rides to the request builder as stream provenance.
+ */
+type ResolvedSendMessageOptions = SendMessageOptions & {
+  autoModelRoutingRecord?: AutoModelRoutingRecord;
+};
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
   const streamOptions: SendMessageOptions = { ...options };
@@ -691,6 +705,8 @@ interface AgentSessionOptions {
   workspaceGoalService?: WorkspaceGoalService;
   /** Cost telemetry sink for headless side-channel calls (branch summaries). */
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
+  /** Difficulty classifier for composer Auto sends; absent means Auto falls back to the composer model. */
+  autoModelRouter?: Pick<AutoModelRouter, "classify">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /**
@@ -895,6 +911,7 @@ export class AgentSession {
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
   private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
+  private readonly autoModelRouter?: Pick<AutoModelRouter, "classify">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
@@ -1208,6 +1225,7 @@ export class AgentSession {
       backgroundProcessManager,
       workspaceGoalService,
       sessionUsageService,
+      autoModelRouter,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
@@ -1245,6 +1263,7 @@ export class AgentSession {
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
     this.sessionUsageService = sessionUsageService;
+    this.autoModelRouter = autoModelRouter;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
@@ -4080,12 +4099,24 @@ export class AgentSession {
     // (task orchestration, compaction, auto-resume, etc.).
     let agentInitiated = internal?.agentInitiated === true;
 
-    let modelForStream = options.model;
-    let optionsForStream: SendMessageOptions = stripGoalInterventionPolicy({
+    let optionsForStream: ResolvedSendMessageOptions = stripGoalInterventionPolicy({
       ...options,
       ...(acpPromptId != null ? { acpPromptId } : {}),
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
+    if (optionsForStream.autoModelRouting === true) {
+      // Strip before anything snapshots these options: retry rows, compaction follow-ups,
+      // and resumes must carry the concrete model and never re-classify (or re-bill).
+      delete optionsForStream.autoModelRouting;
+      if (!isCompactionRequest && !agentInitiated && internal?.synthetic !== true) {
+        optionsForStream = await this.resolveAutoModelRouting(
+          trimmedMessage,
+          optionsForStream,
+          cancelSignal
+        );
+      }
+    }
+    let modelForStream = optionsForStream.model;
 
     // RLM keep-recent floor: stamp compaction requests (manual /compact,
     // mid-stream forced, idle) with the durable tail-start sequence before the
@@ -6874,6 +6905,89 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Composer Auto: classify the prompt's difficulty and swap in the chosen tier's
+   * model and thinking level. Every failure keeps the composer's concrete model, so
+   * the returned options are always streamable; the record explains what happened.
+   */
+  private async resolveAutoModelRouting(
+    prompt: string,
+    options: ResolvedSendMessageOptions,
+    signal: AbortSignal | undefined
+  ): Promise<ResolvedSendMessageOptions> {
+    const experimentEnabled =
+      typeof this.aiService.isExperimentEnabled === "function" &&
+      this.aiService.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+    if (!experimentEnabled) return options;
+
+    const fallback = (
+      record: Omit<AutoModelRoutingRecord, "requestedFallbackModel" | "model">
+    ) => ({
+      ...options,
+      autoModelRoutingRecord: {
+        requestedFallbackModel: options.model,
+        model: options.model,
+        ...record,
+      },
+    });
+    if (!this.autoModelRouter) {
+      return fallback({ status: "fallback", reason: "Classifier unavailable in this session" });
+    }
+
+    const { tiers } = normalizeAutoModelRoutingConfig(
+      this.config.loadConfigOrDefault().autoModelRouting
+    );
+    const decision = await this.autoModelRouter.classify({
+      prompt,
+      recentUserMessages: await this.collectRecentUserPrompts(),
+      tiers,
+      signal,
+    });
+    if (!decision.success) {
+      return fallback({ status: "fallback", reason: decision.error });
+    }
+    const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+    const provenance = {
+      tierId: decision.data.tierId,
+      tierLabel: chosen?.label ?? decision.data.tierId,
+      confidence: decision.data.confidence,
+      probabilities: decision.data.probabilities,
+    };
+    if (chosen?.model == null) {
+      return fallback({ ...provenance, status: "unmapped-tier" });
+    }
+    return {
+      ...options,
+      model: chosen.model,
+      thinkingLevel: chosen.thinkingLevel ?? options.thinkingLevel,
+      autoModelRoutingRecord: {
+        ...provenance,
+        requestedFallbackModel: options.model,
+        model: chosen.model,
+        status: "routed",
+      },
+    };
+  }
+
+  /** Prior user prompts (oldest first) so the classifier sees conversational context. */
+  private async collectRecentUserPrompts(): Promise<string[]> {
+    const recent = await this.historyService
+      .getLastMessages(this.workspaceId, 20)
+      .catch(() => null);
+    if (!recent?.success) return [];
+    return recent.data
+      .filter((message) => message.role === "user" && message.metadata?.synthetic !== true)
+      .map((message) =>
+        message.parts
+          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+          .trim()
+      )
+      .filter((text) => text.length > 0)
+      .slice(-AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT);
+  }
+
   private normalizeGatewaySendOptions(options: SendMessageOptions): SendMessageOptions {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
@@ -7260,7 +7374,7 @@ export class AgentSession {
   private async streamWithHistory(
     turn: TurnId,
     modelString: string,
-    options?: SendMessageOptions,
+    options?: ResolvedSendMessageOptions,
     openaiTruncationModeOverride?: "auto" | "disabled",
     disablePostCompactionAttachments?: boolean,
     agentInitiated?: boolean,
@@ -7767,6 +7881,7 @@ export class AgentSession {
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
+        autoModelRouting: options?.autoModelRoutingRecord,
         muxMetadata: contextBudgetFlushTurn
           ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
           : streamMuxMetadata,

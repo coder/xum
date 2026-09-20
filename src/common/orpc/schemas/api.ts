@@ -158,6 +158,7 @@ import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntr
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 
 // Experiments
 export const experiments = {
@@ -2617,6 +2618,7 @@ export const config = {
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
       modelFallbacks: ModelFallbacksSchema.optional(),
+      autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
@@ -2700,6 +2702,34 @@ export const config = {
       modelFallbacks: ModelFallbacksSchema,
     }),
     output: z.void(),
+  },
+  updateAutoModelRouting: {
+    input: z.object({
+      // Full replacement; the backend normalizes (drops invalid tiers, dedupes ids,
+      // caps the list, falls back to defaults below the minimum) before persisting.
+      autoModelRouting: AutoModelRoutingConfigSchema,
+    }),
+    output: z.void(),
+  },
+  getAutoModelRoutingClassifierStatus: {
+    input: z.void(),
+    // Only where the TypeSafe key comes from, never the key itself.
+    output: z.object({ apiKeySource: z.enum(["config", "file", "env", "none"]) }),
+  },
+  previewAutoModelRouting: {
+    input: z.object({ prompt: z.string().min(1) }),
+    output: ResultSchema(
+      z.object({
+        tierId: z.string(),
+        tierLabel: z.string(),
+        confidence: z.number(),
+        probabilities: z.record(z.string(), z.number()),
+        classifierModel: z.string(),
+        model: z.string().optional(),
+        thinkingLevel: ThinkingLevelSchema.optional(),
+      }),
+      z.string()
+    ),
   },
   updateCoderPrefs: {
     input: z

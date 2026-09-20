@@ -39,6 +39,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -288,6 +289,8 @@ export interface StreamMessageOptions {
   strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** ACP prompt correlation id used to match stream events to a specific request. */
   acpPromptId?: string;
+  /** Auto-model-routing provenance for this turn; session-internal, never sourced from IPC. */
+  autoModelRouting?: AutoModelRoutingRecord;
   /** Invoked with each fatal pre-start error event this call emits before returning Err. */
   onPreStartError?: (event: ErrorEvent) => void;
   /** Synchronous registration of the facade's handleless startup notification identity. */
@@ -865,6 +868,7 @@ export class TurnRequestBuilder {
       agentId,
       strictAgentResolution,
       acpPromptId,
+      autoModelRouting,
       onPreStartError,
       delegatedToolNames,
       recordFileState,
@@ -3217,6 +3221,7 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
+          ...(autoModelRouting != null ? { autoModelRouting } : {}),
         },
         providerOptions: streamProviderOptions,
         maxOutputTokens,

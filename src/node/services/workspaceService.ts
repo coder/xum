@@ -329,6 +329,7 @@ import type {
   GoalContinuationRuntimeState,
   WorkspaceGoalService,
 } from "@/node/services/workspaceGoalService";
+import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import type {
   BackgroundProcess,
@@ -2442,6 +2443,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly appFiberScope?: Scope.Scope
   ) {
     super();
+    this.autoModelRouter = new AutoModelRouter({ providersConfigStore });
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     // Narrow WorkspaceService test doubles construct partial manager stubs (see the
     // typeof guard on subscriptions below); a missing method reads as "no live monitor
@@ -2896,6 +2898,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
+  private readonly autoModelRouter: AutoModelRouter;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: WorkspaceDevToolsCleanup;
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
@@ -4728,6 +4731,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       backgroundProcessManager: this.backgroundProcessManager,
       // Branch-summary side-channel spend recording (edit-resend path).
       sessionUsageService: this.sessionUsageService,
+      autoModelRouter: this.autoModelRouter,
       sanitizeCliWorkspaceRegistration: (args) =>
         this.sanitizeCliRegisteredWorkspace(
           args.workspaceId,

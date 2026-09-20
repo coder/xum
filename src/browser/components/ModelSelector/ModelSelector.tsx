@@ -14,7 +14,7 @@ import React, {
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { ChevronDown, Eye, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, ShieldCheck, Star } from "lucide-react";
 
 import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
@@ -63,6 +63,12 @@ interface ModelSelectorProps {
   variant?: "default" | "box";
   className?: string;
   tooltipExtraContent?: React.ReactNode;
+  /**
+   * Auto-model-routing experiment: when provided, an "Auto" row is pinned above the
+   * model list. While active the trigger reads "Auto" and no concrete model is marked
+   * selected; picking a concrete model still calls onChange (the owner turns Auto off).
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
 }
 
 export interface ModelSelectorRef {
@@ -87,6 +93,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       variant = "default",
       className,
       tooltipExtraContent,
+      autoRouting,
     },
     ref
   ) => {
@@ -308,15 +315,19 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       : cn("bg-transparent rounded-sm text-[11px]", className ?? "w-32");
 
     const hasValue = value.trim().length > 0;
+    const autoActive = autoRouting?.active === true;
+    // While Auto is active the concrete value is only the fallback, not the selection.
+    const isModelSelected = (model: string) => value === model && !autoActive;
     const explicitGateway = hasValue ? getExplicitGatewayPrefix(value) : undefined;
     const canonicalValue = hasValue ? normalizeToCanonical(value) : "";
-    const selectedProvider = hasValue ? getModelProvider(canonicalValue) : "";
-    const displayValue = hasValue
-      ? formatModelStringForDisplay(canonicalValue)
-      : (emptyLabel ?? "");
-    const compactDisplayValue = hasValue
-      ? formatCompactModelStringForDisplay(canonicalValue)
-      : displayValue;
+    const selectedProvider = hasValue && !autoActive ? getModelProvider(canonicalValue) : "";
+    const displayValue = autoActive
+      ? "Auto"
+      : hasValue
+        ? formatModelStringForDisplay(canonicalValue)
+        : (emptyLabel ?? "");
+    const compactDisplayValue =
+      hasValue && !autoActive ? formatCompactModelStringForDisplay(canonicalValue) : displayValue;
 
     // Explicit gateway selections short-circuit route resolution: the user
     // intentionally pinned a gateway, so display that gateway directly instead
@@ -346,6 +357,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               onClick={() => setIsOpen((prev) => !prev)}
             >
               <span className="flex min-w-0 items-center gap-1.5">
+                {autoActive && <Route aria-hidden="true" className="h-3 w-3 shrink-0 opacity-70" />}
                 {selectedProvider && (
                   <ProviderIcon
                     provider={selectedProvider}
@@ -383,7 +395,11 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
             align={tooltipExtraContent ? "start" : "center"}
             className={cn(tooltipExtraContent && "max-w-80 whitespace-normal")}
           >
-            {explicitGateway ? value.trim() : canonicalValue}
+            {autoActive
+              ? `Auto: routes each prompt by difficulty (falls back to ${canonicalValue})`
+              : explicitGateway
+                ? value.trim()
+                : canonicalValue}
             {routedViaDisplayName ? (
               <>
                 <br />
@@ -423,6 +439,38 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               {error && <div className="text-danger-soft mt-1 text-[10px]">{error}</div>}
             </div>
 
+            {autoRouting && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={autoActive}
+                data-auto-routing-option
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  autoRouting.onSelect();
+                  handleCancel();
+                }}
+                className={cn(
+                  composerPickerOptionClass(
+                    { isHighlighted: false, isSelected: autoActive },
+                    "py-1"
+                  ),
+                  "border-border-light w-full shrink-0 border-b text-left"
+                )}
+              >
+                <Route
+                  aria-hidden="true"
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                />
+                <span className="flex min-w-0 flex-1 items-baseline gap-1">
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent")}>Auto</span>
+                  <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
+                </span>
+              </button>
+            )}
+
             {/* Scrollable list */}
             <div ref={listRef} className="max-h-[280px] min-h-0 overflow-y-auto py-1">
               {filteredModels.length === 0 ? (
@@ -442,24 +490,29 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       className={composerPickerOptionClass(
                         {
                           isHighlighted: index === highlightedIndex,
-                          isSelected: value === model,
+                          isSelected: isModelSelected(model),
                         },
                         "py-1",
                         hiddenSet.has(model) && "opacity-50"
                       )}
                       onClick={() => handleSelectModel(model)}
                       role="option"
-                      aria-selected={value === model}
+                      aria-selected={isModelSelected(model)}
                     >
                       <ProviderIcon
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          value === model ? "text-accent" : "text-muted"
+                          isModelSelected(model) ? "text-accent" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                        <span className={cn("min-w-0 truncate", value === model && "text-accent")}>
+                        <span
+                          className={cn(
+                            "min-w-0 truncate",
+                            isModelSelected(model) && "text-accent"
+                          )}
+                        >
                           {formatModelDisplayName(modelName)}
                         </span>
                         {showProviderLabel && (

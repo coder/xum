@@ -4,6 +4,7 @@ import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
 import { UserPreferencesSchema } from "./userPreferences";
@@ -179,6 +180,11 @@ export const AppConfigOnDiskSchema = z
      * runtime sanitization rules (drop self, de-dupe, cap length).
      */
     modelFallbacks: ModelFallbacksSchema.optional(),
+    /**
+     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized
+     * on read (see normalizeAutoModelRoutingConfig); absent means the defaults.
+     */
+    autoModelRouting: AutoModelRoutingConfigSchema.optional(),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),

@@ -3293,6 +3293,9 @@ export class StreamManager {
       metadataModel: streamInfo.metadataModel,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
+      ...(streamInfo.initialMetadata?.autoModelRouting != null && {
+        autoModelRouting: streamInfo.initialMetadata.autoModelRouting,
+      }),
       historySequence,
       startTime: streamInfo.startTime,
       ...(streamStartAgentId && { agentId: streamStartAgentId }),
