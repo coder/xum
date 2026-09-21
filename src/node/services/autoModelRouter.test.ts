@@ -387,18 +387,23 @@ describe("evaluation model factory", () => {
     });
   });
 
-  it("ignores a legacy custom chat provider stored under the typesafe id", () => {
-    const target = resolveEvaluationModelTarget(
-      EVALUATION_MODEL,
-      deps({
-        typesafe: {
-          providerType: "openai-compatible",
-          baseUrl: "http://localhost:8000/v1",
-          apiKey: "chat-provider-key",
-        },
-      })
-    );
-    expect(target).toMatchObject({ success: false, error: { code: "missing_api_key" } });
+  it("refuses an id shadowed by a custom chat provider instead of using env credentials", () => {
+    const custom = {
+      providerType: "openai-compatible",
+      baseUrl: "http://localhost:8000/v1",
+      apiKey: "chat-provider-key",
+    };
+    // The custom entry's key never reaches an evaluation API, and a native env key must not
+    // route the prompt around the endpoint the user pointed that id at.
+    for (const [modelString, providers, env] of [
+      [EVALUATION_MODEL, { typesafe: custom }, { TYPESAFE_API_KEY: "env-key" }],
+      ["openai:gpt-5-nano", { openai: custom }, { OPENAI_API_KEY: "env-key" }],
+    ] as const) {
+      expect(resolveEvaluationModelTarget(modelString, deps(providers, { env }))).toMatchObject({
+        success: false,
+        error: { code: "custom_provider" },
+      });
+    }
   });
 
   it("prefers the providers.jsonc apiKey, then apiKeyFile, then the env vars in order", async () => {

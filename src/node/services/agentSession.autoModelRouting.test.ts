@@ -880,6 +880,59 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(resumeOptions?.modelString).toBe(HARD_MODEL);
     expect(resumeOptions?.thinkingLevel).toBe("medium");
     expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
+    // The record's thinking level says "Auto set it"; this resume ran on the user's pick.
+    expect(resumeOptions?.autoModelRouting?.thinkingLevel).toBeUndefined();
+  });
+
+  it("skips the paid evaluation when a budgeted goal cannot price the evaluator", async () => {
+    const { session, historyService, classify } = await createHarness({
+      experimentEnabled: true,
+      evaluationModel: "openai:gpt-5-nano",
+      unpricedModels: ["openai:gpt-5-nano"],
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const row = await persistedUserRow(historyService);
+    expect(row.metadata?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
+      reason: "openai:gpt-5-nano has no pricing data for the budgeted goal",
+    });
+  });
+
+  it("keeps context-budget-rejected prompts out of the evaluator context", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    for (const [id, text, metadata] of [
+      ["user-kept", "kept earlier prompt", {}],
+      ["user-rejected", "rejected oversized prompt", { contextBudgetRejected: true }],
+    ] as const) {
+      expect(
+        (
+          await historyService.appendToHistory(
+            "ws-auto-routing",
+            createMuxMessage(id, "user", text, { timestamp: Date.now() - 1_000, ...metadata })
+          )
+        ).success
+      ).toBe(true);
+    }
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const recent = classify.mock.calls[0]?.[0]?.recentUserMessages ?? [];
+    expect(recent).toContain("kept earlier prompt");
+    expect(recent).not.toContain("rejected oversized prompt");
   });
 
   it("a resume after leaving Auto uses the explicit model and drops the record", async () => {

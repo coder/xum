@@ -47,6 +47,7 @@ export type EvaluationModelFailure =
   | { code: "invalid_model"; message: string }
   | { code: "policy_denied"; message: string }
   | { code: "provider_disabled"; message: string }
+  | { code: "custom_provider"; message: string }
   | { code: "missing_api_key"; message: string };
 
 interface EvaluationModelTarget {
@@ -85,12 +86,17 @@ export function resolveEvaluationModelTarget(
   }
   const providersConfig = deps.providersConfigStore.loadProvidersConfig() ?? {};
   const entry: unknown = (providersConfig as Record<string, unknown>)[provider];
-  // A custom chat provider under a built-in id (or the reserved typesafe id) owns the
-  // key for a different endpoint; never send it to an evaluation API.
+  // A custom chat provider under a built-in id (or the reserved typesafe id) points that
+  // id at a different endpoint. Its key must not reach an evaluation API, and falling
+  // through to native env credentials would route the prompt around the user's endpoint.
+  if (typeof entry === "object" && entry !== null && isCustomProviderConfig(entry)) {
+    return Err({
+      code: "custom_provider",
+      message: `${provider} is a custom provider in providers.jsonc; evaluation needs the built-in provider`,
+    });
+  }
   const config: ProviderConfigRaw =
-    typeof entry === "object" && entry !== null && !isCustomProviderConfig(entry)
-      ? (entry as ProviderConfigRaw)
-      : {};
+    typeof entry === "object" && entry !== null ? (entry as ProviderConfigRaw) : {};
   if (isProviderDisabledInConfig(config as { enabled?: unknown })) {
     return Err({
       code: "provider_disabled",

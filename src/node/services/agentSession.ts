@@ -14,7 +14,10 @@ import {
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import {
+  isProviderEligibleMessage,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
@@ -7060,6 +7063,18 @@ export class AgentSession {
           : "No difficulty tier has a thinking level mapped",
       });
     }
+    // The evaluation itself is paid: a budgeted goal must not spend on an evaluator it
+    // cannot price, the same rule the tier model meets below.
+    const evaluatorPricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
+      this.workspaceId,
+      evaluationModel
+    );
+    if (evaluatorPricingGate && !evaluatorPricingGate.success) {
+      return fallback({
+        status: "fallback",
+        reason: `${evaluationModel} has no pricing data for the budgeted goal`,
+      });
+    }
     const decision = await this.autoModelRouter.classify({
       prompt,
       recentUserMessages: await this.collectRecentUserPrompts(),
@@ -7210,10 +7225,19 @@ export class AgentSession {
     return history?.success ? history.data.slice(-20) : [];
   }
 
-  /** Prior user prompts (oldest first) so the classifier sees conversational context. */
+  /**
+   * Prior user prompts (oldest first) so the classifier sees conversational context. Only
+   * rows the chat model itself would replay: a context-budget-rejected prompt stays in
+   * history for display but never reached a provider, so it must not reach the evaluator.
+   */
   private async collectRecentUserPrompts(): Promise<string[]> {
     return (await this.loadRecentRoutingRows())
-      .filter((message) => message.role === "user" && message.metadata?.synthetic !== true)
+      .filter(
+        (message) =>
+          message.role === "user" &&
+          message.metadata?.synthetic !== true &&
+          isProviderEligibleMessage(message)
+      )
       .map((message) =>
         message.parts
           .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
@@ -7257,11 +7281,14 @@ export class AgentSession {
         : resumeOptions.thinkingLevel;
     // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
     const keepRecord = modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model);
+    // The record's thinkingLevel means "Auto set it"; a concrete pick on resume replaces it.
+    const { thinkingLevel: _routedThinkingLevel, ...recordWithoutThinking } = record;
+    const resumedRecord = autoThinkingLevel === true ? record : recordWithoutThinking;
     return {
       ...resumeOptions,
       model,
       thinkingLevel,
-      ...(keepRecord ? { autoModelRoutingRecord: record } : {}),
+      ...(keepRecord ? { autoModelRoutingRecord: resumedRecord } : {}),
     };
   }
 
