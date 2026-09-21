@@ -114,7 +114,10 @@ export function MCPServerIdentityBadge(props: MCPServerIdentityBadgeProps) {
           {renderIcon(ICON_SIZES.header, "size-6")}
           <div className="min-w-0">
             <div className="font-medium wrap-anywhere">{displayName}</div>
-            <div className="text-muted text-[10px] wrap-anywhere">v{identity.version}</div>
+            <div className="text-muted text-[10px] wrap-anywhere">
+              {/* Some servers already include the version prefix. */}
+              {identity.version.startsWith("v") ? identity.version : `v${identity.version}`}
+            </div>
           </div>
         </div>
         {identity.description && (
