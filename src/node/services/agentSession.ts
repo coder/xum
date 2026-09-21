@@ -133,8 +133,6 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
-import type { PolicyService } from "@/node/services/policyService";
-import { parseModelString } from "@/node/services/providerModelFactory";
 import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingDimensions,
@@ -719,8 +717,6 @@ interface AgentSessionOptions {
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** Difficulty classifier for composer Auto sends; absent means Auto falls back to the composer model. */
   autoModelRouter?: Pick<AutoModelRouter, "classify">;
-  /** Routed tier models must pass the same policy check the stream applies, or Auto falls back. */
-  policyService?: Pick<PolicyService, "isEnforced" | "isModelAllowed">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /**
@@ -926,7 +922,6 @@ export class AgentSession {
   private readonly workspaceGoalService?: WorkspaceGoalService;
   private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   private readonly autoModelRouter?: Pick<AutoModelRouter, "classify">;
-  private readonly policyService?: Pick<PolicyService, "isEnforced" | "isModelAllowed">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
@@ -1241,7 +1236,6 @@ export class AgentSession {
       workspaceGoalService,
       sessionUsageService,
       autoModelRouter,
-      policyService,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
@@ -1280,7 +1274,6 @@ export class AgentSession {
     this.workspaceGoalService = workspaceGoalService;
     this.sessionUsageService = sessionUsageService;
     this.autoModelRouter = autoModelRouter;
-    this.policyService = policyService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
@@ -7119,8 +7112,10 @@ export class AgentSession {
     }
     if (applies.model && chosen.model != null) {
       // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
-      // context the turn finally runs in, which compaction can still change. A budgeted goal
-      // must not spend on a model it cannot price.
+      // context the turn finally runs in, which compaction can still change. Whether the tier
+      // model can be built at all (credentials, policy, catalog) is decided by the request
+      // preparation itself, which falls back to the composer's model when it cannot
+      // (TurnRequestBuilder). A budgeted goal must not spend on a model it cannot price.
       const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
         this.workspaceId,
         chosen.model
@@ -7131,18 +7126,6 @@ export class AgentSession {
           status: "fallback",
           reason: `${chosen.model} has no pricing data for the budgeted goal`,
         });
-      }
-      // A tier saved before a policy refresh can name a model the stream would refuse with
-      // policy_denied; the promised fallback has to catch that here.
-      if (this.policyService?.isEnforced()) {
-        const [provider, modelId] = parseModelString(chosen.model);
-        if (!this.policyService.isModelAllowed(provider, modelId)) {
-          return fallback({
-            ...provenance,
-            status: "fallback",
-            reason: `${chosen.model} is not allowed by provider policy`,
-          });
-        }
       }
     }
     // A dimension the composer kept concrete (or the tier left unmapped) stays as sent.

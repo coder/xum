@@ -42,12 +42,13 @@ export function formatPercent(value: number): string {
  */
 export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord): string[] {
   const lines: string[] = [];
-  if (record.status === "fallback") {
-    // Attachment reasons arrive as full sentences; avoid a doubled period.
-    const reason = record.reason?.replace(/\.$/, "");
-    lines.push(
-      `Classification failed${reason ? `: ${reason}` : ""}. Used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
-    );
+  const fallbackModel = formatModelStringForDisplay(record.requestedFallbackModel);
+  // Some reasons arrive as full sentences; avoid a doubled period.
+  const reason = record.reason?.replace(/\.$/, "");
+  // A fallback without a tier never got a verdict; one with a tier did, but its model could
+  // not run this turn (pricing, attachments, or the request preparation could not build it).
+  if (record.status === "fallback" && record.tierId == null) {
+    lines.push(`Classification failed${reason ? `: ${reason}` : ""}. Used ${fallbackModel}.`);
   } else {
     const tierLabel = describeTier(record);
     lines.push(
@@ -59,7 +60,9 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
     lines.push(
       record.status === "routed"
         ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`
-        : `Nothing mapped to this tier; used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
+        : record.status === "unmapped-tier"
+          ? `Nothing mapped to this tier; used ${fallbackModel}.`
+          : `Fell back to ${fallbackModel}${reason ? `: ${reason}` : ""}.`
     );
   }
   const probabilities = Object.entries(record.probabilities ?? {}).sort(([, a], [, b]) => b - a);

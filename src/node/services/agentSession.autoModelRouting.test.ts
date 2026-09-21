@@ -63,8 +63,6 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     evaluationModel?: string;
     /** Models the budgeted-goal pricing gate refuses. */
     unpricedModels?: string[];
-    /** When set, provider policy is enforced and refuses exactly these models. */
-    policyDeniedModels?: string[];
   }) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -110,7 +108,6 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       ),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     }) as unknown as AIService;
-    const policyDenied = options.policyDeniedModels;
     const classify = mock<NonNullable<typeof options.classify>>(
       options.classify ?? (() => Promise.resolve(Ok(decision("hard"))))
     );
@@ -142,14 +139,6 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         "recordHeadlessUsage"
       >,
       workspaceGoalService,
-      policyService:
-        policyDenied == null
-          ? undefined
-          : {
-              isEnforced: () => true,
-              isModelAllowed: (provider: string, modelId: string) =>
-                !policyDenied.includes(`${provider}:${modelId}`),
-            },
     });
     return { session, historyService, streamMessage, classify, recordHeadlessUsage };
   }
@@ -794,32 +783,6 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       tierId: "hard",
       model: COMPOSER_MODEL,
     });
-  });
-
-  it("falls back when provider policy no longer allows the chosen tier's model", async () => {
-    const { session, streamMessage, classify } = await createHarness({
-      experimentEnabled: true,
-      policyDeniedModels: [HARD_MODEL],
-    });
-
-    await session.sendMessage("Refactor the scheduler", {
-      model: COMPOSER_MODEL,
-      agentId: "exec",
-      thinkingLevel: "low",
-      autoModelRouting: true,
-    });
-    await session.waitForIdle();
-
-    expect(classify).toHaveBeenCalledTimes(1);
-    const streamOptions = streamMessage.mock.calls[0]?.[0];
-    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
-    expect(streamOptions?.thinkingLevel).toBe("low");
-    expect(streamOptions?.autoModelRouting).toMatchObject({
-      status: "fallback",
-      tierId: "hard",
-      model: COMPOSER_MODEL,
-    });
-    expect(streamOptions?.autoModelRouting?.reason).toContain("policy");
   });
 
   it("a manual resume under Auto continues on the routed model and keeps the record", async () => {

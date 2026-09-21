@@ -856,7 +856,6 @@ export class TurnRequestBuilder {
     const {
       messages,
       workspaceId,
-      modelString,
       thinkingLevel,
       reasoningMode,
       toolPolicy,
@@ -868,7 +867,6 @@ export class TurnRequestBuilder {
       agentId,
       strictAgentResolution,
       acpPromptId,
-      autoModelRouting,
       onPreStartError,
       delegatedToolNames,
       recordFileState,
@@ -887,6 +885,10 @@ export class TurnRequestBuilder {
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
+    // Both can move once, below: an Auto-routed tier model that cannot be built falls back
+    // to the composer's model, and every later use of the pair follows that swap.
+    let modelString = opts.modelString;
+    let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
     // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
     // writing the workspace context notes, on a transcript that may carry injected tool output.
@@ -1118,13 +1120,58 @@ export class TurnRequestBuilder {
       });
     };
 
-    const modelResult = await prepareModelSeed({
+    let modelResult = await prepareModelSeed({
       rawModelString: modelString,
       requestedThinkingLevel: thinkingLevel,
       minimumThinkingLevelOverride: providedMinThinkingLevel,
       enforceMinimum: false,
       recordTiming: true,
     });
+    // Auto routing promises the composer's model whenever the tier model cannot run. The
+    // factory owns every reason it cannot be built (missing credentials, disabled or removed
+    // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
+    // verdict here instead of pre-checking copies of those rules at classification time.
+    // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
+    // the fallback model, like a refusal-fallback hop.
+    if (
+      !modelResult.success &&
+      autoModelRouting?.status === "routed" &&
+      autoModelRouting.model !== autoModelRouting.requestedFallbackModel
+    ) {
+      const routedRecord = autoModelRouting;
+      const tierModelError = modelResult.error;
+      const fallbackModelString = routedRecord.requestedFallbackModel;
+      const fallbackResult = await prepareModelSeed({
+        rawModelString: fallbackModelString,
+        requestedThinkingLevel: thinkingLevel,
+        minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+          this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+          fallbackModelString
+        ),
+        enforceMinimum: true,
+      });
+      if (!fallbackResult.success) {
+        // Neither model runs; the composer's own failure is the one the user can act on.
+        return { type: "finished", result: Err(fallbackResult.error) };
+      }
+      log.warn("Auto-routed tier model cannot be built; falling back to the composer's model", {
+        workspaceId,
+        tierModel: modelString,
+        fallbackModel: fallbackModelString,
+        error: tierModelError,
+      });
+      modelResult = fallbackResult;
+      modelString = fallbackModelString;
+      autoModelRouting = {
+        ...routedRecord,
+        model: fallbackModelString,
+        ...(routedRecord.thinkingLevel != null
+          ? { thinkingLevel: fallbackResult.data.effectiveThinkingLevel }
+          : {}),
+        status: "fallback",
+        reason: formatSendMessageError(tierModelError).message,
+      };
+    }
     if (!modelResult.success) {
       return { type: "finished", result: Err(modelResult.error) };
     }

@@ -75,6 +75,22 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     expect(lines[0]).toContain("Opus 4.6");
   });
 
+  test("a fallback after a verdict keeps the tier and names the model that ran", () => {
+    const lines = buildAutoModelRoutingTooltipLines({
+      ...routed,
+      model: routed.requestedFallbackModel,
+      status: "fallback",
+      reason: "Model openai:gpt-5.5-mini is not allowed by policy",
+    });
+    expect(lines[0]).toContain("Easy");
+    expect(lines[0]).toContain("82%");
+    expect(lines[1]).toContain("Opus 4.6");
+    expect(lines[1]).toContain("not allowed by policy");
+    expect(lines[1]).not.toContain("..");
+    expect(lines.join("\n")).not.toContain("Classification failed");
+    expect(lines.slice(2)).toEqual(["easy: 82%", "medium: 15%", "hard: 3%"]);
+  });
+
   test("omits the confidence when the record lacks one", () => {
     const lines = buildAutoModelRoutingTooltipLines({
       ...routed,
