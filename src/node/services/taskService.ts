@@ -4007,14 +4007,21 @@ export class TaskService implements AgentTaskIntegration {
       if (!followUp.success) failedAwaitingReportCount += 1;
       else if (followUp.data) resumedAwaitingReportCount += 1;
       if (!followUp.success || followUp.data) continue;
-      // The completion prompt binds its obligation at the handoff (WorkspaceService); it may
-      // only be issued while the row still names the attempt this decision rotated.
-      if (this.currentTaskAttemptId(task.id) !== rotatedAttemptId) {
+      // The completion prompt is fenced to the attempt this decision rotated, like every other
+      // startup send: bound here (refused once another writer's attempt owns the row) and carried
+      // through the prompt helper's own awaits as its token, so a rotation landing during them
+      // refuses the send at the gates instead of the handoff adopting the successor.
+      const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
+        acceptanceOrigin: "automatic",
+        expectedAttemptId: rotatedAttemptId,
+      });
+      if (completionAdmission.kind !== "admitted") {
         failedAwaitingReportCount += 1;
         continue;
       }
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
+        fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
       });
       if (!resumed) {
         failedAwaitingReportCount += 1;
@@ -13835,20 +13842,34 @@ export class TaskService implements AgentTaskIntegration {
       error?: Pick<ErrorEvent, "error" | "errorType">;
       /** formatStructuredOutputValidationMessage output for an invalid agent_report. */
       structuredOutputDiagnostic?: string;
+      /**
+       * A caller that decided this prompt for exactly one attempt (the startup re-drive's rotated
+       * id) binds the obligation before calling and hands it over here: the prompt is then
+       * fenced to that attempt through this method's awaits (the budget write is a CAS on it and
+       * the send carries the token), and a token that produces no send is disposed here. Without
+       * a fence the prompt is a same-attempt continuation bound at the handoff.
+       */
+      fence?: { turnAdmission: TurnAdmissionToken; attemptId: string };
     }
   ): Promise<boolean> {
     assert(
       workspaceId.length > 0,
       "promptTaskForRequiredCompletionTool: workspaceId must be non-empty"
     );
+    const fence = options?.fence;
+    // Every return before the handoff below is a send that never happened.
+    const withoutSend = (result: boolean): boolean => {
+      fence?.turnAdmission.onDisposed(result ? "no-work" : "refused");
+      return result;
+    };
 
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, workspaceId);
     if (!entry?.workspace.parentWorkspaceId) {
-      return false;
+      return withoutSend(false);
     }
     if (entry.workspace.taskStatus !== "awaiting_report") {
-      return false;
+      return withoutSend(false);
     }
     const taskIndex = this.buildAgentTaskIndex(cfg);
     if (
@@ -13859,13 +13880,13 @@ export class TaskService implements AgentTaskIntegration {
         taskIndex
       )
     ) {
-      return false;
+      return withoutSend(false);
     }
     if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
-      return false;
+      return withoutSend(false);
     }
     if (this.aiService.isStreaming(workspaceId)) {
-      return true;
+      return withoutSend(true);
     }
 
     const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
@@ -13892,27 +13913,47 @@ export class TaskService implements AgentTaskIntegration {
         limit: MAX_TASK_RECOVERY_ATTEMPTS,
         reason: options?.reason,
       });
+      // A fenced prompt's attempt is not this process's to end: the awaits above may have let
+      // another writer take the row (the terminal failure would otherwise decide their attempt).
+      if (fence?.turnAdmission.admissionStale() === true) {
+        return withoutSend(false);
+      }
       await this.failAgentTaskTerminally(workspaceId, entry, {
         errorType: "task_recovery_limit",
         errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
       });
-      return false;
+      return withoutSend(false);
     }
     // Consume budget before sending so a crash mid-send still counts the attempt.
     // Read the fresh value inside the mutator (not the entry-time snapshot above)
-    // so concurrent edits cannot lose an increment.
+    // so concurrent edits cannot lose an increment. A fenced prompt charges only the attempt it
+    // was decided for: a row another writer re-admitted meanwhile is theirs (no write, no send).
+    let fenceSuperseded = false;
     await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
+        if (fence != null && ws.taskAttemptId !== fence.attemptId) {
+          fenceSuperseded = true;
+          return;
+        }
         ws.taskRecoveryAttempts = (ws.taskRecoveryAttempts ?? 0) + 1;
       },
       { allowMissing: true }
     );
+    if (fenceSuperseded || fence?.turnAdmission.admissionStale() === true) {
+      log.info("[task-attempt] completion prompt refused: decided for a superseded attempt", {
+        workspaceId,
+        reason: options?.reason,
+      });
+      return withoutSend(false);
+    }
 
     const model = entry.workspace.taskModelString ?? defaultModel;
     const agentId = resolveTaskAgentIdForResume(entry.workspace);
     const startedAt = Date.now();
-    // Admission classification: recovery prompt = same-attempt continuation (no rotation).
+    // Admission classification: recovery prompt = same-attempt continuation (no rotation); a
+    // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
+    // mints none of its own — see WorkspaceService.sendMessage).
     const sendResult = await this.workspaceService.sendMessage(
       workspaceId,
       this.buildTaskCompletionRecoveryMessage(completionKind, requiresStructuredOutput, options),
@@ -13935,6 +13976,12 @@ export class TaskService implements AgentTaskIntegration {
         agentInitiated: true,
         queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
         removableQueueDedupeKey: true,
+        ...(fence != null
+          ? {
+              turnAdmission: fence.turnAdmission,
+              admissionStale: () => fence.turnAdmission.admissionStale(),
+            }
+          : {}),
       }
     );
     const durationMs = Date.now() - startedAt;

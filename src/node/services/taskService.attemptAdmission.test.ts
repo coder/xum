@@ -50,6 +50,14 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { AIService } from "@/node/services/aiService";
+import { EventEmitter } from "events";
+import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { TurnCompletion } from "@/node/services/streamManager";
+import { WorkspaceService } from "@/node/services/workspaceService";
 
 /**
  * G1 — attempt identity, lineage and the send-admission lifecycle (Changes 1, 2, 3a). No receipt
@@ -191,7 +199,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
   }
 
   async function setupTree(
-    descendants: Array<{ id: string; overrides?: Partial<WorkspaceConfigEntry> }>
+    descendants: Array<{
+      id: string;
+      overrides?: Partial<WorkspaceConfigEntry>;
+      /** Project-dir local runtimes execute in the project root; persist that path (real host). */
+      inProjectDir?: boolean;
+    }>
   ) {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
@@ -200,8 +213,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       projectPath,
       [
         projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
-        ...descendants.map(({ id, overrides }) =>
-          projectWorkspace(projectPath, id, id, {
+        ...descendants.map(({ id, overrides, inProjectDir }) => ({
+          ...projectWorkspace(projectPath, id, id, {
             parentWorkspaceId: rootId,
             agentType: "explore",
             agentId: "explore",
@@ -209,8 +222,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             taskModelString: "openai:gpt-5.2",
             runtimeConfig: { type: "local" },
             ...overrides,
-          })
-        ),
+          }),
+          ...(inProjectDir ? { path: projectPath } : {}),
+        })),
       ],
       testTaskSettings(4, 3)
     );
@@ -2999,5 +3013,181 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         load.mockRestore();
       }
     });
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Startup re-drive of an awaiting_report task against the REAL host (WorkspaceService +
+  // AgentSession + MessageQueue; only the AI stream is mocked): the completion prompt is decided
+  // for the attempt the re-drive rotated (R) and must never dispatch bound to an attempt another
+  // writer admitted during the prompt helper's own awaits (R → B).
+  // ---------------------------------------------------------------------------------------------
+  describe("startup completion prompt fence (real host)", () => {
+    test.each(["re-admitted by another writer during the prompt's awaits", "untouched"] as const)(
+      "the awaiting_report re-drive's completion prompt binds only to the attempt it rotated (row %s)",
+      async (row) => {
+        const rotatedElsewhere = row !== "untouched";
+        const taskId = rotatedElsewhere ? "redriveforeign1" : "redriveforeign2";
+        const initialAttemptId = "att_00000000000000a3";
+        const foreignAttemptId = "att_00000000000000b3";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "awaiting_report", taskAttemptId: initialAttemptId },
+            inProjectDir: true,
+          },
+        ]);
+        const otherBackend = await createTestConfig(rootDir);
+        const historyService = new HistoryService(config);
+        const aiEmitter = new EventEmitter();
+        const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
+        const streamStarts: Array<Array<{ attemptId: string; state: string; owned: boolean }>> = [];
+        // Filled once the TaskService exists; the stream mock below reads it at stream start.
+        const ledger: { svc?: Internals } = {};
+        const sessionHarness = await createAgentSessionHarness({
+          workspaceId: taskId,
+          config,
+          historyService,
+          aiEmitter,
+          aiServiceOverrides: {
+            isStreaming: () => completions.length > 0,
+            getWorkspaceMetadata: mock(async (workspaceId: string) => {
+              const all = await config.getAllWorkspaceMetadata();
+              const found = all.find((m) => m.id === workspaceId);
+              return found ? Ok(found) : Err("not found");
+            }),
+            streamMessage: mock(() => {
+              const completion = Promise.withResolvers<TurnCompletion>();
+              completions.push(completion);
+              const messageId = `assistant-${completions.length}`;
+              // Which obligations (and whose) the stream starts under.
+              streamStarts.push(
+                [...(ledger.svc?.admittedSendsByTaskId.get(taskId) ?? [])].map((send) => ({
+                  attemptId: send.attemptId,
+                  state: send.state,
+                  owned: ledger.svc?.ownedAttemptByTaskId.get(taskId)?.attemptId === send.attemptId,
+                }))
+              );
+              aiEmitter.emit("stream-start", {
+                type: "stream-start",
+                workspaceId: taskId,
+                messageId,
+                model: "openai:gpt-5.2",
+                startTime: Date.now(),
+              });
+              return Promise.resolve(Ok({ messageId, completion: completion.promise }));
+            }),
+            stopStream: mock(() => {
+              completions.at(-1)?.resolve({ status: "aborted", abortReason: "user" });
+              return Promise.resolve(Ok(undefined));
+            }),
+          },
+        });
+        const backgroundProcessManager = Object.assign(new EventEmitter(), {
+          cleanup: mock(() => Promise.resolve()),
+          hasRunningBackgroundProcesses: mock(() => false),
+          hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
+          setMessageQueued: mock(() => undefined),
+        }) as unknown as BackgroundProcessManager;
+        const initStateManager = {
+          on: mock(() => undefined),
+          off: mock(() => undefined),
+          getInitState: mock(() => undefined),
+          waitForInit: mock(() => Promise.resolve()),
+          clearInMemoryState: mock(() => undefined),
+        } as unknown as InitStateManager;
+        const aiService = sessionHarness.aiService as unknown as AIService;
+        const workspaceService = new WorkspaceService(
+          config,
+          historyService,
+          aiService,
+          new ContextManagementService({ config, historyService, aiService }),
+          initStateManager,
+          new ExtensionMetadataService(path.join(config.rootDir, "fence-extension-metadata.json")),
+          backgroundProcessManager
+        );
+        (workspaceService as unknown as { sessions: Map<string, unknown> }).sessions.set(
+          taskId,
+          sessionHarness.session
+        );
+        const { taskService } = createHarness(config, {
+          aiService,
+          workspaceService: workspaceService as unknown as WorkspaceHost,
+        });
+        const svc = internals(taskService);
+        ledger.svc = svc;
+        workspaceService.setAgentTaskIntegration(
+          taskService as unknown as Parameters<WorkspaceService["setAgentTaskIntegration"]>[0]
+        );
+        let rotatedAttemptId: string | undefined;
+        let rotatedForeign = false;
+        const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+        spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const [id] = args;
+          if (id === taskId) {
+            const current = entryOf(config, taskId)?.taskAttemptId;
+            if (rotatedAttemptId == null && current === initialAttemptId) {
+              // The re-drive's own CAS (rotateAttemptForStartupRedrive): let it commit, note R.
+              const result = await editOriginal(...args);
+              rotatedAttemptId = entryOf(config, taskId)?.taskAttemptId;
+              return result;
+            }
+            if (rotatedElsewhere && !rotatedForeign && rotatedAttemptId != null) {
+              // The prompt helper's first owned write after the rotation (its recovery-budget
+              // charge) is where the other backend's admission of the same row lands first.
+              rotatedForeign = true;
+              await otherBackend.editConfig((cfg) => {
+                for (const project of cfg.projects.values()) {
+                  const ws = project.workspaces.find((w) => w.id === taskId);
+                  if (ws) {
+                    ws.taskAttemptId = foreignAttemptId;
+                    ws.taskAttemptUnproven = true;
+                  }
+                }
+                return cfg;
+              });
+            }
+          }
+          return editOriginal(...args);
+        });
+        try {
+          await taskService.recoverInterruptedTasks();
+          expect(rotatedAttemptId).toMatch(ATTEMPT_ID);
+          expect(rotatedAttemptId).not.toBe(initialAttemptId);
+          if (rotatedElsewhere) {
+            expect(rotatedForeign).toBe(true);
+            // No prompt reached the stream, nothing is bound to B, R's obligation was disposed
+            // at the refusal, and B's row (budget included) is exactly as its writer left it.
+            expect(streamStarts).toHaveLength(0);
+            expect(svc.admittedSendsByTaskId.has(taskId)).toBe(false);
+            expect(entryOf(config, taskId)).toMatchObject({
+              taskStatus: "awaiting_report",
+              taskAttemptId: foreignAttemptId,
+              taskAttemptUnproven: true,
+            });
+            expect(entryOf(config, taskId)?.taskRecoveryAttempts).toBeUndefined();
+            expect(completions).toHaveLength(0);
+            return;
+          }
+          // Control: the prompt is issued exactly once, admitted under R (unowned: a re-drive is
+          // never this process's attempt), and the budget was charged to R's row.
+          await waitForCondition(() => streamStarts.length === 1);
+          expect(streamStarts[0]).toEqual([
+            { attemptId: rotatedAttemptId!, state: "admitted", owned: false },
+          ]);
+          expect(entryOf(config, taskId)).toMatchObject({
+            taskStatus: "awaiting_report",
+            taskAttemptId: rotatedAttemptId,
+            taskRecoveryAttempts: 1,
+          });
+        } finally {
+          for (const completion of completions) {
+            completion.resolve({ status: "aborted", abortReason: "user" });
+          }
+          await sessionHarness.session.dispose();
+          await sessionHarness.cleanup();
+        }
+      },
+      20_000
+    );
   });
 });
