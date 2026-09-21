@@ -42,6 +42,7 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { EditorService } from "@/node/services/editorService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { HeartbeatService } from "@/node/services/heartbeatService";
@@ -135,6 +136,11 @@ export class IdleDispatcherTag extends Context.Service<IdleDispatcherTag, IdleDi
 export class AI extends Context.Service<AI, AIService>()("xum/AI") {}
 export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, AutoModelRouter>()(
   "xum/AutoModelRouter"
+) {}
+
+/** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+export class Evaluation extends Context.Service<Evaluation, EvaluationService>()(
+  "xum/Evaluation"
 ) {}
 export class StreamManagerTag extends Context.Service<StreamManagerTag, StreamManager>()(
   "xum/StreamManager"
@@ -326,6 +332,7 @@ export type CoreTags =
   | WorkspaceGoal
   | IdleDispatcherTag
   | AI
+  | Evaluation
   | StreamManagerTag
   | MCPConfig
   | MCPServerManagerTag
