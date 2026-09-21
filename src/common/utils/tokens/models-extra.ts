@@ -71,7 +71,9 @@ const GPT_56_SOL_STATS: ModelData = {
 export const modelsExtra: Record<string, ModelData> = {
   // Grok 4.7 - Released September 21, 2026. xAI's frontier coding and knowledge-work
   // model. Identical rates and limits to Grok 4.6: $2/M input, $0.50/M cached input,
-  // $6/M output, all doubled for prompts above 200K tokens. Priority Processing is a
+  // $6/M output, all doubled once a prompt reaches the 200K long-context threshold
+  // (xAI bills the long tier at >=200K; Xum's estimator switches above the threshold
+  // and direct-xAI usage is reconciled to the exact billed cost). Priority Processing is a
   // separate request-time 2× multiplier and the Grok 4.7 Fast variant is Cursor/Grok
   // Build-only (not on the public xAI API), so neither is baked into these rates.
   "xai/grok-4.7": {
@@ -90,8 +92,8 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_vision: true,
     supports_reasoning: true,
     supports_response_schema: true,
-    // xAI publishes the cutoff as "May 2026" without a day; pin the first of the month.
-    knowledge_cutoff: "2026-05-01",
+    // xAI publishes only month precision ("May 2026"); keep it rather than inventing a day.
+    knowledge_cutoff: "2026-05",
     supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
   },
 
