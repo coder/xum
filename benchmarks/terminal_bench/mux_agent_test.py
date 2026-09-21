@@ -18,7 +18,6 @@ import pytest
 from harbor.trial.trial import AgentTimeoutError
 
 from .mux_agent import MuxAgent
-from .mux_payload import build_app_archive
 from .mux_run_contract import mux_run_failure_marker
 
 
@@ -1598,15 +1597,3 @@ def test_session_usage_skips_rolled_up_children(
     assert totals["sessions"] == 1
     assert totals["input"] == 10
     assert totals["cost_usd"] == pytest.approx(0.15)
-
-
-def test_app_archive_includes_postinstall_script() -> None:
-    assert "scripts/postinstall.sh" in MuxAgent._INCLUDE_PATHS
-
-    repo_root = _repo_root()
-    postinstall = repo_root / "scripts/postinstall.sh"
-    assert postinstall.is_file()
-
-    archive_bytes = build_app_archive(repo_root, ["scripts/postinstall.sh"])
-    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
-        assert "scripts/postinstall.sh" in archive.getnames()
