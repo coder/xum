@@ -3006,7 +3006,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     async function streamWithFailingModels(
       failing: Set<string>,
-      record: AutoModelRoutingRecord = routedRecord
+      record: AutoModelRoutingRecord = routedRecord,
+      thinkingLevel = record.thinkingLevel
     ) {
       const xumHome = new DisposableTempDir("ai-service-auto-routing-fallback");
       const projectPath = path.join(xumHome.path, "project");
@@ -3042,7 +3043,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages: [createMuxMessage("latest-user", "user", "refactor the scheduler")],
         workspaceId,
         modelString: record.model,
-        thinkingLevel: record.thinkingLevel,
+        thinkingLevel,
         autoModelRouting: record,
       });
       return {
@@ -3086,6 +3087,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       using run = await streamWithFailingModels(new Set([record.model]), record);
       expect(run.result).toEqual({ success: false, error: tierModelDenied });
       expect(run.requestedModels).toEqual([record.model]);
+    });
+
+    it("records the level the request runs at, not the raw tier value, when Auto set it", async () => {
+      // An attachment fallback upstream already reverted the model and clamped the level the
+      // session sends; the record still carries the tier's raw level until it is assembled here.
+      const reverted: AutoModelRoutingRecord = {
+        ...routedRecord,
+        model: COMPOSER_MODEL,
+        status: "fallback",
+        reason: "Model openai:gpt-5.2 does not support image input.",
+      };
+      using run = await streamWithFailingModels(new Set(), reverted, "high");
+      expect(run.result.success).toBe(true);
+      const startStream = run.harness.startStreamCalls[0];
+      expect(startStream.thinkingLevel).toBe("high");
+      expect(initialMetadataFromStartStreamCall(startStream).autoModelRouting).toEqual({
+        ...reverted,
+        thinkingLevel: "high",
+      });
+    });
+
+    it("passes a record without a routed thinking level through untouched", async () => {
+      const { thinkingLevel: _tierLevel, ...composerLevel } = routedRecord;
+      using run = await streamWithFailingModels(new Set(), composerLevel, "low");
+      expect(run.result.success).toBe(true);
+      expect(
+        initialMetadataFromStartStreamCall(run.harness.startStreamCalls[0]).autoModelRouting
+      ).toEqual(composerLevel);
     });
   });
 

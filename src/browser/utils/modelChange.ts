@@ -1,5 +1,11 @@
-import { getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
+import {
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
+  getModelKey,
+  getThinkingLevelKey,
+} from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
@@ -80,5 +86,21 @@ export function setWorkspaceModelWithOrigin(
   // sync-driven mode defaults keep the user's routing choice.
   if (origin !== "sync") {
     updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
+  }
+}
+
+/**
+ * Thinking counterpart of setWorkspaceModelWithOrigin for agent-resolved levels: an explicit
+ * agent switch leaves thinking Auto, otherwise the next send would replace the agent's concrete
+ * level with a tier's; sync-driven defaults keep the user's routing choice.
+ */
+export function setWorkspaceThinkingLevelWithOrigin(
+  workspaceId: string,
+  level: ThinkingLevel,
+  origin: ModelChangeOrigin
+): void {
+  updatePersistedState(getThinkingLevelKey(workspaceId), level);
+  if (origin !== "sync") {
+    updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
   }
 }

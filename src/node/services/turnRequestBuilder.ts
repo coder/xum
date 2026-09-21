@@ -1132,7 +1132,7 @@ export class TurnRequestBuilder {
     // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
     // verdict here instead of pre-checking copies of those rules at classification time.
     // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
-    // the fallback model, like a refusal-fallback hop.
+    // the fallback model here and recorded with the assembled request, like a refusal hop.
     if (
       !modelResult.success &&
       autoModelRouting?.status === "routed" &&
@@ -1165,9 +1165,6 @@ export class TurnRequestBuilder {
       autoModelRouting = {
         ...routedRecord,
         model: fallbackModelString,
-        ...(routedRecord.thinkingLevel != null
-          ? { thinkingLevel: fallbackResult.data.effectiveThinkingLevel }
-          : {}),
         status: "fallback",
         reason: formatSendMessageError(tierModelError).message,
       };
@@ -3268,7 +3265,15 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
-          ...(autoModelRouting != null ? { autoModelRouting } : {}),
+          // When Auto set the thinking level, the record names the level this request starts
+          // at: the tier's choice clamped to the model that runs (the composer's after a
+          // model-only fallback), not the raw tier value.
+          ...(autoModelRouting != null && {
+            autoModelRouting:
+              autoModelRouting.thinkingLevel != null
+                ? { ...autoModelRouting, thinkingLevel: streamThinkingLevel }
+                : autoModelRouting,
+          }),
         },
         providerOptions: streamProviderOptions,
         maxOutputTokens,

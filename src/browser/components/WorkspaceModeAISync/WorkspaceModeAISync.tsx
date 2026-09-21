@@ -13,7 +13,10 @@ import {
   AGENT_AI_DEFAULTS_KEY,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  setWorkspaceModelWithOrigin,
+  setWorkspaceThinkingLevelWithOrigin,
+} from "@/browser/utils/modelChange";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -92,7 +95,11 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      setWorkspaceThinkingLevelWithOrigin(
+        workspaceId,
+        resolvedThinking,
+        isExplicitAgentSwitch ? "agent" : "sync"
+      );
     }
 
     if (existingReasoning !== resolvedReasoningMode) {

@@ -7,6 +7,7 @@ import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   AGENT_AI_DEFAULTS_KEY,
+  getAutoThinkingLevelKey,
   getModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -93,6 +94,31 @@ describe("WorkspaceModeAISync", () => {
       expect(readPersistedState(getModelKey(workspaceId), "")).toBe(planModel);
     });
     expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
+  });
+
+  test("an explicit agent switch that changes the thinking level leaves thinking Auto", async () => {
+    const workspaceId = nextWorkspaceId();
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      exec: { modelString: "openai:gpt-5.2", thinkingLevel: "low" },
+      plan: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
+    });
+    updatePersistedState(getThinkingLevelKey(workspaceId), "medium");
+    updatePersistedState(getAutoThinkingLevelKey(workspaceId), true);
+
+    const { rerender } = renderSync({ workspaceId, agentId: "exec" });
+
+    // Mount sync applies the agent default but keeps the user's routing choice.
+    await waitFor(() => {
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("low");
+    });
+    expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), false)).toBe(true);
+
+    rerender(<SyncHarness workspaceId={workspaceId} agentId="plan" />);
+
+    await waitFor(() => {
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
+    });
+    expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), true)).toBe(false);
   });
 
   test("preserves unsent workspace choices over configured agent defaults", async () => {

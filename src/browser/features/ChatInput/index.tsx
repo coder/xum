@@ -51,7 +51,10 @@ import {
   useAutoRoutingSelection,
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  setWorkspaceModelWithOrigin,
+  setWorkspaceThinkingLevelWithOrigin,
+} from "@/browser/utils/modelChange";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
@@ -1061,7 +1064,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      setWorkspaceThinkingLevelWithOrigin(
+        scopeId,
+        resolvedThinking,
+        isExplicitAgentSwitch ? "agent" : "sync"
+      );
     }
 
     if (existingReasoning !== resolvedReasoning) {

@@ -379,6 +379,19 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
 
+/**
+ * A user row the chat model itself would replay. Context-budget-rejected prompts and workflow
+ * display rows stay in history for the UI but never reach a provider, so routing (evaluator
+ * context, attachment gating) must not see them either.
+ */
+function isProviderVisibleUserRow(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    isProviderEligibleMessage(message) &&
+    !isWorkflowDisplayOnlyMessage(message)
+  );
+}
+
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
   const streamOptions: SendMessageOptions = { ...options };
   delete streamOptions.goalInterventionPolicy;
@@ -7110,6 +7123,14 @@ export class AgentSession {
     if (!chosen || (!applies.model && !applies.thinkingLevel)) {
       return fallback({ ...provenance, status: "unmapped-tier" });
     }
+    // A dimension the composer kept concrete (or the tier left unmapped) stays as sent. The
+    // two dimensions stay independent from here on: every later model-only gate (pricing,
+    // attachments, request preparation) reverts the model and keeps the tier's thinking level.
+    const routedThinking: Pick<AutoModelRoutingRecord, "thinkingLevel"> =
+      applies.thinkingLevel && chosen.thinkingLevel != null
+        ? { thinkingLevel: chosen.thinkingLevel }
+        : {};
+    const thinkingLevel = routedThinking.thinkingLevel ?? options.thinkingLevel;
     if (applies.model && chosen.model != null) {
       // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
       // context the turn finally runs in, which compaction can still change. Whether the tier
@@ -7121,19 +7142,21 @@ export class AgentSession {
         chosen.model
       );
       if (pricingGate && !pricingGate.success) {
-        return fallback({
-          ...provenance,
-          status: "fallback",
-          reason: `${chosen.model} has no pricing data for the budgeted goal`,
-        });
+        return {
+          ...options,
+          thinkingLevel,
+          autoModelRoutingRecord: {
+            ...provenance,
+            requestedFallbackModel: options.model,
+            model: options.model,
+            ...routedThinking,
+            status: "fallback",
+            reason: `${chosen.model} has no pricing data for the budgeted goal`,
+          },
+        };
       }
     }
-    // A dimension the composer kept concrete (or the tier left unmapped) stays as sent.
     const model = applies.model && chosen.model != null ? chosen.model : options.model;
-    const thinkingLevel =
-      applies.thinkingLevel && chosen.thinkingLevel != null
-        ? chosen.thinkingLevel
-        : options.thinkingLevel;
     return {
       ...options,
       model,
@@ -7142,9 +7165,7 @@ export class AgentSession {
         ...provenance,
         requestedFallbackModel: options.model,
         model,
-        ...(applies.thinkingLevel && chosen.thinkingLevel != null
-          ? { thinkingLevel: chosen.thinkingLevel }
-          : {}),
+        ...routedThinking,
         status: "routed",
       },
     };
@@ -7219,12 +7240,16 @@ export class AgentSession {
     return null;
   }
 
-  /** Attachments of earlier user turns in the context window; a read failure reads as none. */
+  /**
+   * Attachments of earlier user turns the provider request will actually carry; a read
+   * failure reads as none. A file on a display-only row never reaches the model, so it
+   * must not cost the tier model either.
+   */
   private async collectContextFileParts(): Promise<FilePart[]> {
     const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (!history.success) return [];
     return history.data.flatMap((message) =>
-      message.role === "user"
+      isProviderVisibleUserRow(message)
         ? message.parts
             .filter((part): part is MuxFilePart => part.type === "file")
             .map((part) => ({ url: part.url, mediaType: part.mediaType, filename: part.filename }))
@@ -7246,18 +7271,13 @@ export class AgentSession {
 
   /**
    * Prior user prompts (oldest first) so the classifier sees conversational context. Only
-   * rows the chat model itself would replay: context-budget-rejected prompts and workflow
-   * display rows stay in history for the UI but never reach a provider, so they must not
-   * reach the evaluator either.
+   * rows the chat model itself would replay reach the evaluator, and only the user's own
+   * words: synthetic rows are the app's, not a prompt to judge.
    */
   private async collectRecentUserPrompts(): Promise<string[]> {
     return (await this.loadRecentRoutingRows())
       .filter(
-        (message) =>
-          message.role === "user" &&
-          message.metadata?.synthetic !== true &&
-          isProviderEligibleMessage(message) &&
-          !isWorkflowDisplayOnlyMessage(message)
+        (message) => isProviderVisibleUserRow(message) && message.metadata?.synthetic !== true
       )
       .map((message) =>
         message.parts

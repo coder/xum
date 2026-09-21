@@ -558,6 +558,34 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("ignores attachments on display-only rows the provider request never carries", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS_WITH_GROK,
+    });
+    // Rejected by the context-budget gate: kept in history for the UI, excluded from requests.
+    const rejected = createMuxMessage(
+      "rejected-image",
+      "user",
+      "Look at this",
+      { timestamp: Date.now() - 1_000, contextBudgetRejected: true },
+      [UNSUPPORTED_IMAGE]
+    );
+    expect((await historyService.appendToHistory("ws-auto-routing", rejected)).success).toBe(true);
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe("xai:grok-3");
+    expect(streamOptions?.autoModelRouting?.status).toBe("routed");
+  });
+
   it("never sends prompts from before the latest context boundary to the classifier", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
     const workspaceId = "ws-auto-routing";
@@ -782,6 +810,33 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       status: "fallback",
       tierId: "hard",
       model: COMPOSER_MODEL,
+    });
+    expect(streamOptions?.autoModelRouting).not.toHaveProperty("thinkingLevel");
+  });
+
+  it("a pricing fallback reverts only the model and keeps the tier's thinking level", async () => {
+    const { session, streamMessage } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [HARD_MODEL],
+    });
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("high");
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
+      model: COMPOSER_MODEL,
+      thinkingLevel: "high",
     });
   });
 
