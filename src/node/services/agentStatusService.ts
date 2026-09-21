@@ -553,18 +553,27 @@ export class AgentStatusService {
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
-    const result = await this.historyService.getLastMessages(
-      workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
-    );
-    if (!result.success) return "";
-
     // Sidebar status is a provider request too: UI-only history rows (plan-review
     // snapshot/resolve/reopen records, workflow display-only rows) must not leak
-    // into it. Filtering after the count-capped read is intentional: the window can
-    // shrink by a few rows, but a hidden record never contributes transcript text
-    // (and so never becomes the sole reason for a status regeneration).
-    const committedMessages: MuxMessage[] = result.data.filter((m) => !isModelHiddenMessage(m));
+    // into it. The window is counted in VISIBLE rows — filtering a count-capped read
+    // instead would let a burst of hidden records (resolving many threads) evict the
+    // recent conversation, and each hidden append would change the hash by evicting
+    // a visible row. Newest-first scan, stopped as soon as the window is full.
+    const newestFirst: MuxMessage[] = [];
+    const scanned = await this.historyService.iterateFullHistory(
+      workspaceId,
+      "backward",
+      (chunk) => {
+        for (const message of chunk) {
+          if (isModelHiddenMessage(message)) continue;
+          newestFirst.push(message);
+          if (newestFirst.length >= AGENT_STATUS_MAX_TRAILING_MESSAGES) return false;
+        }
+        return true;
+      }
+    );
+    if (!scanned.success) return "";
+    const committedMessages = newestFirst.reverse();
     const partial = await this.historyService.readPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees

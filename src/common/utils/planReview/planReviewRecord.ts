@@ -95,9 +95,13 @@ export type PlanReviewFeedbackRecord = z.infer<typeof PlanReviewFeedbackRecordSc
 export type PlanReviewFeedbackComment = z.infer<typeof PlanReviewFeedbackCommentSchema>;
 export type PlanReviewFeedbackReply = z.infer<typeof PlanReviewFeedbackReplySchema>;
 
-/** Snapshot content is CRLF-normalized before hashing so anchors map 1:1 across platforms. */
+/**
+ * Snapshot content is line-ending-normalized before hashing so anchors map 1:1 across platforms.
+ * CommonMark treats a lone CR as a line ending too, so CR-only plans must count the same lines
+ * the rendered review shows (getPlanSnapshotLineCount splits on LF only).
+ */
 export function normalizePlanSnapshotContent(content: string): string {
-  return content.replaceAll("\r\n", "\n");
+  return content.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
 }
 
 /**

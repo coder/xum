@@ -14,6 +14,10 @@ import {
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { EAGER_LEAD_PERCENT } from "@/constants/continuousCompaction";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
@@ -219,6 +223,51 @@ describe("ContinuousCompactor", () => {
       expect((await rows())[0].id).toBe("old-user");
     });
   }
+
+  it("excludes model-hidden plan-review rows from cut selection and the summarized head", async () => {
+    // A plan snapshot row never reaches the provider, yet it sits in the recent tail cluster.
+    // Counting its text would push an otherwise valid rolling cut over the tail budget (no
+    // staging → forced fallback) and hand the summarizer text the model never saw.
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec_snap",
+      snapshotId: "snap_1",
+      planPath: "/plans/p.md",
+      contentHash: "a".repeat(64),
+      content: `# Plan\n${"step ".repeat(30_000)}`,
+    };
+    const hidden = createMuxMessage("plan-snapshot", "user", formatPlanReviewEnvelope(snapshot), {
+      synthetic: true,
+      muxMetadata: buildPlanReviewMetadata(snapshot),
+    });
+    await seed(
+      createMuxMessage("old-user", "user", "Investigate the regression"),
+      createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+      hidden,
+      createMuxMessage("recent-user", "user", "Implement the fix"),
+      createMuxMessage("recent-answer", "assistant", "The fix is ready for review.")
+    );
+    await stage();
+    const summarizedHead = summarize.mock.calls[0][0].map((row) => row.id);
+    expect(summarizedHead).toEqual(["old-user", "old-answer"]);
+    expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
+    // Summary + verbatim copies of the two recent rows; the hidden record is neither summarized
+    // nor copied behind the boundary.
+    const after = await rows();
+    expect(after[0].parts).toMatchObject([{ type: "text", text: summary.text }]);
+    expect(after).toHaveLength(3);
+    const afterText = JSON.stringify(after);
+    expect(afterText).toContain("Implement the fix");
+    expect(afterText).toContain("The fix is ready for review.");
+    expect(afterText).not.toContain("mux_plan_review");
+    // The record itself is durable UI state: still present in full history for review state.
+    const full: MuxMessage[] = [];
+    await store.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      full.push(...chunk);
+    });
+    expect(full.map((row) => row.id)).toContain("plan-snapshot");
+  });
 
   it("awaits compaction.prepare listener persistence before taking the head snapshot", async () => {
     await seedConversation();

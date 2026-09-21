@@ -16,7 +16,12 @@ import * as path from "node:path";
 
 import { ProvidersConfigStore } from "@/node/config";
 import { getPlanFilePath } from "@/common/utils/planStorage";
-import { parsePlanReviewEnvelope } from "@/common/utils/planReview/planReviewEnvelope";
+import { createMuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+  parsePlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewState } from "@/common/utils/planReview/planReviewState";
 import { MAX_PLAN_SNAPSHOT_BYTES } from "@/constants/planReview";
 import { HistoryService } from "@/node/services/historyService";
@@ -44,6 +49,7 @@ const MOCK_MODEL = "mock-model";
 const MODEL = `local-mock:${MOCK_MODEL}`;
 const PROPOSE_MARKER = "[fixture:propose]";
 const READ_MARKER = "[fixture:read]";
+const HOLD_MARKER = "[fixture:hold]";
 const STREAM_TIMEOUT_MS = 30_000;
 
 const PLAN_A = "# Plan A\n\n## Step 1\n\nRead the config loader.\n\n## Step 2\n\nAdd the flag.\n";
@@ -133,20 +139,31 @@ async function createFixtureServer(): Promise<{
   origin: string;
   requests: CapturedRequest[];
   readPath: string;
+  /** Resolves the turn currently parked on the hold marker (keeps the workspace busy until then). */
+  releaseHeld: () => void;
   close: () => Promise<void>;
 }> {
   const requests: CapturedRequest[] = [];
-  const fixture = { readPath: "" };
+  let held = Promise.withResolvers<void>();
+  const fixture = {
+    readPath: "",
+    releaseHeld: () => {
+      held.resolve();
+      held = Promise.withResolvers<void>();
+    },
+  };
   const server = http.createServer((request, response) => {
     const bodyChunks: Buffer[] = [];
     request.on("data", (part: Buffer) => bodyChunks.push(part));
-    request.on("end", () => {
+    request.on("end", async () => {
       const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as RequestBody;
       const captured = { path: request.url ?? "", body };
       requests.push(captured);
       const messages = body.messages ?? [];
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       const lastUserText = contentText(lastUser);
+      // A held turn answers only after releaseHeld(), so sends issued meanwhile are queued.
+      if (lastUserText.includes(HOLD_MARKER)) await held.promise;
       const chunks = lastUserText.includes(PROPOSE_MARKER)
         ? toolCallChunks(`call_plan_${requests.length}`, "propose_plan", {})
         : lastUserText.includes(READ_MARKER) && messages.at(-1)?.role !== "tool"
@@ -573,4 +590,128 @@ describeIntegration("workspace.planReview", () => {
     expect(persistedOutput).toContain("<mux_plan_review>");
     expect(await getState()).toEqual(before);
   }, 60_000);
+
+  test("rejects a plan whose serialized snapshot row would exceed the history row limit", async () => {
+    // Raw bytes are under MAX_PLAN_SNAPSHOT_BYTES, but control characters expand once in the
+    // envelope JSON and again in the persisted JSONL row (7x), past SESSION_HISTORY_MAX_LINE_BYTES.
+    // Such a row is opaque to the provider and replacement-row scanners (they treat it as an
+    // unreadable run), so the cap must be judged on the row that is actually written.
+    const before = (await getState()).snapshots.length;
+    await writePlan(`# Dense\n${"\u0001".repeat(160 * 1024)}\n`);
+    const oversized = await planReview().ensureSnapshot({ workspaceId });
+    expect(!oversized.success && oversized.error.type).toBe("plan_too_large");
+    expect((await getState()).snapshots).toHaveLength(before);
+    await writePlan(PLAN_B);
+  }, 60_000);
+
+  test("a snapshot row whose declared hash does not match its content is ignored and healed", async () => {
+    // Hand-edited/corrupted row: declares PLAN_C's hash but carries other text. Deduplicating a
+    // real PLAN_C proposal against it would pin review anchors to content nobody proposed.
+    const PLAN_C = `${PLAN_B}\n## Step 4\n\nShip it.\n`;
+    const corrupt = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec_corrupt_hash",
+      snapshotId: "snap_corrupt_hash",
+      planPath,
+      contentHash: sha256(PLAN_C),
+      content: "# Not the plan\n",
+    };
+    const history = new HistoryService(env.config);
+    const appended = await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("plan-review-corrupt", "user", formatPlanReviewEnvelope(corrupt), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(corrupt),
+      })
+    );
+    expect(appended.success).toBe(true);
+    const state = await getState();
+    expect(state.snapshots.map((s) => s.snapshotId)).not.toContain("snap_corrupt_hash");
+
+    await writePlan(PLAN_C);
+    const ensured = await planReview().ensureSnapshot({ workspaceId });
+    expect(ensured.success).toBe(true);
+    if (!ensured.success) return;
+    expect(ensured.data.created).toBe(true);
+    expect(ensured.data.snapshotId).not.toBe("snap_corrupt_hash");
+    const healed = ensured.data.state.snapshots.find(
+      (s) => s.snapshotId === ensured.data.snapshotId
+    );
+    expect(healed?.content).toBe(PLAN_C);
+    await writePlan(PLAN_B);
+  }, 60_000);
+
+  test("feedback submitted while the workspace is busy stays its own authentic turn", async () => {
+    // The queue batches ordinary follow-ups into one entry with the FIRST metadata. Feedback
+    // must never share an entry: batched behind text it loses its metadata, batched ahead of
+    // text the envelope gains a trailing line — both make the persisted row inauthentic.
+    const snapshotB = (await getState()).snapshots.find((s) => s.contentHash === sha256(PLAN_B));
+    expect(snapshotB).toBeDefined();
+    if (!snapshotB) return;
+    const before = await getState();
+    const options = { model: MODEL, agentId: "plan" as const };
+    collector.clear();
+    const held = await client().workspace.sendMessage({
+      workspaceId,
+      message: `Think about it ${HOLD_MARKER}`,
+      options,
+    });
+    expect(held.success).toBe(true);
+    expect(await collector.waitForEvent("stream-start", STREAM_TIMEOUT_MS)).toBeDefined();
+
+    const queuedText = await client().workspace.sendMessage({
+      workspaceId,
+      message: "Also consider caching",
+      options,
+    });
+    expect(queuedText.success).toBe(true);
+    const comment = { anchor: { startLine: 1, endLine: 1 }, quote: "# Plan A", body: "Title?" };
+    const queuedFeedback = await planReview().submitFeedback({
+      workspaceId,
+      snapshotId: snapshotB.snapshotId,
+      comments: [comment],
+      replies: [],
+      options,
+    });
+    expect(queuedFeedback.success).toBe(true);
+    if (!queuedFeedback.success) return;
+
+    fixture.releaseHeld();
+    const session = env.services.workspaceService.getOrCreateSession(workspaceId);
+    expect(
+      await waitFor(async () => {
+        await session.waitForIdle();
+        return !session.hasQueuedMessages() && !session.isBusy();
+      }, STREAM_TIMEOUT_MS)
+    ).toBe(true);
+    assertStreamSuccess(collector);
+
+    const after = await getState();
+    expect(after.threads).toHaveLength(before.threads.length + 1);
+    expect(after.feedbacks.map((f) => f.feedbackId)).toContain(queuedFeedback.data.feedbackId);
+    const rows = await new HistoryService(env.config).getLastMessages(workspaceId, 12);
+    if (!rows.success) throw new Error(rows.error);
+    const feedbackRow = rows.data.find(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "plan-review" &&
+        row.metadata.muxMetadata.feedbackId === queuedFeedback.data.feedbackId
+    );
+    expect(feedbackRow?.parts).toHaveLength(1);
+    expect(
+      feedbackRow?.parts[0].type === "text"
+        ? parsePlanReviewEnvelope(feedbackRow.parts[0].text)?.kind
+        : undefined
+    ).toBe("feedback");
+    // The ordinary follow-up is still its own user turn.
+    expect(
+      rows.data.some(
+        (row) =>
+          row.role === "user" &&
+          row.metadata?.muxMetadata?.type !== "plan-review" &&
+          JSON.stringify(row.parts).includes("Also consider caching")
+      )
+    ).toBe(true);
+  }, 90_000);
 });

@@ -999,6 +999,13 @@ export class AgentSession {
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
       if (!this.coordinator.isCurrentOperation(operation)) return;
+      // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
+      // listener runs detached from the engine. Settle it before completion policy so the turn
+      // cannot go idle (and a queued/next turn cannot revise the mutable plan file) while the
+      // snapshot keyed to this proposal is still being read. Captures never reject.
+      while (this.pendingPlanSnapshots.size > 0) {
+        await Promise.all(this.pendingPlanSnapshots);
+      }
       switch (outcome.status) {
         case "completed":
           await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
@@ -1027,6 +1034,8 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
+  /** In-flight propose_plan snapshot captures; completion policy waits for them (see policy). */
+  private readonly pendingPlanSnapshots = new Set<Promise<void>>();
 
   private readonly messageQueue = new MessageQueue();
   /**
@@ -8990,9 +8999,16 @@ export class AgentSession {
         // Native plan review: every successful proposal gets a snapshot row keyed by its tool
         // call, so review anchors stay bound to the text as proposed even after the (mutable)
         // plan file changes. Runs after the dispatch bookkeeping above and never throws, so it
-        // cannot stall tool-end handling or affect the tool result.
+        // cannot stall tool-end handling or affect the tool result. The forward wrapper does
+        // not await this handler, so the capture is registered for the completion policy.
         if (payload.toolName === "propose_plan" && isSuccessfulToolResult(payload.result)) {
-          await this.snapshotProposedPlan(payload.toolCallId);
+          const capture = this.snapshotProposedPlan(payload.toolCallId);
+          this.pendingPlanSnapshots.add(capture);
+          try {
+            await capture;
+          } finally {
+            this.pendingPlanSnapshots.delete(capture);
+          }
         }
       }
     });

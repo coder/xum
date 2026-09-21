@@ -340,9 +340,15 @@ export class ContinuousCompactor {
       if (index < 0) return;
       rows[index] = { ...rows[index], parts: structuredClone(live.parts.slice(0, completedEnd)) };
     }
-    context = await this.withAttachmentEstimate(rows, context);
+    // Model-hidden rows (workflow display, plan-review records) never reach a request, so they
+    // must not count toward cut selection, attachment estimation, or the summarizer's input:
+    // a large plan snapshot in the tail cluster would otherwise force a smaller retained tail
+    // (or no cut at all) and feed the summarizer text the model never saw. Structural evidence
+    // (boundaryIdentity, fingerprints of the persisted rows) keeps reading the raw snapshot.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    context = await this.withAttachmentEstimate(visibleRows, context);
     if (job.generation !== this.generation) return;
-    const cut = selectRollingCut(rows, live ?? null, {
+    const cut = selectRollingCut(visibleRows, live ?? null, {
       contextWindowTokens: context.contextWindowTokens,
       // Before the model call only the system/attachment cost is known. Reject
       // provably oversized tails now, then check the actual summary before staging.
@@ -381,6 +387,8 @@ export class ContinuousCompactor {
   }
 
   private headFromRows(staged: StagedSummary, rows: MuxMessage[]): MuxMessage[] | null {
+    // Same visible projection the cut was selected from, so the fingerprint stays comparable.
+    rows = rows.filter((row) => !isModelHiddenMessage(row));
     const end = rows.findIndex(
       (row) =>
         row.id === staged.headEnd.id && row.metadata?.historySequence === staged.headEnd.sequence

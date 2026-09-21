@@ -23,6 +23,7 @@ import {
   formatPlanReviewStateBlock,
   type PlanReviewState,
 } from "@/common/utils/planReview/planReviewState";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { MAX_PLAN_SNAPSHOT_BYTES, PLAN_REVIEW_METADATA_TYPE } from "@/constants/planReview";
 import {
   createRuntimeForWorkspace,
@@ -86,9 +87,13 @@ function isPlanReviewRow(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE;
 }
 
-function skipLogger(workspaceId: string) {
-  return (reason: string, messageId: string) =>
-    log.debug("plan review: ignoring record row", { workspaceId, reason, messageId });
+/** Backend projection options: skip logging plus the sha256 verification the shared projection cannot import. */
+function deriveOptions(workspaceId: string) {
+  return {
+    onSkip: (reason: string, messageId: string) =>
+      log.debug("plan review: ignoring record row", { workspaceId, reason, messageId }),
+    hashContent: hashPlanSnapshotContent,
+  };
 }
 
 function historyFailed(message: string): PlanReviewError {
@@ -125,7 +130,7 @@ export async function getPlanReviewState(
     rows.push(...chunk.filter(isPlanReviewRow));
   });
   if (!scanned.success) return Err(historyFailed(scanned.error));
-  return Ok(derivePlanReviewState(rows, { onSkip: skipLogger(workspaceId) }));
+  return Ok(derivePlanReviewState(rows, deriveOptions(workspaceId)));
 }
 
 /**
@@ -157,6 +162,39 @@ export async function ensurePlanSnapshot(
     });
   }
   const contentHash = hashPlanSnapshotContent(content);
+  // Build the candidate row up front so its PERSISTED size can be judged: the content is
+  // JSON-escaped once in the envelope and again in the JSONL row, so a plan under the raw cap
+  // (quotes, backslashes, control characters) can still exceed the row limit — and the
+  // provider/replacement-row scanners treat such a row as an unreadable run. Discarded when
+  // the locked dedup below finds the same hash.
+  const candidateSnapshotId = `snap_${randomUUID()}`;
+  const candidate = buildPlanReviewRecordMessage({
+    v: PLAN_REVIEW_RECORD_VERSION,
+    kind: "snapshot",
+    recordId: `rec_${randomUUID()}`,
+    snapshotId: candidateSnapshotId,
+    planPath: plan.path,
+    contentHash,
+    ...(args.proposalToolCallId !== undefined
+      ? { proposalToolCallId: args.proposalToolCallId }
+      : {}),
+    content,
+  });
+  const rowBytes = Buffer.byteLength(
+    // Mirrors HistoryService's row: message + workspaceId, with a widest-case sequence stamp.
+    JSON.stringify({
+      ...candidate,
+      workspaceId: args.workspaceId,
+      metadata: { ...candidate.metadata, historySequence: Number.MAX_SAFE_INTEGER },
+    }),
+    "utf8"
+  );
+  if (rowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
+    return Err({
+      type: "plan_too_large",
+      message: `Plan snapshot row would be ${rowBytes} bytes; history rows are capped at ${SESSION_HISTORY_MAX_LINE_BYTES} bytes`,
+    });
+  }
 
   let priorRows: MuxMessage[] = [];
   const appended = await deps.historyService.appendDerivedFromFullHistory(
@@ -168,25 +206,12 @@ export async function ensurePlanSnapshot(
       value: { snapshotId: string; message: MuxMessage | null };
     } => {
       priorRows = messages.filter(isPlanReviewRow);
-      const state = derivePlanReviewState(priorRows, { onSkip: skipLogger(args.workspaceId) });
+      const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const existing = state.snapshots.find((snapshot) => snapshot.contentHash === contentHash);
       if (existing !== undefined) {
         return { message: null, value: { snapshotId: existing.snapshotId, message: null } };
       }
-      const snapshotId = `snap_${randomUUID()}`;
-      const message = buildPlanReviewRecordMessage({
-        v: PLAN_REVIEW_RECORD_VERSION,
-        kind: "snapshot",
-        recordId: `rec_${randomUUID()}`,
-        snapshotId,
-        planPath: plan.path,
-        contentHash,
-        ...(args.proposalToolCallId !== undefined
-          ? { proposalToolCallId: args.proposalToolCallId }
-          : {}),
-        content,
-      });
-      return { message, value: { snapshotId, message } };
+      return { message: candidate, value: { snapshotId: candidateSnapshotId, message: candidate } };
     }
   );
   if (!appended.success) return Err(historyFailed(appended.error));
@@ -202,7 +227,7 @@ export async function ensurePlanSnapshot(
     snapshotId,
     contentHash,
     created: message !== null,
-    state: derivePlanReviewState(priorRows, { onSkip: skipLogger(args.workspaceId) }),
+    state: derivePlanReviewState(priorRows, deriveOptions(args.workspaceId)),
   });
 }
 
@@ -218,7 +243,7 @@ export async function setPlanReviewThreadResolved(
       messages
     ): { message: MuxMessage | null; value: Result<MuxMessage | null, PlanReviewError> } => {
       priorRows = messages.filter(isPlanReviewRow);
-      const state = derivePlanReviewState(priorRows, { onSkip: skipLogger(args.workspaceId) });
+      const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const thread = state.threads.find((candidate) => candidate.threadId === args.threadId);
       if (thread === undefined) {
         return {
@@ -245,7 +270,7 @@ export async function setPlanReviewThreadResolved(
     deps.emitChatEvent(args.workspaceId, message);
     priorRows.push(message);
   }
-  return Ok(derivePlanReviewState(priorRows, { onSkip: skipLogger(args.workspaceId) }));
+  return Ok(derivePlanReviewState(priorRows, deriveOptions(args.workspaceId)));
 }
 
 /**
@@ -349,6 +374,6 @@ export async function buildPlanReviewStateInstruction(
     return undefined;
   }
   if (newestFirst.length === 0) return undefined;
-  const state = derivePlanReviewState(newestFirst.reverse(), { onSkip: skipLogger(workspaceId) });
+  const state = derivePlanReviewState(newestFirst.reverse(), deriveOptions(workspaceId));
   return formatPlanReviewStateBlock(state);
 }

@@ -132,12 +132,17 @@ export function buildPlanReviewMetadata(record: PlanReviewRecord): PlanReviewMet
 /**
  * Hidden record rows (snapshot/resolve/reopen): UI state persisted in history that must never
  * reach the model, be copied across compaction boundaries, or count as a human turn. Feedback
- * rows are real user messages and are excluded on purpose. Keyed on the discriminator alone so a
- * corrupted record row stays hidden instead of leaking its text into a provider request.
+ * rows are real user messages and are excluded on purpose — but only AUTHENTIC ones: a row whose
+ * metadata merely claims `kind: "feedback"` (a snapshot row with a corrupted kind, a feedback row
+ * with extra parts or a mismatched envelope) stays hidden, otherwise its normally hidden text
+ * would enter the provider request with just the wrapper renamed. Every other row carrying the
+ * discriminator is hidden without parsing its (possibly large) envelope.
  */
-export function isPlanReviewRecordMessage(message: Pick<MuxMessage, "metadata">): boolean {
+export function isPlanReviewRecordMessage(message: MuxMessage): boolean {
   const muxMeta = message.metadata?.muxMetadata;
-  return muxMeta?.type === PLAN_REVIEW_METADATA_TYPE && muxMeta.kind !== "feedback";
+  if (muxMeta?.type !== PLAN_REVIEW_METADATA_TYPE) return false;
+  if (muxMeta.kind !== "feedback") return true;
+  return getAuthenticPlanReviewRecord(message)?.kind !== "feedback";
 }
 
 /**

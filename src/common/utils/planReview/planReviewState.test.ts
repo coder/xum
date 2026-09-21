@@ -192,6 +192,38 @@ describe("derivePlanReviewState", () => {
   });
 });
 
+describe("derivePlanReviewState snapshot hash verification", () => {
+  // The projection stays browser-safe (no node crypto); node callers inject the hasher.
+  const hashContent = (content: string) => (content === PLAN_A ? HASH_A : HASH_B);
+
+  test("skips snapshot rows whose declared hash does not match their content", () => {
+    const skipped: string[] = [];
+    // Declares PLAN_A's hash but carries PLAN_B: a hand edit or narrow corruption. Accepting it
+    // would let ensurePlanSnapshot dedup the real PLAN_A against this row forever.
+    const corrupt: PlanReviewRecord = { ...snapshotA, recordId: "rec_corrupt", content: PLAN_B };
+    const state = derivePlanReviewState([recordRow(corrupt), recordRow(snapshotB)], {
+      onSkip: (reason) => skipped.push(reason),
+      hashContent,
+    });
+    expect(state.snapshots.map((snapshot) => snapshot.snapshotId)).toEqual(["snap_b"]);
+    expect(skipped).toEqual(["snapshot-hash-mismatch"]);
+    // Feedback bound to the skipped snapshot dangles instead of anchoring into wrong content.
+    const withFeedback = derivePlanReviewState(
+      [recordRow(corrupt), recordRow(feedback1), recordRow(snapshotB)],
+      { hashContent }
+    );
+    expect(withFeedback.threads).toHaveLength(0);
+  });
+
+  test("accepts snapshots whose content hashes back to the declared value", () => {
+    const state = derivePlanReviewState([recordRow(snapshotA), recordRow(feedback1)], {
+      hashContent,
+    });
+    expect(state.snapshots.map((snapshot) => snapshot.snapshotId)).toEqual(["snap_a"]);
+    expect(state.threads).toHaveLength(2);
+  });
+});
+
 describe("formatPlanReviewStateBlock", () => {
   test("is absent without unresolved threads and lists them with truncation otherwise", () => {
     const resolvedState = derivePlanReviewState([

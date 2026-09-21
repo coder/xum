@@ -3,6 +3,11 @@ import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
@@ -1597,24 +1602,44 @@ describe("StreamingMessageAggregator", () => {
             snapshotId: "s1",
           },
         });
-        const feedback = createMuxMessage("plan-feedback", "user", "<mux_plan_review>…", {
-          timestamp: 2,
-          historySequence: 2,
-          muxMetadata: {
-            type: "plan-review",
-            kind: "feedback",
-            recordId: "rec2",
-            snapshotId: "s1",
-            feedbackId: "f1",
-          },
-        });
+        const feedbackRecord: PlanReviewRecord = {
+          v: 1,
+          kind: "feedback",
+          recordId: "rec2",
+          feedbackId: "f1",
+          snapshotId: "s1",
+          contentHash: "a".repeat(64),
+          comments: [
+            { threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" },
+          ],
+          replies: [],
+        };
+        const feedback = createMuxMessage(
+          "plan-feedback",
+          "user",
+          formatPlanReviewEnvelope(feedbackRecord),
+          { timestamp: 2, historySequence: 2, muxMetadata: buildPlanReviewMetadata(feedbackRecord) }
+        );
         const resolve = createMuxMessage("plan-resolve", "user", "<mux_plan_review>…", {
           timestamp: 3,
           historySequence: 3,
           synthetic: true,
           muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
         });
-        aggregator.loadHistoricalMessages([snapshot, feedback, resolve], false);
+        // A hidden record whose metadata kind was corrupted to "feedback" stays hidden: only an
+        // authentic feedback envelope is a visible user message.
+        const corruptedKind = createMuxMessage("plan-corrupted", "user", "<mux_plan_review>…", {
+          timestamp: 4,
+          historySequence: 4,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "feedback",
+            recordId: "rec4",
+            snapshotId: "s2",
+          },
+        });
+        aggregator.loadHistoricalMessages([snapshot, feedback, resolve, corruptedKind], false);
         return aggregator
           .getDisplayedMessages()
           .filter((m) => m.type === "user")

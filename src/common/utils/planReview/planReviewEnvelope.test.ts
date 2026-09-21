@@ -84,18 +84,48 @@ describe("planReviewEnvelope", () => {
     expect(getValidPlanReviewMeta({ type: "normal" })).toBeNull();
   });
 
-  test("record predicate hides every kind except feedback", () => {
+  test("record predicate hides every kind except authentic feedback", () => {
     const hidden = createMuxMessage("r", "user", "x", {
       synthetic: true,
       muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
     });
-    const feedback = createMuxMessage("f", "user", "x", {
-      muxMetadata: buildPlanReviewMetadata(feedbackRecord),
-    });
+    const feedbackText = formatPlanReviewEnvelope(feedbackRecord);
+    const feedbackMeta = buildPlanReviewMetadata(feedbackRecord);
+    const feedback = createMuxMessage("f", "user", feedbackText, { muxMetadata: feedbackMeta });
     const ordinary = createMuxMessage("u", "user", "x");
+    // A pasted envelope without the discriminator is ordinary user text (neutralized later).
+    const pasted = createMuxMessage("p", "user", feedbackText);
     expect(isPlanReviewRecordMessage(hidden)).toBe(true);
     expect(isPlanReviewRecordMessage(feedback)).toBe(false);
     expect(isPlanReviewRecordMessage(ordinary)).toBe(false);
+    expect(isPlanReviewRecordMessage(pasted)).toBe(false);
+
+    // Claiming `kind: "feedback"` is not enough: a hidden record whose metadata kind was
+    // corrupted, or a feedback row whose shape is not exactly one authentic envelope, would
+    // otherwise carry its (normally hidden) text into the provider request and transcript.
+    const snapshotRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec_snap",
+      snapshotId: "snap_1",
+      planPath: "/plans/p.md",
+      contentHash: HASH,
+      content: "# Secret plan\n",
+    };
+    const corruptedKind = createMuxMessage("c", "user", formatPlanReviewEnvelope(snapshotRecord), {
+      synthetic: true,
+      muxMetadata: { ...buildPlanReviewMetadata(snapshotRecord), kind: "feedback" },
+    });
+    expect(isPlanReviewRecordMessage(corruptedKind)).toBe(true);
+    const extraPart = createMuxMessage("x", "user", feedbackText, { muxMetadata: feedbackMeta });
+    extraPart.parts.push({ type: "text", text: "trailing" });
+    expect(isPlanReviewRecordMessage(extraPart)).toBe(true);
+    const mismatched = createMuxMessage("m", "user", feedbackText, {
+      muxMetadata: { ...feedbackMeta, feedbackId: "fb_other" },
+    });
+    expect(isPlanReviewRecordMessage(mismatched)).toBe(true);
+    const nonEnvelope = createMuxMessage("n", "user", "x", { muxMetadata: feedbackMeta });
+    expect(isPlanReviewRecordMessage(nonEnvelope)).toBe(true);
   });
 
   test("authentic rows need user role plus matching metadata and envelope", () => {

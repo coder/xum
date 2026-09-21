@@ -63,6 +63,14 @@ export type PlanReviewState = z.infer<typeof PlanReviewStateSchema>;
 export interface DerivePlanReviewStateOptions {
   /** Called for every row or item the replay ignores (corrupt, dangling, duplicate); node callers log it. */
   onSkip?: (reason: string, messageId: string) => void;
+  /**
+   * sha256 hex of snapshot content (see hashPlanSnapshotContent). When provided, a snapshot row
+   * whose declared `contentHash` does not hash back from its `content` is skipped, so a hand-edited
+   * or corrupted row can neither anchor threads into text nobody proposed nor let
+   * ensurePlanSnapshot deduplicate a real plan against it forever. Optional because this module
+   * stays free of node crypto; the backend (the only state authority) always injects it.
+   */
+  hashContent?: (content: string) => string;
 }
 
 export function createEmptyPlanReviewState(): PlanReviewState {
@@ -111,6 +119,13 @@ export function derivePlanReviewState(
       case "snapshot": {
         if (snapshotsById.has(record.snapshotId)) {
           skip("duplicate-snapshot", message.id);
+          break;
+        }
+        if (
+          options.hashContent !== undefined &&
+          options.hashContent(record.content) !== record.contentHash
+        ) {
+          skip("snapshot-hash-mismatch", message.id);
           break;
         }
         const snapshot: PlanReviewSnapshot = {

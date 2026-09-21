@@ -12,6 +12,11 @@ import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -269,32 +274,60 @@ describe("prepareProviderRequestMessages", () => {
     ]);
   });
 
-  test("drops hidden plan-review record rows but keeps feedback rows", () => {
-    const snapshot = createMuxMessage("plan-review-snapshot", "user", "<mux_plan_review>…", {
-      historySequence: 1,
-      synthetic: true,
-      muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "rec1", snapshotId: "s1" },
-    });
-    const feedback = createMuxMessage("plan-review-feedback", "user", "<mux_plan_review>…", {
-      historySequence: 2,
-      muxMetadata: {
-        type: "plan-review",
-        kind: "feedback",
-        recordId: "rec2",
-        snapshotId: "s1",
-        feedbackId: "f1",
-      },
-    });
+  test("drops hidden plan-review record rows but keeps authentic feedback rows", () => {
+    const snapshotRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec1",
+      snapshotId: "s1",
+      planPath: "/plans/p.md",
+      contentHash: "a".repeat(64),
+      content: "# Secret plan\n",
+    };
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec2",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const snapshot = createMuxMessage(
+      "plan-review-snapshot",
+      "user",
+      formatPlanReviewEnvelope(snapshotRecord),
+      { historySequence: 1, synthetic: true, muxMetadata: buildPlanReviewMetadata(snapshotRecord) }
+    );
+    const feedback = createMuxMessage(
+      "plan-review-feedback",
+      "user",
+      formatPlanReviewEnvelope(feedbackRecord),
+      { historySequence: 2, muxMetadata: buildPlanReviewMetadata(feedbackRecord) }
+    );
     const answer = createMuxMessage("answer", "assistant", "revised", { historySequence: 3 });
     const resolve = createMuxMessage("plan-review-resolve", "user", "<mux_plan_review>…", {
       historySequence: 4,
       synthetic: true,
       muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
     });
-    const nextUser = createMuxMessage("next-user", "user", "continue", { historySequence: 5 });
+    // A hidden snapshot whose metadata kind was corrupted to "feedback" must stay hidden: only
+    // an authentic feedback envelope is provider-visible, never a bare kind claim.
+    const corruptedKind = createMuxMessage(
+      "plan-review-corrupted",
+      "user",
+      formatPlanReviewEnvelope({ ...snapshotRecord, recordId: "rec4", snapshotId: "s2" }),
+      {
+        historySequence: 5,
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "feedback", recordId: "rec4", snapshotId: "s2" },
+      }
+    );
+    const nextUser = createMuxMessage("next-user", "user", "continue", { historySequence: 6 });
 
     const prepared = prepareProviderRequestMessages(
-      [snapshot, feedback, answer, resolve, nextUser],
+      [snapshot, feedback, answer, resolve, corruptedKind, nextUser],
       "openai",
       "off"
     );
