@@ -952,27 +952,19 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       experimentEnabled: true,
     });
     // A hand-edited summary: the follow-up is fine, its provenance record is not.
-    expect(
-      (
-        await historyService.appendToHistory(
-          "ws-auto-routing",
-          createMuxMessage("summary", "assistant", "compacted summary", {
-            timestamp: Date.now() - 1_000,
-            compactionBoundary: true,
-            compacted: "user",
-            muxMetadata: {
-              type: "compaction-summary",
-              pendingFollowUp: {
-                text: "continue after compaction",
-                model: HARD_MODEL,
-                agentId: "exec",
-                autoModelRouting: { status: "routed", model: HARD_MODEL },
-              },
-            },
-          })
-        )
-      ).success
-    ).toBe(true);
+    const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+      timestamp: Date.now() - 1_000,
+      compactionBoundary: true,
+      compacted: "user",
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "continue after compaction", model: HARD_MODEL, agentId: "exec" },
+      },
+    });
+    (
+      summary.metadata!.muxMetadata as unknown as { pendingFollowUp: Record<string, unknown> }
+    ).pendingFollowUp.autoModelRouting = { status: "routed", model: HARD_MODEL };
+    expect((await historyService.appendToHistory("ws-auto-routing", summary)).success).toBe(true);
 
     expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
     await session.waitForIdle();
