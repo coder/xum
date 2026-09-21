@@ -7137,12 +7137,16 @@ export class AgentSession {
     );
   }
 
-  /** Tail of the transcript for routing decisions; a read failure reads as empty. */
+  /**
+   * Tail of the active context for routing decisions; a read failure reads as empty.
+   * Scoped to the latest durable boundary, the same privacy floor provider requests
+   * use, so a /clear or compaction also hides earlier prompts from the classifier.
+   */
   private async loadRecentRoutingRows(): Promise<MuxMessage[]> {
-    const recent = await this.historyService
-      .getLastMessages(this.workspaceId, 20)
+    const history = await this.historyService
+      .getHistoryFromLatestBoundary(this.workspaceId)
       .catch(() => null);
-    return recent?.success ? recent.data : [];
+    return history?.success ? history.data.slice(-20) : [];
   }
 
   /** Prior user prompts (oldest first) so the classifier sees conversational context. */
@@ -7171,7 +7175,8 @@ export class AgentSession {
     const { autoModelRouting, ...resumeOptions } = options;
     const lastUserRow = await this.findLastUserRow();
     const record = lastUserRow?.metadata?.autoModelRouting;
-    if (record == null) return resumeOptions;
+    // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
+    if (record == null || typeof record.model !== "string") return resumeOptions;
     if (autoModelRouting !== true) {
       // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
       return modelSelectionEqualityKey(resumeOptions.model) ===

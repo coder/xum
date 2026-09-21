@@ -16,6 +16,12 @@ describe("gitNoHooksPrefix", () => {
     expect(gitNoHooksPrefix(true)).toBe("");
   });
 
+  test("blanks the TypeSafe classifier key env vars alongside provider secrets", () => {
+    const env = gitNoRepoAutomationEnv();
+    expect(env.TYPESAFE_API_KEY).toBe("");
+    expect(env.JEV_API_KEY).toBe("");
+  });
+
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
     expect(prefix).toContain("GIT_CONFIG_COUNT='32'");

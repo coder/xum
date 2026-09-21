@@ -400,6 +400,65 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("never sends prompts from before the latest context boundary to the classifier", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    const workspaceId = "ws-auto-routing";
+    expect(
+      (
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("user-before-boundary", "user", "pre-boundary secret prompt", {
+            timestamp: Date.now() - 4_000,
+          })
+        )
+      ).success
+    ).toBe(true);
+    expect(
+      (
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("assistant-boundary", "assistant", "compacted summary", {
+            timestamp: Date.now() - 2_000,
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          })
+        )
+      ).success
+    ).toBe(true);
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(classify.mock.calls[0]?.[0]?.recentUserMessages ?? []).not.toContain(
+      "pre-boundary secret prompt"
+    );
+  });
+
+  it("treats a corrupted persisted routing record as absent on resume", async () => {
+    const { session, historyService, streamMessage } = await createHarness({
+      experimentEnabled: true,
+    });
+    const row = createMuxMessage("user-corrupt-record", "user", "Refactor the scheduler", {
+      timestamp: Date.now() - 1_000,
+    });
+    (row.metadata as Record<string, unknown>).autoModelRouting = { model: 42, status: "routed" };
+    expect((await historyService.appendToHistory("ws-auto-routing", row)).success).toBe(true);
+
+    const result = await session.resumeStream({ model: COMPOSER_MODEL, agentId: "exec" });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[0]?.[0];
+    expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
   it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
     const internals = session as unknown as {

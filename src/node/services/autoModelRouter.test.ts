@@ -131,6 +131,33 @@ describe("AutoModelRouter.classify", () => {
     expect(result.success).toBe(false);
   });
 
+  it("keeps only the configured tiers' probabilities from the response", async () => {
+    const base = validBody();
+    const body = {
+      ...base,
+      answers: {
+        difficulty: {
+          ...base.answers.difficulty,
+          probabilities: { ...base.answers.difficulty.probabilities, bogus: 0.5, other: 0.25 },
+        },
+      },
+    };
+    const { router } = createRouter({
+      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
+      fetch: () => Promise.resolve(jsonResponse(body)),
+    });
+
+    const result = await router.classify({ prompt: "Refactor the scheduler", tiers: TIERS });
+
+    expect(result.success).toBe(true);
+    expect(result.success && Object.keys(result.data.probabilities).sort()).toEqual([
+      "easy",
+      "extreme",
+      "hard",
+      "medium",
+    ]);
+  });
+
   it("fails when the choice is not one of the tier ids", async () => {
     const { router } = createRouter({
       providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "k" } },

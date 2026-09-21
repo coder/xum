@@ -160,14 +160,19 @@ export class AutoModelRouter {
     if (!parsed.success || !answer) {
       return this.fail("Classifier response did not contain the difficulty answer");
     }
-    if (!input.tiers.some((tier) => tier.id === answer.choice)) {
+    const tierIds = new Set(input.tiers.map((tier) => tier.id));
+    if (!tierIds.has(answer.choice)) {
       return this.fail(`Classifier chose an unknown tier "${answer.choice}"`);
     }
 
     const decision: AutoModelRoutingDecision = {
       tierId: answer.choice,
       confidence: answer.confidence ?? 0,
-      probabilities: answer.probabilities ?? {},
+      // The map is persisted on the message row and rendered per entry, so only the
+      // configured tiers' probabilities are kept; anything else is noise from upstream.
+      probabilities: Object.fromEntries(
+        Object.entries(answer.probabilities ?? {}).filter(([tierId]) => tierIds.has(tierId))
+      ),
       classifierModel: parsed.data.model ?? "",
     };
     log.debug("Auto model routing classified prompt", {
