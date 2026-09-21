@@ -3039,6 +3039,74 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     });
   });
 
+  describe("startup completion prompt fence (token ownership)", () => {
+    test.each(["budget write", "owned-work probe"] as const)(
+      "a throw in the prompt helper's %s before the handoff disposes the fenced token instead of leaking a pending obligation",
+      async (faultAt) => {
+        const taskId = faultAt === "budget write" ? "redrivethrow001" : "redrivethrow002";
+        const initialAttemptId = "att_00000000000000a5";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "awaiting_report", taskAttemptId: initialAttemptId },
+          },
+        ]);
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        let rotatedAttemptId: string | undefined;
+        let injected = false;
+        const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+        spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const [id] = args;
+          if (id === taskId && rotatedAttemptId == null) {
+            // The re-drive's own CAS: let it commit and note R.
+            const result = await editOriginal(...args);
+            rotatedAttemptId = entryOf(config, taskId)?.taskAttemptId;
+            return result;
+          }
+          if (id === taskId && faultAt === "budget write" && !injected) {
+            // The helper's recovery-budget charge (its last awaited write before the handoff).
+            injected = true;
+            throw new Error("injected: config write failed");
+          }
+          return editOriginal(...args);
+        });
+        if (faultAt === "owned-work probe") {
+          spyOn(
+            svc as unknown as { hasActiveTaskOwnedWork: () => Promise<boolean> },
+            "hasActiveTaskOwnedWork"
+          ).mockImplementation(() => {
+            injected = true;
+            return Promise.reject(new Error("injected: owned-work probe failed"));
+          });
+        }
+        // The startup loop has no per-task boundary for a throwing helper: the injected fault
+        // propagates (pre-existing); only the token's disposition is under test here.
+        let thrown: unknown;
+        try {
+          await taskService.recoverInterruptedTasks();
+        } catch (error: unknown) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(Error);
+        expect((thrown as Error).message).toContain("injected");
+        expect(injected).toBe(true);
+        expect(rotatedAttemptId).toMatch(ATTEMPT_ID);
+        expect(sendMessage).not.toHaveBeenCalled();
+        // The fenced token was minted for R by the re-drive; a throw before the handoff must not
+        // leave it pending — a pending obligation nobody holds keeps R's stop cascade waiting.
+        expect(svc.admittedSendsByTaskId.has(taskId)).toBe(false);
+        // R's row is untouched apart from the rotation itself (no budget charged).
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "awaiting_report",
+          taskAttemptId: rotatedAttemptId,
+        });
+        expect(entryOf(config, taskId)?.taskRecoveryAttempts).toBeUndefined();
+      }
+    );
+  });
+
   // ---------------------------------------------------------------------------------------------
   // Startup re-drive of an awaiting_report task against the REAL host (WorkspaceService +
   // AgentSession + MessageQueue; only the AI stream is mocked): the completion prompt is decided

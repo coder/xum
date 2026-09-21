@@ -13857,136 +13857,159 @@ export class TaskService implements AgentTaskIntegration {
       "promptTaskForRequiredCompletionTool: workspaceId must be non-empty"
     );
     const fence = options?.fence;
-    // Every return before the handoff below is a send that never happened.
+    // Token ownership: this method owns the caller's fence from entry until the handoff to
+    // workspaceService.sendMessage. Every exit before that handoff — a return OR a throw from one
+    // of the awaits — disposes it (finally below): a pending obligation nobody holds would keep
+    // the attempt's stop cascade waiting on it for good. From the handoff on the token is
+    // WorkspaceService.sendMessage's (its scoped disposal covers refusal and throw; the queue owns
+    // an enqueued token, the session an admitted one) and is never disposed here.
+    let fenceDisposition: "no-work" | "refused" | "handed-off" = "refused";
     const withoutSend = (result: boolean): boolean => {
-      fence?.turnAdmission.onDisposed(result ? "no-work" : "refused");
+      fenceDisposition = result ? "no-work" : "refused";
       return result;
     };
-
-    const cfg = this.config.loadConfigOrDefault();
-    const entry = findWorkspaceEntry(cfg, workspaceId);
-    if (!entry?.workspace.parentWorkspaceId) {
-      return withoutSend(false);
-    }
-    if (entry.workspace.taskStatus !== "awaiting_report") {
-      return withoutSend(false);
-    }
-    const taskIndex = this.buildAgentTaskIndex(cfg);
-    if (
-      await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-        workspaceId,
-        cfg,
-        `completion-tool-${options?.reason ?? "unknown"}`,
-        taskIndex
-      )
-    ) {
-      return withoutSend(false);
-    }
-    if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
-      return withoutSend(false);
-    }
-    if (this.aiService.isStreaming(workspaceId)) {
-      return withoutSend(true);
-    }
-
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
-    const completionKind = isPlanLike ? "propose_plan" : "final_response";
-    const requiresStructuredOutput =
-      entry.workspace.workflowTask?.outputSchema !== undefined &&
-      !(await this.shouldAllowLegacyInvalidWorkflowOutputSchema(workspaceId, entry));
-
-    // Persisted circuit breaker: a task that keeps consuming recovery prompts
-    // without ever completing is stuck (repeated empty output, repeated
-    // length-truncated turns, or a model that never calls its completion
-    // tool). Interrupt it with a descriptive error instead of prompting
-    // forever. The counter lives on the workspace entry so restart loops stay
-    // bounded too; finalizeAgentTaskReport clears it on success.
-    const recoveryAttempts = entry.workspace.taskRecoveryAttempts ?? 0;
-    if (recoveryAttempts >= MAX_TASK_RECOVERY_ATTEMPTS) {
-      const lastError = options?.error
-        ? ` Last error (${options.error.errorType ?? "unknown"}): ${options.error.error}`
-        : "";
-      log.error("Task exceeded its recovery attempt budget; interrupting task", {
-        workspaceId,
-        taskName: entry.workspace.name,
-        recoveryAttempts,
-        limit: MAX_TASK_RECOVERY_ATTEMPTS,
-        reason: options?.reason,
-      });
-      // A fenced prompt's attempt is not this process's to end: the awaits above may have let
-      // another writer take the row (the terminal failure would otherwise decide their attempt).
-      if (fence?.turnAdmission.admissionStale() === true) {
+    try {
+      const cfg = this.config.loadConfigOrDefault();
+      const entry = findWorkspaceEntry(cfg, workspaceId);
+      if (!entry?.workspace.parentWorkspaceId) {
         return withoutSend(false);
       }
-      await this.failAgentTaskTerminally(workspaceId, entry, {
-        errorType: "task_recovery_limit",
-        errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
-      });
-      return withoutSend(false);
-    }
-    // Consume budget before sending so a crash mid-send still counts the attempt.
-    // Read the fresh value inside the mutator (not the entry-time snapshot above)
-    // so concurrent edits cannot lose an increment. A fenced prompt charges only the attempt it
-    // was decided for: a row another writer re-admitted meanwhile is theirs (no write, no send).
-    let fenceSuperseded = false;
-    await this.editWorkspaceEntry(
-      workspaceId,
-      (ws) => {
-        if (fence != null && ws.taskAttemptId !== fence.attemptId) {
-          fenceSuperseded = true;
-          return;
-        }
-        ws.taskRecoveryAttempts = (ws.taskRecoveryAttempts ?? 0) + 1;
-      },
-      { allowMissing: true }
-    );
-    if (fenceSuperseded || fence?.turnAdmission.admissionStale() === true) {
-      log.info("[task-attempt] completion prompt refused: decided for a superseded attempt", {
-        workspaceId,
-        reason: options?.reason,
-      });
-      return withoutSend(false);
-    }
-
-    const model = entry.workspace.taskModelString ?? defaultModel;
-    const agentId = resolveTaskAgentIdForResume(entry.workspace);
-    const startedAt = Date.now();
-    // Admission classification: recovery prompt = same-attempt continuation (no rotation); a
-    // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
-    // mints none of its own — see WorkspaceService.sendMessage).
-    const sendResult = await this.workspaceService.sendMessage(
-      workspaceId,
-      this.buildTaskCompletionRecoveryMessage(completionKind, requiresStructuredOutput, options),
-      {
-        model,
-        agentId,
-        thinkingLevel: entry.workspace.taskThinkingLevel,
-        reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-        experiments: entry.workspace.taskExperiments,
-        ...(completionKind === "propose_plan"
-          ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
-          : {}),
-        // A tool-end prompt would cut the child's next turn after one step and re-enter this
-        // path (observed recovery loop); wait for the turn to end instead.
-        queueDispatchMode: "turn-end",
-      },
-      {
-        acceptanceOrigin: "automatic",
-        synthetic: true,
-        agentInitiated: true,
-        queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
-        removableQueueDedupeKey: true,
-        ...(fence != null
-          ? {
-              turnAdmission: fence.turnAdmission,
-              admissionStale: () => fence.turnAdmission.admissionStale(),
-            }
-          : {}),
+      if (entry.workspace.taskStatus !== "awaiting_report") {
+        return withoutSend(false);
       }
-    );
-    const durationMs = Date.now() - startedAt;
-    if (!sendResult.success) {
-      log.error("Failed to prompt task for required completion", {
+      const taskIndex = this.buildAgentTaskIndex(cfg);
+      if (
+        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          workspaceId,
+          cfg,
+          `completion-tool-${options?.reason ?? "unknown"}`,
+          taskIndex
+        )
+      ) {
+        return withoutSend(false);
+      }
+      if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
+        return withoutSend(false);
+      }
+      if (this.aiService.isStreaming(workspaceId)) {
+        return withoutSend(true);
+      }
+
+      const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+      const completionKind = isPlanLike ? "propose_plan" : "final_response";
+      const requiresStructuredOutput =
+        entry.workspace.workflowTask?.outputSchema !== undefined &&
+        !(await this.shouldAllowLegacyInvalidWorkflowOutputSchema(workspaceId, entry));
+
+      // Persisted circuit breaker: a task that keeps consuming recovery prompts
+      // without ever completing is stuck (repeated empty output, repeated
+      // length-truncated turns, or a model that never calls its completion
+      // tool). Interrupt it with a descriptive error instead of prompting
+      // forever. The counter lives on the workspace entry so restart loops stay
+      // bounded too; finalizeAgentTaskReport clears it on success.
+      const recoveryAttempts = entry.workspace.taskRecoveryAttempts ?? 0;
+      if (recoveryAttempts >= MAX_TASK_RECOVERY_ATTEMPTS) {
+        const lastError = options?.error
+          ? ` Last error (${options.error.errorType ?? "unknown"}): ${options.error.error}`
+          : "";
+        log.error("Task exceeded its recovery attempt budget; interrupting task", {
+          workspaceId,
+          taskName: entry.workspace.name,
+          recoveryAttempts,
+          limit: MAX_TASK_RECOVERY_ATTEMPTS,
+          reason: options?.reason,
+        });
+        // A fenced prompt's attempt is not this process's to end: the awaits above may have let
+        // another writer take the row (the terminal failure would otherwise decide their attempt).
+        if (fence?.turnAdmission.admissionStale() === true) {
+          return withoutSend(false);
+        }
+        await this.failAgentTaskTerminally(workspaceId, entry, {
+          errorType: "task_recovery_limit",
+          errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
+        });
+        return withoutSend(false);
+      }
+      // Consume budget before sending so a crash mid-send still counts the attempt.
+      // Read the fresh value inside the mutator (not the entry-time snapshot above)
+      // so concurrent edits cannot lose an increment. A fenced prompt charges only the attempt it
+      // was decided for: a row another writer re-admitted meanwhile is theirs (no write, no send).
+      let fenceSuperseded = false;
+      await this.editWorkspaceEntry(
+        workspaceId,
+        (ws) => {
+          if (fence != null && ws.taskAttemptId !== fence.attemptId) {
+            fenceSuperseded = true;
+            return;
+          }
+          ws.taskRecoveryAttempts = (ws.taskRecoveryAttempts ?? 0) + 1;
+        },
+        { allowMissing: true }
+      );
+      if (fenceSuperseded || fence?.turnAdmission.admissionStale() === true) {
+        log.info("[task-attempt] completion prompt refused: decided for a superseded attempt", {
+          workspaceId,
+          reason: options?.reason,
+        });
+        return withoutSend(false);
+      }
+
+      const model = entry.workspace.taskModelString ?? defaultModel;
+      const agentId = resolveTaskAgentIdForResume(entry.workspace);
+      const startedAt = Date.now();
+      // Admission classification: recovery prompt = same-attempt continuation (no rotation); a
+      // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
+      // mints none of its own — see WorkspaceService.sendMessage).
+      fenceDisposition = "handed-off";
+      const sendResult = await this.workspaceService.sendMessage(
+        workspaceId,
+        this.buildTaskCompletionRecoveryMessage(completionKind, requiresStructuredOutput, options),
+        {
+          model,
+          agentId,
+          thinkingLevel: entry.workspace.taskThinkingLevel,
+          reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
+          experiments: entry.workspace.taskExperiments,
+          ...(completionKind === "propose_plan"
+            ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
+            : {}),
+          // A tool-end prompt would cut the child's next turn after one step and re-enter this
+          // path (observed recovery loop); wait for the turn to end instead.
+          queueDispatchMode: "turn-end",
+        },
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          agentInitiated: true,
+          queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
+          removableQueueDedupeKey: true,
+          ...(fence != null
+            ? {
+                turnAdmission: fence.turnAdmission,
+                admissionStale: () => fence.turnAdmission.admissionStale(),
+              }
+            : {}),
+        }
+      );
+      const durationMs = Date.now() - startedAt;
+      if (!sendResult.success) {
+        log.error("Failed to prompt task for required completion", {
+          workspaceId,
+          taskName: entry.workspace.name,
+          projectPath: entry.projectPath,
+          completionKind,
+          reason: options?.reason,
+          model,
+          agentId,
+          durationMs,
+          sendError: sendResult.error,
+          priorErrorType: options?.error?.errorType,
+          priorError: options?.error?.error,
+        });
+        return false;
+      }
+
+      log.info("Prompted task for required completion", {
         workspaceId,
         taskName: entry.workspace.name,
         projectPath: entry.projectPath,
@@ -13995,24 +14018,11 @@ export class TaskService implements AgentTaskIntegration {
         model,
         agentId,
         durationMs,
-        sendError: sendResult.error,
-        priorErrorType: options?.error?.errorType,
-        priorError: options?.error?.error,
       });
-      return false;
+      return true;
+    } finally {
+      if (fenceDisposition !== "handed-off") fence?.turnAdmission.onDisposed(fenceDisposition);
     }
-
-    log.info("Prompted task for required completion", {
-      workspaceId,
-      taskName: entry.workspace.name,
-      projectPath: entry.projectPath,
-      completionKind,
-      reason: options?.reason,
-      model,
-      agentId,
-      durationMs,
-    });
-    return true;
   }
 
   private async promptTaskForBackgroundAwait(
