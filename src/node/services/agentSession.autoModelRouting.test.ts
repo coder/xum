@@ -13,6 +13,7 @@ import type {
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage } from "@/common/types/message";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import {
@@ -368,6 +369,33 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("falls back when an image cannot be sent to the chosen tier's model", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      // xai:grok-3 is catalogued without vision; the composer model has no catalog entry.
+      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+    });
+
+    const result = await session.sendMessage("What is in this screenshot?", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+      fileParts: [{ url: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" }],
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
+      model: COMPOSER_MODEL,
+      reason: "Model xai:grok-3 does not support image input.",
+    });
+  });
+
   it("falls back when a PDF earlier in the conversation cannot be sent to the chosen tier's model", async () => {
     const { session, historyService, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
@@ -582,6 +610,52 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(resumeOptions?.modelString).toBe(HARD_MODEL);
     expect(resumeOptions?.thinkingLevel).toBe("high");
     expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
+  });
+
+  it("a resume under Auto ignores a completed subagent report row appended after the turn", async () => {
+    const { session, historyService, streamMessage } = await createHarness({
+      experimentEnabled: true,
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+    const report = createMuxMessage(
+      "subagent-report",
+      "user",
+      formatSubagentReportEnvelope({
+        taskId: "task-1",
+        agentType: "explore",
+        status: "completed",
+        title: "Findings",
+        reportMarkdown: "done",
+      }),
+      { timestamp: Date.now(), synthetic: true, uiVisible: true }
+    );
+    expect((await historyService.appendToHistory("ws-auto-routing", report)).success).toBe(true);
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+
+    // The resume request is the routed turn (report rows are not retry targets), so the
+    // routing lookup must skip the report row the same way.
+    const internals = session as unknown as {
+      applyAutoRoutedResume(options: {
+        model: string;
+        agentId: string;
+        autoModelRouting?: boolean;
+      }): Promise<{ model: string; autoModelRoutingRecord?: { status: string; tierId?: string } }>;
+    };
+    const resumeOptions = await internals.applyAutoRoutedResume({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(resumeOptions.model).toBe(HARD_MODEL);
+    expect(resumeOptions.autoModelRoutingRecord).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+    });
   });
 
   it("a resume after leaving Auto uses the explicit model and drops the record", async () => {

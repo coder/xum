@@ -7054,12 +7054,12 @@ export class AgentSession {
       // The send-time checks only saw the composer model: every attachment the request
       // carries (this turn's and earlier ones still in the window) must fit the tier
       // model, and a budgeted goal must not spend on a model it cannot price.
-      const pdfIssue = this.findPdfAttachmentIssue(chosen.model, [
-        ...(fileParts ?? []),
-        ...(await this.collectContextFileParts()),
-      ]);
-      if (pdfIssue) {
-        return fallback({ ...provenance, status: "fallback", reason: pdfIssue });
+      const contextParts = [...(fileParts ?? []), ...(await this.collectContextFileParts())];
+      const attachmentIssue =
+        this.findImageAttachmentIssue(chosen.model, contextParts) ??
+        this.findPdfAttachmentIssue(chosen.model, contextParts);
+      if (attachmentIssue) {
+        return fallback({ ...provenance, status: "fallback", reason: attachmentIssue });
       }
       const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
         this.workspaceId,
@@ -7098,6 +7098,18 @@ export class AgentSession {
         status: "routed",
       },
     };
+  }
+
+  /**
+   * Error text when an image attachment cannot be sent to `model`, else null. Routing only:
+   * the composer picked its model with the images in view, a tier model did not.
+   */
+  private findImageAttachmentIssue(model: string, fileParts: FilePart[]): string | null {
+    if (!fileParts.some((part) => normalizeMediaType(part.mediaType).startsWith("image/"))) {
+      return null;
+    }
+    const caps = getModelCapabilitiesResolved(model, this.aiService.getProvidersConfig());
+    return caps && !caps.supportsVision ? `Model ${model} does not support image input.` : null;
   }
 
   /** Error text when a PDF attachment cannot be sent to `model`, else null. */
@@ -7193,8 +7205,9 @@ export class AgentSession {
     };
   }
 
+  /** The same row a resume retries: completed report cards and other non-retry rows are skipped. */
   private async findLastUserRow(): Promise<MuxMessage | undefined> {
-    return (await this.loadRecentRoutingRows()).findLast((message) => message.role === "user");
+    return this.findLastRetryUserMessage(await this.loadRecentRoutingRows());
   }
 
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
