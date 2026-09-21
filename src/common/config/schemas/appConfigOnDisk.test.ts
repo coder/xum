@@ -110,6 +110,36 @@ describe("AppConfigOnDiskSchema", () => {
     }
   });
 
+  it("degrades a damaged autoModelRouting block instead of rejecting the document", () => {
+    const valid = {
+      tiers: [
+        { id: "easy", label: "Easy", description: "Trivial" },
+        { id: "hard", label: "Hard", description: "Complex", model: "openai:gpt-5.5" },
+      ],
+    };
+    const kept = AppConfigOnDiskSchema.safeParse({ autoModelRouting: valid });
+    expect(kept.success && kept.data.autoModelRouting).toEqual(valid);
+
+    // One hand-edited tier (empty label, bad thinking level, too few tiers) used to fail the
+    // whole config parse; the normalizing read path owns the repair, the schema only tolerates it.
+    for (const damaged of [
+      { tiers: [{ id: "easy", label: "", description: "Trivial" }, valid.tiers[1]] },
+      { tiers: [{ ...valid.tiers[0], thinkingLevel: "ultra" }, valid.tiers[1]] },
+      { tiers: [valid.tiers[0]] },
+      "not an object",
+    ]) {
+      const degraded = AppConfigOnDiskSchema.safeParse({
+        autoModelRouting: damaged,
+        defaultModel: "openai:gpt-4o",
+      });
+      expect(degraded.success).toBe(true);
+      if (degraded.success) {
+        expect(degraded.data.autoModelRouting).toBeUndefined();
+        expect(degraded.data.defaultModel).toBe("openai:gpt-4o");
+      }
+    }
+  });
+
   it("rejects a backup repository URL that embeds a credential", () => {
     const base = { branch: "main", path: "mux" };
     for (const repoUrl of [

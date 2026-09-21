@@ -183,8 +183,10 @@ export const AppConfigOnDiskSchema = z
     /**
      * Ordered difficulty tiers for the auto-model-routing experiment. Normalized
      * on read (see normalizeAutoModelRoutingConfig); absent means the defaults.
+     * `.catch`: a hand-edited or damaged tier must not fail the whole document (this
+     * schema also validates unrelated config-tool writes); the read path heals it.
      */
-    autoModelRouting: AutoModelRoutingConfigSchema.optional(),
+    autoModelRouting: AutoModelRoutingConfigSchema.optional().catch(undefined),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
