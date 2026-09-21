@@ -906,11 +906,22 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
-  it("keeps context-budget-rejected prompts out of the evaluator context", async () => {
+  it("keeps display-only rows (rejected prompts, workflow triggers) out of the evaluator context", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
     for (const [id, text, metadata] of [
       ["user-kept", "kept earlier prompt", {}],
       ["user-rejected", "rejected oversized prompt", { contextBudgetRejected: true }],
+      [
+        "user-workflow",
+        "/workflow display-only trigger",
+        {
+          muxMetadata: {
+            type: "workflow-trigger-display",
+            runId: "wfr_1",
+            rawCommand: "/workflow",
+          },
+        },
+      ],
     ] as const) {
       expect(
         (
@@ -933,6 +944,43 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const recent = classify.mock.calls[0]?.[0]?.recentUserMessages ?? [];
     expect(recent).toContain("kept earlier prompt");
     expect(recent).not.toContain("rejected oversized prompt");
+    expect(recent).not.toContain("/workflow display-only trigger");
+  });
+
+  it("drops a malformed routing record from a recovered compaction follow-up", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+    });
+    // A hand-edited summary: the follow-up is fine, its provenance record is not.
+    expect(
+      (
+        await historyService.appendToHistory(
+          "ws-auto-routing",
+          createMuxMessage("summary", "assistant", "compacted summary", {
+            timestamp: Date.now() - 1_000,
+            compactionBoundary: true,
+            compacted: "user",
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: {
+                text: "continue after compaction",
+                model: HARD_MODEL,
+                agentId: "exec",
+                autoModelRouting: { status: "routed", model: HARD_MODEL },
+              },
+            },
+          })
+        )
+      ).success
+    ).toBe(true);
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const options = streamMessage.mock.calls[0]?.[0];
+    expect(options?.modelString).toBe(HARD_MODEL);
+    expect(options?.autoModelRouting).toBeUndefined();
   });
 
   it("a resume after leaving Auto uses the explicit model and drops the record", async () => {

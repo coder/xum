@@ -18,6 +18,7 @@ import {
   isProviderEligibleMessage,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
+import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
@@ -7227,8 +7228,9 @@ export class AgentSession {
 
   /**
    * Prior user prompts (oldest first) so the classifier sees conversational context. Only
-   * rows the chat model itself would replay: a context-budget-rejected prompt stays in
-   * history for display but never reached a provider, so it must not reach the evaluator.
+   * rows the chat model itself would replay: context-budget-rejected prompts and workflow
+   * display rows stay in history for the UI but never reach a provider, so they must not
+   * reach the evaluator either.
    */
   private async collectRecentUserPrompts(): Promise<string[]> {
     return (await this.loadRecentRoutingRows())
@@ -7236,7 +7238,8 @@ export class AgentSession {
         (message) =>
           message.role === "user" &&
           message.metadata?.synthetic !== true &&
-          isProviderEligibleMessage(message)
+          isProviderEligibleMessage(message) &&
+          !isWorkflowDisplayOnlyMessage(message)
       )
       .map((message) =>
         message.parts
@@ -11007,6 +11010,15 @@ export class AgentSession {
         workspaceId: this.workspaceId,
       });
     }
+    const persistedRoutingRecord =
+      followUp.autoModelRouting != null
+        ? AutoModelRoutingRecordSchema.safeParse(followUp.autoModelRouting)
+        : undefined;
+    if (persistedRoutingRecord != null && !persistedRoutingRecord.success) {
+      log.warn("Ignoring malformed persisted autoModelRouting record on compaction follow-up", {
+        workspaceId: this.workspaceId,
+      });
+    }
 
     // Build options for the follow-up message from the preserved send settings captured
     // when the compaction handoff was staged. Avoid forwarding internal-only recovery flags.
@@ -11017,8 +11029,11 @@ export class AgentSession {
       model: effectiveModel,
       agentId: effectiveAgentId,
       thinkingLevel: followUp.thinkingLevel,
-      // Restores the Auto badge and the routed-model resume path without reclassifying.
-      autoModelRoutingRecord: followUp.autoModelRouting,
+      // Restores the Auto badge and the routed-model resume path without reclassifying. Same
+      // raw JSON boundary as toolPolicy above: a malformed record is dropped, not forwarded.
+      ...(persistedRoutingRecord?.success
+        ? { autoModelRoutingRecord: persistedRoutingRecord.data }
+        : {}),
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
