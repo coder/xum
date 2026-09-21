@@ -3414,7 +3414,9 @@ describe("CoderOauthService", () => {
       // deployment — which serves a model that is NOT in the list (and carries
       // a legacy removal tombstone) — but neither the login commit nor the
       // catalog write may add to or remove from `models`. The tombstone is
-      // legacy data: honored by routing, never rewritten here.
+      // legacy data: honored by routing, never rewritten here. The flag marks
+      // the list as written under the new contract (legacy merged lists are
+      // covered separately).
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
@@ -3422,6 +3424,7 @@ describe("CoderOauthService", () => {
           models: ["anthropic/kept-model"],
           discoveredModels: ["anthropic/kept-model", "anthropic/removed-model"],
           removedModels: ["anthropic/removed-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3506,6 +3509,7 @@ describe("CoderOauthService", () => {
             "anthropic/plain-model",
           ],
           discoveredModels: ["anthropic/tuned-model", "anthropic/plain-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3802,21 +3806,8 @@ describe("CoderOauthService", () => {
       expect(deps.setModelsCalls).toEqual([]);
     });
 
-    it("preserves manually added models across a re-login and catalog refresh", async () => {
-      // Users can append model IDs to the coder section's models list (see
-      // docs/config/providers.mdx). Those entries are user-managed data: a
-      // re-login resets only the DISCOVERED catalog (discoveredModels), and the
-      // post-login discovery rewrites only the catalog — the list stays
-      // byte-for-byte, including an entry the new catalog no longer lists.
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth({ sessionId: "session_prior" }),
-          models: ["anthropic/my-manual-model", "anthropic/old-model"],
-          discoveredModels: ["anthropic/old-model"],
-        },
-      };
-
+    /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
+    function mockReLoginFetch(): void {
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3853,10 +3844,13 @@ describe("CoderOauthService", () => {
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
+    }
 
+    /** Drive a desktop login to completion, then wait for the post-login discovery write. */
+    async function completeReLogin(): Promise<Record<string, unknown>> {
       const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
       expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
+      if (!startResult.success) throw new Error(startResult.error);
       const { flowId, authorizeUrl } = startResult.data;
 
       const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
@@ -3867,16 +3861,77 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      // Neither the commit nor discovery touched `models`; only the catalog
-      // was replaced.
       await waitUntil(() => {
         const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
         return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
       });
-      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      return deps.providersConfig.coder as Record<string, unknown>;
+    }
+
+    it("preserves manually added models across a re-login and catalog refresh", async () => {
+      // Users can append model IDs to the coder section's models list (see
+      // docs/config/providers.mdx). Those entries are user-managed data: a
+      // re-login resets only the DISCOVERED catalog (discoveredModels), and the
+      // post-login discovery rewrites only the catalog — the list stays
+      // byte-for-byte, including an entry the new catalog no longer lists.
+      // The flag marks the list as written under the new contract (an
+      // unflagged list next to a catalog marker is legacy merged data; see the
+      // test below).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: ["anthropic/my-manual-model", "anthropic/old-model"],
+          discoveredModels: ["anthropic/old-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
+      // Neither the commit nor discovery touched `models`; only the catalog
+      // was replaced.
       expect(coderSection.models).toEqual(["anthropic/my-manual-model", "anthropic/old-model"]);
       expect(deps.setModelsCalls).toEqual([]);
       expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration before resetting the catalog on re-login", async () => {
+      // The startup migration (separateDiscoveredModelsOnce) can be skipped
+      // or fail transiently, leaving old code's merged list without the flag.
+      // The login commit stamps the flag, so it must separate the list itself
+      // — otherwise the merged catalog entries would be frozen into `models`
+      // and every later startup would skip the migration. Only entries the
+      // OLD markers list are catalog data; the edited object and the manual
+      // ID survive, and the new catalog no longer lists the stripped IDs.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
       expect(coderSection.discoveredModelsUnlisted).toBe(true);
     });
 
@@ -3979,6 +4034,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4055,6 +4111,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4761,6 +4818,7 @@ describe("CoderOauthService", () => {
           ],
           discoveredModels: ["anthropic/claude-old-2"],
           discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4947,6 +5005,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth(),
           models: ["anthropic/my-manual-model", "anthropic/retained-model"],
           staleDiscoveredModels: ["anthropic/retained-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -5164,6 +5223,96 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toEqual(["llm-proxy/llama-3.3-70b"]);
     });
+
+    /**
+     * Legacy merged list whose startup migration was skipped or failed (no
+     * flag). A refresh stamps the flag, so it must strip the entries the OLD
+     * markers list (including ones the fresh catalog no longer lists) before
+     * replacing the catalog; edited objects, manual IDs and the legacy
+     * tombstone survive.
+     */
+    function seedUnmigratedMergedList(): void {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+    }
+    const SEPARATED_USER_MANAGED_LIST = [
+      "anthropic/my-manual-model",
+      { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+    ];
+
+    it("finishes a skipped discovered-models migration on a conclusive refresh", async () => {
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration on an inconclusive refresh", async () => {
+      // A newly listed provider's first fetch fails: the catalog flips to
+      // unknown (see the fail-open test above), but the write still stamps
+      // the flag and therefore still has to separate the merged list.
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([
+              { name: "anthropic", type: "anthropic", enabled: true },
+              { name: "vertex", type: "google", enabled: true },
+            ])
+          );
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/vertex/v1/models`) {
+          return Promise.resolve(new Response("gateway overloaded", { status: 500 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(false);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toBeUndefined();
+      expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -5246,19 +5395,7 @@ describe("CoderOauthService", () => {
       expect(after).toBe(1);
     });
 
-    it("keeps configured models when disconnecting", async () => {
-      // The catalog is meaningless without credentials, but every configured
-      // entry is user-managed data and must survive — including one whose ID
-      // the catalog also lists (the user explicitly added it).
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth(),
-          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
-          discoveredModels: ["anthropic/discovered-model"],
-        },
-      };
-
+    function mockRevokeOnlyFetch(): void {
       mockFetch((input) => {
         const url = fetchUrl(input);
         if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
@@ -5266,6 +5403,23 @@ describe("CoderOauthService", () => {
         }
         return Promise.resolve(new Response("unexpected", { status: 500 }));
       });
+    }
+
+    it("keeps configured models when disconnecting", async () => {
+      // The catalog is meaningless without credentials, but every configured
+      // entry is user-managed data and must survive — including one whose ID
+      // the catalog also lists (the user explicitly added it under the new
+      // contract, which stamps the flag).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
+          discoveredModels: ["anthropic/discovered-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockRevokeOnlyFetch();
 
       const result = await service.disconnect();
       expect(result.success).toBe(true);
@@ -5277,6 +5431,67 @@ describe("CoderOauthService", () => {
       ]);
       expect(coderSection.discoveredModels).toEqual([]);
       expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("keeps a list that never had a catalog marker when disconnecting", async () => {
+      // No marker means old code never merged into this list (it is
+      // user-managed by construction), so a disconnect preserves it verbatim
+      // while stamping the flag like every new-code writer.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("finishes a skipped discovered-models migration before clearing the catalog", async () => {
+      // Legacy merged list whose startup migration was skipped or failed (no
+      // flag): the disconnect stamps the flag, so it must strip the catalog
+      // entries the OLD markers list first — or the merged list would be
+      // frozen and every later startup would skip the migration. Edited
+      // objects, manual IDs and the legacy tombstone survive.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/discovered-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/discovered-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      // A later start finds the flag and does nothing.
+      const afterDisconnect = JSON.stringify(deps.providersConfig);
+      await service.separateDiscoveredModelsOnce();
+      expect(JSON.stringify(deps.providersConfig)).toBe(afterDisconnect);
     });
 
     it("does not clear a newer login that completed while revocation was pending", async () => {

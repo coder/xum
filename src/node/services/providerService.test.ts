@@ -13,6 +13,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { PolicyService } from "@/node/services/policyService";
+import { CoderOauthService } from "@/node/services/coderOauthService";
 import { ProviderService } from "./providerService";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
@@ -1030,6 +1031,66 @@ describe("ProviderService model normalization", () => {
       >;
       expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-c"]);
       expect(stored.removedModels).toBeUndefined();
+    });
+  });
+
+  it("protects a Coder edit made before the one-shot migration ran from being stripped by it", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // Old-code shape (catalog merged into `models`, no flag) whose startup
+      // migration is still pending — e.g. waiting for the providers-file lock.
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: ["anthropic/catalog-a", "anthropic/catalog-b"],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
+        },
+      });
+      const coderOauth = new CoderOauthService(
+        new ProvidersConfigStore(config.rootDir),
+        new FileLeaseManager(config.rootDir),
+        service
+      );
+      // Hold the migration right BEFORE it takes the providers-file lock, so
+      // the edit below deterministically lands first and the migration then
+      // reads the edited section inside the real locked read-modify-write.
+      const realUpdateProviderSection = service.updateProviderSection.bind(service);
+      let releaseMigration!: () => void;
+      const migrationGate = new Promise<void>((resolve) => (releaseMigration = resolve));
+      let migrationWaiting!: () => void;
+      const migrationWaitingPromise = new Promise<void>((resolve) => (migrationWaiting = resolve));
+      const updateSpy = spyOn(service, "updateProviderSection").mockImplementation(
+        async (provider, update) => {
+          migrationWaiting();
+          await migrationGate;
+          return realUpdateProviderSection(provider, update);
+        }
+      );
+      try {
+        const migration = coderOauth.separateDiscoveredModelsOnce();
+        await migrationWaitingPromise;
+
+        // The user keeps catalog-a explicitly and adds a manual model: this
+        // edit stamps the flag under the lock.
+        const edit = await service.setModels("coder", [
+          "anthropic/catalog-a",
+          "anthropic/manual-model",
+        ]);
+        expect(edit.success).toBe(true);
+
+        releaseMigration();
+        await migration;
+      } finally {
+        updateSpy.mockRestore();
+        await coderOauth.dispose();
+      }
+
+      // The resumed migration found the flag and left the explicit list —
+      // including the catalog ID — untouched.
+      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+        ?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual(["anthropic/catalog-a", "anthropic/manual-model"]);
+      expect(stored.discoveredModels).toEqual(["anthropic/catalog-a", "anthropic/catalog-b"]);
+      expect(stored.discoveredModelsUnlisted).toBe(true);
     });
   });
 
