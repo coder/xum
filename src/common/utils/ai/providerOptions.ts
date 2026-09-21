@@ -50,7 +50,10 @@ import {
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
-import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import {
+  bedrockOpenAIModelId,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
 import {
   customProviderWireOrigin,
   isCustomProviderConfig,
@@ -511,13 +514,22 @@ export function buildProviderOptions(
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
     // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
     // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
-    // would drop reasoning.effort. Force the classification; Mantle rejects
-    // every reasoning.summary value except "auto" with HTTP 400.
+    // would drop the ENTIRE reasoning object (effort, summary, and pro mode).
+    // Force the classification; Mantle rejects every reasoning.summary value
+    // except "auto" with HTTP 400. Mantle is reachable through two Coder
+    // instance types: bedrock (whose OpenAI-namespaced IDs already select the
+    // Responses wire) and openai (Mantle speaks OpenAI Responses natively).
+    // Key on the wire model ID's namespace, not the instance type alone, so
+    // the real OpenAI upstream on an openai-typed instance keeps the SDK's
+    // own detection and "detailed" summaries.
+    const coderWire =
+      routeProvider === "coder" && modelString.startsWith("coder:")
+        ? resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
+        : null;
     const bedrockOpenAIWire =
-      routeProvider === "coder" &&
-      modelString.startsWith("coder:") &&
-      resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
-        ?.providerType === "bedrock";
+      coderWire != null &&
+      (coderWire.providerType === "bedrock" || coderWire.providerType === "openai") &&
+      bedrockOpenAIModelId(coderWire.modelId) != null;
 
     log.debug("buildProviderOptions: OpenAI config", {
       reasoningEffort,

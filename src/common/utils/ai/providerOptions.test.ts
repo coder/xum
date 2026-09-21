@@ -577,6 +577,159 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     });
   });
 
+  // A Mantle deployment can also be registered as an OPENAI-typed instance
+  // (it speaks OpenAI Responses natively). The wire model ID stays in
+  // Bedrock's openai.<model> namespace, so the SDK's reasoning-model
+  // detection misses it exactly like on the bedrock-typed instance above.
+  describe("openai-typed instance serving Bedrock Mantle OpenAI-namespaced models", () => {
+    const instance = "bedrock-mantle-us-west-2";
+    const wireModelId = "openai.gpt-6-astra";
+    const modelString = `coder:${instance}/${wireModelId}`;
+    const mantleConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: instance, type: "openai" }],
+        // Capability alias: the openai-typed metadata identity
+        // (openai:openai.gpt-6-astra) misses the Astra matchers on its own.
+        models: [{ id: `${instance}/${wireModelId}`, mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    const build = (
+      level: Parameters<typeof buildProviderOptions>[1],
+      reasoningMode: Parameters<typeof buildProviderOptions>[10]
+    ) =>
+      buildProviderOptions(
+        modelString,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder",
+        undefined,
+        reasoningMode
+      );
+    const openaiOptions = (
+      level: Parameters<typeof buildProviderOptions>[1],
+      reasoningMode: Parameters<typeof buildProviderOptions>[10]
+    ): OpenAIResponsesProviderOptions | undefined => {
+      const result = build(level, reasoningMode);
+      return "openai" in result ? result.openai : undefined;
+    };
+
+    test("forces the reasoning classification and Mantle's summary mode", () => {
+      expect(openaiOptions("high", undefined)).toMatchObject({
+        forceReasoning: true,
+        reasoningEffort: "high",
+        reasoningSummary: "auto",
+      });
+    });
+
+    // The actual defect surfaced at the SDK boundary: without forceReasoning
+    // @ai-sdk/openai omits the ENTIRE reasoning object for openai.<model> IDs,
+    // silently dropping effort AND pro mode while the options looked correct.
+    test.each([
+      ["max", "pro", { effort: "max", summary: "auto", mode: "pro" }],
+      ["xhigh", "standard", { effort: "xhigh", summary: "auto" }],
+    ] as const)(
+      "serializes %s/%s to the Responses wire with the AWS model ID",
+      async (level, reasoningMode, expectedReasoning) => {
+        const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
+        const captureFetch = Object.assign(
+          (
+            input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1]
+          ): Promise<Response> => {
+            if (typeof init?.body !== "string") {
+              throw new Error("Expected the OpenAI provider to send a JSON string body");
+            }
+            const url =
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : input.url;
+            captured.push({
+              path: new URL(url).pathname,
+              body: JSON.parse(init.body) as Record<string, unknown>,
+            });
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  id: "resp_test",
+                  model: wireModelId,
+                  output: [],
+                  usage: { input_tokens: 1, output_tokens: 0 },
+                }),
+                { status: 200, headers: { "content-type": "application/json" } }
+              )
+            );
+          },
+          { preconnect: fetch.preconnect.bind(fetch) }
+        );
+        // Mirrors providerModelFactory's Coder handler: an openai-typed
+        // instance is served by createOpenAI(...).responses(<wire model ID>).
+        const openai = createOpenAI({
+          apiKey: "coder",
+          baseURL: "https://coder.example.test/api/v2/aibridge/bedrock-mantle-us-west-2/v1",
+          fetch: captureFetch,
+        });
+        const options = openaiOptions(level, reasoningMode);
+        if (!options) {
+          throw new Error("Expected OpenAI Responses provider options");
+        }
+
+        await generateText({
+          model: openai.responses(wireModelId),
+          prompt: "Return ok.",
+          providerOptions: { openai: options },
+          maxRetries: 0,
+        });
+
+        expect(captured).toHaveLength(1);
+        expect(captured[0].path).toBe("/api/v2/aibridge/bedrock-mantle-us-west-2/v1/responses");
+        expect(captured[0].body.model).toBe(wireModelId);
+        expect(captured[0].body.reasoning).toEqual(expectedReasoning);
+      }
+    );
+
+    test("keeps effort and pro independent", () => {
+      expect(openaiOptions("xhigh", "pro")).toMatchObject({
+        reasoningEffort: "xhigh",
+        reasoningMode: "pro",
+      });
+      const standardMax = openaiOptions("max", "standard");
+      expect(standardMax).toMatchObject({ reasoningEffort: "max" });
+      expect(standardMax).not.toHaveProperty("reasoningMode");
+    });
+
+    test("does not force the classification for the real OpenAI upstream on an openai-typed instance", () => {
+      const options = buildProviderOptions(
+        "coder:openai/gpt-6-astra",
+        "max",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mantleConfig,
+        "coder",
+        undefined,
+        "pro"
+      ) as { openai?: Record<string, unknown> };
+      expect(options.openai).not.toHaveProperty("forceReasoning");
+      expect(options.openai).toMatchObject({
+        reasoningEffort: "max",
+        reasoningMode: "pro",
+        reasoningSummary: "detailed",
+      });
+    });
+  });
+
   // Discovered metadata must win over the instance NAME: a valid instance can
   // use a canonical route name with a different type, and normalizing the name
   // before consulting metadata would emit options for the wrong wire.
