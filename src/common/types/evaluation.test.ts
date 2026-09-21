@@ -15,6 +15,7 @@ import {
   type EvaluationJsonValue,
   type EvaluationQuestion,
   type EvaluationQuestions,
+  parseEvaluationInputBounded,
 } from "./evaluation";
 
 function choiceQuestion(optionCount: number): EvaluationQuestion {
@@ -360,9 +361,9 @@ describe("canonicalRequestBytes", () => {
       }
       return value;
     };
-    expect(jsonDepth("scalar")).toBe(0);
-    expect(jsonDepth([])).toBe(1);
-    expect(jsonDepth({ a: {} })).toBe(2);
+    expect(jsonDepth("scalar", EVALUATION_MAX_DEPTH)).toBe(0);
+    expect(jsonDepth([], EVALUATION_MAX_DEPTH)).toBe(1);
+    expect(jsonDepth({ a: {} }, EVALUATION_MAX_DEPTH)).toBe(2);
     // The wrapper object contributes one level, so state may nest MAX - 1 deep.
     expect(
       canonicalRequestBytes({ state: nest(EVALUATION_MAX_DEPTH - 1), questions: QUESTIONS })
@@ -394,5 +395,35 @@ describe("canonicalRequestBytes", () => {
         questions: QUESTIONS,
       })
     ).toMatchObject({ ok: false, violation: "request-too-deep" });
+
+    // The schema entry point is bounded too: zod's z.lazy recursion never runs
+    // on such values.
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, deep)).toMatchObject({
+      ok: false,
+      violation: "request-too-deep",
+      depth: EVALUATION_MAX_DEPTH + 1,
+    });
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, cyclic)).toMatchObject({
+      ok: false,
+      violation: "request-too-deep",
+    });
+    expect(
+      parseEvaluationInputBounded(WorkflowEvaluateSpecSchema, { id: "s", questions: cyclic })
+    ).toMatchObject({ ok: false, violation: "request-too-deep" });
+  });
+});
+
+describe("parseEvaluationInputBounded", () => {
+  it("parses in-limit values and reports schema violations as zod errors", () => {
+    const ok = parseEvaluationInputBounded(EvaluationStateSchema, { a: [1, "b", null] });
+    expect(ok).toEqual({ ok: true, value: { a: [1, "b", null] } });
+
+    const invalid = parseEvaluationInputBounded(EvaluationStateSchema, 42);
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok && invalid.violation === "invalid") {
+      expect(invalid.error.issues.length).toBeGreaterThan(0);
+    } else {
+      throw new Error("expected a schema violation");
+    }
   });
 });

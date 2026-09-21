@@ -495,11 +495,10 @@ export type CanonicalRequestResult =
  * Iterative and bounded: `state` is untrusted workflow input, so a recursive
  * walk (or `JSON.stringify`) over a pathologically deep or cyclic value would
  * throw `RangeError` instead of a typed violation. Counting stops as soon as
- * `limit + 1` is reached; the returned depth is then exactly `limit + 1`.
- * Callers must run this check before any recursive consumer of the value,
- * including `EvaluationStateSchema` (zod recurses through `z.lazy`).
+ * `limit + 1` is reached; the returned depth is then exactly `limit + 1`. The
+ * limit is mandatory because a cyclic value never runs out of depth.
  */
-export function jsonDepth(value: unknown, limit: number = Number.POSITIVE_INFINITY): number {
+export function jsonDepth(value: unknown, limit: number): number {
   if (value === null || typeof value !== "object") {
     return 0;
   }
@@ -525,7 +524,36 @@ export function jsonDepth(value: unknown, limit: number = Number.POSITIVE_INFINI
   return deepest;
 }
 
-/** Canonical (key-sorted) JSON, as used for hashing and replay identity. */
+export type BoundedParseResult<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly violation: "request-too-deep"; readonly depth: number }
+  | { readonly ok: false; readonly violation: "invalid"; readonly error: z.ZodError };
+
+/**
+ * The only supported way to apply the evaluation schemas to untrusted raw
+ * values (sandbox `state`/spec, or persisted records read back from disk).
+ * The recursive schemas (`z.lazy`) and canonicalization would overflow the
+ * stack on a pathologically deep or cyclic value, so the bounded iterative
+ * depth walk runs first and turns such input into a typed violation.
+ */
+export function parseEvaluationInputBounded<T>(
+  schema: z.ZodType<T>,
+  raw: unknown
+): BoundedParseResult<T> {
+  const depth = jsonDepth(raw, EVALUATION_MAX_DEPTH);
+  if (depth > EVALUATION_MAX_DEPTH) {
+    return { ok: false, violation: "request-too-deep", depth };
+  }
+  const parsed = schema.safeParse(raw);
+  return parsed.success
+    ? { ok: true, value: parsed.data }
+    : { ok: false, violation: "invalid", error: parsed.error };
+}
+
+/**
+ * Canonical (key-sorted) JSON, as used for hashing and replay identity.
+ * Recursive: only call it on values that passed a bounded depth check.
+ */
 export function canonicalEvaluationJson(value: unknown): string {
   return stableStringify(value);
 }
