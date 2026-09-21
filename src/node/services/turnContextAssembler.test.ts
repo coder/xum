@@ -269,6 +269,50 @@ describe("prepareProviderRequestMessages", () => {
     ]);
   });
 
+  test("drops hidden plan-review record rows but keeps feedback rows", () => {
+    const snapshot = createMuxMessage("plan-review-snapshot", "user", "<mux_plan_review>…", {
+      historySequence: 1,
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "rec1", snapshotId: "s1" },
+    });
+    const feedback = createMuxMessage("plan-review-feedback", "user", "<mux_plan_review>…", {
+      historySequence: 2,
+      muxMetadata: {
+        type: "plan-review",
+        kind: "feedback",
+        recordId: "rec2",
+        snapshotId: "s1",
+        feedbackId: "f1",
+      },
+    });
+    const answer = createMuxMessage("answer", "assistant", "revised", { historySequence: 3 });
+    const resolve = createMuxMessage("plan-review-resolve", "user", "<mux_plan_review>…", {
+      historySequence: 4,
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
+    });
+    const nextUser = createMuxMessage("next-user", "user", "continue", { historySequence: 5 });
+
+    const prepared = prepareProviderRequestMessages(
+      [snapshot, feedback, answer, resolve, nextUser],
+      "openai",
+      "off"
+    );
+
+    expect(prepared.activeContextMessages.map((message) => message.id)).toEqual([
+      "plan-review-feedback",
+      "answer",
+      "next-user",
+    ]);
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "plan-review-feedback",
+      "answer",
+      "next-user",
+    ]);
+    // Hidden rows are ordinary content filtering, not a boundary/keep-recent removal.
+    expect(prepared.contextBoundarySlicedCount).toBe(0);
+  });
+
   test("excludes the stamped keep-recent tail from RLM compaction summarization requests", () => {
     const head = createMuxMessage("head-user", "user", "old context", { historySequence: 1 });
     const headReply = createMuxMessage("head-assistant", "assistant", "old reply", {

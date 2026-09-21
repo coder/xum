@@ -1581,6 +1581,50 @@ describe("StreamingMessageAggregator", () => {
       });
     });
 
+    test("hides plan-review record rows even when debugLlmRequest is enabled", () => {
+      // Debug mode shows what the model sees; record rows are never sent, so they stay hidden.
+      // Feedback rows are real user messages and remain visible either way.
+      const load = () => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        const snapshot = createMuxMessage("plan-snapshot", "user", "<mux_plan_review>…", {
+          timestamp: 1,
+          historySequence: 1,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "snapshot",
+            recordId: "rec1",
+            snapshotId: "s1",
+          },
+        });
+        const feedback = createMuxMessage("plan-feedback", "user", "<mux_plan_review>…", {
+          timestamp: 2,
+          historySequence: 2,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "feedback",
+            recordId: "rec2",
+            snapshotId: "s1",
+            feedbackId: "f1",
+          },
+        });
+        const resolve = createMuxMessage("plan-resolve", "user", "<mux_plan_review>…", {
+          timestamp: 3,
+          historySequence: 3,
+          synthetic: true,
+          muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
+        });
+        aggregator.loadHistoricalMessages([snapshot, feedback, resolve], false);
+        return aggregator
+          .getDisplayedMessages()
+          .filter((m) => m.type === "user")
+          .map((m) => m.id);
+      };
+
+      expect(load()).toEqual(["plan-feedback"]);
+      expect(withDebugLlmRequestEnabled(load)).toEqual(["plan-feedback"]);
+    });
+
     test("should disable displayed message cap when showAllMessages is enabled", () => {
       // Test smart truncation: user messages are always kept, while older assistant/tool/
       // reasoning rows can be filtered behind a history-hidden marker.

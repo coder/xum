@@ -77,6 +77,28 @@ describe("selectRollingCut", () => {
     expect(selectRollingCut(rows, null, budget)?.tail).toEqual([]);
   });
 
+  test("never starts a turn at a plan-review record row", () => {
+    // A hidden record row is user-role synthetic UI state. Treating it as a human turn would
+    // cut the tail right before an assistant answer that belongs to the previous turn.
+    const record: MuxMessage = {
+      ...message("plan-review-record", "user", 50),
+      metadata: {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+      },
+    };
+    const rows = [
+      ...oldHead(),
+      record,
+      message("previous-answer", "assistant", 16_000),
+      message("recent-user", "user", 100),
+      message("recent-answer", "assistant", 16_000),
+    ];
+    const cut = selectRollingCut(rows, null, budget);
+    expect(cut?.head).toEqual(rows.slice(0, 4));
+    expect(cut?.tail).toEqual(rows.slice(4));
+  });
+
   test("splits consecutive tool-only steps only at recorded boundaries and duplicates the user cluster", () => {
     const answer = steppedAnswer(18_000);
     const rows = [...oldHead(), snapshot("file"), message("user", "user", 100), answer];
