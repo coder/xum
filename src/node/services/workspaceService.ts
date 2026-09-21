@@ -12828,11 +12828,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  async dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>> {
+  async dispatchPendingCompactionFollowUp(
+    workspaceId: string,
+    internal?: { turnAdmission?: TurnAdmissionToken }
+  ): Promise<Result<boolean>> {
     try {
       return Ok(
         await this.withStartupSession(workspaceId, (session) =>
-          session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true)
+          session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true, internal)
         )
       );
     } catch (error) {

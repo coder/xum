@@ -10388,7 +10388,11 @@ export class AgentSession {
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
     cancelResume?: () => boolean,
-    startStreamInBackground = false
+    startStreamInBackground = false,
+    // Task-attempt obligation bound by a startup re-drive for exactly the attempt it rotated
+    // (see TaskWorkspaceSeam.dispatchPendingCompactionFollowUp); rides the send as its token
+    // and staleness probe. Absent for the session's own stream-end dispatch.
+    turnAdmission?: TurnAdmissionToken
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -10663,7 +10667,10 @@ export class AgentSession {
           (this.isBusy() && this.coordinator.phase !== "completing")
       : undefined;
     const followUpAdmissionStale = () =>
-      resumeCanceled() || idleRuleStale?.() === true || goalAdmissionStale?.() === true;
+      resumeCanceled() ||
+      idleRuleStale?.() === true ||
+      goalAdmissionStale?.() === true ||
+      turnAdmission?.admissionStale() === true;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
       workspaceId: this.workspaceId,
@@ -10779,6 +10786,7 @@ export class AgentSession {
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
+      turnAdmission,
     });
     if (!sendResult.success) {
       if (resumeCanceled()) {
@@ -11679,10 +11687,16 @@ export class AgentSession {
 
   async dispatchPendingCompactionFollowUpIfNeeded(
     summaryMessageId?: string,
-    startStreamInBackground = false
+    startStreamInBackground = false,
+    internal?: { turnAdmission?: TurnAdmissionToken }
   ): Promise<boolean> {
     this.assertNotDisposed("dispatchPendingCompactionFollowUpIfNeeded");
-    return this.dispatchPendingFollowUp(summaryMessageId, undefined, startStreamInBackground);
+    return this.dispatchPendingFollowUp(
+      summaryMessageId,
+      undefined,
+      startStreamInBackground,
+      internal?.turnAdmission
+    );
   }
 
   /**

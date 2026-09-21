@@ -4383,8 +4383,14 @@ describe("TaskService", () => {
       expect(sendMessage).toHaveBeenCalledTimes(taskStatus == null ? 1 : 2);
       expect(sendMessage.mock.calls[0]?.[0]).toBe("crashed");
       expect(findWorkspaceInConfig(config, "stopped")?.taskStatus).toBe(taskStatus);
-      expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith("stopped");
-      expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith("compacted");
+      expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith(
+        "stopped",
+        expect.anything()
+      );
+      expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith(
+        "compacted",
+        expect.anything()
+      );
     }
   );
 

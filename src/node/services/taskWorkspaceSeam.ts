@@ -441,7 +441,16 @@ export interface WorkspaceTurnHost {
 export interface TurnAdmissionHost {
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
-  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
+  /**
+   * Startup re-drive of a pending compaction follow-up. `internal.turnAdmission` is the
+   * task-attempt obligation the caller bound for it (admitTaskWorkspaceTurn): carried to the
+   * session's send as its token and staleness probe, so the follow-up is admitted under exactly
+   * that attempt or refused. The caller disposes a token that produced no turn.
+   */
+  dispatchPendingCompactionFollowUp(
+    workspaceId: string,
+    internal?: { turnAdmission?: TurnAdmissionToken }
+  ): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
@@ -692,7 +701,15 @@ export interface AgentTaskIntegration {
    */
   admitTaskWorkspaceTurn(
     workspaceId: string,
-    options: { acceptanceOrigin: TurnAcceptanceOrigin }
+    options: {
+      acceptanceOrigin: TurnAcceptanceOrigin;
+      /**
+       * The attempt this send was decided for (a reservation's id, a startup rotation): refused
+       * when the row names another attempt, so a decision never adopts a successor admitted by
+       * another writer between its own admission and this handoff.
+       */
+      expectedAttemptId?: string;
+    }
   ): TaskTurnAdmission;
   restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,

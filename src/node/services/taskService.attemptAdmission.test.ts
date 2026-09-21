@@ -97,6 +97,11 @@ interface Internals {
     entry: WorkspaceConfigEntry
   ) => Promise<{ proven: boolean; reason: string }>;
   admitTaskDesktopRecovery: (taskId: string) => Promise<boolean>;
+  failAgentTaskTerminally: (
+    workspaceId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    failure: { errorType: string; errorMessage: string }
+  ) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -242,6 +247,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
   }
 
   const entryOf = (config: Config, id: string) => findWorkspaceInConfig(config, id);
+  /** The entry with its project path, as the stream-end producers receive it. */
+  function findEntryWithProject(config: Config, id: string) {
+    for (const [projectPath, project] of config.loadConfigOrDefault().projects) {
+      const workspace = project.workspaces.find((w) => w.id === id);
+      if (workspace) return { projectPath, workspace };
+    }
+    throw new Error(`workspace ${id} not found`);
+  }
 
   describe("identity writers", () => {
     test("reservation persists a fresh attempt id owned as receipt-eligible; the launch keeps it and fences its send", async () => {
@@ -844,6 +857,319 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // Retired: untouched and never sent.
       expect(entryOf(config, retired)?.taskAttemptId).toBe(claim.attemptId);
       expect(sendMessage.mock.calls.filter((call) => call[0] === retired)).toHaveLength(0);
+    });
+
+    test.each(["before-launch", "during-materialize", "on-failure"] as const)(
+      "a reserved launch whose row was re-reserved by another writer (%s) neither adopts, dispatches, nor cleans up the successor",
+      async (when) => {
+        const taskId = "reservedsuper1";
+        const foreign = "att_00000000000000a7";
+        const { config, projectPath } = await setupTree([]);
+        stubStableIds(config, [taskId]);
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        // A marker in the task's session dir: the launch's cleanup removes that dir.
+        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
+        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
+        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
+        // Another backend recovered the row and re-reserved it under its own attempt.
+        const supersede = () =>
+          config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              const ws = project.workspaces.find((w) => w.id === taskId);
+              if (ws) ws.taskAttemptId = foreign;
+            }
+            return cfg;
+          });
+        const materialization = {
+          workspacePath: projectPath,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" as const },
+          runtimeForTaskWorkspace: {
+            deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+            getWorkspacePath: () => "/tmp/reserved-super",
+          },
+          inheritedProjects: undefined,
+        };
+        if (when === "before-launch") {
+          const launch = svc.startReservedAgentTask.bind(taskService);
+          spyOn(svc, "startReservedAgentTask").mockImplementation(async (plan) => {
+            await supersede();
+            return launch(plan);
+          });
+        }
+        spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(async () => {
+          if (when === "during-materialize") await supersede();
+          return materialization;
+        });
+        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+          async () => {
+            if (when === "on-failure") {
+              await supersede();
+              return "sanitize failed";
+            }
+            return undefined;
+          }
+        );
+
+        const created = await taskService.createMany([
+          {
+            parentWorkspaceId: rootId,
+            kind: "agent",
+            agentId: "explore",
+            prompt: "go",
+            title: "T",
+          },
+        ]);
+        expect(created.success).toBe(true);
+        const reserved = svc.ownedAttemptByTaskId.get(taskId)!.attemptId!;
+        expect(reserved).toMatch(ATTEMPT_ID);
+        // The launch settles one way or the other; nothing about the successor's row may move.
+        const deadline = Date.now() + 2_000;
+        while (entryOf(config, taskId)?.taskAttemptId !== foreign) {
+          if (Date.now() > deadline) throw new Error("supersession never landed");
+          await settle();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskAttemptId: foreign,
+          taskStatus: "starting",
+        });
+        expect(entryOf(config, taskId)?.taskLaunchError).toBeUndefined();
+        expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(reserved);
+        expect(svc.currentAttemptIdByTaskId.get(taskId)).not.toBe(foreign);
+        expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreign);
+        expect(await fsPromises.readFile(sessionMarker, "utf-8")).toBe("keep");
+      }
+    );
+
+    test.each(["admitted-after-sample", "pending-before-decision"] as const)(
+      "terminal failure closes the attempt before sampling activity: a send %s is refused or drained, never run under a settled attempt",
+      async (race) => {
+        const taskId = "terminal-failure-race";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000a8" },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        const svc = internals(taskService);
+        shortenTerminationTimers();
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const attemptId = entryOf(config, taskId)!.taskAttemptId!;
+        const owned = svc.ownedAttemptByTaskId.get(taskId);
+        const entry = findEntryWithProject(config, taskId);
+        let pending: TurnAdmissionToken | undefined;
+        if (race === "pending-before-decision") {
+          pending = admitted(
+            taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+          );
+        }
+        // A send reaching the fence after the producer sampled activity but before its config
+        // updater ran must meet a closed attempt.
+        let raced: TaskTurnAdmission | undefined;
+        const edit = taskService.editWorkspaceEntry.bind(taskService);
+        spyOn(taskService, "editWorkspaceEntry").mockImplementation(
+          async (id, updater, options) => {
+            if (id === taskId && raced == null) {
+              raced = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" });
+              if (raced.kind === "admitted") raced.token.onAdmitted(Symbol("late-turn"));
+            }
+            return edit(id, updater, options);
+          }
+        );
+        const failure = svc.failAgentTaskTerminally(taskId, entry, {
+          errorType: "provider",
+          errorMessage: "boom",
+        });
+        if (race === "pending-before-decision") {
+          // The pending obligation counted as live: a stop record captured it and cannot release
+          // (nor settle) until it is dispositioned.
+          await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+          expect(svc.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(1);
+          expect(pending!.admissionStale()).toBe(true);
+          pending!.onDisposed("refused");
+        }
+        await failure;
+        // The closure refuses the late send; with a live obligation the latch refuses it first.
+        expect(raced).toEqual({
+          kind: "refused",
+          message:
+            race === "pending-before-decision"
+              ? WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE
+              : TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+        });
+        await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "interrupted",
+          taskAttemptId: attemptId,
+          taskLaunchError: "boom",
+        });
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+          attemptId,
+          attempt: owned,
+          phase: "settled",
+        });
+        expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+      }
+    );
+
+    test.each([
+      "rotated-before",
+      "retired-before",
+      "rotated-during",
+      "retired-during",
+      "clean",
+    ] as const)(
+      "startup compaction follow-up is fenced to the attempt rotated for this decision (%s)",
+      async (variant) => {
+        const taskId = "redrive-followup";
+        const snapshot = "att_00000000000000a9";
+        const foreign = "att_00000000000000b0";
+        const claim = {
+          runId: "wfr_f",
+          stepId: "s",
+          inputHash: "h",
+          childTaskId: taskId,
+          attemptId: foreign,
+          mode: "no-report" as const,
+          at: "2026-09-18T00:00:00.000Z",
+        };
+        const { config } = await setupTree([
+          { id: taskId, overrides: { taskStatus: "running", taskAttemptId: snapshot } },
+        ]);
+        const interfere = () =>
+          config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              const ws = project.workspaces.find((w) => w.id === taskId);
+              if (!ws) continue;
+              if (variant.startsWith("rotated")) ws.taskAttemptId = foreign;
+              else if (variant.startsWith("retired")) ws.taskAttemptRetiredBy = claim;
+            }
+            return cfg;
+          });
+        const turn = Symbol("follow-up-turn");
+        const dispatchCalls: Array<{ turnAdmission?: TurnAdmissionToken; stale?: boolean }> = [];
+        const dispatchPendingCompactionFollowUp = mock(
+          async (
+            ...[, internal]: Parameters<WorkspaceHost["dispatchPendingCompactionFollowUp"]>
+          ): Promise<Result<boolean>> => {
+            if (variant.endsWith("-during")) await interfere();
+            const stale = internal?.turnAdmission?.admissionStale();
+            dispatchCalls.push({ turnAdmission: internal?.turnAdmission, stale });
+            // The session's admission gates refuse a stale token; otherwise the follow-up's turn
+            // is admitted under it.
+            if (internal?.turnAdmission == null || stale === true) return Ok(false);
+            internal.turnAdmission.onAdmitted(turn);
+            return Ok(true);
+          }
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+          dispatchPendingCompactionFollowUp,
+        });
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        if (variant.endsWith("-before")) {
+          // Lands after this startup's rotation is durable, before the wrapper reaches the session.
+          const edit = taskService.editWorkspaceEntry.bind(taskService);
+          let once = false;
+          spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, opts) => {
+            const result = await edit(id, updater, opts);
+            if (id === taskId && !once && entryOf(config, taskId)?.taskAttemptId !== snapshot) {
+              once = true;
+              await interfere();
+            }
+            return result;
+          });
+        }
+        await taskService.recoverInterruptedTasks();
+        const row = entryOf(config, taskId)!;
+        if (variant === "clean") {
+          expect(dispatchCalls).toHaveLength(1);
+          expect(dispatchCalls[0].turnAdmission).toBeDefined();
+          expect(dispatchCalls[0].stale).toBe(false);
+          // The follow-up's turn is bound to the attempt rotated here, so a Stop captures it.
+          const sends = [...svc.admittedSendsByTaskId.get(taskId)!];
+          expect(sends.map((s) => s.attemptId)).toEqual([row.taskAttemptId!]);
+          expect(sends[0].state).toBe("admitted");
+          expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+          return;
+        }
+        if (variant.endsWith("-before")) {
+          // Not this decision's identity anymore: no wrapper call, no send, no obligation.
+          expect(dispatchCalls).toHaveLength(0);
+        } else {
+          expect(dispatchCalls).toHaveLength(1);
+          expect(dispatchCalls[0].stale).toBe(true);
+        }
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+        expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+        expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        if (variant.startsWith("rotated")) expect(row.taskAttemptId).toBe(foreign);
+        else expect(row.taskAttemptRetiredBy).toEqual(claim);
+      }
+    );
+
+    test("a reawaken whose send fails restores `interrupted` and discharges its obligation; the owner stays unsettled until an explicit Stop settles it", async () => {
+      // Deferred by the accepted plan (owned attempt interrupted without settlement evidence): the
+      // witness pins the recovery contract — no dangling obligation, and a Stop proves the lineage.
+      const taskId = "reawaken-send-failed";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000c9" },
+        },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const attemptId = entryOf(config, taskId)!.taskAttemptId!;
+      // WorkspaceService binds the obligation, the send fails before a turn: the token is refused
+      // and the status restored.
+      const token = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      token.onDisposed("refused");
+      await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted");
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskStatus: "interrupted",
+        taskAttemptId: attemptId,
+      });
+      expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+      expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(attemptId);
+      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
+      // A retry rotates again; its predecessor is owned but unsettled, so the retry's lineage is
+      // marked unproven (the deferred cost: no receipt can ever describe this chain)...
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(attemptId);
+      const rotated = entryOf(config, taskId)!.taskAttemptId!;
+      expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
+      // ...and an explicit Stop settles whatever is owned: the outcome recovers to terminal, the
+      // id is closed, and the next reawaken is admitted (still marked, as the marker is inherited).
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        kind: "terminal-no-report",
+      });
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId: rotated,
+        phase: "settled",
+      });
+      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+        source: "reawaken",
+        receiptEligible: false,
+      });
     });
 
     test("a pre-identity starting entry is stamped with a marked id at launch", async () => {

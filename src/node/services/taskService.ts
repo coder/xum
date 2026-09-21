@@ -75,6 +75,7 @@ import {
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
   TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS,
+  SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
@@ -2706,7 +2707,7 @@ export class TaskService implements AgentTaskIntegration {
    */
   admitTaskWorkspaceTurn(
     workspaceId: string,
-    options: { acceptanceOrigin: TurnAcceptanceOrigin }
+    options: { acceptanceOrigin: TurnAcceptanceOrigin; expectedAttemptId?: string }
   ): TaskTurnAdmission {
     assert(workspaceId.length > 0, "admitTaskWorkspaceTurn: workspaceId must be non-empty");
     let entry: WorkspaceConfigEntry | undefined;
@@ -2735,6 +2736,17 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
       });
       return { kind: "not-a-task" };
+    }
+    // A send decided for one attempt never binds to a successor another writer admitted since:
+    // the decision is stale, not the row (see TaskWorkspaceSeam.admitTaskWorkspaceTurn).
+    if (options.expectedAttemptId != null && attemptId !== options.expectedAttemptId) {
+      log.info("[task-attempt] send refused: decided for a superseded attempt", {
+        workspaceId,
+        expectedAttemptId: options.expectedAttemptId,
+        attemptId,
+        acceptanceOrigin: options.acceptanceOrigin,
+      });
+      return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
     }
     if (this.isWorkspaceStopInProgress(workspaceId)) {
       return { kind: "refused", message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE };
@@ -2849,7 +2861,7 @@ export class TaskService implements AgentTaskIntegration {
   private async rotateAttemptForStartupRedrive(
     taskId: string,
     snapshot: Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus">
-  ): Promise<boolean> {
+  ): Promise<string | undefined> {
     const attemptId = newTaskAttemptId();
     let committed = false;
     let moved = false;
@@ -2876,18 +2888,53 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         error,
       });
-      return false;
+      return undefined;
     }
     if (moved) {
       log.info("[startup] task skipped: its row moved after the recovery snapshot", { taskId });
-      return false;
+      return undefined;
     }
     if (!committed) {
       log.info("[startup] task skipped: its attempt was retired by a workflow claim", { taskId });
-      return false;
+      return undefined;
     }
     this.publishAttemptRotation(taskId, attemptId);
-    return true;
+    return attemptId;
+  }
+
+  /**
+   * Startup re-drive of a pending compaction follow-up, fenced to exactly the attempt this
+   * decision rotated: the obligation is bound here (refused when the row already names another
+   * writer's attempt — a decision never adopts a successor) and rides the session's send as its
+   * token and staleness probe, so a rotation or claim landing during the dispatch's awaits
+   * refuses it at the session's admission gates. A token that produced no turn is disposed here;
+   * an admitted one belongs to its turn (and to any Stop that captures it).
+   */
+  private async dispatchFencedStartupCompactionFollowUp(
+    taskId: string,
+    attemptId: string
+  ): Promise<Result<boolean>> {
+    const admission = this.admitTaskWorkspaceTurn(taskId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId: attemptId,
+    });
+    if (admission.kind !== "admitted") {
+      return Err(
+        admission.kind === "refused"
+          ? admission.message
+          : "Startup follow-up refused: the task record is no longer an agent task"
+      );
+    }
+    const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(taskId, {
+      turnAdmission: admission.token,
+    });
+    if (followUp.success && followUp.data) return followUp;
+    // Nothing dispatched. A token that reads stale now was refused at the session's gates because
+    // this decision's attempt is gone (rotated or retired by another writer): report that as a
+    // failure so the caller issues no further send for the decision.
+    const stale = admission.token.admissionStale();
+    admission.token.onDisposed(followUp.success && !stale ? "no-work" : "refused");
+    return stale ? Err(SEND_ADMISSION_STALE_MESSAGE) : followUp;
   }
 
   /**
@@ -3942,14 +3989,24 @@ export class TaskService implements AgentTaskIntegration {
       // the first send below; the sends are then fenced against the fresh id at the handoff.
       // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
       // admitted or stopped by another writer and must not be re-driven.
-      if (!(await this.rotateAttemptForStartupRedrive(task.id, task))) {
+      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotatedAttemptId == null) {
         failedAwaitingReportCount += 1;
         continue;
       }
-      const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      const followUp = await this.dispatchFencedStartupCompactionFollowUp(
+        task.id,
+        rotatedAttemptId
+      );
       if (!followUp.success) failedAwaitingReportCount += 1;
       else if (followUp.data) resumedAwaitingReportCount += 1;
       if (!followUp.success || followUp.data) continue;
+      // The completion prompt binds its obligation at the handoff (WorkspaceService); it may
+      // only be issued while the row still names the attempt this decision rotated.
+      if (this.currentTaskAttemptId(task.id) !== rotatedAttemptId) {
+        failedAwaitingReportCount += 1;
+        continue;
+      }
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
       });
@@ -3989,7 +4046,8 @@ export class TaskService implements AgentTaskIntegration {
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
       // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
-      if (!(await this.rotateAttemptForStartupRedrive(task.id, task))) {
+      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotatedAttemptId == null) {
         failedRunningCount += 1;
         continue;
       }
@@ -3999,10 +4057,21 @@ export class TaskService implements AgentTaskIntegration {
       const followUp =
         alreadyStreaming || queueOnly
           ? Ok(false)
-          : await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotatedAttemptId);
       if (!followUp.success) failedRunningCount += 1;
       else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
       if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
+      // Every further send of this decision is fenced to the attempt rotated for it: bound here
+      // (refused once another writer's attempt owns the row) and carried as the send's token, so
+      // the handoff never adopts a successor and a Stop captures the obligation.
+      const startupTaskId = task.id;
+      const fenceStartupSend = (): TurnAdmissionToken | undefined => {
+        const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
+          acceptanceOrigin: "automatic",
+          expectedAttemptId: rotatedAttemptId,
+        });
+        return admission.kind === "admitted" ? admission.token : undefined;
+      };
       const model = task.taskModelString ?? defaultModel;
       const agentId = resolveTaskAgentIdForResume(task);
       const sendOptions = {
@@ -4015,6 +4084,11 @@ export class TaskService implements AgentTaskIntegration {
       if (pendingGuidance.length > 0) {
         let sendResult: Result<void, SendMessageError> = Ok(undefined);
         for (const guidance of pendingGuidance) {
+          const token = fenceStartupSend();
+          if (token == null) {
+            sendResult = Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+            break;
+          }
           sendResult = await this.workspaceService.sendMessage(
             task.id,
             `Updated guidance from parent:\n\n${guidance.message}`,
@@ -4022,6 +4096,8 @@ export class TaskService implements AgentTaskIntegration {
             {
               ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
               restoreQueued: queueOnly,
+              turnAdmission: token,
+              admissionStale: () => token.admissionStale(),
             }
           );
           if (!sendResult.success) break;
@@ -4058,13 +4134,23 @@ export class TaskService implements AgentTaskIntegration {
       const restartCompletionInstruction = isPlanLike
         ? "When you have a final plan, call propose_plan exactly once."
         : "When you have a final answer, return it in your final assistant message.";
-      const sendResult = await this.workspaceService.sendMessage(
-        task.id,
-        "Xum restarted while this task was running. Continue where you left off. " +
-          restartCompletionInstruction,
-        sendOptions,
-        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
-      );
+      const nudgeToken = fenceStartupSend();
+      const sendResult =
+        nudgeToken == null
+          ? Err<SendMessageError>({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+          : await this.workspaceService.sendMessage(
+              task.id,
+              "Xum restarted while this task was running. Continue where you left off. " +
+                restartCompletionInstruction,
+              sendOptions,
+              {
+                acceptanceOrigin: "automatic",
+                synthetic: true,
+                agentInitiated: true,
+                turnAdmission: nudgeToken,
+                admissionStale: () => nudgeToken.admissionStale(),
+              }
+            );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
         failedRunningCount += 1;
@@ -5200,6 +5286,31 @@ export class TaskService implements AgentTaskIntegration {
     await this.markTaskLaunchFailed(plan.taskId, TASK_RESERVATION_CANCELED_MESSAGE);
   }
 
+  /**
+   * The row no longer names the attempt this launch plan was admitted for: another writer
+   * re-admitted the task meanwhile. Plans without an id (pre-identity records reached without
+   * the drain CAS) are never superseded by this test.
+   */
+  private launchSuperseded(
+    plan: Pick<TaskLaunchPlan, "taskId" | "attemptId">,
+    row: WorkspaceConfigEntry | undefined = findWorkspaceEntry(
+      this.config.loadConfigOrDefault(),
+      plan.taskId
+    )?.workspace
+  ): boolean {
+    return plan.attemptId != null && row?.taskAttemptId !== plan.attemptId;
+  }
+
+  /**
+   * This process's owned attempt is no longer the row's: the record, checkout and session dir
+   * belong to another writer's admission now, so a failure of the superseded attempt must not
+   * interrupt or delete them. Unowned tasks and pre-identity owners are never held back.
+   */
+  private ownedAttemptSuperseded(taskId: string, row: WorkspaceConfigEntry | undefined): boolean {
+    const owned = this.ownedAttemptByTaskId.get(taskId)?.attemptId;
+    return owned != null && row?.taskAttemptId !== owned;
+  }
+
   private async cleanupMaterializedTaskWorkspace(
     runtime: Runtime,
     projectPath: string,
@@ -5218,6 +5329,17 @@ export class TaskService implements AgentTaskIntegration {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
+    if (
+      this.ownedAttemptSuperseded(
+        taskId,
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace
+      )
+    ) {
+      log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
+        taskId,
+      });
+      return;
+    }
 
     if (options?.preservePhysicalWorkspace) {
       log.debug("Task launch cleanup: preserving shared parent checkout", { taskId });
@@ -5392,10 +5514,17 @@ export class TaskService implements AgentTaskIntegration {
     // awaited — no send can be admitted for that id from here on.
     const ownedAttempt = this.ownedAttemptByTaskId.get(taskId);
     let transitionedToInterrupted = false;
+    let superseded = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
       taskId,
       (ws) => {
+        // The failure belongs to the attempt this process owned; a row re-admitted by another
+        // writer meanwhile is that writer's to end (see ownedAttemptSuperseded).
+        if (this.ownedAttemptSuperseded(taskId, ws)) {
+          superseded = true;
+          return;
+        }
         transitionedToInterrupted = ws.taskStatus !== "interrupted";
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
@@ -5404,6 +5533,13 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (superseded) {
+      log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
+        taskId,
+        message,
+      });
+      return;
+    }
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
@@ -5453,6 +5589,19 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // The launch belongs to the reservation it was scheduled for. A row naming another attempt
+    // was re-admitted by another writer since (another backend's stale-starting revert followed
+    // by its own reservation): that attempt is owned and dispatched there. Adopting it would make
+    // two processes drive one attempt, and this launch's failure handling would interrupt or
+    // delete the successor's record and checkout — so it abandons without touching anything.
+    if (this.launchSuperseded(plan, entryAtStart.workspace)) {
+      log.info("[task-attempt] launch abandoned: its reservation was superseded", {
+        taskId: plan.taskId,
+        reservedAttemptId: plan.attemptId,
+        current: entryAtStart.workspace.taskAttemptId,
+      });
+      return;
+    }
     // An owned reservation (or the queue drain's launch CAS) keeps its identity through the
     // launch. A `starting` record nobody in this process owns under its current id (pre-identity
     // entry reached without the drain CAS) becomes owned here; without an id it is stamped
@@ -5598,7 +5747,7 @@ export class TaskService implements AgentTaskIntegration {
     await this.editWorkspaceEntry(
       plan.taskId,
       (ws) => {
-        if (ws.taskStatus !== "starting") {
+        if (ws.taskStatus !== "starting" || this.launchSuperseded(plan, ws)) {
           return;
         }
         ws.path = workspacePath;
@@ -5633,7 +5782,10 @@ export class TaskService implements AgentTaskIntegration {
       );
       return;
     }
-    if (entryBeforeSend.workspace.taskStatus !== "starting") {
+    if (
+      entryBeforeSend.workspace.taskStatus !== "starting" ||
+      this.launchSuperseded(plan, entryBeforeSend.workspace)
+    ) {
       initLogger.logComplete(-1);
       return;
     }
@@ -5721,7 +5873,10 @@ export class TaskService implements AgentTaskIntegration {
     // Launch fence (same-attempt send under the reservation's id): bind the obligation before
     // dispatch so a Stop landing during the send's own awaits captures it, and record that an
     // admission was attempted — a later launch failure can no longer claim "never admitted".
-    const admission = this.admitTaskWorkspaceTurn(plan.taskId, { acceptanceOrigin: "automatic" });
+    const admission = this.admitTaskWorkspaceTurn(plan.taskId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId: plan.attemptId,
+    });
     if (admission.kind !== "admitted") {
       const message =
         admission.kind === "refused"
@@ -14560,6 +14715,17 @@ export class TaskService implements AgentTaskIntegration {
     // settlement), so a stop record captures the live work and the execution-settlement producer
     // settles the attempt when that record releases.
     const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
+    // Close admission FIRST, synchronously with the decision: a send reaching the fence from here
+    // on is refused, so the activity sample below is authoritative — every obligation or turn
+    // admitted before it is visible to it and captured by the stop record, and none can be
+    // admitted between the sample and the persisted `interrupted` (that gap would otherwise let
+    // the no-record branch settle the attempt while a freshly admitted turn runs).
+    this.closeAttemptAdmission(
+      workspaceId,
+      this.currentTaskAttemptId(workspaceId),
+      ownedAttempt,
+      "terminal-failure"
+    );
     const liveExecution =
       this.workspaceService.getActiveTurnGeneration(workspaceId) != null ||
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId) != null ||
