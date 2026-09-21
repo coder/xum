@@ -15,6 +15,7 @@ import type {
   SharedV4ProviderOptions,
 } from "@ai-sdk/provider";
 import {
+  EvaluationRoundingSchema,
   validateAnswersAgainstQuestions,
   type EvaluationAnswers,
   type EvaluationErrorCode,
@@ -159,6 +160,29 @@ export function classifyEvaluationError(error: unknown): EvaluationError {
   return new EvaluationError({ reason: "provider-failure", code: "unknown" });
 }
 
+/**
+ * `null` when the provider reported full precision, the validated
+ * `{ probabilityDecimals?, scoreDecimals? }` projection otherwise, and
+ * `undefined` when the value is not a well-formed rounding object.
+ */
+function projectRounding(raw: unknown): EvaluationRounding | null | undefined {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  const parsed = EvaluationRoundingSchema.safeParse(raw);
+  if (!parsed.success) {
+    return undefined;
+  }
+  const rounding: EvaluationRounding = {};
+  if (parsed.data.probabilityDecimals !== undefined) {
+    rounding.probabilityDecimals = parsed.data.probabilityDecimals;
+  }
+  if (parsed.data.scoreDecimals !== undefined) {
+    rounding.scoreDecimals = parsed.data.scoreDecimals;
+  }
+  return rounding;
+}
+
 export function makeEvaluationService(): EvaluationService {
   return {
     evaluate: <const Q extends EvaluationQuestions>(call: EvaluationCall<Q>) =>
@@ -180,13 +204,20 @@ export function makeEvaluationService(): EvaluationService {
           catch: classifyEvaluationError,
         });
 
+        // Provider-reported rounding is untrusted output too: parse it into the
+        // bounded shape first so a non-object or extra fields can neither reach
+        // the validator nor be forwarded into persisted results.
+        const rounding = projectRounding(result.rounding);
+        if (rounding === undefined) {
+          return yield* new EvaluationError({
+            reason: "invalid-output",
+            code: "answer-validation",
+          });
+        }
+
         // Second, independent validation so answers are guaranteed to match
         // the questions we asked even if the SDK's own checks change.
-        const validated = validateAnswersAgainstQuestions(
-          call.questions,
-          result.answers,
-          result.rounding
-        );
+        const validated = validateAnswersAgainstQuestions(call.questions, result.answers, rounding);
         if (!validated.ok) {
           return yield* new EvaluationError({
             reason: "invalid-output",
@@ -196,7 +227,7 @@ export function makeEvaluationService(): EvaluationService {
 
         return {
           answers: validated.answers,
-          rounding: result.rounding ?? null,
+          rounding,
           usage: {
             inputTokens: result.usage.inputTokens ?? null,
             outputTokens: result.usage.outputTokens ?? null,

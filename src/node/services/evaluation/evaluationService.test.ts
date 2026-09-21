@@ -121,6 +121,39 @@ describe("EvaluationService.evaluate", () => {
     expect(calls[0].state).toEqual({ title: "hello" });
   });
 
+  it("projects only the validated rounding fields and rejects malformed rounding", async () => {
+    // Extra provider fields never reach the bounded result.
+    const { model: extraFields } = mockModel(() =>
+      Promise.resolve({
+        answers: VALID_ANSWERS,
+        rounding: { scoreDecimals: 1, vendor: SENTINEL } as unknown as { scoreDecimals: number },
+        warnings: [],
+      })
+    );
+    const projected = await Effect.runPromise(service.evaluate(call(extraFields, QUESTIONS)));
+    expect(projected.rounding).toEqual({ scoreDecimals: 1 });
+    expect(JSON.stringify(projected)).not.toContain(SENTINEL);
+
+    // A non-object rounding value is invalid output, not silently accepted.
+    const { model: nonObject } = mockModel(() =>
+      Promise.resolve({
+        answers: VALID_ANSWERS,
+        rounding: SENTINEL as unknown as { scoreDecimals: number },
+        warnings: [],
+      })
+    );
+    const exit = await Effect.runPromiseExit(service.evaluate(call(nonObject, QUESTIONS)));
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      const error = Cause.findErrorOption(exit.cause);
+      expect(Option.isSome(error)).toBe(true);
+      if (Option.isSome(error)) {
+        expect(error.value).toMatchObject({ reason: "invalid-output", code: "answer-validation" });
+        expect(JSON.stringify(error.value)).not.toContain(SENTINEL);
+      }
+    }
+  });
+
   it("maps missing usage to nulls and absent provider metadata to null", async () => {
     const { model } = mockModel(() => Promise.resolve({ answers: VALID_ANSWERS, warnings: [] }));
     const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
