@@ -7,6 +7,7 @@ import {
   isAutoModelRoutingEvaluationModel,
   splitAutoModelRoutingEvaluationModel,
 } from "@/common/types/autoModelRouting";
+import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -108,13 +109,23 @@ export function resolveEvaluationModelTarget(
     });
   }
   const baseURL = policy?.getForcedBaseUrl(provider) ?? credentials.baseUrl;
+  // Raw config: keep only string-valued header entries.
+  const configHeaders =
+    typeof config.headers === "object" && config.headers !== null
+      ? Object.fromEntries(
+          Object.entries(config.headers).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string"
+          )
+        )
+      : undefined;
   return Ok({
     provider: evaluationProvider,
     modelId,
     settings: {
       apiKey: credentials.apiKey,
       ...(baseURL ? { baseURL } : {}),
-      headers: Object.fromEntries(buildAIProviderRequestHeaders(undefined).entries()),
+      // Proxy headers from providers.jsonc ride along, as they do for chat requests.
+      headers: Object.fromEntries(buildAIProviderRequestHeaders(configHeaders).entries()),
     },
     ...(credentials.organization ? { organization: credentials.organization } : {}),
   });
@@ -132,7 +143,7 @@ function resolveTypeSafeCredentials(
       fileErrors: "ignore",
     }
   );
-  const baseUrl = typeof config.baseUrl === "string" && config.baseUrl ? config.baseUrl : undefined;
+  const baseUrl = resolveConfigBaseUrl(config);
   return resolved.kind === "resolved" ? { apiKey: resolved.apiKey, baseUrl } : { baseUrl };
 }
 

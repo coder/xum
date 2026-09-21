@@ -262,6 +262,27 @@ describe("evaluation model factory", () => {
     expect(target.data.settings.baseURL).toBeUndefined();
     expect(Object.keys(target.data.settings.headers)).toContain("user-agent");
 
+    // Proxy setups: both providers.jsonc base-URL spellings and configured headers reach
+    // the evaluator, as they do for chat requests.
+    for (const key of ["baseUrl", "baseURL"]) {
+      const proxied = resolveEvaluationModelTarget(
+        EVALUATION_MODEL,
+        deps({
+          typesafe: {
+            apiKey: "sk-test",
+            [key]: "https://proxy.example.test/jev",
+            headers: { "X-Proxy-Token": "proxy-token" },
+          },
+        })
+      );
+      expect(proxied.success && proxied.data.settings.baseURL).toBe(
+        "https://proxy.example.test/jev"
+      );
+      expect(proxied.success && proxied.data.settings.headers).toMatchObject({
+        "x-proxy-token": "proxy-token",
+      });
+    }
+
     const model = await Effect.runPromise(
       createEvaluationModel(EVALUATION_MODEL, deps({ typesafe: { apiKey: "sk-test" } }))
     );
