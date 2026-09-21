@@ -497,6 +497,12 @@ describe("parseEvaluationInputBounded", () => {
         questions: { q: { type: "choice", instructions: "x", criteria } },
       })
     ).toMatchObject({ ok: false, violation: "forbidden-key" });
+    // Wide but shallow in-limit input must not escape as an exception either.
+    const wide = { items: Array<number>(125_000).fill(0) };
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, wide)).toMatchObject({ ok: true });
+    expect(canonicalRequestBytes({ state: wide, questions: QUESTIONS })).toMatchObject({
+      ok: true,
+    });
     // Plain "__proto__" strings as values are fine.
     expect(parseEvaluationInputBounded(EvaluationStateSchema, { text: "__proto__" })).toMatchObject(
       { ok: true }

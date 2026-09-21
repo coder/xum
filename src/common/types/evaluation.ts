@@ -579,8 +579,12 @@ function findForbiddenJsonKey(value: unknown): string | undefined {
       continue;
     }
     if (Array.isArray(current)) {
+      // Indexed loop, not `push(...items)`: a wide but in-limit array (e.g.
+      // 125k scalars ≈ 250 KB) exceeds V8's argument limit when spread.
       const items: unknown[] = current;
-      stack.push(...items);
+      for (const item of items) {
+        stack.push(item);
+      }
       continue;
     }
     for (const key of Object.keys(current)) {
