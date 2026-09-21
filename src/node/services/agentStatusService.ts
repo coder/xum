@@ -18,6 +18,7 @@ import {
 import type { Config } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -558,7 +559,12 @@ export class AgentStatusService {
     );
     if (!result.success) return "";
 
-    const committedMessages: MuxMessage[] = [...result.data];
+    // Sidebar status is a provider request too: UI-only history rows (plan-review
+    // snapshot/resolve/reopen records, workflow display-only rows) must not leak
+    // into it. Filtering after the count-capped read is intentional: the window can
+    // shrink by a few rows, but a hidden record never contributes transcript text
+    // (and so never becomes the sole reason for a status regeneration).
+    const committedMessages: MuxMessage[] = result.data.filter((m) => !isModelHiddenMessage(m));
     const partial = await this.historyService.readPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees

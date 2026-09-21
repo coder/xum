@@ -6,6 +6,10 @@ import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/pr
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import {
   AGENT_STATUS_PROVIDER_FAILURE_IDLE_COOLDOWN_MS,
   AGENT_STATUS_PROVIDER_FAILURE_RETRY_ATTEMPTS,
 } from "@/constants/agentStatus";
@@ -249,6 +253,62 @@ describe("AgentStatusService", () => {
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(generateSpy.mock.calls[1][0]).toContain("Assistant (in progress): Reading config files");
+  });
+
+  test("hidden plan-review record rows never reach the status transcript", async () => {
+    // Snapshot/resolve/reopen records are synthetic user rows that carry the
+    // whole plan text. They are UI state, not conversation: the status model
+    // must not see them, and appending one must not trigger a regeneration.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please propose the plan")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Proposed the plan")
+    );
+    const planContent = "# Secret plan\n\nDo the thing.\n";
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec-1",
+      snapshotId: "snap-1",
+      planPath: "/tmp/plan.md",
+      contentHash: "a".repeat(64),
+      proposalToolCallId: "call-1",
+      content: planContent,
+    };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-1", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Please propose the plan");
+    expect(transcript).toContain("Assistant: Proposed the plan");
+    expect(transcript).not.toContain("mux_plan_review");
+    expect(transcript).not.toContain("Secret plan");
+
+    // A later resolve record changes history but not the transcript → dedup holds.
+    const resolve = { v: 1 as const, kind: "resolve" as const, recordId: "rec-2", threadId: "t-1" };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-2", "user", formatPlanReviewEnvelope(resolve), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(resolve),
+      })
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {
