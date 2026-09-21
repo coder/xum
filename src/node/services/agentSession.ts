@@ -7357,7 +7357,10 @@ export class AgentSession {
     options: SendMessageOptions
   ): Promise<ResolvedSendMessageOptions> {
     const { autoModelRouting, autoThinkingLevel, ...resumeOptions } = options;
-    const lastUserRow = await this.findLastUserRow();
+    // The same row a resume retries, searched across the whole active window: completed report
+    // cards and other non-retry rows are skipped, however many follow the interrupted turn.
+    const rows = await this.loadActiveRoutingRows();
+    const lastUserRow = this.findLastRetryUserMessage(rows);
     // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
     const parsedRecord = AutoModelRoutingRecordSchema.safeParse(
       lastUserRow?.metadata?.autoModelRouting
@@ -7365,6 +7368,17 @@ export class AgentSession {
     if (!parsedRecord.success) return resumeOptions;
     const record = parsedRecord.data;
     const retry = lastUserRow?.metadata?.retrySendOptions;
+    // An interrupted turn may have raised its Auto-set thinking level mid-way; the raises live
+    // on the assistant row it left behind, not on the user row. Under thinking Auto the resume
+    // continues at the raised level and keeps the raises, so the badge and the per-turn cap
+    // count them.
+    const interruptedRow = lastUserRow
+      ? rows.slice(rows.indexOf(lastUserRow) + 1).findLast((row) => row.role === "assistant")
+      : undefined;
+    const interruptedRecord = AutoModelRoutingRecordSchema.safeParse(
+      interruptedRow?.metadata?.autoModelRouting
+    );
+    const escalations = interruptedRecord.success ? interruptedRecord.data.escalations : undefined;
     const model =
       autoModelRouting === true
         ? typeof retry?.model === "string"
@@ -7373,7 +7387,8 @@ export class AgentSession {
         : resumeOptions.model;
     const thinkingLevel =
       autoThinkingLevel === true
-        ? (coerceThinkingLevel(retry?.thinkingLevel) ??
+        ? (escalations?.at(-1)?.to ??
+          coerceThinkingLevel(retry?.thinkingLevel) ??
           record.thinkingLevel ??
           resumeOptions.thinkingLevel)
         : resumeOptions.thinkingLevel;
@@ -7390,21 +7405,16 @@ export class AgentSession {
         thinkingLevel === record.thinkingLevel);
     // The record's thinkingLevel means "Auto set it"; a concrete pick on resume replaces it.
     const { thinkingLevel: _routedThinkingLevel, ...recordWithoutThinking } = record;
-    const resumedRecord = autoThinkingLevel === true ? record : recordWithoutThinking;
+    const resumedRecord =
+      autoThinkingLevel === true
+        ? { ...record, ...(escalations?.length ? { escalations } : {}) }
+        : recordWithoutThinking;
     return {
       ...resumeOptions,
       model,
       thinkingLevel,
       ...(keepRecord ? { autoModelRoutingRecord: resumedRecord } : {}),
     };
-  }
-
-  /**
-   * The same row a resume retries, searched across the whole active window: completed report
-   * cards and other non-retry rows are skipped, however many follow the interrupted turn.
-   */
-  private async findLastUserRow(): Promise<MuxMessage | undefined> {
-    return this.findLastRetryUserMessage(await this.loadActiveRoutingRows());
   }
 
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
@@ -7867,7 +7877,7 @@ export class AgentSession {
       this.activeStreamHadAnyDelta = false;
       this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
-      this.activeStreamContext = {
+      const streamContext: NonNullable<typeof this.activeStreamContext> = {
         admissionCapture,
         modelString,
         contextBudgetRetried,
@@ -7882,6 +7892,23 @@ export class AgentSession {
         ...(goalId != null ? { goalId } : {}),
         providersConfig,
       };
+      this.activeStreamContext = streamContext;
+      if (activeTurnThinkingOverride != null) {
+        // An Auto raise mid-turn must reach the context mid-stream compaction follow-ups are
+        // built from, or the resumed turn drops back to the tier's level and loses the raise.
+        activeTurnThinkingOverride.onEscalated = (escalation) => {
+          if (this.activeStreamContext !== streamContext) return;
+          if (streamContext.autoModelRouting != null) {
+            streamContext.autoModelRouting = {
+              ...streamContext.autoModelRouting,
+              escalations: [...(streamContext.autoModelRouting.escalations ?? []), escalation],
+            };
+          }
+          if (streamContext.options != null) {
+            streamContext.options = { ...streamContext.options, thinkingLevel: escalation.to };
+          }
+        };
+      }
       this.activeStreamUserMessageId = undefined;
 
       const commitResult = await this.historyService.commitPartial(this.workspaceId);

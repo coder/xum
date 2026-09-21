@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { ModelMessage } from "ai";
+import type { ModelMessage, ToolResultPart } from "ai";
 import {
   collectTurnToolSteps,
   createAutoThinkingEscalationState,
@@ -17,7 +17,7 @@ function toolStep(
   calls: Array<{
     toolName: string;
     input: unknown;
-    output: typeof failed | typeof errored | typeof succeeded;
+    output: ToolResultPart["output"];
   }>
 ): ModelMessage[] {
   return [
@@ -93,7 +93,7 @@ describe("detectStuckReason", () => {
     expect(detectStuckReason(short)).toBeUndefined();
   });
 
-  it("fires when one identical call is replayed in each step, regardless of key order or outcome", () => {
+  it("fires when one identical call keeps getting the identical result, regardless of key order", () => {
     const replayed = collectTurnToolSteps([
       { role: "user", content: "go" },
       ...toolStep([{ toolName: "grep", input: { pattern: "x", path: "src" }, output: succeeded }]),
@@ -101,7 +101,7 @@ describe("detectStuckReason", () => {
         { toolName: "file_read", input: { path: "other" }, output: succeeded },
         { toolName: "grep", input: { path: "src", pattern: "x" }, output: succeeded },
       ]),
-      ...toolStep([{ toolName: "grep", input: { pattern: "x", path: "src" }, output: failed }]),
+      ...toolStep([{ toolName: "grep", input: { pattern: "x", path: "src" }, output: succeeded }]),
     ]);
     expect(detectStuckReason(replayed)).toContain("grep");
     const varied = collectTurnToolSteps([
@@ -112,12 +112,30 @@ describe("detectStuckReason", () => {
     ]);
     expect(detectStuckReason(varied)).toBeUndefined();
   });
+
+  it("does not treat a replay that makes progress, or a re-issued wait tool, as stuck", () => {
+    const progress = (line: string) => ({ type: "json" as const, value: { success: true, line } });
+    const polling = collectTurnToolSteps([
+      { role: "user", content: "go" },
+      ...toolStep([{ toolName: "bash", input: { command: "tail log" }, output: progress("a") }]),
+      ...toolStep([{ toolName: "bash", input: { command: "tail log" }, output: progress("b") }]),
+      ...toolStep([{ toolName: "bash", input: { command: "tail log" }, output: progress("c") }]),
+    ]);
+    expect(detectStuckReason(polling)).toBeUndefined();
+    const waiting = collectTurnToolSteps([
+      { role: "user", content: "go" },
+      ...toolStep([{ toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded }]),
+      ...toolStep([{ toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded }]),
+      ...toolStep([{ toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded }]),
+    ]);
+    expect(detectStuckReason(waiting)).toBeUndefined();
+  });
 });
 
 describe("proposeAutoThinkingEscalation", () => {
   it("raises one level per stuck window, judges each step once, and stops at the per-turn cap", () => {
     const persisted: AutoModelRoutingEscalation[][] = [];
-    const state = createAutoThinkingEscalationState("low", (escalations) =>
+    const state = createAutoThinkingEscalationState("low", [], (escalations) =>
       persisted.push(escalations)
     );
     const messages: ModelMessage[] = [{ role: "user", content: "go" }];
@@ -142,8 +160,23 @@ describe("proposeAutoThinkingEscalation", () => {
     expect(proposeAutoThinkingEscalation(state, messages)).toBeUndefined();
   });
 
+  it("counts raises an earlier stream of the turn applied toward the cap", () => {
+    const carried: AutoModelRoutingEscalation[] = [
+      { step: 4, from: "low", to: "medium", reason: "r" },
+      { step: 7, from: "medium", to: "high", reason: "r" },
+    ];
+    const state = createAutoThinkingEscalationState("high", carried, () => undefined);
+    const messages: ModelMessage[] = [
+      { role: "user", content: "go" },
+      ...failingBash("a"),
+      ...failingBash("b"),
+      ...failingBash("c"),
+    ];
+    expect(proposeAutoThinkingEscalation(state, messages)).toBeUndefined();
+  });
+
   it("marks itself exhausted at the top of the ladder instead of proposing", () => {
-    const state = createAutoThinkingEscalationState("max", () => undefined);
+    const state = createAutoThinkingEscalationState("max", [], () => undefined);
     const messages: ModelMessage[] = [
       { role: "user", content: "go" },
       ...failingBash("a"),

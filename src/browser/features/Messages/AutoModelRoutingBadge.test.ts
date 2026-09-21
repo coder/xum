@@ -111,9 +111,11 @@ describe("buildAutoModelRoutingTooltipLines", () => {
   });
 
   test("an escalated turn is labeled at its final level and lists each raise", () => {
+    // A resumed stream restamps thinkingLevel with the raised level; the raises still say
+    // where the turn started.
     const escalated: AutoModelRoutingRecord = {
       ...routed,
-      thinkingLevel: "low",
+      thinkingLevel: "high",
       escalations: [
         {
           step: 4,

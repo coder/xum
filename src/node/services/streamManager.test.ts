@@ -7906,10 +7906,13 @@ describe("StreamManager - mid-turn thinking override", () => {
     const { createStreamResult } = getRequestHelpers(streamManager);
     const streamTextSpy = setupStreamTextSpy();
 
-    const state: ActiveTurnThinkingOverride = {};
+    const sessionSaw: AutoModelRoutingEscalation[] = [];
+    const state: ActiveTurnThinkingOverride = {
+      onEscalated: (escalation) => sessionSaw.push(escalation),
+    };
     const persisted: AutoModelRoutingEscalation[][] = [];
     const stepTracker = {
-      autoThinkingEscalation: createAutoThinkingEscalationState("low", (escalations) =>
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
         persisted.push(escalations)
       ),
     };
@@ -7934,6 +7937,8 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(step?.providerOptions).toEqual({ anthropic: { effort: "medium" } });
     expect(state.applied).toBe("medium");
     expect(persisted.at(-1)).toMatchObject([{ step: 4, from: "low", to: "medium" }]);
+    // The session's sink sees the same raise (it keeps the live stream context current).
+    expect(sessionSaw).toEqual(persisted.at(-1) ?? []);
     // The judged steps do not fire again, and the user never touched the slider.
     expect(await prepareStep({ messages: transcript, stepNumber: 4 })).toBeUndefined();
     expect(state.manual).toBeUndefined();
@@ -7948,7 +7953,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     const state: ActiveTurnThinkingOverride = { manual: true, applied: "off" };
     const persisted: AutoModelRoutingEscalation[][] = [];
     const stepTracker = {
-      autoThinkingEscalation: createAutoThinkingEscalationState("low", (escalations) =>
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
         persisted.push(escalations)
       ),
     };
@@ -7978,7 +7983,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     const state: ActiveTurnThinkingOverride = {};
     const persisted: AutoModelRoutingEscalation[][] = [];
     const stepTracker = {
-      autoThinkingEscalation: createAutoThinkingEscalationState("high", (escalations) =>
+      autoThinkingEscalation: createAutoThinkingEscalationState("high", [], (escalations) =>
         persisted.push(escalations)
       ),
     };
@@ -8024,27 +8029,33 @@ describe("StreamManager - mid-turn thinking override", () => {
       reason: "3 consecutive steps with only failing tool calls",
     };
     const armed: Record<string, boolean> = {};
-    let activeWorkspaceId = "";
+    let active: { workspaceId: string; holder: ActiveTurnThinkingOverride } | undefined;
     // The mocked stream stands in for prepareStep: it reports whether escalation was armed
-    // for this stream and fires the provenance sink the way a recorded raise would.
+    // for this stream, fires the provenance sink the way a recorded raise would, and then
+    // applies a slider move through the holder when the case asks for one.
     Reflect.set(streamManager, "createStreamResult", () =>
       createStreamResultForTests(
         (async function* () {
           await Promise.resolve();
+          if (!active) throw new Error("Expected an active case");
           const tracker = (
-            workspaceStreams.get(activeWorkspaceId) as {
+            workspaceStreams.get(active.workspaceId) as {
               stepTracker: { autoThinkingEscalation?: AutoThinkingEscalationState };
             }
           ).stepTracker;
-          armed[activeWorkspaceId] = tracker.autoThinkingEscalation != null;
+          armed[active.workspaceId] = tracker.autoThinkingEscalation != null;
           tracker.autoThinkingEscalation?.onEscalated([raise]);
+          if (active.holder.manual) active.holder.onApplied?.("max");
           yield { type: "text-delta", text: "done" };
           yield { type: "finish", finishReason: "stop" };
         })()
       )
     );
     const streamEnds: Array<{
-      metadata?: { autoModelRouting?: { escalations?: unknown; thinkingLevel?: string } };
+      metadata?: {
+        thinkingLevel?: string;
+        autoModelRouting?: { escalations?: unknown; thinkingLevel?: string; tierId?: string };
+      };
     }> = [];
     onTurnEngineEvent(streamManager, "stream-end", (data) =>
       streamEnds.push(data as (typeof streamEnds)[number])
@@ -8055,20 +8066,33 @@ describe("StreamManager - mid-turn thinking override", () => {
       model: "openai:gpt-4.1-mini",
       requestedFallbackModel: "openai:gpt-4.1-mini",
     };
-    for (const [workspaceId, autoModelRouting] of [
-      ["auto-escalation-thinking", { ...routed, thinkingLevel: "low" as const }],
-      ["auto-escalation-model-only", routed],
-    ] as const) {
-      activeWorkspaceId = workspaceId;
-      await appendPartialAssistantForTests(workspaceId, `${workspaceId}-msg`, 1);
+    const thinkingRouted = { ...routed, thinkingLevel: "low" as const };
+    const cases: Array<{
+      workspaceId: string;
+      autoModelRouting: typeof routed | typeof thinkingRouted;
+      holder: ActiveTurnThinkingOverride;
+    }> = [
+      { workspaceId: "auto-escalation-thinking", autoModelRouting: thinkingRouted, holder: {} },
+      { workspaceId: "auto-escalation-model-only", autoModelRouting: routed, holder: {} },
+      // The user moved the slider after the raise: Auto's claim (level and raises) is withdrawn.
+      {
+        workspaceId: "auto-escalation-manual",
+        autoModelRouting: thinkingRouted,
+        holder: { manual: true },
+      },
+    ];
+    for (const testCase of cases) {
+      active = testCase;
+      const messageId = `${testCase.workspaceId}-msg`;
+      await appendPartialAssistantForTests(testCase.workspaceId, messageId, 1);
       const result = await streamManager.startStream(
         testStartOptions({
-          workspaceId,
-          messageId: `${workspaceId}-msg`,
+          workspaceId: testCase.workspaceId,
+          messageId,
           model: createTestLanguageModel(),
           tools: {},
-          thinkingOverrideState: {},
-          initialMetadata: { autoModelRouting },
+          thinkingOverrideState: testCase.holder,
+          initialMetadata: { autoModelRouting: testCase.autoModelRouting },
         })
       );
       expect(result.success).toBe(true);
@@ -8079,13 +8103,19 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(armed).toEqual({
       "auto-escalation-thinking": true,
       "auto-escalation-model-only": false,
+      "auto-escalation-manual": true,
     });
-    expect(streamEnds).toHaveLength(2);
+    expect(streamEnds).toHaveLength(3);
     expect(streamEnds[0]?.metadata?.autoModelRouting).toMatchObject({
       thinkingLevel: "low",
       escalations: [raise],
     });
     expect(streamEnds[1]?.metadata?.autoModelRouting?.escalations).toBeUndefined();
+    const manual = streamEnds[2]?.metadata;
+    expect(manual?.thinkingLevel).toBe("max");
+    expect(manual?.autoModelRouting?.tierId).toBe("hard");
+    expect(manual?.autoModelRouting?.thinkingLevel).toBeUndefined();
+    expect(manual?.autoModelRouting?.escalations).toBeUndefined();
   });
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {
     const streamManager = new StreamManager(historyService);

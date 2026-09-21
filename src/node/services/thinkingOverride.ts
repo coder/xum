@@ -13,6 +13,7 @@
  * src/common/types (never crosses IPC).
  */
 import type { ModelMessage } from "ai";
+import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
 
 export interface ActiveTurnThinkingOverride {
@@ -28,6 +29,12 @@ export interface ActiveTurnThinkingOverride {
   applied?: ThinkingLevel;
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */
   onApplied?: (level: ThinkingLevel) => void;
+  /**
+   * Sink wired by AgentSession: an applied Auto raise (autoThinkingEscalation.ts)
+   * updates the live stream context, so a mid-stream compaction follow-up resumes
+   * at the raised level with the raise on its record instead of the tier's level.
+   */
+  onEscalated?: (escalation: AutoModelRoutingEscalation) => void;
 }
 
 /**

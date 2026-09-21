@@ -58,10 +58,11 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
         ? `The evaluation model chose ${tierLabel} (${formatPercent(record.confidence)} confidence).`
         : `The evaluation model chose ${tierLabel}.`
     );
+    // The run line names the level the turn started at; a resumed record is restamped with
+    // the raised level, so the first raise's origin is the reliable start.
+    const startedAt = record.escalations?.[0]?.from ?? record.thinkingLevel;
     const thinking =
-      record.thinkingLevel != null
-        ? getThinkingDisplayLabel(record.thinkingLevel, record.model)
-        : undefined;
+      startedAt != null ? getThinkingDisplayLabel(startedAt, record.model) : undefined;
     lines.push(
       record.status === "routed"
         ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`

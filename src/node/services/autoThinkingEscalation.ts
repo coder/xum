@@ -19,6 +19,7 @@ import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 import { stableStringify } from "@/common/utils/stableStringify";
 import {
   AUTO_THINKING_ESCALATION_MAX_PER_TURN,
+  AUTO_THINKING_ESCALATION_WAIT_TOOLS,
   AUTO_THINKING_ESCALATION_WINDOW_STEPS,
 } from "@/constants/autoModelRouting";
 
@@ -34,17 +35,28 @@ export interface AutoThinkingEscalationState {
   onEscalated: (escalations: AutoModelRoutingEscalation[]) => void;
 }
 
+/**
+ * `escalations` seeds the per-turn cap from raises an earlier stream of the same turn
+ * already applied (a resume or compaction follow-up carries them on its record).
+ */
 export function createAutoThinkingEscalationState(
   level: ThinkingLevel,
+  escalations: AutoModelRoutingEscalation[],
   onEscalated: AutoThinkingEscalationState["onEscalated"]
 ): AutoThinkingEscalationState {
-  return { level, stepsJudged: 0, exhausted: false, escalations: [], onEscalated };
+  return { level, stepsJudged: 0, exhausted: false, escalations, onEscalated };
 }
 
 /** One model step of the current turn that called tools: its calls and how they ended. */
 export interface TurnToolStep {
-  /** `key` is the tool name plus canonical input, so an identical replay compares equal. */
-  calls: Array<{ key: string; toolName: string }>;
+  calls: Array<{
+    /** Tool name plus canonical input, so an identical replay compares equal. */
+    key: string;
+    toolName: string;
+    /** Canonical result, once one arrived; equal keys mean the replay made no progress. */
+    resultKey?: string;
+    failed: boolean;
+  }>;
   /** True when every result the step received was an error. */
   allFailed: boolean;
 }
@@ -71,30 +83,36 @@ export function collectTurnToolSteps(messages: ModelMessage[]): TurnToolStep[] {
     if (message.role === "user") lastUserIndex = index;
   }
   const steps: TurnToolStep[] = [];
-  let current: (TurnToolStep & { results: number; failures: number }) | undefined;
+  let current:
+    | (TurnToolStep & { byCallId: Map<string, TurnToolStep["calls"][number]> })
+    | undefined;
   for (const message of messages.slice(lastUserIndex + 1)) {
     if (message.role === "assistant") {
       current = undefined;
       if (typeof message.content === "string") continue;
       const calls = message.content.filter((part) => part.type === "tool-call");
       if (calls.length === 0) continue;
-      current = {
-        calls: calls.map((call) => ({
+      current = { calls: [], byCallId: new Map(), allFailed: false };
+      for (const call of calls) {
+        const entry = {
           key: `${call.toolName}:${stableStringify(call.input)}`,
           toolName: call.toolName,
-        })),
-        allFailed: false,
-        results: 0,
-        failures: 0,
-      };
+          failed: false,
+        };
+        current.calls.push(entry);
+        current.byCallId.set(call.toolCallId, entry);
+      }
       steps.push(current);
     } else if (message.role === "tool" && current) {
       for (const part of message.content) {
         if (part.type !== "tool-result") continue;
-        current.results += 1;
-        if (isFailedToolOutput(part.output)) current.failures += 1;
+        const entry = current.byCallId.get(part.toolCallId);
+        if (entry == null) continue;
+        entry.resultKey = stableStringify(part.output);
+        entry.failed = isFailedToolOutput(part.output);
       }
-      current.allFailed = current.results > 0 && current.failures === current.results;
+      const answered = current.calls.filter((call) => call.resultKey != null);
+      current.allFailed = answered.length > 0 && answered.every((call) => call.failed);
     }
   }
   return steps;
@@ -110,11 +128,20 @@ export function detectStuckReason(
   if (window.every((step) => step.allFailed)) {
     return `${windowSteps} consecutive steps with only failing tool calls`;
   }
+  // A replay counts only when it made no progress (same call, same result every time);
+  // re-issuing a wait tool while a long task runs is what those tools are for.
   const [first, ...rest] = window;
-  const replayed = first.calls.find((call) =>
-    rest.every((step) => step.calls.some((other) => other.key === call.key))
+  const replayed = first.calls.find(
+    (call) =>
+      call.resultKey != null &&
+      !AUTO_THINKING_ESCALATION_WAIT_TOOLS.includes(call.toolName) &&
+      rest.every((step) =>
+        step.calls.some((other) => other.key === call.key && other.resultKey === call.resultKey)
+      )
   );
-  return replayed ? `the same ${replayed.toolName} call repeated ${windowSteps} times` : undefined;
+  return replayed
+    ? `the same ${replayed.toolName} call and result repeated ${windowSteps} times`
+    : undefined;
 }
 
 export function nextThinkingLevel(level: ThinkingLevel): ThinkingLevel | undefined {

@@ -69,3 +69,8 @@ export const AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS = 8_000;
 export const AUTO_THINKING_ESCALATION_WINDOW_STEPS = 3;
 /** Raises per turn; the tier's level plus two is as far as Auto goes without the user. */
 export const AUTO_THINKING_ESCALATION_MAX_PER_TURN = 2;
+/**
+ * Tools whose contract is to be re-issued while waiting on long-running work. An identical
+ * repeat of one of these is a wait, not a loop, so it never counts as a stuck signal.
+ */
+export const AUTO_THINKING_ESCALATION_WAIT_TOOLS: readonly string[] = ["task_await", "bash_output"];
