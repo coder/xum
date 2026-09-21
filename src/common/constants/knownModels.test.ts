@@ -52,14 +52,15 @@ describe("Known Models Integration", () => {
     expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-astra"]).toBe("openai/gpt-5");
   });
 
-  test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {
-    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.6");
-    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBe("xai:grok-4.6");
+  test("grok aliases resolve only to Grok 4.7 in the curated registry", () => {
+    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.7"]).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.5"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.1"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-code"]).toBeUndefined();
     expect(Object.values(KNOWN_MODELS).filter((model) => model.provider === "xai")).toEqual([
-      KNOWN_MODELS.GROK_46,
+      KNOWN_MODELS.GROK_47,
     ]);
   });
 

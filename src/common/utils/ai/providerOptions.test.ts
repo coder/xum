@@ -2719,7 +2719,13 @@ describe("buildProviderOptions - xAI", () => {
     });
   });
 
-  test("passes native xhigh through for Grok 4.6 while Grok 4.5 clamps to high", () => {
+  test("passes native xhigh through for Grok 4.6/4.7 while Grok 4.5 clamps to high", () => {
+    expect(buildProviderOptions("xai:grok-4.7", "xhigh")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.7", "max")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
     expect(buildProviderOptions("xai:grok-4.6", "xhigh")).toEqual({
       xai: { reasoningEffort: "xhigh", store: false },
     });

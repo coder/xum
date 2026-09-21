@@ -62,8 +62,9 @@ describe("getEffectiveContextLimit", () => {
   });
 
   test("uses frontier Grok's published 500K context window", () => {
-    expect(getEffectiveContextLimit(KNOWN_MODELS.GROK_46.id, false, null)).toBe(500_000);
-    expect(getEffectiveContextLimit("xai:grok-4.6-latest", false, null)).toBe(500_000);
+    expect(getEffectiveContextLimit(KNOWN_MODELS.GROK_47.id, false, null)).toBe(500_000);
+    expect(getEffectiveContextLimit("xai:grok-4.7-latest", false, null)).toBe(500_000);
+    expect(getEffectiveContextLimit("xai:grok-4.6", false, null)).toBe(500_000);
     expect(getEffectiveContextLimit("xai:grok-4.5", false, null)).toBe(500_000);
   });
 

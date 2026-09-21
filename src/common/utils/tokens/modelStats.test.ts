@@ -39,22 +39,24 @@ describe("getModelStats", () => {
     expect(expectStats("openai:gpt-5.6")).toEqual(expectStats("openai:gpt-5.6-sol"));
   });
 
-  test("resolves Grok 4.6 family aliases and case variants for usage meters", () => {
-    const grok = expectStats(KNOWN_MODELS.GROK_46.id);
+  test("resolves Grok 4.7 family aliases and case variants for usage meters", () => {
+    const grok = expectStats(KNOWN_MODELS.GROK_47.id);
     expect(grok.max_input_tokens).toBe(500000);
     expect(grok.max_output_tokens).toBeUndefined();
-    expect(expectStats("xai:grok-4.6-latest")).toEqual(grok);
-    expect(expectStats("XAI:Grok-4.6")).toEqual(grok);
+    expect(expectStats("xai:grok-4.7-latest")).toEqual(grok);
+    expect(expectStats("XAI:Grok-4.7")).toEqual(grok);
   });
 
-  test("resolves Grok 4.6 pricing with its higher cached-input rate", () => {
-    const grok46 = expectStats("xai:grok-4.6");
-    expect(grok46.input_cost_per_token).toBe(0.000002);
-    expect(grok46.output_cost_per_token).toBe(0.000006);
-    expect(grok46.cache_read_input_token_cost).toBe(0.0000005);
-    expect(grok46.input_cost_per_token_above_200k_tokens).toBe(0.000004);
-    expect(grok46.output_cost_per_token_above_200k_tokens).toBe(0.000012);
-    expect(grok46.cache_read_input_token_cost_above_200k_tokens).toBe(0.000001);
+  test("resolves Grok 4.7 pricing, matching Grok 4.6's published rates", () => {
+    for (const model of ["xai:grok-4.7", "xai:grok-4.6"]) {
+      const grok = expectStats(model);
+      expect(grok.input_cost_per_token).toBe(0.000002);
+      expect(grok.output_cost_per_token).toBe(0.000006);
+      expect(grok.cache_read_input_token_cost).toBe(0.0000005);
+      expect(grok.input_cost_per_token_above_200k_tokens).toBe(0.000004);
+      expect(grok.output_cost_per_token_above_200k_tokens).toBe(0.000012);
+      expect(grok.cache_read_input_token_cost_above_200k_tokens).toBe(0.000001);
+    }
 
     // Grok 4.5 keeps its distinct cheaper cache rate.
     const grok45 = expectStats("xai:grok-4.5");

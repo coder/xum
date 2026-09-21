@@ -27,7 +27,7 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   getOpenAIReasoningEffort,
-  isGrok46Model,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
@@ -727,8 +727,8 @@ export function buildProviderOptions(
       ...overrides
     } = muxProviderOptions?.xai ?? {};
     const isGrokFrontier = isGrokFrontierModel(capabilityModel);
-    // Grok 4.6 supports native xhigh effort; Grok 4.5 tops out at high.
-    const topEffort = isGrok46Model(capabilityModel) ? "xhigh" : "high";
+    // Grok 4.6/4.7 support native xhigh effort; Grok 4.5 tops out at high.
+    const topEffort = grokSupportsNativeXhigh(capabilityModel) ? "xhigh" : "high";
     const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrokFrontier
       ? effectiveThinking === "xhigh" || effectiveThinking === "max"
         ? topEffort

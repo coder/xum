@@ -69,7 +69,34 @@ const GPT_56_SOL_STATS: ModelData = {
 };
 
 export const modelsExtra: Record<string, ModelData> = {
-  // Grok 4.6 - Released August 12, 2026. xAI's frontier coding and agentic model.
+  // Grok 4.7 - Released September 21, 2026. xAI's frontier coding and knowledge-work
+  // model. Identical rates and limits to Grok 4.6: $2/M input, $0.50/M cached input,
+  // $6/M output, all doubled for prompts above 200K tokens. Priority Processing is a
+  // separate request-time 2× multiplier and the Grok 4.7 Fast variant is Cursor/Grok
+  // Build-only (not on the public xAI API), so neither is baked into these rates.
+  "xai/grok-4.7": {
+    max_input_tokens: 500000,
+    // Leave max_output_tokens unset: StreamManager forwards it as the request
+    // maxOutputTokens default, and xAI publishes no output limit for grok-4.7.
+    input_cost_per_token: 0.000002, // $2 per million input tokens
+    input_cost_per_token_above_200k_tokens: 0.000004, // $4 per million input tokens
+    output_cost_per_token: 0.000006, // $6 per million output tokens
+    output_cost_per_token_above_200k_tokens: 0.000012, // $12 per million output tokens
+    cache_read_input_token_cost: 0.0000005, // $0.50 per million cached input tokens
+    cache_read_input_token_cost_above_200k_tokens: 0.000001, // $1 per million cached input tokens
+    litellm_provider: "xai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    // xAI publishes the cutoff as "May 2026" without a day; pin the first of the month.
+    knowledge_cutoff: "2026-05-01",
+    supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
+  },
+
+  // Grok 4.6 - Released August 12, 2026. Superseded by Grok 4.7 as the curated xAI
+  // model; still servable as the custom model string `xai:grok-4.6`.
   // Same $2/$6 headline rates as Grok 4.5 but a higher cached-input rate ($0.50 vs
   // $0.30). Pricing doubles for prompts above 200K tokens; Priority Processing is a
   // separate request-time 2× multiplier and is therefore not baked into these rates.

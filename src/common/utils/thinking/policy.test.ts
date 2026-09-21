@@ -1086,6 +1086,15 @@ describe("Grok 4.6 thinking policy", () => {
   });
 });
 
+describe("Grok 4.7 thinking policy", () => {
+  test("keeps the native-xhigh frontier Grok ladder", () => {
+    expect(getThinkingPolicyForModel("xai:grok-4.7")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(getDefaultMinimumThinkingLevel("xai:grok-4.7")).toBe("medium");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "off")).toBe("low");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "max")).toBe("xhigh");
+  });
+});
+
 describe("GLM 5.3 thinking policy", () => {
   test("offers only Z.ai's forced-thinking effort levels", () => {
     for (const model of ["glm-5.3-flash", "zai:glm-5.3", "zai:glm-5.3-flash-2026-08-26"]) {

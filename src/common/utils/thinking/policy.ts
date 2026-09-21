@@ -19,7 +19,7 @@ import {
   THINKING_LEVEL_OFF,
   anthropicRejectsDisabledThinking,
   anthropicSupportsNativeXhigh,
-  isGrok46Model,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
@@ -90,7 +90,7 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
- * - xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
+ * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
  * - xai:grok-4.5 → ["low", "medium", "high"] (reasoning cannot be disabled)
  * - zai:glm-5.3-flash → ["low", "high", "max"] (reasoning cannot be disabled)
  * - default → ["off", "low", "medium", "high"] (standard 4 levels; xhigh is opt-in per model)
@@ -216,9 +216,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "high"];
   }
 
-  // Frontier Grok models always reason. Grok 4.6 adds native xhigh effort;
+  // Frontier Grok models always reason. Grok 4.6/4.7 support native xhigh effort;
   // Grok 4.5 supports configurable low/medium/high.
-  if (isGrok46Model(withoutProviderNamespace)) {
+  if (grokSupportsNativeXhigh(withoutProviderNamespace)) {
     return ["low", "medium", "high", "xhigh"];
   }
   if (isGrokFrontierModel(withoutProviderNamespace)) {
