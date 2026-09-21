@@ -2067,36 +2067,39 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
     test.each([
       ["before the marker's CAS", "idle"],
-      ["before the marker's CAS", "live"],
+      ["before the marker's CAS", "pending"],
+      ["before the marker's CAS", "admitted"],
       ["after the marker committed", "idle"],
-      ["after the marker committed", "live"],
+      ["after the marker committed", "pending"],
+      ["after the marker committed", "admitted"],
     ] as const)(
       "a direct launch failure whose row another writer re-admitted %s (A %s) writes no marker, stops nothing and settles A only when nothing runs under it",
       async (rotateAt, liveness) => {
-        const spawnedId = rotateAt.startsWith("before")
-          ? liveness === "idle"
-            ? "directforeign2"
-            : "directforeign3"
-          : liveness === "idle"
-            ? "directforeign4"
-            : "directforeign5";
+        const spawnedId = `directforeign${rotateAt.startsWith("before") ? "b" : "a"}${liveness}`;
         const { config } = await setupTree([]);
         stubStableIds(config, [spawnedId]);
         const otherBackend = await createTestConfig(rootDir);
+        const racingTurn = Symbol("racing-turn");
         let racingToken: TurnAdmissionToken | undefined;
+        let liveTurn: symbol | undefined;
         let launchSendFailed = false;
-        const host = createWorkspaceServiceMocks({
+        const host = hostWithTurnEvents({
           sendMessage: mock((workspaceId: string) => {
-            if (liveness === "live") {
-              // A user send admitted under A while the launch send is in flight (still in its
-              // own preflight when the launch fails).
+            if (liveness !== "idle") {
+              // A user send admitted under A while the launch send is in flight: still in its
+              // own preflight (pending) or already the live turn (admitted) when the launch fails.
               racingToken = admitted(
                 taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
               );
+              if (liveness === "admitted") {
+                racingToken.onAdmitted(racingTurn);
+                liveTurn = racingTurn;
+              }
             }
             launchSendFailed = true;
             return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
           }),
+          getActiveTurnGeneration: mock(() => liveTurn),
         });
         const stopStream = mock(() => Promise.resolve(Ok(undefined)));
         const { aiService } = createAIServiceMocks(config, { stopStream });
@@ -2158,20 +2161,41 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             });
             return;
           }
-          // A's own obligation is still in its preflight: no settlement proof is minted for it;
-          // it reads stale (the row no longer names A) and settles through its own disposal —
-          // which still proves nothing about A as a whole (no owner watches a superseded attempt).
-          expect(racingToken?.admissionStale()).toBe(true);
+          // A's own obligation is still live — in its preflight (pending) or the live turn
+          // (admitted, not stopped: under B's row the session's turn is not ours to cut). No
+          // settlement proof is minted for it: A stays `closing` (a memory-only entry, dropped by
+          // the next rotation in this process). The obligation itself is released by the
+          // existing signals — a pending one reads stale (the row no longer names A) and is
+          // disposed by its host at its next gate; an admitted one is discharged when its turn
+          // settles — so no orphan obligation outlives the launch failure.
           expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
             attemptId: mintedAttemptId,
             phase: "closing",
             source: "launch-failed",
           });
-          racingToken?.onDisposed("refused");
+          const obligations = [...(svc.admittedSendsByTaskId.get(spawnedId) ?? [])];
+          expect(obligations).toHaveLength(1);
+          expect(obligations[0]).toMatchObject({
+            attemptId: mintedAttemptId,
+            state: liveness,
+          });
+          if (liveness === "pending") {
+            expect(racingToken?.admissionStale()).toBe(true);
+            racingToken?.onDisposed("refused");
+          } else {
+            // The live turn belongs to its coordinator until it settles; then the ledger releases
+            // it exactly as for any settled turn (recordWorkspaceTurnSettled).
+            expect(racingToken?.admissionStale()).toBe(false);
+            liveTurn = undefined;
+            host.settleTurn(spawnedId, racingTurn);
+          }
           expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
           expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+            attemptId: mintedAttemptId,
             phase: "closing",
           });
+          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
           expect(entryOf(config, spawnedId)).toMatchObject({
             taskStatus: "running",
             taskAttemptId: FOREIGN_ATTEMPT_ID,
