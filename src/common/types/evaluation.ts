@@ -277,7 +277,8 @@ export type EvaluationAnswerViolation =
   | "distribution-sum"
   | "choice-not-maximal"
   | "score-mean-mismatch"
-  | "rounding-invalid";
+  | "rounding-invalid"
+  | "rounding-mismatch";
 
 export type ValidateAnswersResult<Q extends EvaluationQuestions> =
   | { readonly ok: true; readonly answers: EvaluationAnswers<Q> }
@@ -320,10 +321,25 @@ function roundingSlack(decimals: number | undefined): number | null {
   return 0.5 * 10 ** -decimals;
 }
 
+/**
+ * Declared rounding only earns its slack when the value really is rounded to
+ * that many decimals. Otherwise corrupted or forged `rounding` metadata on a
+ * replayed result (e.g. `probabilityDecimals: 0` next to `{0.8, 0.8, 0.8}`)
+ * would widen the tolerance enough to accept an inconsistent distribution.
+ */
+function conformsToDecimals(value: number, decimals: number | undefined): boolean {
+  if (decimals === undefined) {
+    return true;
+  }
+  const scaled = value * 10 ** decimals;
+  return Math.abs(scaled - Math.round(scaled)) <= 1e-9 * Math.max(1, Math.abs(scaled));
+}
+
 function validateDistribution(
   value: unknown,
   keys: readonly string[],
-  probabilitySlack: number
+  probabilitySlack: number,
+  probabilityDecimals: number | undefined
 ):
   | { ok: true; distribution: Record<string, number> }
   | { ok: false; violation: EvaluationAnswerViolation } {
@@ -335,6 +351,9 @@ function validateDistribution(
     const probability = value[key];
     if (!isProbability(probability)) {
       return { ok: false, violation: "distribution-values" };
+    }
+    if (!conformsToDecimals(probability, probabilityDecimals)) {
+      return { ok: false, violation: "rounding-mismatch" };
     }
     distribution[key] = probability;
   }
@@ -401,7 +420,12 @@ export function validateAnswersAgainstQuestions<Q extends EvaluationQuestions>(
           projected[id] = { type: "choice", choice };
           break;
         }
-        const distribution = validateDistribution(answer.probabilities, options, probabilitySlack);
+        const distribution = validateDistribution(
+          answer.probabilities,
+          options,
+          probabilitySlack,
+          rounding?.probabilityDecimals
+        );
         if (!distribution.ok) {
           return { ok: false, violation: distribution.violation, questionId: id };
         }
@@ -424,6 +448,9 @@ export function validateAnswersAgainstQuestions<Q extends EvaluationQuestions>(
         if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > maxScore) {
           return { ok: false, violation: "score-out-of-range", questionId: id };
         }
+        if (!conformsToDecimals(score, rounding?.scoreDecimals)) {
+          return { ok: false, violation: "rounding-mismatch", questionId: id };
+        }
         if (answer.probabilities === undefined) {
           projected[id] = { type: "score", score };
           break;
@@ -432,7 +459,8 @@ export function validateAnswersAgainstQuestions<Q extends EvaluationQuestions>(
         const distribution = validateDistribution(
           answer.probabilities,
           levelKeys,
-          probabilitySlack
+          probabilitySlack,
+          rounding?.probabilityDecimals
         );
         if (!distribution.ok) {
           return { ok: false, violation: distribution.violation, questionId: id };
@@ -457,6 +485,9 @@ export function validateAnswersAgainstQuestions<Q extends EvaluationQuestions>(
         const probability = answer.probability;
         if (!isProbability(probability)) {
           return { ok: false, violation: "probability-out-of-range", questionId: id };
+        }
+        if (!conformsToDecimals(probability, rounding?.probabilityDecimals)) {
+          return { ok: false, violation: "rounding-mismatch", questionId: id };
         }
         projected[id] = { type: "boolean", probability };
         break;
@@ -527,14 +558,48 @@ export function jsonDepth(value: unknown, limit: number): number {
 export type BoundedParseResult<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly violation: "request-too-deep"; readonly depth: number }
+  | { readonly ok: false; readonly violation: "forbidden-key"; readonly key: string }
   | { readonly ok: false; readonly violation: "invalid"; readonly error: z.ZodError };
+
+/**
+ * Keys that JSON input may legitimately carry but that zod's record parser
+ * silently drops (it never assigns `__proto__`). Accepting such input would
+ * let the parsed value differ from the raw one: two distinct states could
+ * share canonical content, or a question/option could vanish without error.
+ * Reject them explicitly instead. Only call on values that passed the depth
+ * check (the walk is iterative, but width is unbounded like canonicalization).
+ */
+const FORBIDDEN_JSON_KEYS: ReadonlySet<string> = new Set(["__proto__"]);
+
+function findForbiddenJsonKey(value: unknown): string | undefined {
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === null || typeof current !== "object") {
+      continue;
+    }
+    if (Array.isArray(current)) {
+      const items: unknown[] = current;
+      stack.push(...items);
+      continue;
+    }
+    for (const key of Object.keys(current)) {
+      if (FORBIDDEN_JSON_KEYS.has(key)) {
+        return key;
+      }
+      stack.push((current as Record<string, unknown>)[key]);
+    }
+  }
+  return undefined;
+}
 
 /**
  * The only supported way to apply the evaluation schemas to untrusted raw
  * values (sandbox `state`/spec, or persisted records read back from disk).
  * The recursive schemas (`z.lazy`) and canonicalization would overflow the
  * stack on a pathologically deep or cyclic value, so the bounded iterative
- * depth walk runs first and turns such input into a typed violation.
+ * depth walk runs first and turns such input into a typed violation; keys
+ * zod would silently drop are rejected before parsing for the same reason.
  */
 export function parseEvaluationInputBounded<T>(
   schema: z.ZodType<T>,
@@ -543,6 +608,10 @@ export function parseEvaluationInputBounded<T>(
   const depth = jsonDepth(raw, EVALUATION_MAX_DEPTH);
   if (depth > EVALUATION_MAX_DEPTH) {
     return { ok: false, violation: "request-too-deep", depth };
+  }
+  const forbiddenKey = findForbiddenJsonKey(raw);
+  if (forbiddenKey !== undefined) {
+    return { ok: false, violation: "forbidden-key", key: forbiddenKey };
   }
   const parsed = schema.safeParse(raw);
   return parsed.success

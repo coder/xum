@@ -253,6 +253,57 @@ describe("validateAnswersAgainstQuestions", () => {
     });
   });
 
+  it("grants rounding slack only to values that actually conform to the declared precision", () => {
+    // Forged/corrupted metadata: probabilityDecimals 0 would otherwise widen
+    // the sum tolerance to ±1.5 and accept a distribution summing to 2.4.
+    const unrounded = {
+      ...VALID_ANSWERS,
+      injection: {
+        type: "choice",
+        choice: "suspected",
+        probabilities: { not_detected: 0.8, suspected: 0.8, uncertain: 0.8 },
+      },
+    };
+    expect(
+      validateAnswersAgainstQuestions(QUESTIONS, unrounded, { probabilityDecimals: 0 })
+    ).toMatchObject({ ok: false, violation: "rounding-mismatch", questionId: "injection" });
+
+    // Values that are rounded to the declared precision still get the slack
+    // (every probability in the payload must conform, including the boolean).
+    const rounded = {
+      ...VALID_ANSWERS,
+      asksForSecrets: { type: "boolean", probability: 0.3 },
+      injection: {
+        type: "choice",
+        choice: "suspected",
+        probabilities: { not_detected: 0.3, suspected: 0.4, uncertain: 0.2 },
+      },
+    };
+    expect(
+      validateAnswersAgainstQuestions(QUESTIONS, rounded, { probabilityDecimals: 1 })
+    ).toMatchObject({ ok: true });
+    expect(validateAnswersAgainstQuestions(QUESTIONS, rounded, null)).toMatchObject({
+      ok: false,
+      violation: "distribution-sum",
+    });
+
+    // The same rule applies to scores and boolean probabilities.
+    expect(
+      validateAnswersAgainstQuestions(
+        QUESTIONS,
+        { ...VALID_ANSWERS, severity: { type: "score", score: 1.25 } },
+        { scoreDecimals: 1 }
+      )
+    ).toMatchObject({ ok: false, violation: "rounding-mismatch", questionId: "severity" });
+    expect(
+      validateAnswersAgainstQuestions(
+        QUESTIONS,
+        { ...VALID_ANSWERS, asksForSecrets: { type: "boolean", probability: 0.255 } },
+        { probabilityDecimals: 2 }
+      )
+    ).toMatchObject({ ok: false, violation: "rounding-mismatch", questionId: "asksForSecrets" });
+  });
+
   it("rejects incomplete distributions and a non-maximal selected choice", () => {
     expect(
       validateAnswersAgainstQuestions(
@@ -294,26 +345,29 @@ describe("validateAnswersAgainstQuestions", () => {
         null
       )
     ).toMatchObject({ ok: true });
-    // Rounded to one decimal, the reported score may drift by half a unit.
+    // Exact mean 1.15 reported as the one-decimal score 1.2: accepted only when
+    // the payload declares (and honours) that rounding.
+    const rounding = { probabilityDecimals: 2, scoreDecimals: 1 };
+    const halfway = { "0": 0.2, "1": 0.45, "2": 0.35 };
     expect(
       validateAnswersAgainstQuestions(
         QUESTIONS,
-        { ...VALID_ANSWERS, severity: { type: "score", score: 1.14, probabilities } },
-        { scoreDecimals: 1 }
+        { ...VALID_ANSWERS, severity: { type: "score", score: 1.2, probabilities: halfway } },
+        rounding
       )
     ).toMatchObject({ ok: true });
     expect(
       validateAnswersAgainstQuestions(
         QUESTIONS,
-        { ...VALID_ANSWERS, severity: { type: "score", score: 1.14, probabilities } },
+        { ...VALID_ANSWERS, severity: { type: "score", score: 1.2, probabilities: halfway } },
         null
       )
     ).toMatchObject({ ok: false, violation: "score-mean-mismatch", questionId: "severity" });
     expect(
       validateAnswersAgainstQuestions(
         QUESTIONS,
-        { ...VALID_ANSWERS, severity: { type: "score", score: 2, probabilities } },
-        { scoreDecimals: 1 }
+        { ...VALID_ANSWERS, severity: { type: "score", score: 2, probabilities: halfway } },
+        rounding
       )
     ).toMatchObject({ ok: false, violation: "score-mean-mismatch" });
   });
@@ -414,6 +468,41 @@ describe("canonicalRequestBytes", () => {
 });
 
 describe("parseEvaluationInputBounded", () => {
+  it("rejects own __proto__ keys that zod would silently drop", () => {
+    // JSON.parse creates a real own property; zod's record parser skips it,
+    // so parsing would otherwise "succeed" with a different value.
+    const state = JSON.parse('{"__proto__": {"polluted": true}, "title": "x"}') as unknown;
+    expect(Object.keys(state as object)).toContain("__proto__");
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, state)).toEqual({
+      ok: false,
+      violation: "forbidden-key",
+      key: "__proto__",
+    });
+    // Nested inside arrays/objects, and as a question id or option key.
+    expect(
+      parseEvaluationInputBounded(EvaluationStateSchema, [
+        { nested: JSON.parse('{"__proto__": 1}') as unknown },
+      ])
+    ).toMatchObject({ ok: false, violation: "forbidden-key" });
+    const questions = JSON.parse(
+      '{"__proto__": {"type": "boolean", "instructions": "x"}, "q": {"type": "boolean", "instructions": "y"}}'
+    ) as unknown;
+    expect(
+      parseEvaluationInputBounded(WorkflowEvaluateSpecSchema, { id: "s", questions })
+    ).toMatchObject({ ok: false, violation: "forbidden-key" });
+    const criteria = JSON.parse('{"__proto__": "a", "b": "b"}') as unknown;
+    expect(
+      parseEvaluationInputBounded(WorkflowEvaluateSpecSchema, {
+        id: "s",
+        questions: { q: { type: "choice", instructions: "x", criteria } },
+      })
+    ).toMatchObject({ ok: false, violation: "forbidden-key" });
+    // Plain "__proto__" strings as values are fine.
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, { text: "__proto__" })).toMatchObject(
+      { ok: true }
+    );
+  });
+
   it("parses in-limit values and reports schema violations as zod errors", () => {
     const ok = parseEvaluationInputBounded(EvaluationStateSchema, { a: [1, "b", null] });
     expect(ok).toEqual({ ok: true, value: { a: [1, "b", null] } });
