@@ -167,6 +167,19 @@ export interface AutoModelRoutingDecision {
 }
 
 /**
+ * One mid-turn thinking raise: Auto set this turn's thinking level and the turn then
+ * looked stuck, so the remaining steps ran one level higher.
+ */
+export interface AutoModelRoutingEscalation {
+  /** 1-based index of the first step that ran at the raised level. */
+  step: number;
+  from: ThinkingLevel;
+  to: ThinkingLevel;
+  /** The stuck signal that fired, phrased for the badge tooltip. */
+  reason: string;
+}
+
+/**
  * Persisted on the assistant message so the transcript can show which tier the
  * evaluator chose and why the turn ran on the model and thinking level it did.
  */
@@ -181,6 +194,8 @@ export interface AutoModelRoutingRecord {
   model: string;
   /** Present when Auto set the thinking level; absent means the composer's level ran. */
   thinkingLevel?: ThinkingLevel;
+  /** Mid-turn raises above `thinkingLevel`, in order; the last one's `to` is the level that finished the turn. */
+  escalations?: AutoModelRoutingEscalation[];
   status: "routed" | "unmapped-tier" | "fallback";
   /** Sanitized evaluation failure reason for the fallback status. */
   reason?: string;

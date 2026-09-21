@@ -71,6 +71,13 @@ import type {
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
+import {
+  createAutoThinkingEscalationState,
+  markAutoThinkingEscalationExhausted,
+  proposeAutoThinkingEscalation,
+  recordAutoThinkingEscalation,
+  type AutoThinkingEscalationState,
+} from "@/node/services/autoThinkingEscalation";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
@@ -349,6 +356,8 @@ interface StepMessageTracker {
   prefixSwapInvalidated?: boolean;
   prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
+  /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
+  autoThinkingEscalation?: AutoThinkingEscalationState;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -2700,6 +2709,18 @@ export class StreamManager {
           }
           throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
         }
+        // Auto-set thinking raises itself when the turn looks stuck, through the same
+        // override the slider uses (so the swap check below sees it too); a slider move
+        // this turn hands the level to the user.
+        const escalationState = stepTracker?.autoThinkingEscalation;
+        const overrideState = request.thinkingOverrideState;
+        const escalation =
+          escalationState && overrideState && !overrideState.manual && overrideState.pending == null
+            ? proposeAutoThinkingEscalation(escalationState, stepMessages)
+            : undefined;
+        if (escalation && overrideState) {
+          overrideState.pending = escalation.to;
+        }
         // The staged prefix was prepared under the previous thinking options.
         // Keep full context if those options change before the swap is consumed.
         const pendingSwap = stepTracker?.pendingPrefixSwap;
@@ -2764,6 +2785,16 @@ export class StreamManager {
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
+        if (escalation && escalationState) {
+          // The rebuild clamps to the model's ceiling and reports a no-op as "not
+          // applicable"; only a level that actually changed is provenance.
+          if (thinkingOverride !== undefined && overrideState?.applied === escalation.to) {
+            recordAutoThinkingEscalation(escalationState, escalation);
+            log.info("Auto thinking escalated mid-turn", escalation);
+          } else {
+            markAutoThinkingEscalationExhausted(escalationState);
+          }
+        }
         // Step 0: an override consumed here raced stream setup (written during
         // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
         // fold). Message preparation is thinking-level-dependent (Anthropic
@@ -2981,6 +3012,22 @@ export class StreamManager {
       };
       if (request.thinkingOverrideState.applied) {
         streamInfo.thinkingLevel = request.thinkingOverrideState.applied;
+      }
+      // A thinking level Auto chose may raise itself mid-turn (see autoThinkingEscalation.ts);
+      // the raises land on the routing record the stream-end metadata spreads.
+      const routedThinkingLevel = initialMetadata?.autoModelRouting?.thinkingLevel;
+      if (routedThinkingLevel != null) {
+        stepTracker.autoThinkingEscalation = createAutoThinkingEscalationState(
+          routedThinkingLevel,
+          (escalations) => {
+            const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+            if (autoModelRouting == null) return;
+            streamInfo.initialMetadata = {
+              ...streamInfo.initialMetadata,
+              autoModelRouting: { ...autoModelRouting, escalations },
+            };
+          }
+        );
       }
     }
 

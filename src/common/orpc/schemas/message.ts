@@ -134,6 +134,15 @@ export const ModelFallbackRecordSchema = z.object({
   refusedModels: z.array(z.string()),
 });
 
+// One mid-turn thinking raise applied because the turn looked stuck (auto-model-routing).
+export const AutoModelRoutingEscalationSchema = z.object({
+  // 1-based index of the first step that ran at the raised level.
+  step: z.number().int().positive(),
+  from: ThinkingLevelSchema,
+  to: ThinkingLevelSchema,
+  reason: z.string(),
+});
+
 // Auto-model-routing provenance (which tier the evaluator chose, which model and thinking level ran).
 export const AutoModelRoutingRecordSchema = z.object({
   requestedFallbackModel: z.string(),
@@ -143,6 +152,7 @@ export const AutoModelRoutingRecordSchema = z.object({
   probabilities: z.record(z.string(), z.number()).optional(),
   model: z.string(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  escalations: z.array(AutoModelRoutingEscalationSchema).optional(),
   status: z.enum(["routed", "unmapped-tier", "fallback"]),
   reason: z.string().optional(),
 });

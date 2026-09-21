@@ -110,6 +110,34 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     expect(buildAutoModelRoutingBadgeLabel(withThinking)).toContain("HIGH");
   });
 
+  test("an escalated turn is labeled at its final level and lists each raise", () => {
+    const escalated: AutoModelRoutingRecord = {
+      ...routed,
+      thinkingLevel: "low",
+      escalations: [
+        {
+          step: 4,
+          from: "low",
+          to: "medium",
+          reason: "3 consecutive steps with only failing tool calls",
+        },
+        { step: 7, from: "medium", to: "high", reason: "the same bash call repeated 3 times" },
+      ],
+    };
+    // The badge names the level the turn finished at, not the tier's starting level.
+    expect(buildAutoModelRoutingBadgeLabel(escalated)).toContain("HIGH");
+    expect(buildAutoModelRoutingBadgeLabel(escalated)).not.toContain("LOW");
+    const lines = buildAutoModelRoutingTooltipLines(escalated);
+    // The run line keeps the starting level; one line per raise follows it, in order.
+    expect(lines[1]).toContain("LOW");
+    expect(lines[2]).toContain("MED");
+    expect(lines[2]).toContain("step 4");
+    expect(lines[3]).toContain("HIGH");
+    expect(lines[3]).toContain("step 7");
+    // Probabilities still trail the raises.
+    expect(lines[4]).toContain("easy");
+  });
+
   test("labels the thinking level against the model that ran", () => {
     // OpenAI reports max as xhigh unless the model has a native max effort.
     const openai: AutoModelRoutingRecord = {

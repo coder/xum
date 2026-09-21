@@ -10,11 +10,13 @@ function describeTier(record: AutoModelRoutingRecord): string {
   return record.tierLabel ?? record.tierId ?? "unknown tier";
 }
 
-/** Present only when Auto set the thinking level; labeled against the model that ran. */
+/**
+ * Present only when Auto set the thinking level; labeled against the model that ran. A
+ * turn that escalated mid-way finished at the last raise's level, so that is the one shown.
+ */
 function describeThinking(record: AutoModelRoutingRecord): string | undefined {
-  return record.thinkingLevel != null
-    ? getThinkingDisplayLabel(record.thinkingLevel, record.model)
-    : undefined;
+  const level = record.escalations?.at(-1)?.to ?? record.thinkingLevel;
+  return level != null ? getThinkingDisplayLabel(level, record.model) : undefined;
 }
 
 export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord): string {
@@ -56,7 +58,10 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
         ? `The evaluation model chose ${tierLabel} (${formatPercent(record.confidence)} confidence).`
         : `The evaluation model chose ${tierLabel}.`
     );
-    const thinking = describeThinking(record);
+    const thinking =
+      record.thinkingLevel != null
+        ? getThinkingDisplayLabel(record.thinkingLevel, record.model)
+        : undefined;
     lines.push(
       record.status === "routed"
         ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`
@@ -64,6 +69,11 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
           ? `Nothing mapped to this tier; used ${fallbackModel}.`
           : `Fell back to ${fallbackModel}${reason ? `: ${reason}` : ""}.`
     );
+    for (const escalation of record.escalations ?? []) {
+      lines.push(
+        `Escalated to ${getThinkingDisplayLabel(escalation.to, record.model)} thinking at step ${escalation.step}: ${escalation.reason}.`
+      );
+    }
   }
   const probabilities = Object.entries(record.probabilities ?? {}).sort(([, a], [, b]) => b - a);
   for (const [tierId, probability] of probabilities) {

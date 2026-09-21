@@ -36,6 +36,12 @@ import type {
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "./thinkingOverride";
+import {
+  createAutoThinkingEscalationState,
+  type AutoThinkingEscalationState,
+} from "./autoThinkingEscalation";
+import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import * as aiSdk from "ai";
 import {
@@ -7723,7 +7729,8 @@ describe("StreamManager - mid-turn thinking override", () => {
   type BuildStreamRequestConfig = (input: Record<string, unknown>) => OverrideRequestForTests;
   type CreateStreamResult = (
     request: OverrideRequestForTests,
-    abortController: AbortController
+    abortController: AbortController,
+    stepTracker?: { autoThinkingEscalation?: AutoThinkingEscalationState }
   ) => unknown;
   type CapturedPrepareStep = (options: {
     messages: ModelMessage[];
@@ -7757,8 +7764,8 @@ describe("StreamManager - mid-turn thinking override", () => {
     }
     return {
       buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
-      createStreamResult: (request, abortController) =>
-        createStreamResultMethod.call(streamManager, request, abortController),
+      createStreamResult: (request, abortController, stepTracker) =>
+        createStreamResultMethod.call(streamManager, request, abortController, stepTracker),
     };
   }
 
@@ -7870,6 +7877,216 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
+  // Auto-set thinking escalation (autoThinkingEscalation.ts) rides the same override.
+  function stuckTranscript(): ModelMessage[] {
+    const failing = (index: number): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: `call-${index}`, toolName: "bash", input: { c: index } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "bash",
+            output: { type: "json", value: { success: false, error: "boom" } },
+          },
+        ],
+      },
+    ];
+    return [{ role: "user", content: "fix it" }, ...failing(0), ...failing(1), ...failing(2)];
+  }
+
+  test("a stuck Auto-set thinking level escalates through the rebuild and records provenance", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    const rebuild = mock((level: string) => ({
+      effectiveLevel: level as ThinkingLevel,
+      providerOptions: { anthropic: { effort: level } },
+    }));
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const transcript = stuckTranscript();
+    const step = await prepareStep({ messages: transcript, stepNumber: 3 });
+    expect(step?.providerOptions).toEqual({ anthropic: { effort: "medium" } });
+    expect(state.applied).toBe("medium");
+    expect(persisted.at(-1)).toMatchObject([{ step: 4, from: "low", to: "medium" }]);
+    // The judged steps do not fire again, and the user never touched the slider.
+    expect(await prepareStep({ messages: transcript, stepNumber: 4 })).toBeUndefined();
+    expect(state.manual).toBeUndefined();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  test("a slider move this turn disables Auto's escalation", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = { manual: true, applied: "off" };
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    const rebuild = mock(() => null);
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    expect(await prepareStep({ messages: stuckTranscript(), stepNumber: 3 })).toBeUndefined();
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(persisted).toEqual([]);
+  });
+
+  test("a raise the model ceiling clamps away is not provenance and ends further attempts", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("high", (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    // The model tops out at high: the rebuild reports the clamped level as a no-op.
+    const rebuild = mock(() => null);
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const transcript = stuckTranscript();
+    expect(await prepareStep({ messages: transcript, stepNumber: 3 })).toBeUndefined();
+    expect(persisted).toEqual([]);
+    expect(stepTracker.autoThinkingEscalation.exhausted).toBe(true);
+    // Three more failures would qualify again; the exhausted state stops the retry.
+    const longer = [...transcript, ...stuckTranscript().slice(1)];
+    expect(await prepareStep({ messages: longer, stepNumber: 6 })).toBeUndefined();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  test("startStream arms escalation only for an Auto-set thinking level and lands raises on the stream-end record", async () => {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/auto-escalation-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+    const raise: AutoModelRoutingEscalation = {
+      step: 4,
+      from: "low",
+      to: "medium",
+      reason: "3 consecutive steps with only failing tool calls",
+    };
+    const armed: Record<string, boolean> = {};
+    let activeWorkspaceId = "";
+    // The mocked stream stands in for prepareStep: it reports whether escalation was armed
+    // for this stream and fires the provenance sink the way a recorded raise would.
+    Reflect.set(streamManager, "createStreamResult", () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          const tracker = (
+            workspaceStreams.get(activeWorkspaceId) as {
+              stepTracker: { autoThinkingEscalation?: AutoThinkingEscalationState };
+            }
+          ).stepTracker;
+          armed[activeWorkspaceId] = tracker.autoThinkingEscalation != null;
+          tracker.autoThinkingEscalation?.onEscalated([raise]);
+          yield { type: "text-delta", text: "done" };
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      )
+    );
+    const streamEnds: Array<{
+      metadata?: { autoModelRouting?: { escalations?: unknown; thinkingLevel?: string } };
+    }> = [];
+    onTurnEngineEvent(streamManager, "stream-end", (data) =>
+      streamEnds.push(data as (typeof streamEnds)[number])
+    );
+    const routed = {
+      status: "routed" as const,
+      tierId: "hard",
+      model: "openai:gpt-4.1-mini",
+      requestedFallbackModel: "openai:gpt-4.1-mini",
+    };
+    for (const [workspaceId, autoModelRouting] of [
+      ["auto-escalation-thinking", { ...routed, thinkingLevel: "low" as const }],
+      ["auto-escalation-model-only", routed],
+    ] as const) {
+      activeWorkspaceId = workspaceId;
+      await appendPartialAssistantForTests(workspaceId, `${workspaceId}-msg`, 1);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId: `${workspaceId}-msg`,
+          model: createTestLanguageModel(),
+          tools: {},
+          thinkingOverrideState: {},
+          initialMetadata: { autoModelRouting },
+        })
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Expected stream to start");
+      await result.data.completion;
+    }
+
+    expect(armed).toEqual({
+      "auto-escalation-thinking": true,
+      "auto-escalation-model-only": false,
+    });
+    expect(streamEnds).toHaveLength(2);
+    expect(streamEnds[0]?.metadata?.autoModelRouting).toMatchObject({
+      thinkingLevel: "low",
+      escalations: [raise],
+    });
+    expect(streamEnds[1]?.metadata?.autoModelRouting?.escalations).toBeUndefined();
+  });
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {
     const streamManager = new StreamManager(historyService);
     const { buildRequestConfig, createStreamResult } = getRequestHelpers(streamManager);

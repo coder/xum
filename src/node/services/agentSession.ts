@@ -9976,6 +9976,7 @@ export class AgentSession {
       return { accepted: false };
     }
     holder.pending = level;
+    holder.manual = true;
     return { accepted: true };
   }
 

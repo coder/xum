@@ -18,6 +18,12 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 export interface ActiveTurnThinkingOverride {
   /** Raw level requested mid-turn; consumed at the next prepareStep (incl. step 1). */
   pending?: ThinkingLevel;
+  /**
+   * The user moved the slider during this turn. Auto's stuck-turn escalation
+   * (autoThinkingEscalation.ts) writes `pending` too, but defers to the user for
+   * the rest of the turn once this is set.
+   */
+  manual?: boolean;
   /** Effective level after the most recent successful application. */
   applied?: ThinkingLevel;
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */

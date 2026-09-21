@@ -60,3 +60,12 @@ export const AUTO_MODEL_ROUTING_RECENT_MESSAGE_MAX_CHARS = 500;
  * request is abandoned and the turn falls back to the composer's choices.
  */
 export const AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS = 8_000;
+
+/**
+ * Mid-turn thinking escalation for turns whose thinking level Auto chose. The turn
+ * counts as stuck after this many consecutive tool steps that all failed, or that
+ * repeated one identical call; each raise moves one level up the ladder.
+ */
+export const AUTO_THINKING_ESCALATION_WINDOW_STEPS = 3;
+/** Raises per turn; the tier's level plus two is as far as Auto goes without the user. */
+export const AUTO_THINKING_ESCALATION_MAX_PER_TURN = 2;
