@@ -168,6 +168,49 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     return row;
   }
 
+  /** The follow-up stored on the persisted compaction-request row. */
+  async function persistedCompactionFollowUp(
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"]
+  ) {
+    const history = await historyService.getHistoryFromLatestBoundary("ws-auto-routing");
+    if (!history.success) throw new Error(history.error);
+    const muxMetadata = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    )?.metadata?.muxMetadata;
+    return muxMetadata?.type === "compaction-request"
+      ? muxMetadata.parsed.followUpContent
+      : undefined;
+  }
+
+  /** Make the next send hit the on-send compaction threshold. */
+  function forceOnSendCompaction(session: Awaited<ReturnType<typeof createHarness>>["session"]) {
+    const internals = session as unknown as {
+      contextController: { compactionMonitor: CompactionMonitor };
+    };
+    internals.contextController.compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.85),
+    } as unknown as CompactionMonitor;
+  }
+
+  const UNSUPPORTED_IMAGE = {
+    type: "file" as const,
+    url: "data:image/png;base64,iVBORw0KGgo=",
+    mediaType: "image/png",
+  };
+  /** Tiers whose hard model is catalogued without vision or PDF support. */
+  const TIERS_WITH_GROK = TIERS.map((tier) =>
+    tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier
+  );
+
   it("runs the turn on the chosen tier's model and strips the flag from the retry snapshot", async () => {
     const { session, historyService, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
@@ -442,7 +485,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
       // xai:grok-3 is catalogued without PDF support; the composer model has no catalog entry.
-      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+      tiers: TIERS_WITH_GROK,
     });
 
     const result = await session.sendMessage("Summarize this", {
@@ -471,7 +514,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
       // xai:grok-3 is catalogued without vision; the composer model has no catalog entry.
-      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+      tiers: TIERS_WITH_GROK,
     });
 
     const result = await session.sendMessage("What is in this screenshot?", {
@@ -497,7 +540,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
   it("falls back when a PDF earlier in the conversation cannot be sent to the chosen tier's model", async () => {
     const { session, historyService, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
-      tiers: TIERS.map((tier) => (tier.id === "hard" ? { ...tier, model: "xai:grok-3" } : tier)),
+      tiers: TIERS_WITH_GROK,
     });
     const earlier = createMuxMessage("earlier-pdf", "user", "Read this", undefined, [
       {
@@ -626,21 +669,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
-    const internals = session as unknown as {
-      contextController: { compactionMonitor: CompactionMonitor };
-    };
-    internals.contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: true,
-        shouldForceCompact: true,
-        usagePercentage: 99,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
-    } as unknown as CompactionMonitor;
+    forceOnSendCompaction(session);
 
     const result = await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -652,19 +681,93 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     await session.waitForIdle();
 
     expect(classify).toHaveBeenCalledTimes(1);
-    const history = await historyService.getHistoryFromLatestBoundary("ws-auto-routing");
-    if (!history.success) throw new Error(history.error);
-    const compactionRow = history.data.find(
-      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
-    );
-    const muxMetadata = compactionRow?.metadata?.muxMetadata;
-    const followUp =
-      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+    const followUp = await persistedCompactionFollowUp(historyService);
     expect(followUp?.model).toBe(HARD_MODEL);
     expect(followUp?.autoModelRouting).toMatchObject({
       status: "routed",
       tierId: "hard",
       model: HARD_MODEL,
+    });
+  });
+
+  it("keeps the routed model on the on-send follow-up when only pre-compaction attachments block it", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS_WITH_GROK,
+    });
+    forceOnSendCompaction(session);
+    const earlier = createMuxMessage("earlier-image", "user", "Look at this", undefined, [
+      UNSUPPORTED_IMAGE,
+    ]);
+    expect((await historyService.appendToHistory("ws-auto-routing", earlier)).success).toBe(true);
+
+    const result = await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    // The compaction turn still has the image in context, so it must not inherit the tier model.
+    expect(streamMessage.mock.calls[0]?.[0]?.modelString).not.toBe("xai:grok-3");
+    // The follow-up runs after the boundary folds the image away: it carries the routed decision.
+    const followUp = await persistedCompactionFollowUp(historyService);
+    expect(followUp?.model).toBe("xai:grok-3");
+    expect(followUp?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      model: "xai:grok-3",
+    });
+  });
+
+  it("re-gates a dispatched compaction follow-up against attachments that survived the boundary", async () => {
+    const { session, historyService, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+    });
+    const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+      timestamp: Date.now() - 2_000,
+      compactionBoundary: true,
+      compacted: "user",
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: {
+          text: "Now describe the screenshot",
+          model: "xai:grok-3",
+          agentId: "exec",
+          autoModelRouting: {
+            requestedFallbackModel: COMPOSER_MODEL,
+            model: "xai:grok-3",
+            status: "routed",
+            tierId: "hard",
+            tierLabel: "Hard",
+          },
+        },
+      },
+    });
+    // A keep-recent tail copy carried the screenshot past the boundary.
+    const tailCopy = createMuxMessage(
+      "tail-image",
+      "user",
+      "Look at this",
+      { timestamp: Date.now() - 1_000, rlmPreservedTailCopy: true },
+      [UNSUPPORTED_IMAGE]
+    );
+    expect((await historyService.appendToHistory("ws-auto-routing", summary)).success).toBe(true);
+    expect((await historyService.appendToHistory("ws-auto-routing", tailCopy)).success).toBe(true);
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const options = streamMessage.mock.calls[0]?.[0];
+    expect(options?.modelString).toBe(COMPOSER_MODEL);
+    expect(options?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      tierId: "hard",
+      model: COMPOSER_MODEL,
+      reason: "Model xai:grok-3 does not support image input.",
     });
   });
 
@@ -1121,6 +1224,44 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       model: COMPOSER_MODEL,
       requestedFallbackModel: COMPOSER_MODEL,
     });
+  });
+
+  it("routes a /compact follow-up past attachments the compaction is about to fold away", async () => {
+    const { session, historyService, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS_WITH_GROK,
+    });
+    const earlier = createMuxMessage("earlier-image", "user", "Look at this", undefined, [
+      UNSUPPORTED_IMAGE,
+    ]);
+    expect((await historyService.appendToHistory("ws-auto-routing", earlier)).success).toBe(true);
+    const compactionModel = "anthropic:claude-3-5-haiku-latest";
+
+    const result = await session.sendMessage("/compact\nRefactor the scheduler", {
+      model: compactionModel,
+      agentId: "compact",
+      autoModelRouting: true,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\nRefactor the scheduler",
+        commandPrefix: "/compact",
+        parsed: {
+          model: compactionModel,
+          followUpContent: {
+            text: "Refactor the scheduler",
+            model: COMPOSER_MODEL,
+            agentId: "exec",
+          },
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const followUp = await persistedCompactionFollowUp(historyService);
+    expect(followUp?.model).toBe("xai:grok-3");
+    expect(followUp?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
   });
 
   it("never calls the classifier when the flag is absent", async () => {

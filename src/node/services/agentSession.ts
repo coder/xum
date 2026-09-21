@@ -4160,8 +4160,18 @@ export class AgentSession {
         trimmedMessage,
         optionsForStream,
         routingDimensions,
-        effectiveFileParts,
         cancelSignal
+      );
+    }
+    // A routed record reaches here freshly classified or carried by a compaction follow-up;
+    // either way the attachment gate sees the context this request actually runs in. The
+    // ungated decision survives for an on-send compaction follow-up, which runs after the
+    // boundary and gates itself on dispatch.
+    const routedOptions = optionsForStream;
+    if (!isCompactionRequest) {
+      optionsForStream = await this.gateRoutedModelAgainstAttachments(
+        optionsForStream,
+        effectiveFileParts
       );
     }
     let modelForStream = optionsForStream.model;
@@ -4315,7 +4325,8 @@ export class AgentSession {
         goalKind,
         goalId: internal?.goalId,
         muxMetadata: typedMuxMetadata,
-        autoModelRouting: optionsForStream.autoModelRoutingRecord,
+        // Pre-gate decision: the follow-up re-gates against the post-compaction context.
+        autoModelRouting: routedOptions.autoModelRoutingRecord,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -6829,7 +6840,6 @@ export class AgentSession {
       prompt,
       { ...options, model: followUp.model, thinkingLevel: followUp.thinkingLevel },
       dimensions,
-      followUp.fileParts,
       signal
     );
     if (routed.autoModelRoutingRecord == null) return metadata;
@@ -7018,7 +7028,6 @@ export class AgentSession {
     prompt: string,
     options: ResolvedSendMessageOptions,
     dimensions: AutoModelRoutingDimensions,
-    fileParts: FilePart[] | undefined,
     signal: AbortSignal | undefined
   ): Promise<ResolvedSendMessageOptions> {
     const experimentEnabled =
@@ -7109,16 +7118,9 @@ export class AgentSession {
       return fallback({ ...provenance, status: "unmapped-tier" });
     }
     if (applies.model && chosen.model != null) {
-      // The send-time checks only saw the composer model: every attachment the request
-      // carries (this turn's and earlier ones still in the window) must fit the tier
-      // model, and a budgeted goal must not spend on a model it cannot price.
-      const contextParts = [...(fileParts ?? []), ...(await this.collectContextFileParts())];
-      const attachmentIssue =
-        this.findImageAttachmentIssue(chosen.model, contextParts) ??
-        this.findPdfAttachmentIssue(chosen.model, contextParts);
-      if (attachmentIssue) {
-        return fallback({ ...provenance, status: "fallback", reason: attachmentIssue });
-      }
+      // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
+      // context the turn finally runs in, which compaction can still change. A budgeted goal
+      // must not spend on a model it cannot price.
       const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
         this.workspaceId,
         chosen.model
@@ -7161,6 +7163,39 @@ export class AgentSession {
           ? { thinkingLevel: chosen.thinkingLevel }
           : {}),
         status: "routed",
+      },
+    };
+  }
+
+  /**
+   * Revert a routed model to the composer's when an attachment the request carries (this
+   * turn's, or an earlier turn's still in the window) cannot be sent to it. Runs on the
+   * request that actually streams, never at classification time: an on-send compaction or a
+   * /compact follow-up defers the turn behind a new boundary, and attachments the summary
+   * folds away must not cost the tier model. Only the model reverts; the tier's thinking
+   * level does not depend on attachments.
+   */
+  private async gateRoutedModelAgainstAttachments(
+    options: ResolvedSendMessageOptions,
+    fileParts: FilePart[] | undefined
+  ): Promise<ResolvedSendMessageOptions> {
+    const record = options.autoModelRoutingRecord;
+    if (record?.status !== "routed" || record.model === record.requestedFallbackModel) {
+      return options;
+    }
+    const contextParts = [...(fileParts ?? []), ...(await this.collectContextFileParts())];
+    const attachmentIssue =
+      this.findImageAttachmentIssue(record.model, contextParts) ??
+      this.findPdfAttachmentIssue(record.model, contextParts);
+    if (attachmentIssue == null) return options;
+    return {
+      ...options,
+      model: record.requestedFallbackModel,
+      autoModelRoutingRecord: {
+        ...record,
+        model: record.requestedFallbackModel,
+        status: "fallback",
+        reason: attachmentIssue,
       },
     };
   }

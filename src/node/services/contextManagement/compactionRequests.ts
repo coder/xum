@@ -28,7 +28,10 @@ export function buildAutoCompactionFollowUp(params: {
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
-    model: params.modelForStream,
+    // A routing record names the model its turn should run on. The live send may have gated
+    // it back to the composer model over attachments this compaction folds away; the
+    // follow-up carries the decision and re-gates against the post-boundary context.
+    model: params.autoModelRouting?.model ?? params.modelForStream,
     agentId: params.options.agentId,
     ...pickPreservedSendOptions(params.options),
   };
