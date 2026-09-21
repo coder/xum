@@ -4,11 +4,13 @@ import { join } from "node:path";
 
 const STORY_DIR = "src/browser/stories";
 const COLOCATED_STORY_DIRS = ["src/browser/components", "src/browser/features"];
-const MAX_SNAPSHOT_ENABLED_FILES = 109;
+// Exact retained inventory measured on the current main (the rebase target added six
+// snapshot-enabled App.* story files); the branch itself adds no stories.
+const MAX_SNAPSHOT_ENABLED_FILES = 115;
 // Accept the retained story inventory without dropping visual coverage.
 // Keep this no-headroom guardrail tight: future growth should exclude, consolidate,
 // or intentionally rebalance snapshots rather than silently increasing Pixel load.
-const MAX_ESTIMATED_SNAPSHOTS = 555;
+const MAX_ESTIMATED_SNAPSHOTS = 594;
 const STORY_EXPORT_PATTERN = /^export const \w+/gm;
 const DUAL_THEME_PATTERN = /matrix:\s*PIXEL_DUAL_THEME/g;
 const INLINE_MATRIX_OBJECT_PATTERN = /matrix:\s*{/g;
