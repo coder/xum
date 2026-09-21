@@ -61,7 +61,11 @@ import {
   reasoningProviderOptionsFromMetadata,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
-import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  ThinkingLevelSchema,
+  coerceThinkingLevel,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -3846,11 +3850,16 @@ export class StreamManager {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
       },
-      // The routing record names the model that actually answered, not the refused tier model.
+      // The routing record names the model that actually answered, not the refused tier model,
+      // and (when Auto set it) the thinking level the fallback preparation clamped to.
       ...(streamInfo.initialMetadata?.autoModelRouting != null && {
         autoModelRouting: {
           ...streamInfo.initialMetadata.autoModelRouting,
           model: prepared.data.modelString,
+          ...(streamInfo.initialMetadata.autoModelRouting.thinkingLevel != null &&
+            coerceThinkingLevel(prepared.data.thinkingLevel) != null && {
+              thinkingLevel: coerceThinkingLevel(prepared.data.thinkingLevel),
+            }),
         },
       }),
     };

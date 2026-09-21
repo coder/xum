@@ -4804,7 +4804,7 @@ describe("StreamManager - empty stream completions", () => {
       metadata?: {
         model?: string;
         modelFallback?: { requestedModel: string; refusedModels: string[] };
-        autoModelRouting?: { tierId?: string; model: string };
+        autoModelRouting?: { tierId?: string; model: string; thinkingLevel?: string };
         toolModelUsages?: Array<{
           toolName: string;
           model: string;
@@ -4894,11 +4894,13 @@ describe("StreamManager - empty stream completions", () => {
       historySequence,
       initialMetadata: {
         agentId: "plan",
-        // An Auto-routed turn: the record must follow the swap to the model that answered.
+        // An Auto-routed turn: the record must follow the swap to the model that answered
+        // and to the thinking level the fallback preparation clamped the tier's level to.
         autoModelRouting: {
           status: "routed",
           tierId: "hard",
           model: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "high",
           requestedFallbackModel: "anthropic:claude-3-5-haiku-latest",
         },
       },
@@ -4928,7 +4930,11 @@ describe("StreamManager - empty stream completions", () => {
       requestedModel: KNOWN_MODELS.SONNET.id,
       refusedModels: [KNOWN_MODELS.SONNET.id],
     });
-    expect(metadata?.autoModelRouting).toMatchObject({ tierId: "hard", model: fallbackModel });
+    expect(metadata?.autoModelRouting).toMatchObject({
+      tierId: "hard",
+      model: fallbackModel,
+      thinkingLevel: "off",
+    });
     // Pin the IPC passthrough: the oRPC schema strips unknown metadata keys, so
     // modelFallback must survive StreamEndEventSchema or the live transcript
     // never learns about the swap.
