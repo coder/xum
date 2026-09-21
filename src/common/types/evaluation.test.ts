@@ -371,4 +371,28 @@ describe("canonicalRequestBytes", () => {
       canonicalRequestBytes({ state: nest(EVALUATION_MAX_DEPTH), questions: QUESTIONS })
     ).toMatchObject({ ok: false, violation: "request-too-deep", depth: EVALUATION_MAX_DEPTH + 1 });
   });
+
+  it("returns a typed violation for pathologically deep or cyclic state instead of throwing", () => {
+    // A recursive walk over these would overflow the stack (RangeError).
+    let deep: EvaluationJsonValue[] = [];
+    for (let index = 0; index < 200_000; index++) {
+      deep = [deep];
+    }
+    expect(canonicalRequestBytes({ state: deep, questions: QUESTIONS })).toMatchObject({
+      ok: false,
+      violation: "request-too-deep",
+      depth: EVALUATION_MAX_DEPTH + 1,
+    });
+    expect(jsonDepth(deep, EVALUATION_MAX_DEPTH)).toBe(EVALUATION_MAX_DEPTH + 1);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(jsonDepth(cyclic, EVALUATION_MAX_DEPTH)).toBe(EVALUATION_MAX_DEPTH + 1);
+    expect(
+      canonicalRequestBytes({
+        state: cyclic as unknown as EvaluationJsonValue[],
+        questions: QUESTIONS,
+      })
+    ).toMatchObject({ ok: false, violation: "request-too-deep" });
+  });
 });
