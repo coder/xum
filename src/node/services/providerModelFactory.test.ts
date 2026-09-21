@@ -4456,3 +4456,234 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 });
+
+describe("ProviderModelFactory.createEvaluationModel", () => {
+  // Credential resolution reads provider env vars; the host may export real
+  // keys/base URLs, so every case runs against the temp providers.jsonc only.
+  const PROVIDER_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GOOGLE_BASE_URL",
+    "XAI_API_KEY",
+  ] as const;
+
+  async function withEvaluationFixture(
+    providers: Record<string, unknown>,
+    run: (
+      config: Config,
+      factory: ProviderModelFactory,
+      fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
+    ) => Promise<void>
+  ): Promise<void> {
+    const saved = new Map<string, string | undefined>();
+    for (const name of PROVIDER_ENV_VARS) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    const fetchSpy = spyOn(globalThis, "fetch");
+    try {
+      await withTempConfig(async (config, factory) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig(
+          providers as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]
+        );
+        await run(config, factory, fetchSpy);
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      for (const [name, value] of saved) {
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
+  }
+
+  function expectResolved(
+    result: Awaited<ReturnType<ProviderModelFactory["createEvaluationModel"]>>
+  ) {
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error(`Expected evaluation model, got ${result.error.reason}`);
+    }
+    return result.data;
+  }
+
+  function expectRejected(
+    result: Awaited<ReturnType<ProviderModelFactory["createEvaluationModel"]>>
+  ) {
+    expect(result.success).toBe(false);
+    if (result.success) {
+      throw new Error("Expected a typed rejection");
+    }
+    return result.error;
+  }
+
+  it.each([
+    ["openai:gpt-5", "openai"],
+    ["anthropic:claude-haiku-4-5", "anthropic"],
+    ["google:gemini-2.5-flash", "google"],
+  ] as const)(
+    "resolves %s to a direct evaluation model without network I/O",
+    async (modelString, providerName) => {
+      await withEvaluationFixture(
+        {
+          openai: { apiKey: "sk-openai" },
+          anthropic: { apiKey: "sk-anthropic" },
+          google: { apiKey: "sk-google" },
+        },
+        async (_config, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          expect(pinned.model.specificationVersion).toBe("v4");
+          expect(typeof pinned.model.doEvaluate).toBe("function");
+          expect(pinned.model.provider.startsWith(providerName)).toBe(true);
+          expect(pinned.model.modelId).toBe(modelString.slice(modelString.indexOf(":") + 1));
+          expect(pinned.routeKind).toBe("direct");
+          expect(pinned.wireProviderName).toBe(providerName);
+          expect(pinned.effectiveModelString).toBe(modelString);
+          expect(pinned.modelString).toBe(modelString);
+          expect(pinned.configFingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+          const again = expectResolved(await factory.createEvaluationModel(modelString));
+          expect(again.configFingerprint).toBe(pinned.configFingerprint);
+          expect(fetchSpy).not.toHaveBeenCalled();
+        }
+      );
+    }
+  );
+
+  it("changes the fingerprint with the base URL but not with the API key", async () => {
+    let baseline: string | undefined;
+    await withEvaluationFixture({ openai: { apiKey: "sk-one" } }, async (_c, factory) => {
+      baseline = expectResolved(
+        await factory.createEvaluationModel("openai:gpt-5")
+      ).configFingerprint;
+    });
+    await withEvaluationFixture({ openai: { apiKey: "sk-two" } }, async (_c, factory) => {
+      const pinned = expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+      expect(pinned.configFingerprint).toBe(baseline!);
+      expect(pinned.configFingerprint).not.toContain("sk-two");
+    });
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-one", baseUrl: "https://proxy.example/openai" } },
+      async (_c, factory) => {
+        const pinned = expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+        expect(pinned.configFingerprint).not.toBe(baseline!);
+      }
+    );
+  });
+
+  it("rejects an OpenAI model the chat path would route through Codex OAuth", async () => {
+    const codexOauth = {
+      type: "oauth",
+      access: "test-access-token",
+      refresh: "test-refresh-token",
+      expires: Date.now() + 60_000,
+      accountId: "test-account-id",
+    };
+    // OAuth only (no API key): the chat path would reroute to chatgpt.com.
+    await withEvaluationFixture({ openai: { codexOauth } }, async (_c, factory) => {
+      expect(
+        expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
+      ).toEqual({ reason: "unsupported-route", routeKind: "codex-oauth", providerName: "openai" });
+    });
+    // Both credentials, OAuth preferred: still rerouted by the chat path, so rejected.
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "oauth" } },
+      async (_c, factory) => {
+        expect(
+          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
+            .routeKind
+        ).toBe("codex-oauth");
+      }
+    );
+    // Both credentials, API key preferred: the chat path uses the key, and so does evaluation.
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "apiKey" } },
+      async (_c, factory) => {
+        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id));
+      }
+    );
+  });
+
+  it("rejects a routePriority that prefers a configured gateway", async () => {
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test" }, openrouter: { apiKey: "or-test" } },
+      async (config, factory) => {
+        await saveRoutePriority(config, ["openrouter", "direct"]);
+        expect(expectRejected(await factory.createEvaluationModel("openai:gpt-5"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "gateway",
+          providerName: "openrouter",
+        });
+        // Direct first: the same config resolves.
+        await saveRoutePriority(config, ["direct", "openrouter"]);
+        expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+      }
+    );
+  });
+
+  it("rejects explicit gateway prefixes instead of rewriting them to a direct route", async () => {
+    await withEvaluationFixture({ openai: { apiKey: "sk-test" } }, async (_c, factory) => {
+      expect(
+        expectRejected(await factory.createEvaluationModel("mux-gateway:openai/gpt-5"))
+      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "mux-gateway" });
+      expect(
+        expectRejected(await factory.createEvaluationModel("coder:anthropic/claude-haiku-4-5"))
+      ).toMatchObject({ reason: "unsupported-route", providerName: "coder" });
+    });
+  });
+
+  it("rejects a custom provider shadowing a built-in evaluation provider id", async () => {
+    await withEvaluationFixture(
+      { openai: { providerType: "openai-compatible", baseUrl: LOCAL_VLLM_BASE_URL, apiKey: "x" } },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("openai:gpt-5"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "custom",
+        });
+      }
+    );
+  });
+
+  it("rejects unconfigured or disabled providers as unauthorized", async () => {
+    await withEvaluationFixture({}, async (_c, factory) => {
+      expect(
+        expectRejected(await factory.createEvaluationModel("anthropic:claude-haiku-4-5"))
+      ).toEqual({ reason: "unauthorized", providerName: "anthropic" });
+    });
+    await withEvaluationFixture(
+      { google: { apiKey: "sk-google", enabled: false } },
+      async (_c, factory) => {
+        expect(
+          expectRejected(await factory.createEvaluationModel("google:gemini-2.5-flash"))
+        ).toEqual({ reason: "unauthorized", providerName: "google" });
+      }
+    );
+  });
+
+  it("rejects providers without an evaluation factory and malformed model strings", async () => {
+    await withEvaluationFixture({ xai: { apiKey: "xai-test" } }, async (_c, factory) => {
+      expect(expectRejected(await factory.createEvaluationModel("xai:grok-4-1-fast"))).toEqual({
+        reason: "unsupported-provider",
+        providerName: "xai",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("nobody:model"))).toEqual({
+        reason: "unsupported-provider",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("gpt-5"))).toEqual({
+        reason: "unknown-model",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("openai:"))).toEqual({
+        reason: "unknown-model",
+      });
+    });
+  });
+});

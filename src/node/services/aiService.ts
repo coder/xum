@@ -626,6 +626,13 @@ export class AIService extends EventEmitter {
     return this.providerModelFactory.createModelWithPinnedOptions(modelString, opts);
   }
 
+  /** Evaluation model for the workflow `evaluate()` primitive (see ProviderModelFactory). */
+  createEvaluationModel(
+    modelString: string
+  ): ReturnType<ProviderModelFactory["createEvaluationModel"]> {
+    return this.providerModelFactory.createEvaluationModel(modelString);
+  }
+
   private wrapToolsForDelegation(
     workspaceId: string,
     tools: Record<string, Tool>,

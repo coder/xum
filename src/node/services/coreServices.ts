@@ -42,6 +42,7 @@ import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
@@ -92,6 +93,8 @@ export interface CoreServices {
    */
   idleDispatcher: IdleDispatcher;
   aiService: AIService;
+  /** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+  evaluationService: EvaluationService;
   streamManager: StreamManager;
   mcpConfigService: MCPConfigService;
   mcpServerManager: MCPServerManager;
