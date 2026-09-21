@@ -19129,7 +19129,7 @@ describe("TaskService", () => {
     expect(ws?.taskStatus).toBe("running");
   });
 
-  test("rolls back created workspace when initial sendMessage fails", async () => {
+  test("keeps the published workspace as an interrupted one (no rollback) when the initial sendMessage fails", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "aaaaaaaaaa");
 
@@ -19177,26 +19177,18 @@ describe("TaskService", () => {
 
     expect(created.success).toBe(false);
 
-    const postCfg = config.loadConfigOrDefault();
-    const stillExists = Array.from(postCfg.projects.values())
-      .flatMap((p) => p.workspaces)
-      .some((w) => w.id === "aaaaaaaaaa");
-    expect(stillExists).toBe(false);
-
-    // Rollback must also drop the extension-metadata entry: the failed send
-    // may already have scheduled metadata writes that would otherwise leak a
-    // stale key after deregistration (#3959).
-    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith("aaaaaaaaaa");
+    // The entry was persisted and announced before the send: the workspace is published, so a
+    // launch failure ends it as an interrupted workspace with its launch error (removable like
+    // any other) instead of deleting the row, checkout and session underneath whoever may
+    // already have sent into it or re-admitted it.
+    expect(findWorkspaceInConfig(config, "aaaaaaaaaa")?.taskStatus).toBe("interrupted");
+    expect(findWorkspaceInConfig(config, "aaaaaaaaaa")?.taskLaunchError).toContain("send failed");
+    // Still registered, so its extension metadata must not be discarded (write-tombstoned).
+    expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
 
     const workspaceName = "agent_explore_aaaaaaaaaa";
     const workspacePath = runtime.getWorkspacePath(projectPath, workspaceName);
-    let workspacePathExists = true;
-    try {
-      await fsPromises.access(workspacePath);
-    } catch {
-      workspacePathExists = false;
-    }
-    expect(workspacePathExists).toBe(false);
+    await fsPromises.access(workspacePath);
   }, 20_000);
 
   test("rolls back a forked checkout when persistence throws after the fork", async () => {
@@ -19269,63 +19261,6 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
       parentId
     );
-  }, 20_000);
-
-  test("failed config deregistration during rollback does not tombstone the task's metadata", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["bbbbbbbbbb"], "bbbbbbbbbb");
-
-    const projectPath = await createTestProject(rootDir);
-
-    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
-    const runtime = createRuntime(runtimeConfig, { projectPath });
-    const initLogger = createNullInitLogger();
-
-    const parentName = "parent-b";
-    const parentCreate = await runtime.createWorkspace({
-      projectPath,
-      branchName: parentName,
-      trunkBranch: "main",
-      directoryName: parentName,
-      initLogger,
-    });
-    expect(parentCreate.success).toBe(true);
-
-    const parentId = "2222222222";
-    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        {
-          path: parentPath,
-          id: parentId,
-          name: parentName,
-          createdAt: new Date().toISOString(),
-          runtimeConfig,
-        },
-      ],
-      testTaskSettings()
-    );
-    const { aiService } = createAIServiceMocks(config);
-    const failingSendMessage = mock(() => Promise.resolve(Err("send failed")));
-    const { workspaceService, discardExtensionMetadataEntry } = createWorkspaceServiceMocks({
-      sendMessage: failingSendMessage,
-    });
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    // Deregistration fails: the rollback must NOT discard (and thereby
-    // write-tombstone) metadata for a workspace that is still registered.
-    const removeSpy = spyOn(config, "removeWorkspace").mockImplementation(() =>
-      Promise.reject(new Error("config locked"))
-    );
-    try {
-      const created = await createAgentTask(taskService, parentId, "do the thing");
-      expect(created.success).toBe(false);
-      expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
-    } finally {
-      removeSpy.mockRestore();
-    }
   }, 20_000);
 
   test("agent_report posts report to parent, finalizes pending task tool output, and triggers cleanup", async () => {

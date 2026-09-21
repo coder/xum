@@ -17,6 +17,7 @@ import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SecretsStore } from "@/node/config";
 import {
+  SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
@@ -115,6 +116,7 @@ interface Internals {
   handleStreamEnd: (event: unknown) => Promise<void>;
   /** The direct create's rollback: the only deleter of a failed launch's row, checkout and session. */
   rollbackFailedTaskCreate: (...args: unknown[]) => Promise<void>;
+  emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -1824,7 +1826,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     });
 
     test.each(["pending", "admitted", "pending-outlives", "admitted-outlives"] as const)(
-      "a direct create whose launch fails closes and drains its attempt before any deletion (%s racing send); an owner outliving the bound defers the rollback without minting settlement",
+      "a direct create whose launch fails closes and drains its attempt and keeps the published workspace as an interrupted one (%s racing send); an owner outliving the bound defers settlement to its own end",
       async (racing) => {
         const outlives = racing.endsWith("-outlives");
         const spawnedId = {
@@ -1886,19 +1888,10 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           workspaceService: host.workspaceService,
         });
         const svc = internals(taskService);
-        const atFirstDeletion: Record<string, unknown> = {};
-        const rollback = svc.rollbackFailedTaskCreate.bind(taskService);
-        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate").mockImplementation(
-          (...args: unknown[]) => {
-            const id = args[3] as string;
-            order.push("rollback");
-            atFirstDeletion.settlement = svc.attemptSettlementByTaskId.get(id)?.phase;
-            atFirstDeletion.racingStale = racingToken?.admissionStale();
-            atFirstDeletion.stopRecordRetained = svc.workspaceStopRecords.has(id);
-            atFirstDeletion.debts = svc.admittedSendsByTaskId.get(id)?.size ?? 0;
-            return rollback(...args);
-          }
-        );
+        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate").mockImplementation(() => {
+          order.push("rollback");
+          return Promise.resolve();
+        });
         try {
           const created = await taskService.create({
             parentWorkspaceId: rootId,
@@ -1920,31 +1913,27 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           // task creation.
           const lock = await raceWithTimeout(taskService.acquireTaskCreationLock(), 1_000);
           await lock[Symbol.asyncDispose]();
+          // The published workspace is never deleted underneath the racing send: closure and the
+          // attempt's stop cascade (queue cleared, stream stopped) run, and the row stays as the
+          // durable marker — interrupted with its launch error, removable like any other.
+          expect(order).toEqual(["clearQueue", "stopStream"]);
+          expect(rollbackSpy).not.toHaveBeenCalled();
+          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
+          expect(entryOf(config, spawnedId)?.taskLaunchError).toContain("provider unavailable");
           if (!outlives) {
-            // Closure and the attempt's stop cascade (queue cleared, stream stopped, owners
-            // settled) precede the deletion; nothing admitted under the attempt outlives the row.
-            expect(order).toEqual(["clearQueue", "stopStream", "rollback"]);
-            expect(atFirstDeletion).toEqual({
-              settlement: "settled",
-              racingStale: true,
-              stopRecordRetained: false,
-              debts: 0,
-            });
-            expect(entryOf(config, spawnedId)).toBeUndefined();
+            // The captured owners settled within the bound: record released, attempt settled.
             expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
             expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
             expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
               phase: "settled",
             });
+            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+              kind: "terminal-no-report",
+            });
             return;
           }
-          // The captured owner outlived the bound: NO deletion and NO settlement proof — the
-          // rollback is deferred, the row stays as the durable stop marker (interrupted with its
-          // launch error), the latch holds and the attempt reads cleanup-pending.
-          expect(order).toEqual(["clearQueue", "stopStream"]);
-          expect(rollbackSpy).not.toHaveBeenCalled();
-          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-          expect(entryOf(config, spawnedId)?.taskLaunchError).toContain("provider unavailable");
+          // The captured owner outlived the bound: NO settlement proof — the latch holds and the
+          // attempt reads cleanup-pending until that owner's own settlement.
           expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
             phase: "closing",
             source: "launch-failed",
@@ -1981,6 +1970,289 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         }
       }
     );
+
+    // ---------------------------------------------------------------------------------------------
+    // Direct create vs. another writer (a second backend on the same root — its startup re-drive or
+    // reawaken rotates the published row A → B while this launch is still in flight). The launch
+    // is decided for A: it never dispatches under B, and its failure never touches B's row, queue
+    // or stream; only A's own obligations are accounted for.
+    // ---------------------------------------------------------------------------------------------
+    const FOREIGN_ATTEMPT_ID = "att_00000000000000b2";
+    /** The other backend's re-admission of the row: fresh unproven id, running (a reawaken). */
+    async function rotateRowElsewhere(otherBackend: Config, workspaceId: string): Promise<void> {
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === workspaceId);
+          if (ws) {
+            ws.taskAttemptId = FOREIGN_ATTEMPT_ID;
+            ws.taskAttemptUnproven = true;
+            ws.taskStatus = "running";
+            delete ws.taskLaunchError;
+          }
+        }
+        return cfg;
+      });
+    }
+
+    test("a direct create whose row another writer re-admitted before the launch admission refuses to dispatch under the successor and leaves that row alone", async () => {
+      const spawnedId = "directforeign1";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const otherBackend = await createTestConfig(rootDir);
+      const host = createWorkspaceServiceMocks();
+      const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
+      const svc = internals(taskService);
+      let mintedAttemptId: string | undefined;
+      const emitOriginal = svc.emitWorkspaceMetadata.bind(taskService);
+      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+        // The entry is persisted and about to be announced; the other writer's rotation lands
+        // in the announcement's own await, before this launch binds its send.
+        if (id === spawnedId && mintedAttemptId == null) {
+          mintedAttemptId = entryOf(config, spawnedId)?.taskAttemptId;
+          await rotateRowElsewhere(otherBackend, spawnedId);
+        }
+        return emitOriginal(id);
+      });
+      const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
+      try {
+        const created = await taskService.create({
+          parentWorkspaceId: rootId,
+          kind: "agent",
+          agentId: "explore",
+          prompt: "go",
+          title: "Foreign",
+          isolation: "none",
+        });
+        expect(created).toEqual(Err(SEND_ADMISSION_STALE_MESSAGE));
+        expect(mintedAttemptId).toMatch(ATTEMPT_ID);
+        // No prompt went out under B, and B's row is exactly as its writer left it.
+        expect(host.sendMessage).not.toHaveBeenCalled();
+        expect(rollbackSpy).not.toHaveBeenCalled();
+        expect(entryOf(config, spawnedId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: FOREIGN_ATTEMPT_ID,
+        });
+        expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
+        expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+        expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+        // This process still owns A; idle under it, the launch failure settles exactly A.
+        expect(svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(mintedAttemptId);
+        expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+          attemptId: mintedAttemptId,
+          phase: "settled",
+          source: "launch-failed",
+        });
+        // B's row stays open to its own writer's sends (bound unowned here).
+        expect(
+          taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" }).kind
+        ).toBe("admitted");
+      } finally {
+        rollbackSpy.mockRestore();
+      }
+    });
+
+    test.each([
+      ["before the marker's CAS", "idle"],
+      ["before the marker's CAS", "live"],
+      ["after the marker committed", "idle"],
+      ["after the marker committed", "live"],
+    ] as const)(
+      "a direct launch failure whose row another writer re-admitted %s (A %s) writes no marker, stops nothing and settles A only when nothing runs under it",
+      async (rotateAt, liveness) => {
+        const spawnedId = rotateAt.startsWith("before")
+          ? liveness === "idle"
+            ? "directforeign2"
+            : "directforeign3"
+          : liveness === "idle"
+            ? "directforeign4"
+            : "directforeign5";
+        const { config } = await setupTree([]);
+        stubStableIds(config, [spawnedId]);
+        const otherBackend = await createTestConfig(rootDir);
+        let racingToken: TurnAdmissionToken | undefined;
+        let launchSendFailed = false;
+        const host = createWorkspaceServiceMocks({
+          sendMessage: mock((workspaceId: string) => {
+            if (liveness === "live") {
+              // A user send admitted under A while the launch send is in flight (still in its
+              // own preflight when the launch fails).
+              racingToken = admitted(
+                taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+              );
+            }
+            launchSendFailed = true;
+            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+          }),
+        });
+        const stopStream = mock(() => Promise.resolve(Ok(undefined)));
+        const { aiService } = createAIServiceMocks(config, { stopStream });
+        const { taskService } = createHarness(config, {
+          aiService,
+          workspaceService: host.workspaceService,
+        });
+        const svc = internals(taskService);
+        let mintedAttemptId: string | undefined;
+        let rotated = false;
+        const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+        spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const [id] = args;
+          // The launch failure's marker write is the first edit of this row after the send failed.
+          if (id !== spawnedId || !launchSendFailed || rotated) return editOriginal(...args);
+          rotated = true;
+          mintedAttemptId = entryOf(config, spawnedId)?.taskAttemptId;
+          if (rotateAt.startsWith("before")) {
+            await rotateRowElsewhere(otherBackend, spawnedId);
+            return editOriginal(...args);
+          }
+          const result = await editOriginal(...args);
+          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
+          await rotateRowElsewhere(otherBackend, spawnedId);
+          return result;
+        });
+        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
+        try {
+          const created = await taskService.create({
+            parentWorkspaceId: rootId,
+            kind: "agent",
+            agentId: "explore",
+            prompt: "go",
+            title: "Foreign",
+            isolation: "none",
+          });
+          expect(created.success).toBe(false);
+          if (created.success) throw new Error("unreachable");
+          expect(created.error).toContain("provider unavailable");
+          expect(rotated).toBe(true);
+          expect(mintedAttemptId).toMatch(ATTEMPT_ID);
+          // B's row is its writer's: no marker of ours, no deletion, no latch, no stop record.
+          expect(rollbackSpy).not.toHaveBeenCalled();
+          expect(host.clearQueue).not.toHaveBeenCalled();
+          expect(stopStream).not.toHaveBeenCalled();
+          expect(entryOf(config, spawnedId)).toMatchObject({
+            taskStatus: "running",
+            taskAttemptId: FOREIGN_ATTEMPT_ID,
+          });
+          expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
+          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(mintedAttemptId);
+          if (liveness === "idle") {
+            expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+              attemptId: mintedAttemptId,
+              phase: "settled",
+              source: "launch-failed",
+            });
+            return;
+          }
+          // A's own obligation is still in its preflight: no settlement proof is minted for it;
+          // it reads stale (the row no longer names A) and settles through its own disposal —
+          // which still proves nothing about A as a whole (no owner watches a superseded attempt).
+          expect(racingToken?.admissionStale()).toBe(true);
+          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+            attemptId: mintedAttemptId,
+            phase: "closing",
+            source: "launch-failed",
+          });
+          racingToken?.onDisposed("refused");
+          expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
+          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+            phase: "closing",
+          });
+          expect(entryOf(config, spawnedId)).toMatchObject({
+            taskStatus: "running",
+            taskAttemptId: FOREIGN_ATTEMPT_ID,
+          });
+        } finally {
+          rollbackSpy.mockRestore();
+        }
+      }
+    );
+
+    test("a direct launch failure whose row another writer re-admits during its stop cascade finishes settling A and leaves B's row alone", async () => {
+      const spawnedId = "directforeign6";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      shortenTerminationTimers();
+      const otherBackend = await createTestConfig(rootDir);
+      const racingTurn = Symbol("racing-turn");
+      let racingToken: TurnAdmissionToken | undefined;
+      let liveTurn: symbol | undefined;
+      const host = hostWithTurnEvents({
+        sendMessage: mock((workspaceId: string) => {
+          // A user send admitted under A is already the live turn when the launch fails.
+          racingToken = admitted(
+            taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+          );
+          racingToken.onAdmitted(racingTurn);
+          liveTurn = racingTurn;
+          return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+        }),
+        getActiveTurnGeneration: mock(() => liveTurn),
+      });
+      // Phase B targets A's captured turn; the other writer's rotation lands in this very await
+      // and the stopped turn hangs past the bound (the cleanup wait is abandoned at the shortened
+      // deadline, so the rotation is awaited explicitly below before the row is read).
+      const rotation = Promise.withResolvers<void>();
+      const stopStream = mock(async () => {
+        await rotateRowElsewhere(otherBackend, spawnedId);
+        rotation.resolve();
+        return Ok(undefined);
+      });
+      const { aiService } = createAIServiceMocks(config, { stopStream });
+      const { taskService } = createHarness(config, {
+        aiService,
+        workspaceService: host.workspaceService,
+      });
+      const svc = internals(taskService);
+      const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
+      try {
+        const created = await taskService.create({
+          parentWorkspaceId: rootId,
+          kind: "agent",
+          agentId: "explore",
+          prompt: "go",
+          title: "Foreign",
+          isolation: "none",
+        });
+        expect(created.success).toBe(false);
+        expect(stopStream).toHaveBeenCalledTimes(1);
+        await raceWithTimeout(rotation.promise, 5_000);
+        const mintedAttemptId = svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId;
+        expect(mintedAttemptId).toMatch(ATTEMPT_ID);
+        // The captured owner outlived the bound: the latch holds for A's turn, and B's row —
+        // written after our marker — is untouched (no deletion, no second marker).
+        expect(rollbackSpy).not.toHaveBeenCalled();
+        expect(svc.workspaceStopRecords.get(spawnedId)).toMatchObject({
+          attemptId: mintedAttemptId,
+        });
+        expect(entryOf(config, spawnedId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: FOREIGN_ATTEMPT_ID,
+        });
+        expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+          attemptId: mintedAttemptId,
+          phase: "closing",
+          source: "launch-failed",
+        });
+        // Only A's turn settling releases the record and settles A; B's row stays as it was.
+        liveTurn = undefined;
+        host.settleTurn(spawnedId, racingTurn);
+        expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+        expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+        expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+          attemptId: mintedAttemptId,
+          phase: "settled",
+          source: "stop-settled",
+        });
+        expect(rollbackSpy).not.toHaveBeenCalled();
+        expect(entryOf(config, spawnedId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: FOREIGN_ATTEMPT_ID,
+        });
+      } finally {
+        rollbackSpy.mockRestore();
+      }
+    });
 
     test.each(["id", "status"] as const)(
       "startup re-drive refuses to overwrite a row whose %s moved after the recovery snapshot",
