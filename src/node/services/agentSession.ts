@@ -88,6 +88,7 @@ import type {
   StreamErrorMessage,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
@@ -770,6 +771,8 @@ interface AgentSessionOptions {
    * settles on its own, so waits bound to it move to the successor.
    */
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
+  /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
+  planSnapshotCaptureTimeoutMs?: number;
 }
 
 interface CachedMemoryContext {
@@ -952,6 +955,7 @@ export class AgentSession {
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
+  private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -1000,12 +1004,12 @@ export class AgentSession {
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
       if (!this.coordinator.isCurrentOperation(operation)) return;
       // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
-      // listener runs detached from the engine. Settle it before completion policy so the turn
-      // cannot go idle (and a queued/next turn cannot revise the mutable plan file) while the
-      // snapshot keyed to this proposal is still being read. Captures never reject.
-      while (this.pendingPlanSnapshots.size > 0) {
-        await Promise.all(this.pendingPlanSnapshots);
-      }
+      // listener runs detached from the engine. A completed turn settles it before completion
+      // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
+      // file) while the snapshot keyed to this proposal is still being read — but only within a
+      // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
+      // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
+      await this.settlePendingPlanSnapshots(outcome.status === "completed");
       switch (outcome.status) {
         case "completed":
           await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
@@ -1034,8 +1038,11 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
-  /** In-flight propose_plan snapshot captures; completion policy waits for them (see policy). */
-  private readonly pendingPlanSnapshots = new Set<Promise<void>>();
+  /** In-flight propose_plan snapshot captures; completion policy settles them (see policy). */
+  private readonly pendingPlanSnapshots = new Set<{
+    promise: Promise<void>;
+    controller: AbortController;
+  }>();
 
   private readonly messageQueue = new MessageQueue();
   /**
@@ -1312,6 +1319,7 @@ export class AgentSession {
       onTurnSettled,
       onTurnSuperseded,
       onBeforeTurnCompletion,
+      planSnapshotCaptureTimeoutMs,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1349,6 +1357,12 @@ export class AgentSession {
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
     this.onBeforeTurnCompletion = onBeforeTurnCompletion;
+    this.planSnapshotCaptureTimeoutMs =
+      planSnapshotCaptureTimeoutMs ?? PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS;
+    assert(
+      Number.isFinite(this.planSnapshotCaptureTimeoutMs) && this.planSnapshotCaptureTimeoutMs > 0,
+      "planSnapshotCaptureTimeoutMs must be a positive number"
+    );
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Accessors must read live session state, not the host object's receiver.
     const session = this;
@@ -9002,10 +9016,14 @@ export class AgentSession {
         // cannot stall tool-end handling or affect the tool result. The forward wrapper does
         // not await this handler, so the capture is registered for the completion policy.
         if (payload.toolName === "propose_plan" && isSuccessfulToolResult(payload.result)) {
-          const capture = this.snapshotProposedPlan(payload.toolCallId);
+          const controller = new AbortController();
+          const capture = {
+            controller,
+            promise: this.snapshotProposedPlan(payload.toolCallId, controller.signal),
+          };
           this.pendingPlanSnapshots.add(capture);
           try {
-            await capture;
+            await capture.promise;
           } finally {
             this.pendingPlanSnapshots.delete(capture);
           }
@@ -9793,15 +9811,70 @@ export class AgentSession {
   }
 
   /**
+   * Settle every in-flight propose_plan capture before completion policy runs. A completed turn
+   * waits up to planSnapshotCaptureTimeoutMs for the row to become durable; on a stopped or
+   * failed turn, or once the deadline passes, the captures are aborted instead so settlement is
+   * never held hostage by a stalled plan read. Captures never reject.
+   */
+  private async settlePendingPlanSnapshots(waitForCompletion: boolean): Promise<void> {
+    if (this.pendingPlanSnapshots.size === 0) return;
+    const abortAll = () => {
+      for (const capture of this.pendingPlanSnapshots) capture.controller.abort();
+    };
+    if (!waitForCompletion) {
+      abortAll();
+      return;
+    }
+    const deadline = Promise.withResolvers<"deadline">();
+    const timer = setTimeout(() => deadline.resolve("deadline"), this.planSnapshotCaptureTimeoutMs);
+    try {
+      // Captures remove themselves from the set when they finish. The wait races the deadline
+      // rather than relying on the capture to notice the abort: the stall can be inside the
+      // plan read itself (a remote command can block for minutes), so the abandoned capture is
+      // left running and its late result is refused at ensurePlanSnapshot's admission checks.
+      while (this.pendingPlanSnapshots.size > 0) {
+        const outcome = await Promise.race([
+          Promise.all([...this.pendingPlanSnapshots].map((capture) => capture.promise)).then(
+            () => "settled" as const
+          ),
+          deadline.promise,
+        ]);
+        if (outcome === "deadline") {
+          log.warn("plan review: snapshot capture exceeded its deadline; abandoning it", {
+            workspaceId: this.workspaceId,
+            timeoutMs: this.planSnapshotCaptureTimeoutMs,
+          });
+          abortAll();
+          return;
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
    * Snapshot the plan file after a successful `propose_plan` (see the tool-call-end listener).
    * Fully non-throwing: a missing plan, an oversized plan, or a history failure only logs.
-   * Dedup by content hash makes a replayed or repeated proposal a no-op.
+   * Dedup by content hash makes a replayed or repeated proposal a no-op. `signal` is the
+   * completion policy's abandonment (deadline/Stop); session close aborts the capture as well.
    */
-  private async snapshotProposedPlan(proposalToolCallId: string): Promise<void> {
+  private async snapshotProposedPlan(
+    proposalToolCallId: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    const captureSignal = AbortSignal.any([signal, this.closingSignal]);
     try {
       // Guard for test mocks that may not implement getWorkspaceMetadata.
       if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
       const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (captureSignal.aborted) {
+        log.debug("plan review: snapshot capture abandoned before the plan read", {
+          workspaceId: this.workspaceId,
+          proposalToolCallId,
+        });
+        return;
+      }
       if (!metadata.success) {
         log.warn("plan review: skipping snapshot, workspace metadata unavailable", {
           workspaceId: this.workspaceId,
@@ -9815,9 +9888,21 @@ export class AgentSession {
           emitChatEvent: (_workspaceId, message) =>
             this.emitChatEvent({ ...message, type: "message" }),
         },
-        { workspaceId: this.workspaceId, metadata: metadata.data, proposalToolCallId }
+        {
+          workspaceId: this.workspaceId,
+          metadata: metadata.data,
+          proposalToolCallId,
+          signal: captureSignal,
+        }
       );
       if (!result.success) {
+        if (result.error.type === "capture_aborted") {
+          log.debug("plan review: snapshot capture abandoned", {
+            workspaceId: this.workspaceId,
+            proposalToolCallId,
+          });
+          return;
+        }
         log.warn("plan review: skipping snapshot after propose_plan", {
           workspaceId: this.workspaceId,
           proposalToolCallId,

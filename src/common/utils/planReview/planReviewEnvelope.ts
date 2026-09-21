@@ -156,10 +156,17 @@ export function getAuthenticPlanReviewRecord(message: MuxMessage): PlanReviewRec
   if (message.role !== "user") return null;
   const meta = getValidPlanReviewMeta(message.metadata?.muxMetadata);
   if (meta === null) return null;
-  if (message.parts.length !== 1) return null;
-  const [part] = message.parts;
-  if (part.type !== "text") return null;
-  const record = parsePlanReviewEnvelope(part.text);
+  // Persisted rows reach replay and request filtering as parsed JSON without schema validation
+  // (the full-history iterator only requires valid JSON): a damaged row with a missing, null or
+  // non-array `parts`, or a non-text entry, is inauthentic — never a thrown TypeError that
+  // would brick getState and every mutation that replays history (self-healing rule).
+  const parts: unknown = message.parts;
+  if (!Array.isArray(parts) || parts.length !== 1) return null;
+  const part: unknown = parts[0];
+  if (typeof part !== "object" || part === null) return null;
+  const { type, text } = part as { type?: unknown; text?: unknown };
+  if (type !== "text" || typeof text !== "string") return null;
+  const record = parsePlanReviewEnvelope(text);
   if (record === null) return null;
   const expected = buildPlanReviewMetadata(record);
   if (

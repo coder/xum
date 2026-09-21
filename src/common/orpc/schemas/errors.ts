@@ -42,8 +42,12 @@ export const PlanReviewErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("unknown_thread"), message: z.string() }),
   z.object({ type: z.literal("invalid_anchor"), message: z.string() }),
   z.object({ type: z.literal("nothing_to_send"), message: z.string() }),
+  /** Fields were within limits but the serialized feedback row would exceed the history row cap. */
+  z.object({ type: z.literal("feedback_too_large"), message: z.string() }),
   /** History read/append failed (the message is the HistoryService error string). */
   z.object({ type: z.literal("history_failed"), message: z.string() }),
+  /** The caller's abort signal fired before the snapshot row was admitted (nothing was written). */
+  z.object({ type: z.literal("capture_aborted"), message: z.string() }),
   /** submitFeedback validated but the underlying sendMessage refused the turn. */
   z.object({ type: z.literal("send_failed"), error: SendMessageErrorSchema }),
 ]);

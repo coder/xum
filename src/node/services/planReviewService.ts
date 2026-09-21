@@ -24,7 +24,11 @@ import {
   type PlanReviewState,
 } from "@/common/utils/planReview/planReviewState";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
-import { MAX_PLAN_SNAPSHOT_BYTES, PLAN_REVIEW_METADATA_TYPE } from "@/constants/planReview";
+import {
+  MAX_PLAN_SNAPSHOT_BYTES,
+  PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES,
+  PLAN_REVIEW_METADATA_TYPE,
+} from "@/constants/planReview";
 import {
   createRuntimeForWorkspace,
   type WorkspaceMetadataForRuntime,
@@ -33,7 +37,7 @@ import { readPlanFile } from "@/node/utils/runtime/helpers";
 
 import type { HistoryService } from "./historyService";
 import { log } from "./log";
-import { createPlanReviewRecordMessageId } from "./utils/messageIds";
+import { createPlanReviewRecordMessageId, createUserMessageId } from "./utils/messageIds";
 
 /**
  * Backend side of native plan review: reads the review projection from chat history and
@@ -58,6 +62,12 @@ export interface EnsurePlanSnapshotArgs {
   metadata: WorkspaceMetadataForRuntime & { projectName: string };
   /** Tool call id of the `propose_plan` that produced this revision; omitted for on-demand snapshots. */
   proposalToolCallId?: string;
+  /**
+   * Abandons the capture: checked before the (possibly remote, slow) plan read, after it, and
+   * again at append admission under the history lock, so a capture whose turn already settled
+   * or stopped can never publish a late row.
+   */
+  signal?: AbortSignal;
 }
 
 export interface EnsurePlanSnapshotResult {
@@ -87,6 +97,11 @@ function isPlanReviewRow(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE;
 }
 
+function isPlanReviewSnapshotRow(message: MuxMessage): boolean {
+  const muxMetadata = message.metadata?.muxMetadata;
+  return muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE && muxMetadata.kind === "snapshot";
+}
+
 /** Backend projection options: skip logging plus the sha256 verification the shared projection cannot import. */
 function deriveOptions(workspaceId: string) {
   return {
@@ -102,6 +117,24 @@ function historyFailed(message: string): PlanReviewError {
 
 export function hashPlanSnapshotContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/**
+ * Size of `message` as HistoryService would persist it: message + workspaceId, with a
+ * widest-case sequence stamp. Record text is JSON-escaped once in the envelope and again in the
+ * JSONL row, so content under a raw cap (quotes, backslashes, control characters) can still
+ * exceed the row limit — and the provider/replacement-row scanners treat such a row as an
+ * unreadable run, so it must be refused before it is written.
+ */
+function measurePersistedRowBytes(message: MuxMessage, workspaceId: string): number {
+  return Buffer.byteLength(
+    JSON.stringify({
+      ...message,
+      workspaceId,
+      metadata: { ...message.metadata, historySequence: Number.MAX_SAFE_INTEGER },
+    }),
+    "utf8"
+  );
 }
 
 /** Hidden record rows (snapshot/resolve/reopen): synthetic without uiVisible, never a human turn. */
@@ -133,6 +166,10 @@ export async function getPlanReviewState(
   return Ok(derivePlanReviewState(rows, deriveOptions(workspaceId)));
 }
 
+function captureAborted(): PlanReviewError {
+  return { type: "capture_aborted", message: "Plan snapshot capture aborted" };
+}
+
 /**
  * Snapshot the current plan file into history unless a snapshot with the same content hash
  * already exists. Dedup and append happen under one history write lock so a racing on-demand
@@ -142,6 +179,7 @@ export async function ensurePlanSnapshot(
   deps: PlanReviewHistoryDeps,
   args: EnsurePlanSnapshotArgs
 ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
+  if (args.signal?.aborted) return Err(captureAborted());
   const runtime = createRuntimeForWorkspace(args.metadata);
   const plan = await readPlanFile(
     runtime,
@@ -149,6 +187,7 @@ export async function ensurePlanSnapshot(
     args.metadata.projectName,
     args.workspaceId
   );
+  if (args.signal?.aborted) return Err(captureAborted());
   if (!plan.exists) {
     return Err({ type: "plan_missing", message: `Plan file not found at ${plan.path}` });
   }
@@ -162,11 +201,8 @@ export async function ensurePlanSnapshot(
     });
   }
   const contentHash = hashPlanSnapshotContent(content);
-  // Build the candidate row up front so its PERSISTED size can be judged: the content is
-  // JSON-escaped once in the envelope and again in the JSONL row, so a plan under the raw cap
-  // (quotes, backslashes, control characters) can still exceed the row limit — and the
-  // provider/replacement-row scanners treat such a row as an unreadable run. Discarded when
-  // the locked dedup below finds the same hash.
+  // Build the candidate row up front so its PERSISTED size can be judged (see
+  // measurePersistedRowBytes). Discarded when the locked dedup below finds the same hash.
   const candidateSnapshotId = `snap_${randomUUID()}`;
   const candidate = buildPlanReviewRecordMessage({
     v: PLAN_REVIEW_RECORD_VERSION,
@@ -180,15 +216,7 @@ export async function ensurePlanSnapshot(
       : {}),
     content,
   });
-  const rowBytes = Buffer.byteLength(
-    // Mirrors HistoryService's row: message + workspaceId, with a widest-case sequence stamp.
-    JSON.stringify({
-      ...candidate,
-      workspaceId: args.workspaceId,
-      metadata: { ...candidate.metadata, historySequence: Number.MAX_SAFE_INTEGER },
-    }),
-    "utf8"
-  );
+  const rowBytes = measurePersistedRowBytes(candidate, args.workspaceId);
   if (rowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
     return Err({
       type: "plan_too_large",
@@ -203,8 +231,11 @@ export async function ensurePlanSnapshot(
       messages
     ): {
       message: MuxMessage | null;
-      value: { snapshotId: string; message: MuxMessage | null };
+      value: { snapshotId: string; message: MuxMessage | null } | "aborted";
     } => {
+      // Admission check under the lock: the read above may have taken long enough for the
+      // owning turn to settle or stop, and a late row must not be published after that.
+      if (args.signal?.aborted) return { message: null, value: "aborted" };
       priorRows = messages.filter(isPlanReviewRow);
       const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const existing = state.snapshots.find((snapshot) => snapshot.contentHash === contentHash);
@@ -215,6 +246,7 @@ export async function ensurePlanSnapshot(
     }
   );
   if (!appended.success) return Err(historyFailed(appended.error));
+  if (appended.data === "aborted") return Err(captureAborted());
 
   const { snapshotId, message } = appended.data;
   if (message !== null) {
@@ -337,31 +369,56 @@ export async function preparePlanReviewFeedback(
       body: reply.body,
     })),
   };
+  const text = formatPlanReviewEnvelope(record);
+  const muxMetadata = buildPlanReviewMetadata(record);
+  // Per-field caps hold at the oRPC boundary, but the persisted row is the double-escaped
+  // envelope; refuse before sendMessage writes a row the history scanners would skip as
+  // unreadable (which would also silently drop the user's feedback from provider requests).
+  const rowBytes = measurePersistedRowBytes(
+    createMuxMessage(createUserMessageId(), "user", text, { timestamp: Date.now(), muxMetadata }),
+    workspaceId
+  );
+  const maxRowBytes = SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES;
+  if (rowBytes > maxRowBytes) {
+    return Err({
+      type: "feedback_too_large",
+      message: `Feedback row would be ${rowBytes} bytes; plan review feedback is capped at ${maxRowBytes} bytes per submission`,
+    });
+  }
   return Ok({
     feedbackId,
     threadIds: record.comments.map((comment) => comment.threadId),
-    text: formatPlanReviewEnvelope(record),
-    muxMetadata: buildPlanReviewMetadata(record),
+    text,
+    muxMetadata,
   });
 }
 
 /**
  * `<plan-review-state>` block for a plan-mode request: unresolved threads derived from durable
  * rows AFTER the latest durable context reset (a reset is a privacy floor, so pre-reset threads
- * stay out of the model's context even though getState still returns them). Never throws —
- * a history read failure must not block a send — and returns undefined when nothing is
- * unresolved.
+ * stay out of the model's context even though getState still returns them). Pre-reset SNAPSHOT
+ * rows are still replayed: ensurePlanSnapshot deduplicates an unchanged plan against them, so
+ * post-reset feedback can legitimately target a pre-reset snapshotId and would otherwise be
+ * dropped as dangling. A snapshot row carries only plan-file content and its hash (never user
+ * conversation), and the block renders just the hash/path. Never throws — a history read
+ * failure must not block a send — and returns undefined when nothing is unresolved.
  */
 export async function buildPlanReviewStateInstruction(
   historyService: PlanReviewHistory,
   workspaceId: string
 ): Promise<string | undefined> {
   const newestFirst: MuxMessage[] = [];
+  let pastReset = false;
   try {
     const scanned = await historyService.iterateFullHistory(workspaceId, "backward", (chunk) => {
       for (const message of chunk) {
-        if (isDurableContextResetBoundaryMarker(message)) return false;
-        if (isPlanReviewRow(message)) newestFirst.push(message);
+        if (!pastReset && isDurableContextResetBoundaryMarker(message)) {
+          pastReset = true;
+          continue;
+        }
+        if (pastReset ? isPlanReviewSnapshotRow(message) : isPlanReviewRow(message)) {
+          newestFirst.push(message);
+        }
       }
       return true;
     });

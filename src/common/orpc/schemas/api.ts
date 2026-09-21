@@ -27,6 +27,13 @@ import {
   SendMessageErrorSchema,
 } from "./errors";
 import { PlanReviewAnchorSchema } from "@/common/utils/planReview/planReviewRecord";
+import {
+  PLAN_REVIEW_MAX_BODY_CHARS,
+  PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_QUOTE_CHARS,
+  PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_SUMMARY_CHARS,
+} from "@/constants/planReview";
 import { PlanReviewStateSchema } from "@/common/utils/planReview/planReviewState";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
 import {
@@ -1834,15 +1841,27 @@ export const workspace = {
       input: z.object({
         workspaceId: z.string(),
         snapshotId: z.string().min(1),
-        summary: z.string().nullish(),
-        comments: z.array(
-          z.object({
-            anchor: PlanReviewAnchorSchema,
-            quote: z.string(),
-            body: z.string().min(1),
-          })
-        ),
-        replies: z.array(z.object({ threadId: z.string().min(1), body: z.string().min(1) })),
+        // Bounded at the boundary: unresolved feedback is re-rendered into every plan turn's
+        // system prompt and persisted as one history row, so sizes are product limits, not
+        // storage details (see src/constants/planReview.ts).
+        summary: z.string().max(PLAN_REVIEW_MAX_SUMMARY_CHARS).nullish(),
+        comments: z
+          .array(
+            z.object({
+              anchor: PlanReviewAnchorSchema,
+              quote: z.string().max(PLAN_REVIEW_MAX_QUOTE_CHARS),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK),
+        replies: z
+          .array(
+            z.object({
+              threadId: z.string().min(1),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK),
         /** Agent/model/thinking for the resulting user turn, as the plan card's Implement sends them. */
         options: SendMessageOptionsSchema,
       }),

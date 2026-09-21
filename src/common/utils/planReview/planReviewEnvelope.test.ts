@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 
 import {
   buildPlanReviewMetadata,
@@ -126,6 +126,33 @@ describe("planReviewEnvelope", () => {
     expect(isPlanReviewRecordMessage(mismatched)).toBe(true);
     const nonEnvelope = createMuxMessage("n", "user", "x", { muxMetadata: feedbackMeta });
     expect(isPlanReviewRecordMessage(nonEnvelope)).toBe(true);
+  });
+
+  test("malformed persisted message shapes are inauthentic, hidden and skipped without throwing", () => {
+    // chat.jsonl rows reach the plan-review consumers as parsed JSON without schema validation:
+    // a valid JSON row with `plan-review` metadata but a missing/null/non-array `parts` (or a
+    // null entry) must not throw out of getState or request filtering (self-healing rule).
+    const meta = buildPlanReviewMetadata(feedbackRecord);
+    const text = formatPlanReviewEnvelope(feedbackRecord);
+    const base = createMuxMessage("ok", "user", text, { muxMetadata: meta });
+    const malformed = [
+      { ...base, parts: undefined },
+      { ...base, parts: null },
+      { ...base, parts: "not-an-array" },
+      { ...base, parts: [null] },
+      { ...base, parts: [{ type: "text" }] },
+      { ...base, parts: [{ type: "text", text: 42 }] },
+    ] as unknown as MuxMessage[];
+    for (const row of malformed) {
+      expect(getAuthenticPlanReviewRecord(row)).toBeNull();
+      expect(isPlanReviewRecordMessage(row)).toBe(true);
+    }
+    // Ordinary (non-plan-review) rows are not this predicate's business, malformed or not.
+    const ordinary = {
+      ...createMuxMessage("u", "user", "hi"),
+      parts: null,
+    } as unknown as MuxMessage;
+    expect(isPlanReviewRecordMessage(ordinary)).toBe(false);
   });
 
   test("authentic rows need user role plus matching metadata and envelope", () => {

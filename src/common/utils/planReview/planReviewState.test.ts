@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 
+import {
+  PLAN_REVIEW_STATE_MAX_CHARS,
+  PLAN_REVIEW_STATE_MAX_TEXT_CHARS,
+  PLAN_REVIEW_STATE_MAX_THREADS,
+} from "@/constants/planReview";
 import { buildPlanReviewMetadata, formatPlanReviewEnvelope } from "./planReviewEnvelope";
 import type { PlanReviewRecord } from "./planReviewRecord";
 import {
@@ -192,6 +197,26 @@ describe("derivePlanReviewState", () => {
   });
 });
 
+describe("derivePlanReviewState malformed rows", () => {
+  test("skips rows whose persisted parts are missing or malformed instead of throwing", () => {
+    const skipped: string[] = [];
+    const broken = {
+      ...recordRow(feedback1),
+      parts: null,
+    } as unknown as MuxMessage;
+    const brokenEntry = {
+      ...recordRow(resolve("rec_r", "thr_1")),
+      parts: [null],
+    } as unknown as MuxMessage;
+    const state = derivePlanReviewState([recordRow(snapshotA), broken, brokenEntry], {
+      onSkip: (reason) => skipped.push(reason),
+    });
+    expect(state.snapshots).toHaveLength(1);
+    expect(state.threads).toHaveLength(0);
+    expect(skipped).toEqual(["invalid-record", "invalid-record"]);
+  });
+});
+
 describe("derivePlanReviewState snapshot hash verification", () => {
   // The projection stays browser-safe (no node crypto); node callers inject the hasher.
   const hashContent = (content: string) => (content === PLAN_A ? HASH_A : HASH_B);
@@ -246,13 +271,150 @@ describe("formatPlanReviewStateBlock", () => {
     expect(block?.endsWith("</plan-review-state>")).toBe(true);
     // Current snapshot is the latest one; earlier-revision threads say so.
     expect(block).toContain(HASH_B);
+    // Capacity goes to the threads with the most recent user activity: thr_1 (replied to in
+    // feedback2) and thr_3 (opened by feedback2); thr_2 has had no activity since feedback1.
     expect(block).toContain("thr_1");
-    expect(block).toContain("thr_2");
-    expect(block).not.toContain("thr_3");
+    expect(block).toContain("thr_3");
+    expect(block).not.toContain("thr_2");
     expect(block).toContain("1 more unresolved thread");
-    // The latest reply, not the original body, is what the agent still has to address.
+    // The whole thread is what the agent has to address: original comment AND every reply.
+    expect(block).toContain("Why?");
     expect(block).toContain("Still unclear");
     expect(block).not.toContain(PLAN_A);
+  });
+
+  test("serializes the original comment and every reply in order", () => {
+    const secondReply: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec_fb_3",
+      feedbackId: "fb_3",
+      snapshotId: "snap_a",
+      contentHash: HASH_A,
+      comments: [],
+      replies: [{ replyId: "rpl_2", threadId: "thr_1", body: "Also rename the flag" }],
+    };
+    const state = derivePlanReviewState([
+      recordRow(snapshotA),
+      recordRow(feedback1),
+      recordRow(snapshotB),
+      recordRow(feedback2),
+      recordRow(secondReply),
+    ]);
+    const block = formatPlanReviewStateBlock(state) ?? "";
+    // Independent instructions in one thread must all survive once their envelopes are compacted.
+    const why = block.indexOf("Why?");
+    const unclear = block.indexOf("Still unclear");
+    const rename = block.indexOf("Also rename the flag");
+    expect(why).toBeGreaterThan(-1);
+    expect(unclear).toBeGreaterThan(why);
+    expect(rename).toBeGreaterThan(unclear);
+  });
+
+  test("keeps the threads with the most recent activity when more than the cap are unresolved", () => {
+    const rows: MuxMessage[] = [recordRow(snapshotA)];
+    for (let i = 0; i < PLAN_REVIEW_STATE_MAX_THREADS + 5; i++) {
+      rows.push(
+        recordRow({
+          v: 1,
+          kind: "feedback",
+          recordId: `rec_many_${i}`,
+          feedbackId: `fb_many_${i}`,
+          snapshotId: "snap_a",
+          contentHash: HASH_A,
+          comments: [
+            {
+              threadId: `thr_many_${i}`,
+              anchor: { startLine: 1, endLine: 1 },
+              quote: "# Plan",
+              body: `Comment ${i}`,
+            },
+          ],
+          replies: [],
+        })
+      );
+    }
+    // A late reply on the very first (oldest) thread makes it the most recent activity.
+    rows.push(
+      recordRow({
+        v: 1,
+        kind: "feedback",
+        recordId: "rec_many_reply",
+        feedbackId: "fb_many_reply",
+        snapshotId: "snap_a",
+        contentHash: HASH_A,
+        comments: [],
+        replies: [{ replyId: "rpl_many", threadId: "thr_many_0", body: "Still needed" }],
+      })
+    );
+    const block = formatPlanReviewStateBlock(derivePlanReviewState(rows)) ?? "";
+    expect(block).toContain("thr_many_0 ");
+    expect(block).toContain("Still needed");
+    // The newest openings are kept; the oldest untouched ones (1..5) are the omitted set.
+    for (let i = 1; i <= 5; i++) expect(block).not.toContain(`thr_many_${i} `);
+    for (let i = 6; i < PLAN_REVIEW_STATE_MAX_THREADS + 5; i++) {
+      expect(block).toContain(`thr_many_${i} `);
+    }
+    expect(block).toContain("5 more unresolved thread");
+  });
+
+  test("bounds each rendered text and the whole block, never claiming completeness", () => {
+    const huge: PlanReviewRecord = {
+      ...feedback1,
+      recordId: "rec_huge",
+      feedbackId: "fb_huge",
+      comments: [
+        {
+          threadId: "thr_huge",
+          anchor: { startLine: 1, endLine: 1 },
+          quote: "q".repeat(5_000),
+          body: `${"body ".repeat(20_000)}\u0001\u0002`,
+        },
+        {
+          threadId: "thr_after_huge",
+          anchor: { startLine: 1, endLine: 1 },
+          quote: "# Plan",
+          body: "Short follow-up",
+        },
+      ],
+    };
+    const block =
+      formatPlanReviewStateBlock(derivePlanReviewState([recordRow(snapshotA), recordRow(huge)])) ??
+      "";
+    expect(block.length).toBeLessThanOrEqual(PLAN_REVIEW_STATE_MAX_CHARS);
+    expect(block).toContain("thr_huge ");
+    expect(block).toContain("[truncated]");
+    expect(block).not.toContain("q".repeat(PLAN_REVIEW_STATE_MAX_TEXT_CHARS + 1));
+    // The short thread still fits after the clipped giant one.
+    expect(block).toContain("Short follow-up");
+
+    // When threads cannot fit the total budget at all, the note says how many are missing.
+    const many: MuxMessage[] = [recordRow(snapshotA)];
+    for (let i = 0; i < 25; i++) {
+      many.push(
+        recordRow({
+          v: 1,
+          kind: "feedback",
+          recordId: `rec_big_${i}`,
+          feedbackId: `fb_big_${i}`,
+          snapshotId: "snap_a",
+          contentHash: HASH_A,
+          comments: [
+            {
+              threadId: `thr_big_${i}`,
+              anchor: { startLine: 1, endLine: 1 },
+              quote: "x".repeat(PLAN_REVIEW_STATE_MAX_TEXT_CHARS),
+              body: "y".repeat(PLAN_REVIEW_STATE_MAX_TEXT_CHARS),
+            },
+          ],
+          replies: [],
+        })
+      );
+    }
+    const crowded = formatPlanReviewStateBlock(derivePlanReviewState(many)) ?? "";
+    expect(crowded.length).toBeLessThanOrEqual(PLAN_REVIEW_STATE_MAX_CHARS);
+    expect(crowded).toMatch(/Truncated: \d+ more unresolved thread/);
+    expect(crowded.endsWith("</plan-review-state>")).toBe(true);
   });
 
   test("user text cannot close the block", () => {
