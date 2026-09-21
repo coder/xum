@@ -368,6 +368,21 @@ function withAutoThinkingClaim(
   return level != null ? { ...record, thinkingLevel: level } : record;
 }
 
+/**
+ * Report what an Auto-routed stream now runs on to the session (see
+ * ActiveTurnThinkingOverride.onLiveRoutingChanged). Called after every mid-turn change to the
+ * stream's model, thinking level or routing record; a no-op for streams without a record.
+ */
+function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
+  const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+  if (autoModelRouting == null) return;
+  streamInfo.request.thinkingOverrideState?.onLiveRoutingChanged?.({
+    model: streamInfo.model,
+    thinkingLevel: coerceThinkingLevel(streamInfo.thinkingLevel),
+    autoModelRouting,
+  });
+}
+
 interface StepMessageTracker {
   workspaceId?: string;
   pendingPrefixSwap?: ContinuousPrefixSwap;
@@ -2809,7 +2824,6 @@ export class StreamManager {
           // applicable"; only a level that actually changed is provenance.
           if (thinkingOverride !== undefined && overrideState?.applied === escalation.to) {
             recordAutoThinkingEscalation(escalationState, escalation);
-            overrideState.onEscalated?.(escalation);
             log.info("Auto thinking escalated mid-turn", escalation);
           } else {
             markAutoThinkingEscalationExhausted(escalationState);
@@ -3037,6 +3051,7 @@ export class StreamManager {
             autoModelRouting: withAutoThinkingClaim(autoModelRouting, undefined, true),
           };
         }
+        publishLiveRouting(streamInfo);
       };
       if (holder.applied) {
         streamInfo.thinkingLevel = holder.applied;
@@ -3055,6 +3070,7 @@ export class StreamManager {
               ...streamInfo.initialMetadata,
               autoModelRouting: { ...autoModelRouting, escalations },
             };
+            publishLiveRouting(streamInfo);
           }
         );
       }
@@ -3942,6 +3958,7 @@ export class StreamManager {
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
+    publishLiveRouting(streamInfo);
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (
       consumedSwap &&

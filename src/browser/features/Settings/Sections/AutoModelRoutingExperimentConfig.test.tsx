@@ -211,7 +211,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
   });
 
-  test("a paused edit commits without blur; a duplicate label is flagged and never written", async () => {
+  test("Enter commits a label; a duplicate label is flagged, never written, and reverts on blur", async () => {
     const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
@@ -219,9 +219,8 @@ describe("AutoModelRoutingExperimentConfig", () => {
     const replaceAll = { initialSelectionStart: 0, initialSelectionEnd: label.value.length };
     await userEvent.type(label, "Fast", replaceAll);
     expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
-    await waitFor(() => expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1), {
-      timeout: 2000,
-    });
+    fireEvent.keyDown(label, { key: "Enter" });
+    expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
     expect(lastUpdate().tiers[0].label).toBe("Fast");
 
     // Tier 2 is still labelled "Medium"; reusing it must not persist.
@@ -232,13 +231,13 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(container.querySelector("[data-auto-model-routing-text-error]")?.textContent).toBe(
       "Another tier already uses this label"
     );
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    fireEvent.keyDown(label, { key: "Enter" });
     expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
-    fireEvent.blur(label);
     expect(label.value).toBe("Fast");
+    expect(container.querySelector("[data-auto-model-routing-text-error]")).toBeNull();
   });
 
-  test("a debounced label commit spreads the config another window replaced meanwhile", async () => {
+  test("a label committed on blur spreads the config another window replaced while typing", async () => {
     const configChange = { signal: null as (() => void) | null };
     mockApi.config.onConfigChanged = mock(() =>
       Promise.resolve({
@@ -263,7 +262,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     });
     expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
 
-    // Another window switches the evaluator while this label's commit is still debounced.
+    // Another window switches the evaluator while this label is still being edited.
     mockApi.config.getConfig = mock(() =>
       Promise.resolve({
         autoModelRouting: {
@@ -276,11 +275,31 @@ describe("AutoModelRoutingExperimentConfig", () => {
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
     await waitFor(() => expect(field.value).toBe("openai:gpt-5.5"));
 
-    await waitFor(() => expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1), {
-      timeout: 2000,
-    });
+    fireEvent.blur(label);
+    expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
     expect(lastUpdate().tiers[0].label).toBe("Fast");
     expect(lastUpdate().evaluationModel).toBe("openai:gpt-5.5");
+  });
+
+  test("a rejected write shows the error and reverts the field to the persisted config", async () => {
+    mockApi.config.updateAutoModelRouting = mock(() => Promise.reject(new Error("disk full")));
+    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+    const fetchesBefore = mockApi.config.getConfig.mock.calls.length;
+
+    const label = getByLabelText("Tier 1 label") as HTMLInputElement;
+    await userEvent.type(label, "Quick", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: label.value.length,
+    });
+    fireEvent.blur(label);
+    // The optimistic edit shows until the rejection re-fetches the persisted config.
+    expect(label.value).toBe("Quick");
+    await waitFor(() =>
+      expect(container.textContent).toContain("Could not save routing settings: disk full")
+    );
+    await waitFor(() => expect(label.value).toBe("Easy"));
+    expect(mockApi.config.getConfig.mock.calls.length).toBeGreaterThan(fetchesBefore);
   });
 
   test("a valid evaluation model is saved with the tiers on Enter", async () => {

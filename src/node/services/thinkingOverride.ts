@@ -13,8 +13,15 @@
  * src/common/types (never crosses IPC).
  */
 import type { ModelMessage } from "ai";
-import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
+
+/** What an Auto-routed stream is running on right now, as StreamManager's stream state has it. */
+export interface LiveTurnRouting {
+  model: string;
+  thinkingLevel: ThinkingLevel | undefined;
+  autoModelRouting: AutoModelRoutingRecord;
+}
 
 export interface ActiveTurnThinkingOverride {
   /** Raw level requested mid-turn; consumed at the next prepareStep (incl. step 1). */
@@ -30,11 +37,13 @@ export interface ActiveTurnThinkingOverride {
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */
   onApplied?: (level: ThinkingLevel) => void;
   /**
-   * Sink wired by AgentSession: an applied Auto raise (autoThinkingEscalation.ts)
-   * updates the live stream context, so a mid-stream compaction follow-up resumes
-   * at the raised level with the raise on its record instead of the tier's level.
+   * Sink wired by AgentSession for Auto-routed turns: StreamManager reports every mid-turn
+   * change to what the stream runs on (an applied slider move or Auto raise, a refusal
+   * fallback). The session's stream context is what a mid-stream compaction follow-up is
+   * built from after the stream is stopped, so it must follow, or the resumed turn drops
+   * back to the tier's model and level and re-arms a claim the user withdrew.
    */
-  onEscalated?: (escalation: AutoModelRoutingEscalation) => void;
+  onLiveRoutingChanged?: (live: LiveTurnRouting) => void;
 }
 
 /**

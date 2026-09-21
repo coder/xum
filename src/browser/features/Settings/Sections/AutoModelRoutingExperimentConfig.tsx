@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ArrowDown, ArrowUp, Loader2, Plus, RotateCcw, Trash2, X } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
@@ -38,7 +38,6 @@ import {
 } from "@/constants/autoModelRouting";
 
 const INHERIT_THINKING = "inherit";
-const TIER_TEXT_COMMIT_DEBOUNCE_MS = 500;
 const SUPPORTED_EVALUATION_PROVIDERS = AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS.join(", ");
 const EVALUATION_MODEL_ERROR = `Enter provider:model using one of ${SUPPORTED_EVALUATION_PROVIDERS}`;
 
@@ -68,19 +67,11 @@ export function AutoModelRoutingExperimentConfig() {
   const { config, setConfig, writeError } = useAutoModelRouting();
   const tiers = config.tiers;
 
-  // Text fields are debounced, not written per keystroke: the IPC boundary rejects
-  // empty intermediate values and would revert the field mid-edit. A draft is
-  // committed after a pause, on blur, or on Enter; an invalid draft shows its
-  // message and reverts on blur.
+  // Text fields commit on blur or Enter, not per keystroke: the IPC boundary rejects empty
+  // intermediate values and would revert the field mid-edit. An invalid draft shows its
+  // message while typing and reverts to the saved value on blur.
   const [textDrafts, setTextDrafts] = useState<Record<string, Partial<TierTextDraft>>>({});
   const [textErrors, setTextErrors] = useState<Record<string, Partial<TierTextDraft>>>({});
-  const textDraftsRef = useRef(textDrafts);
-  textDraftsRef.current = textDrafts;
-  // Debounced commits run from a stale render: every delayed write spreads the latest
-  // config, so a tier commit cannot restore an evaluation model another window replaced.
-  const configRef = useRef(config);
-  configRef.current = config;
-  const commitTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   // null means "not editing": the field shows the saved evaluation model.
   const [evaluationDraft, setEvaluationDraft] = useState<string | null>(null);
@@ -120,8 +111,7 @@ export function AutoModelRoutingExperimentConfig() {
     };
   }, [api, evaluationValid, evaluationValue, statusRefresh]);
 
-  const replaceTiers = (next: AutoModelRoutingTier[]) =>
-    setConfig({ ...configRef.current, tiers: next });
+  const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
   const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
     replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, ...patch } : tier)));
   const moveTier = (index: number, delta: -1 | 1) => {
@@ -136,7 +126,7 @@ export function AutoModelRoutingExperimentConfig() {
     if (!trimmed) return field === "label" ? "Label is required" : "Description is required";
     if (
       field === "label" &&
-      configRef.current.tiers.some(
+      tiers.some(
         (tier) => tier.id !== id && tier.label.trim().toLowerCase() === trimmed.toLowerCase()
       )
     ) {
@@ -146,58 +136,19 @@ export function AutoModelRoutingExperimentConfig() {
   };
   const setTextError = (id: string, field: TierTextField, error: string | null) =>
     setTextErrors((prev) => ({ ...prev, [id]: { ...prev[id], [field]: error ?? undefined } }));
-  const clearTextDraft = (id: string, field: TierTextField) =>
-    setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: undefined } }));
-  const cancelCommitTimer = (id: string, field: TierTextField) => {
-    const key = `${id}:${field}`;
-    const timer = commitTimers.current.get(key);
-    if (timer != null) clearTimeout(timer);
-    commitTimers.current.delete(key);
-  };
-  const commitText = (id: string, field: TierTextField, value: string) => {
-    cancelCommitTimer(id, field);
-    if (validateText(id, field, value)) return;
-    clearTextDraft(id, field);
-    setTextError(id, field, null);
-    replaceTiers(
-      configRef.current.tiers.map((tier) =>
-        tier.id === id ? { ...tier, [field]: value.trim() } : tier
-      )
-    );
-  };
   const handleTextChange = (id: string, field: TierTextField, value: string) => {
     setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: value } }));
     setTextError(id, field, validateText(id, field, value));
-    cancelCommitTimer(id, field);
-    commitTimers.current.set(
-      `${id}:${field}`,
-      setTimeout(() => commitText(id, field, value), TIER_TEXT_COMMIT_DEBOUNCE_MS)
-    );
   };
-  const flushText = (id: string, field: TierTextField) => {
-    const draft = textDraftsRef.current[id]?.[field];
+  const commitText = (id: string, field: TierTextField) => {
+    const draft = textDrafts[id]?.[field];
     if (draft === undefined) return;
-    if (validateText(id, field, draft)) {
-      cancelCommitTimer(id, field);
-      clearTextDraft(id, field);
-      return;
-    }
-    commitText(id, field, draft);
+    setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: undefined } }));
+    setTextError(id, field, null);
+    // An invalid draft never reaches the backend; the field shows the saved value again.
+    if (validateText(id, field, draft)) return;
+    replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, [field]: draft.trim() } : tier)));
   };
-  useEffect(() => {
-    const timers = commitTimers.current;
-    return () => {
-      // Unmounting mid-debounce must not lose a valid edit.
-      for (const [key, timer] of timers) {
-        clearTimeout(timer);
-        const [id, field] = key.split(":") as [string, TierTextField];
-        const draft = textDraftsRef.current[id]?.[field];
-        if (draft !== undefined && !validateText(id, field, draft)) commitText(id, field, draft);
-      }
-      timers.clear();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount-only flush
-  }, []);
 
   const commitEvaluationModel = () => {
     if (evaluationDraft === null) return;
@@ -393,9 +344,9 @@ export function AutoModelRoutingExperimentConfig() {
                   onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                     handleTextChange(tier.id, "label", event.target.value)
                   }
-                  onBlur={() => flushText(tier.id, "label")}
+                  onBlur={() => commitText(tier.id, "label")}
                   onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
-                    if (event.key === "Enter") flushText(tier.id, "label");
+                    if (event.key === "Enter") commitText(tier.id, "label");
                   }}
                   className="border-border-medium bg-modal-bg h-8 min-w-0 flex-1 text-sm"
                 />
@@ -449,9 +400,9 @@ export function AutoModelRoutingExperimentConfig() {
                 onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                   handleTextChange(tier.id, "description", event.target.value)
                 }
-                onBlur={() => flushText(tier.id, "description")}
+                onBlur={() => commitText(tier.id, "description")}
                 onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
-                  if (event.key === "Enter") flushText(tier.id, "description");
+                  if (event.key === "Enter") commitText(tier.id, "description");
                 }}
                 className="border-border-medium bg-modal-bg h-8 w-full text-xs"
               />

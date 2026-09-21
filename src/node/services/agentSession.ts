@@ -1206,9 +1206,10 @@ export class AgentSession {
     options?: SendMessageOptions;
     /**
      * Auto routing decision of the streaming request. Starts as the session's pre-stream
-     * decision and is replaced by the prepared record on stream-start: request preparation
-     * may fall back to the composer's model when the tier model cannot be built, and live
-     * pricing, compaction thresholds and mid-stream follow-ups must follow that swap.
+     * decision, is replaced by the prepared record on stream-start (request preparation
+     * may fall back to the composer's model when the tier model cannot be built), and then
+     * follows the stream's mid-turn changes (ActiveTurnThinkingOverride.onLiveRoutingChanged):
+     * live pricing, compaction thresholds and mid-stream follow-ups must follow each swap.
      */
     autoModelRouting?: AutoModelRoutingRecord;
     agentInitiated?: boolean;
@@ -7894,18 +7895,18 @@ export class AgentSession {
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
-        // An Auto raise mid-turn must reach the context mid-stream compaction follow-ups are
-        // built from, or the resumed turn drops back to the tier's level and loses the raise.
-        activeTurnThinkingOverride.onEscalated = (escalation) => {
+        // Mid-stream compaction follow-ups are built from this context after the stream is
+        // stopped: what the Auto-routed stream runs on (a raise, a slider move, a refusal
+        // fallback) must land here, or the resumed turn drops back to the tier's model and level.
+        activeTurnThinkingOverride.onLiveRoutingChanged = (live) => {
           if (this.activeStreamContext !== streamContext) return;
-          if (streamContext.autoModelRouting != null) {
-            streamContext.autoModelRouting = {
-              ...streamContext.autoModelRouting,
-              escalations: [...(streamContext.autoModelRouting.escalations ?? []), escalation],
-            };
-          }
+          streamContext.modelString = live.model;
+          streamContext.autoModelRouting = live.autoModelRouting;
           if (streamContext.options != null) {
-            streamContext.options = { ...streamContext.options, thinkingLevel: escalation.to };
+            streamContext.options = {
+              ...streamContext.options,
+              thinkingLevel: live.thinkingLevel ?? streamContext.options.thinkingLevel,
+            };
           }
         };
       }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
 import {
   getDefaultAutoModelRoutingConfig,
@@ -28,37 +28,36 @@ export function useAutoModelRouting(): AutoModelRoutingState {
   const [config, setLocalConfig] = useState<AutoModelRoutingConfig>(() =>
     getDefaultAutoModelRoutingConfig()
   );
+  const [writeError, setWriteError] = useState<string | null>(null);
   // Ignore stale config fetches so backend refreshes can't overwrite newer optimistic edits.
   const fetchVersionRef = useRef(0);
-
-  const fetchConfig = useCallback(async () => {
-    const getConfig = api?.config?.getConfig;
-    if (!getConfig) {
-      return;
-    }
-
-    const fetchVersion = ++fetchVersionRef.current;
-
-    try {
-      const loadedConfig = await getConfig();
-      if (fetchVersion !== fetchVersionRef.current) {
-        return;
-      }
-      setLocalConfig(normalizeAutoModelRoutingConfig(loadedConfig.autoModelRouting));
-    } catch {
-      // Best-effort only.
-    }
-  }, [api]);
+  // A rejected write re-fetches by re-running the subscription effect below, which owns the
+  // only fetch closure (no memoized callback to thread through effect dependencies).
+  const [refetchVersion, setRefetchVersion] = useState(0);
 
   useEffect(() => {
-    const onConfigChanged = api?.config?.onConfigChanged;
-    if (!onConfigChanged) {
+    const configApi = api?.config;
+    const onConfigChanged = configApi?.onConfigChanged;
+    if (!configApi?.getConfig || !onConfigChanged) {
       return;
     }
 
     const abortController = new AbortController();
     const { signal } = abortController;
     let iterator: AsyncIterator<unknown> | null = null;
+
+    const fetchConfig = async () => {
+      const fetchVersion = ++fetchVersionRef.current;
+      try {
+        const loadedConfig = await configApi.getConfig();
+        if (fetchVersion !== fetchVersionRef.current || signal.aborted) {
+          return;
+        }
+        setLocalConfig(normalizeAutoModelRoutingConfig(loadedConfig.autoModelRouting));
+      } catch {
+        // Best-effort only.
+      }
+    };
 
     void fetchConfig();
 
@@ -85,25 +84,21 @@ export function useAutoModelRouting(): AutoModelRoutingState {
       abortController.abort();
       void iterator?.return?.();
     };
-  }, [api, fetchConfig]);
+  }, [api, refetchVersion]);
 
-  const [writeError, setWriteError] = useState<string | null>(null);
-  const setConfig = useCallback(
-    (next: AutoModelRoutingConfig) => {
-      fetchVersionRef.current++;
-      setLocalConfig(next);
+  const setConfig = (next: AutoModelRoutingConfig) => {
+    fetchVersionRef.current++;
+    setLocalConfig(next);
 
-      api?.config
-        ?.updateAutoModelRouting({ autoModelRouting: next })
-        .then(() => setWriteError(null))
-        .catch((error: unknown) => {
-          // If the write fails, re-fetch so the UI reverts to what the send path applies.
-          setWriteError(getErrorMessage(error));
-          void fetchConfig();
-        });
-    },
-    [api, fetchConfig]
-  );
+    api?.config
+      ?.updateAutoModelRouting({ autoModelRouting: next })
+      .then(() => setWriteError(null))
+      .catch((error: unknown) => {
+        // If the write fails, re-fetch so the UI reverts to what the send path applies.
+        setWriteError(getErrorMessage(error));
+        setRefetchVersion((version) => version + 1);
+      });
+  };
 
   return { config, setConfig, writeError };
 }

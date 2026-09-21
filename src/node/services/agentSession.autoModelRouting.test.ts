@@ -20,7 +20,12 @@ import type {
 } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
-import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
+import type { LiveTurnRouting } from "./thinkingOverride";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
@@ -947,105 +952,157 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     }
   );
 
-  it("a mid-stream compaction after an Auto raise resumes at the raised level with the raise on its record", async () => {
-    const { session, aiService, streamMessage } = await createHarness({
-      experimentEnabled: true,
-      classify: () => Promise.resolve(Ok(decision("hard"))),
-    });
-    const usage = { inputTokens: 4_000, outputTokens: 1, totalTokens: 4_001 };
-    const raise: AutoModelRoutingEscalation = {
-      step: 4,
-      from: "high",
-      to: "xhigh",
-      reason: "3 consecutive steps with only failing tool calls",
-    };
-    let streamCalls = 0;
-    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
-      streamCalls += 1;
-      if (streamCalls === 1) {
-        aiService.emit("stream-start", {
-          type: "stream-start",
-          workspaceId: "ws-auto-routing",
-          messageId: "assistant-routed",
-          model: opts.modelString,
-          historySequence: 1,
-          startTime: Date.now(),
-          autoModelRouting: opts.autoModelRouting,
-        });
-        // StreamManager reports an applied raise through the turn's override holder.
-        opts.activeTurnThinkingOverride?.onEscalated?.(raise);
-        aiService.emit("usage-delta", {
-          type: "usage-delta",
-          workspaceId: "ws-auto-routing",
-          messageId: "assistant-routed",
-          usage,
-          cumulativeUsage: usage,
-        });
-      }
-      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
-    });
-    aiService.stopStream = mock((workspaceId: string) => {
-      void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
-        type: "stream-abort",
-        workspaceId,
-        messageId: "assistant-routed",
-        abortReason: "system",
-      });
-      return Promise.resolve(Ok(undefined));
-    });
-
-    const internals = session as unknown as {
-      contextController: { compactionMonitor: CompactionMonitor };
-      sendMessage: AgentSession["sendMessage"];
-    };
-    let midStreamChecks = 0;
-    internals.contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: false,
-        shouldForceCompact: false,
-        usagePercentage: 0,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => {
-        midStreamChecks += 1;
-        return midStreamChecks === 1;
+  const RAISE: AutoModelRoutingEscalation = {
+    step: 4,
+    from: "high",
+    to: "xhigh",
+    reason: "3 consecutive steps with only failing tool calls",
+  };
+  const FALLBACK_MODEL = "openai:gpt-4.1";
+  // StreamManager reports each of these through the turn's override holder; the compaction
+  // follow-up must be built from what the stream ran on afterwards.
+  it.each([
+    {
+      change: "an Auto raise",
+      live: (record: AutoModelRoutingRecord, model: string): LiveTurnRouting => ({
+        model,
+        thinkingLevel: "xhigh",
+        autoModelRouting: { ...record, escalations: [RAISE] },
       }),
-      resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
-    } as unknown as CompactionMonitor;
-    const originalSendMessage = session.sendMessage.bind(session);
-    let compactionRequest: SendMessageOptions | undefined;
-    internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
-      const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
-      if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
-      compactionRequest ??= args[1];
-      return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
-    }) as AgentSession["sendMessage"];
-    let streamErrored = false;
-    session.onChatEvent(({ message }) => {
-      if (message.type === "stream-error") streamErrored = true;
-    });
+      expectFollowUp: (followUp: CompactionFollowUpRequest) => {
+        expect(followUp.model).toBe(HARD_MODEL);
+        expect(followUp.thinkingLevel).toBe("xhigh");
+        expect(followUp.autoModelRouting).toMatchObject({ tierId: "hard", escalations: [RAISE] });
+      },
+    },
+    {
+      change: "a slider move that withdrew Auto's thinking claim",
+      live: (record: AutoModelRoutingRecord, model: string): LiveTurnRouting => {
+        const { thinkingLevel: _level, ...withoutClaim } = record;
+        return { model, thinkingLevel: "max", autoModelRouting: withoutClaim };
+      },
+      expectFollowUp: (followUp: CompactionFollowUpRequest) => {
+        expect(followUp.thinkingLevel).toBe("max");
+        expect(followUp.autoModelRouting).toMatchObject({ tierId: "hard" });
+        expect(followUp.autoModelRouting).not.toHaveProperty("thinkingLevel");
+      },
+    },
+    {
+      change: "a refusal fallback to a configured model",
+      live: (record: AutoModelRoutingRecord): LiveTurnRouting => ({
+        model: FALLBACK_MODEL,
+        thinkingLevel: "medium",
+        autoModelRouting: { ...record, model: FALLBACK_MODEL, thinkingLevel: "medium" },
+      }),
+      expectFollowUp: (followUp: CompactionFollowUpRequest) => {
+        expect(followUp.model).toBe(FALLBACK_MODEL);
+        expect(followUp.thinkingLevel).toBe("medium");
+        expect(followUp.autoModelRouting).toMatchObject({
+          tierId: "hard",
+          model: FALLBACK_MODEL,
+          thinkingLevel: "medium",
+        });
+      },
+    },
+  ])(
+    "a mid-stream compaction after $change resumes on what the stream ran on",
+    async (testCase) => {
+      const { session, aiService, streamMessage } = await createHarness({
+        experimentEnabled: true,
+        classify: () => Promise.resolve(Ok(decision("hard"))),
+      });
+      const usage = { inputTokens: 4_000, outputTokens: 1, totalTokens: 4_001 };
+      let streamCalls = 0;
+      streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          aiService.emit("stream-start", {
+            type: "stream-start",
+            workspaceId: "ws-auto-routing",
+            messageId: "assistant-routed",
+            model: opts.modelString,
+            historySequence: 1,
+            startTime: Date.now(),
+            autoModelRouting: opts.autoModelRouting,
+          });
+          if (opts.autoModelRouting == null) throw new Error("Expected a routed request");
+          opts.activeTurnThinkingOverride?.onLiveRoutingChanged?.(
+            testCase.live(opts.autoModelRouting, opts.modelString)
+          );
+          aiService.emit("usage-delta", {
+            type: "usage-delta",
+            workspaceId: "ws-auto-routing",
+            messageId: "assistant-routed",
+            usage,
+            cumulativeUsage: usage,
+          });
+        }
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.stopStream = mock((workspaceId: string) => {
+        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "assistant-routed",
+          abortReason: "system",
+        });
+        return Promise.resolve(Ok(undefined));
+      });
 
-    const result = await internals.sendMessage("design it", {
-      model: COMPOSER_MODEL,
-      agentId: "exec",
-      thinkingLevel: "low",
-      autoThinkingLevel: true,
-    });
-    expect(result.success).toBe(true);
-    const deadline = Date.now() + 2_000;
-    while (!streamErrored && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      const internals = session as unknown as {
+        contextController: { compactionMonitor: CompactionMonitor };
+        sendMessage: AgentSession["sendMessage"];
+      };
+      let midStreamChecks = 0;
+      internals.contextController.compactionMonitor = {
+        checkBeforeSend: mock(() => ({
+          shouldShowWarning: false,
+          shouldForceCompact: false,
+          usagePercentage: 0,
+          thresholdPercentage: 85,
+        })),
+        checkMidStream: mock(() => {
+          midStreamChecks += 1;
+          return midStreamChecks === 1;
+        }),
+        resetForNewStream: mock(() => undefined),
+        setThreshold: mock(() => undefined),
+        getThreshold: mock(() => 0.85),
+      } as unknown as CompactionMonitor;
+      const originalSendMessage = session.sendMessage.bind(session);
+      let compactionRequest: SendMessageOptions | undefined;
+      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+        const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
+        if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
+        compactionRequest ??= args[1];
+        return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
+      }) as AgentSession["sendMessage"];
+      let streamErrored = false;
+      session.onChatEvent(({ message }) => {
+        if (message.type === "stream-error") streamErrored = true;
+      });
+
+      const result = await internals.sendMessage("design it", {
+        model: COMPOSER_MODEL,
+        agentId: "exec",
+        thinkingLevel: "low",
+        autoModelRouting: true,
+        autoThinkingLevel: true,
+      });
+      expect(result.success).toBe(true);
+      const deadline = Date.now() + 2_000;
+      while (!streamErrored && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const muxMetadata = compactionRequest?.muxMetadata as MuxMessageMetadata | undefined;
+      const followUp =
+        muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+      if (followUp == null) throw new Error("Expected a captured compaction follow-up");
+      testCase.expectFollowUp(followUp);
+      await session.dispose();
     }
-
-    const muxMetadata = compactionRequest?.muxMetadata as MuxMessageMetadata | undefined;
-    const followUp =
-      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
-    expect(followUp?.thinkingLevel).toBe("xhigh");
-    expect(followUp?.autoModelRouting).toMatchObject({ tierId: "hard", escalations: [raise] });
-    await session.dispose();
-  });
+  );
 
   it("falls back when a budgeted goal cannot price the chosen tier's model", async () => {
     const { session, streamMessage, classify } = await createHarness({
