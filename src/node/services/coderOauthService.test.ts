@@ -5405,10 +5405,12 @@ describe("CoderOauthService", () => {
       // plain-string entries whose ID the catalog marker lists are catalog
       // data; an object entry is user-edited even when its ID is listed, and
       // IDs outside the catalog were added by hand.
+      // Compare against the seeded expiry, not a new timestamp after migration.
+      const auth = validAuth();
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth(),
+          coderOauth: auth,
           models: [
             "anthropic/manual-model",
             "anthropic/catalog-a",
@@ -5436,7 +5438,7 @@ describe("CoderOauthService", () => {
       expect(coderSection.staleDiscoveredModels).toEqual(["openai/catalog-c"]);
       expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
       expect(coderSection.coderCatalogGeneration).toBe(7);
-      expect(coderSection.coderOauth).toEqual(validAuth());
+      expect(coderSection.coderOauth).toEqual(auth);
 
       // Second start: the flag short-circuits — no write at all.
       const afterFirstRun = JSON.stringify(deps.providersConfig);
