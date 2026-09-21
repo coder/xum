@@ -56,7 +56,7 @@ describe("prepareMessagePayload", () => {
         messageText: "/+2 hello",
         modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
       },
-      false,
+      true,
     ],
   ])("keeps the Auto routing flag only for %s", (_name, input, expected) => {
     const result = prepare({

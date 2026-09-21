@@ -69,6 +69,8 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     evaluationModel?: string;
     /** Models the budgeted-goal pricing gate refuses. */
     unpricedModels?: string[];
+    /** Priced cost the workspace ledger reports for the evaluator's usage; absent means unpriced. */
+    evaluatorCostUsd?: number;
   }) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -86,6 +88,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     // Goal service stub: only the pricing gate has behavior; every other method the
     // send path touches is a no-op resolving to undefined (no goal exists here).
     const unpriced = new Set(options.unpricedModels ?? []);
+    const recordStreamAccounting = mock((_input: Record<string, unknown>) => Promise.resolve(null));
     const workspaceGoalService =
       options.unpricedModels == null
         ? undefined
@@ -97,6 +100,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
                     ? Err({ type: "unknown" as const, raw: "unpriced" })
                     : Ok(undefined)
                 ),
+              recordStreamAccounting,
             } as Record<PropertyKey, unknown>,
             { get: (target, prop) => target[prop] ?? (() => Promise.resolve(undefined)) }
           ) as unknown as WorkspaceGoalService);
@@ -120,11 +124,24 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const recordHeadlessUsage = mock(
       (
         _workspaceId: string,
-        _modelString: string,
-        _usage: AutoModelRoutingDecision["usage"],
+        modelString: string,
+        usage: AutoModelRoutingDecision["usage"],
         _providerMetadata?: Record<string, unknown>,
         _options?: { analyticsSource?: string }
-      ) => Promise.resolve(undefined)
+      ) => {
+        if (options.evaluatorCostUsd == null || usage == null) return Promise.resolve(undefined);
+        const priced = (tokens: number, cost_usd: number) => ({ tokens, cost_usd });
+        return Promise.resolve({
+          model: modelString,
+          usage: {
+            input: priced(usage.inputTokens ?? 0, options.evaluatorCostUsd),
+            cached: priced(0, 0),
+            cacheCreate: priced(0, 0),
+            output: priced(usage.outputTokens ?? 0, 0),
+            reasoning: priced(0, 0),
+          },
+        });
+      }
     );
 
     const session = createTestAgentSession({
@@ -146,7 +163,15 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       >,
       workspaceGoalService,
     });
-    return { session, historyService, aiService, streamMessage, classify, recordHeadlessUsage };
+    return {
+      session,
+      historyService,
+      aiService,
+      streamMessage,
+      classify,
+      recordHeadlessUsage,
+      recordStreamAccounting,
+    };
   }
 
   afterEach(async () => {
@@ -1127,6 +1152,33 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       providerMetadata,
       { analyticsSource: "auto_model_routing" }
     );
+  });
+
+  it("charges the evaluator's priced spend to the goal as a zero-turn user stream", async () => {
+    const usage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, streamMessage, recordStreamAccounting } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage })),
+    });
+    const result = await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    // Goal cost otherwise advances only from stream usage; the evaluator's cost lands on the
+    // budget by itself, with the user origin that consumes no goal turn.
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect(recordStreamAccounting.mock.calls[0]?.[0]).toEqual({
+      workspaceId: "ws-auto-routing",
+      costUsd: 0.0042,
+      streamOriginKind: "user",
+    });
+    expect(streamMessage).toHaveBeenCalledTimes(1);
   });
 
   it("a resume with only thinking Auto keeps a newly picked concrete model", async () => {

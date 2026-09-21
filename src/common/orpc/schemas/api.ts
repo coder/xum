@@ -2725,7 +2725,14 @@ export const config = {
     }),
   },
   previewAutoModelRouting: {
-    input: z.object({ prompt: z.string().min(1) }),
+    input: z.object({
+      prompt: z.string().min(1),
+      /**
+       * The tiers and evaluator the panel shows. The panel saves edits optimistically, so a
+       * preview must classify against what the user sees, not the last persisted config.
+       */
+      config: AutoModelRoutingConfigSchema.optional(),
+    }),
     output: ResultSchema(
       z.object({
         tierId: z.string(),

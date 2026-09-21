@@ -879,9 +879,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           evaluationModel: input?.evaluationModel ?? autoModelRouting.evaluationModel,
           available: true,
         }),
-      previewAutoModelRouting: (input: { prompt: string }) => {
+      previewAutoModelRouting: (input: { prompt: string; config?: AutoModelRoutingConfig }) => {
         // Deterministic stand-in for the evaluation model: longer prompts land on later tiers.
-        const { tiers } = autoModelRouting;
+        const { tiers } = input.config ?? autoModelRouting;
         const index = Math.min(tiers.length - 1, Math.floor(input.prompt.length / 40));
         const chosen = tiers[index];
         const probabilities = Object.fromEntries(
@@ -897,7 +897,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             tierLabel: chosen.label,
             confidence: 0.7,
             probabilities,
-            evaluationModel: autoModelRouting.evaluationModel,
+            evaluationModel: input.config?.evaluationModel ?? autoModelRouting.evaluationModel,
             ...(chosen.model != null ? { model: chosen.model } : {}),
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },

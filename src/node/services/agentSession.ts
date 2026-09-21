@@ -7118,13 +7118,14 @@ export class AgentSession {
     }
     // The evaluation is a paid request outside StreamManager; bill it to the workspace
     // before any fallback below, since the tokens were spent either way.
-    await this.sessionUsageService?.recordHeadlessUsage(
+    const billed = await this.sessionUsageService?.recordHeadlessUsage(
       this.workspaceId,
       decision.data.evaluationModel,
       decision.data.usage,
       decision.data.providerMetadata,
       { analyticsSource: "auto_model_routing" }
     );
+    await this.chargeEvaluatorToGoal(billed ? getTotalCost(billed.usage) : undefined);
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,
@@ -7217,6 +7218,27 @@ export class AgentSession {
         reason: attachmentIssue,
       },
     };
+  }
+
+  /**
+   * A budgeted goal caps every dollar the turn spends, and goal cost otherwise only advances
+   * from stream usage, so the evaluator's priced spend is charged here as a zero-turn
+   * user-origin stream: the cap sees it without a goal turn being consumed.
+   */
+  private async chargeEvaluatorToGoal(costUsd: number | undefined): Promise<void> {
+    if (!this.workspaceGoalService || costUsd == null || costUsd <= 0) return;
+    try {
+      await this.workspaceGoalService.recordStreamAccounting({
+        workspaceId: this.workspaceId,
+        costUsd,
+        streamOriginKind: "user",
+      });
+    } catch (error) {
+      log.warn("Failed to charge evaluator usage to the goal", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /**

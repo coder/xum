@@ -380,7 +380,7 @@ export const router = (authToken?: string) => {
           handlerGen(function* ({ context }, input) {
             const router = yield* AutoModelRouterTag;
             const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
-              context.config.loadConfigOrDefault().autoModelRouting
+              input.config ?? context.config.loadConfigOrDefault().autoModelRouting
             );
             const decision = yield* router.classifyEffect({
               prompt: input.prompt,

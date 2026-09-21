@@ -236,7 +236,9 @@ export function AutoModelRoutingExperimentConfig() {
     setPreview(null);
     setPreviewError(null);
     try {
-      const result = await api.config.previewAutoModelRouting({ prompt: samplePrompt });
+      // Classify against the tiers and evaluator on screen: setConfig saves optimistically and
+      // the write may still be in flight when the click lands.
+      const result = await api.config.previewAutoModelRouting({ prompt: samplePrompt, config });
       if (result.success) setPreview(result.data);
       else setPreviewError(result.error);
     } catch (error) {

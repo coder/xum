@@ -350,6 +350,32 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(preview.textContent).toContain("GPT-5.5");
   });
 
+  test("classifying sends the tiers on screen, not the last persisted config", async () => {
+    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
+    // The edit is saved optimistically on blur; a save still in flight must not make the
+    // preview classify against the previous tiers.
+    mockApi.config.updateAutoModelRouting.mockImplementation(
+      () => new Promise<void>(() => undefined)
+    );
+    const label = getByLabelText("Tier 1 label") as HTMLInputElement;
+    await userEvent.type(label, "Quick", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: label.value.length,
+    });
+    fireEvent.blur(label);
+    await userEvent.type(getByLabelText("Sample prompt"), "Rename a variable");
+    fireEvent.click(getByRole("button", { name: "Classify" }));
+
+    await waitFor(() => expect(mockApi.config.previewAutoModelRouting).toHaveBeenCalledTimes(1));
+    const request = mockApi.config.previewAutoModelRouting.mock.calls[0]?.[0] as {
+      prompt: string;
+      config?: AutoModelRoutingConfig;
+    };
+    expect(request.config?.tiers[0]?.label).toBe("Quick");
+  });
+
   test("a preview without confidence or probabilities still renders the tier", async () => {
     mockApi.config.previewAutoModelRouting.mockImplementation(() =>
       Promise.resolve({
