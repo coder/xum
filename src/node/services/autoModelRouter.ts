@@ -1,7 +1,6 @@
-import { experimental_evaluate } from "ai";
+import { APICallError, experimental_evaluate } from "ai";
 import { Effect } from "effect";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { getErrorMessage } from "@/common/utils/errors";
 import type {
   AutoModelRoutingDecision,
   AutoModelRoutingEvaluationStatus,
@@ -120,7 +119,7 @@ export class AutoModelRouter {
         return self.fail(
           timeoutSignal.aborted
             ? `Evaluation timed out after ${AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS}ms`
-            : `Evaluation failed: ${getErrorMessage(evaluation.error)}`
+            : describeEvaluationError(evaluation.error)
         );
       }
 
@@ -133,6 +132,11 @@ export class AutoModelRouter {
         ...(confidence != null ? { confidence } : {}),
         ...(answer.probabilities ? { probabilities: answer.probabilities } : {}),
         evaluationModel: input.evaluationModel,
+        // TypeSafe reports no token usage; keep those decisions free of an all-undefined object.
+        ...(hasTokenCounts(evaluation.data.usage) ? { usage: evaluation.data.usage } : {}),
+        ...(evaluation.data.providerMetadata
+          ? { providerMetadata: evaluation.data.providerMetadata }
+          : {}),
       };
       log.debug("Auto model routing classified prompt", {
         tierId: decision.tierId,
@@ -150,6 +154,20 @@ export class AutoModelRouter {
     });
     return Err(reason);
   }
+}
+
+function hasTokenCounts(usage: NonNullable<AutoModelRoutingDecision["usage"]>): boolean {
+  return usage.inputTokens != null || usage.outputTokens != null || usage.totalTokens != null;
+}
+
+/** SDK error messages embed response bodies (and with them any echoed credential), so only a category survives. */
+function describeEvaluationError(error: unknown): string {
+  if (APICallError.isInstance(error)) {
+    return error.statusCode != null
+      ? `Evaluation request failed with HTTP ${error.statusCode}`
+      : "Evaluation request failed";
+  }
+  return `Evaluation failed (${error instanceof Error ? error.name : typeof error})`;
 }
 
 /** TypeSafe reports a per-question confidence in provider metadata; other evaluators do not. */

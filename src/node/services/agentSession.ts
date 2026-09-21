@@ -7070,6 +7070,15 @@ export class AgentSession {
     if (!decision.success) {
       return fallback({ status: "fallback", reason: decision.error });
     }
+    // The evaluation is a paid request outside StreamManager; bill it to the workspace
+    // before any fallback below, since the tokens were spent either way.
+    await this.sessionUsageService?.recordHeadlessUsage(
+      this.workspaceId,
+      decision.data.evaluationModel,
+      decision.data.usage,
+      decision.data.providerMetadata,
+      { analyticsSource: "auto_model_routing" }
+    );
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,
@@ -7216,10 +7225,11 @@ export class AgentSession {
   }
 
   /**
-   * A manual resume sends the composer's current options, but while Auto is active the
-   * composer model is only the routing fallback: continue on the model this turn was
-   * routed to and keep its badge. Without the flag the caller chose a concrete model,
-   * so the badge is kept only when that model is the routed one (startup retries).
+   * A manual resume sends the composer's current options, but a dimension still on Auto
+   * only names the routing fallback: continue on what this turn actually ran with (the
+   * retry snapshot). A concrete dimension keeps the caller's choice. The badge names the
+   * routed model, so it survives only a resume that still runs on that model (startup
+   * retries, or a caller picking it by hand).
    */
   private async applyAutoRoutedResume(
     options: SendMessageOptions
@@ -7232,19 +7242,26 @@ export class AgentSession {
     );
     if (!parsedRecord.success) return resumeOptions;
     const record = parsedRecord.data;
-    if (autoModelRouting !== true && autoThinkingLevel !== true) {
-      // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
-      return modelSelectionEqualityKey(resumeOptions.model) ===
-        modelSelectionEqualityKey(record.model)
-        ? { ...resumeOptions, autoModelRoutingRecord: record }
-        : resumeOptions;
-    }
     const retry = lastUserRow?.metadata?.retrySendOptions;
+    const model =
+      autoModelRouting === true
+        ? typeof retry?.model === "string"
+          ? retry.model
+          : record.model
+        : resumeOptions.model;
+    const thinkingLevel =
+      autoThinkingLevel === true
+        ? (coerceThinkingLevel(retry?.thinkingLevel) ??
+          record.thinkingLevel ??
+          resumeOptions.thinkingLevel)
+        : resumeOptions.thinkingLevel;
+    // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
+    const keepRecord = modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model);
     return {
       ...resumeOptions,
-      model: typeof retry?.model === "string" ? retry.model : record.model,
-      thinkingLevel: coerceThinkingLevel(retry?.thinkingLevel) ?? resumeOptions.thinkingLevel,
-      autoModelRoutingRecord: record,
+      model,
+      thinkingLevel,
+      ...(keepRecord ? { autoModelRoutingRecord: record } : {}),
     };
   }
 

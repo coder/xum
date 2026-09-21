@@ -22,6 +22,7 @@ import {
   resolveApiKeyCandidate,
   resolveProviderCredentials,
   type ProviderConfigRaw,
+  type ResolvedCredentials,
 } from "@/node/utils/providerRequirements";
 
 /**
@@ -51,6 +52,8 @@ interface EvaluationModelTarget {
   provider: AutoModelRoutingEvaluationProvider;
   modelId: string;
   settings: { apiKey: string; baseURL?: string; headers: Record<string, string> };
+  /** OpenAI only: the configured organization, as chat requests send it. */
+  organization?: string;
 }
 
 /**
@@ -113,13 +116,14 @@ export function resolveEvaluationModelTarget(
       ...(baseURL ? { baseURL } : {}),
       headers: Object.fromEntries(buildAIProviderRequestHeaders(undefined).entries()),
     },
+    ...(credentials.organization ? { organization: credentials.organization } : {}),
   });
 }
 
 function resolveTypeSafeCredentials(
   config: ProviderConfigRaw,
   env: Record<string, string | undefined>
-): { apiKey?: string; baseUrl?: string } {
+): Pick<ResolvedCredentials, "apiKey" | "baseUrl" | "organization"> {
   const resolved = resolveApiKeyCandidate(
     { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
     {
@@ -139,13 +143,17 @@ export function createEvaluationModel(
   return Effect.gen(function* () {
     const target = resolveEvaluationModelTarget(modelString, deps);
     if (!target.success) return target;
-    const { provider, modelId, settings } = target.data;
+    const { provider, modelId, settings, organization } = target.data;
     switch (provider) {
       case TYPESAFE_PROVIDER_KEY:
         return Ok(createTypeSafeAi(settings).evaluationModel(modelId));
       case "openai": {
         const { createOpenAI } = yield* Effect.promise(PROVIDER_REGISTRY.openai);
-        return Ok(createOpenAI(settings).evaluationModel(modelId));
+        return Ok(
+          createOpenAI({ ...settings, ...(organization ? { organization } : {}) }).evaluationModel(
+            modelId
+          )
+        );
       }
       case "anthropic": {
         const { createAnthropic } = yield* Effect.promise(PROVIDER_REGISTRY.anthropic);

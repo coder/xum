@@ -517,6 +517,9 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.thinkingLevel).toBe(execThinking);
+    // Both explicit choices opt out of composer Auto, per dimension.
+    expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
+    expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
     //

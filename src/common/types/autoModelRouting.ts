@@ -161,6 +161,9 @@ export interface AutoModelRoutingDecision {
   probabilities?: Record<string, number>;
   /** The `provider:model` that produced the verdict. */
   evaluationModel: string;
+  /** Evaluator spend, so the caller can bill it to the workspace like other headless calls. */
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  providerMetadata?: Record<string, unknown>;
 }
 
 /**

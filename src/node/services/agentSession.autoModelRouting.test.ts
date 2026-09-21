@@ -6,6 +6,7 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { Config } from "@/node/config";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
   AutoModelRouter,
   AutoModelRouterClassifyInput,
@@ -113,6 +114,15 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const classify = mock<NonNullable<typeof options.classify>>(
       options.classify ?? (() => Promise.resolve(Ok(decision("hard"))))
     );
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _modelString: string,
+        _usage: AutoModelRoutingDecision["usage"],
+        _providerMetadata?: Record<string, unknown>,
+        _options?: { analyticsSource?: string }
+      ) => Promise.resolve(undefined)
+    );
 
     const session = createTestAgentSession({
       workspaceId: "ws-auto-routing",
@@ -127,6 +137,10 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         }),
       } as unknown as BackgroundProcessManager,
       autoModelRouter: { classify } satisfies Pick<AutoModelRouter, "classify">,
+      sessionUsageService: { recordHeadlessUsage } as unknown as Pick<
+        SessionUsageService,
+        "recordHeadlessUsage"
+      >,
       workspaceGoalService,
       policyService:
         policyDenied == null
@@ -137,7 +151,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
                 !policyDenied.includes(`${provider}:${modelId}`),
             },
     });
-    return { session, historyService, streamMessage, classify };
+    return { session, historyService, streamMessage, classify, recordHeadlessUsage };
   }
 
   afterEach(async () => {
@@ -779,6 +793,93 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       status: "routed",
       tierId: "hard",
     });
+  });
+
+  it("bills the evaluator's usage to the workspace even when the verdict falls back", async () => {
+    const usage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const providerMetadata = { openai: { cachedPromptTokens: 0 } };
+    const { session, recordHeadlessUsage } = await createHarness({
+      experimentEnabled: true,
+      evaluationModel: "openai:gpt-5-nano",
+      // "extreme" maps nothing, so the turn falls back after paying for the verdict.
+      classify: () =>
+        Promise.resolve(
+          Ok({
+            ...decision("extreme"),
+            evaluationModel: "openai:gpt-5-nano",
+            usage,
+            providerMetadata,
+          })
+        ),
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage).toHaveBeenCalledWith(
+      "ws-auto-routing",
+      "openai:gpt-5-nano",
+      usage,
+      providerMetadata,
+      { analyticsSource: "auto_model_routing" }
+    );
+  });
+
+  it("a resume with only thinking Auto keeps a newly picked concrete model", async () => {
+    const { session, streamMessage } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    // The user left model Auto and picked a concrete model before continuing.
+    await session.resumeStream({
+      model: "anthropic:claude-3-5-haiku-latest",
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe("anthropic:claude-3-5-haiku-latest");
+    expect(resumeOptions?.thinkingLevel).toBe("high");
+    // The record names the routed model, which this resume no longer runs on.
+    expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("a resume with only model Auto keeps a newly picked concrete thinking level", async () => {
+    const { session, streamMessage } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    // The user left thinking Auto and picked a level below the routed "high".
+    await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "medium",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(HARD_MODEL);
+    expect(resumeOptions?.thinkingLevel).toBe("medium");
+    expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
   });
 
   it("a resume after leaving Auto uses the explicit model and drops the record", async () => {

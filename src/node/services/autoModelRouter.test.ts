@@ -3,6 +3,7 @@ import type {
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Result,
 } from "@ai-sdk/provider";
+import { APICallError } from "ai";
 import { Effect } from "effect";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
@@ -15,7 +16,7 @@ import {
   type EvaluationModelFactoryDeps,
 } from "./evaluationModelFactory";
 import type { ProvidersConfig } from "@/node/config/providersConfigStore";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { DEFAULT_AUTO_MODEL_ROUTING_TIERS } from "@/common/types/autoModelRouting";
 import {
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
@@ -97,6 +98,7 @@ describe("AutoModelRouter.classify", () => {
         confidence: 0.6,
         probabilities: { easy: 0.1, medium: 0.2, hard: 0.6, extreme: 0.1 },
         evaluationModel: EVALUATION_MODEL,
+        providerMetadata: { [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } } },
       },
     });
     expect(doEvaluate).toHaveBeenCalledTimes(1);
@@ -153,6 +155,46 @@ describe("AutoModelRouter.classify", () => {
     expect(result.success).toBe(false);
     if (result.success) return;
     expect(result.error).toContain("Evaluation failed");
+    expect(result.error).not.toContain("sk-secret");
+  });
+
+  it("reduces a provider HTTP failure to its status code", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.reject(
+          new APICallError({
+            message: 'Rate limited: {"error":"key sk-secret exhausted"}',
+            url: "https://api.example.test/evaluate",
+            requestBodyValues: {},
+            statusCode: 429,
+            responseBody: '{"error":"key sk-secret exhausted"}',
+          })
+        ),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result).toEqual(Err("Evaluation request failed with HTTP 429"));
+  });
+
+  it("passes the evaluator's usage and provider metadata through for cost accounting", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve(verdict("hard", { usage: { inputTokens: 40, outputTokens: 3 } })),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.usage).toMatchObject({ inputTokens: 40, outputTokens: 3 });
+    expect(result.data.providerMetadata).toEqual({
+      [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } },
+    });
   });
 
   it("fails when the caller aborts", async () => {
@@ -241,6 +283,13 @@ describe("evaluation model factory", () => {
       modelId: "gpt-5-nano",
       settings: { apiKey: "sk-openai", baseURL: "https://proxy.example.test/v1" },
     });
+    expect(target.data.organization).toBeUndefined();
+    // Multi-org OpenAI keys evaluate against the same organization chat requests use.
+    const withOrg = resolveEvaluationModelTarget(
+      "openai:gpt-5-nano",
+      deps({ openai: { apiKey: "sk-openai" } }, { env: { OPENAI_ORG_ID: "org-env" } })
+    );
+    expect(withOrg.success && withOrg.data.organization).toBe("org-env");
     expect(resolveEvaluationModelTarget("anthropic:claude-haiku-4-5", deps({}))).toMatchObject({
       success: false,
       error: { code: "missing_api_key" },
