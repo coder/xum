@@ -1148,6 +1148,9 @@ export class AgentSession {
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
 
+  /** Evaluator spend the next non-compaction stream's goal accounting carries (deferEvaluatorGoalCharge). */
+  private pendingEvaluatorGoalCostUsd?: number;
+
   /** True once we see any model/tool output for the current stream (retry guard). */
   private activeStreamHadAnyDelta = false;
 
@@ -7126,7 +7129,7 @@ export class AgentSession {
       decision.data.providerMetadata,
       { analyticsSource: "auto_model_routing" }
     );
-    await this.chargeEvaluatorToGoal(billed ? getTotalCost(billed.usage) : undefined);
+    this.deferEvaluatorGoalCharge(billed ? getTotalCost(billed.usage) : undefined);
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,
@@ -7223,23 +7226,16 @@ export class AgentSession {
 
   /**
    * A budgeted goal caps every dollar the turn spends, and goal cost otherwise only advances
-   * from stream usage, so the evaluator's priced spend is charged here as a zero-turn
-   * user-origin stream: the cap sees it without a goal turn being consumed.
+   * from stream usage, so the evaluator's priced spend is charged with the turn it routed, in
+   * that turn's own stream accounting (recordGoalAccountingFromUsage). Charged by itself it
+   * could tip the goal into budget_limited before the response starts, and a user-origin
+   * stream on a non-active goal is not charged at all, so the far larger response cost would
+   * escape the cap. Compaction streams never charge the goal and leave it for the turn that
+   * follows their boundary (an on-send compaction or a /compact follow-up).
    */
-  private async chargeEvaluatorToGoal(costUsd: number | undefined): Promise<void> {
+  private deferEvaluatorGoalCharge(costUsd: number | undefined): void {
     if (!this.workspaceGoalService || costUsd == null || costUsd <= 0) return;
-    try {
-      await this.workspaceGoalService.recordStreamAccounting({
-        workspaceId: this.workspaceId,
-        costUsd,
-        streamOriginKind: "user",
-      });
-    } catch (error) {
-      log.warn("Failed to charge evaluator usage to the goal", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
+    this.pendingEvaluatorGoalCostUsd = (this.pendingEvaluatorGoalCostUsd ?? 0) + costUsd;
   }
 
   /**
@@ -8935,7 +8931,9 @@ export class AgentSession {
     // whether this stream may charge a non-active goal — otherwise the Goal UI
     // shows growing maintenance cost mid-stream that snaps back at stream end.
     const streamOriginKind = getGoalStreamOriginKind(input);
-    const costUsd = getTotalCost(displayUsage) ?? 0;
+    const evaluatorCostUsd =
+      input.isCompaction === true ? 0 : (this.pendingEvaluatorGoalCostUsd ?? 0);
+    const costUsd = (getTotalCost(displayUsage) ?? 0) + evaluatorCostUsd;
     try {
       await this.workspaceGoalService.previewStreamAccounting({
         workspaceId: this.workspaceId,
@@ -9002,7 +9000,13 @@ export class AgentSession {
       input.metadataModel
     );
     const streamOriginKind = getGoalStreamOriginKind(input);
-    const costUsd = getTotalCost(displayUsage) ?? 0;
+    // The turn's accounting carries the evaluator spend that routed it (deferEvaluatorGoalCharge).
+    let evaluatorCostUsd = 0;
+    if (input.isCompaction !== true && this.pendingEvaluatorGoalCostUsd != null) {
+      evaluatorCostUsd = this.pendingEvaluatorGoalCostUsd;
+      this.pendingEvaluatorGoalCostUsd = undefined;
+    }
+    const costUsd = (getTotalCost(displayUsage) ?? 0) + evaluatorCostUsd;
     try {
       await this.workspaceGoalService.recordStreamAccounting({
         workspaceId: this.workspaceId,

@@ -28,7 +28,9 @@ export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord):
     case "unmapped-tier":
       return `${head} (nothing mapped)`;
     case "fallback":
-      return "Auto: fallback";
+      // Without a verdict there is no tier to name. After one, only the model fell back: the
+      // tier and the thinking level Auto applied still describe this turn.
+      return record.tierId == null ? "Auto: fallback" : `${head} (model fallback)`;
   }
 }
 
@@ -68,7 +70,7 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
         ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`
         : record.status === "unmapped-tier"
           ? `Nothing mapped to this tier; used ${fallbackModel}.`
-          : `Fell back to ${fallbackModel}${reason ? `: ${reason}` : ""}.`
+          : `Fell back to ${fallbackModel}${thinking ? ` at ${thinking} thinking` : ""}${reason ? `: ${reason}` : ""}.`
     );
     for (const escalation of record.escalations ?? []) {
       lines.push(

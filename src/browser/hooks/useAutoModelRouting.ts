@@ -59,8 +59,6 @@ export function useAutoModelRouting(): AutoModelRoutingState {
       }
     };
 
-    void fetchConfig();
-
     (async () => {
       try {
         const subscribedIterator = await onConfigChanged(undefined, { signal });
@@ -69,6 +67,9 @@ export function useAutoModelRouting(): AutoModelRoutingState {
           return;
         }
         iterator = subscribedIterator;
+        // Load only once the subscription is live: a save landing between an earlier snapshot
+        // and this point would be the one change event this panel never sees.
+        void fetchConfig();
         for await (const _ of subscribedIterator) {
           if (signal.aborted) {
             break;
@@ -76,7 +77,9 @@ export function useAutoModelRouting(): AutoModelRoutingState {
           void fetchConfig();
         }
       } catch {
-        // Subscription cancelled via abort signal - expected on cleanup.
+        // Cancelled via the abort signal on cleanup. A refused subscription still loads the
+        // current config once so the panel does not sit on defaults.
+        if (!signal.aborted) void fetchConfig();
       }
     })();
 

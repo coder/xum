@@ -281,6 +281,26 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(lastUpdate().evaluationModel).toBe("openai:gpt-5.5");
   });
 
+  test("loads the config only once the change subscription is live", async () => {
+    // A save landing between a snapshot and the subscription emits no event this panel can
+    // see; it is only visible when the first fetch runs after subscribing.
+    const subscribe = mockApi.config.onConfigChanged as () => Promise<unknown>;
+    mockApi.config.onConfigChanged = mock(() => {
+      mockApi.config.getConfig = mock(() =>
+        Promise.resolve({
+          autoModelRouting: {
+            ...getDefaultAutoModelRoutingConfig(),
+            evaluationModel: "openai:gpt-5.5",
+          },
+        })
+      );
+      return subscribe();
+    });
+    const { getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const field = getByLabelText("Evaluation model") as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("openai:gpt-5.5"));
+  });
+
   test("a rejected write shows the error and reverts the field to the persisted config", async () => {
     mockApi.config.updateAutoModelRouting = mock(() => Promise.reject(new Error("disk full")));
     const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);

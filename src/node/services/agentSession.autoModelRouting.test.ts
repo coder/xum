@@ -28,6 +28,8 @@ import {
 import type { LiveTurnRouting } from "./thinkingOverride";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   createStartedTurnHandle,
@@ -1312,13 +1314,27 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     );
   });
 
-  it("charges the evaluator's priced spend to the goal as a zero-turn user stream", async () => {
-    const usage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, streamMessage, recordStreamAccounting } = await createHarness({
+  it("charges the evaluator's priced spend with the routed turn's own stream accounting", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
-      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage })),
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+      aiService.emit("stream-start", {
+        type: "stream-start",
+        workspaceId: "ws-auto-routing",
+        messageId: "assistant-routed",
+        model: opts.modelString,
+        historySequence: 1,
+        startTime: Date.now(),
+        autoModelRouting: opts.autoModelRouting,
+      });
+      return Promise.resolve(
+        Ok(createStartedTurnHandle(session.closingSignal, "assistant-routed"))
+      );
     });
     const result = await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -1326,17 +1342,70 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       autoModelRouting: true,
     });
     expect(result.success).toBe(true);
-    await session.waitForIdle();
-
-    // Goal cost otherwise advances only from stream usage; the evaluator's cost lands on the
-    // budget by itself, with the user origin that consumes no goal turn.
-    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
-    expect(recordStreamAccounting.mock.calls[0]?.[0]).toEqual({
-      workspaceId: "ws-auto-routing",
-      costUsd: 0.0042,
-      streamOriginKind: "user",
-    });
     expect(streamMessage).toHaveBeenCalledTimes(1);
+    // Charged by itself, the evaluator could tip the goal into budget_limited before the
+    // response streams, and a user-origin stream on a non-active goal is not charged at all.
+    expect(recordStreamAccounting).not.toHaveBeenCalled();
+
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+      type: "stream-end",
+      workspaceId: "ws-auto-routing",
+      messageId: "assistant-routed",
+      parts: [{ type: "text", text: "done" }],
+      metadata: { model: HARD_MODEL, agentId: "exec", finishReason: "stop", usage },
+    });
+    const responseCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(responseCost).toBeGreaterThan(0);
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    const accounted = recordStreamAccounting.mock.calls[0]?.[0] as { costUsd: number };
+    expect(accounted).toMatchObject({
+      workspaceId: "ws-auto-routing",
+      streamOriginKind: "user",
+      isCompaction: false,
+    });
+    expect(accounted.costUsd).toBeCloseTo(responseCost + 0.0042, 10);
+  });
+
+  it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, recordStreamAccounting } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    const internals = session as unknown as {
+      recordGoalAccountingFromUsage(input: {
+        model: string;
+        usage: typeof usage;
+        isCompaction?: boolean;
+      }): Promise<void>;
+    };
+    // An on-send compaction streams first; its accounting never charges the goal.
+    await internals.recordGoalAccountingFromUsage({
+      model: COMPOSER_MODEL,
+      usage,
+      isCompaction: true,
+    });
+    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    const costs = recordStreamAccounting.mock.calls.map(
+      (call) => (call[0] as { costUsd: number }).costUsd
+    );
+    const composerCost = getTotalCost(createDisplayUsage(usage, COMPOSER_MODEL)) ?? 0;
+    const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(costs).toHaveLength(3);
+    expect(costs[0]).toBeCloseTo(composerCost, 10);
+    // The turn behind the boundary carries the evaluator's spend, exactly once.
+    expect(costs[1]).toBeCloseTo(hardCost + 0.0042, 10);
+    expect(costs[2]).toBeCloseTo(hardCost, 10);
   });
 
   it("a resume with only thinking Auto keeps a newly picked concrete model", async () => {

@@ -76,12 +76,13 @@ describe("buildAutoModelRoutingTooltipLines", () => {
   });
 
   test("a fallback after a verdict keeps the tier and names the model that ran", () => {
-    const lines = buildAutoModelRoutingTooltipLines({
+    const fallback: AutoModelRoutingRecord = {
       ...routed,
       model: routed.requestedFallbackModel,
       status: "fallback",
       reason: "Model openai:gpt-5.5-mini is not allowed by policy",
-    });
+    };
+    const lines = buildAutoModelRoutingTooltipLines(fallback);
     expect(lines[0]).toContain("Easy");
     expect(lines[0]).toContain("82%");
     expect(lines[1]).toContain("Opus 4.6");
@@ -89,6 +90,26 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     expect(lines[1]).not.toContain("..");
     expect(lines.join("\n")).not.toContain("Classification failed");
     expect(lines.slice(2)).toEqual(["easy: 82%", "medium: 15%", "hard: 3%"]);
+    // The label keeps the tier too, but must not read like a routed turn.
+    const label = buildAutoModelRoutingBadgeLabel(fallback);
+    expect(label).toContain("Easy");
+    expect(label).not.toBe(buildAutoModelRoutingBadgeLabel({ ...fallback, status: "routed" }));
+  });
+
+  test("a model fallback still shows the thinking level Auto applied", () => {
+    // Both dimensions on Auto; only the tier model was rejected, the tier's level still ran.
+    const fallback: AutoModelRoutingRecord = {
+      ...routed,
+      model: routed.requestedFallbackModel,
+      status: "fallback",
+      thinkingLevel: "high",
+      reason: "Model openai:gpt-5.5-mini does not support image input",
+    };
+    expect(buildAutoModelRoutingBadgeLabel(fallback)).toContain("HIGH");
+    const lines = buildAutoModelRoutingTooltipLines(fallback);
+    expect(lines[1]).toContain("Opus 4.6");
+    expect(lines[1]).toContain("HIGH");
+    expect(lines[1]).toContain("image input");
   });
 
   test("omits the confidence when the record lacks one", () => {
