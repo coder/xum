@@ -109,6 +109,18 @@ export function retiredAttemptMessage(claim: { runId: string; stepId: string }):
 export const SEND_ADMISSION_STALE_MESSAGE =
   "Send refused: the target was stopped or interrupted while the message was being admitted.";
 
+/**
+ * A message queued into a sub-agent while its last turn streamed, refused at dispatch because
+ * that turn turned out to be the task's terminal report. The text is handed back to the composer
+ * as unsent input; sending it again is a new, normally admitted send that starts a fresh attempt.
+ */
+export const TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE =
+  "The sub-agent completed its report before this queued message could run; it was not sent and is back in the composer.";
+
+/** As above, when the report's outcome could not be established (handler failure, partial artifact). */
+export const TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE =
+  "The sub-agent's report outcome could not be determined; this queued message was not sent and is back in the composer.";
+
 /** Bound on-demand instance discovery without growing the default task list. */
 export const INSTANCE_DISCOVERY_DEFAULT_LIMIT = 20;
 export const INSTANCE_DISCOVERY_MAX_LIMIT = 100;

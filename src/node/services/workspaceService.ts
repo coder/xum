@@ -13450,6 +13450,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
   }
 
+  /** See WorkspaceHost.drainQueuedMessagesIfIdle. */
+  drainQueuedMessagesIfIdle(workspaceId: string): void {
+    this.sessions.get(workspaceId.trim())?.drainQueuedMessagesIfIdle();
+  }
+
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
     const session = this.sessions.get(workspaceId.trim());
     if (!session) {

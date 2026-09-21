@@ -10220,16 +10220,46 @@ export class AgentSession {
       this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
       return;
     }
+    // Report-decision hold: the stream that just ended may still be deciding whether it carried
+    // the task's terminal report (TaskService classifies it under its event lock, after this
+    // drain runs). Until that decision resolves the head entry is RETAINED — not dequeued, not
+    // dispatched, not removed — and this drain returns; TaskService re-runs the idle drain when
+    // the decision lands. Nothing here awaits TaskService: the turn's own completion (compaction
+    // decision, finishTurn) proceeds, so no circular wait exists. Every trigger passes through
+    // this gate, so no drain path can dispatch the held entry.
+    const dispatchDecision = candidate.turnAdmission?.resolveDispatch?.() ?? "proceed";
+    if (dispatchDecision === "hold") return;
     // Dequeue gate: a task-attempt obligation whose attempt was closed, superseded or stopped
-    // while the entry waited is refused BEFORE the coordinator claims a turn for it — the token
-    // must never report admission for work its attempt no longer authorizes. The entry is
-    // removed (its own token disposed as refused, its cancel callbacks notified) and the drain
-    // continues with the next head; every pass removes one entry, so this recursion is bounded.
-    if (candidate.turnAdmission?.admissionStale() === true) {
+    // while the entry waited — or whose report decision resolved against it — is refused BEFORE
+    // the coordinator claims a turn for it — the token must never report admission for work its
+    // attempt no longer authorizes. The entry is removed (its own token disposed as refused, its
+    // cancel callbacks notified) and the drain continues with the next head; every pass removes
+    // one entry, so this recursion is bounded. A manual entry's text was never sent: it is handed
+    // back to the composer (appended, never replacing what the user typed since) so it stays
+    // visible and recoverable as unsent input — a later send of it is a new, normally admitted
+    // send, never an automatic continuation.
+    const refusal =
+      typeof dispatchDecision === "object"
+        ? dispatchDecision.refuse
+        : candidate.turnAdmission?.admissionStale() === true
+          ? SEND_ADMISSION_STALE_MESSAGE
+          : undefined;
+    if (refusal != null) {
+      const unsent = candidate.unsentInput();
       const removed = this.messageQueue.removeEntry(candidate.identity);
       if (removed != null) {
         this.emitQueuedMessageChanged();
-        this.notifyQueuedMessageCleared(removed, SEND_ADMISSION_STALE_MESSAGE);
+        this.notifyQueuedMessageCleared(removed, refusal);
+        if (unsent != null && unsent.text.length > 0) {
+          this.emitChatEvent({
+            type: "restore-to-input",
+            workspaceId: this.workspaceId,
+            text: unsent.text,
+            fileParts: unsent.fileParts,
+            reviews: unsent.reviews,
+            mode: "append",
+          });
+        }
       }
       this.sendQueuedMessages(trigger, stopAdmission);
       return;

@@ -19,6 +19,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     isBusyForMessage: () => false,
     hasQueuedMessages: () => false,
     hasPendingQueuedOrPreparingTurn: () => false,
+    drainQueuedMessagesIfIdle: () => undefined,
     hasPendingAutoRetry: () => false,
     hasPendingBashMonitorWakeContinuation: () => false,
     hasPendingWorkspaceTurnContinuation: () => false,

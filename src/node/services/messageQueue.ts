@@ -930,13 +930,23 @@ export class MessageQueue {
     return this.inputForRestore(this.entries);
   }
 
-  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
+  private inputForRestore(
+    entries: readonly QueueEntry[],
+    options?: {
+      /**
+       * Include an entry whose admission probe reads stale. Stop's restore excludes those (the
+       * probe is what refused them); the dequeue gate's refusal of a manual entry is exactly that
+       * case and must still hand the user's text back (it was never sent).
+       */
+      includeStale?: boolean;
+    }
+  ): QueuedInput | undefined {
     const restorable = entries.filter(
       (entry) =>
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
         !entry.cancelSignal?.aborted &&
-        entry.admissionStale?.() !== true
+        (options?.includeStale === true || entry.admissionStale?.() !== true)
     );
     return restorable.length > 0
       ? {
@@ -1076,6 +1086,8 @@ export class MessageQueue {
         muxMetadata: unknown;
         acceptanceOrigin: TurnAcceptanceOrigin;
         inputForRestore: () => QueuedInput | undefined;
+        /** The user's authored input even when its admission reads stale (a refused manual entry). */
+        unsentInput: () => QueuedInput | undefined;
         /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
         turnAdmission: TurnAdmissionToken | undefined;
       }
@@ -1087,6 +1099,7 @@ export class MessageQueue {
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
           inputForRestore: () => this.inputForRestore([entry]),
+          unsentInput: () => this.inputForRestore([entry], { includeStale: true }),
           turnAdmission: entry.turnAdmission,
         }
       : undefined;

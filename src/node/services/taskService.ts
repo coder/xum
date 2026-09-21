@@ -41,6 +41,7 @@ import {
   type AgentTaskStatus,
   type BackgroundableForegroundWaiter,
   type QueueCutAttributionSnapshot,
+  type QueuedDispatchDecision,
   type ResolvedWorkspaceAiSettings,
   type TaskCreateArgs,
   type TaskKind,
@@ -77,6 +78,8 @@ import {
   TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS,
   SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+  TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE,
+  TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
 } from "@/constants/agentMessaging";
@@ -512,6 +515,33 @@ interface AdmittedSend {
   /** Stop records that captured this obligation while it was pending (by reference). */
   readonly capturedBy: Set<WorkspaceStopRecord>;
   readonly token: TurnAdmissionToken;
+}
+
+/**
+ * The decision a child task's stream-end handler owes for the owned attempt whose stream just
+ * ended: did that stream carry the task's terminal report? Registered synchronously in the
+ * stream-end event's own tick — before the session's turn-completion policy (a later microtask)
+ * can drain the queue against the attempt — and resolved exactly once from inside the handler:
+ *  - `pending`: not classified yet. Queued follow-ups bound to this attempt are HELD at the
+ *    dequeue gate (retained, not dispatched, not dropped) and a direct send still in preflight
+ *    reads stale — neither may start a turn under an attempt that is about to complete.
+ *  - `nonreport`: no terminal report was published; the attempt continues and held entries
+ *    proceed through their ordinary gates under it.
+ *  - `published`: the report is durable and the attempt released. A held entry is refused, its
+ *    text handed back as unsent input; the user's next send is a new, normally admitted send
+ *    (markInterruptedTaskRunning mints the fresh attempt) — never an automatic continuation.
+ *  - `indeterminate`: the handler threw, the artifact was not durable everywhere, or the row has
+ *    no parent to report to. Never a continuation: held entries are refused as for `published`.
+ * Bound to the exact OwnedTaskAttempt object, so a reawakening that replaced the attempt while
+ * the handler waited never reads a predecessor's decision as its own. Lifetime is explicit, never
+ * a count: dropped once no pending/enqueued obligation of the attempt remains to read it, and
+ * when a new attempt begins in this process (sends bound to the old id read stale anyway).
+ */
+interface StreamEndDecision {
+  readonly attempt: OwnedTaskAttempt;
+  readonly attemptId: string;
+  readonly messageId: string;
+  outcome: "pending" | "nonreport" | "published" | "indeterminate";
 }
 
 interface TaskLaunchPlan {
@@ -1759,6 +1789,8 @@ export class TaskService implements AgentTaskIntegration {
   private readonly currentAttemptIdByTaskId = new Map<string, string>();
   /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
   private readonly admittedSendsByTaskId = new Map<string, Set<AdmittedSend>>();
+  /** Per task, the stream-end decisions of this process's owned attempts (see StreamEndDecision). */
+  private readonly streamEndDecisionsByTaskId = new Map<string, StreamEndDecision[]>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
   /**
    * Ownership of every in-progress stop, keyed by workspace (see beginWorkspaceStop). The latch
@@ -2432,6 +2464,9 @@ export class TaskService implements AgentTaskIntegration {
     if (this.attemptSettlementByTaskId.get(taskId)?.attemptId !== identity.attemptId) {
       this.attemptSettlementByTaskId.delete(taskId);
     }
+    // Predecessors' stream-end decisions have no reader left that they could authorize: a send
+    // bound to a predecessor reads stale from the row's new id at its next gate.
+    this.streamEndDecisionsByTaskId.delete(taskId);
     return attempt;
   }
 
@@ -2516,6 +2551,110 @@ export class TaskService implements AgentTaskIntegration {
     this.ownedAttemptByTaskId.delete(taskId);
     if (this.attemptSettlementByTaskId.get(taskId)?.attempt === attempt) {
       this.attemptSettlementByTaskId.delete(taskId);
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Stream-end decisions (see StreamEndDecision)
+  // ---------------------------------------------------------------------------------------------
+
+  /** Register the pending decision for `attempt`'s ended stream. Synchronous, event tick only. */
+  private registerStreamEndDecision(
+    taskId: string,
+    messageId: string,
+    attempt: OwnedTaskAttempt
+  ): StreamEndDecision | undefined {
+    if (attempt.attemptId == null) return undefined;
+    const decision: StreamEndDecision = {
+      attempt,
+      attemptId: attempt.attemptId,
+      messageId,
+      outcome: "pending",
+    };
+    const decisions = this.streamEndDecisionsByTaskId.get(taskId) ?? [];
+    decisions.push(decision);
+    this.streamEndDecisionsByTaskId.set(taskId, decisions);
+    return decision;
+  }
+
+  /** The decision a send bound to `attemptId` must honor: the pending one, else the latest. */
+  private findStreamEndDecision(taskId: string, attemptId: string): StreamEndDecision | undefined {
+    let latest: StreamEndDecision | undefined;
+    for (const decision of this.streamEndDecisionsByTaskId.get(taskId) ?? []) {
+      if (decision.attemptId !== attemptId) continue;
+      if (decision.outcome === "pending") return decision;
+      latest = decision;
+    }
+    return latest;
+  }
+
+  /** The handler's own pending decision for exactly `attempt` (none once resolved or replaced). */
+  private findPendingStreamEndDecision(
+    taskId: string,
+    attempt: OwnedTaskAttempt | undefined
+  ): StreamEndDecision | undefined {
+    if (attempt?.attemptId == null) return undefined;
+    const decision = this.findStreamEndDecision(taskId, attempt.attemptId);
+    return decision?.outcome === "pending" && decision.attempt === attempt ? decision : undefined;
+  }
+
+  /**
+   * Resolve exactly once (later calls, including the handler's finally, are no-ops), drop the
+   * decision when nothing is left to read it, and wake the workspace's idle drain so a held entry
+   * either dispatches (nonreport) or is refused and handed back (published/indeterminate) now
+   * rather than at the next unrelated drain. Returns whether this call resolved it.
+   */
+  private resolveStreamEndDecision(
+    taskId: string,
+    decision: StreamEndDecision | undefined,
+    outcome: Exclude<StreamEndDecision["outcome"], "pending">
+  ): boolean {
+    if (decision?.outcome !== "pending") return false;
+    decision.outcome = outcome;
+    log.debug("[task-attempt] stream-end decision resolved", {
+      taskId,
+      attemptId: decision.attemptId,
+      messageId: decision.messageId,
+      outcome,
+    });
+    this.pruneStreamEndDecisions(taskId);
+    this.workspaceService.drainQueuedMessagesIfIdle(taskId);
+    return true;
+  }
+
+  /** Drop resolved decisions no pending/enqueued obligation of their attempt can still read. */
+  private pruneStreamEndDecisions(taskId: string): void {
+    const decisions = this.streamEndDecisionsByTaskId.get(taskId);
+    if (decisions == null) return;
+    const readers = new Set<string>();
+    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+      if (send.state === "pending" || send.state === "enqueued") readers.add(send.attemptId);
+    }
+    const kept = decisions.filter(
+      (decision) => decision.outcome === "pending" || readers.has(decision.attemptId)
+    );
+    if (kept.length === 0) this.streamEndDecisionsByTaskId.delete(taskId);
+    else if (kept.length !== decisions.length) this.streamEndDecisionsByTaskId.set(taskId, kept);
+  }
+
+  /**
+   * Dequeue-gate consultation for an enqueued obligation (see TurnAdmissionToken.resolveDispatch):
+   * held while its attempt's stream-end is undecided, refused once that stream turned out to be
+   * the terminal report (or its outcome is unknowable), otherwise on to the ordinary gates.
+   */
+  private resolveEnqueuedSendDispatch(send: AdmittedSend): QueuedDispatchDecision {
+    if (send.state !== "enqueued") return "proceed";
+    const decision = this.findStreamEndDecision(send.taskId, send.attemptId);
+    switch (decision?.outcome) {
+      case "pending":
+        return "hold";
+      case "published":
+        return { refuse: TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE };
+      case "indeterminate":
+        return { refuse: TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE };
+      case "nonreport":
+      case undefined:
+        return "proceed";
     }
   }
 
@@ -2607,6 +2746,7 @@ export class TaskService implements AgentTaskIntegration {
       record.pendingAdmissions.delete(send);
     }
     send.capturedBy.clear();
+    this.pruneStreamEndDecisions(send.taskId);
   }
 
   /**
@@ -2627,13 +2767,24 @@ export class TaskService implements AgentTaskIntegration {
       state: "pending",
       capturedBy: new Set(),
       token: {
+        resolveDispatch: () => this.resolveEnqueuedSendDispatch(send),
         admissionStale: () => {
           // Admitted obligations belong to their turn: rotation, closure and stops no longer
           // concern the send itself (the turn is captured by the stop record instead).
           if (send.state === "admitted") return false;
           if (send.state === "discharged") return true;
           if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
-          return send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt;
+          if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
+            return true;
+          }
+          // A send still in its preflight while the attempt's last stream is undecided, or was
+          // decided a report (or unknowable): it must not start a turn under that attempt. The
+          // queue's own gate handles enqueued entries (hold/refuse) before reaching here.
+          if (send.state === "pending") {
+            const decision = this.findStreamEndDecision(taskId, attemptId);
+            return decision != null && decision.outcome !== "nonreport";
+          }
+          return false;
         },
         onEnqueued: () => {
           if (send.state === "pending") send.state = "enqueued";
@@ -3350,9 +3501,28 @@ export class TaskService implements AgentTaskIntegration {
         // releaseReportedTaskAttempt).
         ownedAttempt: this.ownedAttemptByTaskId.get(payload.workspaceId),
       };
+      // The decision this handler owes for the owned attempt's ended stream, registered in the
+      // event's own tick so the session's turn-completion drain (a later microtask) finds it.
+      const decision =
+        taskOrigin.ownedAttempt != null
+          ? this.registerStreamEndDecision(
+              payload.workspaceId,
+              payload.messageId,
+              taskOrigin.ownedAttempt
+            )
+          : undefined;
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleStreamEnd(payload, queueCutSnapshot, taskOrigin);
+          try {
+            await this.handleStreamEnd(payload, queueCutSnapshot, taskOrigin);
+          } catch (error: unknown) {
+            // Unknown outcome: never let held follow-ups run as if the attempt continued.
+            this.resolveStreamEndDecision(payload.workspaceId, decision, "indeterminate");
+            throw error;
+          } finally {
+            // Every return path that neither published nor failed left the attempt continuing.
+            this.resolveStreamEndDecision(payload.workspaceId, decision, "nonreport");
+          }
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamEnd failed", { error });
@@ -14446,6 +14616,16 @@ export class TaskService implements AgentTaskIntegration {
     const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
     const reportArgs = isPlanLike ? null : finalAgentReportArgs;
     const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // No terminal report in this stream: the attempt continues. Decide (and wake the held queue)
+    // BEFORE the recovery/continuation sends below, so a user follow-up queued during the stream
+    // still dispatches ahead of them, exactly as it did before the hold existed.
+    if (reportArgs == null && !(isPlanLike && proposePlanResult) && status !== "interrupted") {
+      this.resolveStreamEndDecision(
+        workspaceId,
+        this.findPendingStreamEndDecision(workspaceId, taskOrigin.ownedAttempt),
+        "nonreport"
+      );
+    }
 
     // Stream-end settlement: interrupted tasks must settle all pending waiters.
     // A workflow-owned plan step that successfully called propose_plan is already complete,
@@ -16188,6 +16368,12 @@ export class TaskService implements AgentTaskIntegration {
       // Best-effort: resolve any foreground waiters even if we can't deliver to a parent.
       this.resolveWaiters(childWorkspaceId, reportArgs);
       void this.maybeStartQueuedTasks();
+      // Reported row, no release, nobody to report to: not a continuation of the attempt.
+      this.resolveStreamEndDecision(
+        childWorkspaceId,
+        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        "indeterminate"
+      );
       return null;
     }
 
@@ -16252,8 +16438,23 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    // The decision for the attempt's ended stream is settled here, before the parent delivery:
+    // durable everywhere → published (held follow-ups are refused and handed back); otherwise the
+    // row says reported while the attempt stays owned — neither a continuation nor a completion,
+    // so held follow-ups are refused rather than run under an attempt of unknown standing.
     if (persistedInEveryAncestor) {
       this.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
+      this.resolveStreamEndDecision(
+        childWorkspaceId,
+        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        "published"
+      );
+    } else {
+      this.resolveStreamEndDecision(
+        childWorkspaceId,
+        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        "indeterminate"
+      );
     }
 
     return { parentWorkspaceId, latestChildEntry, isWorkflowOwnedChildReport };

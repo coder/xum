@@ -699,6 +699,12 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * How the composer takes the text. `replace` (default; a user Stop restores what the user had
+   * queued) overwrites the draft. `append` keeps the current draft and adds the text after it —
+   * used when a queued message was refused at dispatch and is handed back as unsent input.
+   */
+  mode: z.enum(["replace", "append"]).optional(),
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.

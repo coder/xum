@@ -454,6 +454,12 @@ export interface TurnAdmissionHost {
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+  /**
+   * Re-run the workspace's idle queue drain. Called by the task layer when a stream-end decision
+   * that held a queued entry (see TurnAdmissionToken.resolveDispatch) resolves; a no-op while a
+   * turn is active or nothing is queued.
+   */
+  drainQueuedMessagesIfIdle(workspaceId: string): void;
   hasPendingAutoRetry(workspaceId: string): boolean;
   hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
@@ -549,7 +555,19 @@ export interface TurnAdmissionToken {
    * it does not prove settlement); terminal otherwise — a disposed token never admits.
    */
   onDisposed(kind: "no-work" | "refused" | "canceled-before-admission"): void;
+  /**
+   * Consulted by the queue's dequeue gate once per drain pass, BEFORE admissionStale and before
+   * the coordinator claims a turn. `hold` keeps the entry queued without dispatching it — the
+   * token's owner is still deciding whether the stream that just ended carried the task's
+   * terminal report, and wakes the drain again (drainQueuedMessagesIfIdle) once it knows;
+   * `proceed` continues to the ordinary gates; a refusal removes the entry with a recoverable
+   * message. Never blocks: the drain returns immediately on `hold`.
+   */
+  resolveDispatch?(): QueuedDispatchDecision;
 }
+
+/** Outcome of {@link TurnAdmissionToken.resolveDispatch}. */
+export type QueuedDispatchDecision = "hold" | "proceed" | { refuse: string };
 
 /** Result of asking TaskService to admit a send into a workspace (see admitTaskWorkspaceTurn). */
 export type TaskTurnAdmission =
