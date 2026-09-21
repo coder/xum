@@ -1,11 +1,7 @@
 import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type {
-  Experimental_EvaluationModelV4,
-  LanguageModelV4,
-  LanguageModelV4CallOptions,
-} from "@ai-sdk/provider";
+import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
@@ -24,6 +20,7 @@ import {
   type EvaluationProviderName,
 } from "@/common/utils/ai/evaluationModels";
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
+import type { EvaluationModelInstance } from "@/node/services/evaluation/evaluationService";
 import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
@@ -1186,9 +1183,6 @@ export interface PinnedModelOptions extends Pick<
   optionsMuxProviderOptions: MuxProviderOptions;
   optionsRouteProvider?: ProviderName;
 }
-
-/** An AI SDK evaluation model instance (never a bare model id string). */
-export type EvaluationModelInstance = Experimental_EvaluationModelV4;
 
 /**
  * Creation-time receipt of an evaluation model for the workflow `evaluate()`
