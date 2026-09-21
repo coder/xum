@@ -101,8 +101,7 @@ describe("gatewayModelCatalog", () => {
         ["openai/gpt-5"]
       )
     ).toBe(false);
-    // The catalog is what makes a model routable — a catalog ID needs no
-    // configured `models` row (discovery no longer merges into `models`).
+    // A catalog ID is routable without a configured `models` row.
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
         "coder",
@@ -124,7 +123,6 @@ describe("gatewayModelCatalog", () => {
         ["openai/gpt-5"]
       )
     ).toBe(true);
-    // Object-form (user-edited) entries count as explicit additions too.
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
         "coder",
@@ -213,8 +211,7 @@ describe("gatewayModelCatalog", () => {
         ["openai/other-model"]
       )
     ).toBe(true);
-    // A legacy tombstone wins even over a catalog listing and an explicit
-    // `models` row: the removal was made to force routing away from Coder.
+    // A removal wins even over a catalog listing and a `models` row.
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
         "coder",
@@ -236,10 +233,9 @@ describe("gatewayModelCatalog", () => {
     ).toBe(false);
   });
 
-  test("gates Coder routing on the catalog whether models is missing, empty, or explicit-only", () => {
-    // `models` holds only explicit user additions, so the catalog verdict
-    // must not depend on its shape: missing (hand-edited config), empty
-    // (fresh install), or populated with unrelated explicit entries.
+  test("gates Coder routing on the catalog whether models is missing, empty, or manual-only", () => {
+    // The catalog verdict must not depend on the shape of `models`: missing
+    // (hand-edited config), empty, or holding only unrelated manual entries.
     for (const models of [undefined, [], ["anthropic/my-manual-model"]]) {
       expect(
         isProviderModelAccessibleFromAuthoritativeCatalog("coder", "openai/gpt-5", models, [

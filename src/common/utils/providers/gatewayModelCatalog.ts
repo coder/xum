@@ -8,29 +8,25 @@ export function isProviderModelAccessibleFromAuthoritativeCatalog(
   modelId: string,
   models: ProviderModelEntry[] | undefined,
   // Coder-only: the AI Bridge catalog discovered at login. It is the
-  // authoritative accessible set; `models` only widens it with explicit
-  // user additions and never narrows it.
+  // authoritative accessible set; `models` can only widen it.
   discoveredModels: string[] | undefined,
-  // Coder-only: legacy removal tombstones (recorded by older versions of
-  // applyCoderModelEdit; no longer written). Checked before every other
-  // branch — including the unknown-catalog fail-open — because a removal
-  // was made to force routing away from Coder and must hold even while
-  // discovery is pending or failed, or routePriority could route the
-  // removed model through Coder instead of the user's configured fallback.
+  // Coder-only: durable user removals (see applyCoderModelEdit). Checked
+  // before every other branch — including the unknown-catalog fail-open —
+  // because an explicit removal must hold even while discovery is pending
+  // or failed, or routePriority could route the removed model through Coder
+  // instead of the user's configured fallback.
   removedModels?: string[]
 ): boolean {
   // Coder routing is gated on the discovered AI Bridge catalog: the bridge
   // only serves models its upstreams expose, so routing any other model
   // through Coder would fail at the bridge instead of falling back to a
   // configured direct provider. A present `discoveredModels` (including an
-  // empty one) marks the catalog as known and is the accessible set.
-  // `models` is the user's explicit list (discovery never merges the catalog
-  // into it), so its entries stay routable even when the catalog does not
-  // list them, but a catalog model needs no `models` row to route. A MISSING
-  // `discoveredModels` means the catalog is unknown (login clears it and
-  // discovery is pending, or discovery failed transiently and was not
-  // persisted): stay permissive so a temporary /models outage cannot strand
-  // routing until the next login.
+  // empty one) marks the catalog as known and is the accessible set; `models`
+  // entries stay routable too (manual additions are not in the catalog), but
+  // a catalog model needs no `models` row. A MISSING `discoveredModels` means
+  // the catalog is unknown (login clears it and discovery is pending, or
+  // discovery failed transiently and was not persisted): stay permissive so a
+  // temporary /models outage cannot strand routing until the next login.
   if (provider === "coder") {
     if (removedModels?.includes(modelId)) {
       return false;
