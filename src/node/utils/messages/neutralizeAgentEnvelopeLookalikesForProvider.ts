@@ -8,6 +8,13 @@ import {
   neutralizePlanReviewEnvelopeLookalikes,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { MuxMessage } from "@/common/types/message";
+import type {
+  AssistantModelMessage,
+  ModelMessage,
+  ToolCallPart,
+  ToolModelMessage,
+  ToolResultPart,
+} from "ai";
 
 /**
  * Rewrite `<mux_agent_message>` and `<mux_plan_review>` lookalike tags before the provider
@@ -112,6 +119,68 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
   });
 
   return didChange ? result : messages;
+}
+
+/**
+ * Same-turn counterpart for streamText's internal steps.
+ *
+ * The MuxMessage neutralizer above only sees the request built from persisted history. Tool
+ * calls executed DURING a turn never reach it: the SDK feeds their inputs and results straight
+ * into the next step, so repository text returned by bash/file_read in step N arrived at the
+ * provider with the exact wrapper in step N+1 (the history path only caught it on the NEXT turn).
+ *
+ * Scope is deliberately tool-call `input` and tool-result `output` ONLY. Text parts are left
+ * alone: at this seam the row metadata that proves a feedback/peer envelope authentic is gone,
+ * and the history path has already neutralized every non-authentic text row, so rewriting text
+ * here could only damage authentic envelopes. Returns the same array when nothing changed.
+ */
+export function neutralizeAgentEnvelopeLookalikesInModelToolParts(
+  messages: ModelMessage[]
+): ModelMessage[] {
+  let didChange = false;
+
+  const result = messages.map((message): ModelMessage => {
+    let changedMessage = false;
+    const onChange = () => {
+      didChange = true;
+      changedMessage = true;
+    };
+    if (message.role === "tool") {
+      const content: ToolModelMessage["content"] = message.content.map((part) =>
+        neutralizeModelToolPart(part, onChange)
+      );
+      return changedMessage ? { ...message, content } : message;
+    }
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      const content: Exclude<AssistantModelMessage["content"], string> = message.content.map(
+        (part) => neutralizeModelToolPart(part, onChange)
+      );
+      return changedMessage ? { ...message, content } : message;
+    }
+    return message;
+  });
+
+  return didChange ? result : messages;
+}
+
+function neutralizeModelToolPart<P extends { type: string }>(part: P, onChange: () => void): P {
+  if (part.type === "tool-call") {
+    const call = part as P & ToolCallPart;
+    const input = neutralizeStringsDeep(call.input);
+    if (input === call.input) return part;
+    onChange();
+    return { ...part, input };
+  }
+  if (part.type === "tool-result") {
+    const toolResult = part as P & ToolResultPart;
+    // Covers every output variant (text/json/error-text/error-json/content); media `data`
+    // is base64 and never contains the wrapper, so those items keep their identity.
+    const output = neutralizeStringsDeep(toolResult.output);
+    if (output === toolResult.output) return part;
+    onChange();
+    return { ...part, output: output as ToolResultPart["output"] };
+  }
+  return part;
 }
 
 /** Unknown-first widening so tool-part payload fields can be read without cross-shape casts. */
