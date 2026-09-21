@@ -317,6 +317,28 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("skips the classifier for an attachment-only send and keeps the composer model", async () => {
+    const { session, streamMessage, classify } = await createHarness({ experimentEnabled: true });
+
+    const result = await session.sendMessage("", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+      fileParts: [{ url: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" }],
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
+      reason: "Attachment-only send has no prompt text to classify",
+    });
+  });
+
   it("falls back when a PDF attachment cannot be sent to the chosen tier's model", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,

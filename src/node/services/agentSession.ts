@@ -7012,6 +7012,13 @@ export class AgentSession {
     if (!this.autoModelRouter) {
       return fallback({ status: "fallback", reason: "Classifier unavailable in this session" });
     }
+    // An attachment-only send gives the classifier nothing to judge; skip the paid round-trip.
+    if (prompt.length === 0) {
+      return fallback({
+        status: "fallback",
+        reason: "Attachment-only send has no prompt text to classify",
+      });
+    }
 
     const { tiers } = normalizeAutoModelRoutingConfig(
       this.config.loadConfigOrDefault().autoModelRouting
