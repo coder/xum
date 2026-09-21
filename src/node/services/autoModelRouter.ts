@@ -51,8 +51,11 @@ export interface AutoModelRouterClassifyInput {
 
 export interface AutoModelRouterDeps {
   providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig">;
-  /** Prompts are third-party egress, so provider policy gates the classifier like any provider. */
-  policyService?: Pick<PolicyService, "isEnforced" | "isProviderAllowed">;
+  /**
+   * Prompts are third-party egress, so provider policy gates the classifier like any
+   * provider model: `typesafe` must be listed and its `model_access` must admit the classifier.
+   */
+  policyService?: Pick<PolicyService, "isEnforced" | "isModelAllowed">;
   env?: Record<string, string | undefined>;
   fetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
@@ -78,7 +81,10 @@ export class AutoModelRouter {
     }
     if (
       this.deps.policyService?.isEnforced() &&
-      !this.deps.policyService.isProviderAllowed(TYPESAFE_PROVIDER_KEY)
+      !this.deps.policyService.isModelAllowed(
+        TYPESAFE_PROVIDER_KEY,
+        AUTO_MODEL_ROUTING_CLASSIFIER_MODEL
+      )
     ) {
       return Err("Provider policy does not allow TypeSafe");
     }

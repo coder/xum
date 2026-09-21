@@ -159,7 +159,10 @@ describe("AutoModelRouter.classify", () => {
   it("refuses to call the API when provider policy excludes typesafe", async () => {
     const { router, fetchMock } = createRouter({
       providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-      policyService: { isEnforced: () => true, isProviderAllowed: (id) => id !== "typesafe" },
+      policyService: {
+        isEnforced: () => true,
+        isModelAllowed: (provider) => provider !== "typesafe",
+      },
     });
 
     const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
@@ -167,6 +170,22 @@ describe("AutoModelRouter.classify", () => {
     expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(router.getClassifierStatus()).toEqual({ apiKeySource: "config" });
+  });
+
+  it("refuses to call the API when policy lists typesafe but its model_access excludes the classifier", async () => {
+    const { router, fetchMock } = createRouter({
+      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
+      policyService: {
+        isEnforced: () => true,
+        isModelAllowed: (provider, modelId) =>
+          provider === TYPESAFE_PROVIDER_KEY && modelId !== AUTO_MODEL_ROUTING_CLASSIFIER_MODEL,
+      },
+    });
+
+    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
+
+    expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("ignores a legacy custom chat provider stored under the typesafe id", async () => {

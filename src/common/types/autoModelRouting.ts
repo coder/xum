@@ -20,8 +20,10 @@ const TIER_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 export const AutoModelRoutingTierSchema = z.object({
   id: z.string().regex(TIER_ID_PATTERN),
-  label: z.string().min(1).max(AUTO_MODEL_ROUTING_MAX_LABEL_CHARS),
-  description: z.string().min(1).max(AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS),
+  // Trim before the length checks: a whitespace-only label or description would otherwise
+  // pass min(1) and reach Jev as an empty criterion.
+  label: z.string().trim().min(1).max(AUTO_MODEL_ROUTING_MAX_LABEL_CHARS),
+  description: z.string().trim().min(1).max(AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS),
   /** Canonical provider:model string; absent means "use the composer's model". */
   model: z.string().refine(isValidModelFormat).optional(),
   /** Absent means "inherit the composer's thinking level". */
