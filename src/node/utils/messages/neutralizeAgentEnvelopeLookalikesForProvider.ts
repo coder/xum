@@ -3,24 +3,31 @@ import {
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
 } from "@/common/utils/agentMessageEnvelope";
+import {
+  getAuthenticPlanReviewRecord,
+  neutralizePlanReviewEnvelopeLookalikes,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import type { MuxMessage } from "@/common/types/message";
 
 /**
- * Rewrite `<mux_agent_message>` lookalike tags before the provider request.
+ * Rewrite `<mux_agent_message>` and `<mux_plan_review>` lookalike tags before the provider
+ * request.
  *
- * Why: the system prompt classifies transcript rows wrapped in that tag as untrusted agent peer
- * messages. Authentic envelopes are authored exclusively by the peer-message send path as
- * assistant-role synthetic pre-turn rows carrying valid `agent-peer-message` metadata; any other
- * occurrence is user-pasted text (which must keep user authority) or model-emitted text (which
- * must not be able to forge a peer message into its own later context). Rewriting every
- * non-authentic row makes the exact wrapper server-controlled provenance.
+ * Why: the system prompt classifies transcript rows wrapped in these tags as protocol messages
+ * (untrusted agent peer messages; the user's structured plan feedback). Authentic envelopes are
+ * authored exclusively by their server send paths — peer messages as assistant-role synthetic
+ * pre-turn rows carrying valid `agent-peer-message` metadata, plan feedback as user rows carrying
+ * `plan-review` metadata that matches the envelope. Any other occurrence is user-pasted text
+ * (which must keep user authority) or model-emitted text (which must not be able to forge a
+ * protocol message into its own later context). Rewriting every non-authentic row makes the
+ * exact wrapper server-controlled provenance.
  *
  * Notes:
  * - Request-only: does not mutate persisted history/UI.
  * - Scope: text parts of user and assistant rows that are not authentic payload rows, plus
  *   string-bearing tool parts (input/output/errorText). Tool results carry attacker-controlled
  *   repository content (file_read, bash, ...), so a wrapper inside them must be neutralized too
- *   or repository text could masquerade as the peer-message protocol in provider tool content.
+ *   or repository text could masquerade as a protocol message in provider tool content.
  */
 export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessage[]): MuxMessage[] {
   let didChange = false;
@@ -54,14 +61,22 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
         );
       });
 
+    // Plan feedback is authentic only when the row's `plan-review` metadata and its single
+    // envelope text part describe the same record (getAuthenticPlanReviewRecord); a row that
+    // fails that cross-check is treated like any pasted text.
+    const isAuthenticPlanReviewRow = getAuthenticPlanReviewRecord(msg) !== null;
+
     let msgChanged = false;
     const nextParts = msg.parts.map((part) => {
       if (part.type === "text") {
-        if (isAuthenticPeerRow || !part.text.includes("mux_agent_message")) {
+        let text = part.text;
+        if (!isAuthenticPeerRow) text = neutralizeAgentEnvelopeLookalikes(text);
+        if (!isAuthenticPlanReviewRow) text = neutralizePlanReviewEnvelopeLookalikes(text);
+        if (text === part.text) {
           return part;
         }
         msgChanged = true;
-        return { ...part, text: neutralizeAgentEnvelopeLookalikes(part.text) };
+        return { ...part, text };
       }
       if (part.type === "dynamic-tool" || part.type.startsWith("tool-")) {
         // Tool parts are treated as an opaque record here: the string-bearing payload fields are
@@ -110,7 +125,8 @@ function toRecord(value: unknown): Record<string, unknown> {
  */
 function neutralizeStringsDeep(value: unknown): unknown {
   if (typeof value === "string") {
-    return value.includes("mux_agent_message") ? neutralizeAgentEnvelopeLookalikes(value) : value;
+    // Both neutralizers return the same reference when their tag is absent.
+    return neutralizePlanReviewEnvelopeLookalikes(neutralizeAgentEnvelopeLookalikes(value));
   }
   if (Array.isArray(value)) {
     let changed = false;

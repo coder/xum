@@ -19,6 +19,7 @@ import {
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
   isDurableContextBoundaryMarker,
   sliceMessagesFromLatestCompactionBoundary,
@@ -426,6 +427,9 @@ export class ContinuousCompactor {
           },
         ];
       }
+      // Model-hidden rows (workflow display, plan-review records) never reach a request;
+      // copying them behind the boundary would only duplicate UI state.
+      if (isModelHiddenMessage(row)) return [];
       return index > end || copiedCluster.has(row.id) ? [row] : [];
     });
   }

@@ -98,6 +98,7 @@ import {
   getContextBoundaryKind,
 } from "@/common/utils/messages/compactionBoundary";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 // Hidden synthetic snapshot rows (skill, MCP prompt, and @file materializations) precede the
 // durable first message and never render, so they must not drop the presentation-only pending
@@ -3724,12 +3725,15 @@ export class StreamingMessageAggregator {
       // the live stream, the recovered partial, and the settled history row, so hide the
       // whole turn by that flag rather than by the text it happens to emit. A failed flush
       // stays visible: its error row and retry controls are the only explanation the user gets.
+      // Plan-review record rows stay hidden even in debug-LLM mode: that mode shows what the
+      // model sees, and these rows are never sent (isModelHiddenMessage).
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
-        !showSyntheticMessages &&
-        ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
-          (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
-            message.metadata.error == null) ||
-          isWorkflowResultMessage(message));
+        isPlanReviewRecordMessage(message) ||
+        (!showSyntheticMessages &&
+          ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
+            (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
+              message.metadata.error == null) ||
+            isWorkflowResultMessage(message)));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.
       const latestAgentSkillSnapshotByKey = new Map<string, AgentSkillSnapshotContent>();

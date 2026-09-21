@@ -22,6 +22,8 @@ import type { ThinkingLevel } from "./thinking";
 import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
+import type { PlanReviewRecordKind } from "@/common/utils/planReview/planReviewRecord";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 export type { ModelMessage };
 
@@ -829,6 +831,18 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         /** The sender's relationship to the recipient (mirrors the envelope enum). */
         relationship: AgentMessageRelationship;
       }
+    | {
+        // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
+        // envelope stays in the message text; this metadata mirrors the record identity so
+        // filters and the UI never re-parse it. `feedback` rows are real user messages the
+        // model receives; every other kind is hidden UI state (see isPlanReviewRecordMessage).
+        type: "plan-review";
+        kind: PlanReviewRecordKind;
+        recordId: string;
+        snapshotId?: string;
+        threadId?: string;
+        feedbackId?: string;
+      }
   );
 
 /** Rollover internals do not make an otherwise empty window eligible for another reset. */
@@ -1476,11 +1490,15 @@ export interface QueuedMessage {
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */
 export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    message.metadata?.synthetic === true &&
-    (message.metadata.fileAtMentionSnapshot !== undefined ||
-      message.metadata.agentSkillSnapshot !== undefined ||
-      message.metadata.mcpPromptSnapshot !== undefined)
+    (message.role === "user" &&
+      message.metadata?.synthetic === true &&
+      (message.metadata.fileAtMentionSnapshot !== undefined ||
+        message.metadata.agentSkillSnapshot !== undefined ||
+        message.metadata.mcpPromptSnapshot !== undefined)) ||
+    // Plan-review record rows are hidden UI state, not human turns: rolling cut,
+    // keep-recent-tail, edit truncation, retry eligibility and goal reconciliation must all
+    // skip them through this one predicate instead of mistaking them for a user prompt.
+    isPlanReviewRecordMessage(message)
   );
 }
 

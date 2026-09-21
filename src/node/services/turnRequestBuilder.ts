@@ -99,6 +99,7 @@ import {
   readAdditionalSystemContext,
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
+import { buildPlanReviewStateInstruction } from "./planReviewService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
@@ -1685,6 +1686,21 @@ export class TurnRequestBuilder {
     );
     recordStartupPhaseTiming("loadAdditionalSystemContextMs", loadAdditionalSystemContextStartedAt);
 
+    // Native plan review: plan-mode turns get a deterministic <plan-review-state> block listing
+    // the user's unresolved threads. Derived from durable record rows on every turn (never
+    // stored, independent of any compaction summary) so the agent sees exactly what the review
+    // UI shows, even after compaction. Record rows themselves never enter the request.
+    const planReviewStateInstruction =
+      effectiveMode === "plan"
+        ? await buildPlanReviewStateInstruction(this.dependencies.historyService, workspaceId)
+        : undefined;
+    const additionalSystemInstructionsWithPlanReview =
+      planReviewStateInstruction === undefined
+        ? scratchpadAdditionalSystemInstructions
+        : scratchpadAdditionalSystemInstructions
+          ? `${scratchpadAdditionalSystemInstructions}\n\n${planReviewStateInstruction}`
+          : planReviewStateInstruction;
+
     // Build plan-aware instructions and determine plan→exec transition content.
     // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
     // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
@@ -1700,7 +1716,7 @@ export class TurnRequestBuilder {
         agentIsPlanLike,
         agentDiscoveryRuntime,
         agentDiscoveryPath,
-        additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
+        additionalSystemInstructions: additionalSystemInstructionsWithPlanReview,
         shouldDisableTaskToolsForDepth,
         taskDepth,
         taskSettings,

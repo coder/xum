@@ -34,6 +34,20 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 
+/** Typed failures of the workspace.planReview.* endpoints (see planReviewService.ts). */
+export const PlanReviewErrorSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("plan_missing"), message: z.string() }),
+  z.object({ type: z.literal("plan_too_large"), message: z.string() }),
+  z.object({ type: z.literal("unknown_snapshot"), message: z.string() }),
+  z.object({ type: z.literal("unknown_thread"), message: z.string() }),
+  z.object({ type: z.literal("invalid_anchor"), message: z.string() }),
+  z.object({ type: z.literal("nothing_to_send"), message: z.string() }),
+  /** History read/append failed (the message is the HistoryService error string). */
+  z.object({ type: z.literal("history_failed"), message: z.string() }),
+  /** submitFeedback validated but the underlying sendMessage refused the turn. */
+  z.object({ type: z.literal("send_failed"), error: SendMessageErrorSchema }),
+]);
+
 /**
  * Stream error types - categorizes errors during AI streaming
  * Used across backend (StreamManager) and frontend (StreamErrorMessage)

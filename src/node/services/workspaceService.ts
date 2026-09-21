@@ -417,6 +417,17 @@ import {
   upsertSubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { PlanReviewError } from "@/common/types/errors";
+import type { PlanReviewState } from "@/common/utils/planReview/planReviewState";
+import {
+  ensurePlanSnapshot,
+  getPlanReviewState,
+  preparePlanReviewFeedback,
+  setPlanReviewThreadResolved,
+  type EnsurePlanSnapshotResult,
+  type PlanReviewHistoryDeps,
+  type SubmitPlanReviewFeedbackInput,
+} from "@/node/services/planReviewService";
 
 /** Maximum number of retry attempts when workspace name collides */
 const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
@@ -11669,6 +11680,72 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean> {
     return (await this.getWorkflowInvocationCurrentness(workspaceId, runId)) === "current";
+  }
+
+  // ---------------------------------------------------------------------------
+  // Native plan review (workspace.planReview.*): thin adapters over planReviewService.
+  // Record rows are appended without waking the agent and published like workflow rows.
+  // ---------------------------------------------------------------------------
+
+  private get planReviewHistoryDeps(): PlanReviewHistoryDeps {
+    return {
+      historyService: this.historyService,
+      emitChatEvent: (workspaceId, message) =>
+        this.getOrCreateSession(workspaceId).emitChatEvent({ ...message, type: "message" }),
+    };
+  }
+
+  planReviewGetState(workspaceId: string): Promise<Result<PlanReviewState, PlanReviewError>> {
+    return getPlanReviewState(this.historyService, workspaceId);
+  }
+
+  async planReviewEnsureSnapshot(
+    workspaceId: string,
+    proposalToolCallId?: string
+  ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
+    const metadata = await this.getInfo(workspaceId);
+    if (!metadata) {
+      return Err({ type: "plan_missing", message: `Workspace not found: ${workspaceId}` });
+    }
+    return ensurePlanSnapshot(this.planReviewHistoryDeps, {
+      workspaceId,
+      metadata,
+      ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
+    });
+  }
+
+  planReviewSetThreadResolved(
+    workspaceId: string,
+    threadId: string,
+    resolved: boolean
+  ): Promise<Result<PlanReviewState, PlanReviewError>> {
+    return setPlanReviewThreadResolved(this.planReviewHistoryDeps, {
+      workspaceId,
+      threadId,
+      resolved,
+    });
+  }
+
+  /**
+   * Validate and stamp the feedback, then send it as an ordinary user turn so the plan agent
+   * wakes with the envelope in its context. When the workspace is busy the row is queued like
+   * any other send, so the returned state may not include it yet; the UI refetches when the
+   * row appears in the transcript.
+   */
+  async planReviewSubmitFeedback(
+    workspaceId: string,
+    input: SubmitPlanReviewFeedbackInput & { options: SendMessageOptions }
+  ): Promise<Result<{ feedbackId: string; state: PlanReviewState }, PlanReviewError>> {
+    const prepared = await preparePlanReviewFeedback(this.historyService, workspaceId, input);
+    if (!prepared.success) return prepared;
+    const sent = await this.sendMessage(workspaceId, prepared.data.text, {
+      ...input.options,
+      muxMetadata: prepared.data.muxMetadata,
+    });
+    if (!sent.success) return Err({ type: "send_failed", error: sent.error });
+    const state = await getPlanReviewState(this.historyService, workspaceId);
+    if (!state.success) return state;
+    return Ok({ feedbackId: prepared.data.feedbackId, state: state.data });
   }
 
   /**

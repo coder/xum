@@ -18,7 +18,7 @@ import {
 import type { ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
-import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -73,7 +73,7 @@ export function prepareProviderRequestMessages(
   // Establish the boundary before any content filter can erase that structural evidence.
   const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
   const keepContextRow = (message: MuxMessage) =>
-    !isWorkflowDisplayOnlyMessage(message) && !message.metadata?.contextBudgetRejected;
+    !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
     boundarySlicedMessages.filter(keepContextRow)

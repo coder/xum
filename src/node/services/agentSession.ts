@@ -178,6 +178,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
+import { ensurePlanSnapshot } from "./planReviewService";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
 
@@ -468,6 +469,13 @@ function normalizeDelegatedToolNames(candidate: unknown): string[] | undefined {
   }
 
   return [...new Set(normalizedTools)];
+}
+
+/** Completion/routing tools report `{ success: true }`; anything else is not a completed proposal. */
+function isSuccessfulToolResult(result: unknown): boolean {
+  return (
+    typeof result === "object" && result !== null && "success" in result && result.success === true
+  );
 }
 
 function extractAcpPromptId(muxMetadata: unknown): string | undefined {
@@ -8979,6 +8987,13 @@ export class AgentSession {
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
         }
+        // Native plan review: every successful proposal gets a snapshot row keyed by its tool
+        // call, so review anchors stay bound to the text as proposed even after the (mutable)
+        // plan file changes. Runs after the dispatch bookkeeping above and never throws, so it
+        // cannot stall tool-end handling or affect the tool result.
+        if (payload.toolName === "propose_plan" && isSuccessfulToolResult(payload.result)) {
+          await this.snapshotProposedPlan(payload.toolCallId);
+        }
       }
     });
     forward("reasoning-delta", (payload) => {
@@ -9759,6 +9774,47 @@ export class AgentSession {
     }
     this.clearQueue("Scheduled message superseded by new input.");
     return true;
+  }
+
+  /**
+   * Snapshot the plan file after a successful `propose_plan` (see the tool-call-end listener).
+   * Fully non-throwing: a missing plan, an oversized plan, or a history failure only logs.
+   * Dedup by content hash makes a replayed or repeated proposal a no-op.
+   */
+  private async snapshotProposedPlan(proposalToolCallId: string): Promise<void> {
+    try {
+      // Guard for test mocks that may not implement getWorkspaceMetadata.
+      if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
+      const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (!metadata.success) {
+        log.warn("plan review: skipping snapshot, workspace metadata unavailable", {
+          workspaceId: this.workspaceId,
+          error: metadata.error,
+        });
+        return;
+      }
+      const result = await ensurePlanSnapshot(
+        {
+          historyService: this.historyService,
+          emitChatEvent: (_workspaceId, message) =>
+            this.emitChatEvent({ ...message, type: "message" }),
+        },
+        { workspaceId: this.workspaceId, metadata: metadata.data, proposalToolCallId }
+      );
+      if (!result.success) {
+        log.warn("plan review: skipping snapshot after propose_plan", {
+          workspaceId: this.workspaceId,
+          proposalToolCallId,
+          error: result.error,
+        });
+      }
+    } catch (error) {
+      log.warn("plan review: snapshot after propose_plan failed", {
+        workspaceId: this.workspaceId,
+        proposalToolCallId,
+        error,
+      });
+    }
   }
 
   private async requestQueuedProviderToolEndDispatch(): Promise<void> {

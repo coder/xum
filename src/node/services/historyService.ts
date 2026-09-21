@@ -3497,6 +3497,40 @@ export class HistoryService {
     );
   }
 
+  /**
+   * Derive one new row from FULL history and append it under the SAME write lock.
+   *
+   * Plan-review mutations validate against a projection of every prior record (thread exists,
+   * snapshot hash unseen) before appending; holding the lock across read + append keeps two
+   * windows or backends from both passing that validation against the same stale state. `derive`
+   * returns `message: null` to append nothing (an idempotent no-op) while still returning its
+   * value. Reads the archive too, so reserve it for rare user actions, not hot paths.
+   */
+  async appendDerivedFromFullHistory<T>(
+    workspaceId: string,
+    derive: (messages: MuxMessage[]) => { message: MuxMessage | null; value: T }
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append derived history",
+      async () => {
+        // Truncation recovery already ran inside withCrossProcessWriteLock, and the read-side
+        // recovery would re-acquire the (non-reentrant) file lock, so read unlocked here.
+        const messages: MuxMessage[] = [];
+        const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+          messages.push(...chunk);
+        });
+        if (!scanned.success) return scanned;
+        const derived = derive(messages);
+        if (derived.message !== null) {
+          const appended = await this.appendToHistoryUnderWriteLock(workspaceId, derived.message);
+          if (!appended.success) return appended;
+        }
+        return Ok(derived.value);
+      }
+    );
+  }
+
   private async appendToHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage
