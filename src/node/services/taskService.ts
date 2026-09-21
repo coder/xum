@@ -876,10 +876,12 @@ const MAX_TASK_RECOVERY_ATTEMPTS = 5;
 
 /**
  * Bound on waiting for an owned predecessor's in-flight settlement write before deciding a
- * successor's lineage (evaluateAttemptLineage). Elapsing the bound is a decision — unproven — not
- * an error; the write keeps its own ownership and completes on its own.
+ * successor's lineage (evaluateAttemptLineage), and on a failed direct launch's wait for the
+ * owners its stop cascade captured before its rollback (TaskService.create). Elapsing the bound
+ * is a decision — unproven lineage, deferred rollback — not an error; the write or the cascade
+ * keeps its own ownership and completes on its own.
  */
-const ATTEMPT_CLOSURE_SETTLE_WAIT_MS = 5_000;
+export const ATTEMPT_CLOSURE_SETTLE_WAIT_MS = 5_000;
 
 /** See TaskService.workspaceStopRecords. */
 interface WorkspaceStopRecord {
@@ -6384,13 +6386,19 @@ export class TaskService implements AgentTaskIntegration {
      * deletion: the closure (synchronous, no further send binds to the id), then — when anything
      * is live under it — this task's own stop cascade, in the two-producer shape of
      * failAgentTaskTerminally: Phase A directly (this method holds the global mutex Phase A
-     * requires; the mutex is not reentrant, so it must not be re-acquired here), Phase B
-     * (clearQueue + stopStream, bounded), then a bounded wait for the captured owners to settle,
-     * which releases the record. The row's removal below is the cascade's terminal state. A wait
-     * that outlives its bound leaves the latch held (fail closed) like every other cascade; the
-     * launch owner still settles its attempt afterwards, as before.
+     * requires; the mutex is not reentrant, so it must not be re-acquired here), the durable stop
+     * marker (the row persisted `interrupted` with the launch error, as markTaskLaunchFailed
+     * leaves it), Phase B (clearQueue + stopStream, bounded), then a bounded wait for the captured
+     * owners to settle, which releases the record and settles the attempt (Phase C).
+     *
+     * The rollback runs only once nothing is live under the attempt. An owner that outlives the
+     * bound defers it: the task stays an interrupted workspace with its launch error (removable
+     * like any other), the latch holds until that owner settles, and only its settlement settles
+     * the attempt — no proof is minted here for work still running. The bound keeps this method's
+     * hold on the global mutex finite; a hung owner never pins task creation.
      */
     const failLaunch = async (
+      message: string,
       runtimeForRollback: Runtime,
       rollback: { preservePhysicalWorkspace?: boolean }
     ): Promise<void> => {
@@ -6398,17 +6406,46 @@ export class TaskService implements AgentTaskIntegration {
         this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
         const liveExecution =
           this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
           this.aiService.isStreaming(taskId) ||
           this.hasPendingAdmissions(taskId);
         if (liveExecution) {
           this.beginWorkspaceStop(taskId);
-          this.markWorkspaceStopPersisted(taskId);
+          let parentWorkspaceId: string | undefined;
+          try {
+            await this.editWorkspaceEntry(
+              taskId,
+              (ws) => {
+                parentWorkspaceId = ws.parentWorkspaceId;
+                ws.taskStatus = "interrupted";
+                ws.taskLaunchError = message;
+              },
+              { allowMissing: true }
+            );
+            this.markWorkspaceStopPersisted(taskId);
+          } catch (error: unknown) {
+            // No durable marker: the record cannot release (fail closed, latch retained) and the
+            // rollback below is deferred, exactly as a cascade whose Phase A write failed.
+            log.error("Task.create rollback: failed to persist the launch failure", {
+              taskId,
+              error: getErrorMessage(error),
+            });
+          }
           await this.runWorkspaceStopCleanup([taskId], {
             label: "TaskService.create rollback",
             abandonPartial: true,
             clearQueue: true,
           });
           await this.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
+          if (this.workspaceStopRecords.has(taskId)) {
+            log.warn("Task.create rollback deferred: the failed launch's attempt is still live", {
+              taskId,
+              message,
+            });
+            this.recordTaskInterrupted(taskId, parentWorkspaceId);
+            await this.emitWorkspaceMetadata(taskId);
+            return;
+          }
         }
       }
       await this.rollbackFailedTaskCreate(
@@ -6598,7 +6635,7 @@ export class TaskService implements AgentTaskIntegration {
       if (materializedCheckout != null) {
         // Runs after the desktop gate released: only the checkout and any persisted entry (which
         // would otherwise hold the desktop reservation as a running child) need to go.
-        await failLaunch(materializedCheckout.runtime, {
+        await failLaunch(materialized.error, materializedCheckout.runtime, {
           preservePhysicalWorkspace: useSharedWorkspace,
         });
         materializedCheckout.initLogger.logComplete(-1);
@@ -6623,7 +6660,7 @@ export class TaskService implements AgentTaskIntegration {
         forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
-        await failLaunch(runtimeForTaskWorkspace, {});
+        await failLaunch(sanitizeError, runtimeForTaskWorkspace, {});
         initLogger.logComplete(-1);
         return Err(sanitizeError);
       }
@@ -6703,7 +6740,9 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await failLaunch(runtimeForTaskWorkspace, { preservePhysicalWorkspace: useSharedWorkspace });
+      await failLaunch(message, runtimeForTaskWorkspace, {
+        preservePhysicalWorkspace: useSharedWorkspace,
+      });
       return Err(message);
     }
 

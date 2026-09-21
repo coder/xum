@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -18,7 +27,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { HistoryService } from "@/node/services/historyService";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
-import { TaskService } from "@/node/services/taskService";
+import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
 import {
   createAIServiceMocks,
   createMockInitStateManager,
@@ -104,6 +113,8 @@ interface Internals {
   ) => Promise<void>;
   /** The production stream-end listener's handler (entry-time origin capture for direct callers). */
   handleStreamEnd: (event: unknown) => Promise<void>;
+  /** The direct create's rollback: the only deleter of a failed launch's row, checkout and session. */
+  rollbackFailedTaskCreate: (...args: unknown[]) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -141,7 +152,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 
-  /** Fire only the termination timers immediately; every other timer keeps its delay. */
+  /**
+   * Fire only the termination timers and the closure-settle wait immediately; every other timer
+   * keeps its delay. The settle wait is a deadline loop (`deadline - Date.now()`, so its timer is
+   * matched by a narrow range below the bound): firing it early alone would only re-arm it, so
+   * the clock is moved past the bound as it fires — the wait then genuinely elapses.
+   */
   function shortenTerminationTimers(): void {
     const originalSetTimeout = globalThis.setTimeout;
     const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
@@ -154,9 +170,22 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       ) {
         return originalSetTimeout(handler, 0);
       }
+      if (
+        timeout != null &&
+        timeout <= ATTEMPT_CLOSURE_SETTLE_WAIT_MS &&
+        timeout > ATTEMPT_CLOSURE_SETTLE_WAIT_MS - 100
+      ) {
+        return originalSetTimeout(() => {
+          setSystemTime(new Date(Date.now() + timeout));
+          handler();
+        }, 0);
+      }
       return originalSetTimeout(handler, timeout);
     }) as typeof setTimeout);
-    restoreTimers = () => spy.mockRestore();
+    restoreTimers = () => {
+      spy.mockRestore();
+      setSystemTime();
+    };
   }
 
   async function setupTree(
@@ -259,6 +288,21 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
   async function settle(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  /** Resolve `promise` or fail the test after `timeoutMs` (a hung acquisition must not hang the suite). */
+  async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer != null) clearTimeout(timer);
+    }
   }
 
   /** Bounded wait for work that owns its own completion (a cleanup that outlived its deadline). */
@@ -1779,10 +1823,16 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, spawnedId)?.taskAttemptUnproven).toBeUndefined();
     });
 
-    test.each(["pending", "admitted"] as const)(
-      "a direct create whose launch fails closes and drains its attempt (%s racing send) before the rollback deletes the row, checkout and session",
+    test.each(["pending", "admitted", "pending-outlives", "admitted-outlives"] as const)(
+      "a direct create whose launch fails closes and drains its attempt before any deletion (%s racing send); an owner outliving the bound defers the rollback without minting settlement",
       async (racing) => {
-        const spawnedId = racing === "pending" ? "directfail001" : "directfail002";
+        const outlives = racing.endsWith("-outlives");
+        const spawnedId = {
+          pending: "directfail001",
+          admitted: "directfail002",
+          "pending-outlives": "directfail003",
+          "admitted-outlives": "directfail004",
+        }[racing];
         const { config } = await setupTree([]);
         stubStableIds(config, [spawnedId]);
         shortenTerminationTimers();
@@ -1799,7 +1849,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             racingToken = admitted(
               taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
             );
-            if (racing === "admitted") {
+            if (racing.startsWith("admitted")) {
               racingToken.onAdmitted(racingTurn);
               liveTurn = racingTurn;
             }
@@ -1808,7 +1858,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           clearQueue: mock(() => {
             order.push("clearQueue");
             // The racing send's next gate refuses it once its attempt is closed (its host disposes
-            // the obligation); a pending debt settles only through that disposal.
+            // the obligation); a pending debt settles only through that disposal. In the
+            // outliving variant that host is stuck in a long preflight and gets there late.
             if (racing === "pending" && racingToken?.admissionStale() === true) {
               racingToken.onDisposed("refused");
             }
@@ -1816,14 +1867,17 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           }),
           getActiveTurnGeneration: mock(() => liveTurn),
         });
+        const settleRacingTurn = (workspaceId: string) => {
+          const turn = liveTurn;
+          if (turn == null) return;
+          liveTurn = undefined;
+          host.settleTurn(workspaceId, turn);
+        };
         const stopStream = mock((workspaceId: string) => {
           order.push("stopStream");
-          const turn = liveTurn;
-          if (turn != null) {
-            // The stopped turn settles like a real coordinator's idle transition.
-            liveTurn = undefined;
-            host.settleTurn(workspaceId, turn);
-          }
+          // The stopped turn settles like a real coordinator's idle transition — unless the
+          // stream hangs (outliving variant), in which case only its later settlement counts.
+          if (racing === "admitted") settleRacingTurn(workspaceId);
           return Promise.resolve(Ok(undefined));
         });
         const { aiService } = createAIServiceMocks(config, { stopStream });
@@ -1833,15 +1887,18 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         const svc = internals(taskService);
         const atFirstDeletion: Record<string, unknown> = {};
-        const removeWorkspace = config.removeWorkspace.bind(config);
-        const remove = spyOn(config, "removeWorkspace").mockImplementation(async (id: string) => {
-          order.push("removeWorkspace");
-          atFirstDeletion.settlement = svc.attemptSettlementByTaskId.get(id)?.phase;
-          atFirstDeletion.racingStale = racingToken?.admissionStale();
-          atFirstDeletion.stopRecordRetained = svc.workspaceStopRecords.has(id);
-          atFirstDeletion.debts = svc.admittedSendsByTaskId.get(id)?.size ?? 0;
-          return removeWorkspace(id);
-        });
+        const rollback = svc.rollbackFailedTaskCreate.bind(taskService);
+        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate").mockImplementation(
+          (...args: unknown[]) => {
+            const id = args[3] as string;
+            order.push("rollback");
+            atFirstDeletion.settlement = svc.attemptSettlementByTaskId.get(id)?.phase;
+            atFirstDeletion.racingStale = racingToken?.admissionStale();
+            atFirstDeletion.stopRecordRetained = svc.workspaceStopRecords.has(id);
+            atFirstDeletion.debts = svc.admittedSendsByTaskId.get(id)?.size ?? 0;
+            return rollback(...args);
+          }
+        );
         try {
           const created = await taskService.create({
             parentWorkspaceId: rootId,
@@ -1855,21 +1912,72 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           if (created.success) throw new Error("unreachable");
           expect(created.error).toContain("provider unavailable");
           expect(racingToken).toBeDefined();
-          // Closure and the attempt's stop cascade (queue cleared, stream stopped, owners settled)
-          // precede the first deletion; nothing admitted under the attempt outlives the row.
-          expect(order).toEqual(["clearQueue", "stopStream", "removeWorkspace"]);
-          expect(atFirstDeletion).toEqual({
-            settlement: "settled",
-            racingStale: true,
-            stopRecordRetained: false,
-            debts: 0,
+          // A pending obligation reads stale from the closure on (and a discharged one always
+          // does); an admitted one belongs to its turn — captured by the stop record — until that
+          // turn settles, so the still-live turn's token is the one exception.
+          expect(racingToken?.admissionStale()).toBe(racing !== "admitted-outlives");
+          // Whatever happens next, create released the capacity mutex: a hung owner never pins
+          // task creation.
+          const lock = await raceWithTimeout(taskService.acquireTaskCreationLock(), 1_000);
+          await lock[Symbol.asyncDispose]();
+          if (!outlives) {
+            // Closure and the attempt's stop cascade (queue cleared, stream stopped, owners
+            // settled) precede the deletion; nothing admitted under the attempt outlives the row.
+            expect(order).toEqual(["clearQueue", "stopStream", "rollback"]);
+            expect(atFirstDeletion).toEqual({
+              settlement: "settled",
+              racingStale: true,
+              stopRecordRetained: false,
+              debts: 0,
+            });
+            expect(entryOf(config, spawnedId)).toBeUndefined();
+            expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+            expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
+            expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+              phase: "settled",
+            });
+            return;
+          }
+          // The captured owner outlived the bound: NO deletion and NO settlement proof — the
+          // rollback is deferred, the row stays as the durable stop marker (interrupted with its
+          // launch error), the latch holds and the attempt reads cleanup-pending.
+          expect(order).toEqual(["clearQueue", "stopStream"]);
+          expect(rollbackSpy).not.toHaveBeenCalled();
+          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
+          expect(entryOf(config, spawnedId)?.taskLaunchError).toContain("provider unavailable");
+          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+            phase: "closing",
+            source: "launch-failed",
           });
-          expect(entryOf(config, spawnedId)).toBeUndefined();
+          expect((await taskService.readAttemptOutcome(spawnedId, requesting)).kind).toBe(
+            "cleanup-pending"
+          );
+          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
+          expect(
+            taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" })
+          ).toEqual({
+            kind: "refused",
+            message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+          });
+          // Only the owner's actual settlement releases the record and settles the attempt.
+          if (racing === "pending-outlives") racingToken?.onDisposed("refused");
+          else settleRacingTurn(spawnedId);
           expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+            phase: "settled",
+            source: "stop-settled",
+          });
           expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({ phase: "settled" });
+          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+            kind: "terminal-no-report",
+          });
+          // Deferred means deferred: the interrupted workspace remains for the user or parent to
+          // remove; nothing deletes it behind their back.
+          expect(rollbackSpy).not.toHaveBeenCalled();
+          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
         } finally {
-          remove.mockRestore();
+          rollbackSpy.mockRestore();
         }
       }
     );
