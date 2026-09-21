@@ -988,25 +988,29 @@ describe("ProviderService model normalization", () => {
 
         const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
           ?.coder as Record<string, unknown>;
-        // The hidden entry survives; only the visible removal took effect.
+        // The hidden entry survives; only the visible removal took effect,
+        // and a removal is just a removal — no routing tombstone.
         expect(stored.models).toEqual(["anthropic/visible-model", "anthropic/hidden"]);
-        expect(stored.removedModels).toEqual(["anthropic/other-visible"]);
+        expect(stored.removedModels).toBeUndefined();
+        expect(stored.discoveredModelsUnlisted).toBe(true);
       }
     );
   });
 
-  it("records removals of discovered Coder models and clears them on re-add", async () => {
+  it("does not record Coder removals; re-adding clears a legacy tombstone", async () => {
     await withTempConfigAsync(async (config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: ["anthropic/model-a", "anthropic/model-b"],
-          discoveredModels: ["anthropic/model-a", "anthropic/model-b"],
+          discoveredModels: ["anthropic/model-a", "anthropic/model-b", "anthropic/model-c"],
+          // Written by old code when the user deleted a merged catalog row.
+          removedModels: ["anthropic/model-c"],
         },
       });
 
-      // Removing a discovered model records the exclusion so catalog
-      // refreshes and re-logins cannot resurrect it.
+      // Removing a configured model only removes the row: the catalog still
+      // routes it, and no new tombstone is minted. The legacy one survives.
       const removal = await service.setModels("coder", ["anthropic/model-a"]);
       expect(removal.success).toBe(true);
       let stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
@@ -1014,53 +1018,26 @@ describe("ProviderService model normalization", () => {
         unknown
       >;
       expect(stored.models).toEqual(["anthropic/model-a"]);
-      expect(stored.removedModels).toEqual(["anthropic/model-b"]);
+      expect(stored.removedModels).toEqual(["anthropic/model-c"]);
+      expect(stored.discoveredModelsUnlisted).toBe(true);
 
-      // Re-adding the model clears its exclusion.
-      const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-b"]);
+      // Re-adding the tombstoned model clears its tombstone (nothing else can).
+      const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-c"]);
       expect(readd.success).toBe(true);
       stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
         string,
         unknown
       >;
-      expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-b"]);
+      expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-c"]);
       expect(stored.removedModels).toBeUndefined();
-    });
-  });
-
-  it("records removals of Coder models the current catalog no longer lists", async () => {
-    await withTempConfigAsync(async (config, service) => {
-      // Provenance is lossy: a discovered model with a user-authored object
-      // override survives a catalog that temporarily omits its ID (only
-      // `models` still knows it). Deleting it in that state must still
-      // record the exclusion, or the next catalog that lists the ID again
-      // would resurrect a model the user explicitly removed.
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        coder: {
-          deploymentUrl: "https://coder.example.com",
-          models: [
-            { id: "anthropic/overridden", contextWindowTokens: 100_000 },
-            "anthropic/model-a",
-          ],
-          // The current catalog omits the overridden model's ID.
-          discoveredModels: ["anthropic/model-a"],
-        },
-      });
-
-      const result = await service.setModels("coder", ["anthropic/model-a"]);
-      expect(result.success).toBe(true);
-      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
-        ?.coder as Record<string, unknown>;
-      expect(stored.models).toEqual(["anthropic/model-a"]);
-      expect(stored.removedModels).toEqual(["anthropic/overridden"]);
     });
   });
 
   it("keeps prior Coder removals across edits made while the catalog is unknown", async () => {
     await withTempConfigAsync(async (config, service) => {
       // Post-login state: discoveredModels deleted (catalog unknown), but a
-      // removal recorded earlier must survive an unrelated edit — otherwise
-      // the pending discovery would resurrect the removed model.
+      // legacy tombstone must survive an unrelated edit — only re-adding
+      // that model may clear it.
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",

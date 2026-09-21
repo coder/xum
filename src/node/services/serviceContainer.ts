@@ -365,7 +365,7 @@ export class ServiceContainer {
 
   /**
    * The hard startup steps, in order: everything request handling depends on, plus agent-task
-   * restart recovery. All five are mandatory — a failure stops startup — and every name is a
+   * restart recovery. All six are mandatory — a failure stops startup — and every name is a
    * `stepDurationsMs` key of the `[startup] ServiceContainer.initialize completed` line (and the
    * `step` of a `StartupStepTimeoutError`), so names and order are an observability contract.
    * Downgrading a step to best-effort is runStartupHousekeeping()'s policy, not a change here.
@@ -375,6 +375,12 @@ export class ServiceContainer {
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
     // Startup gating
     { name: "policyService.initialize", run: () => this.policyService.initialize() },
+    // One-shot providers.jsonc migration; must land before IPC/HTTP mount so no client reads
+    // or edits the coder section's pre-migration model list. Internally non-throwing.
+    {
+      name: "coderOauthService.separateDiscoveredModels",
+      run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
+    },
     { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
     {
       name: "taskService.recoverInterruptedTasks",

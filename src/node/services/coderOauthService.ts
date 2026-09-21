@@ -275,23 +275,25 @@ function parseEndpointUrl(value: unknown): string | null {
 }
 
 /**
- * Entries of the coder section's `models` list that carry user-managed data:
- * everything NOT recorded in `discoveredModels` (the bookkeeping of what
- * catalog discovery wrote), plus any object-form entry — normalization
- * collapses override-free objects to plain strings, so an object entry means
- * the user edited it (context window override, model mapping) even when its
- * ID was discovered. Logins, catalog refreshes, and disconnects must carry
- * these forward instead of clobbering them with the server catalog.
+ * MIGRATION-ONLY classifier for a coder section written by OLD code, whose
+ * discovery merged the catalog into `models`: the entries that carry
+ * user-managed data are everything NOT recorded in the catalog markers, plus
+ * any object-form entry — normalization collapses override-free objects to
+ * plain strings, so an object entry means the user edited it (context window
+ * override, model mapping) even when its ID was discovered. Under the current
+ * contract `models` is user-managed by construction, so no other writer may
+ * apply this classification (it would strip explicit adds of catalog IDs);
+ * see separateDiscoveredModelsOnce.
  */
-function manualModelEntries(section: Record<string, unknown> | undefined): ProviderModelEntry[] {
+function userManagedModelEntries(
+  section: Record<string, unknown> | undefined
+): ProviderModelEntry[] {
   if (!Array.isArray(section?.models)) {
     return [];
   }
-  // Discovered classification unions the authoritative catalog with the
-  // stale marker (entries retained in `models` while the catalog was
-  // inconclusive). Without the marker, an inconclusive refresh would
-  // reclassify retained catalog entries as manual — surviving disconnect and
-  // resurrecting across refreshes as if the user had added them.
+  // Old code unioned the authoritative catalog with the stale marker
+  // (entries it retained in `models` while the catalog was inconclusive), so
+  // both are catalog provenance here.
   const discovered = new Set(
     [section.discoveredModels, section.staleDiscoveredModels].flatMap((value) =>
       Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
@@ -443,9 +445,9 @@ export class CoderOauthService {
       // would let a refresh rotate + persist in the meantime. The predicate
       // matches on the session lineage id — stable across rotations, re-minted
       // by each login — so it clears the disconnected session even if it just
-      // rotated, while a genuinely newer login is preserved. Tokens and models
-      // are cleared in ONE locked mutation so racing observers see either the
-      // connected state or the fully disconnected state, never a mix.
+      // rotated, while a genuinely newer login is preserved. Tokens and the
+      // catalog are cleared in ONE locked mutation so racing observers see
+      // either the connected state or the fully disconnected state, never a mix.
       //
       // The clear runs under the cross-process login-commit lock: a commit in
       // another Xum process persists its login and announces success as one
@@ -491,13 +493,12 @@ export class CoderOauthService {
                 // Discovered models/providers were fetched from the deployment's AI
                 // Gateway at login time; they are meaningless without credentials and
                 // are refetched on the next login. discoveredModels stays PRESENT
-                // (as []) so the catalog reads as authoritatively empty, while
-                // manually added entries (and additionalProviders) are user-managed
-                // data and survive the disconnect.
-                next.models = manualModelEntries(section);
+                // (as []) so the catalog reads as authoritatively empty. `models`
+                // (and additionalProviders) are user-managed data: not touched.
                 next.discoveredModels = [];
                 next.discoveredProviders = [];
                 delete next.staleDiscoveredModels;
+                next.discoveredModelsUnlisted = true;
                 return { value: next };
               }
             );
@@ -1763,18 +1764,14 @@ export class CoderOauthService {
         const next = { ...(section ?? {}) };
         next.deploymentUrl = deploymentUrl;
         next.coderOauth = auth;
-        const manual = manualModelEntries(section);
-        if (manual.length > 0) {
-          next.models = manual;
-        } else {
-          delete next.models;
-        }
         // Fresh login: the previous deployment's catalog and provider set are
         // meaningless; discovery (running right after commit) repopulates
         // them. Deleted, not emptied, so routing fails open until then.
+        // `models` is user-managed and stays as-is.
         delete next.discoveredModels;
         delete next.discoveredProviders;
         delete next.staleDiscoveredModels;
+        next.discoveredModelsUnlisted = true;
         return { value: next };
       });
       this.cachedAuth = null;
@@ -2372,6 +2369,53 @@ export class CoderOauthService {
     );
   }
 
+  /**
+   * One-shot upgrade migration (a startup core step, see serviceContainer):
+   * older versions merged the discovered catalog into the coder section's
+   * `models` list; now `models` is user-managed only and the catalog lives in
+   * `discoveredModels`. Strip the catalog-derived plain-string entries once,
+   * keeping user-edited object entries and IDs the catalog never listed, and
+   * stamp `discoveredModelsUnlisted` so this never runs again on that file.
+   *
+   * Only a section that carries a catalog marker WITHOUT the flag is eligible:
+   * old code merged only when it wrote such a marker, and every new-code
+   * writer stamps the flag, so an explicit add of a catalog ID made under the
+   * new contract can never be mistaken for merged data. Not a catalog commit:
+   * catalog markers, legacy `removedModels` tombstones and generation
+   * counters are left untouched. Never throws (startup rule).
+   */
+  async separateDiscoveredModelsOnce(): Promise<void> {
+    try {
+      // updateProviderSection runs the predicate under the cross-process
+      // providers.jsonc lock, so the read, the classification and the write
+      // are one critical section against concurrent Xum processes.
+      const result = await this.providerService.updateProviderSection("coder", (section) => {
+        if (
+          section === undefined ||
+          section.discoveredModelsUnlisted === true ||
+          (!Array.isArray(section.discoveredModels) &&
+            !Array.isArray(section.staleDiscoveredModels))
+        ) {
+          return null;
+        }
+        const next = { ...section };
+        const userManaged = userManagedModelEntries(section);
+        if (userManaged.length > 0) {
+          next.models = userManaged;
+        } else {
+          delete next.models;
+        }
+        next.discoveredModelsUnlisted = true;
+        return { value: next };
+      });
+      if (!result.success) {
+        log.error(`[Coder OAuth] Failed to separate discovered models: ${result.error}`);
+      }
+    } catch (error) {
+      log.error(`[Coder OAuth] Failed to separate discovered models: ${getErrorMessage(error)}`);
+    }
+  }
+
   private refreshBridgeModelsEffect(auth: CoderOauthAuth): Effect.Effect<void, CoderOauthError> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2468,9 +2512,9 @@ export class CoderOauthService {
       // repopulate models over a disconnect or a newer deployment's catalog.
       // The credential check also pins the deployment, so per-provider
       // carry-forward below can only resurrect entries from THIS deployment.
-      // `models` stays the user-visible union: manually added entries (those
-      // not recorded in discoveredModels) are carried forward ahead of the
-      // fresh catalog, so discovery never clobbers user-managed data.
+      // Discovery writes the catalog markers only; `models` is user-managed
+      // (Settings offers the catalog in an "add model" dropdown) and is never
+      // read or written here.
       let catalogInconclusive = false;
       let supersededByConcurrentRefresh = false;
       const setResult = yield* Effect.promise(() =>
@@ -2506,10 +2550,10 @@ export class CoderOauthService {
           const previousDiscovered = Array.isArray(section?.discoveredModels)
             ? section.discoveredModels.filter((id): id is string => typeof id === "string")
             : [];
-          // Display state retained through an earlier inconclusive refresh (the
+          // Catalog IDs carried through an earlier inconclusive refresh (the
           // authoritative catalog was deleted then; this marker is all that
-          // remains of it). Never authoritative prior state — it only keeps
-          // entries user-visible across consecutive failed refreshes.
+          // remains of it). Never authoritative prior state — it only carries a
+          // provider's entries forward across consecutive failed refreshes.
           const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
             ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
             : [];
@@ -2567,11 +2611,11 @@ export class CoderOauthService {
                 // Consecutive failed refreshes: after an inconclusive refresh the
                 // authoritative catalog is gone (previousKnown false), so a
                 // transiently failing provider has no carry-forward state — but
-                // its stale display entries must stay user-visible instead of
-                // vanishing from Settings/the selector. The catalog stays
-                // inconclusive, so these IDs land back in models +
-                // staleDiscoveredModels, never in discoveredModels. Type-gated
-                // like authoritative carry-forward.
+                // its stale entries must not vanish (a later successful refresh
+                // would otherwise start from nothing). The catalog stays
+                // inconclusive, so these IDs land back in staleDiscoveredModels,
+                // never in discoveredModels. Type-gated like authoritative
+                // carry-forward.
                 if (typeUnchanged) {
                   modelIds.push(
                     ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
@@ -2600,8 +2644,8 @@ export class CoderOauthService {
                   ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
                 );
               } else {
-                // No authoritative prior catalog: stale display entries must not
-                // be promoted into a conclusive write.
+                // No authoritative prior catalog: stale entries must not be
+                // promoted into a conclusive write.
                 catalogInconclusive = true;
                 modelIds.push(
                   ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
@@ -2614,50 +2658,25 @@ export class CoderOauthService {
             // recorded metadata — the route is conclusively absent; drop it.
           }
 
-          const manual = manualModelEntries(section);
-          const manualIds = new Set(manual.map((entry) => maybeGetProviderModelEntryId(entry)));
-          // User-removed discovered models (recorded by setModels) stay excluded:
-          // a catalog refresh or re-login must not resurrect entries the user
-          // deleted from the model list.
-          const removed = new Set(
-            Array.isArray(section?.removedModels)
-              ? section.removedModels.filter((id): id is string => typeof id === "string")
-              : []
-          );
-          // User-visible union: manual entries first, then discovered/carried IDs.
-          const retainedDiscovered = modelIds.filter(
-            (id) => !manualIds.has(id) && !removed.has(id)
-          );
-          const merged = [...manual, ...retainedDiscovered];
-
           if (catalogInconclusive) {
             // The catalog cannot be written as authoritative. Keep/flip it to
             // UNKNOWN so routing fails open (the failed provider's models stay
             // reachable), losing at worst one refresh's worth of catalog data —
             // the next successful refresh rebuilds it. The healthy providers'
-            // fetched and carried-forward entries STAY user-visible in `models`
-            // (only the authoritative `discoveredModels` marker is dropped):
-            // wiping them would empty Settings and the model selector until a
-            // later fully successful refresh. The authoritative admin listing is
-            // conclusive independently of the catalog fetches, so it is still
-            // persisted: custom-named instances must stay resolvable (e.g. for
-            // manually added models). Probe-derived metadata is just the
-            // name === type default that resolveCoderGatewayProvider already
-            // applies without persistence, so the probe path persists nothing
-            // new and keeps any previously stored metadata.
+            // fetched and carried-forward entries are kept in the stale marker
+            // (only the authoritative `discoveredModels` marker is dropped) so
+            // the next inconclusive refresh can carry them forward again. The
+            // authoritative admin listing is conclusive independently of the
+            // catalog fetches, so it is still persisted: custom-named instances
+            // must stay resolvable (e.g. for manually added models).
+            // Probe-derived metadata is just the name === type default that
+            // resolveCoderGatewayProvider already applies without persistence,
+            // so the probe path persists nothing new and keeps any previously
+            // stored metadata.
             const next = { ...(section ?? {}) };
-            if (merged.length > 0) {
-              next.models = merged;
-            } else {
-              delete next.models;
-            }
             delete next.discoveredModels;
-            // Record which retained entries came from discovery so
-            // manualModelEntries keeps classifying them as catalog data (cleared
-            // by disconnect/login, excluded from manual carry-forward) while the
-            // authoritative marker is absent.
-            if (retainedDiscovered.length > 0) {
-              next.staleDiscoveredModels = retainedDiscovered;
+            if (modelIds.length > 0) {
+              next.staleDiscoveredModels = modelIds;
             } else {
               delete next.staleDiscoveredModels;
             }
@@ -2667,6 +2686,7 @@ export class CoderOauthService {
             // Even an inconclusive write is a catalog commit: a slower concurrent
             // refresh must re-fetch rather than overwrite the retained state.
             next.coderCatalogGeneration = currentCatalogGeneration + 1;
+            next.discoveredModelsUnlisted = true;
             return { value: next };
           }
 
@@ -2681,10 +2701,10 @@ export class CoderOauthService {
           // in discoveredModels or conclusively gone.
           const conclusive: Record<string, unknown> = {
             ...(section ?? {}),
-            models: merged,
             discoveredModels: modelIds,
             discoveredProviders: nextProviders,
             coderCatalogGeneration: currentCatalogGeneration + 1,
+            discoveredModelsUnlisted: true,
           };
           delete conclusive.staleDiscoveredModels;
           return { value: conclusive };
