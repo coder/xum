@@ -336,6 +336,7 @@ export class ContinuousStrategy {
       goalKind: context.goalKind,
       goalId: context.goalId,
       muxMetadata: context.workspaceTurnMetadata,
+      autoModelRouting: context.autoModelRouting,
     });
     followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
     return followUp;

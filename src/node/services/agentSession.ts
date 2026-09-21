@@ -210,6 +210,7 @@ import {
   type StreamAbortReason,
   type StreamEndEvent,
   type StreamAbortEvent,
+  type StreamStartEvent,
   type StreamLifecycleSnapshot,
 } from "@/common/types/stream";
 import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoalService";
@@ -1203,6 +1204,13 @@ export class AgentSession {
     contextBudgetRetried?: boolean;
     requestAssemblySnapshot?: RequestAssemblySnapshot;
     options?: SendMessageOptions;
+    /**
+     * Auto routing decision of the streaming request. Starts as the session's pre-stream
+     * decision and is replaced by the prepared record on stream-start: request preparation
+     * may fall back to the composer's model when the tier model cannot be built, and live
+     * pricing, compaction thresholds and mid-stream follow-ups must follow that swap.
+     */
+    autoModelRouting?: AutoModelRoutingRecord;
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
@@ -7212,6 +7220,23 @@ export class AgentSession {
   }
 
   /**
+   * Adopt the routing record the prepared request actually streams with. Request preparation
+   * owns the last fallback (a tier model the factory cannot build reverts to the composer's,
+   * see TurnRequestBuilder), which the session's pre-stream decision cannot know about. Live
+   * usage pricing, goal accounting, compaction thresholds and mid-stream follow-ups read this
+   * context, so a swapped model must land here before the first usage delta.
+   */
+  private adoptPreparedRouting(payload: StreamStartEvent): void {
+    const context = this.activeStreamContext;
+    const record = payload.autoModelRouting;
+    if (context?.autoModelRouting == null || record == null) return;
+    if (record.model !== context.autoModelRouting.model) {
+      context.modelString = record.model;
+    }
+    context.autoModelRouting = record;
+  }
+
+  /**
    * Error text when an image attachment cannot be sent to `model`, else null. Routing only:
    * the composer picked its model with the images in view, a tier model did not.
    */
@@ -7814,6 +7839,9 @@ export class AgentSession {
         contextBudgetRetried,
         requestAssemblySnapshot,
         options,
+        ...(options?.autoModelRoutingRecord != null
+          ? { autoModelRouting: options.autoModelRoutingRecord }
+          : {}),
         agentInitiated,
         openaiTruncationModeOverride,
         ...(goalKind != null ? { goalKind } : {}),
@@ -9563,6 +9591,7 @@ export class AgentSession {
         return;
       }
       if (payload.type === "stream-start" && this.coordinator.streamStarted(payload)) {
+        this.adoptPreparedRouting(payload);
         this.emitChatEvent(payload);
       }
     });

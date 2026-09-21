@@ -4,12 +4,15 @@ import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { CompactionReplacementCapture } from "../compactionCancellation";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 /** The original session object is the identity receipt; never clone it across an awaited hook. */
 export interface StreamContextSnapshot {
   admissionCapture?: CompactionReplacementCapture;
   modelString: string;
   options?: SendMessageOptions;
+  /** Auto routing decision the streaming request carries; mid-stream follow-ups inherit it. */
+  autoModelRouting?: AutoModelRoutingRecord;
   agentInitiated?: boolean;
   providersConfig: ProvidersConfigMap | null;
   goalKind?: GoalSyntheticMessageKind;

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { AgentSession } from "./agentSession";
+import type { SendMessageOptions } from "@/common/orpc/types";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CompactionMonitor } from "./compactionMonitor";
@@ -11,10 +13,13 @@ import type {
   AutoModelRouter,
   AutoModelRouterClassifyInput,
 } from "@/node/services/autoModelRouter";
-import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
+import type {
+  AutoModelRoutingDecision,
+  AutoModelRoutingRecord,
+} from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
@@ -22,6 +27,7 @@ import {
   createStartedTurnHandle,
   createStreamLifecycleMocks,
   createTestAgentSession,
+  runSessionTerminalPolicy,
 } from "./agentSession.testHarness";
 
 const COMPOSER_MODEL = "anthropic:claude-3-5-sonnet-latest";
@@ -140,7 +146,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       >,
       workspaceGoalService,
     });
-    return { session, historyService, streamMessage, classify, recordHeadlessUsage };
+    return { session, historyService, aiService, streamMessage, classify, recordHeadlessUsage };
   }
 
   afterEach(async () => {
@@ -787,6 +793,133 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       reason: "Model xai:grok-3 does not support image input.",
     });
   });
+
+  it.each([
+    {
+      name: "keeps the routed tier model",
+      prepared: (record: AutoModelRoutingRecord): AutoModelRoutingRecord => record,
+      streamedModel: HARD_MODEL,
+      status: "routed",
+    },
+    {
+      name: "adopts the composer model the request builder fell back to",
+      prepared: (record: AutoModelRoutingRecord): AutoModelRoutingRecord => ({
+        ...record,
+        model: COMPOSER_MODEL,
+        status: "fallback",
+        reason: "Provider is blocked by policy.",
+      }),
+      streamedModel: COMPOSER_MODEL,
+      status: "fallback",
+    },
+  ])(
+    "mid-stream compaction $name for live usage and its Continue follow-up",
+    async ({ prepared, streamedModel, status }) => {
+      const { session, aiService, streamMessage } = await createHarness({
+        experimentEnabled: true,
+      });
+      const usage = { inputTokens: 4_000, outputTokens: 1, totalTokens: 4_001 };
+      let streamCalls = 0;
+      streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          // stream-start reports the request preparation actually assembled: the routed tier
+          // model may have been swapped for the composer's there (TurnRequestBuilder).
+          const record = prepared(opts.autoModelRouting!);
+          aiService.emit("stream-start", {
+            type: "stream-start",
+            workspaceId: "ws-auto-routing",
+            messageId: "assistant-routed",
+            model: record.model,
+            historySequence: 1,
+            startTime: Date.now(),
+            autoModelRouting: record,
+          });
+          aiService.emit("usage-delta", {
+            type: "usage-delta",
+            workspaceId: "ws-auto-routing",
+            messageId: "assistant-routed",
+            usage,
+            cumulativeUsage: usage,
+          });
+        }
+        // The mocked stop never aborts the request signal; let session shutdown retire the handle.
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.stopStream = mock((workspaceId: string) => {
+        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "assistant-routed",
+          abortReason: "system",
+        });
+        return Promise.resolve(Ok(undefined));
+      });
+
+      const internals = session as unknown as {
+        contextController: { compactionMonitor: CompactionMonitor };
+        sendMessage: AgentSession["sendMessage"];
+      };
+      let midStreamChecks = 0;
+      const checkMidStream = mock((_params: { model: string }) => {
+        midStreamChecks += 1;
+        return midStreamChecks === 1;
+      });
+      internals.contextController.compactionMonitor = {
+        checkBeforeSend: mock(() => ({
+          shouldShowWarning: false,
+          shouldForceCompact: false,
+          usagePercentage: 0,
+          thresholdPercentage: 85,
+        })),
+        checkMidStream,
+        resetForNewStream: mock(() => undefined),
+        setThreshold: mock(() => undefined),
+        getThreshold: mock(() => 0.85),
+      } as unknown as CompactionMonitor;
+      const originalSendMessage = session.sendMessage.bind(session);
+      let compactionRequest: SendMessageOptions | undefined;
+      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+        // Send options carry muxMetadata as a black box; the session stamps a typed payload.
+        const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
+        if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
+        // Capture the compaction request instead of running it; the follow-up it carries is
+        // what the resumed turn would dispatch.
+        compactionRequest ??= args[1];
+        return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
+      }) as AgentSession["sendMessage"];
+
+      let streamErrored = false;
+      session.onChatEvent(({ message }) => {
+        if (message.type === "stream-error") streamErrored = true;
+      });
+
+      const result = await internals.sendMessage("Refactor the scheduler", {
+        model: COMPOSER_MODEL,
+        agentId: "exec",
+        autoModelRouting: true,
+      });
+      expect(result.success).toBe(true);
+      // The captured compaction request fails, which surfaces as the turn's stream error.
+      const deadline = Date.now() + 2_000;
+      while (!streamErrored && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // The threshold check prices the model that streams, not the pre-stream decision.
+      expect(checkMidStream.mock.calls[0]?.[0]).toMatchObject({ model: streamedModel });
+      const muxMetadata = compactionRequest?.muxMetadata as MuxMessageMetadata | undefined;
+      const followUp =
+        muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+      expect(followUp?.model).toBe(streamedModel);
+      expect(followUp?.autoModelRouting).toMatchObject({
+        status,
+        tierId: "hard",
+        model: streamedModel,
+      });
+      await session.dispose();
+    }
+  );
 
   it("falls back when a budgeted goal cannot price the chosen tier's model", async () => {
     const { session, streamMessage, classify } = await createHarness({
