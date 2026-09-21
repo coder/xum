@@ -1086,22 +1086,47 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     });
   }, []);
 
+  const attachmentsFromPending = (pending: PendingUserMessage, attachmentKeyPrefix: string) => [
+    ...filePartsToChatAttachments(pending.fileParts, attachmentKeyPrefix),
+    ...pending.stagedAttachments.map((attachment, index) => ({
+      ...attachment,
+      id: `${attachmentKeyPrefix}-staged-${index}`,
+    })),
+  ];
+
   const applyDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
-      const providerAttachments = filePartsToChatAttachments(
-        pending.fileParts,
-        attachmentKeyPrefix
-      );
-      const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
-        ...attachment,
-        id: `${attachmentKeyPrefix}-staged-${index}`,
-      }));
       setDraft({
         text: pending.content,
-        attachments: [...providerAttachments, ...stagedAttachments],
+        attachments: attachmentsFromPending(pending, attachmentKeyPrefix),
       });
     },
     [setDraft]
+  );
+
+  // Append a restored pending message to the CURRENT draft without losing any of the user's draft
+  // data: text goes after the draft text, attachments after the draft's attachments, review notes
+  // after the notes already attached. Used when a queued message is handed back as unsent input
+  // (the user may have typed and attached more since queueing it); `applyDraftFromPending` is the
+  // replacing variant for restores that own the whole draft (Stop, queued-message edit).
+  const appendDraftFromPending = useCallback(
+    (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
+      const current = getDraft();
+      const separator = current.text.trim() ? "\n\n" : "";
+      setDraft({
+        text: current.text + separator + pending.content,
+        attachments: [
+          ...current.attachments,
+          ...attachmentsFromPending(pending, attachmentKeyPrefix),
+        ],
+      });
+      if (pending.reviews.length > 0) {
+        // `reviewData` is the effective list (draft override or the panel's attached notes); the
+        // merged result becomes the draft override so nothing already attached is hidden or dropped.
+        setDraftReviews([...(reviewData ?? []), ...pending.reviews]);
+      }
+    },
+    [getDraft, reviewData, setDraft, setDraftReviews]
   );
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.
@@ -1384,15 +1409,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           restoreText(restoredPending.content);
         }
       } else if (hasFileParts || hasStagedAttachments || hasReviews) {
-        const currentText = getDraft().text;
-        const separator = currentText.trim() ? "\n\n" : "";
-        applyDraftFromPending(
-          {
-            ...restoredPending,
-            content: currentText + separator + restoredPending.content,
-          },
-          restoredIdPrefix
-        );
+        appendDraftFromPending(restoredPending, restoredIdPrefix);
       } else {
         appendText(restoredPending.content);
       }
@@ -1404,8 +1421,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     appendText,
     restoreText,
     restoreDraft,
-    applyDraftFromPending,
-    getDraft,
+    appendDraftFromPending,
     editingMessageForUi,
     workspaceIdForComposerClear,
   ]);
