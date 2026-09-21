@@ -1461,6 +1461,29 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("a tier level the tier model's ladder lacks streams at the clamped level, like a composer pick", async () => {
+    // Gemini 3 Pro only offers low and high; the tier asks for medium.
+    const sparseModel = "google:gemini-3.1-pro-preview";
+    const { session, streamMessage } = await createHarness({
+      experimentEnabled: true,
+      classify: () => Promise.resolve(Ok(decision("hard"))),
+      tiers: [TIERS[0], { ...TIERS[1], model: sparseModel, thinkingLevel: "medium" }, TIERS[2]],
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(sparseModel);
+    // The same per-model clamp every send gets, applied to the model that streams.
+    expect(["low", "high"]).toContain(streamOptions?.thinkingLevel ?? "missing");
+  });
+
   it("a resume under model Auto continues on the refusal fallback model the interrupted turn ran on", async () => {
     const { session, streamMessage, historyService } = await createHarness({
       experimentEnabled: true,

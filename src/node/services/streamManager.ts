@@ -2820,11 +2820,21 @@ export class StreamManager {
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
         if (escalation && escalationState) {
-          // The rebuild clamps to the model's ceiling and reports a no-op as "not
-          // applicable"; only a level that actually changed is provenance.
-          if (thinkingOverride !== undefined && overrideState?.applied === escalation.to) {
-            recordAutoThinkingEscalation(escalationState, escalation);
-            log.info("Auto thinking escalated mid-turn", escalation);
+          // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
+          // only a level that actually changed is provenance, at the level it changed to (a
+          // sparse ladder can land above the requested step). A slider write that raced the
+          // step's awaits is the user's level, not Auto's.
+          const applied = overrideState?.applied;
+          if (
+            thinkingOverride !== undefined &&
+            applied != null &&
+            applied !== escalation.from &&
+            !overrideState?.manual
+          ) {
+            const effective =
+              applied === escalation.to ? escalation : { ...escalation, to: applied };
+            recordAutoThinkingEscalation(escalationState, effective);
+            log.info("Auto thinking escalated mid-turn", effective);
           } else {
             markAutoThinkingEscalationExhausted(escalationState);
           }

@@ -7971,6 +7971,44 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(persisted).toEqual([]);
   });
 
+  test("a raise a sparse ladder clamps upward is recorded at the level that applied", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    // The model offers only low and high: the requested medium lands on high.
+    const rebuild = mock((level: string) => ({
+      effectiveLevel: (level === "medium" ? "high" : level) as ThinkingLevel,
+      providerOptions: { google: { thinkingLevel: level === "medium" ? "high" : level } },
+    }));
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const step = await prepareStep({ messages: stuckTranscript(), stepNumber: 3 });
+    expect(step?.providerOptions).toEqual({ google: { thinkingLevel: "high" } });
+    expect(state.applied).toBe("high");
+    // Provenance names the level the turn now runs at, and the ladder continues from it.
+    expect(persisted.at(-1)).toMatchObject([{ step: 4, from: "low", to: "high" }]);
+    expect(stepTracker.autoThinkingEscalation.level).toBe("high");
+    expect(stepTracker.autoThinkingEscalation.exhausted).toBe(false);
+  });
+
   test("a raise the model ceiling clamps away is not provenance and ends further attempts", async () => {
     const streamManager = new StreamManager(historyService);
     const { createStreamResult } = getRequestHelpers(streamManager);
