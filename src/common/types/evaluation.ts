@@ -489,20 +489,40 @@ export type CanonicalRequestResult =
       readonly depth: number;
     };
 
-/** Nesting depth of a JSON value: scalars are 0, `{}`/`[]` are 1, `{ a: {} }` is 2. */
-export function jsonDepth(value: unknown): number {
+/**
+ * Nesting depth of a JSON value: scalars are 0, `{}`/`[]` are 1, `{ a: {} }` is 2.
+ *
+ * Iterative and bounded: `state` is untrusted workflow input, so a recursive
+ * walk (or `JSON.stringify`) over a pathologically deep or cyclic value would
+ * throw `RangeError` instead of a typed violation. Counting stops as soon as
+ * `limit + 1` is reached; the returned depth is then exactly `limit + 1`.
+ * Callers must run this check before any recursive consumer of the value,
+ * including `EvaluationStateSchema` (zod recurses through `z.lazy`).
+ */
+export function jsonDepth(value: unknown, limit: number = Number.POSITIVE_INFINITY): number {
   if (value === null || typeof value !== "object") {
     return 0;
   }
-  const children = Array.isArray(value) ? value : Object.values(value);
-  let deepest = 0;
-  for (const child of children) {
-    const depth = jsonDepth(child);
+  // Explicit stack of [container, depthOfContainer]; cycles simply keep
+  // increasing the depth until the limit stops the walk.
+  const stack: Array<[object, number]> = [[value, 1]];
+  let deepest = 1;
+  while (stack.length > 0) {
+    const [container, depth] = stack.pop()!;
     if (depth > deepest) {
       deepest = depth;
     }
+    if (deepest > limit) {
+      return limit + 1;
+    }
+    const children: unknown[] = Array.isArray(container) ? container : Object.values(container);
+    for (const child of children) {
+      if (child !== null && typeof child === "object") {
+        stack.push([child, depth + 1]);
+      }
+    }
   }
-  return deepest + 1;
+  return deepest;
 }
 
 /** Canonical (key-sorted) JSON, as used for hashing and replay identity. */
@@ -520,12 +540,14 @@ export function canonicalRequestBytes(request: {
   readonly questions: EvaluationQuestions;
 }): CanonicalRequestResult {
   const payload = { state: request.state, questions: request.questions };
+  // Depth first: canonicalization recurses, so it must never see a payload
+  // that exceeds the depth limit (or a cyclic one). Bytes are unknown then.
+  const depth = jsonDepth(payload, EVALUATION_MAX_DEPTH);
+  if (depth > EVALUATION_MAX_DEPTH) {
+    return { ok: false, violation: "request-too-deep", bytes: 0, depth };
+  }
   const canonical = canonicalEvaluationJson(payload);
   const bytes = new TextEncoder().encode(canonical).length;
-  const depth = jsonDepth(payload);
-  if (depth > EVALUATION_MAX_DEPTH) {
-    return { ok: false, violation: "request-too-deep", bytes, depth };
-  }
   if (bytes > EVALUATION_MAX_REQUEST_BYTES) {
     return { ok: false, violation: "request-too-large", bytes, depth };
   }
