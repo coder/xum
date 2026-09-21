@@ -48,7 +48,7 @@ import {
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
 import {
-  useAutoModelRoutingSelection,
+  useAutoRoutingSelection,
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
@@ -594,8 +594,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath);
   const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const [autoModelRoutingActive, setAutoModelRoutingActive] =
-    useAutoModelRoutingSelection(sendOptionsScopeId);
+  const [autoModelRoutingActive, setAutoModelRoutingActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "model"
+  );
+  const [autoThinkingLevelActive, setAutoThinkingLevelActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "thinkingLevel"
+  );
   const composerSuggestions = useComposerSuggestions({
     input,
     setInput,
@@ -2969,7 +2975,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       className="flex shrink-0 items-center"
                       data-component="ThinkingSelectorGroup"
                     >
-                      <ThinkingSelector modelString={baseModel} />
+                      <ThinkingSelector
+                        modelString={baseModel}
+                        autoRouting={
+                          autoModelRoutingEnabled
+                            ? {
+                                active: autoThinkingLevelActive,
+                                onSelect: () => setAutoThinkingLevelActive(true),
+                              }
+                            : undefined
+                        }
+                      />
                     </div>
                   </div>
 

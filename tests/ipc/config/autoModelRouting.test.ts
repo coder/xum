@@ -1,7 +1,10 @@
 import type { TestEnvironment } from "../setup";
 import { cleanupTestEnvironment, createTestEnvironment } from "../setup";
 import { DEFAULT_AUTO_MODEL_ROUTING_TIERS } from "@/common/types/autoModelRouting";
-import { AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS } from "@/constants/autoModelRouting";
+import {
+  AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS,
+  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+} from "@/constants/autoModelRouting";
 
 describe("config.updateAutoModelRouting", () => {
   let env: TestEnvironment;
@@ -16,9 +19,10 @@ describe("config.updateAutoModelRouting", () => {
     }
   });
 
-  it("serves the default tiers when nothing is persisted", async () => {
+  it("serves the default tiers and evaluation model when nothing is persisted", async () => {
     const cfg = await env.orpc.config.getConfig();
     expect(cfg.autoModelRouting.tiers).toEqual(DEFAULT_AUTO_MODEL_ROUTING_TIERS);
+    expect(cfg.autoModelRouting.evaluationModel).toBe(DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL);
     expect(env.config.loadConfigOrDefault().autoModelRouting).toBeUndefined();
   });
 
@@ -37,10 +41,12 @@ describe("config.updateAutoModelRouting", () => {
           // Duplicate id: dropped, first occurrence wins.
           { id: "quick", label: "Dup", description: "Dup" },
         ],
+        evaluationModel: "anthropic:claude-haiku-4-5",
       },
     });
 
     const expected = {
+      evaluationModel: "anthropic:claude-haiku-4-5",
       tiers: [
         { id: "quick", label: "Quick", description: "Small asks", model: "openai:gpt-5.5-mini" },
         {
@@ -69,15 +75,38 @@ describe("config.updateAutoModelRouting", () => {
       })
     ).rejects.toThrow();
 
-    // A hand-edited config with too few valid tiers normalizes to the defaults.
+    // A hand-edited config with too few valid tiers normalizes to the default tiers
+    // while keeping its valid evaluation model; an unsupported evaluation model
+    // normalizes to the default evaluator independently.
     await env.config.editConfig((config) => ({
       ...config,
       autoModelRouting: {
         tiers: [{ id: "only", label: "Only", description: "one valid tier" }],
+        evaluationModel: "google:gemini-3.5-flash-lite",
       },
     }));
     const cfg = await env.orpc.config.getConfig();
     expect(cfg.autoModelRouting.tiers).toEqual(DEFAULT_AUTO_MODEL_ROUTING_TIERS);
+    expect(cfg.autoModelRouting.evaluationModel).toBe("google:gemini-3.5-flash-lite");
+
+    await expect(
+      env.orpc.config.updateAutoModelRouting({
+        autoModelRouting: {
+          tiers: [...DEFAULT_AUTO_MODEL_ROUTING_TIERS],
+          evaluationModel: "coder:openai/gpt-5",
+        },
+      })
+    ).rejects.toThrow();
+    await env.config.editConfig((config) => ({
+      ...config,
+      autoModelRouting: {
+        tiers: [...DEFAULT_AUTO_MODEL_ROUTING_TIERS],
+        evaluationModel: "coder:openai/gpt-5",
+      },
+    }));
+    expect((await env.orpc.config.getConfig()).autoModelRouting.evaluationModel).toBe(
+      DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL
+    );
   });
 
   it("drops a hand-edited tier whose description exceeds the cap", async () => {
@@ -94,6 +123,7 @@ describe("config.updateAutoModelRouting", () => {
           },
           { id: "huge", label: "Huge", description: oversized },
         ],
+        evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
       },
     }));
     const cfg = await env.orpc.config.getConfig();

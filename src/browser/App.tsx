@@ -64,6 +64,7 @@ import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
+  getAutoThinkingLevelKey,
   getModelKey,
   getNotifyOnResponseKey,
   getProjectScopeId,
@@ -571,6 +572,8 @@ function AppInner() {
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
+      // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
+      updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<

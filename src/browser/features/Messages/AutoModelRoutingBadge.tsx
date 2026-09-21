@@ -3,19 +3,28 @@ import { Route } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import { getThinkingDisplayLabel } from "@/common/types/thinking";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 
 function describeTier(record: AutoModelRoutingRecord): string {
   return record.tierLabel ?? record.tierId ?? "unknown tier";
 }
 
+/** Present only when Auto set the thinking level; labeled against the model that ran. */
+function describeThinking(record: AutoModelRoutingRecord): string | undefined {
+  return record.thinkingLevel != null
+    ? getThinkingDisplayLabel(record.thinkingLevel, record.model)
+    : undefined;
+}
+
 export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord): string {
-  const tierLabel = describeTier(record);
+  const thinking = describeThinking(record);
+  const head = `Auto: ${describeTier(record)}${thinking ? ` · ${thinking}` : ""}`;
   switch (record.status) {
     case "routed":
-      return `Auto: ${tierLabel}`;
+      return head;
     case "unmapped-tier":
-      return `Auto: ${tierLabel} (no model mapped)`;
+      return `${head} (nothing mapped)`;
     case "fallback":
       return "Auto: fallback";
   }
@@ -43,13 +52,14 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
     const tierLabel = describeTier(record);
     lines.push(
       record.confidence != null
-        ? `Jev chose ${tierLabel} (${formatPercent(record.confidence)} confidence).`
-        : `Jev chose ${tierLabel}.`
+        ? `The evaluation model chose ${tierLabel} (${formatPercent(record.confidence)} confidence).`
+        : `The evaluation model chose ${tierLabel}.`
     );
+    const thinking = describeThinking(record);
     lines.push(
       record.status === "routed"
-        ? `Ran on ${formatModelStringForDisplay(record.model)}.`
-        : `No model mapped to this tier; used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
+        ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`
+        : `Nothing mapped to this tier; used ${formatModelStringForDisplay(record.requestedFallbackModel)}.`
     );
   }
   const probabilities = Object.entries(record.probabilities ?? {}).sort(([, a], [, b]) => b - a);

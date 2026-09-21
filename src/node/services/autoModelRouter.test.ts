@@ -1,60 +1,77 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type {
+  Experimental_EvaluationModelV4,
+  Experimental_EvaluationModelV4Result,
+} from "@ai-sdk/provider";
+import { Effect } from "effect";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { AutoModelRouter, type AutoModelRouterDeps } from "./autoModelRouter";
+import {
+  createEvaluationModel,
+  resolveEvaluationModelTarget,
+  type EvaluationModelFactoryDeps,
+} from "./evaluationModelFactory";
 import type { ProvidersConfig } from "@/node/config/providersConfigStore";
+import { Ok } from "@/common/types/result";
 import { DEFAULT_AUTO_MODEL_ROUTING_TIERS } from "@/common/types/autoModelRouting";
 import {
-  AUTO_MODEL_ROUTING_CLASSIFIER_MODEL,
+  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
   TYPESAFE_PROVIDER_KEY,
-  TYPESAFE_SYSTEM_ONE_URL,
 } from "@/constants/autoModelRouting";
 
 const TIERS = DEFAULT_AUTO_MODEL_ROUTING_TIERS.map((tier) => ({ ...tier }));
+const EVALUATION_MODEL = DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL;
 
-function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(typeof body === "string" ? body : JSON.stringify(body), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
-}
+type DoEvaluate = Experimental_EvaluationModelV4["doEvaluate"];
 
-function createRouter(options: {
-  providers?: Record<string, unknown> | null;
-  env?: Record<string, string | undefined>;
-  fetch?: NonNullable<AutoModelRouterDeps["fetch"]>;
-  policyService?: AutoModelRouterDeps["policyService"];
-}) {
-  const fetchMock = mock<NonNullable<AutoModelRouterDeps["fetch"]>>(
-    options.fetch ?? (() => Promise.resolve(jsonResponse(validBody())))
-  );
-  const router = new AutoModelRouter({
-    providersConfigStore: {
-      loadProvidersConfig: () => (options.providers ?? null) as ProvidersConfig | null,
-    },
-    policyService: options.policyService,
-    env: options.env ?? {},
-    fetch: fetchMock,
-  });
-  return { router, fetchMock };
-}
-
-function validBody(choice = "hard") {
+function fakeEvaluationModel(doEvaluate: DoEvaluate): Experimental_EvaluationModelV4 {
   return {
-    model: "jev-1.13.0",
+    specificationVersion: "v4",
+    provider: "fake",
+    modelId: "fake-judge",
+    supportedQuestionTypes: ["choice"],
+    doEvaluate,
+  };
+}
+
+function verdict(
+  choice = "hard",
+  extra: Partial<Experimental_EvaluationModelV4Result> = {}
+): Experimental_EvaluationModelV4Result {
+  return {
     answers: {
       difficulty: {
         type: "choice",
         choice,
         probabilities: { easy: 0.1, medium: 0.2, hard: 0.6, extreme: 0.1 },
-        confidence: 0.6,
       },
     },
-    usage: { input_tokens: 10, output_tokens: 1 },
+    warnings: [],
+    providerMetadata: { [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } } },
+    ...extra,
   };
+}
+
+function providersStore(providers: Record<string, unknown> | null) {
+  return { loadProvidersConfig: () => providers as ProvidersConfig | null };
+}
+
+/** Router over a fake evaluation model so the real experimental_evaluate runs, minus I/O. */
+function createRouter(options: {
+  doEvaluate?: DoEvaluate;
+  policyService?: AutoModelRouterDeps["policyService"];
+}) {
+  const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
+  const router = new AutoModelRouter({
+    providersConfigStore: providersStore({}),
+    policyService: options.policyService,
+    env: {},
+    createEvaluationModel: () => Effect.succeed(Ok(fakeEvaluationModel(doEvaluate))),
+  });
+  return { router, doEvaluate };
 }
 
 const tempPaths: string[] = [];
@@ -63,234 +80,281 @@ afterEach(() => {
 });
 
 describe("AutoModelRouter.classify", () => {
-  it("posts a bearer-authenticated choice question keyed by tier id", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-    });
+  it("asks one choice question keyed by tier id and maps the verdict", async () => {
+    const { router, doEvaluate } = createRouter({});
 
     const result = await router.classify({
       prompt: "Rename a variable",
       recentUserMessages: ["a", "b", "c", "d"],
       tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
     });
 
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.data).toEqual({
-      tierId: "hard",
-      confidence: 0.6,
-      probabilities: { easy: 0.1, medium: 0.2, hard: 0.6, extreme: 0.1 },
-      classifierModel: "jev-1.13.0",
+    expect(result).toEqual({
+      success: true,
+      data: {
+        tierId: "hard",
+        confidence: 0.6,
+        probabilities: { easy: 0.1, medium: 0.2, hard: 0.6, extreme: 0.1 },
+        evaluationModel: EVALUATION_MODEL,
+      },
     });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe(TYPESAFE_SYSTEM_ONE_URL);
-    expect(init.method).toBe("POST");
-    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
-    const body = JSON.parse(init.body as string) as {
-      model: string;
-      state: { prompt: string; recentUserMessages?: string[] };
-      questions: Record<string, { type: string; criteria: Record<string, string> }>;
-    };
-    expect(body.model).toBe(AUTO_MODEL_ROUTING_CLASSIFIER_MODEL);
-    expect(body.state.prompt).toBe("Rename a variable");
+    expect(doEvaluate).toHaveBeenCalledTimes(1);
+    const call = doEvaluate.mock.calls[0][0];
+    const state = call.state as { prompt: string; recentUserMessages?: string[] };
+    expect(state.prompt).toBe("Rename a variable");
     // Only the most recent messages ride along.
-    expect(body.state.recentUserMessages).toEqual(["b", "c", "d"]);
-    const question = Object.values(body.questions)[0];
+    expect(state.recentUserMessages).toEqual(["b", "c", "d"]);
+    const question = call.questions.difficulty;
     expect(question.type).toBe("choice");
+    if (question.type !== "choice") return;
     expect(Object.keys(question.criteria)).toEqual(TIERS.map((tier) => tier.id));
     expect(question.criteria.easy).toBe(TIERS[0].description);
   });
 
-  it("fails without calling the API when no key is configured", async () => {
-    const { router, fetchMock } = createRouter({ providers: {} });
-    const result = await router.classify({ prompt: "x", tiers: TIERS });
+  it("omits confidence and probabilities when the evaluator reports none", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve({
+          answers: { difficulty: { type: "choice", choice: "easy" } },
+          warnings: [],
+        }),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: "openai:gpt-5-nano",
+    });
+    expect(result).toEqual({
+      success: true,
+      data: { tierId: "easy", evaluationModel: "openai:gpt-5-nano" },
+    });
+  });
+
+  it("fails when the evaluator chooses outside the tiers", async () => {
+    const { router } = createRouter({ doEvaluate: () => Promise.resolve(verdict("impossible")) });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
     expect(result.success).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fails on non-2xx responses without leaking the key", async () => {
+  it("fails when the evaluator throws, without leaking the error body into the reason", async () => {
     const { router } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-secret" } },
-      fetch: () => Promise.resolve(jsonResponse({ error: "rate limited" }, { status: 429 })),
+      doEvaluate: () => Promise.reject(new Error("HTTP 429 sk-secret rate limited")),
     });
-    const result = await router.classify({ prompt: "x", tiers: TIERS });
-    expect(result.success).toBe(false);
-    if (result.success) return;
-    expect(result.error).toContain("429");
-    expect(result.error).not.toContain("sk-secret");
-  });
-
-  it("fails on malformed JSON", async () => {
-    const { router } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "k" } },
-      fetch: () => Promise.resolve(jsonResponse("{not json")),
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
     });
-    const result = await router.classify({ prompt: "x", tiers: TIERS });
-    expect(result.success).toBe(false);
-  });
-
-  it("keeps only the configured tiers' probabilities from the response", async () => {
-    const base = validBody();
-    const body = {
-      ...base,
-      answers: {
-        difficulty: {
-          ...base.answers.difficulty,
-          probabilities: { ...base.answers.difficulty.probabilities, bogus: 0.5, other: 0.25 },
-        },
-      },
-    };
-    const { router } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-      fetch: () => Promise.resolve(jsonResponse(body)),
-    });
-
-    const result = await router.classify({ prompt: "Refactor the scheduler", tiers: TIERS });
-
-    expect(result.success).toBe(true);
-    expect(result.success && Object.keys(result.data.probabilities).sort()).toEqual([
-      "easy",
-      "extreme",
-      "hard",
-      "medium",
-    ]);
-  });
-
-  it("fails when the choice is not one of the tier ids", async () => {
-    const { router } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "k" } },
-      fetch: () => Promise.resolve(jsonResponse(validBody("impossible"))),
-    });
-    const result = await router.classify({ prompt: "x", tiers: TIERS });
     expect(result.success).toBe(false);
     if (result.success) return;
-    expect(result.error).toContain("impossible");
+    expect(result.error).toContain("Evaluation failed");
   });
 
-  it("fails when the caller aborts the request", async () => {
+  it("fails when the caller aborts", async () => {
     const controller = new AbortController();
     controller.abort();
-    const { router } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "k" } },
-      fetch: (_url, init) =>
-        init.signal?.aborted
-          ? Promise.reject(new DOMException("aborted", "AbortError"))
-          : Promise.resolve(jsonResponse(validBody())),
+    const { router, doEvaluate } = createRouter({});
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+      signal: controller.signal,
     });
-    const result = await router.classify({ prompt: "x", tiers: TIERS, signal: controller.signal });
     expect(result.success).toBe(false);
+    expect(doEvaluate).not.toHaveBeenCalled();
   });
 
-  it("refuses to call the API when provider policy excludes typesafe", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-      policyService: {
-        isEnforced: () => true,
-        isModelAllowed: (provider) => provider !== "typesafe",
-        getForcedBaseUrl: () => undefined,
-      },
+  it("requires at least two tiers", async () => {
+    const { router, doEvaluate } = createRouter({});
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS.slice(0, 1),
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(false);
+    expect(doEvaluate).not.toHaveBeenCalled();
+  });
+
+  it("fails without evaluating when the evaluation model cannot be built", async () => {
+    const router = new AutoModelRouter({ providersConfigStore: providersStore({}), env: {} });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result).toEqual({
+      success: false,
+      error: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc`,
+    });
+    expect(router.getEvaluationStatus(EVALUATION_MODEL)).toEqual({
+      evaluationModel: EVALUATION_MODEL,
+      available: false,
+      reason: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc`,
+    });
+  });
+});
+
+describe("evaluation model factory", () => {
+  function deps(
+    providers: Record<string, unknown> | null,
+    extra: Partial<EvaluationModelFactoryDeps> = {}
+  ): EvaluationModelFactoryDeps {
+    return { providersConfigStore: providersStore(providers), env: {}, ...extra };
+  }
+
+  it("builds a TypeSafe evaluation model from the reserved providers.jsonc entry", async () => {
+    const target = resolveEvaluationModelTarget(
+      EVALUATION_MODEL,
+      deps({ typesafe: { apiKey: "sk-test" } })
+    );
+    expect(target.success).toBe(true);
+    if (!target.success) return;
+    expect(target.data.provider).toBe(TYPESAFE_PROVIDER_KEY);
+    expect(target.data.modelId).toBe("jev-latest");
+    expect(target.data.settings.apiKey).toBe("sk-test");
+    expect(target.data.settings.baseURL).toBeUndefined();
+    expect(Object.keys(target.data.settings.headers)).toContain("user-agent");
+
+    const model = await Effect.runPromise(
+      createEvaluationModel(EVALUATION_MODEL, deps({ typesafe: { apiKey: "sk-test" } }))
+    );
+    expect(model.success).toBe(true);
+    if (!model.success) return;
+    expect(model.data.modelId).toBe("jev-latest");
+    expect(model.data.supportedQuestionTypes).toContain("choice");
+  });
+
+  it("resolves language-model evaluators through the same providers.jsonc credentials", () => {
+    const target = resolveEvaluationModelTarget(
+      "openai:gpt-5-nano",
+      deps({ openai: { apiKey: "sk-openai", baseUrl: "https://proxy.example.test/v1" } })
+    );
+    expect(target.success).toBe(true);
+    if (!target.success) return;
+    expect(target.data).toMatchObject({
+      provider: "openai",
+      modelId: "gpt-5-nano",
+      settings: { apiKey: "sk-openai", baseURL: "https://proxy.example.test/v1" },
+    });
+    expect(resolveEvaluationModelTarget("anthropic:claude-haiku-4-5", deps({}))).toMatchObject({
+      success: false,
+      error: { code: "missing_api_key" },
+    });
+  });
+
+  it("rejects model strings outside the evaluation-capable providers", () => {
+    for (const modelString of ["coder:openai/gpt-5", "typesafe", "openai:", "mux-gateway:x"]) {
+      expect(
+        resolveEvaluationModelTarget(modelString, deps({ openai: { apiKey: "k" } }))
+      ).toMatchObject({
+        success: false,
+        error: { code: "invalid_model" },
+      });
+    }
+  });
+
+  it("honors provider enablement and enforced policy, including the forced base URL", () => {
+    expect(
+      resolveEvaluationModelTarget(
+        "openai:gpt-5-nano",
+        deps({ openai: { apiKey: "k", enabled: false } })
+      )
+    ).toMatchObject({ success: false, error: { code: "provider_disabled" } });
+
+    const denyProvider = deps(
+      { typesafe: { apiKey: "k" } },
+      {
+        policyService: {
+          isEnforced: () => true,
+          isProviderAllowed: (provider) => provider !== TYPESAFE_PROVIDER_KEY,
+          isModelAllowed: () => true,
+          getForcedBaseUrl: () => undefined,
+        },
+      }
+    );
+    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyProvider)).toMatchObject({
+      success: false,
+      error: { code: "policy_denied" },
     });
 
-    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
-
-    expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(router.getClassifierStatus()).toEqual({ apiKeySource: "config" });
-  });
-
-  it("refuses to call the API when policy lists typesafe but its model_access excludes the classifier", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-      policyService: {
-        isEnforced: () => true,
-        isModelAllowed: (provider, modelId) =>
-          provider === TYPESAFE_PROVIDER_KEY && modelId !== AUTO_MODEL_ROUTING_CLASSIFIER_MODEL,
-        getForcedBaseUrl: () => undefined,
-      },
+    const denyModel = deps(
+      { typesafe: { apiKey: "k" } },
+      {
+        policyService: {
+          isEnforced: () => true,
+          isProviderAllowed: () => true,
+          isModelAllowed: (provider, modelId) =>
+            !(provider === TYPESAFE_PROVIDER_KEY && modelId === "jev-latest"),
+          getForcedBaseUrl: () => undefined,
+        },
+      }
+    );
+    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyModel)).toMatchObject({
+      success: false,
+      error: { code: "policy_denied" },
     });
 
-    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
-
-    expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("posts to the policy-forced TypeSafe base URL when policy is enforced", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
-      policyService: {
-        isEnforced: () => true,
-        isModelAllowed: () => true,
-        getForcedBaseUrl: (provider) =>
-          provider === TYPESAFE_PROVIDER_KEY ? "https://proxy.example.test/typesafe/" : undefined,
-      },
+    const forced = deps(
+      { typesafe: { apiKey: "k", baseUrl: "https://user.example.test/v1" } },
+      {
+        policyService: {
+          isEnforced: () => true,
+          isProviderAllowed: () => true,
+          isModelAllowed: () => true,
+          getForcedBaseUrl: (provider) =>
+            provider === TYPESAFE_PROVIDER_KEY ? "https://proxy.example.test/typesafe/" : undefined,
+        },
+      }
+    );
+    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, forced)).toMatchObject({
+      success: true,
+      data: { settings: { baseURL: "https://proxy.example.test/typesafe/" } },
     });
-
-    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
-
-    expect(result.success).toBe(true);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://proxy.example.test/typesafe/systemone");
   });
 
-  it("ignores a legacy custom chat provider stored under the typesafe id", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: {
-        [TYPESAFE_PROVIDER_KEY]: {
+  it("ignores a legacy custom chat provider stored under the typesafe id", () => {
+    const target = resolveEvaluationModelTarget(
+      EVALUATION_MODEL,
+      deps({
+        typesafe: {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:8000/v1",
           apiKey: "chat-provider-key",
         },
-      },
-    });
-
-    expect(router.getClassifierStatus()).toEqual({ apiKeySource: "none" });
-    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
-    expect(result).toEqual({ success: false, error: "No TypeSafe API key configured" });
-    expect(fetchMock).not.toHaveBeenCalled();
+      })
+    );
+    expect(target).toMatchObject({ success: false, error: { code: "missing_api_key" } });
   });
 
-  it("requires at least two tiers", async () => {
-    const { router, fetchMock } = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "k" } },
-    });
-    const result = await router.classify({ prompt: "x", tiers: TIERS.slice(0, 1) });
-    expect(result.success).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-});
-
-describe("AutoModelRouter credential resolution", () => {
-  it("prefers providers.jsonc apiKey, then apiKeyFile, then env", async () => {
+  it("prefers the providers.jsonc apiKey, then apiKeyFile, then the env vars in order", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-model-routing-"));
     tempPaths.push(dir);
     const keyFile = path.join(dir, "typesafe.key");
     await fsp.writeFile(keyFile, "file-key\n");
-    const env = { TYPESAFE_API_KEY: "env-key" };
+    const apiKeyOf = (providers: Record<string, unknown> | null, env: Record<string, string>) => {
+      const target = resolveEvaluationModelTarget(EVALUATION_MODEL, deps(providers, { env }));
+      return target.success ? target.data.settings.apiKey : target.error.code;
+    };
 
-    const withConfig = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "config-key", apiKeyFile: keyFile } },
-      env,
-    });
-    expect(withConfig.router.getClassifierStatus()).toEqual({ apiKeySource: "config" });
-
-    const withFile = createRouter({
-      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKeyFile: keyFile } },
-      env,
-    });
-    expect(withFile.router.getClassifierStatus()).toEqual({ apiKeySource: "file" });
-    await withFile.router.classify({ prompt: "x", tiers: TIERS });
-    const [, init] = withFile.fetchMock.mock.calls[0];
-    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer file-key");
-
-    const withEnv = createRouter({ providers: null, env });
-    expect(withEnv.router.getClassifierStatus()).toEqual({ apiKeySource: "env" });
-
-    const withJevEnv = createRouter({ providers: {}, env: { JEV_API_KEY: "jev" } });
-    expect(withJevEnv.router.getClassifierStatus()).toEqual({ apiKeySource: "env" });
-
-    const withNothing = createRouter({ providers: {}, env: {} });
-    expect(withNothing.router.getClassifierStatus()).toEqual({ apiKeySource: "none" });
+    const env = {
+      TYPESAFE_API_KEY: "env-key",
+      TYPESAFE_AI_API_KEY: "sdk-env-key",
+      JEV_API_KEY: "jev",
+    };
+    expect(apiKeyOf({ typesafe: { apiKey: "config-key", apiKeyFile: keyFile } }, env)).toBe(
+      "config-key"
+    );
+    expect(apiKeyOf({ typesafe: { apiKeyFile: keyFile } }, env)).toBe("file-key");
+    expect(apiKeyOf(null, env)).toBe("env-key");
+    expect(apiKeyOf({}, { TYPESAFE_AI_API_KEY: "sdk-env-key", JEV_API_KEY: "jev" })).toBe(
+      "sdk-env-key"
+    );
+    expect(apiKeyOf({}, { JEV_API_KEY: "jev" })).toBe("jev");
+    expect(apiKeyOf({}, {})).toBe("missing_api_key");
   });
 });

@@ -68,7 +68,7 @@ describe("buildAutoModelRoutingTooltipLines", () => {
       requestedFallbackModel: "anthropic:claude-opus-4-6",
       model: "anthropic:claude-opus-4-6",
       status: "fallback",
-      reason: "Classifier returned HTTP 429",
+      reason: "Evaluation model returned HTTP 429",
     });
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("HTTP 429");
@@ -83,5 +83,30 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     });
     expect(lines).toHaveLength(2);
     expect(lines[0]).not.toContain("%");
+  });
+
+  test("names the routed thinking level only when Auto set it", () => {
+    expect(buildAutoModelRoutingTooltipLines(routed)[1]).not.toContain("thinking");
+    expect(buildAutoModelRoutingBadgeLabel(routed)).not.toContain("HIGH");
+
+    const withThinking: AutoModelRoutingRecord = { ...routed, thinkingLevel: "high" };
+    expect(buildAutoModelRoutingTooltipLines(withThinking)[1]).toContain("HIGH");
+    expect(buildAutoModelRoutingBadgeLabel(withThinking)).toContain("HIGH");
+  });
+
+  test("labels the thinking level against the model that ran", () => {
+    // OpenAI reports max as xhigh unless the model has a native max effort.
+    const openai: AutoModelRoutingRecord = {
+      ...routed,
+      model: "openai:gpt-5.5-mini",
+      thinkingLevel: "max",
+    };
+    const anthropic: AutoModelRoutingRecord = {
+      ...routed,
+      model: "anthropic:claude-opus-4-6",
+      thinkingLevel: "max",
+    };
+    expect(buildAutoModelRoutingBadgeLabel(openai)).toContain("XHIGH");
+    expect(buildAutoModelRoutingBadgeLabel(anthropic)).toContain("MAX");
   });
 });

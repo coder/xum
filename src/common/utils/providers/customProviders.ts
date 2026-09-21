@@ -25,7 +25,7 @@ const RESERVED_CUSTOM_PROVIDER_IDS = new Set<string>([
   "prototype",
   "constructor",
   "hasOwnProperty",
-  // Holds the auto-model-routing classifier key in providers.jsonc.
+  // Holds the TypeSafe evaluation-model key (auto routing) in providers.jsonc.
   TYPESAFE_PROVIDER_KEY,
 ]);
 

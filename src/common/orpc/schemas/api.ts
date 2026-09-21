@@ -2714,10 +2714,15 @@ export const config = {
     }),
     output: z.void(),
   },
-  getAutoModelRoutingClassifierStatus: {
-    input: z.void(),
-    // Only where the TypeSafe key comes from, never the key itself.
-    output: z.object({ apiKeySource: z.enum(["config", "file", "env", "none"]) }),
+  getAutoModelRoutingEvaluationStatus: {
+    // Omit to check the saved evaluation model; pass one to check an unsaved edit.
+    input: z.object({ evaluationModel: z.string().optional() }).optional(),
+    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    output: z.object({
+      evaluationModel: z.string(),
+      available: z.boolean(),
+      reason: z.string().optional(),
+    }),
   },
   previewAutoModelRouting: {
     input: z.object({ prompt: z.string().min(1) }),
@@ -2725,9 +2730,9 @@ export const config = {
       z.object({
         tierId: z.string(),
         tierLabel: z.string(),
-        confidence: z.number(),
-        probabilities: z.record(z.string(), z.number()),
-        classifierModel: z.string(),
+        confidence: z.number().optional(),
+        probabilities: z.record(z.string(), z.number()).optional(),
+        evaluationModel: z.string(),
         model: z.string().optional(),
         thinkingLevel: ThinkingLevelSchema.optional(),
       }),

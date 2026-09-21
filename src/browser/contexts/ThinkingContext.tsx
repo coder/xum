@@ -13,6 +13,7 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import {
   getAgentIdKey,
+  getAutoThinkingLevelKey,
   getModelKey,
   getProjectScopeId,
   getReasoningModeKey,
@@ -195,6 +196,9 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
 
       setThinkingLevelInternal(level);
+      // A concrete pick (selector row or keybind step) leaves thinking Auto,
+      // mirroring setWorkspaceModelWithOrigin for the model dimension.
+      updatePersistedState(getAutoThinkingLevelKey(scopeId), false);
       persistAgentAiSettings({
         model,
         thinkingLevel: level,

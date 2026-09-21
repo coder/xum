@@ -874,9 +874,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
-      getAutoModelRoutingClassifierStatus: () => Promise.resolve({ apiKeySource: "env" as const }),
+      getAutoModelRoutingEvaluationStatus: (input?: { evaluationModel?: string }) =>
+        Promise.resolve({
+          evaluationModel: input?.evaluationModel ?? autoModelRouting.evaluationModel,
+          available: true,
+        }),
       previewAutoModelRouting: (input: { prompt: string }) => {
-        // Deterministic stand-in for Jev: longer prompts land on later tiers.
+        // Deterministic stand-in for the evaluation model: longer prompts land on later tiers.
         const { tiers } = autoModelRouting;
         const index = Math.min(tiers.length - 1, Math.floor(input.prompt.length / 40));
         const chosen = tiers[index];
@@ -893,7 +897,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             tierLabel: chosen.label,
             confidence: 0.7,
             probabilities,
-            classifierModel: "jev-1.13.0",
+            evaluationModel: autoModelRouting.evaluationModel,
             ...(chosen.model != null ? { model: chosen.model } : {}),
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },

@@ -79,8 +79,8 @@ import {
 } from "@/node/services/workspaceOperations";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
-import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
@@ -357,16 +357,18 @@ export const router = (authToken?: string) => {
           })
         ),
 
-      getAutoModelRoutingClassifierStatus: t
-        .input(schemas.config.getAutoModelRoutingClassifierStatus.input)
-        .output(schemas.config.getAutoModelRoutingClassifierStatus.output)
+      getAutoModelRoutingEvaluationStatus: t
+        .input(schemas.config.getAutoModelRoutingEvaluationStatus.input)
+        .output(schemas.config.getAutoModelRoutingEvaluationStatus.output)
         .handler(
-          handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() =>
-              new AutoModelRouter({
-                providersConfigStore: context.providersConfigStore,
-                policyService: context.policyService,
-              }).getClassifierStatus()
+          handlerGen(function* ({ context }, input) {
+            const router = yield* AutoModelRouterTag;
+            return router.getEvaluationStatus(
+              // Unsaved Settings edits preview their own evaluator; otherwise the saved one.
+              input?.evaluationModel ??
+                normalizeAutoModelRoutingConfig(
+                  context.config.loadConfigOrDefault().autoModelRouting
+                ).evaluationModel
             );
           })
         ),
@@ -376,23 +378,22 @@ export const router = (authToken?: string) => {
         .output(schemas.config.previewAutoModelRouting.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            return yield* atomicPromise(async () => {
-              const { tiers } = normalizeAutoModelRoutingConfig(
-                context.config.loadConfigOrDefault().autoModelRouting
-              );
-              const router = new AutoModelRouter({
-                providersConfigStore: context.providersConfigStore,
-                policyService: context.policyService,
-              });
-              const decision = await router.classify({ prompt: input.prompt, tiers });
-              if (!decision.success) return decision;
-              const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
-              return Ok({
-                ...decision.data,
-                tierLabel: chosen?.label ?? decision.data.tierId,
-                ...(chosen?.model != null ? { model: chosen.model } : {}),
-                ...(chosen?.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
-              });
+            const router = yield* AutoModelRouterTag;
+            const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
+              context.config.loadConfigOrDefault().autoModelRouting
+            );
+            const decision = yield* router.classifyEffect({
+              prompt: input.prompt,
+              tiers,
+              evaluationModel,
+            });
+            if (!decision.success) return decision;
+            const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+            return Ok({
+              ...decision.data,
+              tierLabel: chosen?.label ?? decision.data.tierId,
+              ...(chosen?.model != null ? { model: chosen.model } : {}),
+              ...(chosen?.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
             });
           })
         ),

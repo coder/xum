@@ -7,10 +7,14 @@ import * as ActualAPIModule from "@/browser/contexts/API";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import {
-  DEFAULT_AUTO_MODEL_ROUTING_TIERS,
+  getDefaultAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
+  type AutoModelRoutingEvaluationStatus,
 } from "@/common/types/autoModelRouting";
-import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
+import {
+  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+  TYPESAFE_PROVIDER_KEY,
+} from "@/constants/autoModelRouting";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
@@ -24,7 +28,7 @@ interface MockApi {
     getConfig: ReturnType<typeof mock>;
     onConfigChanged: ReturnType<typeof mock>;
     updateAutoModelRouting: ReturnType<typeof mock>;
-    getAutoModelRoutingClassifierStatus: ReturnType<typeof mock>;
+    getAutoModelRoutingEvaluationStatus: ReturnType<typeof mock>;
     previewAutoModelRouting: ReturnType<typeof mock>;
   };
   providers: {
@@ -67,9 +71,7 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 
 function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
-  let stored: AutoModelRoutingConfig = initial ?? {
-    tiers: DEFAULT_AUTO_MODEL_ROUTING_TIERS.map((tier) => ({ ...tier })),
-  };
+  let stored: AutoModelRoutingConfig = initial ?? getDefaultAutoModelRoutingConfig();
   return {
     config: {
       getConfig: mock(() => Promise.resolve({ autoModelRouting: stored })),
@@ -87,8 +89,12 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
         stored = input.autoModelRouting;
         return Promise.resolve();
       }),
-      getAutoModelRoutingClassifierStatus: mock(() =>
-        Promise.resolve({ apiKeySource: "none" as const })
+      getAutoModelRoutingEvaluationStatus: mock(
+        (input?: { evaluationModel?: string }): Promise<AutoModelRoutingEvaluationStatus> =>
+          Promise.resolve({
+            evaluationModel: input?.evaluationModel ?? stored.evaluationModel,
+            available: true,
+          })
       ),
       previewAutoModelRouting: mock(() =>
         Promise.resolve({
@@ -98,7 +104,7 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
             tierLabel: "Hard",
             confidence: 0.7,
             probabilities: { easy: 0.1, hard: 0.7 },
-            classifierModel: "jev-1.13.0",
+            evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
             model: "openai:gpt-5.5",
           },
         })
@@ -108,6 +114,13 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
       setProviderConfig: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     },
   };
+}
+
+function lastUpdate(): AutoModelRoutingConfig {
+  const call = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
+    autoModelRouting: AutoModelRoutingConfig;
+  };
+  return call.autoModelRouting;
 }
 
 describe("AutoModelRoutingExperimentConfig", () => {
@@ -145,19 +158,21 @@ describe("AutoModelRoutingExperimentConfig", () => {
     return Array.from(container.querySelectorAll("[data-auto-model-routing-tier]"));
   }
 
+  function statusText(container: HTMLElement) {
+    return container.querySelector("[data-auto-model-routing-evaluation-status]")?.textContent;
+  }
+
   test("adds and removes tiers through the update route, respecting the minimum", async () => {
     const { container, getByRole } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     fireEvent.click(getByRole("button", { name: "Add tier" }));
     expect(tierRows(container)).toHaveLength(5);
-    const lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
-      autoModelRouting: AutoModelRoutingConfig;
-    };
-    expect(lastUpdate.autoModelRouting.tiers).toHaveLength(5);
-    // New ids never collide with existing ones.
-    const ids = lastUpdate.autoModelRouting.tiers.map((tier) => tier.id);
+    expect(lastUpdate().tiers).toHaveLength(5);
+    // New ids never collide with existing ones, and the evaluator rides along untouched.
+    const ids = lastUpdate().tiers.map((tier) => tier.id);
     expect(new Set(ids).size).toBe(ids.length);
+    expect(lastUpdate().evaluationModel).toBe(DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL);
 
     fireEvent.click(getByRole("button", { name: "Remove tier 5" }));
     fireEvent.click(getByRole("button", { name: "Remove tier 4" }));
@@ -174,10 +189,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     fireEvent.click(getByRole("button", { name: "Move tier 2 up" }));
-    const lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
-      autoModelRouting: AutoModelRoutingConfig;
-    };
-    expect(lastUpdate.autoModelRouting.tiers.map((tier) => tier.id)).toEqual([
+    expect(lastUpdate().tiers.map((tier) => tier.id)).toEqual([
       "medium",
       "easy",
       "hard",
@@ -195,10 +207,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     await userEvent.type(label, "Quick", replaceAll);
     expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
     fireEvent.blur(label);
-    const lastUpdate = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
-      autoModelRouting: AutoModelRoutingConfig;
-    };
-    expect(lastUpdate.autoModelRouting.tiers[0].label).toBe("Quick");
+    expect(lastUpdate().tiers[0].label).toBe("Quick");
     expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
   });
 
@@ -213,10 +222,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     await waitFor(() => expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1), {
       timeout: 2000,
     });
-    const committed = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
-      autoModelRouting: AutoModelRoutingConfig;
-    };
-    expect(committed.autoModelRouting.tiers[0].label).toBe("Fast");
+    expect(lastUpdate().tiers[0].label).toBe("Fast");
 
     // Tier 2 is still labelled "Medium"; reusing it must not persist.
     await userEvent.type(label, "medium", {
@@ -232,14 +238,76 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(label.value).toBe("Fast");
   });
 
-  test("saving and clearing the key writes the typesafe provider entry", async () => {
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+  test("a valid evaluation model is saved with the tiers on Enter", async () => {
+    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
-    // The status refresh after saving reports the stored key, which enables Clear.
-    mockApi.config.getAutoModelRoutingClassifierStatus.mockImplementation(() =>
-      Promise.resolve({ apiKeySource: "config" as const })
+    const field = getByLabelText("Evaluation model") as HTMLInputElement;
+    expect(field.value).toBe(DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL);
+    await userEvent.type(field, "openai:gpt-5.5{enter}", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: field.value.length,
+    });
+    expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1);
+    expect(lastUpdate()).toEqual({
+      ...getDefaultAutoModelRoutingConfig(),
+      evaluationModel: "openai:gpt-5.5",
+    });
+    expect(field.value).toBe("openai:gpt-5.5");
+    // The status probe follows the typed value rather than the saved one.
+    const probed = mockApi.config.getAutoModelRoutingEvaluationStatus.mock.calls.at(-1)?.[0] as {
+      evaluationModel: string;
+    };
+    expect(probed.evaluationModel).toBe("openai:gpt-5.5");
+  });
+
+  test("an unsupported evaluation model is flagged, never saved, and reverts on blur", async () => {
+    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
+    const field = getByLabelText("Evaluation model") as HTMLInputElement;
+    const statusCallsBefore = mockApi.config.getAutoModelRoutingEvaluationStatus.mock.calls.length;
+    await userEvent.type(field, "xai:grok-4", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: field.value.length,
+    });
+    expect(field.getAttribute("aria-invalid")).toBe("true");
+    // Invalid candidates are not probed either: the message explains the format instead.
+    expect(mockApi.config.getAutoModelRoutingEvaluationStatus.mock.calls.length).toBe(
+      statusCallsBefore
     );
+    await userEvent.type(field, "{enter}");
+    expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
+    // Enter with an invalid value reverted to the saved model; a fresh invalid draft reverts on blur too.
+    expect(field.value).toBe(DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL);
+    await userEvent.type(field, "nonsense", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: field.value.length,
+    });
+    fireEvent.blur(field);
+    expect(field.value).toBe(DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL);
+    expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
+  });
+
+  test("an unavailable evaluation model shows the backend's reason", async () => {
+    mockApi.config.getAutoModelRoutingEvaluationStatus.mockImplementation(
+      (input?: { evaluationModel?: string }): Promise<AutoModelRoutingEvaluationStatus> =>
+        Promise.resolve({
+          evaluationModel: input?.evaluationModel ?? DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+          available: false,
+          reason: "No TypeSafe API key configured",
+        })
+    );
+    const { container } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(statusText(container)).toBe("No TypeSafe API key configured"));
+  });
+
+  test("the TypeSafe key field only appears for a typesafe evaluator and writes the provider entry", async () => {
+    const { container, getByLabelText, getByRole, queryByLabelText } = render(
+      <AutoModelRoutingExperimentConfig />
+    );
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
     await userEvent.type(getByLabelText("TypeSafe API key"), " sk-test ");
     fireEvent.click(getByRole("button", { name: "Save" }));
     await waitFor(() => expect(mockApi.providers.setProviderConfig).toHaveBeenCalledTimes(1));
@@ -251,18 +319,23 @@ describe("AutoModelRoutingExperimentConfig", () => {
     // The draft is cleared so the key never lingers in the DOM.
     expect((getByLabelText("TypeSafe API key") as HTMLInputElement).value).toBe("");
 
-    await waitFor(() =>
-      expect((getByRole("button", { name: "Clear" }) as HTMLButtonElement).disabled).toBe(false)
-    );
     fireEvent.click(getByRole("button", { name: "Clear" }));
     await waitFor(() => expect(mockApi.providers.setProviderConfig).toHaveBeenCalledTimes(2));
     expect(mockApi.providers.setProviderConfig.mock.calls[1]?.[0]).toMatchObject({
       provider: TYPESAFE_PROVIDER_KEY,
       value: "",
     });
+
+    // Switching to another provider's evaluator hides the TypeSafe-only field.
+    const field = getByLabelText("Evaluation model") as HTMLInputElement;
+    await userEvent.type(field, "anthropic:claude-haiku-4-5", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: field.value.length,
+    });
+    expect(queryByLabelText("TypeSafe API key")).toBeNull();
   });
 
-  test("classifying a sample prompt shows the chosen tier and model", async () => {
+  test("classifying a sample prompt shows the chosen tier, model, and evaluator", async () => {
     const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
@@ -275,5 +348,29 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(preview.textContent).toContain("Hard");
     expect(preview.textContent).toContain("70%");
     expect(preview.textContent).toContain("GPT-5.5");
+  });
+
+  test("a preview without confidence or probabilities still renders the tier", async () => {
+    mockApi.config.previewAutoModelRouting.mockImplementation(() =>
+      Promise.resolve({
+        success: true as const,
+        data: {
+          tierId: "easy",
+          tierLabel: "Easy",
+          evaluationModel: "anthropic:claude-haiku-4-5",
+        },
+      })
+    );
+    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
+    await userEvent.type(getByLabelText("Sample prompt"), "Rename a variable");
+    fireEvent.click(getByRole("button", { name: "Classify" }));
+    await waitFor(() =>
+      expect(container.querySelector("[data-auto-model-routing-preview]")).not.toBeNull()
+    );
+    const preview = container.querySelector("[data-auto-model-routing-preview]")!;
+    expect(preview.textContent).toContain("Easy");
+    expect(preview.textContent).not.toContain("%");
   });
 });

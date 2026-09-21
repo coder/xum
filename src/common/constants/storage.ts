@@ -225,6 +225,15 @@ export function getAutoModelRoutingKey(workspaceId: string): string {
 }
 
 /**
+ * Get the localStorage key for the composer's Auto thinking-level selection
+ * (auto-model-routing experiment). Independent of the model Auto key: either
+ * dimension can be routed while the other stays concrete.
+ */
+export function getAutoThinkingLevelKey(workspaceId: string): string {
+  return `autoThinkingLevel:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for the input text for a workspace
  */
 export function getInputKey(workspaceId: string): string {
@@ -868,6 +877,7 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getWorkspaceAISettingsByAgentKey,
   getModelKey,
   getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
   getInputKey,
   getAutoExpandPrefsKey,
   getWorkspaceNameStateKey,

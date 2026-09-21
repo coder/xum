@@ -134,7 +134,7 @@ export const ModelFallbackRecordSchema = z.object({
   refusedModels: z.array(z.string()),
 });
 
-// Auto-model-routing provenance (which tier Jev chose, which model ran).
+// Auto-model-routing provenance (which tier the evaluator chose, which model and thinking level ran).
 export const AutoModelRoutingRecordSchema = z.object({
   requestedFallbackModel: z.string(),
   tierId: z.string().optional(),
@@ -142,6 +142,7 @@ export const AutoModelRoutingRecordSchema = z.object({
   confidence: z.number().optional(),
   probabilities: z.record(z.string(), z.number()).optional(),
   model: z.string(),
+  thinkingLevel: ThinkingLevelSchema.optional(),
   status: z.enum(["routed", "unmapped-tier", "fallback"]),
   reason: z.string().optional(),
 });

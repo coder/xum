@@ -7,7 +7,12 @@ import {
   buildSendMessageOptions,
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
-import { DEFAULT_MODEL_KEY, getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
+import {
+  DEFAULT_MODEL_KEY,
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
+  getModelKey,
+} from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentOverrideValue, useExperimentValue } from "./useExperiments";
@@ -24,17 +29,27 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
   baseModel: string;
 }
 
+/** The composer dimensions Auto can take over, each with its own persisted flag. */
+export type AutoRoutingDimension = "model" | "thinkingLevel";
+
+const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (workspaceId: string) => string> =
+  {
+    model: getAutoModelRoutingKey,
+    thinkingLevel: getAutoThinkingLevelKey,
+  };
+
 /**
- * Composer Auto selection (auto-model-routing experiment), workspace-scoped and
- * forced off while the experiment is disabled so a stale persisted true cannot
- * reach the backend.
+ * Composer Auto selection for one dimension (auto-model-routing experiment),
+ * workspace-scoped and forced off while the experiment is disabled so a stale
+ * persisted true cannot reach the backend.
  */
-export function useAutoModelRoutingSelection(
-  workspaceId: string
+export function useAutoRoutingSelection(
+  workspaceId: string,
+  dimension: AutoRoutingDimension
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const [persisted, setPersisted] = usePersistedState<boolean>(
-    getAutoModelRoutingKey(workspaceId),
+    AUTO_ROUTING_KEY_BY_DIMENSION[dimension](workspaceId),
     false,
     { listener: true }
   );
@@ -80,7 +95,8 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
   const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
-  const [autoModelRouting] = useAutoModelRoutingSelection(workspaceId);
+  const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
+  const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const baseModel = resolveEffectiveComposerModel(
@@ -109,6 +125,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     },
     disableWorkspaceAgents,
     autoModelRouting,
+    autoThinkingLevel,
   });
 
   return {

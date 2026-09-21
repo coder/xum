@@ -11,14 +11,14 @@ export interface AutoModelRoutingState {
   config: AutoModelRoutingConfig;
   // Arrow-function property type so consumers can destructure without
   // tripping @typescript-eslint/unbound-method.
-  /** Full replacement of the tier list; the backend normalizes before persisting. */
+  /** Full replacement of the tiers and evaluation model; the backend normalizes before persisting. */
   setConfig: (config: AutoModelRoutingConfig) => void;
   /** Last rejected write, cleared by the next successful one; the optimistic edit is reverted. */
   writeError: string | null;
 }
 
 /**
- * Reads/writes the auto-model-routing tier list from app config.
+ * Reads/writes the auto-model-routing config (tiers and evaluation model) from app config.
  *
  * Mirrors useModelFallbacks: fetch on mount, subscribe to config changes,
  * optimistically apply local edits while ignoring stale fetches.

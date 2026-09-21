@@ -123,9 +123,10 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       ...(input.modelOneShot?.modelString ? { model: input.modelOneShot.modelString } : {}),
       ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-      // A one-shot model or thinking override is the user's explicit choice for this turn;
-      // Auto must not replace either.
+      // A one-shot command is the user's explicit choice for this turn: any model
+      // one-shot pins the model, and a thinking override additionally pins the level.
       ...(input.modelOneShot ? { skipAiSettingsPersistence: true, autoModelRouting: false } : {}),
+      ...(thinkingOverride ? { autoThinkingLevel: false } : {}),
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),

@@ -1,13 +1,9 @@
 /**
- * Auto model routing (auto-model-routing experiment): the composer's Auto entry
- * sends each prompt to TypeSafe's Jev System One for a single difficulty-tier
- * choice and runs the turn on that tier's configured model.
+ * Auto model routing (auto-model-routing experiment): the composer's Auto entries
+ * send each prompt to the user's evaluation model (AI SDK `experimental_evaluate`)
+ * for a single difficulty-tier choice and run the turn on that tier's model and/or
+ * thinking level.
  */
-
-/** Default API base; an enforced policy `base_url` for `typesafe` replaces it. */
-export const TYPESAFE_API_BASE_URL = "https://api.typesafe.ai/v1";
-export const TYPESAFE_SYSTEM_ONE_PATH = "/systemone";
-export const TYPESAFE_SYSTEM_ONE_URL = TYPESAFE_API_BASE_URL + TYPESAFE_SYSTEM_ONE_PATH;
 
 /**
  * providers.jsonc entry holding the TypeSafe credential. Deliberately not a
@@ -16,15 +12,32 @@ export const TYPESAFE_SYSTEM_ONE_URL = TYPESAFE_API_BASE_URL + TYPESAFE_SYSTEM_O
  */
 export const TYPESAFE_PROVIDER_KEY = "typesafe";
 
-/** Alias resolved server-side to the latest Jev release. */
-export const AUTO_MODEL_ROUTING_CLASSIFIER_MODEL = "jev-latest";
+/**
+ * Providers whose AI SDK package exposes `evaluationModel()`. The evaluation model
+ * is a user choice (`provider:model`); nothing else about routing is provider-specific.
+ */
+export const AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS = [
+  TYPESAFE_PROVIDER_KEY,
+  "openai",
+  "anthropic",
+  "google",
+] as const;
+export type AutoModelRoutingEvaluationProvider =
+  (typeof AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS)[number];
 
-/** Environment variables consulted after providers.jsonc, in order. */
-export const AUTO_MODEL_ROUTING_API_KEY_ENV_VARS = ["TYPESAFE_API_KEY", "JEV_API_KEY"] as const;
+/** TypeSafe's native evaluator: the default until the user picks another model. */
+export const DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL = `${TYPESAFE_PROVIDER_KEY}:jev-latest`;
+
+/** Environment variables consulted after providers.jsonc for the TypeSafe key, in order. */
+export const TYPESAFE_API_KEY_ENV_VARS = [
+  "TYPESAFE_API_KEY",
+  "TYPESAFE_AI_API_KEY",
+  "JEV_API_KEY",
+] as const;
 
 /**
- * Prompt text cap sent to the classifier. Jev's context window is 32k tokens;
- * 24k chars leaves room for the question, criteria, and recent messages.
+ * Prompt text cap sent to the evaluation model. Small evaluators have windows around
+ * 32k tokens; 24k chars leaves room for the question, criteria, and recent messages.
  */
 export const AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS = 24_000;
 
@@ -33,8 +46,8 @@ export const AUTO_MODEL_ROUTING_MAX_TIERS = 8;
 
 /**
  * Tier labels ride in the transcript badge; descriptions are copied verbatim into
- * the classifier criteria, so unbounded text could push every request past Jev's
- * window and leave Auto permanently falling back.
+ * the evaluation criteria, so unbounded text could push every request past a small
+ * evaluator's window and leave Auto permanently falling back.
  */
 export const AUTO_MODEL_ROUTING_MAX_LABEL_CHARS = 32;
 export const AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS = 400;
@@ -43,7 +56,7 @@ export const AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT = 3;
 export const AUTO_MODEL_ROUTING_RECENT_MESSAGE_MAX_CHARS = 500;
 
 /**
- * Best-effort classification: a slow classifier must not stall the send, so
- * the request is abandoned and the turn falls back to the composer's model.
+ * Best-effort classification: a slow evaluator must not stall the send, so the
+ * request is abandoned and the turn falls back to the composer's choices.
  */
 export const AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS = 8_000;

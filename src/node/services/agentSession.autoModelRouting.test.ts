@@ -12,6 +12,7 @@ import type {
 } from "@/node/services/autoModelRouter";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -44,7 +45,7 @@ function decision(tierId: string): AutoModelRoutingDecision {
     tierId,
     confidence: 0.9,
     probabilities: { easy: 0.05, hard: 0.9, extreme: 0.05 },
-    classifierModel: "jev-1.13.0",
+    evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
   };
 }
 
@@ -57,6 +58,8 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       input: AutoModelRouterClassifyInput
     ) => Promise<Result<AutoModelRoutingDecision, string>>;
     tiers?: TierInput[];
+    /** Saved evaluation model; absent means the normalized default. */
+    evaluationModel?: string;
     /** Models the budgeted-goal pricing gate refuses. */
     unpricedModels?: string[];
     /** When set, provider policy is enforced and refuses exactly these models. */
@@ -68,7 +71,12 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
-      loadConfigOrDefault: () => ({ autoModelRouting: { tiers: options.tiers ?? TIERS } }),
+      loadConfigOrDefault: () => ({
+        autoModelRouting: {
+          tiers: options.tiers ?? TIERS,
+          ...(options.evaluationModel ? { evaluationModel: options.evaluationModel } : {}),
+        },
+      }),
     } as unknown as Config;
     // Goal service stub: only the pricing gate has behavior; every other method the
     // send path touches is a no-op resolving to undefined (no goal exists here).
@@ -154,7 +162,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const result = await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
       agentId: "exec",
-      thinkingLevel: "low",
+      thinkingLevel: "medium",
       autoModelRouting: true,
     });
     expect(result.success).toBe(true);
@@ -164,11 +172,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(classify.mock.calls[0]?.[0]).toMatchObject({
       prompt: "Refactor the scheduler",
       tiers: TIERS,
+      evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
     });
     expect(streamMessage).toHaveBeenCalledTimes(1);
     const streamOptions = streamMessage.mock.calls[0]?.[0];
     expect(streamOptions?.modelString).toBe(HARD_MODEL);
-    expect(streamOptions?.thinkingLevel).toBe("high");
+    // Only the model dimension was Auto: the tier's "high" stays out of it.
+    expect(streamOptions?.thinkingLevel).toBe("medium");
     expect(streamOptions?.autoModelRouting).toMatchObject({
       status: "routed",
       tierId: "hard",
@@ -177,13 +187,43 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       requestedFallbackModel: COMPOSER_MODEL,
       confidence: 0.9,
     });
+    expect(streamOptions?.autoModelRouting).not.toHaveProperty("thinkingLevel");
 
     const row = await persistedUserRow(historyService);
     const retry = row.metadata?.retrySendOptions as Record<string, unknown> | undefined;
     expect(retry?.model).toBe(HARD_MODEL);
-    expect(retry?.thinkingLevel).toBe("high");
+    expect(retry?.thinkingLevel).toBe("medium");
     expect(retry).not.toHaveProperty("autoModelRouting");
+    expect(retry).not.toHaveProperty("autoThinkingLevel");
     expect(retry).not.toHaveProperty("autoModelRoutingRecord");
+  });
+
+  it("applies both the tier's model and thinking level when both composer dimensions are Auto", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      evaluationModel: "openai:gpt-5-nano",
+    });
+
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    // The saved evaluation model reaches the evaluator unchanged.
+    expect(classify.mock.calls[0]?.[0]?.evaluationModel).toBe("openai:gpt-5-nano");
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(HARD_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("high");
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      model: HARD_MODEL,
+      thinkingLevel: "high",
+    });
   });
 
   it("keeps the composer model when the classifier fails and records the reason", async () => {
@@ -290,31 +330,75 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
-  it("classifies when a model-less tier sets a thinking level and applies it to the composer model", async () => {
+  it("thinking-only Auto applies the tier's thinking level and keeps the composer model", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
-      classify: () => Promise.resolve(Ok(decision("extreme"))),
-      tiers: TIERS.map(({ model: _model, thinkingLevel: _level, ...tier }) =>
-        tier.id === "extreme" ? { ...tier, thinkingLevel: "high" } : tier
-      ),
+      classify: () => Promise.resolve(Ok(decision("hard"))),
     });
 
     await session.sendMessage("design it", {
       model: COMPOSER_MODEL,
       agentId: "exec",
       thinkingLevel: "low",
-      autoModelRouting: true,
+      autoThinkingLevel: true,
     });
     await session.waitForIdle();
 
     expect(classify).toHaveBeenCalledTimes(1);
     const streamOptions = streamMessage.mock.calls[0]?.[0];
+    // The hard tier maps a model too, but the composer kept its model concrete.
     expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
     expect(streamOptions?.thinkingLevel).toBe("high");
     expect(streamOptions?.autoModelRouting).toMatchObject({
       status: "routed",
-      tierId: "extreme",
+      tierId: "hard",
       model: COMPOSER_MODEL,
+      thinkingLevel: "high",
+    });
+  });
+
+  it("thinking-only Auto skips the evaluator when no tier has a thinking level mapped", async () => {
+    const { session, streamMessage, classify } = await createHarness({
+      experimentEnabled: true,
+      tiers: TIERS.map(({ thinkingLevel: _level, ...tier }) => tier),
+    });
+
+    await session.sendMessage("hello", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("low");
+    expect(streamOptions?.autoModelRouting).toMatchObject({ status: "fallback" });
+  });
+
+  it("thinking-only Auto treats a tier without a thinking level as unmapped", async () => {
+    const { session, streamMessage } = await createHarness({
+      experimentEnabled: true,
+      classify: () => Promise.resolve(Ok(decision("easy"))),
+    });
+
+    await session.sendMessage("rename it", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    const streamOptions = streamMessage.mock.calls[0]?.[0];
+    // The easy tier maps a model but no thinking level; model Auto was off.
+    expect(streamOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(streamOptions?.thinkingLevel).toBe("low");
+    expect(streamOptions?.autoModelRouting).toMatchObject({
+      status: "unmapped-tier",
+      tierId: "easy",
     });
   });
 
@@ -475,16 +559,55 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const row = createMuxMessage("user-corrupt-record", "user", "Refactor the scheduler", {
       timestamp: Date.now() - 1_000,
     });
-    (row.metadata as Record<string, unknown>).autoModelRouting = { model: 42, status: "routed" };
+    // Every field is a string, so a model-only guard would accept it; the status is bogus.
+    (row.metadata as Record<string, unknown>).autoModelRouting = {
+      requestedFallbackModel: COMPOSER_MODEL,
+      model: HARD_MODEL,
+      status: "bogus",
+    };
     expect((await historyService.appendToHistory("ws-auto-routing", row)).success).toBe(true);
 
-    const result = await session.resumeStream({ model: COMPOSER_MODEL, agentId: "exec" });
+    const result = await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
     expect(result.success).toBe(true);
     await session.waitForIdle();
 
     const resumeOptions = streamMessage.mock.calls[0]?.[0];
     expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
     expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("a manual resume under thinking Auto continues on the routed thinking level and keeps the record", async () => {
+    const { session, streamMessage, classify } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    const resumed = await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoThinkingLevel: true,
+    });
+    expect(resumed).toEqual(Ok({ started: true }));
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(resumeOptions?.thinkingLevel).toBe("high");
+    expect(resumeOptions?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      thinkingLevel: "high",
+    });
   });
 
   it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
@@ -589,7 +712,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
       agentId: "exec",
-      thinkingLevel: "low",
+      thinkingLevel: "medium",
       autoModelRouting: true,
     });
     await session.waitForIdle();
@@ -598,7 +721,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const resumed = await session.resumeStream({
       model: COMPOSER_MODEL,
       agentId: "exec",
-      thinkingLevel: "low",
+      thinkingLevel: "medium",
       autoModelRouting: true,
     });
     expect(resumed).toEqual(Ok({ started: true }));
@@ -608,7 +731,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(streamMessage).toHaveBeenCalledTimes(2);
     const resumeOptions = streamMessage.mock.calls[1]?.[0];
     expect(resumeOptions?.modelString).toBe(HARD_MODEL);
-    expect(resumeOptions?.thinkingLevel).toBe("high");
+    expect(resumeOptions?.thinkingLevel).toBe("medium");
     expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
   });
 
@@ -727,6 +850,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       agentId: "compact",
       thinkingLevel: "low",
       autoModelRouting: true,
+      autoThinkingLevel: true,
       muxMetadata: {
         type: "compaction-request",
         rawCommand: "/compact\nRefactor the scheduler",
@@ -762,6 +886,45 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       status: "routed",
       tierId: "hard",
       model: HARD_MODEL,
+      requestedFallbackModel: COMPOSER_MODEL,
+    });
+  });
+
+  it("keeps a fallback record on an attachment-only /compact follow-up", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    const compactionModel = "anthropic:claude-3-5-haiku-latest";
+
+    const result = await session.sendMessage("/compact", {
+      model: compactionModel,
+      agentId: "compact",
+      autoModelRouting: true,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        commandPrefix: "/compact",
+        parsed: {
+          model: compactionModel,
+          followUpContent: {
+            text: "",
+            model: COMPOSER_MODEL,
+            agentId: "exec",
+            fileParts: [{ url: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" }],
+          },
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).not.toHaveBeenCalled();
+    const row = await persistedUserRow(historyService);
+    const muxMetadata = row.metadata?.muxMetadata;
+    const followUp =
+      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+    expect(followUp?.model).toBe(COMPOSER_MODEL);
+    expect(followUp?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
       requestedFallbackModel: COMPOSER_MODEL,
     });
   });

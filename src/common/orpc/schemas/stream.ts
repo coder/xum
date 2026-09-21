@@ -946,12 +946,18 @@ export const SendMessageOptionsSchema = z.object({
   skipAiSettingsPersistence: z.boolean().optional(),
   experiments: ExperimentsSchema.optional(),
   /**
-   * Composer "Auto" selection (auto-model-routing experiment): classify the prompt's
+   * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
    * difficulty and run on the matching tier's model. `model` stays the concrete
    * composer model and doubles as the fallback; the backend strips this flag from the
    * resolved options so retries and resumes never re-classify.
    */
   autoModelRouting: z.boolean().optional(),
+  /**
+   * Composer thinking level set to "Auto": the same classification picks the tier's
+   * thinking level. Independent of `autoModelRouting`; `thinkingLevel` stays the
+   * composer's concrete level and doubles as the fallback.
+   */
+  autoThinkingLevel: z.boolean().optional(),
   /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when

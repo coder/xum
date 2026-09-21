@@ -2441,10 +2441,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
     private readonly effectRunner: EffectRunner = defaultEffectRunner,
-    private readonly appFiberScope?: Scope.Scope
+    private readonly appFiberScope?: Scope.Scope,
+    // Test doubles construct WorkspaceService directly; the core graph provides the
+    // shared router (AutoModelRouterLive).
+    private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
+      providersConfigStore,
+      policyService,
+    })
   ) {
     super();
-    this.autoModelRouter = new AutoModelRouter({ providersConfigStore, policyService });
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     // Narrow WorkspaceService test doubles construct partial manager stubs (see the
     // typeof guard on subscriptions below); a missing method reads as "no live monitor
@@ -2899,7 +2904,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
-  private readonly autoModelRouter: AutoModelRouter;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: WorkspaceDevToolsCleanup;
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */

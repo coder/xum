@@ -12,10 +12,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import {
-  AUTO_MODEL_ROUTING_API_KEY_ENV_VARS,
-  TYPESAFE_PROVIDER_KEY,
-} from "@/constants/autoModelRouting";
+import { TYPESAFE_API_KEY_ENV_VARS, TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -119,8 +116,8 @@ export function providerSecretEnvVarNames(): string[] {
   names.add(BEDROCK_AUTH_ENV_VARS.accessKeyId);
   names.add(BEDROCK_AUTH_ENV_VARS.secretAccessKey);
   names.add(BEDROCK_AUTH_ENV_VARS.bearerToken);
-  // The classifier key is not a chat provider, but it is a bearer credential all the same.
-  for (const key of AUTO_MODEL_ROUTING_API_KEY_ENV_VARS) {
+  // The TypeSafe evaluation key is not a chat provider, but it is a bearer credential all the same.
+  for (const key of TYPESAFE_API_KEY_ENV_VARS) {
     names.add(key);
   }
   return [...names];
@@ -624,7 +621,7 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       return true;
     }
 
-    // The TypeSafe classifier key cannot serve a chat model (a legacy custom provider
+    // The TypeSafe evaluation key cannot serve a chat model (a legacy custom provider
     // under the same id still counts).
     if (providerKey === TYPESAFE_PROVIDER_KEY && !isCustomProviderConfig(rawConfig)) {
       continue;

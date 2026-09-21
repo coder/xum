@@ -7,8 +7,8 @@ import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
 export const PolicyFormatVersionSchema = z.literal("0.1");
 
-// The auto-routing classifier is gated by provider_access like a chat provider, but its id
-// is reserved (not a valid custom provider id), so admit it here explicitly.
+// The TypeSafe evaluation provider (auto routing) is gated by provider_access like a chat
+// provider, but its id is reserved (not a valid custom provider id), so admit it explicitly.
 export const PolicyProviderIdSchema = z
   .string()
   .refine(

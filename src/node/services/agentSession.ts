@@ -120,6 +120,7 @@ import {
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
+import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
   normalizePersistedAgentCandidate,
@@ -132,7 +133,9 @@ import type { PolicyService } from "@/node/services/policyService";
 import { parseModelString } from "@/node/services/providerModelFactory";
 import {
   normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingDimensions,
   type AutoModelRoutingRecord,
+  type AutoModelRoutingTier,
 } from "@/common/types/autoModelRouting";
 import {
   buildStreamErrorEventData,
@@ -4138,13 +4141,21 @@ export class AgentSession {
     });
     // Strip before anything snapshots these options: retry rows, compaction follow-ups,
     // and resumes must carry the concrete model and never re-classify (or re-bill).
-    const classifyUserTurn =
-      optionsForStream.autoModelRouting === true && !agentInitiated && internal?.synthetic !== true;
+    const routingDimensions: AutoModelRoutingDimensions = {
+      model: optionsForStream.autoModelRouting === true,
+      thinkingLevel: optionsForStream.autoThinkingLevel === true,
+    };
     delete optionsForStream.autoModelRouting;
+    delete optionsForStream.autoThinkingLevel;
+    const classifyUserTurn =
+      (routingDimensions.model || routingDimensions.thinkingLevel) &&
+      !agentInitiated &&
+      internal?.synthetic !== true;
     if (classifyUserTurn && !isCompactionRequest) {
       optionsForStream = await this.resolveAutoModelRouting(
         trimmedMessage,
         optionsForStream,
+        routingDimensions,
         effectiveFileParts,
         cancelSignal
       );
@@ -4158,7 +4169,12 @@ export class AgentSession {
       isCompactionRequest && typedMuxMetadata?.type === "compaction-request"
         ? await this.withKeepRecentTailStamp(
             classifyUserTurn
-              ? await this.withAutoRoutedFollowUp(typedMuxMetadata, optionsForStream, cancelSignal)
+              ? await this.withAutoRoutedFollowUp(
+                  typedMuxMetadata,
+                  optionsForStream,
+                  routingDimensions,
+                  cancelSignal
+                )
               : typedMuxMetadata,
             optionsForStream
           )
@@ -6796,14 +6812,19 @@ export class AgentSession {
   private async withAutoRoutedFollowUp(
     metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
     options: ResolvedSendMessageOptions,
+    dimensions: AutoModelRoutingDimensions,
     signal: AbortSignal | undefined
   ): Promise<Extract<MuxMessageMetadata, { type: "compaction-request" }>> {
     const followUp = metadata.parsed.followUpContent;
-    const prompt = followUp?.text?.trim();
-    if (followUp == null || !prompt || followUp.autoModelRouting != null) return metadata;
+    const prompt = followUp?.text?.trim() ?? "";
+    if (followUp == null || followUp.autoModelRouting != null) return metadata;
+    // An attachment-only follow-up still goes through routing so its fallback record
+    // (and badge) survive the redispatch, exactly like an attachment-only send.
+    if (!prompt && !(followUp.fileParts?.length ?? 0)) return metadata;
     const routed = await this.resolveAutoModelRouting(
       prompt,
       { ...options, model: followUp.model, thinkingLevel: followUp.thinkingLevel },
+      dimensions,
       followUp.fileParts,
       signal
     );
@@ -6985,12 +7006,14 @@ export class AgentSession {
 
   /**
    * Composer Auto: classify the prompt's difficulty and swap in the chosen tier's
-   * model and thinking level. Every failure keeps the composer's concrete model, so
-   * the returned options are always streamable; the record explains what happened.
+   * model and/or thinking level, each only when the composer opted that dimension
+   * into Auto. Every failure keeps the composer's concrete choices, so the returned
+   * options are always streamable; the record explains what happened.
    */
   private async resolveAutoModelRouting(
     prompt: string,
     options: ResolvedSendMessageOptions,
+    dimensions: AutoModelRoutingDimensions,
     fileParts: FilePart[] | undefined,
     signal: AbortSignal | undefined
   ): Promise<ResolvedSendMessageOptions> {
@@ -7010,9 +7033,9 @@ export class AgentSession {
       },
     });
     if (!this.autoModelRouter) {
-      return fallback({ status: "fallback", reason: "Classifier unavailable in this session" });
+      return fallback({ status: "fallback", reason: "Evaluator unavailable in this session" });
     }
-    // An attachment-only send gives the classifier nothing to judge; skip the paid round-trip.
+    // An attachment-only send gives the evaluator nothing to judge; skip the paid round-trip.
     if (prompt.length === 0) {
       return fallback({
         status: "fallback",
@@ -7020,21 +7043,28 @@ export class AgentSession {
       });
     }
 
-    const { tiers } = normalizeAutoModelRoutingConfig(
+    const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
       this.config.loadConfigOrDefault().autoModelRouting
     );
-    // Without a mapped model or thinking level no answer can change the turn, so skip the
-    // paid round-trip.
-    if (tiers.every((tier) => tier.model == null && tier.thinkingLevel == null)) {
+    // Only the opted-in dimensions can change the turn; without a mapped tier in one
+    // of them no answer matters, so skip the paid round-trip.
+    const routable = (tier: AutoModelRoutingTier) => ({
+      model: dimensions.model && tier.model != null,
+      thinkingLevel: dimensions.thinkingLevel && tier.thinkingLevel != null,
+    });
+    if (tiers.every((tier) => !routable(tier).model && !routable(tier).thinkingLevel)) {
       return fallback({
         status: "fallback",
-        reason: "No difficulty tier has a model or thinking level mapped",
+        reason: dimensions.model
+          ? "No difficulty tier has a model mapped"
+          : "No difficulty tier has a thinking level mapped",
       });
     }
     const decision = await this.autoModelRouter.classify({
       prompt,
       recentUserMessages: await this.collectRecentUserPrompts(),
       tiers,
+      evaluationModel,
       signal,
     });
     if (!decision.success) {
@@ -7044,13 +7074,16 @@ export class AgentSession {
     const provenance = {
       tierId: decision.data.tierId,
       tierLabel: chosen?.label ?? decision.data.tierId,
-      confidence: decision.data.confidence,
-      probabilities: decision.data.probabilities,
+      ...(decision.data.confidence != null ? { confidence: decision.data.confidence } : {}),
+      ...(decision.data.probabilities != null
+        ? { probabilities: decision.data.probabilities }
+        : {}),
     };
-    if (!chosen || (chosen.model == null && chosen.thinkingLevel == null)) {
+    const applies = chosen ? routable(chosen) : { model: false, thinkingLevel: false };
+    if (!chosen || (!applies.model && !applies.thinkingLevel)) {
       return fallback({ ...provenance, status: "unmapped-tier" });
     }
-    if (chosen.model != null) {
+    if (applies.model && chosen.model != null) {
       // The send-time checks only saw the composer model: every attachment the request
       // carries (this turn's and earlier ones still in the window) must fit the tier
       // model, and a budgeted goal must not spend on a model it cannot price.
@@ -7085,16 +7118,23 @@ export class AgentSession {
         }
       }
     }
-    // A tier without a model keeps the composer model and only changes the thinking level.
-    const model = chosen.model ?? options.model;
+    // A dimension the composer kept concrete (or the tier left unmapped) stays as sent.
+    const model = applies.model && chosen.model != null ? chosen.model : options.model;
+    const thinkingLevel =
+      applies.thinkingLevel && chosen.thinkingLevel != null
+        ? chosen.thinkingLevel
+        : options.thinkingLevel;
     return {
       ...options,
       model,
-      thinkingLevel: chosen.thinkingLevel ?? options.thinkingLevel,
+      thinkingLevel,
       autoModelRoutingRecord: {
         ...provenance,
         requestedFallbackModel: options.model,
         model,
+        ...(applies.thinkingLevel && chosen.thinkingLevel != null
+          ? { thinkingLevel: chosen.thinkingLevel }
+          : {}),
         status: "routed",
       },
     };
@@ -7184,12 +7224,15 @@ export class AgentSession {
   private async applyAutoRoutedResume(
     options: SendMessageOptions
   ): Promise<ResolvedSendMessageOptions> {
-    const { autoModelRouting, ...resumeOptions } = options;
+    const { autoModelRouting, autoThinkingLevel, ...resumeOptions } = options;
     const lastUserRow = await this.findLastUserRow();
-    const record = lastUserRow?.metadata?.autoModelRouting;
     // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
-    if (record == null || typeof record.model !== "string") return resumeOptions;
-    if (autoModelRouting !== true) {
+    const parsedRecord = AutoModelRoutingRecordSchema.safeParse(
+      lastUserRow?.metadata?.autoModelRouting
+    );
+    if (!parsedRecord.success) return resumeOptions;
+    const record = parsedRecord.data;
+    if (autoModelRouting !== true && autoThinkingLevel !== true) {
       // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
       return modelSelectionEqualityKey(resumeOptions.model) ===
         modelSelectionEqualityKey(record.model)

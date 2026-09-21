@@ -15,6 +15,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { RecursivePartial } from "@/browser/testUtils";
 import {
+  getAutoThinkingLevelKey,
   getModelKey,
   getProjectScopeId,
   getReasoningModeKey,
@@ -738,5 +739,36 @@ describe("ThinkingContext", () => {
     await waitFor(() => {
       expect(view.getByTestId("thinking-project").textContent).toBe("low");
     });
+  });
+
+  test("a concrete pick via setter or keybind leaves Auto thinking routing", async () => {
+    const projectPath = "/Users/dev/auto-thinking";
+    const scopeId = getProjectScopeId(projectPath);
+    updatePersistedState(getModelKey(scopeId), "openai:gpt-4.1");
+    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+
+    const view = renderWithAPI(
+      <ThinkingProvider projectPath={projectPath}>
+        <ThinkingSetterComponent />
+      </ThinkingProvider>
+    );
+
+    const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
+    act(() => {
+      button.click();
+    });
+    await waitFor(() => {
+      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+    }, METADATA_WAIT_OPTIONS);
+
+    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+    act(() => {
+      window.dispatchEvent(
+        new window.KeyboardEvent("keydown", { key: "T", ctrlKey: true, shiftKey: true })
+      );
+    });
+    await waitFor(() => {
+      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+    }, METADATA_WAIT_OPTIONS);
   });
 });

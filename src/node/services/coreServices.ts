@@ -25,6 +25,7 @@ import type { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ProviderService } from "@/node/services/providerService";
 import type { AIService } from "@/node/services/aiService";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import type { StreamManager } from "@/node/services/streamManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -82,6 +83,7 @@ export interface CoreServices {
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
+  autoModelRouter: AutoModelRouter;
   backgroundProcessManager: BackgroundProcessManager;
   sessionUsageService: SessionUsageService;
   workspaceGoalService: WorkspaceGoalService;

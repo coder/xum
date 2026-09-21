@@ -1253,7 +1253,27 @@ export const AutoModelRoutingBadges: AppStory = {
               requestedFallbackModel: "anthropic:claude-opus-4-6",
               model: "anthropic:claude-opus-4-6",
               status: "fallback",
-              reason: "Classifier returned HTTP 429",
+              reason: "Evaluation model returned HTTP 429",
+            }
+          ),
+          createUserMessage("msg-7", "Why does the retry loop double-count?", {
+            historySequence: 7,
+            timestamp: STABLE_TIMESTAMP - 4000,
+          }),
+          // Thinking-only routing: the composer model stays, Auto set the effort.
+          withRouting(
+            createAssistantMessage("msg-8", "The counter increments before the guard.", {
+              historySequence: 8,
+              timestamp: STABLE_TIMESTAMP - 2000,
+              model: "anthropic:claude-opus-4-6",
+            }),
+            {
+              requestedFallbackModel: "anthropic:claude-opus-4-6",
+              tierId: "hard",
+              tierLabel: "Hard",
+              model: "anthropic:claude-opus-4-6",
+              thinkingLevel: "high",
+              status: "routed",
             }
           ),
         ];
@@ -1265,7 +1285,7 @@ export const AutoModelRoutingBadges: AppStory = {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     await waitFor(() => {
       const badges = storyRoot.querySelectorAll("[data-auto-model-routing-badge]");
-      if (badges.length !== 3) throw new Error(`Expected 3 routing badges, saw ${badges.length}`);
+      if (badges.length !== 4) throw new Error(`Expected 4 routing badges, saw ${badges.length}`);
     });
   },
 };

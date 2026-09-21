@@ -281,7 +281,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
     name: "Auto model routing",
     description:
-      "Add an Auto entry to the composer model selector. Prompts sent with Auto are classified by difficulty with TypeSafe's Jev and run on the model mapped to the chosen tier",
+      "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
     enabledByDefault: false,
     showInSettings: true,
   },

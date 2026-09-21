@@ -17,22 +17,30 @@ import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { formatPercent } from "@/browser/features/Messages/AutoModelRoutingBadge";
 import {
   getDefaultAutoModelRoutingConfig,
-  type AutoModelRoutingApiKeySource,
+  isAutoModelRoutingEvaluationModel,
+  splitAutoModelRoutingEvaluationModel,
+  type AutoModelRoutingEvaluationStatus,
   type AutoModelRoutingTier,
 } from "@/common/types/autoModelRouting";
 import { THINKING_LEVELS, isThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 import {
+  AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS,
   AUTO_MODEL_ROUTING_MAX_DESCRIPTION_CHARS,
   AUTO_MODEL_ROUTING_MAX_LABEL_CHARS,
   AUTO_MODEL_ROUTING_MAX_TIERS,
   AUTO_MODEL_ROUTING_MIN_TIERS,
+  AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT,
+  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+  TYPESAFE_API_KEY_ENV_VARS,
   TYPESAFE_PROVIDER_KEY,
 } from "@/constants/autoModelRouting";
 
 const INHERIT_THINKING = "inherit";
 const TIER_TEXT_COMMIT_DEBOUNCE_MS = 500;
+const SUPPORTED_EVALUATION_PROVIDERS = AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS.join(", ");
+const EVALUATION_MODEL_ERROR = `Enter provider:model using one of ${SUPPORTED_EVALUATION_PROVIDERS}`;
 
 type TierTextField = "label" | "description";
 type TierTextDraft = Record<TierTextField, string>;
@@ -40,23 +48,11 @@ type TierTextDraft = Record<TierTextField, string>;
 interface RoutingPreview {
   tierId: string;
   tierLabel: string;
-  confidence: number;
-  probabilities: Record<string, number>;
+  confidence?: number;
+  probabilities?: Record<string, number>;
+  evaluationModel: string;
   model?: string;
   thinkingLevel?: string;
-}
-
-function describeKeySource(source: AutoModelRoutingApiKeySource): string {
-  switch (source) {
-    case "config":
-      return "Stored in providers.jsonc";
-    case "file":
-      return "Read from the apiKeyFile configured in providers.jsonc";
-    case "env":
-      return "Using TYPESAFE_API_KEY or JEV_API_KEY from the environment";
-    case "none":
-      return "No key configured; Auto falls back to the selected model";
-  }
 }
 
 function nextTierId(tiers: AutoModelRoutingTier[]): string {
@@ -84,31 +80,45 @@ export function AutoModelRoutingExperimentConfig() {
   tiersRef.current = tiers;
   const commitTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
+  // null means "not editing": the field shows the saved evaluation model.
+  const [evaluationDraft, setEvaluationDraft] = useState<string | null>(null);
+  const evaluationValue = (evaluationDraft ?? config.evaluationModel).trim();
+  const evaluationValid = isAutoModelRoutingEvaluationModel(evaluationValue);
+  const [evaluationStatus, setEvaluationStatus] = useState<AutoModelRoutingEvaluationStatus | null>(
+    null
+  );
+  const evaluationProvider = evaluationValid
+    ? splitAutoModelRoutingEvaluationModel(evaluationValue).provider
+    : null;
+
   const [keyDraft, setKeyDraft] = useState("");
-  const [keySource, setKeySource] = useState<AutoModelRoutingApiKeySource | null>(null);
   const [keyError, setKeyError] = useState<string | null>(null);
   const [keyBusy, setKeyBusy] = useState(false);
+  // Bumped after a key write so the status effect re-checks the same evaluation model.
+  const [statusRefresh, setStatusRefresh] = useState(0);
 
   const [samplePrompt, setSamplePrompt] = useState("");
   const [preview, setPreview] = useState<RoutingPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);
 
+  // The status follows the field as typed, not the saved value, so the user sees
+  // whether a candidate evaluator is usable before committing it.
   useEffect(() => {
-    if (!api) return;
+    if (!api || !evaluationValid) return;
     let cancelled = false;
     api.config
-      .getAutoModelRoutingClassifierStatus()
+      .getAutoModelRoutingEvaluationStatus({ evaluationModel: evaluationValue })
       .then((status) => {
-        if (!cancelled) setKeySource(status.apiKeySource);
+        if (!cancelled) setEvaluationStatus(status);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [api]);
+  }, [api, evaluationValid, evaluationValue, statusRefresh]);
 
-  const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ tiers: next });
+  const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
   const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
     replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, ...patch } : tier)));
   const moveTier = (index: number, delta: -1 | 1) => {
@@ -146,11 +156,9 @@ export function AutoModelRoutingExperimentConfig() {
     if (validateText(id, field, value)) return;
     clearTextDraft(id, field);
     setTextError(id, field, null);
-    setConfig({
-      tiers: tiersRef.current.map((tier) =>
-        tier.id === id ? { ...tier, [field]: value.trim() } : tier
-      ),
-    });
+    replaceTiers(
+      tiersRef.current.map((tier) => (tier.id === id ? { ...tier, [field]: value.trim() } : tier))
+    );
   };
   const handleTextChange = (id: string, field: TierTextField, value: string) => {
     setTextDrafts((prev) => ({ ...prev, [id]: { ...prev[id], [field]: value } }));
@@ -186,6 +194,19 @@ export function AutoModelRoutingExperimentConfig() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount-only flush
   }, []);
 
+  const commitEvaluationModel = () => {
+    if (evaluationDraft === null) return;
+    if (!evaluationValid) {
+      // An invalid draft never reaches the backend; blur reverts to the saved value.
+      setEvaluationDraft(null);
+      return;
+    }
+    setEvaluationDraft(null);
+    if (evaluationValue !== config.evaluationModel) {
+      setConfig({ ...config, evaluationModel: evaluationValue });
+    }
+  };
+
   const writeKey = async (value: string) => {
     if (!api) return;
     setKeyBusy(true);
@@ -201,8 +222,7 @@ export function AutoModelRoutingExperimentConfig() {
         return;
       }
       setKeyDraft("");
-      const status = await api.config.getAutoModelRoutingClassifierStatus();
-      setKeySource(status.apiKeySource);
+      setStatusRefresh((count) => count + 1);
     } catch (error) {
       setKeyError(getErrorMessage(error));
     } finally {
@@ -234,65 +254,119 @@ export function AutoModelRoutingExperimentConfig() {
     );
   }
 
+  const evaluationStatusText = !evaluationValid
+    ? EVALUATION_MODEL_ERROR
+    : evaluationStatus?.evaluationModel !== evaluationValue
+      ? "Checking evaluation model..."
+      : evaluationStatus.available
+        ? "Ready to classify prompts"
+        : (evaluationStatus.reason ?? "Evaluation model unavailable");
+
   return (
     <div className="bg-background-secondary space-y-4 px-4 py-3" data-auto-model-routing-config>
       <p className="text-muted text-xs">
-        When Auto is selected, the prompt and up to three of your previous prompts in the workspace
-        are sent to TypeSafe (api.typesafe.ai) for classification.
+        Choose Auto for the model, the thinking level, or both in the composer. Each prompt (with up
+        to {AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT} of your previous prompts in the workspace) is
+        sent to the evaluation model, which picks a difficulty tier. The turn then runs on that
+        tier&apos;s model and/or thinking level, whichever you set to Auto.
       </p>
 
       <div className="space-y-2">
-        <div className="text-foreground text-sm">TypeSafe API key</div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Input
-            aria-label="TypeSafe API key"
-            type="password"
-            autoComplete="off"
-            value={keyDraft}
-            placeholder="Paste a TypeSafe API key"
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-              setKeyDraft(event.target.value)
-            }
-            className="border-border-medium bg-modal-bg h-9 flex-1"
-          />
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              size="sm"
-              disabled={keyBusy || keyDraft.trim().length === 0}
-              onClick={() => void writeKey(keyDraft.trim())}
-            >
-              Save
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={keyBusy || keySource !== "config"}
-              onClick={() => void writeKey("")}
-            >
-              Clear
-            </Button>
-          </div>
+        <label className="text-foreground block text-sm" htmlFor="auto-model-routing-evaluation">
+          Evaluation model
+        </label>
+        <Input
+          id="auto-model-routing-evaluation"
+          aria-invalid={!evaluationValid}
+          autoComplete="off"
+          spellCheck={false}
+          value={evaluationDraft ?? config.evaluationModel}
+          placeholder={DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL}
+          onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+            setEvaluationDraft(event.target.value)
+          }
+          onBlur={commitEvaluationModel}
+          onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === "Enter") commitEvaluationModel();
+            if (event.key === "Escape") setEvaluationDraft(null);
+          }}
+          className="border-border-medium bg-modal-bg h-9 w-full font-mono text-xs"
+        />
+        <div className="text-muted text-xs">
+          provider:model with one of {SUPPORTED_EVALUATION_PROVIDERS}. The {TYPESAFE_PROVIDER_KEY}{" "}
+          key comes from the {TYPESAFE_PROVIDER_KEY} entry in providers.jsonc or{" "}
+          {TYPESAFE_API_KEY_ENV_VARS.join(", ")}; other providers use their Providers settings.
         </div>
-        <div className="text-muted text-xs" data-auto-model-routing-key-status>
-          {keySource ? describeKeySource(keySource) : "Checking key status..."}
+        <div
+          className={
+            evaluationValid && evaluationStatus?.available !== false
+              ? "text-muted text-xs"
+              : "text-danger-light text-xs"
+          }
+          data-auto-model-routing-evaluation-status
+        >
+          {evaluationStatusText}
         </div>
-        {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
       </div>
+
+      {evaluationProvider === TYPESAFE_PROVIDER_KEY ? (
+        <div className="space-y-2">
+          <div className="text-foreground text-sm">TypeSafe API key</div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Input
+              aria-label="TypeSafe API key"
+              type="password"
+              autoComplete="off"
+              value={keyDraft}
+              placeholder="Paste a TypeSafe API key"
+              onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+                setKeyDraft(event.target.value)
+              }
+              onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+                if (event.key === "Enter" && keyDraft.trim().length > 0) {
+                  void writeKey(keyDraft.trim());
+                }
+              }}
+              className="border-border-medium bg-modal-bg h-9 min-w-0 flex-1"
+            />
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                size="sm"
+                disabled={keyBusy || keyDraft.trim().length === 0}
+                onClick={() => void writeKey(keyDraft.trim())}
+              >
+                Save
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={keyBusy}
+                onClick={() => void writeKey("")}
+              >
+                Clear
+              </Button>
+            </div>
+          </div>
+          {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
+        </div>
+      ) : null}
 
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
           <div>
             <div className="text-foreground text-sm">Difficulty tiers</div>
             <div className="text-muted text-xs">
-              Ordered easiest to hardest. Jev picks one tier per prompt from these descriptions.
+              Ordered easiest to hardest. The evaluation model picks one tier per prompt from these
+              descriptions; each tier maps to a model, a thinking level, or both.
             </div>
           </div>
           <Button
             type="button"
             size="sm"
             variant="ghost"
+            className="shrink-0"
             onClick={() => replaceTiers(getDefaultAutoModelRoutingConfig().tiers)}
           >
             <RotateCcw aria-hidden="true" />
@@ -453,7 +527,7 @@ export function AutoModelRoutingExperimentConfig() {
         </Button>
         {writeError ? (
           <div className="text-danger-light text-xs" data-auto-model-routing-write-error>
-            Could not save tiers: {writeError}
+            Could not save routing settings: {writeError}
           </div>
         ) : null}
       </div>
@@ -463,7 +537,7 @@ export function AutoModelRoutingExperimentConfig() {
         <textarea
           aria-label="Sample prompt"
           value={samplePrompt}
-          placeholder="Paste a prompt to see which tier Jev would choose"
+          placeholder="Paste a prompt to see which tier the evaluation model would choose"
           rows={3}
           onChange={(event) => setSamplePrompt(event.target.value)}
           className="border-border-medium bg-modal-bg text-foreground placeholder:text-muted w-full rounded border px-2 py-1 text-xs outline-none"
@@ -487,17 +561,25 @@ export function AutoModelRoutingExperimentConfig() {
         {preview ? (
           <div className="text-xs" data-auto-model-routing-preview>
             <div className="text-foreground">
-              {preview.tierLabel} ({formatPercent(preview.confidence)} confidence)
+              {preview.tierLabel}
+              {preview.confidence != null
+                ? ` (${formatPercent(preview.confidence)} confidence)`
+                : ""}
               {preview.model
                 ? ` on ${formatModelStringForDisplay(preview.model)}`
                 : " (no model mapped; the composer model would be used)"}
               {preview.thinkingLevel ? `, thinking ${preview.thinkingLevel}` : ""}
             </div>
+            {preview.probabilities ? (
+              <div className="text-muted">
+                {Object.entries(preview.probabilities)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([tierId, probability]) => `${tierId}: ${formatPercent(probability)}`)
+                  .join(", ")}
+              </div>
+            ) : null}
             <div className="text-muted">
-              {Object.entries(preview.probabilities)
-                .sort(([, a], [, b]) => b - a)
-                .map(([tierId, probability]) => `${tierId}: ${formatPercent(probability)}`)
-                .join(", ")}
+              Evaluated by {formatModelStringForDisplay(preview.evaluationModel)}
             </div>
           </div>
         ) : null}

@@ -35,7 +35,7 @@ import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tas
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
-  type AutoModelRoutingConfig,
+  type AutoModelRoutingConfigInput,
 } from "@/common/types/autoModelRouting";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
@@ -2696,7 +2696,7 @@ export class Config {
     }));
   }
 
-  async updateAutoModelRouting(autoModelRouting: AutoModelRoutingConfig): Promise<void> {
+  async updateAutoModelRouting(autoModelRouting: AutoModelRoutingConfigInput): Promise<void> {
     const normalized = normalizeAutoModelRoutingConfig(autoModelRouting);
     await this.editConfig((config) => ({ ...config, autoModelRouting: normalized }));
   }

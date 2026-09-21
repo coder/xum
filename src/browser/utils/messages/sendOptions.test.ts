@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoModelRoutingKey, getModelKey } from "@/common/constants/storage";
+import {
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
+  getModelKey,
+} from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
@@ -52,6 +56,22 @@ describe("getSendOptionsFromStorage", () => {
       );
     }
   );
+
+  test.each([
+    { experiment: true, model: true, thinking: false },
+    { experiment: true, model: false, thinking: true },
+    { experiment: false, model: true, thinking: true },
+  ])("routes the model and thinking dimensions independently (%j)", (input) => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), input.experiment);
+    updatePersistedState(getAutoModelRoutingKey("ws-dims"), input.model);
+    updatePersistedState(getAutoThinkingLevelKey("ws-dims"), input.thinking);
+    const options = getSendOptionsFromStorage("ws-dims");
+    expect(options.autoModelRouting).toBe(input.experiment && input.model ? true : undefined);
+    expect(options.autoThinkingLevel).toBe(input.experiment && input.thinking ? true : undefined);
+    expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).thinkingLevel).toBe(
+      options.thinkingLevel
+    );
+  });
 
   test.each([true, false])("preserves explicit continuous compaction overrides (%s)", (enabled) => {
     expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBeUndefined();
