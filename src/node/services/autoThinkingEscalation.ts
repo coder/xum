@@ -28,6 +28,13 @@ export interface AutoThinkingEscalationState {
   level: ThinkingLevel;
   /** Tool steps already judged by an earlier raise; they never count toward the next one. */
   stepsJudged: number;
+  /**
+   * Raises carried from an earlier stream of this turn judged steps that a resume still has
+   * in its transcript but a compaction follow-up does not (it starts behind a new boundary).
+   * Until the first proposal sees the transcript, `stepsJudged` is the carried count and is
+   * then clamped to the steps actually present.
+   */
+  judgedStepsCarried: boolean;
   /** Set once a raise could not be applied (model ceiling); later steps stop trying. */
   exhausted: boolean;
   escalations: AutoModelRoutingEscalation[];
@@ -37,14 +44,24 @@ export interface AutoThinkingEscalationState {
 
 /**
  * `escalations` seeds the per-turn cap from raises an earlier stream of the same turn
- * already applied (a resume or compaction follow-up carries them on its record).
+ * already applied (a resume or compaction follow-up carries them on its record), and the
+ * judged-step boundary from the last raise (each records the step it applied to), so the
+ * steps that earned an earlier raise cannot earn the next one again.
  */
 export function createAutoThinkingEscalationState(
   level: ThinkingLevel,
   escalations: AutoModelRoutingEscalation[],
   onEscalated: AutoThinkingEscalationState["onEscalated"]
 ): AutoThinkingEscalationState {
-  return { level, stepsJudged: 0, exhausted: false, escalations, onEscalated };
+  const lastRaise = escalations.at(-1);
+  return {
+    level,
+    stepsJudged: lastRaise ? lastRaise.step - 1 : 0,
+    judgedStepsCarried: lastRaise != null,
+    exhausted: false,
+    escalations,
+    onEscalated,
+  };
 }
 
 /** One model step of the current turn that called tools: its calls and how they ended. */
@@ -162,6 +179,10 @@ export function proposeAutoThinkingEscalation(
     return undefined;
   }
   const steps = collectTurnToolSteps(stepMessages);
+  if (state.judgedStepsCarried) {
+    state.stepsJudged = Math.min(state.stepsJudged, steps.length);
+    state.judgedStepsCarried = false;
+  }
   const reason = detectStuckReason(steps.slice(state.stepsJudged));
   if (reason == null) return undefined;
   const to = nextThinkingLevel(state.level);

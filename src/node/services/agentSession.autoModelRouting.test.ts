@@ -1461,6 +1461,54 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("a resume under model Auto continues on the refusal fallback model the interrupted turn ran on", async () => {
+    const { session, streamMessage, historyService } = await createHarness({
+      experimentEnabled: true,
+      classify: () => Promise.resolve(Ok(decision("hard"))),
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+    const routed = streamMessage.mock.calls[0]?.[0]?.autoModelRouting;
+    expect(routed?.model).toBe(HARD_MODEL);
+    if (routed == null) throw new Error("Expected a routing record on the first stream");
+
+    // The tier model refused and a configured fallback continued the answer: the assistant row
+    // records the model that actually ran, the user row still names the tier model.
+    const fallbackModel = "openai:gpt-4.1";
+    const interrupted = createMuxMessage("assistant-interrupted", "assistant", "half an answer", {
+      timestamp: Date.now(),
+      partial: true,
+      autoModelRouting: { ...routed, model: fallbackModel },
+      modelFallback: { requestedModel: HARD_MODEL, refusedModels: [HARD_MODEL] },
+    });
+    expect((await historyService.appendToHistory("ws-auto-routing", interrupted)).success).toBe(
+      true
+    );
+
+    await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    // Continue runs on the fallback, not on the model that already refused, and the record
+    // keeps describing that run.
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe(fallbackModel);
+    expect(resumeOptions?.autoModelRouting).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+      model: fallbackModel,
+    });
+  });
+
   it.each([
     ["the level that ran keeps the record without its thinking claim", "high", true],
     ["a different level drops the record", "low", false],

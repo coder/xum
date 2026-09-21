@@ -175,6 +175,46 @@ describe("proposeAutoThinkingEscalation", () => {
     expect(proposeAutoThinkingEscalation(state, messages)).toBeUndefined();
   });
 
+  it("does not let the steps that earned a carried raise earn the next one on a resume", () => {
+    // The interrupted stream raised at step 4 over steps 1-3, which the resumed request
+    // still carries in its transcript.
+    const carried: AutoModelRoutingEscalation[] = [
+      { step: 4, from: "low", to: "medium", reason: "r" },
+    ];
+    const state = createAutoThinkingEscalationState("medium", carried, () => undefined);
+    const messages: ModelMessage[] = [
+      { role: "user", content: "go" },
+      ...failingBash("a"),
+      ...failingBash("b"),
+      ...failingBash("c"),
+    ];
+    expect(proposeAutoThinkingEscalation(state, messages)).toBeUndefined();
+
+    // Three fresh failures after the resume qualify again.
+    messages.push(...failingBash("d"), ...failingBash("e"), ...failingBash("f"));
+    expect(proposeAutoThinkingEscalation(state, messages)).toMatchObject({
+      from: "medium",
+      to: "high",
+      step: 7,
+    });
+  });
+
+  it("starts counting fresh when a compaction follow-up carries a raise but none of its steps", () => {
+    const carried: AutoModelRoutingEscalation[] = [
+      { step: 4, from: "low", to: "medium", reason: "r" },
+    ];
+    const state = createAutoThinkingEscalationState("medium", carried, () => undefined);
+    // Behind the new boundary the follow-up's first proposal sees no earlier tool steps.
+    const messages: ModelMessage[] = [{ role: "user", content: "Continue" }];
+    expect(proposeAutoThinkingEscalation(state, messages)).toBeUndefined();
+    messages.push(...failingBash("a"), ...failingBash("b"), ...failingBash("c"));
+    expect(proposeAutoThinkingEscalation(state, messages)).toMatchObject({
+      from: "medium",
+      to: "high",
+      step: 4,
+    });
+  });
+
   it("marks itself exhausted at the top of the ladder instead of proposing", () => {
     const state = createAutoThinkingEscalationState("max", [], () => undefined);
     const messages: ModelMessage[] = [

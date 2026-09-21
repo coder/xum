@@ -7367,28 +7367,30 @@ export class AgentSession {
       lastUserRow?.metadata?.autoModelRouting
     );
     if (!parsedRecord.success) return resumeOptions;
-    const record = parsedRecord.data;
     const retry = lastUserRow?.metadata?.retrySendOptions;
-    // An interrupted turn may have raised its Auto-set thinking level mid-way; the raises live
-    // on the assistant row it left behind, not on the user row. Under thinking Auto the resume
-    // continues at the raised level and keeps the raises, so the badge and the per-turn cap
-    // count them.
+    // The user row only knows the pre-stream decision. What the turn actually ran on is on the
+    // assistant row it left behind: a refusal fallback corrected the model there, and the
+    // raises of an Auto-set thinking level accumulated there. Under Auto the resume continues
+    // on that (the fallback model rather than the one that refused, the raised level with its
+    // raises), so the badge and the per-turn cap describe the run.
     const interruptedRow = lastUserRow
       ? rows.slice(rows.indexOf(lastUserRow) + 1).findLast((row) => row.role === "assistant")
       : undefined;
     const interruptedRecord = AutoModelRoutingRecordSchema.safeParse(
       interruptedRow?.metadata?.autoModelRouting
     );
-    const escalations = interruptedRecord.success ? interruptedRecord.data.escalations : undefined;
+    const record = interruptedRecord.success ? interruptedRecord.data : parsedRecord.data;
     const model =
       autoModelRouting === true
-        ? typeof retry?.model === "string"
-          ? retry.model
-          : record.model
+        ? interruptedRecord.success
+          ? record.model
+          : typeof retry?.model === "string"
+            ? retry.model
+            : record.model
         : resumeOptions.model;
     const thinkingLevel =
       autoThinkingLevel === true
-        ? (escalations?.at(-1)?.to ??
+        ? (record.escalations?.at(-1)?.to ??
           coerceThinkingLevel(retry?.thinkingLevel) ??
           record.thinkingLevel ??
           resumeOptions.thinkingLevel)
@@ -7404,12 +7406,14 @@ export class AgentSession {
         autoThinkingLevel === true ||
         record.thinkingLevel == null ||
         thinkingLevel === record.thinkingLevel);
-    // The record's thinkingLevel means "Auto set it"; a concrete pick on resume replaces it.
-    const { thinkingLevel: _routedThinkingLevel, ...recordWithoutThinking } = record;
-    const resumedRecord =
-      autoThinkingLevel === true
-        ? { ...record, ...(escalations?.length ? { escalations } : {}) }
-        : recordWithoutThinking;
+    // The record's thinkingLevel (and the raises that followed it) means "Auto set it"; a
+    // concrete pick on resume replaces it.
+    const {
+      thinkingLevel: _routedThinkingLevel,
+      escalations: _raises,
+      ...recordWithoutThinking
+    } = record;
+    const resumedRecord = autoThinkingLevel === true ? record : recordWithoutThinking;
     return {
       ...resumeOptions,
       model,
