@@ -13,8 +13,9 @@ import {
   AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS,
   AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT,
   AUTO_MODEL_ROUTING_RECENT_MESSAGE_MAX_CHARS,
+  TYPESAFE_API_BASE_URL,
   TYPESAFE_PROVIDER_KEY,
-  TYPESAFE_SYSTEM_ONE_URL,
+  TYPESAFE_SYSTEM_ONE_PATH,
 } from "@/constants/autoModelRouting";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
@@ -53,9 +54,10 @@ export interface AutoModelRouterDeps {
   providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig">;
   /**
    * Prompts are third-party egress, so provider policy gates the classifier like any
-   * provider model: `typesafe` must be listed and its `model_access` must admit the classifier.
+   * provider model: `typesafe` must be listed, its `model_access` must admit the
+   * classifier, and a forced `base_url` redirects the request.
    */
-  policyService?: Pick<PolicyService, "isEnforced" | "isModelAllowed">;
+  policyService?: Pick<PolicyService, "isEnforced" | "isModelAllowed" | "getForcedBaseUrl">;
   env?: Record<string, string | undefined>;
   fetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
@@ -79,15 +81,18 @@ export class AutoModelRouter {
     if (input.tiers.length < 2) {
       return Err("Auto model routing needs at least two tiers");
     }
+    const enforcedPolicy = this.deps.policyService?.isEnforced()
+      ? this.deps.policyService
+      : undefined;
     if (
-      this.deps.policyService?.isEnforced() &&
-      !this.deps.policyService.isModelAllowed(
-        TYPESAFE_PROVIDER_KEY,
-        AUTO_MODEL_ROUTING_CLASSIFIER_MODEL
-      )
+      enforcedPolicy &&
+      !enforcedPolicy.isModelAllowed(TYPESAFE_PROVIDER_KEY, AUTO_MODEL_ROUTING_CLASSIFIER_MODEL)
     ) {
       return Err("Provider policy does not allow TypeSafe");
     }
+    const baseUrl =
+      enforcedPolicy?.getForcedBaseUrl(TYPESAFE_PROVIDER_KEY) ?? TYPESAFE_API_BASE_URL;
+    const url = baseUrl.replace(/\/+$/, "") + TYPESAFE_SYSTEM_ONE_PATH;
     const resolved = this.resolveApiKey();
     if (resolved.kind !== "resolved") {
       return Err("No TypeSafe API key configured");
@@ -117,7 +122,7 @@ export class AutoModelRouter {
     const doFetch = this.deps.fetch ?? ((url, init) => fetch(url, init));
     let response: Response;
     try {
-      response = await doFetch(TYPESAFE_SYSTEM_ONE_URL, {
+      response = await doFetch(url, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${resolved.apiKey}`,

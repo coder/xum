@@ -162,6 +162,7 @@ describe("AutoModelRouter.classify", () => {
       policyService: {
         isEnforced: () => true,
         isModelAllowed: (provider) => provider !== "typesafe",
+        getForcedBaseUrl: () => undefined,
       },
     });
 
@@ -179,6 +180,7 @@ describe("AutoModelRouter.classify", () => {
         isEnforced: () => true,
         isModelAllowed: (provider, modelId) =>
           provider === TYPESAFE_PROVIDER_KEY && modelId !== AUTO_MODEL_ROUTING_CLASSIFIER_MODEL,
+        getForcedBaseUrl: () => undefined,
       },
     });
 
@@ -186,6 +188,23 @@ describe("AutoModelRouter.classify", () => {
 
     expect(result).toEqual({ success: false, error: "Provider policy does not allow TypeSafe" });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("posts to the policy-forced TypeSafe base URL when policy is enforced", async () => {
+    const { router, fetchMock } = createRouter({
+      providers: { [TYPESAFE_PROVIDER_KEY]: { apiKey: "sk-test" } },
+      policyService: {
+        isEnforced: () => true,
+        isModelAllowed: () => true,
+        getForcedBaseUrl: (provider) =>
+          provider === TYPESAFE_PROVIDER_KEY ? "https://proxy.example.test/typesafe/" : undefined,
+      },
+    });
+
+    const result = await router.classify({ prompt: "Rename a variable", tiers: TIERS });
+
+    expect(result.success).toBe(true);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://proxy.example.test/typesafe/systemone");
   });
 
   it("ignores a legacy custom chat provider stored under the typesafe id", async () => {

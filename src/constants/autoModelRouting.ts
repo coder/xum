@@ -4,7 +4,10 @@
  * choice and runs the turn on that tier's configured model.
  */
 
-export const TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone";
+/** Default API base; an enforced policy `base_url` for `typesafe` replaces it. */
+export const TYPESAFE_API_BASE_URL = "https://api.typesafe.ai/v1";
+export const TYPESAFE_SYSTEM_ONE_PATH = "/systemone";
+export const TYPESAFE_SYSTEM_ONE_URL = TYPESAFE_API_BASE_URL + TYPESAFE_SYSTEM_ONE_PATH;
 
 /**
  * providers.jsonc entry holding the TypeSafe credential. Deliberately not a
