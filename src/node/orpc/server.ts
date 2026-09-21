@@ -43,8 +43,7 @@ import {
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
 import { getErrorMessage } from "@/common/utils/errors";
-import { getXumHome } from "@/common/constants/paths";
-import { resolveHealthResponse } from "@/node/orpc/healthProbe";
+import { createHealthProbe } from "@/node/orpc/healthProbe";
 import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
 import { escapeHtml } from "@/node/utils/oauthUtils";
 import type { Result } from "@/common/types/result";
@@ -885,9 +884,16 @@ export async function createOrpcServer({
   // Health check. Must be registered ahead of express.static: serve-static stats
   // "<staticDir>/health" on every request before falling through, so a wedged libuv threadpool
   // used to hang this route before it could answer. Probe the fs on purpose instead, bounded,
-  // against the directory the server actually depends on, and report a stalled pool as 503.
+  // against the root the server actually depends on, and report a stalled pool as 503. Only the
+  // async stat may touch the filesystem here: resolving the root per request (getXumHome) runs
+  // synchronous stats on the main thread, which would block the event loop on the very stall
+  // this probe exists to report.
+  const probeHealth = createHealthProbe(
+    () => fs.stat(context.config.rootDir),
+    HEALTH_FS_PROBE_TIMEOUT_MS
+  );
   app.get("/health", async (_req, res) => {
-    const health = await resolveHealthResponse(fs.stat(getXumHome()), HEALTH_FS_PROBE_TIMEOUT_MS);
+    const health = await probeHealth();
     res.status(health.statusCode).json(health.body);
   });
 
