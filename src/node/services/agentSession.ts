@@ -10250,7 +10250,13 @@ export class AgentSession {
       if (removed != null) {
         this.emitQueuedMessageChanged();
         this.notifyQueuedMessageCleared(removed, refusal);
-        if (unsent != null && unsent.text.length > 0) {
+        // Attachment-only input has empty text but is still the user's unsent data.
+        if (
+          unsent != null &&
+          (unsent.text.length > 0 ||
+            (unsent.fileParts?.length ?? 0) > 0 ||
+            (unsent.reviews?.length ?? 0) > 0)
+        ) {
           this.emitChatEvent({
             type: "restore-to-input",
             workspaceId: this.workspaceId,

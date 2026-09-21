@@ -51,6 +51,7 @@ interface Internals {
   attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
   admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
+  workspaceStopRecords: Map<string, unknown>;
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
@@ -155,7 +156,21 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           const found = all.find((m) => m.id === workspaceId);
           return found ? Ok(found) : Err("not found");
         }),
-        streamMessage: mock(() => {
+        streamMessage: mock((opts: { workspaceId: string }) => {
+          // Only the child's streams are under test. The root shares this mocked AIService, and
+          // its terminal-attention wake (the `<mux_subagent_report>` delivery) would otherwise be
+          // counted as a second child stream whenever it lands before the assertions.
+          if (opts.workspaceId !== childId) {
+            return Promise.resolve(
+              Ok({
+                messageId: `root-${Date.now()}`,
+                completion: Promise.resolve({
+                  status: "aborted",
+                  abortReason: "user",
+                } as TurnCompletion),
+              })
+            );
+          }
           const completion = Promise.withResolvers<TurnCompletion>();
           completions.push(completion);
           streaming = true;
@@ -354,6 +369,35 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  test("an attachment-only manual follow-up refused after the report is handed back with its file parts (empty text is not a drop)", async () => {
+    const childId = "holdattachment01";
+    const stack = await createStack(childId);
+    const { taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      // Attachment-only sends are valid user input (AgentSession accepts files without text).
+      expect(
+        await workspaceService.sendMessage(childId, "", { ...sendOptions, fileParts })
+      ).toEqual(Ok(undefined));
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+      stack.endStream(0, { report: "done" }, true);
+      await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+      await yieldMacrotasks(5);
+      expect(completions).toHaveLength(1);
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      const restored = stack.restoreEvents();
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).toMatchObject({ workspaceId: childId, text: "", mode: "append" });
+      expect(restored[0].fileParts).toEqual(fileParts);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("a follow-up queued during a turn that was NOT the report is held and then dispatched under the same attempt, ahead of the recovery nudge", async () => {
     const childId = "holdcontinue001";
@@ -563,6 +607,133 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(outstanding(svc, childId).filter((send) => send.attemptId === attemptA)).toHaveLength(
         0
       );
+    } finally {
+      gate.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  /** Hold the decision pending (handler blocked past its `reported` write) with a manual follow-up held. */
+  async function holdWithQueuedFollowUp(
+    stack: Awaited<ReturnType<typeof createStack>>,
+    childId: string
+  ) {
+    const { config, taskService, svc, workspaceService, sessionHarness, sendOptions } = stack;
+    const gate = Promise.withResolvers<void>();
+    let blocked = false;
+    const emitOriginal = svc.emitWorkspaceMetadata.bind(taskService);
+    spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+      if (id === childId && entryOf(config, childId)?.taskStatus === "reported" && !blocked) {
+        blocked = true;
+        await gate.promise;
+      }
+      return emitOriginal(id);
+    });
+    expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+    const attemptA = entryOf(config, childId)!.taskAttemptId!;
+    expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(Ok(undefined));
+    const onCanceled = mock((_reason: string) => undefined);
+    expect(
+      await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+    ).toEqual(Ok(undefined));
+    stack.endStream(0, { report: "done" }, true);
+    await until(() => blocked, "handler blocked");
+    await until(() => !sessionHarness.session.isBusy(), "session idle");
+    await yieldMacrotasks(3);
+    // Held: still queued, obligation still enqueued, decision pending.
+    expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+    expect(outstanding(svc, childId).map((send) => send.state)).toEqual(["enqueued"]);
+    expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual(["pending"]);
+    return { gate, attemptA, onCanceled };
+  }
+
+  test("a user Stop on the child while the decision is pending: the held entry is cleared once (no dispatch), its text restored by the Stop itself, the obligation discharged, and the decision pruned once the handler settles", async () => {
+    const childId = "holdstopuser001";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+    const { gate, attemptA, onCanceled } = await holdWithQueuedFollowUp(stack, childId);
+    try {
+      // The session is idle with the entry held: the Stop's own queue restore hands the text back
+      // through the ordinary Stop path (replace, like any Stop) because the entry's token is not
+      // stale while the decision is pending — the hold never turns a Stop into a silent drop.
+      expect(await workspaceService.interruptStream(childId)).toEqual(Ok(undefined));
+      await yieldMacrotasks(3);
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      expect(stack.restoreEvents()).toHaveLength(1);
+      expect(stack.restoreEvents()[0]).toMatchObject({
+        workspaceId: childId,
+        text: "follow-up text",
+      });
+      expect(stack.restoreEvents()[0].mode).toBeUndefined();
+      expect(onCanceled).toHaveBeenCalledTimes(1);
+      expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
+      // The obligation is discharged by the clear; the decision still belongs to the handler.
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+        "pending",
+      ]);
+      expect(completions).toHaveLength(1);
+      // Handler resumes: publishes and releases A; no reader is left, so the decision is dropped.
+      gate.resolve();
+      await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
+      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      await yieldMacrotasks(5);
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "reported",
+        taskAttemptId: attemptA,
+      });
+      // Nothing dispatched under A, nothing handed back twice, no stop latch retained.
+      expect(completions).toHaveLength(1);
+      expect(streamStarts.map((start) => start.messageId)).toEqual(["assistant-1"]);
+      expect(stack.restoreEvents()).toHaveLength(1);
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+      // Sending the restored text again is a fresh admission that mints a new attempt.
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(false);
+      expect(entryOf(config, childId)?.taskAttemptId).not.toBe(attemptA);
+    } finally {
+      gate.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("the parent's cascade Stop while the decision is pending: the held entry is cleared once (no dispatch), the obligation discharged, the stop record released, the reported row preserved, and the decision pruned once the handler settles", async () => {
+    const childId = "holdstopcascade1";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+    const { gate, attemptA, onCanceled } = await holdWithQueuedFollowUp(stack, childId);
+    try {
+      // The row already reads `reported` (written before the handler blocked): the cascade
+      // preserves the completed report rather than marking it interrupted, and still latches the
+      // child, clears its queue and releases once its captured obligations are gone.
+      expect(await taskService.terminateAllDescendantAgentTasks(rootId)).toEqual([]);
+      await yieldMacrotasks(3);
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      // Cascade clears never restore input (a descendant stopped by its parent keeps no pending
+      // input); the callback is notified exactly once and the obligation discharged.
+      expect(stack.restoreEvents()).toHaveLength(0);
+      expect(onCanceled).toHaveBeenCalledTimes(1);
+      expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(svc.workspaceStopRecords.has(childId)).toBe(false);
+      expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+      expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+        "pending",
+      ]);
+      expect(completions).toHaveLength(1);
+      gate.resolve();
+      await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
+      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      await yieldMacrotasks(5);
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "reported",
+        taskAttemptId: attemptA,
+      });
+      expect(completions).toHaveLength(1);
+      expect(streamStarts.map((start) => start.messageId)).toEqual(["assistant-1"]);
+      expect(stack.restoreEvents()).toHaveLength(0);
+      expect(outstanding(svc, childId)).toHaveLength(0);
     } finally {
       gate.resolve();
       await stack.cleanup();
