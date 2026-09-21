@@ -17,6 +17,16 @@ import type * as RuntimeStatusStoreModuleType from "@/browser/stores/RuntimeStat
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealWorkspaceHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+
+// The heartbeat modal stub below replaces the modal's index module for the whole process.
+// When an earlier suite has already linked that index (WorkspaceMenuBar renders the real
+// modal), bun patches the live re-export binding, which also empties the modal's own module
+// and blanks WorkspaceHeartbeatModal.test.tsx. Restore the real exports once this suite ends.
+restoreModulesAfterSuite([
+  ["@/browser/components/WorkspaceHeartbeatModal", { ...RealWorkspaceHeartbeatModalModule }],
+]);
 import type {
   AgentRowRenderMeta,
   WorkspaceDelegatedActivity,
