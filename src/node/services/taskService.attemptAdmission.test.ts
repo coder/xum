@@ -2272,6 +2272,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           phase: "closing",
           source: "launch-failed",
         });
+        // `rotation` resolves inside stopStream, a few microtasks before the cascade's cleanup
+        // promise settles and hands its in-flight count back; the record cannot release while
+        // that cleanup is still counted, so wait for it before checking that only A's turn holds.
+        await waitForCondition(
+          () => svc.workspaceStopRecords.get(spawnedId)?.cleanupInFlight === 0
+        );
+        expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
         // Only A's turn settling releases the record and settles A; B's row stays as it was.
         liveTurn = undefined;
         host.settleTurn(spawnedId, racingTurn);
