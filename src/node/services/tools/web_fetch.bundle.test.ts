@@ -27,7 +27,6 @@ describe("web_fetch server bundle", () => {
         "--format=cjs",
         `--outfile=${bundlePath}`,
         "--external:@lydell/node-pty",
-        "--external:node-pty",
         "--external:electron",
         "--external:ssh2",
         "--alias:jsonc-parser=jsonc-parser/lib/esm/main.js",

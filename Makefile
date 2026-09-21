@@ -71,7 +71,7 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
@@ -89,7 +89,7 @@ include fmt.mk
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build test-storybook
 .PHONY: benchmark-terminal
-.PHONY: ensure-deps rebuild-native mux
+.PHONY: ensure-deps mux
 .PHONY: check-eager-imports check-bundle-size check-startup
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
@@ -135,13 +135,6 @@ node_modules/.installed: package.json bun.lock
 
 # Legacy target for backwards compatibility
 ensure-deps: node_modules/.installed
-
-# Rebuild native modules for Electron
-rebuild-native: node_modules/.installed ## Rebuild native modules (node-pty, DuckDB) for Electron
-	@echo "Rebuilding native modules for Electron..."
-	@npx @electron/rebuild -f -m node_modules/node-pty
-	@npx @electron/rebuild -f -m node_modules/@duckdb/node-bindings
-	@echo "Native modules rebuilt successfully"
 
 # Run compiled CLI with trailing arguments (builds only if missing)
 mux: ## Run the compiled mux CLI (e.g., make mux server --port 3000)

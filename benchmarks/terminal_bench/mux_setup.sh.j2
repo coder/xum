@@ -58,7 +58,7 @@ if [[ -d "node_modules" ]]; then
   log "node_modules already present, skipping bun install"
 else
   log "installing mux production dependencies via bun"
-  MUX_HEADLESS=1 bun install --production --frozen-lockfile
+  bun install --production --frozen-lockfile
 fi
 
 mkdir -p "${MUX_CONFIG_ROOT}"

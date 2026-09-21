@@ -11,35 +11,19 @@ interface PtySpawnRequest {
   cwd: string;
   cols: number;
   rows: number;
-  preferElectronBuild: boolean;
   env?: NodeJS.ProcessEnv;
   pathEnv?: string;
   logLocalEnv?: boolean;
 }
 
-function loadNodePty(runtimeType: string, preferElectronBuild: boolean): typeof NodePty {
-  const first = preferElectronBuild ? "node-pty" : "@lydell/node-pty";
-  const second = preferElectronBuild ? "@lydell/node-pty" : "node-pty";
-
+// Lazy require so a missing prebuilt binary fails at terminal spawn, not at app startup.
+function loadNodePty(runtimeType: string): typeof NodePty {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pty = require(first) as typeof NodePty;
-    log.debug(`Using ${first} for ${runtimeType}`);
-    return pty;
-  } catch {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const pty = require(second) as typeof NodePty;
-      log.debug(`Using ${second} for ${runtimeType} (fallback)`);
-      return pty;
-    } catch (err) {
-      log.error("Neither @lydell/node-pty nor node-pty available:", err);
-      throw new Error(
-        process.versions.electron
-          ? `${runtimeType} terminals are not available. node-pty failed to load (likely due to Electron ABI version mismatch). Run 'make rebuild-native' to rebuild native modules.`
-          : `${runtimeType} terminals are not available. No prebuilt binaries found for your platform. Supported: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64.`
-      );
-    }
+    return require("@lydell/node-pty") as typeof NodePty;
+  } catch (err) {
+    log.error("@lydell/node-pty failed to load:", err);
+    throw new Error(`${runtimeType} terminals are not available: ${getErrorMessage(err)}`);
   }
 }
 
@@ -57,7 +41,7 @@ export function resolvePathEnv(
 }
 
 export function spawnPtyProcess(request: PtySpawnRequest): IPty {
-  const pty = loadNodePty(request.runtimeLabel, request.preferElectronBuild);
+  const pty = loadNodePty(request.runtimeLabel);
   const mergedEnv = sanitizeXumChildEnv({ ...process.env, ...request.env });
   const pathEnv = resolvePathEnv(mergedEnv, request.pathEnv);
 

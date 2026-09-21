@@ -44,8 +44,7 @@
     "docs:watch": "make docs-watch",
     "storybook": "make storybook",
     "storybook:build": "make storybook-build",
-    "test:storybook": "make test-storybook",
-    "postinstall": "sh scripts/postinstall.sh"
+    "test:storybook": "make test-storybook"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.25.0",
@@ -160,7 +159,6 @@
     "@babel/preset-react": "^7.28.5",
     "@babel/preset-typescript": "^7.28.5",
     "@coder/pixel-storybook": "0.3.0",
-    "@electron/rebuild": "^4.0.4",
     "@eslint/js": "^9.36.0",
     "@playwright/test": "^1.56.0",
     "@storybook/addon-docs": "^10.0.0",
@@ -180,6 +178,7 @@
     "@types/katex": "^0.16.7",
     "@types/markdown-it": "^14.1.2",
     "@types/minimist": "^1.2.5",
+    "@types/node": "^24.9.0",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@types/ssh2": "^1.15.0",
@@ -239,8 +238,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^40.9.3",
-    "node-pty": "1.1.0-beta39"
+    "electron": "^40.9.3"
   },
   "files": [
     "dist/**/*.js",
@@ -255,7 +253,6 @@
     "dist/**/*.png",
     "dist/assets/**/*",
     "patches/**/*",
-    "scripts/postinstall.sh",
     "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
@@ -286,7 +283,7 @@
     "asarUnpack": [
       "dist/**/*.wasm",
       "dist/**/*.map",
-      "**/node_modules/node-pty/build/**/*",
+      "**/node_modules/@lydell/**/*",
       "**/node_modules/@duckdb/**/*.node",
       "**/node_modules/sharp/**/*",
       "**/node_modules/@img/**/*"
@@ -335,7 +332,6 @@
     "esbuild",
     "geckodriver",
     "lzma-native",
-    "node-pty",
     "sharp",
     "ssh2",
     "unrs-resolver"

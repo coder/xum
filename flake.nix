@@ -29,13 +29,15 @@
 
           src = ./.;
 
+          # Stamp buildTime from the flake's source date so the output is reproducible.
+          SOURCE_DATE_EPOCH = toString (self.lastModified or 315532800);
+
           nativeBuildInputs = with pkgs; [
             bun
             nodejs
             makeWrapper
             gnumake
             git # Needed by scripts/generate-version.sh
-            python3 # Needed by node-gyp for native module builds
           ];
 
           buildInputs = with pkgs; [
@@ -70,7 +72,6 @@
 
             # --ignore-scripts: postinstall scripts (e.g., lzma-native's node-gyp-build)
             # fail in the sandbox because shebangs like #!/usr/bin/env node can't resolve.
-            # Native modules are rebuilt in the main derivation after patchShebangs runs.
             buildPhase = ''
               export HOME=$TMPDIR
               export BUN_INSTALL_CACHE_DIR=$TMPDIR/.bun-cache
@@ -84,7 +85,7 @@
 
             outputHashMode = "recursive";
             # Marker used by scripts/update_flake_hash.sh to update this hash in place.
-            outputHash = "sha256-nu5eQwEZv7GxIwvcDKWZxNkOd5HKTqbARmvVP4RgsJY="; # xum-offline-cache-hash
+            outputHash = "sha256-6was78BfWKCXZrUpfl9RHTw0T0vrkVjfKdRmBnSc0Hk="; # xum-offline-cache-hash
           };
 
           configurePhase = ''
@@ -96,10 +97,6 @@
             # Patch shebangs in node_modules binaries and scripts
             patchShebangs node_modules
             patchShebangs scripts
-
-            # Run postinstall to rebuild node-pty for Electron
-            # (skipped in offlineCache due to --ignore-scripts)
-            ./scripts/postinstall.sh
 
             # Touch sentinel to prevent make from re-running bun install
             touch node_modules/.installed
