@@ -1,0 +1,533 @@
+import { z } from "zod";
+import {
+  EVALUATION_CHOICE_MAX_OPTIONS,
+  EVALUATION_CHOICE_MIN_OPTIONS,
+  EVALUATION_MAX_DEPTH,
+  EVALUATION_MAX_QUESTIONS,
+  EVALUATION_MAX_REQUEST_BYTES,
+  EVALUATION_SCORE_MAX_LEVELS,
+  EVALUATION_SCORE_MIN_LEVELS,
+} from "@/constants/evaluation";
+import { stableStringify } from "@/common/utils/stableStringify";
+
+/**
+ * Shared shapes for the workflow `evaluate()` primitive: the question/answer
+ * contract of AI SDK `experimental_evaluate` (choice | score | boolean) plus the
+ * pure, question-aware answer validator that guards both fresh provider output
+ * and replayed step results.
+ *
+ * Crypto-free on purpose so browser bundles (Settings, timeline) can import the
+ * schemas and validator; hashing lives in
+ * `src/node/services/evaluation/evaluationDigest.ts`.
+ */
+
+// ---------------------------------------------------------------------------
+// JSON inputs
+// ---------------------------------------------------------------------------
+
+export type EvaluationJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | EvaluationJsonValue[]
+  | { [key: string]: EvaluationJsonValue };
+
+export const EvaluationJsonValueSchema: z.ZodType<EvaluationJsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(EvaluationJsonValueSchema),
+    z.record(z.string(), EvaluationJsonValueSchema),
+  ])
+);
+
+/**
+ * Shared state and structured instructions: string | JSON object | JSON array.
+ * Bare numbers, booleans and null are rejected (mirrors the SDK's
+ * `EvaluationModelV4Input`), so a sandbox passing `evaluate(42, …)` fails as
+ * invalid input instead of becoming a billable request.
+ */
+export const EvaluationInputSchema = z.union([
+  z.string(),
+  z.array(EvaluationJsonValueSchema),
+  z.record(z.string(), EvaluationJsonValueSchema),
+]);
+export type EvaluationInput = z.infer<typeof EvaluationInputSchema>;
+
+export const EvaluationStateSchema = EvaluationInputSchema;
+export type EvaluationState = z.infer<typeof EvaluationStateSchema>;
+
+// ---------------------------------------------------------------------------
+// Questions
+// ---------------------------------------------------------------------------
+
+const CriteriaDescriptionSchema = EvaluationInputSchema.nullable();
+
+export const EvaluationChoiceQuestionSchema = z.strictObject({
+  type: z.literal("choice"),
+  instructions: EvaluationInputSchema,
+  criteria: z.record(z.string().min(1), CriteriaDescriptionSchema).refine((criteria) => {
+    const count = Object.keys(criteria).length;
+    return count >= EVALUATION_CHOICE_MIN_OPTIONS && count <= EVALUATION_CHOICE_MAX_OPTIONS;
+  }, `choice criteria must contain between ${EVALUATION_CHOICE_MIN_OPTIONS} and ${EVALUATION_CHOICE_MAX_OPTIONS} options`),
+});
+
+export const EvaluationScoreQuestionSchema = z.strictObject({
+  type: z.literal("score"),
+  instructions: EvaluationInputSchema,
+  criteria: z
+    .array(CriteriaDescriptionSchema)
+    .min(EVALUATION_SCORE_MIN_LEVELS)
+    .max(EVALUATION_SCORE_MAX_LEVELS),
+});
+
+export const EvaluationBooleanQuestionSchema = z.strictObject({
+  type: z.literal("boolean"),
+  instructions: EvaluationInputSchema,
+  criteria: z
+    .strictObject({
+      true: CriteriaDescriptionSchema.optional(),
+      false: CriteriaDescriptionSchema.optional(),
+    })
+    .optional(),
+});
+
+export const EvaluationQuestionSchema = z.discriminatedUnion("type", [
+  EvaluationChoiceQuestionSchema,
+  EvaluationScoreQuestionSchema,
+  EvaluationBooleanQuestionSchema,
+]);
+export type EvaluationQuestion = z.infer<typeof EvaluationQuestionSchema>;
+
+/** Question map keyed by stable question ids (1–EVALUATION_MAX_QUESTIONS entries). */
+export const EvaluationQuestionsSchema = z
+  .record(z.string().min(1), EvaluationQuestionSchema)
+  .refine((questions) => {
+    const count = Object.keys(questions).length;
+    return count >= 1 && count <= EVALUATION_MAX_QUESTIONS;
+  }, `questions must contain between 1 and ${EVALUATION_MAX_QUESTIONS} entries`);
+export type EvaluationQuestions = Readonly<Record<string, EvaluationQuestion>>;
+
+/** Provider-namespaced options passed through to the SDK (`providerOptions`). */
+export const EvaluationProviderOptionsSchema = z.record(
+  z.string(),
+  z.record(z.string(), EvaluationJsonValueSchema)
+);
+export type EvaluationProviderOptions = z.infer<typeof EvaluationProviderOptionsSchema>;
+
+/**
+ * The sandbox-facing `evaluate(state, spec)` options (consumed by the workflow
+ * runner in a later layer). `timeoutMs` is clamped by the host, not here.
+ */
+export const WorkflowEvaluateSpecSchema = z.strictObject({
+  id: z
+    .string()
+    .min(1)
+    .refine((id) => id.trim().length > 0, "id must be a non-blank step id"),
+  title: z.string().optional(),
+  model: z.string().optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  questions: EvaluationQuestionsSchema,
+  providerOptions: EvaluationProviderOptionsSchema.optional(),
+});
+export type WorkflowEvaluateSpec = z.infer<typeof WorkflowEvaluateSpecSchema>;
+
+// ---------------------------------------------------------------------------
+// Answers
+// ---------------------------------------------------------------------------
+
+const ProbabilitySchema = z.number().min(0).max(1);
+const DistributionSchema = z.record(z.string(), ProbabilitySchema);
+
+export const EvaluationAnswerSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("choice"),
+    choice: z.string(),
+    probabilities: DistributionSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("score"),
+    score: z.number(),
+    probabilities: DistributionSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("boolean"),
+    probability: ProbabilitySchema,
+  }),
+]);
+export type EvaluationAnswer = z.infer<typeof EvaluationAnswerSchema>;
+
+export const EvaluationAnswersSchema = z.record(z.string(), EvaluationAnswerSchema);
+
+/** Question-aware answer type: choices are narrowed to the question's option names. */
+export type EvaluationAnswerFor<Q extends EvaluationQuestion> = Q extends {
+  type: "choice";
+  criteria: infer CRITERIA;
+}
+  ? {
+      readonly type: "choice";
+      readonly choice: Extract<keyof CRITERIA, string>;
+      readonly probabilities?: Readonly<Record<Extract<keyof CRITERIA, string>, number>>;
+    }
+  : Q extends { type: "score" }
+    ? {
+        readonly type: "score";
+        readonly score: number;
+        readonly probabilities?: Readonly<Record<string, number>>;
+      }
+    : { readonly type: "boolean"; readonly probability: number };
+
+export type EvaluationAnswers<Q extends EvaluationQuestions> = {
+  readonly [ID in keyof Q]: EvaluationAnswerFor<Q[ID]>;
+};
+
+/** Decimal places the provider rounded to; `null` when it reports full precision. */
+export const EvaluationRoundingSchema = z.object({
+  probabilityDecimals: z.number().int().min(0).max(15).optional(),
+  scoreDecimals: z.number().int().min(0).max(15).optional(),
+});
+export type EvaluationRounding = z.infer<typeof EvaluationRoundingSchema>;
+
+// ---------------------------------------------------------------------------
+// Persisted step shapes (consumed by the workflow runner in a later layer)
+// ---------------------------------------------------------------------------
+
+const NullableTokenCountSchema = z.number().int().nonnegative().nullable();
+
+export const EvaluationStepResultSchema = z.object({
+  answers: EvaluationAnswersSchema,
+  rounding: EvaluationRoundingSchema.nullable(),
+  model: z.object({
+    modelString: z.string(),
+    responseModelId: z.string(),
+  }),
+  usage: z.object({
+    inputTokens: NullableTokenCountSchema,
+    outputTokens: NullableTokenCountSchema,
+    totalTokens: NullableTokenCountSchema,
+  }),
+  state: z.object({
+    sha256: z.string(),
+    bytes: z.number().int().nonnegative(),
+  }),
+});
+export type EvaluationStepResult = z.infer<typeof EvaluationStepResultSchema>;
+
+/** What the runner admits before dispatching one billable attempt. */
+export const EvaluationAdmissionSchema = z.object({
+  attempt: z.number().int().positive(),
+  selection: z.object({
+    modelString: z.string(),
+    effectiveModelString: z.string(),
+    wireProviderName: z.string(),
+    routeKind: z.literal("direct"),
+    configFingerprint: z.string(),
+  }),
+  timeoutMs: z.number().int().positive(),
+  attemptDeadlineAt: z.string().datetime({ offset: true }),
+  providerOptions: EvaluationProviderOptionsSchema.optional(),
+  stateSha256: z.string(),
+  stateBytes: z.number().int().nonnegative(),
+  questionsSha256: z.string(),
+  questionCount: z.number().int().positive(),
+});
+export type EvaluationAdmission = z.infer<typeof EvaluationAdmissionSchema>;
+
+// ---------------------------------------------------------------------------
+// Error identity (finite allowlists; never free text)
+// ---------------------------------------------------------------------------
+
+export const EvaluationErrorReasonSchema = z.enum([
+  "invalid-input",
+  "unsupported",
+  "invalid-output",
+  "provider-failure",
+]);
+export type EvaluationErrorReason = z.infer<typeof EvaluationErrorReasonSchema>;
+
+export const EvaluationErrorCodeSchema = z.enum([
+  "unsupported-question-type",
+  "invalid-argument",
+  "invalid-response",
+  "type-validation",
+  "json-parse",
+  "answer-validation",
+  "api-call",
+  "unknown",
+]);
+export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
+
+// ---------------------------------------------------------------------------
+// Question-aware answer validation
+// ---------------------------------------------------------------------------
+
+export type EvaluationAnswerViolation =
+  | "answers-not-object"
+  | "question-set-mismatch"
+  | "answer-not-object"
+  | "type-mismatch"
+  | "unknown-choice"
+  | "score-out-of-range"
+  | "probability-out-of-range"
+  | "distribution-keys"
+  | "distribution-values"
+  | "distribution-sum"
+  | "choice-not-maximal"
+  | "score-mean-mismatch"
+  | "rounding-invalid";
+
+export type ValidateAnswersResult<Q extends EvaluationQuestions> =
+  | { readonly ok: true; readonly answers: EvaluationAnswers<Q> }
+  | {
+      readonly ok: false;
+      readonly violation: EvaluationAnswerViolation;
+      readonly questionId?: string;
+    };
+
+// Absolute tolerance shared with the SDK's own validator; the rounding-aware
+// slack below is added on top so provider-rounded distributions still pass.
+const ABSOLUTE_TOLERANCE = 1e-6;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isProbability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return (
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+/** Half a unit in the last declared decimal; 0 when the provider did not round. */
+function roundingSlack(decimals: number | undefined): number | null {
+  if (decimals === undefined) {
+    return 0;
+  }
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 15) {
+    return null;
+  }
+  return 0.5 * 10 ** -decimals;
+}
+
+function validateDistribution(
+  value: unknown,
+  keys: readonly string[],
+  probabilitySlack: number
+):
+  | { ok: true; distribution: Record<string, number> }
+  | { ok: false; violation: EvaluationAnswerViolation } {
+  if (!isPlainRecord(value) || !hasExactKeys(value, keys)) {
+    return { ok: false, violation: "distribution-keys" };
+  }
+  const distribution: Record<string, number> = {};
+  for (const key of keys) {
+    const probability = value[key];
+    if (!isProbability(probability)) {
+      return { ok: false, violation: "distribution-values" };
+    }
+    distribution[key] = probability;
+  }
+  const sum = Object.values(distribution).reduce((total, probability) => total + probability, 0);
+  // One half-unit of rounding error per rounded value, accumulated over the sum
+  // (a two-decimal distribution over three options may legitimately sum to 0.99).
+  if (Math.abs(sum - 1) > ABSOLUTE_TOLERANCE + keys.length * probabilitySlack) {
+    return { ok: false, violation: "distribution-sum" };
+  }
+  return { ok: true, distribution };
+}
+
+/**
+ * Validate provider (or replayed) answers against the questions they answer.
+ *
+ * Pure and total: untrusted input never throws. On success the returned
+ * `answers` are a fresh projection containing only the contract fields, so
+ * provider-added extras never reach persisted results. Mirrors the SDK's rules
+ * (exact id set, per-question type, option/level membership, complete
+ * distributions, maximal selected choice, score = probability-weighted mean)
+ * with the SDK's rounding tolerance so both validators agree.
+ */
+export function validateAnswersAgainstQuestions<Q extends EvaluationQuestions>(
+  questions: Q,
+  answers: unknown,
+  rounding: EvaluationRounding | null | undefined
+): ValidateAnswersResult<Q> {
+  const probabilitySlack = roundingSlack(rounding?.probabilityDecimals);
+  const scoreSlack = roundingSlack(rounding?.scoreDecimals);
+  if (probabilitySlack === null || scoreSlack === null) {
+    return { ok: false, violation: "rounding-invalid" };
+  }
+
+  const questionIds = Object.keys(questions);
+  if (!isPlainRecord(answers) || !hasExactKeys(answers, questionIds)) {
+    return {
+      ok: false,
+      violation:
+        answers === null || typeof answers !== "object"
+          ? "answers-not-object"
+          : "question-set-mismatch",
+    };
+  }
+
+  const projected: Record<string, EvaluationAnswer> = {};
+  for (const id of questionIds) {
+    const question = questions[id];
+    const answer = answers[id];
+    if (!isPlainRecord(answer)) {
+      return { ok: false, violation: "answer-not-object", questionId: id };
+    }
+    if (answer.type !== question.type) {
+      return { ok: false, violation: "type-mismatch", questionId: id };
+    }
+
+    switch (question.type) {
+      case "choice": {
+        const options = Object.keys(question.criteria);
+        const choice = answer.choice;
+        if (typeof choice !== "string" || !Object.hasOwn(question.criteria, choice)) {
+          return { ok: false, violation: "unknown-choice", questionId: id };
+        }
+        if (answer.probabilities === undefined) {
+          projected[id] = { type: "choice", choice };
+          break;
+        }
+        const distribution = validateDistribution(answer.probabilities, options, probabilitySlack);
+        if (!distribution.ok) {
+          return { ok: false, violation: distribution.violation, questionId: id };
+        }
+        const selected = distribution.distribution[choice];
+        if (
+          Object.values(distribution.distribution).some(
+            (probability) => probability > selected + ABSOLUTE_TOLERANCE
+          )
+        ) {
+          return { ok: false, violation: "choice-not-maximal", questionId: id };
+        }
+        projected[id] = { type: "choice", choice, probabilities: distribution.distribution };
+        break;
+      }
+      case "score": {
+        const maxScore = question.criteria.length - 1;
+        const score = answer.score;
+        // Fractional scores are legitimate: with a distribution the score is its
+        // probability-weighted mean, so only the [0, levels - 1] range is enforced.
+        if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > maxScore) {
+          return { ok: false, violation: "score-out-of-range", questionId: id };
+        }
+        if (answer.probabilities === undefined) {
+          projected[id] = { type: "score", score };
+          break;
+        }
+        const levelKeys = question.criteria.map((_, index) => String(index));
+        const distribution = validateDistribution(
+          answer.probabilities,
+          levelKeys,
+          probabilitySlack
+        );
+        if (!distribution.ok) {
+          return { ok: false, violation: distribution.violation, questionId: id };
+        }
+        const mean = levelKeys.reduce(
+          (total, key) => total + Number(key) * distribution.distribution[key],
+          0
+        );
+        // Each rounded level probability contributes up to index × slack to the
+        // mean; the score itself may also be rounded.
+        const meanSlack = levelKeys.reduce(
+          (total, key) => total + Number(key) * probabilitySlack,
+          0
+        );
+        if (Math.abs(mean - score) > ABSOLUTE_TOLERANCE + meanSlack + scoreSlack) {
+          return { ok: false, violation: "score-mean-mismatch", questionId: id };
+        }
+        projected[id] = { type: "score", score, probabilities: distribution.distribution };
+        break;
+      }
+      case "boolean": {
+        const probability = answer.probability;
+        if (!isProbability(probability)) {
+          return { ok: false, violation: "probability-out-of-range", questionId: id };
+        }
+        projected[id] = { type: "boolean", probability };
+        break;
+      }
+    }
+  }
+
+  // Every id, type, membership and distribution rule above has been checked
+  // against `questions`, which is exactly what `EvaluationAnswers<Q>` encodes.
+  return { ok: true, answers: projected as EvaluationAnswers<Q> };
+}
+
+// ---------------------------------------------------------------------------
+// Canonical request payload (size/depth limits)
+// ---------------------------------------------------------------------------
+
+export type EvaluationRequestViolation = "request-too-large" | "request-too-deep";
+
+export type CanonicalRequestResult =
+  | {
+      readonly ok: true;
+      readonly canonical: string;
+      readonly bytes: number;
+      readonly depth: number;
+    }
+  | {
+      readonly ok: false;
+      readonly violation: EvaluationRequestViolation;
+      readonly bytes: number;
+      readonly depth: number;
+    };
+
+/** Nesting depth of a JSON value: scalars are 0, `{}`/`[]` are 1, `{ a: {} }` is 2. */
+export function jsonDepth(value: unknown): number {
+  if (value === null || typeof value !== "object") {
+    return 0;
+  }
+  const children = Array.isArray(value) ? value : Object.values(value);
+  let deepest = 0;
+  for (const child of children) {
+    const depth = jsonDepth(child);
+    if (depth > deepest) {
+      deepest = depth;
+    }
+  }
+  return deepest + 1;
+}
+
+/** Canonical (key-sorted) JSON, as used for hashing and replay identity. */
+export function canonicalEvaluationJson(value: unknown): string {
+  return stableStringify(value);
+}
+
+/**
+ * Canonical JSON of `{ state, questions }` with its UTF-8 byte length and
+ * nesting depth (the wrapper object counts as one level), checked against
+ * `EVALUATION_MAX_REQUEST_BYTES` / `EVALUATION_MAX_DEPTH`.
+ */
+export function canonicalRequestBytes(request: {
+  readonly state: EvaluationState;
+  readonly questions: EvaluationQuestions;
+}): CanonicalRequestResult {
+  const payload = { state: request.state, questions: request.questions };
+  const canonical = canonicalEvaluationJson(payload);
+  const bytes = new TextEncoder().encode(canonical).length;
+  const depth = jsonDepth(payload);
+  if (depth > EVALUATION_MAX_DEPTH) {
+    return { ok: false, violation: "request-too-deep", bytes, depth };
+  }
+  if (bytes > EVALUATION_MAX_REQUEST_BYTES) {
+    return { ok: false, violation: "request-too-large", bytes, depth };
+  }
+  return { ok: true, canonical, bytes, depth };
+}
