@@ -102,8 +102,31 @@ interface Internals {
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
     failure: { errorType: string; errorMessage: string }
   ) => Promise<void>;
+  /** The production stream-end listener's handler (entry-time origin capture for direct callers). */
+  handleStreamEnd: (event: unknown) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
+
+/** A child's stream ending on a successful terminal `agent_report` (the ordinary report path). */
+function reportingStreamEnd(taskId: string, messageId: string, reportMarkdown: string) {
+  return {
+    type: "stream-end",
+    workspaceId: taskId,
+    messageId,
+    metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+    parts: [
+      {
+        type: "dynamic-tool",
+        toolCallId: `${messageId}-report`,
+        toolName: "agent_report",
+        input: { reportMarkdown },
+        state: "output-available",
+        output: { success: true, report: { reportMarkdown } },
+      },
+      { type: "text", text: reportMarkdown },
+    ],
+  };
+}
 
 describe("TaskService attempt identity and send admission (G1)", () => {
   let rootDir: string;
@@ -607,7 +630,87 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
     });
 
-    test.each(["missing-id", "unsettled", "closing", "stale", "retired"] as const)(
+    test("an ordinary reported child (durable report, ledgers released) gets a fresh attempt on the manual send/resume rescue instead of the fence admitting under the completed id", async () => {
+      // The ordinary lifecycle, end to end through the real producers: a reawaken owns the attempt,
+      // the stream ends on a terminal agent_report, the report is persisted for every ancestor and
+      // releaseReportedTaskAttempt drops the attempt's owner AND settlement entry. The user then
+      // types into the finished child (WorkspaceService.sendMessage) or resumes it
+      // (WorkspaceService.resumeStream): both run markInterruptedTaskRunning and then the fence.
+      const taskId = "reported-released";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000d0" },
+        },
+      ]);
+      const host = hostWithTurnEvents();
+      const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const reportedAttemptId = entryOf(config, taskId)!.taskAttemptId!;
+      expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(reportedAttemptId);
+      await svc.handleStreamEnd(reportingStreamEnd(taskId, "assistant-report-1", "done"));
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskStatus: "reported",
+        taskAttemptId: reportedAttemptId,
+      });
+      expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      expect(svc.attemptSettlementByTaskId.has(taskId)).toBe(false);
+      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
+
+      // Manual send: the rescue mints a fresh owned attempt (false: the report stays historical,
+      // no status rollback is owed) and the fence binds the send to IT, never to the completed id.
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+      const continued = entryOf(config, taskId);
+      expect(continued?.taskStatus).toBe("reported");
+      expect(continued?.taskAttemptId).toMatch(ATTEMPT_ID);
+      const continuedAttemptId = continued!.taskAttemptId!;
+      expect(continuedAttemptId).not.toBe(reportedAttemptId);
+      // Lineage: the completed attempt is neither settled by this process nor by a receipt.
+      expect(continued?.taskAttemptUnproven).toBe(true);
+      expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+        source: "reawaken",
+        attemptId: continuedAttemptId,
+        receiptEligible: false,
+      });
+      // The historical report still decides the task's outcome for its ancestors.
+      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
+      const sendToken = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect(svc.admittedSendsByTaskId.get(taskId)?.size).toBe(1);
+      for (const send of svc.admittedSendsByTaskId.get(taskId) ?? []) {
+        expect(send.attemptId).toBe(continuedAttemptId);
+      }
+      // The continuation runs and settles without a second report (a reported child never turns
+      // back into an active task): its attempt stays owned and unsettled...
+      const turn = Symbol("manual-continuation");
+      sendToken.onAdmitted(turn);
+      host.settleTurn(taskId, turn);
+      expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+      // ...so a resume (same rescue, same fence) continues THAT attempt rather than rotating again.
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(continuedAttemptId);
+      const resumeToken = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect(resumeToken.admissionStale()).toBe(false);
+      resumeToken.onDisposed("no-work");
+      // An explicit Stop settles the owned continuation; the next rescue rotates from that
+      // settlement (the pre-existing settled-predecessor path) and inherits the marker.
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId: continuedAttemptId,
+        phase: "settled",
+      });
+      expect(entryOf(config, taskId)?.taskStatus).toBe("reported");
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
+      expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(continuedAttemptId);
+      expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
+    });
+
+    test.each(["missing-id", "owned-unsettled", "closing", "stale", "retired"] as const)(
       "manual recovery of a reported child refuses %s settlement evidence",
       async (evidence) => {
         const taskId = "reported-recovery";
@@ -617,7 +720,16 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         ]);
         const { taskService } = createHarness(config);
         const svc = internals(taskService);
-        if (evidence !== "unsettled") {
+        if (evidence === "owned-unsettled") {
+          // A live continuation this process owns (a parent reactivation, an earlier manual
+          // follow-up): the attempt is neither released nor settled, so it is continued, not
+          // rotated. The released shape (no owner, no entry) is the lifecycle test above.
+          svc.ownedAttemptByTaskId.set(taskId, {
+            attemptId,
+            receiptEligible: true,
+            source: "reactivation",
+          });
+        } else {
           svc.attemptSettlementByTaskId.set(taskId, {
             attemptId: evidence === "stale" ? "att_00000000000000bb" : attemptId,
             phase: evidence === "closing" ? "closing" : "settled",
@@ -646,10 +758,11 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           });
         }
         const before = entryOf(config, taskId);
+        const owned = svc.ownedAttemptByTaskId.get(taskId);
         const settlement = svc.attemptSettlementByTaskId.get(taskId);
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
         expect(entryOf(config, taskId)).toEqual(before);
-        expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        expect(svc.ownedAttemptByTaskId.get(taskId)).toBe(owned);
         expect(svc.attemptSettlementByTaskId.get(taskId)).toBe(settlement);
       }
     );
@@ -1665,6 +1778,101 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       });
       expect(entryOf(config, spawnedId)?.taskAttemptUnproven).toBeUndefined();
     });
+
+    test.each(["pending", "admitted"] as const)(
+      "a direct create whose launch fails closes and drains its attempt (%s racing send) before the rollback deletes the row, checkout and session",
+      async (racing) => {
+        const spawnedId = racing === "pending" ? "directfail001" : "directfail002";
+        const { config } = await setupTree([]);
+        stubStableIds(config, [spawnedId]);
+        shortenTerminationTimers();
+        const order: string[] = [];
+        const racingTurn = Symbol("racing-turn");
+        let racingToken: TurnAdmissionToken | undefined;
+        let liveTurn: symbol | undefined;
+        const host = hostWithTurnEvents({
+          sendMessage: mock((workspaceId: string) => {
+            // The entry is persisted and announced, so a concurrent (user/peer) send reaches the
+            // fence while the launch send is in flight and is admitted under the launch's attempt:
+            // still in its own preflight (pending) or already the live turn (admitted) when the
+            // launch fails.
+            racingToken = admitted(
+              taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+            );
+            if (racing === "admitted") {
+              racingToken.onAdmitted(racingTurn);
+              liveTurn = racingTurn;
+            }
+            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+          }),
+          clearQueue: mock(() => {
+            order.push("clearQueue");
+            // The racing send's next gate refuses it once its attempt is closed (its host disposes
+            // the obligation); a pending debt settles only through that disposal.
+            if (racing === "pending" && racingToken?.admissionStale() === true) {
+              racingToken.onDisposed("refused");
+            }
+            return Ok(undefined);
+          }),
+          getActiveTurnGeneration: mock(() => liveTurn),
+        });
+        const stopStream = mock((workspaceId: string) => {
+          order.push("stopStream");
+          const turn = liveTurn;
+          if (turn != null) {
+            // The stopped turn settles like a real coordinator's idle transition.
+            liveTurn = undefined;
+            host.settleTurn(workspaceId, turn);
+          }
+          return Promise.resolve(Ok(undefined));
+        });
+        const { aiService } = createAIServiceMocks(config, { stopStream });
+        const { taskService } = createHarness(config, {
+          aiService,
+          workspaceService: host.workspaceService,
+        });
+        const svc = internals(taskService);
+        const atFirstDeletion: Record<string, unknown> = {};
+        const removeWorkspace = config.removeWorkspace.bind(config);
+        const remove = spyOn(config, "removeWorkspace").mockImplementation(async (id: string) => {
+          order.push("removeWorkspace");
+          atFirstDeletion.settlement = svc.attemptSettlementByTaskId.get(id)?.phase;
+          atFirstDeletion.racingStale = racingToken?.admissionStale();
+          atFirstDeletion.stopRecordRetained = svc.workspaceStopRecords.has(id);
+          atFirstDeletion.debts = svc.admittedSendsByTaskId.get(id)?.size ?? 0;
+          return removeWorkspace(id);
+        });
+        try {
+          const created = await taskService.create({
+            parentWorkspaceId: rootId,
+            kind: "agent",
+            agentId: "explore",
+            prompt: "go",
+            title: "Direct",
+            isolation: "none",
+          });
+          expect(created.success).toBe(false);
+          if (created.success) throw new Error("unreachable");
+          expect(created.error).toContain("provider unavailable");
+          expect(racingToken).toBeDefined();
+          // Closure and the attempt's stop cascade (queue cleared, stream stopped, owners settled)
+          // precede the first deletion; nothing admitted under the attempt outlives the row.
+          expect(order).toEqual(["clearQueue", "stopStream", "removeWorkspace"]);
+          expect(atFirstDeletion).toEqual({
+            settlement: "settled",
+            racingStale: true,
+            stopRecordRetained: false,
+            debts: 0,
+          });
+          expect(entryOf(config, spawnedId)).toBeUndefined();
+          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+          expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
+          expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({ phase: "settled" });
+        } finally {
+          remove.mockRestore();
+        }
+      }
+    );
 
     test.each(["id", "status"] as const)(
       "startup re-drive refuses to overwrite a row whose %s moved after the recovery snapshot",

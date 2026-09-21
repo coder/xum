@@ -2504,6 +2504,10 @@ export class TaskService implements AgentTaskIntegration {
    * Interrupted-without-report receipts are deliberately NOT dropped here or on stop: an ancestor
    * that has not yet read terminal-no-report still needs the receipt after config cleanup, and no
    * consumer acknowledgement exists yet to bound that retention.
+   *
+   * The released shape (reported row, no owner, no settlement entry) is itself read by
+   * markInterruptedTaskRunning: a manual follow-up into such a child mints a fresh attempt rather
+   * than being admitted under the completed id.
    */
   private releaseReportedTaskAttempt(taskId: string, attempt: OwnedTaskAttempt | undefined): void {
     if (attempt == null || this.ownedAttemptByTaskId.get(taskId) !== attempt) return;
@@ -6372,7 +6376,48 @@ export class TaskService implements AgentTaskIntegration {
     // never meets an owned attempt without settlement evidence.
     const attemptId = newTaskAttemptId();
     let launchAttempt: OwnedTaskAttempt | undefined;
-    const settleFailedLaunch = () => {
+    /**
+     * Launch failure: close the attempt, drain what it admitted, THEN roll the workspace back.
+     * Once the entry is persisted (launchAttempt set) and announced, a racing user or peer send can
+     * be admitted under the attempt while the launch send is in flight; deleting the row, checkout
+     * and session dir underneath that obligation or its turn would strand them. So, before any
+     * deletion: the closure (synchronous, no further send binds to the id), then — when anything
+     * is live under it — this task's own stop cascade, in the two-producer shape of
+     * failAgentTaskTerminally: Phase A directly (this method holds the global mutex Phase A
+     * requires; the mutex is not reentrant, so it must not be re-acquired here), Phase B
+     * (clearQueue + stopStream, bounded), then a bounded wait for the captured owners to settle,
+     * which releases the record. The row's removal below is the cascade's terminal state. A wait
+     * that outlives its bound leaves the latch held (fail closed) like every other cascade; the
+     * launch owner still settles its attempt afterwards, as before.
+     */
+    const failLaunch = async (
+      runtimeForRollback: Runtime,
+      rollback: { preservePhysicalWorkspace?: boolean }
+    ): Promise<void> => {
+      if (launchAttempt != null) {
+        this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
+        const liveExecution =
+          this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+          this.aiService.isStreaming(taskId) ||
+          this.hasPendingAdmissions(taskId);
+        if (liveExecution) {
+          this.beginWorkspaceStop(taskId);
+          this.markWorkspaceStopPersisted(taskId);
+          await this.runWorkspaceStopCleanup([taskId], {
+            label: "TaskService.create rollback",
+            abandonPartial: true,
+            clearQueue: true,
+          });
+          await this.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
+        }
+      }
+      await this.rollbackFailedTaskCreate(
+        runtimeForRollback,
+        parentMeta.projectPath,
+        workspaceName,
+        taskId,
+        rollback
+      );
       if (launchAttempt != null) {
         this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
       }
@@ -6553,15 +6598,10 @@ export class TaskService implements AgentTaskIntegration {
       if (materializedCheckout != null) {
         // Runs after the desktop gate released: only the checkout and any persisted entry (which
         // would otherwise hold the desktop reservation as a running child) need to go.
-        await this.rollbackFailedTaskCreate(
-          materializedCheckout.runtime,
-          parentMeta.projectPath,
-          workspaceName,
-          taskId,
-          { preservePhysicalWorkspace: useSharedWorkspace }
-        );
+        await failLaunch(materializedCheckout.runtime, {
+          preservePhysicalWorkspace: useSharedWorkspace,
+        });
         materializedCheckout.initLogger.logComplete(-1);
-        settleFailedLaunch();
       }
       return materialized;
     }
@@ -6583,14 +6623,8 @@ export class TaskService implements AgentTaskIntegration {
         forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
-        await this.rollbackFailedTaskCreate(
-          runtimeForTaskWorkspace,
-          parentMeta.projectPath,
-          workspaceName,
-          taskId
-        );
+        await failLaunch(runtimeForTaskWorkspace, {});
         initLogger.logComplete(-1);
-        settleFailedLaunch();
         return Err(sanitizeError);
       }
     }
@@ -6669,14 +6703,7 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await this.rollbackFailedTaskCreate(
-        runtimeForTaskWorkspace,
-        parentMeta.projectPath,
-        workspaceName,
-        taskId,
-        { preservePhysicalWorkspace: useSharedWorkspace }
-      );
-      settleFailedLaunch();
+      await failLaunch(runtimeForTaskWorkspace, { preservePhysicalWorkspace: useSharedWorkspace });
       return Err(message);
     }
 
@@ -13472,12 +13499,23 @@ export class TaskService implements AgentTaskIntegration {
     const settledPredecessor = this.attemptSettlementByTaskId.get(workspaceId);
     // A parent continuation preserves `reported`; Stop then closes its attempt without changing
     // that status. Explicit manual recovery must rotate the settled identity, not reopen it.
+    //
+    // The ordinary reported child is the other terminal shape: its report is durable and
+    // releaseReportedTaskAttempt dropped the attempt's owner AND its settlement entry, so neither
+    // ledger names the task. That attempt is not live in this process — a live one would still be
+    // owned (live continuation: continued, not rotated), a closing or stop-closed one would still
+    // have its entry (refused below and at the fence) — so a manual follow-up mints a fresh
+    // attempt for it exactly as the parent's reactivation does (lineage unproven: no settlement,
+    // no receipt), instead of the fence admitting the continuation under the completed id.
+    const releasedReportedAttempt =
+      settledPredecessor == null && !this.ownedAttemptByTaskId.has(workspaceId);
     const resumeSettledReportedTask =
       entryAtStart.workspace.taskStatus === "reported" &&
       entryAtStart.workspace.taskDesktopOwnerWorkspaceId == null &&
       entryAtStart.workspace.taskAttemptId != null &&
-      settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
-      settledPredecessor.phase === "settled";
+      ((settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
+        settledPredecessor.phase === "settled") ||
+        releasedReportedAttempt);
     if (
       !resumeSettledReportedTask &&
       entryAtStart.workspace.taskStatus !== "interrupted" &&
@@ -13524,11 +13562,14 @@ export class TaskService implements AgentTaskIntegration {
       // (admissionStale probe → WorkspaceService skips the user-resume rescue) and workspace-turn
       // sends carry their correlation.
       await using _lock = await this.mutex.acquire();
+      // The reported-child decision above rechecks its evidence here: a closure recorded, or an
+      // owner installed for the released attempt, during the lineage awaits invalidates it.
       if (
         this.isWorkspaceStopInProgress(workspaceId) ||
         this.getWorkspaceStopEpoch(workspaceId) !== stopEpochAtStart ||
         (resumeSettledReportedTask &&
-          this.attemptSettlementByTaskId.get(workspaceId) !== settledPredecessor)
+          (this.attemptSettlementByTaskId.get(workspaceId) !== settledPredecessor ||
+            (releasedReportedAttempt && this.ownedAttemptByTaskId.has(workspaceId))))
       ) {
         log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
         return false;

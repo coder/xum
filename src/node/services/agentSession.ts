@@ -5110,6 +5110,14 @@ export class AgentSession {
     if (this.isStopInProgress()) {
       return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
     }
+    // Task-attempt fence (the PREPARING gate prepareMessage applies through isAdmissionStale):
+    // the host checked the obligation before calling, but the attempt can be rotated, retired or
+    // stopped during the preflight awaits above. Same synchronous block as the prepare below, so
+    // a stale token never reports admission for work its attempt no longer authorizes; the host
+    // disposes a refused resume's token.
+    if (internal?.turnAdmission?.admissionStale() === true) {
+      return Err(createUnknownSendMessageError(SEND_ADMISSION_STALE_MESSAGE));
+    }
 
     const attempt: PreparationAttempt = {
       intent: "resume",

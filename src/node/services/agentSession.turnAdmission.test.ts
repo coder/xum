@@ -359,6 +359,47 @@ describe("AgentSession turn admission tokens", () => {
     expect(settled.at(-1)).toBe(token.admittedTurns[0]);
   });
 
+  test("resumeStream refuses a token that went stale during its preflight awaits before any turn is claimed", async () => {
+    const { session, aiService, historyService } = await harness();
+    expect(await session.sendMessage("first", sendOptions)).toEqual(Ok(undefined));
+    await settleTurn(0, () => settled.length > 0);
+    const token = recordingToken();
+    const result = await session.resumeStream(sendOptions, {
+      acceptanceOrigin: "automatic",
+      turnAdmission: token,
+      // The host checked the token before calling; the attempt is rotated, retired or stopped
+      // while the resume is inside its own asynchronous preflight (compaction admission,
+      // pricing) — after the host's check, before the coordinator claims PREPARING.
+      readCompactionAdmission: async () => {
+        const capture = await historyService.captureCompactionReplacement(workspaceId, {
+          onRepaired: () => undefined,
+          replaceUnreadable: false,
+        });
+        token.stale = true;
+        return capture;
+      },
+    });
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE },
+    });
+    // Never admitted, no stream, no turn left behind: the host disposes the token as refused.
+    expect(token.events).toEqual([]);
+    expect(streamCalls(aiService)).toBe(1);
+    expect(internal(session).coordinator.phase).toBe("idle");
+    // A resume whose token stays valid is unaffected and its admitted turn still settles it.
+    const fresh = recordingToken();
+    expect(
+      await session.resumeStream(sendOptions, {
+        acceptanceOrigin: "automatic",
+        turnAdmission: fresh,
+      })
+    ).toEqual(Ok({ started: true }));
+    expect(fresh.events).toEqual(["admitted"]);
+    await settleTurn(1, () => settled.length > 1);
+    expect(settled.at(-1)).toBe(fresh.admittedTurns[0]);
+  });
+
   test("a queued entry dispatched at a step boundary supersedes the live turn instead of settling it", async () => {
     const { session } = await harness();
     expect(await session.sendMessage("first", sendOptions)).toEqual(Ok(undefined));
