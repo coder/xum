@@ -916,6 +916,52 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
+  it("a resume under Auto finds the routed turn behind more than twenty non-retry rows", async () => {
+    const { session, historyService, streamMessage } = await createHarness({
+      experimentEnabled: true,
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+    for (let index = 0; index < 25; index += 1) {
+      const report = createMuxMessage(
+        `subagent-report-${index}`,
+        "user",
+        formatSubagentReportEnvelope({
+          taskId: `task-${index}`,
+          agentType: "explore",
+          status: "completed",
+          title: "Findings",
+          reportMarkdown: "done",
+        }),
+        { timestamp: Date.now(), synthetic: true, uiVisible: true }
+      );
+      expect((await historyService.appendToHistory("ws-auto-routing", report)).success).toBe(true);
+    }
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+
+    const internals = session as unknown as {
+      applyAutoRoutedResume(options: {
+        model: string;
+        agentId: string;
+        autoModelRouting?: boolean;
+      }): Promise<{ model: string; autoModelRoutingRecord?: { status: string; tierId?: string } }>;
+    };
+    const resumeOptions = await internals.applyAutoRoutedResume({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(resumeOptions.model).toBe(HARD_MODEL);
+    expect(resumeOptions.autoModelRoutingRecord).toMatchObject({
+      status: "routed",
+      tierId: "hard",
+    });
+  });
+
   it("bills the evaluator's usage to the workspace even when the verdict falls back", async () => {
     const usage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
     const providerMetadata = { openai: { cachedPromptTokens: 0 } };
@@ -1242,6 +1288,49 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       model: COMPOSER_MODEL,
       requestedFallbackModel: COMPOSER_MODEL,
     });
+  });
+
+  it("classifies a review-only /compact follow-up on the text the redispatch sends", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    const compactionModel = "anthropic:claude-3-5-haiku-latest";
+
+    const result = await session.sendMessage("/compact", {
+      model: compactionModel,
+      agentId: "compact",
+      autoModelRouting: true,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        commandPrefix: "/compact",
+        parsed: {
+          model: compactionModel,
+          followUpContent: {
+            text: "",
+            model: COMPOSER_MODEL,
+            agentId: "exec",
+            reviews: [
+              {
+                filePath: "src/scheduler.ts",
+                lineRange: "+4-9",
+                selectedCode: "setTimeout(tick, 0)",
+                userNote: "Rework the scheduler loop",
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(classify.mock.calls[0]?.[0]?.prompt).toContain("Rework the scheduler loop");
+    const row = await persistedUserRow(historyService);
+    const muxMetadata = row.metadata?.muxMetadata;
+    const followUp =
+      muxMetadata?.type === "compaction-request" ? muxMetadata.parsed.followUpContent : undefined;
+    expect(followUp?.model).toBe(HARD_MODEL);
+    expect(followUp?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
   });
 
   it("routes a /compact follow-up past attachments the compaction is about to fold away", async () => {

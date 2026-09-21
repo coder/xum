@@ -311,6 +311,22 @@ describe("evaluation model factory", () => {
       deps({ openai: { apiKey: "sk-openai" } }, { env: { OPENAI_ORG_ID: "org-env" } })
     );
     expect(withOrg.success && withOrg.data.organization).toBe("org-env");
+    // Origin-only proxy URLs get the provider path the chat factory adds; an explicit path and
+    // the TypeSafe endpoint are left alone.
+    const originOnly = (evaluator: string, providerKey: string) =>
+      resolveEvaluationModelTarget(
+        evaluator,
+        deps({ [providerKey]: { apiKey: "sk", baseUrl: "https://proxy.example.test" } })
+      );
+    expect(originOnly("openai:gpt-5-nano", "openai")).toMatchObject({
+      data: { settings: { baseURL: "https://proxy.example.test/v1" } },
+    });
+    expect(originOnly("anthropic:claude-haiku-4-5", "anthropic")).toMatchObject({
+      data: { settings: { baseURL: "https://proxy.example.test/v1" } },
+    });
+    expect(originOnly(EVALUATION_MODEL, "typesafe")).toMatchObject({
+      data: { settings: { baseURL: "https://proxy.example.test" } },
+    });
     expect(resolveEvaluationModelTarget("anthropic:claude-haiku-4-5", deps({}))).toMatchObject({
       success: false,
       error: { code: "missing_api_key" },

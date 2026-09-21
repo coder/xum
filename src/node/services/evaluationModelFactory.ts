@@ -18,7 +18,11 @@ import {
 } from "@/constants/autoModelRouting";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
 import type { PolicyService } from "@/node/services/policyService";
-import { buildAIProviderRequestHeaders } from "@/node/services/providerModelFactory";
+import {
+  buildAIProviderRequestHeaders,
+  normalizeAnthropicBaseURL,
+  normalizeOpenAICompatibleBaseURL,
+} from "@/node/services/providerModelFactory";
 import {
   resolveApiKeyCandidate,
   resolveProviderCredentials,
@@ -114,7 +118,18 @@ export function resolveEvaluationModelTarget(
       message: `No API key configured for ${provider} in providers.jsonc`,
     });
   }
-  const baseURL = policy?.getForcedBaseUrl(provider) ?? credentials.baseUrl;
+  const configuredBaseURL = policy?.getForcedBaseUrl(provider) ?? credentials.baseUrl;
+  // Same origin-only proxy handling as chat requests: the OpenAI and Anthropic SDKs need the
+  // /v1 path that users routinely leave off, and a value the chat factory would fix up must
+  // not send every classification to the wrong endpoint.
+  const baseURL =
+    configuredBaseURL == null
+      ? undefined
+      : evaluationProvider === "openai"
+        ? normalizeOpenAICompatibleBaseURL(configuredBaseURL)
+        : evaluationProvider === "anthropic"
+          ? normalizeAnthropicBaseURL(configuredBaseURL)
+          : configuredBaseURL;
   // Raw config: keep only string-valued header entries.
   const configHeaders =
     typeof config.headers === "object" && config.headers !== null

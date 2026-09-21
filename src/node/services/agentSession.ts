@@ -6837,8 +6837,15 @@ export class AgentSession {
     signal: AbortSignal | undefined
   ): Promise<Extract<MuxMessageMetadata, { type: "compaction-request" }>> {
     const followUp = metadata.parsed.followUpContent;
-    const prompt = followUp?.text?.trim() ?? "";
     if (followUp == null || followUp.autoModelRouting != null) return metadata;
+    // Classify the text the redispatch will actually send: review notes are formatted into
+    // the prompt there (prepareUserMessageForSend), so a review-only follow-up is a real
+    // prompt, not an empty one.
+    const prompt = prepareUserMessageForSend({
+      // Persisted follow-ups are untyped on disk; a missing text must not throw here.
+      text: followUp.text ?? "",
+      reviews: followUp.reviews,
+    }).finalText.trim();
     // An attachment-only follow-up still goes through routing so its fallback record
     // (and badge) survive the redispatch, exactly like an attachment-only send.
     if (!prompt && !(followUp.fileParts?.length ?? 0)) return metadata;
@@ -7246,9 +7253,7 @@ export class AgentSession {
    * must not cost the tier model either.
    */
   private async collectContextFileParts(): Promise<FilePart[]> {
-    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!history.success) return [];
-    return history.data.flatMap((message) =>
+    return (await this.loadActiveRoutingRows()).flatMap((message) =>
       isProviderVisibleUserRow(message)
         ? message.parts
             .filter((part): part is MuxFilePart => part.type === "file")
@@ -7258,15 +7263,15 @@ export class AgentSession {
   }
 
   /**
-   * Tail of the active context for routing decisions; a read failure reads as empty.
-   * Scoped to the latest durable boundary, the same privacy floor provider requests
-   * use, so a /clear or compaction also hides earlier prompts from the classifier.
+   * The active context for routing decisions; a read failure reads as empty. Scoped to the
+   * latest durable boundary, the same privacy floor provider requests use, so a /clear or
+   * compaction also hides earlier prompts (and attachments) from routing.
    */
-  private async loadRecentRoutingRows(): Promise<MuxMessage[]> {
+  private async loadActiveRoutingRows(): Promise<MuxMessage[]> {
     const history = await this.historyService
       .getHistoryFromLatestBoundary(this.workspaceId)
       .catch(() => null);
-    return history?.success ? history.data.slice(-20) : [];
+    return history?.success ? history.data : [];
   }
 
   /**
@@ -7275,7 +7280,9 @@ export class AgentSession {
    * words: synthetic rows are the app's, not a prompt to judge.
    */
   private async collectRecentUserPrompts(): Promise<string[]> {
-    return (await this.loadRecentRoutingRows())
+    // Bounded tail: the classifier only needs conversational context, not the whole window.
+    return (await this.loadActiveRoutingRows())
+      .slice(-20)
       .filter(
         (message) => isProviderVisibleUserRow(message) && message.metadata?.synthetic !== true
       )
@@ -7333,9 +7340,12 @@ export class AgentSession {
     };
   }
 
-  /** The same row a resume retries: completed report cards and other non-retry rows are skipped. */
+  /**
+   * The same row a resume retries, searched across the whole active window: completed report
+   * cards and other non-retry rows are skipped, however many follow the interrupted turn.
+   */
   private async findLastUserRow(): Promise<MuxMessage | undefined> {
-    return this.findLastRetryUserMessage(await this.loadRecentRoutingRows());
+    return this.findLastRetryUserMessage(await this.loadActiveRoutingRows());
   }
 
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
