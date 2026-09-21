@@ -38,6 +38,11 @@ const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (workspaceId: 
     thinkingLevel: getAutoThinkingLevelKey,
   };
 
+/** Persisted-state key of one Auto dimension's flag; the palette reads and writes it outside React. */
+export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
+  return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
+}
+
 /**
  * Composer Auto selection for one dimension (auto-model-routing experiment),
  * workspace-scoped and forced off while the experiment is disabled so a stale
@@ -49,7 +54,7 @@ export function useAutoRoutingSelection(
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const [persisted, setPersisted] = usePersistedState<boolean>(
-    AUTO_ROUTING_KEY_BY_DIMENSION[dimension](workspaceId),
+    getAutoRoutingKey(workspaceId, dimension),
     false,
     { listener: true }
   );

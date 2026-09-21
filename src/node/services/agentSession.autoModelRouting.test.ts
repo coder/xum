@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
+import type { SendMessageError } from "@/common/types/errors";
 import type { AgentSession } from "./agentSession";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -113,8 +115,9 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
             { get: (target, prop) => target[prop] ?? (() => Promise.resolve(undefined)) }
           ) as unknown as WorkspaceGoalService);
 
-    const streamMessage = mock((opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+    const streamMessage = mock(
+      (opts: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>> =>
+        Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
     );
     const aiService = Object.assign(new EventEmitter(), {
       ...createStreamLifecycleMocks(),
@@ -1365,6 +1368,55 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       isCompaction: false,
     });
     expect(accounted.costUsd).toBeCloseTo(responseCost + 0.0042, 10);
+  });
+
+  it("a send that never streams charges the evaluator by itself instead of the next turn", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, streamMessage, recordStreamAccounting } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    // Request preparation fails after classification: neither the tier model nor the
+    // composer's fallback could be built.
+    streamMessage.mockImplementation(() =>
+      Promise.resolve(Err({ type: "unknown" as const, raw: "no provider can serve this model" }))
+    );
+    const failed = await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(failed.success).toBe(false);
+    await session.waitForIdle();
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect(recordStreamAccounting.mock.calls[0]?.[0]).toEqual({
+      workspaceId: "ws-auto-routing",
+      costUsd: 0.0042,
+      streamOriginKind: "user",
+    });
+
+    // The next send classifies again and owes only its own evaluator spend.
+    streamMessage.mockImplementation((opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+    );
+    await session.sendMessage("And the retry queue", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    const internals = session as unknown as {
+      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
+    };
+    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(2);
+    const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
+      hardCost + 0.0042,
+      10
+    );
   });
 
   it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {

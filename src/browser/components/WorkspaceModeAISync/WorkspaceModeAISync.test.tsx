@@ -7,6 +7,7 @@ import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   AGENT_AI_DEFAULTS_KEY,
+  getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getModelKey,
   getThinkingLevelKey,
@@ -119,6 +120,31 @@ describe("WorkspaceModeAISync", () => {
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
     });
     expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), true)).toBe(false);
+  });
+
+  test("an explicit agent switch that keeps the stored settings still leaves Auto", async () => {
+    const workspaceId = nextWorkspaceId();
+    // Both agents resolve to what is already stored, so neither setter runs.
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      exec: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
+      plan: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
+    });
+    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
+    updatePersistedState(getThinkingLevelKey(workspaceId), "high");
+    updatePersistedState(getAutoModelRoutingKey(workspaceId), true);
+    updatePersistedState(getAutoThinkingLevelKey(workspaceId), true);
+
+    const { rerender } = renderSync({ workspaceId, agentId: "exec" });
+    // Mount sync is not a switch: the user's routing choice survives.
+    expect(readPersistedState(getAutoModelRoutingKey(workspaceId), false)).toBe(true);
+    expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), false)).toBe(true);
+
+    rerender(<SyncHarness workspaceId={workspaceId} agentId="plan" />);
+    await waitFor(() => {
+      expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), true)).toBe(false);
+    });
+    expect(readPersistedState(getAutoModelRoutingKey(workspaceId), true)).toBe(false);
+    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
   });
 
   test("preserves unsent workspace choices over configured agent defaults", async () => {

@@ -75,6 +75,8 @@ export const CommandIds = {
   thinkingSetLevel: () => "thinking:set-level" as const,
   toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
   toggleFastMode: () => "thinking:toggle-fast-mode" as const,
+  toggleAutoRouting: (dimension: "model" | "thinkingLevel") =>
+    `auto-routing:toggle:${dimension}` as const,
 
   // Project commands
   projectAdd: () => "project:add" as const,

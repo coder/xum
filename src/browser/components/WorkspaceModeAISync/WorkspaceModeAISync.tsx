@@ -14,6 +14,7 @@ import {
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import {
+  leaveAutoRoutingForAgentSwitch,
   setWorkspaceModelWithOrigin,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
@@ -86,6 +87,9 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    if (isExplicitAgentSwitch) {
+      leaveAutoRoutingForAgentSwitch(workspaceId);
+    }
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(
         workspaceId,

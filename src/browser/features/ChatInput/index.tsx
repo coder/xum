@@ -52,6 +52,7 @@ import {
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
 import {
+  leaveAutoRoutingForAgentSwitch,
   setWorkspaceModelWithOrigin,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
@@ -1059,6 +1060,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
     });
 
+    if (isExplicitAgentSwitch) {
+      leaveAutoRoutingForAgentSwitch(scopeId);
+    }
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }

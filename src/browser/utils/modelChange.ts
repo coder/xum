@@ -90,6 +90,16 @@ export function setWorkspaceModelWithOrigin(
 }
 
 /**
+ * An explicit agent switch applies the agent's concrete model and thinking level, so it leaves
+ * both Auto dimensions even when the stored values already match and nothing is rewritten;
+ * otherwise the next send would replace the agent's concrete settings with a tier's.
+ */
+export function leaveAutoRoutingForAgentSwitch(workspaceId: string): void {
+  updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
+  updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
+}
+
+/**
  * Thinking counterpart of setWorkspaceModelWithOrigin for agent-resolved levels: an explicit
  * agent switch leaves thinking Auto, otherwise the next send would replace the agent's concrete
  * level with a tier's; sync-driven defaults keep the user's routing choice.

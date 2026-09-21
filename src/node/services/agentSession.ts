@@ -918,6 +918,8 @@ interface PreparationAttempt {
    * turn that had no registered start yet); prepared candidates never refresh it at startup.
    */
   admissionStopEpoch?: number;
+  /** Evaluator spend this turn owes its goal (deferEvaluatorGoalCharge); settled if it never streams. */
+  evaluatorGoalCostUsd?: number;
 }
 
 export class AgentSession {
@@ -1148,7 +1150,10 @@ export class AgentSession {
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
 
-  /** Evaluator spend the next non-compaction stream's goal accounting carries (deferEvaluatorGoalCharge). */
+  /**
+   * Evaluator spend a delivered turn owes its goal, carried by the next non-compaction stream's
+   * accounting (deferEvaluatorGoalCharge). Discarded with the stream's own cost on a terminal error.
+   */
   private pendingEvaluatorGoalCostUsd?: number;
 
   /** True once we see any model/tool output for the current stream (retry guard). */
@@ -3443,6 +3448,7 @@ export class AgentSession {
       // (withdrawn send, pre-admission early return) also never runs; settle it before idle.
       if (attempt.outcome !== "delivered" && attempt.outcome !== "background") {
         this.recordQueueCutSuccessorPreStreamFailure(attempt);
+        await this.settleEvaluatorGoalCharge(attempt);
       }
       try {
         if (this.preparingQueuedInput?.attempt === attempt) {
@@ -4178,7 +4184,8 @@ export class AgentSession {
         trimmedMessage,
         optionsForStream,
         routingDimensions,
-        cancelSignal
+        cancelSignal,
+        attempt
       );
     }
     // A routed record reaches here freshly classified or carried by a compaction follow-up;
@@ -4205,7 +4212,8 @@ export class AgentSession {
                   typedMuxMetadata,
                   optionsForStream,
                   routingDimensions,
-                  cancelSignal
+                  cancelSignal,
+                  attempt
                 )
               : typedMuxMetadata,
             optionsForStream
@@ -5028,6 +5036,7 @@ export class AgentSession {
       attempt.outcome = "background";
       const backgroundAttempt: PreparationAttempt = { ...attempt, outcome: "preparing" };
       attempt.preparedRequest = undefined;
+      attempt.evaluatorGoalCostUsd = undefined;
       // Handoff callbacks may already have preempted back to idle. Transfer the edit
       // exclusion too, so only the child's settled startup can release queued work.
       attempt.editReservation = undefined;
@@ -6846,7 +6855,8 @@ export class AgentSession {
     metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
     options: ResolvedSendMessageOptions,
     dimensions: AutoModelRoutingDimensions,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    attempt: PreparationAttempt
   ): Promise<Extract<MuxMessageMetadata, { type: "compaction-request" }>> {
     const followUp = metadata.parsed.followUpContent;
     if (followUp == null || followUp.autoModelRouting != null) return metadata;
@@ -6865,7 +6875,8 @@ export class AgentSession {
       prompt,
       { ...options, model: followUp.model, thinkingLevel: followUp.thinkingLevel },
       dimensions,
-      signal
+      signal,
+      attempt
     );
     if (routed.autoModelRoutingRecord == null) return metadata;
     return {
@@ -7053,7 +7064,8 @@ export class AgentSession {
     prompt: string,
     options: ResolvedSendMessageOptions,
     dimensions: AutoModelRoutingDimensions,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    attempt: PreparationAttempt
   ): Promise<ResolvedSendMessageOptions> {
     const experimentEnabled =
       typeof this.aiService.isExperimentEnabled === "function" &&
@@ -7129,7 +7141,7 @@ export class AgentSession {
       decision.data.providerMetadata,
       { analyticsSource: "auto_model_routing" }
     );
-    this.deferEvaluatorGoalCharge(billed ? getTotalCost(billed.usage) : undefined);
+    this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,
@@ -7230,12 +7242,45 @@ export class AgentSession {
    * that turn's own stream accounting (recordGoalAccountingFromUsage). Charged by itself it
    * could tip the goal into budget_limited before the response starts, and a user-origin
    * stream on a non-active goal is not charged at all, so the far larger response cost would
-   * escape the cap. Compaction streams never charge the goal and leave it for the turn that
-   * follows their boundary (an on-send compaction or a /compact follow-up).
+   * escape the cap. The charge rides the preparation attempt until its stream is delivered
+   * (adoptEvaluatorGoalCharge); an attempt that never streams settles it by itself
+   * (settleEvaluatorGoalCharge), so nothing owed leaks into a later, unrelated turn.
+   * Compaction streams never charge the goal and leave it for the turn that follows their
+   * boundary (an on-send compaction or a /compact follow-up).
    */
-  private deferEvaluatorGoalCharge(costUsd: number | undefined): void {
+  private deferEvaluatorGoalCharge(attempt: PreparationAttempt, costUsd: number | undefined): void {
     if (!this.workspaceGoalService || costUsd == null || costUsd <= 0) return;
-    this.pendingEvaluatorGoalCostUsd = (this.pendingEvaluatorGoalCostUsd ?? 0) + costUsd;
+    attempt.evaluatorGoalCostUsd = (attempt.evaluatorGoalCostUsd ?? 0) + costUsd;
+  }
+
+  /** The delivered stream's accounting now owns the attempt's evaluator charge. */
+  private adoptEvaluatorGoalCharge(attempt: PreparationAttempt): void {
+    if (attempt.evaluatorGoalCostUsd == null) return;
+    this.pendingEvaluatorGoalCostUsd =
+      (this.pendingEvaluatorGoalCostUsd ?? 0) + attempt.evaluatorGoalCostUsd;
+    attempt.evaluatorGoalCostUsd = undefined;
+  }
+
+  /**
+   * No stream follows this attempt, so its evaluator spend is charged as a zero-turn
+   * user-origin stream: the cap sees it without a goal turn being consumed.
+   */
+  private async settleEvaluatorGoalCharge(attempt: PreparationAttempt): Promise<void> {
+    const costUsd = attempt.evaluatorGoalCostUsd;
+    attempt.evaluatorGoalCostUsd = undefined;
+    if (!this.workspaceGoalService || costUsd == null) return;
+    try {
+      await this.workspaceGoalService.recordStreamAccounting({
+        workspaceId: this.workspaceId,
+        costUsd,
+        streamOriginKind: "user",
+      });
+    } catch (error) {
+      log.warn("Failed to charge evaluator usage to the goal", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /**
@@ -8447,6 +8492,7 @@ export class AgentSession {
 
       if (preparation) {
         preparation.outcome = "delivered";
+        this.adoptEvaluatorGoalCharge(preparation);
         // An already-resolved handle can launch recovery synchronously. Release the
         // valid edit's history exclusion first; canceled startup keeps it through its callback.
         if (
@@ -9168,6 +9214,9 @@ export class AgentSession {
     const streamErrorMessage = createStreamErrorMessage(data);
     this.setTerminalStreamLifecycle("failed");
     this.terminalStreamError = streamErrorMessage;
+    // The failed stream's cost is discarded below; the evaluator spend that routed it
+    // follows, rather than landing on whichever unrelated turn streams next.
+    this.pendingEvaluatorGoalCostUsd = undefined;
     await this.restoreGoalAccountingSnapshot();
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
