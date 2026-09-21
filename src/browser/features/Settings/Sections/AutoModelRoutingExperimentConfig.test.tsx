@@ -238,6 +238,51 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(label.value).toBe("Fast");
   });
 
+  test("a debounced label commit spreads the config another window replaced meanwhile", async () => {
+    const configChange = { signal: null as (() => void) | null };
+    mockApi.config.onConfigChanged = mock(() =>
+      Promise.resolve({
+        next: () =>
+          new Promise<IteratorResult<void>>((resolve) => {
+            configChange.signal = () => resolve({ done: false, value: undefined });
+          }),
+        return: () => Promise.resolve({ done: true, value: undefined }),
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      })
+    );
+    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+    await waitFor(() => expect(configChange.signal).not.toBeNull());
+
+    const label = getByLabelText("Tier 1 label") as HTMLInputElement;
+    await userEvent.type(label, "Fast", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: label.value.length,
+    });
+    expect(mockApi.config.updateAutoModelRouting).not.toHaveBeenCalled();
+
+    // Another window switches the evaluator while this label's commit is still debounced.
+    mockApi.config.getConfig = mock(() =>
+      Promise.resolve({
+        autoModelRouting: {
+          ...getDefaultAutoModelRoutingConfig(),
+          evaluationModel: "openai:gpt-5.5",
+        },
+      })
+    );
+    configChange.signal?.();
+    const field = getByLabelText("Evaluation model") as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("openai:gpt-5.5"));
+
+    await waitFor(() => expect(mockApi.config.updateAutoModelRouting).toHaveBeenCalledTimes(1), {
+      timeout: 2000,
+    });
+    expect(lastUpdate().tiers[0].label).toBe("Fast");
+    expect(lastUpdate().evaluationModel).toBe("openai:gpt-5.5");
+  });
+
   test("a valid evaluation model is saved with the tiers on Enter", async () => {
     const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));

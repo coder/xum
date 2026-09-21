@@ -7327,20 +7327,23 @@ export class AgentSession {
    * words: synthetic rows are the app's, not a prompt to judge.
    */
   private async collectRecentUserPrompts(): Promise<string[]> {
-    // Bounded tail: the classifier only needs conversational context, not the whole window.
-    return (await this.loadActiveRoutingRows())
-      .slice(-20)
-      .filter(
-        (message) => isProviderVisibleUserRow(message) && message.metadata?.synthetic !== true
-      )
-      .map((message) =>
-        message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n")
-          .trim()
-      )
-      .filter((text) => text.length > 0);
+    return (
+      (await this.loadActiveRoutingRows())
+        .filter(
+          (message) => isProviderVisibleUserRow(message) && message.metadata?.synthetic !== true
+        )
+        // Bounded tail of the user's prompts, counted after filtering: the classifier only
+        // needs conversational context, but a prompt behind many report rows still counts.
+        .slice(-20)
+        .map((message) =>
+          message.parts
+            .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+            .map((part) => part.text)
+            .join("\n")
+            .trim()
+        )
+        .filter((text) => text.length > 0)
+    );
   }
 
   /**
@@ -7374,8 +7377,17 @@ export class AgentSession {
           record.thinkingLevel ??
           resumeOptions.thinkingLevel)
         : resumeOptions.thinkingLevel;
-    // Route-aware: a Coder-gateway tier model and its direct twin are different runs.
-    const keepRecord = modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model);
+    // The record survives a resume that still runs on the routed model (route-aware: a
+    // Coder-gateway tier model and its direct twin are different runs) while a dimension is
+    // still on Auto. With both dimensions concrete it survives only when the picks match what
+    // ran (startup retries): a thinking-only routing resumed at a hand-picked level routed
+    // nothing, and the badge must not claim its tier.
+    const keepRecord =
+      modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model) &&
+      (autoModelRouting === true ||
+        autoThinkingLevel === true ||
+        record.thinkingLevel == null ||
+        thinkingLevel === record.thinkingLevel);
     // The record's thinkingLevel means "Auto set it"; a concrete pick on resume replaces it.
     const { thinkingLevel: _routedThinkingLevel, ...recordWithoutThinking } = record;
     const resumedRecord = autoThinkingLevel === true ? record : recordWithoutThinking;

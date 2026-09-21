@@ -1236,6 +1236,40 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(resumeOptions?.autoModelRouting?.thinkingLevel).toBeUndefined();
   });
 
+  it.each([
+    ["the level that ran keeps the record without its thinking claim", "high", true],
+    ["a different level drops the record", "low", false],
+  ] as const)(
+    "a thinking-only routing resumed with both dimensions concrete at %s",
+    async (_case, thinkingLevel, kept) => {
+      const { session, streamMessage } = await createHarness({
+        experimentEnabled: true,
+        classify: () => Promise.resolve(Ok(decision("hard"))),
+      });
+      await session.sendMessage("design it", {
+        model: COMPOSER_MODEL,
+        agentId: "exec",
+        thinkingLevel: "low",
+        autoThinkingLevel: true,
+      });
+      await session.waitForIdle();
+
+      // Auto never changed the model here, so only the thinking level tells the two resumes apart.
+      await session.resumeStream({ model: COMPOSER_MODEL, agentId: "exec", thinkingLevel });
+      await session.waitForIdle();
+
+      const resumeOptions = streamMessage.mock.calls[1]?.[0];
+      expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
+      expect(resumeOptions?.thinkingLevel).toBe(thinkingLevel);
+      if (kept) {
+        expect(resumeOptions?.autoModelRouting).toMatchObject({ status: "routed", tierId: "hard" });
+        expect(resumeOptions?.autoModelRouting?.thinkingLevel).toBeUndefined();
+      } else {
+        expect(resumeOptions?.autoModelRouting).toBeUndefined();
+      }
+    }
+  );
+
   it("skips the paid evaluation when a budgeted goal cannot price the evaluator", async () => {
     const { session, historyService, classify } = await createHarness({
       experimentEnabled: true,
@@ -1297,6 +1331,48 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(recent).toContain("kept earlier prompt");
     expect(recent).not.toContain("rejected oversized prompt");
     expect(recent).not.toContain("/workflow display-only trigger");
+  });
+
+  it("keeps an earlier prompt in the evaluator context behind more than twenty report rows", async () => {
+    const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
+    expect(
+      (
+        await historyService.appendToHistory(
+          "ws-auto-routing",
+          createMuxMessage("user-earlier", "user", "design the scheduler first", {
+            timestamp: Date.now() - 2_000,
+          })
+        )
+      ).success
+    ).toBe(true);
+    for (let index = 0; index < 25; index += 1) {
+      const report = createMuxMessage(
+        `subagent-report-${index}`,
+        "user",
+        formatSubagentReportEnvelope({
+          taskId: `task-${index}`,
+          agentType: "explore",
+          status: "completed",
+          title: "Findings",
+          reportMarkdown: "done",
+        }),
+        { timestamp: Date.now() - 1_000, synthetic: true, uiVisible: true }
+      );
+      expect((await historyService.appendToHistory("ws-auto-routing", report)).success).toBe(true);
+    }
+
+    await session.sendMessage("now implement that", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    await session.waitForIdle();
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    // The bound applies to the user's prompts, not to the rows between them.
+    expect(classify.mock.calls[0]?.[0]?.recentUserMessages ?? []).toContain(
+      "design the scheduler first"
+    );
   });
 
   it("drops a malformed routing record from a recovered compaction follow-up", async () => {

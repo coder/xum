@@ -76,8 +76,10 @@ export function AutoModelRoutingExperimentConfig() {
   const [textErrors, setTextErrors] = useState<Record<string, Partial<TierTextDraft>>>({});
   const textDraftsRef = useRef(textDrafts);
   textDraftsRef.current = textDrafts;
-  const tiersRef = useRef(tiers);
-  tiersRef.current = tiers;
+  // Debounced commits run from a stale render: every delayed write spreads the latest
+  // config, so a tier commit cannot restore an evaluation model another window replaced.
+  const configRef = useRef(config);
+  configRef.current = config;
   const commitTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   // null means "not editing": the field shows the saved evaluation model.
@@ -118,7 +120,8 @@ export function AutoModelRoutingExperimentConfig() {
     };
   }, [api, evaluationValid, evaluationValue, statusRefresh]);
 
-  const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
+  const replaceTiers = (next: AutoModelRoutingTier[]) =>
+    setConfig({ ...configRef.current, tiers: next });
   const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
     replaceTiers(tiers.map((tier) => (tier.id === id ? { ...tier, ...patch } : tier)));
   const moveTier = (index: number, delta: -1 | 1) => {
@@ -133,7 +136,7 @@ export function AutoModelRoutingExperimentConfig() {
     if (!trimmed) return field === "label" ? "Label is required" : "Description is required";
     if (
       field === "label" &&
-      tiersRef.current.some(
+      configRef.current.tiers.some(
         (tier) => tier.id !== id && tier.label.trim().toLowerCase() === trimmed.toLowerCase()
       )
     ) {
@@ -157,7 +160,9 @@ export function AutoModelRoutingExperimentConfig() {
     clearTextDraft(id, field);
     setTextError(id, field, null);
     replaceTiers(
-      tiersRef.current.map((tier) => (tier.id === id ? { ...tier, [field]: value.trim() } : tier))
+      configRef.current.tiers.map((tier) =>
+        tier.id === id ? { ...tier, [field]: value.trim() } : tier
+      )
     );
   };
   const handleTextChange = (id: string, field: TierTextField, value: string) => {
