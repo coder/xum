@@ -18,6 +18,8 @@ export function SearchableModelSelect(props: {
   placeholder?: string;
   emptyOption?: { value: string; label: string };
   compact?: boolean;
+  /** Extra trigger classes, merged last so callers can override the height. */
+  className?: string;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -25,10 +27,14 @@ export function SearchableModelSelect(props: {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // getModelName("") returns "" (not undefined), so the placeholder only shows
+  // when the empty value is checked explicitly.
   const displayValue =
     props.emptyOption && !props.value
       ? props.emptyOption.label
-      : (getModelName(props.value) ?? props.placeholder ?? "Select model");
+      : props.value
+        ? getModelName(props.value)
+        : (props.placeholder ?? "Select model");
   const selectedProvider = props.value ? getModelProvider(props.value) : "";
 
   // Filter models based on search
@@ -125,15 +131,11 @@ export function SearchableModelSelect(props: {
         <button
           className={cn(
             "bg-background-secondary border-border-medium focus:border-accent flex w-full items-center justify-between rounded border px-2 text-xs",
-            props.compact ? "py-0.5" : "h-8"
+            props.compact ? "py-0.5" : "h-8",
+            props.className
           )}
         >
-          <span
-            className={cn(
-              "flex items-center gap-1.5 truncate",
-              !props.value && props.emptyOption && "text-muted"
-            )}
-          >
+          <span className={cn("flex items-center gap-1.5 truncate", !props.value && "text-muted")}>
             {selectedProvider && (
               <ProviderIcon provider={selectedProvider} className="text-muted shrink-0" />
             )}

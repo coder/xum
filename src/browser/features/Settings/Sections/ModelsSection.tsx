@@ -36,6 +36,7 @@ import {
   getProviderModelEntryMappedTo,
 } from "@/common/utils/providers/modelEntries";
 import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
+import { SearchableModelSelect } from "@/browser/features/Settings/Components/SearchableModelSelect";
 import { ModelRow } from "./ModelRow";
 
 // Providers to exclude from the custom models UI (handled specially or internal)
@@ -191,35 +192,53 @@ export function ModelsSection() {
     [config]
   );
 
+  // Shared by the free-text Add button and the discovered-models dropdown.
+  // Returns whether the model was added so the text path only clears its
+  // input on success (a rejected duplicate keeps the typed ID visible).
+  const addModel = useCallback(
+    (provider: string, modelId: string): boolean => {
+      if (!config) return false;
+
+      // mux-gateway is a routing layer, not a provider users should add models under.
+      if (HIDDEN_PROVIDERS.has(provider)) {
+        setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
+        return false;
+      }
+
+      // Check for duplicates
+      if (modelExists(provider, modelId)) {
+        setError(`Model "${modelId}" already exists for this provider`);
+        return false;
+      }
+
+      if (!api) return false;
+      setError(null);
+
+      // Optimistic update - returns new models array for API call
+      const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
+
+      // Save in background
+      void api.providers.setModels({ provider, models: updatedModels });
+      return true;
+    },
+    [api, config, modelExists, updateModelsOptimistically]
+  );
+
   const handleAddModel = useCallback(() => {
-    if (!config || !lastProvider || !newModelId.trim()) return;
-
-    // mux-gateway is a routing layer, not a provider users should add models under.
-    if (HIDDEN_PROVIDERS.has(lastProvider)) {
-      setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
-      return;
-    }
     const trimmedModelId = newModelId.trim();
+    if (!lastProvider || !trimmedModelId) return;
 
-    // Check for duplicates
-    if (modelExists(lastProvider, trimmedModelId)) {
-      setError(`Model "${trimmedModelId}" already exists for this provider`);
-      return;
+    if (addModel(lastProvider, trimmedModelId)) {
+      setNewModelId("");
     }
+  }, [addModel, lastProvider, newModelId]);
 
-    if (!api) return;
-    setError(null);
-
-    // Optimistic update - returns new models array for API call
-    const updatedModels = updateModelsOptimistically(lastProvider, (models) => [
-      ...models,
-      trimmedModelId,
-    ]);
-    setNewModelId("");
-
-    // Save in background
-    void api.providers.setModels({ provider: lastProvider, models: updatedModels });
-  }, [api, lastProvider, newModelId, config, modelExists, updateModelsOptimistically]);
+  // Catalog entries the user has not added yet, offered in the dropdown as
+  // full `${provider}:${id}` strings (SearchableModelSelect displays full IDs).
+  // The backend already policy-filters `discoveredModels`.
+  const discoveredUnconfigured = (config?.[lastProvider]?.discoveredModels ?? [])
+    .filter((modelId) => !modelExists(lastProvider, modelId))
+    .map((modelId) => `${lastProvider}:${modelId}`);
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
@@ -442,12 +461,28 @@ export function ModelsSection() {
                 ))}
               </SelectContent>
             </Select>
+            {discoveredUnconfigured.length > 0 && (
+              <div className="min-w-[12rem] flex-1">
+                <SearchableModelSelect
+                  value=""
+                  placeholder="Discovered models…"
+                  className="bg-background h-7"
+                  models={discoveredUnconfigured}
+                  onChange={(fullId) =>
+                    addModel(lastProvider, fullId.slice(lastProvider.length + 1))
+                  }
+                />
+              </div>
+            )}
+            {/* flex-1 has a 0 basis, so without a real minimum the input never
+                wraps and collapses to its padding next to the dropdown at phone
+                widths; the minimum makes it wrap to a second line instead. */}
             <input
               type="text"
               value={newModelId}
               onChange={(e) => setNewModelId(e.target.value)}
               placeholder="model-id"
-              className="bg-background border-border-medium focus:border-accent min-w-0 flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
+              className="bg-background border-border-medium focus:border-accent min-w-[8rem] flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
               onKeyDown={(e) => {
                 if (e.key === "Enter") void handleAddModel();
               }}
