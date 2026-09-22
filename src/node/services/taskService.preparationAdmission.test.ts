@@ -269,16 +269,25 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
       );
     });
 
-    test("a shared child whose path differs from its anchor, or whose ancestry no longer reaches a root, is refused", async () => {
+    test("a shared child whose execution directory differs from its anchor's, or whose ancestry no longer reaches a root, is refused", async () => {
       await setupTree([
         { id: "shared-mid", kind: "shared" },
         { id: "shared-leaf", kind: "shared", parentId: "shared-mid" },
         { id: "shared-detached", kind: "shared" },
       ]);
-      const detachedPath = path.join(rootDir, "elsewhere");
-      await fsPromises.mkdir(detachedPath, { recursive: true });
-      await editEntry("shared-detached", (ws) => {
-        ws.path = detachedPath;
+      // A LocalRuntime row executes in its PROJECT directory whatever its persisted path says, so
+      // "another directory" for a local child means another project bucket: the detached child is
+      // re-registered under its own project while still naming the root as its parent.
+      const detachedProject = path.join(rootDir, "elsewhere");
+      await fsPromises.mkdir(detachedProject, { recursive: true });
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath)!;
+        const detached = project.workspaces.find((w) => w.id === "shared-detached")!;
+        project.workspaces = project.workspaces.filter((w) => w.id !== "shared-detached");
+        cfg.projects.set(detachedProject, {
+          workspaces: [{ ...detached, path: detachedProject }],
+        });
+        return cfg;
       });
       const { taskService } = createHarness();
       expect((await taskService.preflightTaskWorkspacePreparation("shared-detached")).success).toBe(
