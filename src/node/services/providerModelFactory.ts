@@ -60,6 +60,7 @@ import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coder
 import type { DevToolsService } from "@/node/services/devToolsService";
 import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
+import { createToolInputDepthGuardMiddleware } from "@/node/services/toolInputDepthGuardMiddleware";
 import {
   attachLanguageModelCleanup,
   moveLanguageModelCleanup,
@@ -1336,7 +1337,14 @@ export class ProviderModelFactory {
         return result;
       }
 
-      let model: LanguageModel = result.data;
+      // Innermost wrapper: reject over-deep tool-call input before the SDK parses
+      // it (see createToolInputDepthGuardMiddleware). DevTools wraps outside so it
+      // records what the SDK actually saw.
+      let model: LanguageModel = wrapLanguageModel({
+        model: result.data,
+        middleware: createToolInputDepthGuardMiddleware(),
+      });
+      moveLanguageModelCleanup(result.data, model);
 
       const workspaceId = opts?.workspaceId;
       const devToolsService = self.devToolsService;

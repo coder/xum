@@ -388,8 +388,10 @@ describe("ProviderModelFactory.createModel", () => {
         return;
       }
 
+      // `<name>.chat` is the OpenAI-compatible Chat adapter's provider id (the completion
+      // adapter reports `<name>.completion`). createModel wraps every v4 model in the
+      // tool-input depth guard, so the concrete class is no longer observable here.
       expect((listedModel.data as { provider?: unknown }).provider).toBe("local-vllm.chat");
-      expect(listedModel.data.constructor.name).toMatch(/OpenAICompatibleChatLanguageModel$/);
 
       const unlistedModel = await factory.createModel("local-vllm:any-other-id");
       expect(unlistedModel.success).toBe(true);
