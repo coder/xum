@@ -41,7 +41,7 @@ const OPENAI = ids(
   "DAYBREAK_RED"
 );
 const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH");
-const XAI = ids("GROK_46");
+const XAI = ids("GROK_47");
 const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
 const MOONSHOT = ids("KIMI_K3");
 const ZAI = ids("GLM_53_FLASH");
