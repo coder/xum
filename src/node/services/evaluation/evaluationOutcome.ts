@@ -88,6 +88,18 @@ export async function runEvaluationToOutcome<A>(
     "runEvaluationToOutcome requires a finite, non-negative attempt budget"
   );
 
+  // Settle synchronously when nothing can run: a runtime abort that already
+  // happened is an interruption, and an already-expired budget is a deadline
+  // failure. `AbortSignal.timeout(0)` aborts on a later task, so without this
+  // the effect could dispatch (and bill) a provider request, or even complete
+  // through an immediately resolved promise, before the timer fires.
+  if (options.runtimeAbortSignal.aborted) {
+    return { status: "interrupted" };
+  }
+  if (remainingMs === 0) {
+    return { status: "failed", reason: "deadline", code: "deadline", defect: false };
+  }
+
   const signal = AbortSignal.any([options.runtimeAbortSignal, AbortSignal.timeout(remainingMs)]);
   const exit = await Effect.runPromiseExit(effect, { signal });
   return classifyEvaluationExit(exit, options.runtimeAbortSignal);

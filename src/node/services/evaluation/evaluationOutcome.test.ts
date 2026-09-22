@@ -92,6 +92,40 @@ describe("runEvaluationToOutcome", () => {
     expect(outcome).toMatchObject({ status: "failed", reason: "deadline" });
   });
 
+  it("never starts the effect when the budget is already spent or the runtime already aborted", async () => {
+    // An immediately-succeeding effect would otherwise win the race against
+    // AbortSignal.timeout(0), which aborts on a later task — billing a
+    // provider call and reporting `completed` for an expired attempt.
+    let started = 0;
+    const instant = Effect.sync(() => {
+      started += 1;
+      return "should-not-run";
+    });
+    const expired = await runEvaluationToOutcome(instant, {
+      runtimeAbortSignal: new AbortController().signal,
+      deadlineAt: Date.now() - 1_000,
+    });
+    expect(expired).toEqual({
+      status: "failed",
+      reason: "deadline",
+      code: "deadline",
+      defect: false,
+    });
+    const zeroBudget = await runEvaluationToOutcome(instant, {
+      runtimeAbortSignal: new AbortController().signal,
+      timeoutMs: 0,
+    });
+    expect(zeroBudget).toMatchObject({ status: "failed", reason: "deadline" });
+    const runtime = new AbortController();
+    runtime.abort();
+    const aborted = await runEvaluationToOutcome(instant, {
+      runtimeAbortSignal: runtime.signal,
+      timeoutMs: 60_000,
+    });
+    expect(aborted).toEqual({ status: "interrupted" });
+    expect(started).toBe(0);
+  });
+
   it("lets the runtime abort win when both the timeout and the runtime signal fired", async () => {
     // Pre-aborted runtime signal + zero budget: both reasons are present at once.
     const runtime = new AbortController();
