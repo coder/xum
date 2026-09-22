@@ -4366,14 +4366,28 @@ export class WorkspaceMcpOverridesService {
        */
       shouldPrune?: () => Promise<boolean>;
       /**
+       * Runs INSIDE the same held checkout and global override locks AFTER a
+       * `true` verdict and BEFORE the prune: the task-checkout preparation
+       * producer CLAIMS the fresh checkout here (a durable nonce write into its
+       * git admin dir). MUTATING, unlike the verdict — so a deadline that fires
+       * while it is in flight does not detach it: the claim is joined (landed or
+       * failed) before the locks release, exactly like an abandoned prune
+       * rewrite. A late nonce write after the release could otherwise stamp a
+       * directory a successor owns by then. Bounded by the prune's own budget;
+       * a deadline here fails the operation before any prune is launched.
+       */
+      claimUnderLock?: () => Promise<void>;
+      /**
        * Runs INSIDE the same held checkout and global override locks AFTER the
        * prune's writes settled (also when `shouldPrune` allowed the prune and
        * nothing needed rewriting): the task-checkout preparation producer binds
        * the physical identity of the sanitized directory here, so what it binds
        * is exactly what was pruned, with no window in which an alias writer could
-       * replace or re-consent the checkout. Read/stat plus the nonce write inside
-       * the git admin dir only; bounded by the prune's own budget. Not invoked
-       * when `shouldPrune` returned `false` (nothing was sanitized, nothing to bind).
+       * replace or re-consent the checkout. Read-only (stats and a bounded read
+       * of the nonce; the nonce was written by `claimUnderLock`), so a deadline
+       * may leave it detached like the verdict; bounded by the prune's own
+       * budget. Not invoked when `shouldPrune` returned `false` (nothing was
+       * sanitized, nothing to bind).
        */
       afterPruneUnderLock?: () => Promise<void>;
     }
@@ -4399,11 +4413,11 @@ export class WorkspaceMcpOverridesService {
           if (unresolvable !== undefined) {
             throw unresolvable.error;
           }
-          // ONE budget for the verdict and the prune (the prune sweep's shape): a
-          // slow registry walk under the locks must not leave a full prune budget
-          // behind it, and an expired verdict must not launch a mutating prune
-          // at all — the only detached work a deadline can leave here is the
-          // read-only verdict itself.
+          // ONE budget for the verdict, the claim and the prune (the prune sweep's
+          // shape): a slow registry walk under the locks must not leave a full
+          // prune budget behind it, and an expired verdict must not launch a
+          // mutating claim or prune at all — the only detached work a deadline
+          // can leave here is the read-only verdict (and the read-only bind).
           const budget = createPublicationBudget();
           if (options?.shouldPrune !== undefined) {
             const prune = await withDeadline(
@@ -4412,6 +4426,27 @@ export class WorkspaceMcpOverridesService {
               `verifying the siblings of ${label} exceeded the plugin-prune budget`
             );
             if (!prune) return;
+          }
+          if (options?.claimUnderLock !== undefined) {
+            if (budget.exhausted()) {
+              throw new Error(`claiming ${label} exceeded the plugin-prune budget`);
+            }
+            const claim = options.claimUnderLock();
+            try {
+              await withDeadline(
+                claim,
+                budget.remaining(),
+                `claiming ${label} exceeded the plugin-prune budget`
+              );
+            } finally {
+              // Write-join: a claim the deadline abandoned must land (or fail) before
+              // the locks release (see the option's contract). Its own failure, if
+              // any, is the error already propagating from the await above.
+              await claim.then(
+                () => undefined,
+                () => undefined
+              );
+            }
           }
           if (budget.exhausted()) {
             throw new Error(`pruning ${label} exceeded the plugin-prune budget`);
