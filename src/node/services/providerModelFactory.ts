@@ -2971,8 +2971,13 @@ export class ProviderModelFactory {
         }
         case "google": {
           // Mirrors the generic provider branch of createModelCoreEffect
-          // (credential merge; env base URL only when config sets none).
-          effectiveBaseURL = configuredBaseURL ?? creds.baseUrl;
+          // (credential merge; env base URL whenever config sets no usable one —
+          // an empty string counts as unset there, so it must here too, or an
+          // empty `google.baseURL` would bypass a GOOGLE_BASE_URL proxy).
+          effectiveBaseURL =
+            configuredBaseURL !== undefined && configuredBaseURL.trim() !== ""
+              ? configuredBaseURL
+              : creds.baseUrl;
           const configWithCreds = {
             ...providerConfig,
             apiKey: creds.apiKey,

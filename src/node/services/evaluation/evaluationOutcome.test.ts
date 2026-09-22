@@ -58,13 +58,20 @@ describe("runEvaluationToOutcome", () => {
   it("classifies a runtime abort as interrupted and aborts the in-flight provider signal", async () => {
     const runtime = new AbortController();
     let providerSignal: AbortSignal | undefined;
+    // Await the provider's own entry signal rather than sleeping: on a loaded
+    // worker the fiber may not reach the provider within a fixed delay.
+    let providerEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      providerEntered = resolve;
+    });
     const pending = runEvaluationToOutcome(
       hangUntilInterrupted((signal) => {
         providerSignal = signal;
+        providerEntered();
       }),
       { runtimeAbortSignal: runtime.signal, timeoutMs: 60_000 }
     );
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await entered;
     expect(providerSignal?.aborted).toBe(false);
     runtime.abort();
     expect(await pending).toEqual({ status: "interrupted" });

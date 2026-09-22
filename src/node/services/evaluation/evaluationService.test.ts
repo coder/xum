@@ -279,6 +279,12 @@ describe("EvaluationService.evaluate", () => {
 
   it("passes the fiber's abort signal to the model and propagates interruption, not failure", async () => {
     let seenSignal: AbortSignal | undefined;
+    // Deterministic hand-off: the provider call resolves this promise when it
+    // is entered, so the test never depends on scheduler timing.
+    let providerEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      providerEntered = resolve;
+    });
     const { model } = mockModel(
       (options) =>
         new Promise((_resolve, reject) => {
@@ -286,6 +292,7 @@ describe("EvaluationService.evaluate", () => {
           options.abortSignal?.addEventListener("abort", () =>
             reject(new Error(`aborted ${SENTINEL}`))
           );
+          providerEntered();
         })
     );
 
@@ -293,8 +300,7 @@ describe("EvaluationService.evaluate", () => {
     const pending = Effect.runPromiseExit(service.evaluate(call(model, QUESTIONS)), {
       signal: controller.signal,
     });
-    // Let the fiber reach the provider call before aborting.
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await entered;
     expect(seenSignal).toBeDefined();
     expect(seenSignal?.aborted).toBe(false);
     controller.abort();
