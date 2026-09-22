@@ -5,6 +5,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as ActualAPIModule from "@/browser/contexts/API";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import {
   getDefaultAutoModelRoutingConfig,
@@ -21,6 +23,8 @@ import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimi
 // Capture before installing module mocks; mock.restore() does not undo them.
 const actualAPIModule = { ...ActualAPIModule };
 const actualModelsFromSettingsModule = { ...ActualModelsFromSettingsModule };
+const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
+let mockProvidersConfig: ProvidersConfigMap | null = null;
 const actualModelSelectorModule = { ...ActualModelSelectorModule };
 
 interface MockApi {
@@ -50,6 +54,9 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
     models: ["openai:gpt-5.5", "anthropic:claude-opus-4-6"],
     hiddenModelsForSelector: [],
   }),
+}));
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  useProvidersConfig: () => ({ config: mockProvidersConfig, loading: false }),
 }));
 void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ModelSelector: (props: {
@@ -132,6 +139,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
       "@/browser/hooks/useModelsFromSettings",
       () => actualModelsFromSettingsModule
     );
+    await mock.module("@/browser/hooks/useProvidersConfig", () => actualProvidersConfigModule);
     await mock.module(
       "@/browser/components/ModelSelector/ModelSelector",
       () => actualModelSelectorModule
@@ -145,6 +153,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     mockApi = createMockApi();
+    mockProvidersConfig = null;
   });
 
   afterEach(() => {
@@ -417,6 +426,27 @@ describe("AutoModelRoutingExperimentConfig", () => {
       initialSelectionEnd: field.value.length,
     });
     expect(queryByLabelText("TypeSafe API key")).toBeNull();
+  });
+
+  test("the TypeSafe key controls stay hidden while typesafe is a legacy custom chat provider", async () => {
+    // Save/Clear would write that entry's apiKey, which the evaluator refuses to use anyway.
+    mockProvidersConfig = {
+      [TYPESAFE_PROVIDER_KEY]: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "openai-compatible",
+        baseUrl: "https://llm.example.internal/v1",
+      },
+    };
+    const { container, queryByLabelText, queryByRole } = render(
+      <AutoModelRoutingExperimentConfig />
+    );
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+    expect(queryByLabelText("TypeSafe API key")).toBeNull();
+    expect(queryByRole("button", { name: "Clear" })).toBeNull();
+    expect(mockApi.providers.setProviderConfig).not.toHaveBeenCalled();
   });
 
   test("classifying a sample prompt shows the chosen tier, model, and evaluator", async () => {

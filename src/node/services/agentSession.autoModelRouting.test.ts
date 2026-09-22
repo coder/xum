@@ -1419,6 +1419,63 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     );
   });
 
+  it("a compaction the user stops settles the evaluator spend it carried for its follow-up", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+      aiService.emit("stream-start", {
+        type: "stream-start",
+        workspaceId: "ws-auto-routing",
+        messageId: "assistant-compaction",
+        model: opts.modelString,
+        historySequence: 1,
+        startTime: Date.now(),
+      });
+      return Promise.resolve(
+        Ok(createStartedTurnHandle(session.closingSignal, "assistant-compaction"))
+      );
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(recordStreamAccounting).not.toHaveBeenCalled();
+
+    // The delivered stream is an on-send compaction; the user stops it before the deferred
+    // send behind its boundary is dispatched, and the queue holding that send is cleared.
+    const internals = session as unknown as { activeCompactionRequest?: { id: string } };
+    internals.activeCompactionRequest = { id: "compaction-1" };
+    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+      type: "stream-abort",
+      workspaceId: "ws-auto-routing",
+      messageId: "assistant-compaction",
+      abortReason: "user",
+    });
+    expect(recordStreamAccounting.mock.calls.map((call) => call[0])).toContainEqual({
+      workspaceId: "ws-auto-routing",
+      costUsd: 0.0042,
+      streamOriginKind: "user",
+    });
+
+    // Nothing is left over for the next unrelated turn.
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    const accounting = session as unknown as {
+      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
+    };
+    const callsBefore = recordStreamAccounting.mock.calls.length;
+    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(
+      (recordStreamAccounting.mock.calls[callsBefore]?.[0] as { costUsd: number }).costUsd
+    ).toBeCloseTo(hardCost, 10);
+  });
+
   it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
     const { session, recordStreamAccounting } = await createHarness({

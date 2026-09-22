@@ -14,6 +14,8 @@ import {
 import { useAPI } from "@/browser/contexts/API";
 import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { formatPercent } from "@/browser/features/Messages/AutoModelRoutingBadge";
 import {
   getDefaultAutoModelRoutingConfig,
@@ -65,6 +67,13 @@ export function AutoModelRoutingExperimentConfig() {
   const { api } = useAPI();
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
   const { config, setConfig, writeError } = useAutoModelRouting();
+  const { config: providersConfig } = useProvidersConfig();
+  // An upgraded install can still carry a legacy custom chat provider under the typesafe id.
+  // The evaluator refuses that entry, and Save/Clear here would overwrite its apiKey, so the
+  // key controls stay hidden; the status line names the conflict.
+  const typesafeEntry = providersConfig?.[TYPESAFE_PROVIDER_KEY];
+  const typesafeEntryIsCustom =
+    typesafeEntry?.isCustom === true && isCustomProviderConfig(typesafeEntry);
   const tiers = config.tiers;
 
   // Text fields commit on blur or Enter, not per keystroke: the IPC boundary rejects empty
@@ -267,7 +276,7 @@ export function AutoModelRoutingExperimentConfig() {
         </div>
       </div>
 
-      {evaluationProvider === TYPESAFE_PROVIDER_KEY ? (
+      {evaluationProvider === TYPESAFE_PROVIDER_KEY && !typesafeEntryIsCustom ? (
         <div className="space-y-2">
           <div className="text-foreground text-sm">TypeSafe API key</div>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">

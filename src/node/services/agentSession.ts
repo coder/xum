@@ -1152,7 +1152,8 @@ export class AgentSession {
 
   /**
    * Evaluator spend a delivered turn owes its goal, carried by the next non-compaction stream's
-   * accounting (deferEvaluatorGoalCharge). Discarded with the stream's own cost on a terminal error.
+   * accounting (deferEvaluatorGoalCharge). Settled by itself when a compaction aborts before its
+   * follow-up; discarded with the stream's own cost on a terminal error.
    */
   private pendingEvaluatorGoalCostUsd?: number;
 
@@ -7268,6 +7269,21 @@ export class AgentSession {
   private async settleEvaluatorGoalCharge(attempt: PreparationAttempt): Promise<void> {
     const costUsd = attempt.evaluatorGoalCostUsd;
     attempt.evaluatorGoalCostUsd = undefined;
+    await this.chargeEvaluatorSpendToGoal(costUsd);
+  }
+
+  /**
+   * A compaction that ends without handing off to its follow-up (the user stopped it) owes
+   * the goal the spend it was carrying for that follow-up; charge it now rather than let the
+   * next unrelated turn, possibly under a replacement goal, pick it up.
+   */
+  private async settlePendingEvaluatorGoalCharge(): Promise<void> {
+    const costUsd = this.pendingEvaluatorGoalCostUsd;
+    this.pendingEvaluatorGoalCostUsd = undefined;
+    await this.chargeEvaluatorSpendToGoal(costUsd);
+  }
+
+  private async chargeEvaluatorSpendToGoal(costUsd: number | undefined): Promise<void> {
     if (!this.workspaceGoalService || costUsd == null) return;
     try {
       await this.workspaceGoalService.recordStreamAccounting({
@@ -9342,6 +9358,16 @@ export class AgentSession {
           agentInitiated: this.activeStreamContext?.agentInitiated,
           isCompaction: hadCompactionRequest,
         });
+        if (
+          !this.coordinator.isCurrentTurn(turn) ||
+          !this.coordinator.isCurrentOperation(operation)
+        )
+          return;
+      }
+      // An aborted compaction never reaches its follow-up (the queue is cleared below), so the
+      // evaluator spend it carried for that follow-up cannot ride the follow-up's accounting.
+      if (hadCompactionRequest && this.pendingEvaluatorGoalCostUsd != null) {
+        await this.settlePendingEvaluatorGoalCharge();
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
