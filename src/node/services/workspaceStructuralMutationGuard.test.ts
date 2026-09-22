@@ -157,6 +157,78 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
     ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: secondaryProject });
   });
 
+  test("a missing runtimeConfig derives through the default worktree runtime under XUM_ROOT, and a tilde srcBaseDir is expanded", async () => {
+    // Config.getAllMetadata substitutes DEFAULT_RUNTIME_CONFIG (worktree, `~/.xum/src`) and
+    // WorktreeManager expands the tilde through getXumHome(): the runtime acts on
+    // <XUM_ROOT>/src/<project>/<name>, so that is the footprint — never the literal spelling.
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = tempDir;
+    try {
+      const projectPath = path.join(tempDir, "repo");
+      const derivedRoot = path.join(tempDir, "src", "repo", "root");
+      const derivedTask = path.join(tempDir, "src", "repo", "agent_task");
+      for (const dir of [projectPath, derivedRoot, derivedTask, path.join(tempDir, "stale")]) {
+        await fsPromises.mkdir(dir, { recursive: true });
+      }
+      const explicitWorktree = { type: "worktree", srcBaseDir: path.join(tempDir, "src") } as const;
+      const scan = (root: Workspace, task: Workspace) =>
+        findProtectedFootprintOverlap(
+          { projects: new Map([[projectPath, { workspaces: [root, task] }]]) },
+          { row: root, bucketProjectPath: projectPath }
+        );
+
+      // Legacy root without a runtimeConfig and a stale stored path; the task sits at the
+      // root's default-derived target.
+      const legacyRoot: Workspace = { path: path.join(tempDir, "stale"), id: "root", name: "root" };
+      const taskAtTarget: Workspace = {
+        path: derivedRoot,
+        id: "task",
+        name: "agent_task",
+        parentWorkspaceId: "root",
+        runtimeConfig: explicitWorktree,
+      };
+      expect(await scan(legacyRoot, taskAtTarget)).toMatchObject({
+        kind: "overlap",
+        taskWorkspaceId: "task",
+        targetPath: derivedRoot,
+      });
+      // Legacy TASK without a runtimeConfig and a stale stored path; the root's checkout is
+      // the task's default-derived location.
+      const rootAtTaskTarget: Workspace = {
+        path: derivedTask,
+        id: "root",
+        name: "agent_task",
+        runtimeConfig: explicitWorktree,
+      };
+      const legacyTask: Workspace = {
+        path: path.join(tempDir, "stale"),
+        id: "task",
+        name: "agent_task",
+        parentWorkspaceId: "other-root",
+      };
+      expect(await scan(rootAtTaskTarget, legacyTask)).toMatchObject({
+        kind: "overlap",
+        taskWorkspaceId: "task",
+        taskPath: derivedTask,
+      });
+      // An explicit `~/.xum/src` srcBaseDir aliases <XUM_ROOT>/src.
+      const tildeRoot: Workspace = {
+        path: path.join(tempDir, "stale"),
+        id: "root",
+        name: "root",
+        runtimeConfig: { type: "worktree", srcBaseDir: "~/.xum/src" },
+      };
+      expect(await scan(tildeRoot, taskAtTarget)).toMatchObject({
+        kind: "overlap",
+        taskWorkspaceId: "task",
+        targetPath: derivedRoot,
+      });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
   test.skipIf(process.platform === "win32")(
     "a symlinked or special .git entry is unknown backing: never followed, never opened",
     async () => {

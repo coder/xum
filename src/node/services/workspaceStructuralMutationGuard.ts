@@ -3,9 +3,11 @@ import type { Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
+import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { readSmallRegularFile } from "@/node/services/taskCheckoutPreparation";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -117,10 +119,22 @@ export function isProtectedTaskRow(row: Workspace): boolean {
 }
 
 /**
+ * The runtime a row actually runs under: Config.getAllMetadata substitutes
+ * DEFAULT_RUNTIME_CONFIG for a missing runtimeConfig before any runtime is
+ * created, so a legacy row without one is a worktree row under the default
+ * srcBaseDir, not a row that derives nothing.
+ */
+function effectiveRuntimeConfig(runtimeConfig: RuntimeConfig | undefined): RuntimeConfig {
+  return runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+}
+
+/**
  * Name-derived checkout path, mirroring WorktreeManager.getWorkspacePath for
- * worktree-style runtimes (`<srcBaseDir>/<projectName>/<name>`) and the
- * project directory for project-dir local runtimes. Multi-project rows persist
- * only the primary path; the other projects' checkouts are derived this way.
+ * worktree-style runtimes (`<srcBaseDir>/<projectName>/<name>`, with the
+ * srcBaseDir tilde expanded exactly as the WorktreeManager constructor does)
+ * and the project directory for project-dir local runtimes. Multi-project rows
+ * persist only the primary path; the other projects' checkouts are derived
+ * this way.
  */
 export function deriveHostLocalCheckoutPath(
   runtimeConfig: RuntimeConfig | undefined,
@@ -128,8 +142,9 @@ export function deriveHostLocalCheckoutPath(
   workspaceName: string
 ): string {
   assert(projectPath.length > 0, "deriveHostLocalCheckoutPath: projectPath is required");
-  if (hasSrcBaseDir(runtimeConfig)) {
-    return path.join(runtimeConfig.srcBaseDir, getProjectName(projectPath), workspaceName);
+  const runtime = effectiveRuntimeConfig(runtimeConfig);
+  if (hasSrcBaseDir(runtime)) {
+    return path.join(expandTilde(runtime.srcBaseDir), getProjectName(projectPath), workspaceName);
   }
   return projectPath;
 }
@@ -153,24 +168,26 @@ const CANONICALIZE_TIMEOUT_MS = 2_000;
  * operation land on a derived target the scan did not cover, so both the
  * stored path and every derived target are footprint.
  *
- * LocalRuntime rows execute in the PROJECT directory of every project they
- * belong to (LocalRuntime.forkWorkspace shares the project directory; the
- * producer core's execution directory is the bucket path, not the stored
- * path), so those directories are footprint too — a stored path that is stale
- * or points elsewhere must not hide the directory the task actually runs in.
+ * Project-dir LocalRuntime rows (`local` WITHOUT a srcBaseDir — runtimeFactory
+ * maps a legacy `local` WITH one to the worktree runtime) execute in the
+ * PROJECT directory of every project they belong to (LocalRuntime.forkWorkspace
+ * shares the project directory), so those directories are footprint too — a
+ * stored path that is stale or points elsewhere must not hide the directory
+ * the task actually runs in.
  */
 function footprintPathsForRow(row: Workspace, bucketProjectPath: string): string[] {
   const paths = [row.path];
+  const runtime = effectiveRuntimeConfig(row.runtimeConfig);
   const projectPaths =
     row.projects !== undefined && row.projects.length > 0
       ? row.projects.map((project) => project.projectPath)
       : [bucketProjectPath];
-  if (hasSrcBaseDir(row.runtimeConfig) && typeof row.name === "string" && row.name.length > 0) {
+  if (hasSrcBaseDir(runtime) && typeof row.name === "string" && row.name.length > 0) {
     for (const projectPath of projectPaths) {
-      paths.push(deriveHostLocalCheckoutPath(row.runtimeConfig, projectPath, row.name));
+      paths.push(deriveHostLocalCheckoutPath(runtime, projectPath, row.name));
     }
   }
-  if (row.runtimeConfig?.type === "local") {
+  if (runtime.type === "local" && !hasSrcBaseDir(runtime)) {
     paths.push(bucketProjectPath, ...projectPaths);
   }
   collectProofPaths(readTaskCheckoutPreparation(row), paths);
