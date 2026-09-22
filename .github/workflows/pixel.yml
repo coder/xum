@@ -45,24 +45,28 @@ jobs:
           PIXEL_AUTO_REVIEW: ${{ github.event_name == 'push' && 'true' || 'false' }}
 
       # A story whose final frame depends on timing shows up as a spurious "changed"
-      # snapshot on unrelated PRs. Replay Pixel's capture pipeline on the stories this PR
-      # touches (all stories when the shared harness changes, including story support
-      # modules named *Story*, e.g. settingsStoryUtils.tsx) and fail on any variant
-      # that renders differently across runs. Reuses the storybook-static/ build above.
+      # snapshot on unrelated PRs. Replay Pixel's capture pipeline and fail on any variant
+      # that renders differently across runs. Story-only PRs check just their stories;
+      # any other change Storybook consumes (components, hooks, styles, the harness)
+      # checks every story, since it can make any snapshot nondeterministic. This runs
+      # in parallel with the much longer PR workflow and reuses storybook-static/ above.
       - name: Check stories for nondeterministic snapshots
         if: github.event_name == 'pull_request' && env.PIXEL_KEY != ''
         run: |
-          changed=$(git diff --name-only --diff-filter=AMR HEAD^1 HEAD)
-          if echo "$changed" | grep -qE '^(\.storybook/|src/browser/stories/(helpers|mocks)/|src/browser/stories/(meta\.tsx|storyPlayHelpers\.ts|storyTime\.ts)$|pixel\.jsonc$|scripts/storybook-flake-check\.mjs$)|(^|/)[^/]*Story[^/]*\.tsx?$'; then
-            echo "Storybook harness changed; checking every story."
-            node scripts/storybook-flake-check.mjs --runs 3
+          # Storybook renders browser/common code plus its own harness; backend, desktop
+          # shell, CLI, and unit tests never reach a snapshot.
+          consumed=$(git diff --name-only --diff-filter=AMR HEAD^1 HEAD \
+            | grep -E '^(src/|\.storybook/|pixel\.jsonc$|scripts/storybook-flake-check\.mjs$)' \
+            | grep -vE '^src/(node|desktop|cli)/|\.test\.tsx?$' || true)
+          if [ -z "$consumed" ]; then
+            echo "No Storybook-consumed files changed; skipping."
+            exit 0
+          fi
+          if ! echo "$consumed" | grep -qvE '\.stories\.tsx?$'; then
+            node scripts/storybook-flake-check.mjs --runs 3 --files "$(echo "$consumed" | paste -sd, -)"
           else
-            stories=$(echo "$changed" | grep -E '\.stories\.tsx?$' | paste -sd, - || true)
-            if [ -z "$stories" ]; then
-              echo "No story files changed; skipping."
-              exit 0
-            fi
-            node scripts/storybook-flake-check.mjs --runs 3 --files "$stories"
+            echo "Storybook-consumed sources changed; checking every story."
+            node scripts/storybook-flake-check.mjs --runs 3
           fi
 
       - name: Upload nondeterministic renders
