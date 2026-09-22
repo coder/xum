@@ -2814,30 +2814,6 @@ export const config = {
       .strict(),
     output: z.void(),
   },
-  /**
-   * Authoritative, network-free check of whether `evaluate()` could admit a
-   * model string under the current providers/routing/policy configuration.
-   * Public projection of the resolver's typed rejection only (identifier
-   * fields; never SDK instances, credentials or raw errors). Selection
-   * feedback for Settings; call-time admission stays authoritative.
-   */
-  checkEvaluationModel: {
-    input: z.object({ model: z.string().min(1) }).strict(),
-    output: z.discriminatedUnion("ok", [
-      z.object({ ok: z.literal(true) }),
-      z.object({
-        ok: z.literal(false),
-        reason: z.enum([
-          "unsupported-provider",
-          "unsupported-route",
-          "unauthorized",
-          "unknown-model",
-        ]),
-        routeKind: z.enum(["gateway", "local", "custom", "codex-oauth"]).optional(),
-        providerName: z.string().optional(),
-      }),
-    ]),
-  },
   unenrollMuxGovernor: {
     input: z.void(),
     output: z.void(),

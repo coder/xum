@@ -70,6 +70,17 @@ interface WorkflowStepRowProps {
   nestedDepth: number;
 }
 
+/**
+ * The provider-reported response model id is a bare id (`gpt-5`), and the
+ * evaluation service falls back to the requested bare id when a provider
+ * reports none, while the admitted `modelString` keeps its provider prefix
+ * (`openai:gpt-5`). Compare like with like so an ordinary completion does not
+ * render a second "↳ …" model line.
+ */
+function bareModelId(modelString: string): string {
+  return modelString.slice(modelString.indexOf(":") + 1);
+}
+
 function getNestedWorkflowSummary(input: {
   childView: WorkflowRunView | null;
   fallbackStatus?: WorkflowStepView["nestedWorkflowStatus"];
@@ -400,7 +411,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                       {/* Untrusted display text (model ids); React escaping is the only rendering path. */}
                       <span className="min-w-0 truncate font-mono">{evaluation.modelString}</span>
                       {evaluation.responseModelId != null &&
-                        evaluation.responseModelId !== evaluation.modelString && (
+                        evaluation.responseModelId !== bareModelId(evaluation.modelString) && (
                           <span className="min-w-0 truncate font-mono">
                             ↳ {evaluation.responseModelId}
                           </span>
