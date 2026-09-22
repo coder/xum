@@ -24,15 +24,18 @@
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 // Deep imports: the package only exports its CLI + storyapi, but these are the
 // exact modules `pixel-storybook` runs. Re-check them when bumping the pinned version.
+// File URLs keep dynamic import() working with Windows drive-letter paths.
 const PIXEL_BUILD = resolve("node_modules/@coder/pixel-storybook/build");
-const pixelConfig = await import(join(PIXEL_BUILD, "config.js"));
-const pixelCrawler = await import(join(PIXEL_BUILD, "crawler/storybook.js"));
-const pixelShots = await import(join(PIXEL_BUILD, "shots/shots.js"));
-const pixelUtils = await import(join(PIXEL_BUILD, "utils.js"));
+const importPixel = (module) => import(pathToFileURL(join(PIXEL_BUILD, module)).href);
+const pixelConfig = await importPixel("config.js");
+const pixelCrawler = await importPixel("crawler/storybook.js");
+const pixelShots = await importPixel("shots/shots.js");
+const pixelUtils = await importPixel("utils.js");
 
 const { values } = parseArgs({
   options: {

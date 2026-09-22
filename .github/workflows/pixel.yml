@@ -56,7 +56,7 @@ jobs:
             echo "Storybook harness changed; checking every story."
             node scripts/storybook-flake-check.mjs --runs 3
           else
-            stories=$(echo "$changed" | grep -E '\.stories\.tsx$' | paste -sd, - || true)
+            stories=$(echo "$changed" | grep -E '\.stories\.tsx?$' | paste -sd, - || true)
             if [ -z "$stories" ]; then
               echo "No story files changed; skipping."
               exit 0
