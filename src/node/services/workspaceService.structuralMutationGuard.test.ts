@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test, type Mock } from "bun:test";
+import { execFile } from "child_process";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
+import { promisify } from "util";
 import type { Workspace } from "@/common/types/project";
 import { Err, Ok } from "@/common/types/result";
 import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
@@ -42,6 +44,7 @@ describe("WorkspaceService structural mutation guard", () => {
   let config: Config;
   let cleanup: () => Promise<void>;
   let service: WorkspaceService;
+  let tempDir: string;
   let projectPath: string;
   let srcBaseDir: string;
   let worktreeRuntime: RuntimeConfig;
@@ -111,6 +114,7 @@ describe("WorkspaceService structural mutation guard", () => {
     const harness = await createTestHistoryService();
     config = harness.config;
     cleanup = harness.cleanup;
+    tempDir = harness.tempDir;
     projectPath = path.join(harness.tempDir, "repo");
     srcBaseDir = path.join(harness.tempDir, "src");
     worktreeRuntime = { type: "worktree", srcBaseDir };
@@ -118,10 +122,13 @@ describe("WorkspaceService structural mutation guard", () => {
     physical = { deleted: [], renamed: [] };
     deleteBarrier = undefined;
 
-    // Faked runtime: derives paths like WorktreeManager and performs the physical effect on
-    // the real directories so a guard placed AFTER an effect is caught by the intact checks.
+    // Faked runtime: derives its operation target from the NAME like the real
+    // WorktreeManager.deleteWorkspace/renameWorkspace do (the persisted row path is not what
+    // they act on) and performs the physical effect on the real directories, so a guard
+    // placed AFTER an effect — or one that scanned only the stored path — is caught by the
+    // intact checks.
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockImplementation(
-      (runtimeConfig, options) => {
+      (runtimeConfig) => {
         const derive = (targetProjectPath: string, name: string) =>
           hasSrcBaseDir(runtimeConfig)
             ? path.join(runtimeConfig.srcBaseDir, path.basename(targetProjectPath), name)
@@ -133,14 +140,14 @@ describe("WorkspaceService structural mutation guard", () => {
           stat: () => Promise.reject(new Error("no plan file")),
           canDeleteWorkspaceWithoutForce: () => Promise.resolve({ success: true as const }),
           deleteWorkspace: async (targetProjectPath: string, name: string) => {
-            const target = options?.workspacePath ?? derive(targetProjectPath, name);
+            const target = derive(targetProjectPath, name);
             await deleteBarrier?.();
             await fsPromises.rm(target, { recursive: true, force: true });
             physical.deleted.push(target);
             return { success: true as const, deletedPath: target };
           },
           renameWorkspace: async (targetProjectPath: string, oldName: string, newName: string) => {
-            const from = options?.workspacePath ?? derive(targetProjectPath, oldName);
+            const from = derive(targetProjectPath, oldName);
             const to = derive(targetProjectPath, newName);
             await fsPromises.rename(from, to);
             physical.renamed.push({ from, to });
@@ -457,6 +464,75 @@ describe("WorkspaceService structural mutation guard", () => {
       expect(await service.archive("root-ws-other")).toEqual(Ok({ kind: "archived" }));
       expect(removeManagedGitWorktreeSpy).toHaveBeenCalledWith(projectPath, other.path);
       await expectIntact(unrelatedTask);
+    });
+
+    test("a stored root path that differs from the runtime's name-derived target still protects a task at that target", async () => {
+      // WorktreeRuntime.deleteWorkspace/renameWorkspace act on <srcBaseDir>/<project>/<name>,
+      // not on the persisted row path: a stale stored path must not let the operation land on a
+      // derived target the guard never scanned.
+      const root = row("root", ROOT_ID, { path: checkoutPath("root-stored") });
+      const taskAtDerivedTarget = taskRow("agent_at_target", TASK_ID, {
+        path: checkoutPath("root"),
+      });
+      await seed([root, taskAtDerivedTarget]);
+
+      expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+      expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+      await expectIntact(taskAtDerivedTarget);
+      await expectIntact(root);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
+    test("a legacy task worktree backed by a repo nested inside the root blocks the root's removal and rename (real git)", async () => {
+      const git = async (cwd: string, ...args: string[]) => {
+        await promisify(execFile)("git", args, {
+          cwd,
+          env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+        });
+      };
+      const root = row("root", ROOT_ID);
+      await seed([root]);
+      // A project repository nested inside the ordinary root's checkout ...
+      const nestedRepo = path.join(root.path, "nested");
+      await fsPromises.mkdir(nestedRepo, { recursive: true });
+      await git(nestedRepo, "init", "-q");
+      await fsPromises.writeFile(path.join(nestedRepo, "README.md"), "nested\n");
+      await git(nestedRepo, "add", "README.md");
+      await git(
+        nestedRepo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "init"
+      );
+      // ... backs a legacy task checkout OUTSIDE the root: its `.git` file points at the admin
+      // dir under the nested repo, which the root's deletion or move would destroy.
+      const legacyCheckout = path.join(tempDir, "legacy-task");
+      await git(nestedRepo, "worktree", "add", "-q", legacyCheckout, "-b", "legacy-task");
+      const adminDir = path.join(nestedRepo, ".git", "worktrees", "legacy-task");
+      expect((await fsPromises.stat(path.join(legacyCheckout, ".git"))).isFile()).toBe(true);
+      expect(await exists(adminDir)).toBe(true);
+      const legacyTask: Workspace = {
+        path: legacyCheckout,
+        id: TASK_ID,
+        name: "legacy-task",
+        parentWorkspaceId: ROOT_ID,
+      };
+      await saveWorkspaces(config, projectPath, [root, legacyTask]);
+
+      expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+      expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+      await expectIntact(root);
+      expect(await exists(adminDir)).toBe(true);
+      expect(await exists(path.join(legacyCheckout, "README.md"))).toBe(true);
+      expect(persistedRow(TASK_ID)).toMatchObject({ path: legacyCheckout });
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
     });
 
     test("an id with no registered row refuses instead of deleting its session as a phantom", async () => {
