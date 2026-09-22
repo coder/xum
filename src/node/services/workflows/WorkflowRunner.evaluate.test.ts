@@ -315,6 +315,34 @@ const storedResult: EvaluationStepResult = {
   state: { sha256: "seeded", bytes: 1 },
 };
 
+describe("hashEvaluationStepInput", () => {
+  const base = { id: STEP_ID, questions: QUESTIONS };
+
+  test("request-shaping inputs change the replay key; execution config does not", () => {
+    const key = hashEvaluationStepInput(base, STATE);
+    expect(hashEvaluationStepInput({ ...base, title: "other", timeoutMs: 9_000 }, STATE)).toBe(key);
+    expect(hashEvaluationStepInput({ ...base, model: SENTINEL_MODEL }, STATE)).not.toBe(key);
+    expect(
+      hashEvaluationStepInput(
+        { ...base, providerOptions: { openai: { reasoningEffort: "low" } } },
+        STATE
+      )
+    ).not.toBe(key);
+    expect(
+      hashEvaluationStepInput(
+        { ...base, providerOptions: { openai: { reasoningEffort: "low" } } },
+        STATE
+      )
+    ).not.toBe(
+      hashEvaluationStepInput(
+        { ...base, providerOptions: { openai: { reasoningEffort: "high" } } },
+        STATE
+      )
+    );
+    expect(hashEvaluationStepInput(base, { ...STATE, body: "changed" })).not.toBe(key);
+  });
+});
+
 describe("WorkflowRunner evaluate()", () => {
   test("happy path: admits once, dispatches once, commits then accounts", async () => {
     using tmp = new DisposableTempDir("workflow-eval");

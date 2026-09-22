@@ -120,7 +120,12 @@ export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);
 }
 
-/** Replay identity: the logical inputs only. Settings, timeout and title are execution config. */
+/**
+ * Replay identity: everything that shapes the provider request (state,
+ * questions, per-call model, provider options). The Settings default, timeout
+ * and title are execution config and stay out of the key, so a completed step
+ * never replays a result produced under different request settings.
+ */
 export function hashEvaluationStepInput(
   spec: WorkflowEvaluateSpec,
   state: EvaluationState
@@ -130,6 +135,7 @@ export function hashEvaluationStepInput(
     state,
     questions: spec.questions,
     ...(spec.model !== undefined ? { model: spec.model } : {}),
+    ...(spec.providerOptions !== undefined ? { providerOptions: spec.providerOptions } : {}),
   });
 }
 
