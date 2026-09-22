@@ -245,19 +245,20 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
-  // Claude Opus 5.5 - successor to Opus 5. Pricing follows the pre-launch leak
-  // (unconfirmed): $4/M input, $20/M output (20% below Opus 5), cache write 1.25x
-  // input, cache read $0.20/M as leaked (a 0.05x-input multiplier no other model
-  // uses today — the single most uncertain number here; verify on announcement).
-  // Same envelope shape as Opus 5 assumed: native 1M context, 128K max output,
-  // full effort ladder with native xhigh and max.
+  // Claude Opus 5.5 - Released September 22, 2026
+  // Official pricing: $4/M input, $20/M output (20% below Opus 5), 5-minute cache
+  // write $5/M (1.25x input), cache read $0.20/M (0.05x input). The 1-hour cache
+  // write tier ($8/M, 2x input) and fast mode ($8/$40) have no field/entry here,
+  // matching the Opus 5 treatment. Native 1M context, 128K max output, effort
+  // ladder low..max with native xhigh; thinking cannot be disabled (default
+  // effort medium). https://platform.claude.com/docs/en/models/opus-5-5/overview
   "claude-opus-5-5": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000004, // $4 per million input tokens
     output_cost_per_token: 0.00002, // $20 per million output tokens
     cache_creation_input_token_cost: 0.000005, // $5 per million tokens (1.25× input)
-    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.05× input, leak-literal)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.05× input)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,

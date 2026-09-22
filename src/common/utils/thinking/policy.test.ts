@@ -477,16 +477,6 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
-    // Opus 5.5 rides the same Opus 5+ wildcard: full 6-level ladder, and
-    // (unlike Mythos-class models) "off" stays available.
-    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
     expect(getThinkingPolicyForModel("anthropic:claude-opus-5-0")).toEqual([
       "off",
       "low",
@@ -521,6 +511,21 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    // Opus 5.5 is the first Opus that cannot disable thinking (Opus 5 still can).
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5-20260922")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5-1")).toEqual([
       "low",
       "medium",
@@ -536,6 +541,7 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
   test("resolveEffectiveThinkingLevel clamps unset/off for forced-thinking models", () => {
@@ -545,6 +551,10 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", undefined)).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "off")).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "medium")).toBe("medium");
+    // Opus 5.5 always thinks; Opus 5 (and Bedrock-style ids) keep their own behavior.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("bedrock:anthropic.claude-opus-5-5", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5", undefined)).toBe("off");
     // Other models keep legacy behavior: unset means "off", explicit levels pass through
     // unclamped (policy enforcement happens at the call sites that own it).
     expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-4-8", undefined)).toBe("off");

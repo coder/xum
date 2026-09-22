@@ -133,9 +133,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // proxies encode (e.g. `mux-gateway:openai/gpt-5.5-pro` -> `gpt-5.5-pro`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
-  // Mythos-class models (Fable/Mythos) cannot disable thinking — the API rejects
-  // `thinking: { type: "disabled" }` and always thinks (adaptive by default) — so
-  // "off" is not offered and requests for it clamp up to "low".
+  // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
+  // API rejects `thinking: { type: "disabled" }` and always thinks (adaptive by
+  // default) — so "off" is not offered and requests for it clamp up to "low".
   if (anthropicRejectsDisabledThinking(modelString)) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
