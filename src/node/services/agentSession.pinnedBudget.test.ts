@@ -45,6 +45,16 @@ async function setup(
 ) {
   const history = await createTestHistoryService();
   const { config, historyService } = history;
+  // A registered ordinary root: every stream start derives the workspace's checkout-preparation
+  // authority from its config row (roots are exempt; an unregistered id is refused).
+  await config.editConfig((cfg) => {
+    cfg.projects.set(config.rootDir, {
+      workspaces: [
+        { id: workspaceId, name: "test", path: config.rootDir, runtimeConfig: { type: "local" } },
+      ],
+    });
+    return cfg;
+  });
   spyOn(config, "findWorkspace").mockReturnValue({
     projectPath: config.rootDir,
     workspacePath: config.rootDir,

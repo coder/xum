@@ -110,7 +110,9 @@ export function makeAgentTaskIntegrationFake(
     // Derived from the (possibly overridden) boolean rescue, so suites that script only
     // markInterruptedTaskRunning keep driving the outcome WorkspaceService consumes.
     reawakenInterruptedTask: async (workspaceId, options) =>
-      (await fake.markInterruptedTaskRunning(workspaceId, options))
+      (await (options != null
+        ? fake.markInterruptedTaskRunning(workspaceId, options)
+        : fake.markInterruptedTaskRunning(workspaceId)))
         ? { kind: "reawakened", attemptId: FAKE_REAWAKENED_ATTEMPT_ID, statusChanged: true }
         : { kind: "not-applicable" },
     ...overrides,
