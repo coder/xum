@@ -965,6 +965,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
+      // Stories have no resolver; every eligible selection reads as admissible.
+      checkEvaluationModel: () => Promise.resolve({ ok: true as const }),
       updateRuntimeEnablement: (input: {
         projectPath?: string | null;
         runtimeEnablement?: Record<string, boolean> | null;

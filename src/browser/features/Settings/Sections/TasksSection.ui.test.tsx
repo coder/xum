@@ -53,6 +53,7 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
       "xai:grok-code-fast-1",
     ],
     hiddenModelsForSelector: [],
+    isAllowedByPolicyOnActiveRoute: () => true,
   }),
 }));
 

@@ -508,6 +508,28 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateEvaluationDefaults(input));
           })
         ),
+      checkEvaluationModel: t
+        .input(schemas.config.checkEvaluationModel.input)
+        .output(schemas.config.checkEvaluationModel.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            // createEvaluationModel performs no network I/O: it only proves the
+            // configuration admits the model (route, credentials, policy).
+            const resolved = yield* atomicPromise(() =>
+              context.aiService.createEvaluationModel(input.model)
+            );
+            if (resolved.success) {
+              return { ok: true as const };
+            }
+            const { reason, routeKind, providerName } = resolved.error;
+            return {
+              ok: false as const,
+              reason,
+              ...(routeKind !== undefined ? { routeKind } : {}),
+              ...(providerName !== undefined ? { providerName } : {}),
+            };
+          })
+        ),
       unenrollMuxGovernor: t
         .input(schemas.config.unenrollMuxGovernor.input)
         .output(schemas.config.unenrollMuxGovernor.output)

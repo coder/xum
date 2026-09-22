@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as RealAPIModule from "@/browser/contexts/API";
 import * as RealModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import * as RealModelsModule from "@/browser/hooks/useModelsFromSettings";
-import * as RealRoutingModule from "@/browser/hooks/useRouting";
+import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import type { EvaluationModelCheck } from "@/common/orpc/types";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
@@ -11,20 +12,21 @@ let apiMock: {
   config: {
     getConfig: ReturnType<typeof mock>;
     updateEvaluationDefaults: ReturnType<typeof mock>;
+    checkEvaluationModel: ReturnType<typeof mock>;
   };
 } | null = null;
-let routeMock: { route: string; isAuto: boolean; displayName: string } = {
-  route: "direct",
-  isAuto: true,
-  displayName: "Direct",
-};
+// Backend verdict per model string; unknown models read as admissible.
+let checkResults: Record<string, EvaluationModelCheck | Promise<EvaluationModelCheck>> = {};
+// Policy predicate shared with the chat pickers; models not listed here are disallowed.
+let policyDisallowed: string[] = [];
+let providersConfigMock: Record<string, { isCustom?: boolean }> = {};
 
 // Capture the real exports BEFORE any mock.module call in this file: the spread
 // must see the real module, or the afterAll restore would reinstall the stub.
 restoreModulesAfterSuite([
   ["@/browser/contexts/API", { ...RealAPIModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...RealModelsModule }],
-  ["@/browser/hooks/useRouting", { ...RealRoutingModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...RealProvidersConfigModule }],
   ["@/browser/components/ModelSelector/ModelSelector", { ...RealModelSelectorModule }],
 ]);
 
@@ -39,11 +41,16 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
       "xai:grok-code-fast-1",
       "openrouter:openai/gpt-5",
     ],
-    hiddenModelsForSelector: ["google:gemini-2.5-flash", "xai:grok-4-1-fast"],
+    hiddenModelsForSelector: [
+      "google:gemini-2.5-flash",
+      "xai:grok-4-1-fast",
+      "google:gemini-2.5-pro",
+    ],
+    isAllowedByPolicyOnActiveRoute: (model: string) => !policyDisallowed.includes(model),
   }),
 }));
-void mock.module("@/browser/hooks/useRouting", () => ({
-  useRouting: () => ({ resolveRoute: () => routeMock }),
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  useProvidersConfig: () => ({ config: providersConfigMock, loading: false }),
 }));
 void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ModelSelector: (props: {
@@ -76,6 +83,9 @@ function renderCard(
   update: () => Promise<undefined> = () => Promise.resolve(undefined)
 ) {
   const updateEvaluationDefaults = mock(update);
+  const checkEvaluationModel = mock(({ model }: { model: string }) =>
+    Promise.resolve(checkResults[model] ?? { ok: true as const })
+  );
   apiMock = {
     config: {
       getConfig: mock(() =>
@@ -84,11 +94,12 @@ function renderCard(
         )
       ),
       updateEvaluationDefaults,
+      checkEvaluationModel,
     },
   };
   const view = render(<EvaluationModelCard />);
   const select = () => view.getByLabelText("Model") as HTMLSelectElement;
-  return { view, select, updateEvaluationDefaults };
+  return { view, select, updateEvaluationDefaults, checkEvaluationModel };
 }
 
 describe("EvaluationModelCard", () => {
@@ -96,7 +107,9 @@ describe("EvaluationModelCard", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
-    routeMock = { route: "direct", isAuto: true, displayName: "Direct" };
+    checkResults = {};
+    policyDisallowed = [];
+    providersConfigMock = {};
   });
 
   afterEach(() => {
@@ -106,22 +119,38 @@ describe("EvaluationModelCard", () => {
   });
 
   test("offers only evaluation-eligible models and persists a selection through the dedicated endpoint", async () => {
-    const { view, select, updateEvaluationDefaults } = renderCard();
+    // A policy-disallowed model hides in "Show all models…": it must not be offered there either.
+    policyDisallowed = ["google:gemini-2.5-pro"];
+    const { view, select, updateEvaluationDefaults, checkEvaluationModel } = renderCard();
     await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
 
-    // Unsupported providers and explicit gateway selections are dropped from both
-    // the primary list and the "Show all models…" list.
+    // Unsupported providers, explicit gateway selections and policy-disallowed
+    // models are dropped from both the primary and the hidden list.
     const options = Array.from(select().options).map((option) => option.value);
     expect(options).toEqual(["", "anthropic:claude-haiku-4-5", "openai:gpt-5"]);
     expect(select().dataset.hiddenModels).toBe("google:gemini-2.5-flash");
     expect(view.queryByRole("button", { name: "Clear evaluation model" })).toBeNull();
+    // Nothing selected: nothing to check.
+    expect(checkEvaluationModel).not.toHaveBeenCalled();
 
     fireEvent.change(select(), { target: { value: "openai:gpt-5" } });
 
     expect(updateEvaluationDefaults).toHaveBeenCalledWith({ model: "openai:gpt-5" });
     await waitFor(() => expect(select().value).toBe("openai:gpt-5"));
+    await waitFor(() =>
+      expect(checkEvaluationModel).toHaveBeenCalledWith({ model: "openai:gpt-5" })
+    );
     expect(view.getByRole("button", { name: "Clear evaluation model" })).toBeTruthy();
     expect(view.queryByRole("note")).toBeNull();
+  });
+
+  test("drops models whose built-in id is shadowed by a custom provider", async () => {
+    providersConfigMock = { openai: { isCustom: true } };
+    const { select } = renderCard();
+    await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
+
+    const options = Array.from(select().options).map((option) => option.value);
+    expect(options).toEqual(["", "anthropic:claude-haiku-4-5"]);
   });
 
   test("keeps showing the stored model when the write is rejected", async () => {
@@ -147,31 +176,49 @@ describe("EvaluationModelCard", () => {
     expect(view.queryByRole("button", { name: "Clear evaluation model" })).toBeNull();
   });
 
-  test("flags an explicit gateway selection even when the canonical route is direct", async () => {
-    // resolveRoute canonicalizes `openrouter:openai/gpt-5` to a direct OpenAI route
-    // (mocked as "direct" here), but the backend rejects the raw gateway prefix.
-    const { view } = renderCard("openrouter:openai/gpt-5");
+  // The hint is the backend resolver's verdict, so auth-mode, route and
+  // credential rules are not re-implemented client-side.
+  test.each([
+    [
+      { ok: false, reason: "unsupported-route", routeKind: "codex-oauth", providerName: "openai" },
+      "ChatGPT OAuth",
+    ],
+    [{ ok: false, reason: "unsupported-route", routeKind: "custom" }, "custom provider"],
+    [
+      { ok: false, reason: "unsupported-route", routeKind: "gateway", providerName: "openrouter" },
+      "Would route via openrouter",
+    ],
+    [{ ok: false, reason: "unauthorized", providerName: "openai" }, "no usable API key"],
+    [{ ok: false, reason: "unsupported-provider" }, "not supported for evaluation"],
+  ] as const satisfies ReadonlyArray<readonly [EvaluationModelCheck, string]>)(
+    "explains the backend rejection %j for the persisted model",
+    async (result, expectedText) => {
+      checkResults = { "openai:gpt-5": result };
+      const { view } = renderCard("openai:gpt-5");
 
+      await waitFor(() => expect(view.getByRole("note").textContent).toContain(expectedText));
+      expect(view.getByRole("button", { name: "Clear evaluation model" })).toBeTruthy();
+    }
+  );
+
+  test("ignores a late verdict for a previous selection", async () => {
+    const late = Promise.withResolvers<EvaluationModelCheck>();
+    checkResults = { "anthropic:claude-haiku-4-5": late.promise };
+    const { view, select, checkEvaluationModel } = renderCard("anthropic:claude-haiku-4-5");
     await waitFor(() =>
-      expect(view.getByRole("note").textContent).toContain("Gateway-scoped model strings")
+      expect(checkEvaluationModel).toHaveBeenCalledWith({ model: "anthropic:claude-haiku-4-5" })
     );
-  });
 
-  test("flags a selection that would leave the direct route", async () => {
-    routeMock = { route: "openrouter", isAuto: true, displayName: "OpenRouter" };
-    const { view, select } = renderCard("openai:gpt-5");
+    fireEvent.change(select(), { target: { value: "openai:gpt-5" } });
     await waitFor(() => expect(select().value).toBe("openai:gpt-5"));
-
-    expect(view.getByRole("note").textContent).toContain("Would route via OpenRouter");
-  });
-
-  test("flags a persisted model whose provider cannot evaluate", async () => {
-    const { view } = renderCard("xai:grok-code-fast-1");
-
-    // The mocked selector has no option for it, so the note is the observable signal.
     await waitFor(() =>
-      expect(view.getByRole("note").textContent).toContain("not supported for evaluation")
+      expect(checkEvaluationModel).toHaveBeenCalledWith({ model: "openai:gpt-5" })
     );
-    expect(view.getByRole("button", { name: "Clear evaluation model" })).toBeTruthy();
+
+    // The stale response for the previous model arrives after the switch.
+    late.resolve({ ok: false, reason: "unauthorized", providerName: "anthropic" });
+    await late.promise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(view.queryByRole("note")).toBeNull();
   });
 });

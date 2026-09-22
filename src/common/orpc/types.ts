@@ -53,6 +53,7 @@ export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
 export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
 export type DesktopPrereqStatus = z.infer<typeof schemas.desktop.getPrereqStatus.output>;
+export type EvaluationModelCheck = z.infer<typeof schemas.config.checkEvaluationModel.output>;
 export type ChatMuxMessage = z.infer<typeof schemas.ChatMuxMessageSchema>;
 export type WorkspaceStatsSnapshot = z.infer<typeof schemas.WorkspaceStatsSnapshotSchema>;
 export type WorkspaceActivitySnapshot = z.infer<typeof schemas.WorkspaceActivitySnapshotSchema>;
