@@ -422,6 +422,7 @@ The complete screening example ships with this skill: `agent_skill_read_file({ n
 
 ```sh
 REPO="owner/repo"; N=123   # N must be a positive integer
+gh label create needs-human-review -R "$REPO" --force   # once per repository: --add-label does not create labels
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
   | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \

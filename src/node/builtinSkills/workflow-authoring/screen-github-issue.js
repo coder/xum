@@ -1,11 +1,15 @@
-// Screens and triages an ingested GitHub issue with evaluate(). No agent ever
-// reads the issue text: triage answers come from the tool-free evaluator, and the
-// only agent step (labeling) receives identifiers and a digest.
+// Screens and triages an ingested GitHub issue with evaluate(). The issue text
+// is never placed in an agent prompt: triage answers come from the tool-free
+// evaluator, and the only agent step (labeling) is prompted with identifiers and
+// a digest. That is prompt isolation, not read isolation — the labeling agent
+// keeps its tools, so "do not read the issue" stays guidance (see below).
 //
 // Run from a trusted CLI ingestion (no in-sandbox fetch). The evaluate() call
 // sets no per-call model, so pass --evaluation-model unless a default is
-// persisted; --model sets the labeling agent's model (else the CLI default):
+// persisted; --model sets the labeling agent's model (else the CLI default).
+// The review label must already exist: --add-label does not create labels.
 //   REPO="owner/repo"; N=123
+//   gh label create needs-human-review -R "$REPO" --force   # once per repository
 //   gh issue view "$N" -R "$REPO" --json title,body \
 //     | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
 //     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
@@ -27,6 +31,7 @@ export const meta = {
   }),
 };
 
+// Must exist in the repository (`gh issue edit --add-label` does not create it).
 const REVIEW_LABEL = "needs-human-review";
 
 export default function workflow({ args, evaluate, agent }) {
