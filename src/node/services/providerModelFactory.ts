@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
+import { createTypeSafeAi } from "@ai-sdk/typesafe-ai";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
@@ -82,9 +83,11 @@ import {
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
+  resolveTypeSafeCredentials,
   type ProviderConfigRaw,
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
@@ -1203,12 +1206,12 @@ export interface PinnedEvaluationModel {
 /**
  * Typed rejection of `createEvaluationModel`. Identifier fields only (no free
  * text): `routeKind` names the unsupported route class, `providerName` the
- * built-in provider involved.
+ * built-in provider (or the evaluation-only `typesafe` key) involved.
  */
 export interface EvaluationResolveError {
   reason: "unsupported-provider" | "unsupported-route" | "unauthorized" | "unknown-model";
   routeKind?: "gateway" | "local" | "custom" | "codex-oauth";
-  providerName?: ProviderName;
+  providerName?: ProviderName | EvaluationProviderName;
 }
 
 interface CreateModelOptions {
@@ -2847,7 +2850,11 @@ export class ProviderModelFactory {
       // routePriority/routeOverrides may prefer a configured gateway for this
       // origin; evaluation only runs on the origin's own direct route.
       const routeContext = self.resolveModelRoute(canonicalModelString, providersConfig);
-      if (routeContext.routeProvider !== providerName) {
+      // Compared as strings: `typesafe` is not a ProviderName (resolveRoute
+      // returns it as a direct route via an unchecked cast), and equality
+      // narrowing on the typed field would drop it from `providerName` below.
+      const routeProvider: string = routeContext.routeProvider;
+      if (routeProvider !== providerName) {
         const routeKind = PROVIDER_DEFINITIONS[routeContext.routeProvider].kind;
         // resolveRoute only ever moves an origin onto a gateway that routes it;
         // a different DIRECT provider would be a routing bug, not a route class.
@@ -2898,7 +2905,12 @@ export class ProviderModelFactory {
         providerConfig = withoutBaseURL;
       }
 
-      const creds = resolveProviderCredentials(providerName, providerConfig);
+      // `typesafe` is not a ProviderName (no PROVIDER_ENV_VARS entry): its key
+      // comes from the reserved providers.jsonc entry or TYPESAFE_API_KEY_ENV_VARS.
+      const creds =
+        providerName === TYPESAFE_PROVIDER_KEY
+          ? resolveTypeSafeCredentials(providerConfig)
+          : resolveProviderCredentials(providerName, providerConfig);
 
       if (providerName === "openai") {
         // Codex OAuth is an auth mode inside OpenAI construction, not a route.
@@ -2995,6 +3007,19 @@ export class ProviderModelFactory {
           );
           model = createGoogleGenerativeAI({
             ...configWithCreds,
+            fetch: providerFetch,
+          }).evaluationModel(modelId);
+          break;
+        }
+        case TYPESAFE_PROVIDER_KEY: {
+          // Evaluation-only provider with no chat sibling to mirror: the SDK
+          // reads exactly apiKey/baseURL/headers/fetch, so pass those fields
+          // rather than spreading the raw providers.jsonc entry.
+          effectiveBaseURL = configuredBaseURL;
+          model = createTypeSafeAi({
+            apiKey: creds.apiKey,
+            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+            headers: providerConfig.headers,
             fetch: providerFetch,
           }).evaluationModel(modelId);
           break;

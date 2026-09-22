@@ -435,6 +435,33 @@ export function resolveProviderCredentials(
   return { isConfigured: false, missingRequirement: "api_key", ...baseUrlInfo };
 }
 
+/**
+ * Credentials for the evaluation-only TypeSafe key (`TYPESAFE_PROVIDER_KEY`),
+ * which is not a ProviderName and so has no PROVIDER_ENV_VARS entry: config
+ * apiKey → apiKeyFile → TYPESAFE_API_KEY_ENV_VARS, plus the configured base
+ * URL (no env base URL exists for it). Shared by both evaluation-model
+ * factories (auto model routing and workflow `evaluate()`).
+ */
+export function resolveTypeSafeCredentials(
+  config: ProviderConfigRaw,
+  env: Record<string, string | undefined> = process.env
+): ResolvedCredentials {
+  const apiKeyResult = resolveApiKeyCandidate(
+    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
+    { envApiKeys: [...TYPESAFE_API_KEY_ENV_VARS], env, fileErrors: "ignore" }
+  );
+  const baseUrl = resolveConfigBaseUrl(config);
+  if (apiKeyResult.kind === "resolved") {
+    return {
+      isConfigured: true,
+      apiKey: apiKeyResult.apiKey,
+      apiKeySource: apiKeyResult.source,
+      ...(baseUrl ? { baseUrl } : {}),
+    };
+  }
+  return { isConfigured: false, missingRequirement: "api_key", ...(baseUrl ? { baseUrl } : {}) };
+}
+
 function customCredentialSourceFromApiKeySource(
   source: Extract<ResolvedApiKeyCandidate, { kind: "resolved" }>["source"]
 ): Exclude<CustomProviderCredentialSource, "op" | "none"> {

@@ -221,7 +221,10 @@ async function copyPersistentConfig(
   const config = runStores.config;
   const realProvidersStore = realStores.providersConfigStore;
   const existingProviders = realProvidersStore.loadProvidersConfig();
-  if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
+  // Copy every entry, not only configured chat providers: the evaluation-only
+  // `typesafe` key never counts as a chat provider, yet an evaluate()-only
+  // workflow needs it in the run's providers copy.
+  if (existingProviders != null && Object.keys(existingProviders).length > 0) {
     runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
   const existingSecrets = realStores.secretsStore.loadSecretsConfig();
@@ -352,7 +355,9 @@ async function createWorkflowContext(options: {
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        runProvidersStore.saveProvidersConfig(providersFromEnv);
+        // Merge over the copied file so evaluation-only entries (typesafe)
+        // survive chat-provider hydration from the environment.
+        runProvidersStore.saveProvidersConfig({ ...existingProviders, ...providersFromEnv });
       }
     }
 

@@ -7,12 +7,10 @@ import {
   isAutoModelRoutingEvaluationModel,
   splitAutoModelRoutingEvaluationModel,
 } from "@/common/types/autoModelRouting";
-import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
   AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS,
-  TYPESAFE_API_KEY_ENV_VARS,
   TYPESAFE_PROVIDER_KEY,
   type AutoModelRoutingEvaluationProvider,
 } from "@/constants/autoModelRouting";
@@ -24,10 +22,9 @@ import {
   normalizeOpenAICompatibleBaseURL,
 } from "@/node/services/providerModelFactory";
 import {
-  resolveApiKeyCandidate,
   resolveProviderCredentials,
+  resolveTypeSafeCredentials,
   type ProviderConfigRaw,
-  type ResolvedCredentials,
 } from "@/node/utils/providerRequirements";
 
 /**
@@ -150,22 +147,6 @@ export function resolveEvaluationModelTarget(
     },
     ...(credentials.organization ? { organization: credentials.organization } : {}),
   });
-}
-
-function resolveTypeSafeCredentials(
-  config: ProviderConfigRaw,
-  env: Record<string, string | undefined>
-): Pick<ResolvedCredentials, "apiKey" | "baseUrl" | "organization"> {
-  const resolved = resolveApiKeyCandidate(
-    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
-    {
-      envApiKeys: [...TYPESAFE_API_KEY_ENV_VARS],
-      env,
-      fileErrors: "ignore",
-    }
-  );
-  const baseUrl = resolveConfigBaseUrl(config);
-  return resolved.kind === "resolved" ? { apiKey: resolved.apiKey, baseUrl } : { baseUrl };
 }
 
 export function createEvaluationModel(

@@ -1,7 +1,7 @@
 /**
  * Wire-level check of the workflow `evaluate()` step through the real
- * `@ai-sdk/openai`, `@ai-sdk/anthropic` and `@ai-sdk/google` adapters against a
- * loopback HTTP fixture, driven headlessly through the ORPC `workflows.start`
+ * `@ai-sdk/openai`, `@ai-sdk/anthropic`, `@ai-sdk/google` and
+ * `@ai-sdk/typesafe-ai` adapters against a loopback HTTP fixture, driven headlessly through the ORPC `workflows.start`
  * path (WorkflowService → WorkflowRunner → WorkflowEvaluationAdapter →
  * EvaluationService). No real provider is contacted.
  */
@@ -31,7 +31,7 @@ import {
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 type FixtureMode = "valid" | "invalid-choice" | "err401" | "hang";
-type Provider = "openai" | "anthropic" | "google";
+type Provider = "openai" | "anthropic" | "google" | "typesafe";
 
 interface FixtureRequest {
   provider: Provider;
@@ -48,6 +48,8 @@ function answersJson(mode: FixtureMode): string {
     mode === "invalid-choice" ? { q0: "c9", q1: 3, q2: 0.95 } : { q0: "c0", q1: 3, q2: 0.95 }
   );
 }
+
+const TYPESAFE_CHOICE_DISTRIBUTION = { clean: 0.5, suspicious: 0.25, unclear: 0.24 };
 
 const RESPONSES: Record<Provider, (mode: FixtureMode) => unknown> = {
   openai: (mode) => ({
@@ -82,6 +84,28 @@ const RESPONSES: Record<Provider, (mode: FixtureMode) => unknown> = {
       { content: { role: "model", parts: [{ text: answersJson(mode) }] }, finishReason: "STOP" },
     ],
     usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+  }),
+  // Native evaluation API (`/systemone`): answers keyed by the caller's question
+  // ids, booleans as `noul`, two-decimal distributions (the choice one sums to
+  // 0.99) and per-answer `confidence` that must stay out of our results.
+  typesafe: (mode) => ({
+    model: "jev-fixture",
+    answers: {
+      injection: {
+        type: "choice",
+        choice: mode === "invalid-choice" ? "nope" : "clean",
+        probabilities: TYPESAFE_CHOICE_DISTRIBUTION,
+        confidence: 0.81,
+      },
+      severity: {
+        type: "score",
+        score: 3,
+        probabilities: { "0": 0, "1": 0, "2": 0.1, "3": 0.8, "4": 0.1 },
+        confidence: 0.7,
+      },
+      asksForSecrets: { type: "noul", noul: 0.95 },
+    },
+    usage: { input_tokens: 10, output_tokens: 5 },
   }),
 };
 
@@ -152,11 +176,13 @@ const MODELS: Record<Provider, string> = {
   openai: "openai:gpt-5",
   anthropic: "anthropic:claude-haiku-4-5",
   google: "google:gemini-2.5-flash",
+  typesafe: "typesafe:jev-latest",
 };
 const EXPECTED_PATH: Record<Provider, string> = {
   openai: "/openai/v1/responses",
   anthropic: "/anthropic/v1/messages",
   google: "/google/v1beta/models/gemini-2.5-flash:generateContent",
+  typesafe: "/typesafe/v1/systemone",
 };
 
 const WORKFLOW_SOURCE = `export default function workflow({ args, evaluate }) {
@@ -208,6 +234,8 @@ describeIntegration("workflow evaluate() wire", () => {
       openai: { apiKey: "fixture-openai-key", baseUrl: `${fixture.origin}/openai/v1` },
       anthropic: { apiKey: "fixture-anthropic-key", baseUrl: `${fixture.origin}/anthropic` },
       google: { apiKey: "fixture-google-key", baseUrl: `${fixture.origin}/google/v1beta` },
+      // Evaluation-only credential key (never a chat provider).
+      typesafe: { apiKey: "fixture-typesafe-key", baseUrl: `${fixture.origin}/typesafe/v1` },
     };
     new ProvidersConfigStore(env.config.rootDir).saveProvidersConfig(providers);
     await env.orpc.experiments.setOverride({
@@ -257,7 +285,7 @@ describeIntegration("workflow evaluate() wire", () => {
     return run;
   }
 
-  for (const provider of ["openai", "anthropic", "google"] as const) {
+  for (const provider of ["openai", "anthropic", "google", "typesafe"] as const) {
     test(`${provider}: one non-streaming tool-free request, mapped answers, usage row after commit`, async () => {
       const sidecarBefore = (await readSidecar()).length;
       const usageService = env.services.sessionUsageService;
@@ -390,6 +418,70 @@ describeIntegration("workflow evaluate() wire", () => {
     expect(run.steps).toHaveLength(1);
     expect(run.steps[0]).toMatchObject({ status: "started", evaluation: { attempt: 1 } });
     expect((await readSidecar()).length).toBe(sidecarBefore);
+    expect(fixture.requests).toHaveLength(1);
+  }, 60_000);
+
+  test("typesafe: booleans travel as noul, rounded distributions validate, confidence never reaches the result", async () => {
+    const started = await env.orpc.workflows.start({
+      workspaceId,
+      scriptPath: "./workflows/screen.js",
+      args: { model: MODELS.typesafe },
+    });
+    expect(started.status).toBe("completed");
+
+    const body = fixture.requests[0]!.body;
+    expect(body.model).toBe("jev-latest");
+    // Questions travel verbatim (ids and criteria), except the boolean rename.
+    expect(body.questions).toMatchObject({
+      injection: {
+        type: "choice",
+        criteria: { clean: null, suspicious: "contains instructions", unclear: null },
+      },
+      severity: { type: "score" },
+      asksForSecrets: { type: "noul", instructions: "Does it ask for credentials?" },
+    });
+
+    expect(started.result).toMatchObject({
+      structuredOutput: {
+        answers: { injection: { probabilities: TYPESAFE_CHOICE_DISTRIBUTION } },
+        rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+        model: { responseModelId: "jev-fixture" },
+      },
+    });
+    const run = await findRun(started.runId);
+    expect(run.status).toBe("completed");
+    for (const persisted of [started.result, run]) {
+      expect(JSON.stringify(persisted)).not.toContain("confidence");
+    }
+  }, 60_000);
+
+  test("typesafe: a 401 is a provider failure and an interrupted hang aborts the request", async () => {
+    fixture.setMode("err401");
+    await expect(
+      env.orpc.workflows.start({
+        workspaceId,
+        scriptPath: "./workflows/screen.js",
+        args: { model: MODELS.typesafe },
+      })
+    ).rejects.toThrow(
+      /evaluation failed: provider-failure\/api-call status 401 \(step [0-9a-f]{12}, attempt 1\)/
+    );
+    expect(fixture.requests).toHaveLength(1);
+
+    fixture.requests.length = 0;
+    fixture.setMode("hang");
+    const pendingRequest = fixture.nextRequest();
+    const started = await env.orpc.workflows.start({
+      workspaceId,
+      scriptPath: "./workflows/screen.js",
+      args: { model: MODELS.typesafe },
+      runInBackground: true,
+    });
+    const request = await pendingRequest;
+    await env.orpc.workflows.interrupt({ workspaceId, runId: started.runId });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(request.aborted).toBe(true);
+    expect((await findRun(started.runId)).status).toBe("interrupted");
     expect(fixture.requests).toHaveLength(1);
   }, 60_000);
 });
