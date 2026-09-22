@@ -586,7 +586,7 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
 /**
  * True when a raw on-disk fallback entry deep-equals a shipped default chain:
  * an object whose only key is `models`, holding exactly the default's model
- * strings in order. Used by the one-time Opus 5.1 target migration to tell
+ * strings in order. Used by the one-time Opus 5.5 target migration to tell
  * "still the shipped default" apart from user-edited entries.
  */
 function isExactDefaultFallbackChain(
@@ -1555,7 +1555,7 @@ export class Config {
         daybreakModelsHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
-        defaultModelFallbacksSeededOpus51: true,
+        defaultModelFallbacksSeededOpus55: true,
         persistentSubagentsDefaulted: true,
       },
     };
@@ -1932,10 +1932,10 @@ export class Config {
       configModified = true;
     }
 
-    // One-time chain-TARGET migration for the Opus 5.1 promotion. Unlike
+    // One-time chain-TARGET migration for the Opus 5.5 promotion. Unlike
     // the key-gap seeds above (new source keys), promoting OPUS only moved
     // the target of an existing default chain (Fable 5.1 → Opus 5 became
-    // Fable 5.1 → Opus 5.1), and already-seeded configs would keep the
+    // Fable 5.1 → Opus 5.5), and already-seeded configs would keep the
     // stale target forever. A chain that still deep-equals the superseded
     // shipped default is provably untouched (or indistinguishable from it),
     // so it moves to the current default exactly once; anything else —
@@ -1946,7 +1946,7 @@ export class Config {
     // the flag: migrated or edited chains no longer match the superseded
     // shape.
     const migrationsBeforeTargetMigration = normalizeConfigMigrations(parsed.migrations);
-    if (migrationsBeforeTargetMigration.defaultModelFallbacksSeededOpus51 !== true) {
+    if (migrationsBeforeTargetMigration.defaultModelFallbacksSeededOpus55 !== true) {
       const rawFallbacks =
         typeof parsed.modelFallbacks === "object" &&
         parsed.modelFallbacks !== null &&
@@ -1966,7 +1966,7 @@ export class Config {
       }
       parsed.migrations = {
         ...migrationsBeforeTargetMigration,
-        defaultModelFallbacksSeededOpus51: true,
+        defaultModelFallbacksSeededOpus55: true,
       };
       configModified = true;
     }

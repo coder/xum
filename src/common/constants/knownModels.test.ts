@@ -23,9 +23,9 @@ describe("Known Models Integration", () => {
     }
   });
 
-  test("opus alias tracks Opus 5.1 and retired ids keep tokenizer overrides", () => {
-    expect(MODEL_ABBREVIATIONS.opus).toBe("anthropic:claude-opus-5-1");
-    expect(KNOWN_MODELS.OPUS.id).toBe("anthropic:claude-opus-5-1");
+  test("opus alias tracks Opus 5.5 and retired ids keep tokenizer overrides", () => {
+    expect(MODEL_ABBREVIATIONS.opus).toBe("anthropic:claude-opus-5-5");
+    expect(KNOWN_MODELS.OPUS.id).toBe("anthropic:claude-opus-5-5");
     // Exact-id lookup for retired-but-documented custom model strings must keep
     // resolving to the Opus 4.5 approximation instead of falling back (with a
     // warning) to the generic per-provider tokenizer.

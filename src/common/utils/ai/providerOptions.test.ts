@@ -143,7 +143,7 @@ describe("buildProviderOptions - Anthropic", () => {
   for (const model of [
     "claude-opus-4-7",
     "claude-opus-5",
-    "claude-opus-5-1",
+    "claude-opus-5-5",
     "claude-sonnet-5",
   ] as const) {
     describe(`${model} (native xhigh effort + summarized display)`, () => {

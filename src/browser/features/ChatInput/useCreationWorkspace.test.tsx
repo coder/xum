@@ -1489,7 +1489,7 @@ describe("useCreationWorkspace", () => {
     // No user turn is queued, but the workspace still runs init, so the creation card is carried.
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5-1",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: false,
       pendingUserMessage: undefined,
       pendingCreationInit: {
@@ -2008,7 +2008,7 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5-1",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: true,
       pendingUserMessage: {
         content: "test message",

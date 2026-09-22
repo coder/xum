@@ -477,9 +477,9 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
-    // Opus 5.1 rides the same Opus 5+ wildcard: full 6-level ladder, and
+    // Opus 5.5 rides the same Opus 5+ wildcard: full 6-level ladder, and
     // (unlike Mythos-class models) "off" stays available.
-    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-1")).toEqual([
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5")).toEqual([
       "off",
       "low",
       "medium",

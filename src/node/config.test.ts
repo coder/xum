@@ -188,7 +188,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            defaultModelFallbacksSeededOpus51: true,
+            defaultModelFallbacksSeededOpus55: true,
             persistentSubagentsDefaulted: true,
           },
         })
@@ -2043,7 +2043,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            defaultModelFallbacksSeededOpus51: true,
+            defaultModelFallbacksSeededOpus55: true,
           },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
@@ -2175,8 +2175,8 @@ describe("Config", () => {
       expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
     });
 
-    it("migrates the shipped Fable 5.1 → Opus 5 default to Opus 5.1 exactly once", async () => {
-      // A config seeded before the Opus 5.1 promotion holds the superseded
+    it("migrates the shipped Fable 5.1 → Opus 5 default to Opus 5.5 exactly once", async () => {
+      // A config seeded before the Opus 5.5 promotion holds the superseded
       // default target. The one-shot target migration moves it to the current
       // default while leaving the legacy Fable 5 chain byte-identical.
       fs.writeFileSync(
@@ -2199,21 +2199,21 @@ describe("Config", () => {
         [LEGACY_FABLE]: { models: [LEGACY_OPUS] },
         [FABLE]: { models: [OPUS] },
       });
-      expect(loaded.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
 
       await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
-        migrations?: { defaultModelFallbacksSeededOpus51?: unknown };
+        migrations?: { defaultModelFallbacksSeededOpus55?: unknown };
       };
       expect(raw.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [LEGACY_OPUS] },
         [FABLE]: { models: [OPUS] },
       });
-      expect(raw.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(raw.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
     });
 
-    it("leaves customized chains untouched during the Opus 5.1 target migration", () => {
+    it("leaves customized chains untouched during the Opus 5.5 target migration", () => {
       // Same models as the superseded default, but the user added a field:
       // the entry no longer deep-equals the shipped default, so it is intent.
       fs.writeFileSync(
@@ -2234,10 +2234,10 @@ describe("Config", () => {
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { enabled: false, models: [LEGACY_OPUS] },
       });
-      expect(loaded.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
     });
 
-    it("does not resurrect a deleted chain during the Opus 5.1 target migration", () => {
+    it("does not resurrect a deleted chain during the Opus 5.5 target migration", () => {
       fs.writeFileSync(
         configFilePath(),
         JSON.stringify({
@@ -2251,10 +2251,10 @@ describe("Config", () => {
 
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toBeUndefined();
-      expect(loaded.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
     });
 
-    it("does not migrate a gateway-keyed chain during the Opus 5.1 target migration", () => {
+    it("does not migrate a gateway-keyed chain during the Opus 5.5 target migration", () => {
       // We only ever seeded the canonical key; a gateway-prefixed key with the
       // old target was hand-written by the user, so its chain must keep the
       // old target even though the key canonicalizes to the FABLE source.
@@ -2276,7 +2276,7 @@ describe("Config", () => {
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { models: [LEGACY_OPUS] },
       });
-      expect(loaded.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
 
       // Raw file read before the async write-back flushes: the migration pass
       // itself must not have rewritten the user's entry.
@@ -2288,7 +2288,7 @@ describe("Config", () => {
       });
     });
 
-    it("re-running the Opus 5.1 target migration is a no-op once migrated", () => {
+    it("re-running the Opus 5.5 target migration is a no-op once migrated", () => {
       // A downgrade to a build predating the flag could strip it; re-running
       // the migration must not touch a chain already on the current default
       // (or anything the user changed since).
@@ -2310,7 +2310,7 @@ describe("Config", () => {
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { models: [OPUS] },
       });
-      expect(loaded.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
     });
 
     it("merges the seeded default with pre-existing chains for other source models", async () => {
@@ -2444,7 +2444,7 @@ describe("Config", () => {
         modelFallbacks?: unknown;
         migrations?: {
           defaultModelFallbacksSeeded?: unknown;
-          defaultModelFallbacksSeededOpus51?: unknown;
+          defaultModelFallbacksSeededOpus55?: unknown;
         };
       };
       expect(raw.modelFallbacks).toEqual({
@@ -2452,9 +2452,9 @@ describe("Config", () => {
         [FABLE]: { models: [OPUS] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
-      // Fresh installs already carry the current default target; the Opus 5.1
+      // Fresh installs already carry the current default target; the Opus 5.5
       // migration flag rides along so the target migration never re-runs.
-      expect(raw.migrations?.defaultModelFallbacksSeededOpus51).toBe(true);
+      expect(raw.migrations?.defaultModelFallbacksSeededOpus55).toBe(true);
     });
   });
 
@@ -3076,7 +3076,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            defaultModelFallbacksSeededOpus51: true,
+            defaultModelFallbacksSeededOpus55: true,
           },
         })
       );

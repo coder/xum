@@ -18,8 +18,8 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * Seeded into the config exactly once, guarded by
  * migrations.defaultModelFallbacksSeeded (plus the one-shot
  * defaultModelFallbacksSeededFable51 re-seed for the key move to Fable 5.1,
- * and the one-shot defaultModelFallbacksSeededOpus51 target migration for the
- * Opus 5.1 promotion, see SUPERSEDED_DEFAULT_MODEL_FALLBACKS)
+ * and the one-shot defaultModelFallbacksSeededOpus55 target migration for the
+ * Opus 5.5 promotion, see SUPERSEDED_DEFAULT_MODEL_FALLBACKS)
  * — on versions that know the flag,
  * user edits or deletions of these chains are never overridden by updates.
  * (Versions predating the flag strip it on save, so a downgrade→save→
@@ -47,8 +47,8 @@ export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
 };
 
 /**
- * Shipped defaults superseded by the Opus 5.1 promotion, keyed like
- * DEFAULT_MODEL_FALLBACKS. Guarded by migrations.defaultModelFallbacksSeededOpus51,
+ * Shipped defaults superseded by the Opus 5.5 promotion, keyed like
+ * DEFAULT_MODEL_FALLBACKS. Guarded by migrations.defaultModelFallbacksSeededOpus55,
  * config load rewrites a chain to the current default exactly once IF the stored
  * entry still deep-equals the superseded default (same single-model chain, no
  * enabled/triggers customization). Any deviation is user intent and is never

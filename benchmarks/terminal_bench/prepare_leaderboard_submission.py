@@ -123,12 +123,12 @@ MODEL_METADATA = {
         "model_org_display_name": "Anthropic",
         "folder_name": "Claude-Opus-5",
     },
-    "anthropic/claude-opus-5-1": {
-        "model_name": "claude-opus-5-1",
+    "anthropic/claude-opus-5-5": {
+        "model_name": "claude-opus-5-5",
         "model_provider": "anthropic",
-        "model_display_name": "Claude Opus 5.1",
+        "model_display_name": "Claude Opus 5.5",
         "model_org_display_name": "Anthropic",
-        "folder_name": "Claude-Opus-5.1",
+        "folder_name": "Claude-Opus-5.5",
     },
     # Keep historical GPT metadata alongside the current GPT-5.6 Sol bench target
     # so mixed or older artifact sets still map to the canonical leaderboard names.

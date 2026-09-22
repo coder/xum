@@ -127,12 +127,12 @@ export const AppConfigMigrationsSchema = z
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /**
-     * One-time chain-target migration after the opus alias moved to Opus 5.1:
+     * One-time chain-target migration after the opus alias moved to Opus 5.5:
      * chains still exactly equal to the superseded shipped default
-     * (Fable 5.1 → Opus 5) move to the current default (Fable 5.1 → Opus 5.1);
+     * (Fable 5.1 → Opus 5) move to the current default (Fable 5.1 → Opus 5.5);
      * any user-edited chain is left untouched.
      */
-    defaultModelFallbacksSeededOpus51: z.boolean().optional(),
+    defaultModelFallbacksSeededOpus55: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
   })
