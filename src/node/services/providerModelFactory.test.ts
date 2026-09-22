@@ -4622,6 +4622,45 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     }
   );
 
+  it.each([
+    ["anthropic", "anthropic:claude-haiku-4-5", "api.anthropic.com"],
+    ["openai", "openai:gpt-5-mini", "api.openai.com"],
+    ["google", "google:gemini-2.5-flash", "generativelanguage.googleapis.com"],
+  ] as const)(
+    "sends %s requests to the provider default when the configured base URL is blank and no env proxy exists",
+    async (provider, modelString, defaultHost) => {
+      // Regression: the blank `baseURL` property used to survive the config
+      // spread into the SDK settings, so requests targeted "  /v1/…".
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseURL: "  " } },
+        async (_c, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          const urls: string[] = [];
+          fetchSpy.mockImplementation(
+            Object.assign(
+              (input: Parameters<typeof fetch>[0]) => {
+                urls.push(input instanceof Request ? input.url : String(input));
+                return Promise.reject(new Error("captured"));
+              },
+              { preconnect: () => undefined }
+            )
+          );
+          await pinned.model
+            .doEvaluate({
+              state: "hello",
+              questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+            })
+            .then(
+              () => undefined,
+              () => undefined
+            );
+          expect(urls).toHaveLength(1);
+          expect(new URL(urls[0] ?? "").host).toBe(defaultHost);
+        }
+      );
+    }
+  );
+
   it("rejects an OpenAI model the chat path would route through Codex OAuth", async () => {
     const codexOauth = {
       type: "oauth",

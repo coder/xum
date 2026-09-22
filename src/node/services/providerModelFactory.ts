@@ -2890,6 +2890,13 @@ export class ProviderModelFactory {
         typeof providerConfig.baseURL === "string" && providerConfig.baseURL.trim() !== ""
           ? providerConfig.baseURL
           : undefined;
+      if (configuredBaseURL === undefined && providerConfig.baseURL !== undefined) {
+        // Drop the blank property itself: every provider branch below spreads
+        // `providerConfig` into the SDK settings, and with no env fallback the
+        // blank string would otherwise reach the SDK as the endpoint.
+        const { baseURL: _blankBaseURL, ...withoutBaseURL } = providerConfig;
+        providerConfig = withoutBaseURL;
+      }
 
       const creds = resolveProviderCredentials(providerName, providerConfig);
 
