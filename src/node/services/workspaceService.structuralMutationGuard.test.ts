@@ -484,6 +484,41 @@ describe("WorkspaceService structural mutation guard", () => {
       expect(physical.renamed).toEqual([]);
     });
 
+    test("a local-runtime task's project execution directory protects it even when its stored path is unrelated", async () => {
+      // LocalRuntime forks execute in the PROJECT directory of their bucket (no checkout of
+      // their own), whatever the row's stored path says. A worktree root whose name-derived
+      // target contains that project directory would destroy the task's execution directory,
+      // so the scan must cover the bucket path, not only the stored one.
+      const root = row("root", ROOT_ID);
+      const nestedProjectPath = path.join(root.path, "nested-project");
+      const localTask: Workspace = {
+        path: path.join(tempDir, "unrelated-stored"),
+        id: TASK_ID,
+        name: "local-task",
+        parentWorkspaceId: ROOT_ID,
+        taskStatus: "reported",
+        runtimeConfig: { type: "local" },
+      };
+      await seed([root]);
+      await fsPromises.mkdir(nestedProjectPath, { recursive: true });
+      await fsPromises.writeFile(path.join(nestedProjectPath, "PROJECT.md"), "nested\n");
+      await fsPromises.mkdir(localTask.path, { recursive: true });
+      await fsPromises.mkdir(sessionDir(TASK_ID), { recursive: true });
+      await fsPromises.writeFile(path.join(sessionDir(TASK_ID), "chat.jsonl"), "");
+      await saveWorkspaces(config, projectPath, [root], {
+        extraProjects: [[nestedProjectPath, { trusted: true, workspaces: [localTask] }]],
+      });
+
+      expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+      expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+      await expectIntact(root);
+      expect(await exists(path.join(nestedProjectPath, "PROJECT.md"))).toBe(true);
+      expect(persistedRow(TASK_ID)).toMatchObject({ path: localTask.path });
+      expect(await exists(path.join(sessionDir(TASK_ID), "chat.jsonl"))).toBe(true);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
     test("a legacy task worktree backed by a repo nested inside the root blocks the root's removal and rename (real git)", async () => {
       const git = async (cwd: string, ...args: string[]) => {
         await promisify(execFile)("git", args, {
