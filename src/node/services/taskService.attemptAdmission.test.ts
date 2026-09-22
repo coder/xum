@@ -2094,7 +2094,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         // B's row stays open to its own writer's sends (bound unowned here).
         expect(
-          await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "manual" }).kind
+          (await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "manual" })).kind
         ).toBe("admitted");
       } finally {
         rollbackSpy.mockRestore();

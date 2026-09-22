@@ -190,16 +190,18 @@ describe("MCPServerManager checkout-preparation gate", () => {
   test("a cached entry is not returned, and its served tools and prompts are refused, once the fresh check fails", async () => {
     const first = await manager.getToolsForWorkspace(request());
     expect(started).toEqual(["echo"]);
-    const toolName = Object.keys(first.tools)[0]!;
+    const toolName = Object.keys(first.tools)[0];
     // Baseline: the served tool dispatches while the authorization holds.
-    await first.tools[toolName]!.execute!({}, { toolCallId: "ok", messages: [], context: {} });
+    await first.tools[toolName].execute!({}, { toolCallId: "ok", messages: [], context: {} });
     await archiveRoot();
     const second = await manager.getToolsForWorkspace(request());
     expect(second.tools).toEqual({});
     expect(started).toEqual(["echo"]);
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(
-      first.tools[toolName]!.execute!({}, { toolCallId: "stale", messages: [], context: {} })
+      first.tools[toolName].execute!({}, { toolCallId: "stale", messages: [], context: {} })
     ).rejects.toThrow();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(sharedId, "echo", "review", {})).rejects.toThrow();
   });
 

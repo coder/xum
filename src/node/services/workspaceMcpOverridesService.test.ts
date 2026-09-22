@@ -9,6 +9,8 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { prepareDedicatedTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
+import { initGitRepo } from "@/node/services/taskService.testHarness";
 import {
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
@@ -101,6 +103,62 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   }
 
+  /**
+   * A dedicated sub-agent (task child) row the way the materializer publishes it: a REAL git
+   * worktree at `checkout`, claimed and bound, with its preparation proof on the row. Every
+   * consumer read of a host-local task row (`getOverridesForWorkspace` included) is gated on
+   * that proof, so a plain directory with `parentWorkspaceId` would model an unprepared legacy
+   * task the gate refuses — not the inheriting child these tests are about.
+   */
+  async function prepareChildCheckout(
+    workspaceName: string,
+    checkout: string
+  ): Promise<{
+    taskCheckoutPreparation: Awaited<ReturnType<typeof prepareDedicatedTaskCheckout>>;
+  }> {
+    const repo = path.join(tempDir, "repos", workspaceName);
+    await fs.mkdir(repo, { recursive: true });
+    initGitRepo(repo);
+    await fs.mkdir(path.dirname(checkout), { recursive: true });
+    const taskCheckoutPreparation = await prepareDedicatedTaskCheckout({
+      projectPath: repo,
+      checkout,
+      branch: "branch",
+      runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+    });
+    return { taskCheckoutPreparation };
+  }
+
+  async function registerPreparedChild(
+    parentWorkspaceId: string,
+    workspaceName: string
+  ): Promise<{ workspaceId: string; workspacePath: string }> {
+    const projectPath = `/fake/${workspaceName}`;
+    const workspaceId = `ws-${workspaceName}`;
+    const workspacePath = getWorkspacePath({
+      srcDir: config.srcDir,
+      projectName: workspaceName,
+      workspaceName: "branch",
+    });
+    const prepared = await prepareChildCheckout(workspaceName, workspacePath);
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: workspacePath,
+            id: workspaceId,
+            name: "branch",
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            parentWorkspaceId,
+            ...prepared,
+          },
+        ],
+      });
+      return cfg;
+    });
+    return { workspaceId, workspacePath };
+  }
+
   it("returns empty overrides when no file and no legacy config", async () => {
     const projectPath = "/fake/project";
     const workspaceId = "ws-id";
@@ -152,20 +210,8 @@ describe("WorkspaceMcpOverridesService", () => {
   });
 
   describe("sub-agent inheritance", () => {
-    async function registerChild(
-      parentWorkspaceId: string,
-      workspaceName: string
-    ): Promise<{ workspaceId: string; workspacePath: string }> {
-      const { workspaceId, workspacePath } = await registerWorkspace(workspaceName);
-      await config.editConfig((cfg) => {
-        for (const project of cfg.projects.values()) {
-          const workspace = project.workspaces.find((w) => w.id === workspaceId);
-          if (workspace) workspace.parentWorkspaceId = parentWorkspaceId;
-        }
-        return cfg;
-      });
-      return { workspaceId, workspacePath };
-    }
+    // Children are real prepared dedicated checkouts (see registerPreparedChild).
+    const registerChild = registerPreparedChild;
 
     it("child without its own file inherits the parent chain's overrides", async () => {
       const service = new WorkspaceMcpOverridesService(config);
@@ -457,14 +503,15 @@ describe("WorkspaceMcpOverridesService", () => {
         }
         return cfg;
       });
-      // Fail only the legacy-config read. Each resolution loads config twice
-      // through the snapshot — the workspace enumeration first, then the
-      // legacy lookup that decides between "own" and "inherit" — so failing
-      // every second authoritative load isolates the failure to the latter.
+      // Fail only the legacy-config read. Each resolution loads config three
+      // times authoritatively — the checkout-preparation gate first, then
+      // through the snapshot the workspace enumeration and the legacy lookup
+      // that decides between "own" and "inherit" — so failing every third
+      // authoritative load isolates the failure to the latter.
       const realLoad = config.loadConfigOrDefault.bind(config);
       let authoritativeLoads = 0;
       spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
-        if (options?.throwOnError && ++authoritativeLoads % 2 === 0) {
+        if (options?.throwOnError && ++authoritativeLoads % 3 === 0) {
           throw new Error("EIO: config.json unreadable");
         }
         return realLoad(options);
@@ -4827,6 +4874,7 @@ describe("WorkspaceMcpOverridesService", () => {
       workspaceName: "child",
     });
     await fs.mkdir(path.join(parentPath, ".xum"), { recursive: true });
+    const preparedChild = await prepareChildCheckout("child", childPath);
     await fs.mkdir(path.join(childPath, ".xum"), { recursive: true });
     await fs.writeFile(
       path.join(parentPath, ".xum", "mcp.local.jsonc"),
@@ -4847,6 +4895,7 @@ describe("WorkspaceMcpOverridesService", () => {
             name: "child",
             runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
             parentWorkspaceId: "ws-parent",
+            ...preparedChild,
           },
         ],
       });
@@ -4880,7 +4929,7 @@ describe("WorkspaceMcpOverridesService", () => {
       workspaceName: "child",
     });
     await fs.mkdir(path.join(parentPath, ".xum"), { recursive: true });
-    await fs.mkdir(childPath, { recursive: true });
+    const preparedChild = await prepareChildCheckout("child", childPath);
     await fs.writeFile(
       path.join(parentPath, ".xum", "mcp.local.jsonc"),
       JSON.stringify({ enabledServers: ["parent-enable"] })
@@ -4902,6 +4951,7 @@ describe("WorkspaceMcpOverridesService", () => {
             runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
             parentWorkspaceId: "ws-parent",
             mcp: { disabledServers: ["parent-enable"] },
+            ...preparedChild,
           },
         ],
       });
