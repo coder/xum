@@ -268,6 +268,123 @@ afterEach(async () => {
   await fixture.cleanup();
 });
 
+describe("session_history project skill provenance", () => {
+  test("taints the window of a row skipped as oversized", async () => {
+    // A near-cap skill read serializes past the line cap: the scanner skips the
+    // row unparsed, so it can never be classified. The rows after it in the
+    // same window are treated like rows after a classified source.
+    await appendRawRows([
+      JSON.stringify({
+        ...createMuxMessage("oversized-read", "assistant", "read something", { timestamp: 2 }),
+        padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+      }),
+    ]);
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("after-oversized", "assistant", "Applying what was read", { timestamp: 3 })
+    );
+    const runAll = async (excludeProjectSkillContent: boolean) => {
+      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+      config.historyService = fixture.historyService;
+      config.excludeProjectSkillContent = excludeProjectSkillContent;
+      const tool = createSessionHistoryTool(config);
+      const page = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+        await tool.execute!({ action: "list_items", role: "assistant" }, mockToolCallOptions)
+      );
+      expect(page.success).toBe(true);
+      return {
+        texts: (page.items ?? []).map((item) => item.text),
+        carries: page.carriesProjectSkillContent === true,
+        withheld: page.withheldProjectSkillRows ?? 0,
+        oversized: page.warnings?.includes("oversized_rows_skipped") === true,
+      };
+    };
+    const open = await runAll(false);
+    expect(open.oversized).toBe(true);
+    expect(open.texts).toEqual(["opening facts", "Applying what was read"]);
+    expect(open.carries).toBe(true);
+
+    const excluding = await runAll(true);
+    expect(excluding.texts).toEqual(["opening facts"]);
+    expect(excluding.withheld).toBe(1);
+  });
+
+  test("stamps results carrying a project skill read and leaves such rows out when excluded", async () => {
+    // A rollover hides earlier rows from the request's own filter; the tool
+    // can still reach them. A returned row carrying a project skill read
+    // stamps the result (the consent gate arms on it); a turn that must not
+    // read project content never receives the row.
+    await fixture.historyService.appendToHistory(workspaceId, {
+      id: "skill-read-row",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "skill-1",
+          toolName: "agent_skill_read",
+          state: "output-available",
+          input: { name: "repo-conventions" },
+          output: {
+            success: true,
+            skill: { name: "repo-conventions", scope: "project", body: "PROJECT SKILL BODY" },
+          },
+        },
+      ],
+      metadata: { timestamp: 2, historySequence: 2 },
+    });
+    // A later reply in the same context window can quote the read: tainted too.
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("downstream-reply", "assistant", "Applying the conventions", {
+        timestamp: 3,
+      })
+    );
+    const run = async (excludeProjectSkillContent: boolean) => {
+      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+      config.historyService = fixture.historyService;
+      config.excludeProjectSkillContent = excludeProjectSkillContent;
+      const tool = createSessionHistoryTool(config);
+      return TOOL_DEFINITIONS.session_history.resultSchema.parse(
+        await tool.execute!(
+          { action: "list_items", tool_name: "agent_skill_read" },
+          mockToolCallOptions
+        )
+      );
+    };
+    const open = await run(false);
+    expect(open.success).toBe(true);
+    expect(open.items).toHaveLength(1);
+    expect(open.items?.[0].text).toContain("repo-conventions");
+    expect(open.carriesProjectSkillContent).toBe(true);
+    const excluded = await run(true);
+    expect(excluded.success).toBe(true);
+    expect(excluded.items).toEqual([]);
+    expect(excluded.carriesProjectSkillContent).toBeUndefined();
+    // The read AND the downstream reply of its window are withheld.
+    expect(excluded.withheldProjectSkillRows).toBe(2);
+
+    // The downstream reply alone (no tool filter) is withheld/stamped through
+    // its window's taint, and a routed turn cannot browse recent-first.
+    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+    config.historyService = fixture.historyService;
+    config.projectSkillContentStillReadable = () => Promise.resolve(true);
+    const routedTool = createSessionHistoryTool(config);
+    const stamped = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+      await routedTool.execute!(
+        { action: "search", query: "Applying the conventions" },
+        mockToolCallOptions
+      )
+    );
+    expect(stamped.items).toHaveLength(1);
+    expect(stamped.carriesProjectSkillContent).toBe(true);
+    const refused = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+      await routedTool.execute!({ action: "list_items", recent_first: true }, mockToolCallOptions)
+    );
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toBe("recent_first_unavailable");
+  });
+});
+
 describe("session_history tool wiring", () => {
   test("the tool requires the persistent HistoryService", () => {
     const config = createTestToolConfig(fixture.tempDir, { workspaceId });

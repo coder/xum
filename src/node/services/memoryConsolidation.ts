@@ -25,6 +25,7 @@
  * TODO(#3534, phase 2): net-shrink enforcement needs a byte-size API on
  * MemoryService; until then the journal is the only post-run signal.
  */
+import { toolExcludesProjectSkillContent } from "./tools/projectSkillContentGate";
 import { tool, streamText, stepCountIs, type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
@@ -192,6 +193,10 @@ async function validateMutationForStaging(
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
  */
+/** Retryable consolidation failure: Project Trust changed under the run before its request. */
+export const CONSOLIDATION_INPUT_STALE_MESSAGE =
+  "consolidation input changed before dispatch (Project Trust); retry";
+
 export function createConsolidationMemoryTool(args: {
   memoryService: MemoryService;
   metaService: MemoryMetaService;
@@ -226,6 +231,10 @@ export function createConsolidationMemoryTool(args: {
    * immediately before the first durable write.
    */
   abortSignal?: AbortSignal;
+  /** Untrusted project: views of memories carrying project skill provenance are refused. */
+  excludeProjectSkillContent?: boolean;
+  /** Trusted at setup: trust re-read at each read (a revocation mid-run must not wait). */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -291,8 +300,11 @@ export function createConsolidationMemoryTool(args: {
       }
       const target = classifyMutation(input);
       if (target === null) {
-        // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
+        // Reads (and malformed inputs, which fail validation inside) pass through,
+        // under the run's provenance exclusion.
+        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
+          excludeProjectSkillContent: await toolExcludesProjectSkillContent(args),
+        });
       }
 
       let rejection: string | null;
@@ -381,6 +393,16 @@ export async function runMemoryConsolidation(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** See createConsolidationMemoryTool. */
+  excludeProjectSkillContent?: boolean;
+  /** See createConsolidationMemoryTool. */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
+  /**
+   * Re-verification immediately before EVERY provider step (model creation,
+   * tool setup and each tool-driven step are trust-revocation windows): false
+   * ends the run with a retryable stream error before the request.
+   */
+  beforeDispatch?: () => Promise<boolean>;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -390,6 +412,8 @@ export async function runMemoryConsolidation(args: {
     ctx: args.ctx,
     dryRun: args.dryRun,
     journal,
+    excludeProjectSkillContent: args.excludeProjectSkillContent,
+    projectSkillContentStillReadable: args.projectSkillContentStillReadable,
     // r59: workspace removal aborts this signal — a tool execution wedged in
     // filesystem I/O must not commit durable memory (or recreate the deleted
     // session directory via its journal row) once the I/O unblocks.
@@ -403,6 +427,19 @@ export async function runMemoryConsolidation(args: {
         ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
         : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
 
+  if (args.beforeDispatch !== undefined && !(await args.beforeDispatch())) {
+    return {
+      ops: journal,
+      summary: `stream error: ${CONSOLIDATION_INPUT_STALE_MESSAGE}`,
+      budgetExhausted: false,
+      usage: undefined,
+      streamError: CONSOLIDATION_INPUT_STALE_MESSAGE,
+    };
+  }
+  // Per-step gate outcome: a throw inside prepareStep is swallowed by the SDK's
+  // step loop, so the gate aborts the stream and flags the run instead.
+  let stale = false;
+  const gate = new AbortController();
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
@@ -411,7 +448,22 @@ export async function runMemoryConsolidation(args: {
       finalPassPrompt,
     tools: { memory: memoryTool },
     stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
-    abortSignal: args.abortSignal,
+    abortSignal:
+      args.abortSignal === undefined
+        ? gate.signal
+        : AbortSignal.any([args.abortSignal, gate.signal]),
+    // The tool loop is multi-step: the gate runs again before every provider
+    // step, so a revocation after step one stops the next request.
+    prepareStep:
+      args.beforeDispatch === undefined
+        ? undefined
+        : async () => {
+            if (!stale && !(await args.beforeDispatch!())) {
+              stale = true;
+              gate.abort(new Error(CONSOLIDATION_INPUT_STALE_MESSAGE));
+            }
+            return undefined;
+          },
   });
 
   // Drain the stream; tool executions happen as the loop runs. consumeStream
@@ -424,6 +476,7 @@ export async function runMemoryConsolidation(args: {
       streamErrors.push(getErrorMessage(error));
     },
   });
+  if (stale) streamErrors.unshift(CONSOLIDATION_INPUT_STALE_MESSAGE);
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
 

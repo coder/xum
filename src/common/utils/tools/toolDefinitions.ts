@@ -41,6 +41,7 @@ import { z } from "zod";
 import {
   AgentIdSchema,
   AgentSkillPackageSchema,
+  AgentSkillScopeSchema,
   BestOfGroupSchema,
   SkillNameSchema,
   WorkflowRunRecordSchema,
@@ -298,6 +299,8 @@ const IntuitionResultFields = {
   candidates: z.array(IntuitionCandidateSchema).max(MEMORY_INTUITION_MAX_RESULTS),
   model: z.string(),
   stats: IntuitionStatsSchema,
+  /** A recognized memory or lead carries project skill provenance. */
+  carriesProjectSkillContent: z.literal(true).optional(),
 };
 export const IntuitionToolResultSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -613,6 +616,8 @@ const TaskToolCompletedReportSchema = z
   .object({
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** The report's context carried project skill content (see task tool provenance). */
+    carriesProjectSkillContent: z.boolean().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -666,6 +671,8 @@ export const TaskToolCompletedResultSchema = z
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     reportMarkdown: z.string().optional(),
+    /** Any delivered report's context carried project skill content. */
+    carriesProjectSkillContent: z.boolean().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -853,6 +860,8 @@ export const TaskAwaitToolCompletedResultSchema = z
     status: z.literal("completed"),
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** The report's context carried project skill content (see task tool provenance). */
+    carriesProjectSkillContent: z.boolean().optional(),
     handleKind: TaskHandleKindSchema.optional(),
     workspaceId: z.string().optional(),
     messageId: z.string().optional(),
@@ -1668,6 +1677,8 @@ export const TaskListToolResultSchema = z
   .object({
     tasks: z.array(TaskListToolTaskSchema),
     note: z.string().optional(),
+    /** A listed title was authored from project skill content (kept under trust). */
+    carriesProjectSkillContent: z.boolean().optional(),
     /** scope:"instance" only — present when more rows match; pass it back as `offset`. */
     nextOffset: z.number().int().min(0).optional(),
   })
@@ -2233,9 +2244,17 @@ export const AgentSkillReadToolResultSchema = z.union([
 
 /**
  * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read.
+ * Uses the same shape/limits as file_read, plus the scope of the skill the
+ * file belongs to: a referenced file of a PROJECT skill is repository-
+ * controlled content, and the routed-request consent scan identifies it from
+ * the persisted result alone (older rows without the tag count as project).
  */
-export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
+export const AgentSkillReadFileToolResultSchema = z.union([
+  FileReadToolResultSchema.options[0].extend({
+    skillScope: AgentSkillScopeSchema.optional(),
+  }),
+  FileReadToolResultSchema.options[1],
+]);
 
 /**
  * MCP prompt get tool result - flattened prompt text or error.
@@ -2347,6 +2366,8 @@ export const MemoryToolResultSchema = z.union([
   z.object({
     success: z.literal(true),
     output: z.string(),
+    /** The viewed memory carries project skill provenance (MemoryService.view). */
+    carriesProjectSkillContent: z.literal(true).optional(),
   }),
   z.object({
     success: z.literal(false),
@@ -2511,7 +2532,12 @@ export const TOOL_DEFINITIONS = {
     resultSchema: z.object({
       success: z.boolean(),
       // query_required | item_id_required | filters_unsupported | task_not_found |
-      // session_unavailable | item_not_found | history_changed | history_timeout | history_unavailable
+      // session_unavailable | item_not_found | history_changed | history_timeout | history_unavailable |
+      // recent_first_unavailable
+      /** A returned row carries project skill provenance (a routed turn's consent gate arms on it). */
+      carriesProjectSkillContent: z.literal(true).optional(),
+      /** Rows left out because the turn must not read project skill content. */
+      withheldProjectSkillRows: z.number().int().nonnegative().optional(),
       error: z.string().optional(),
       notice: z.string().optional(),
       // list_windows / list_items / search only: at least one further matching window/row exists

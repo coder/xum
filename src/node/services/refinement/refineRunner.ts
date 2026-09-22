@@ -199,9 +199,23 @@ function buildRefineSystemPrompt(hasSkillTool: boolean): string {
  * transcript, and (optionally) supplies the standard skill-write tool so this
  * module stays independent of workspace/runtime resolution.
  */
+/** Refine pass aborted: Project Trust was revoked while the transcript carried project skill content. */
+export const REFINE_INPUT_STALE_MESSAGE =
+  "refine input changed before dispatch (Project Trust); run /refine again";
+
 export async function runRefinePass(args: {
   model: LanguageModel;
   memoryService: MemoryService;
+  /** See createConsolidationMemoryTool. */
+  excludeProjectSkillContent?: boolean;
+  /** See createConsolidationMemoryTool. */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
+  /**
+   * Re-verification before EVERY provider step of the pass (the transcript
+   * itself is retransmitted each step): false ends the pass with
+   * REFINE_INPUT_STALE_MESSAGE through the stream's error path.
+   */
+  beforeDispatch?: () => Promise<boolean>;
   metaService: MemoryMetaService;
   ctx: MemoryScopeContext;
   /** Pre-built, bounded, thinking-stripped trajectory transcript. */
@@ -242,6 +256,10 @@ export async function runRefinePass(args: {
     dryRun: true,
     journal,
     budget,
+    // The refinement model may differ from the workspace's: without Project
+    // Trust it must not view memories carrying project skill provenance.
+    excludeProjectSkillContent: args.excludeProjectSkillContent,
+    projectSkillContentStillReadable: args.projectSkillContentStillReadable,
     // r59 defense in depth: dry-run stages in memory only (nothing durable),
     // but a cancelled pass must not start new validation work either, and
     // the shared signal keeps this posture if dry-run semantics ever change.
@@ -314,13 +332,32 @@ export async function runRefinePass(args: {
     )}\n</workspace_trajectory>`,
   ];
 
+  // Per-step gate outcome: a throw inside prepareStep is swallowed by the SDK's
+  // step loop (logged, no error part), so the gate aborts the stream through
+  // its own controller and flags the pass; the flag is folded into the stream
+  // errors once the consumer settles.
+  let stale = false;
+  const gate = new AbortController();
   const stream = streamText({
     model: args.model,
     system: buildRefineSystemPrompt(args.skillWriteAvailable === true),
     prompt: promptSections.join("\n\n"),
     tools,
     stopWhen: stepCountIs(REFINE_MAX_STEPS),
-    abortSignal: args.abortSignal,
+    abortSignal:
+      args.abortSignal === undefined
+        ? gate.signal
+        : AbortSignal.any([args.abortSignal, gate.signal]),
+    prepareStep:
+      args.beforeDispatch === undefined
+        ? undefined
+        : async () => {
+            if (!stale && !(await args.beforeDispatch!())) {
+              stale = true;
+              gate.abort(new Error(REFINE_INPUT_STALE_MESSAGE));
+            }
+            return undefined;
+          },
   });
 
   // Drain the stream; tool executions happen as the loop runs. Explicit
@@ -427,6 +464,7 @@ export async function runRefinePass(args: {
       streamErrors.push("refine pass deadline exceeded before the stream finished");
     }
   }
+  if (stale) streamErrors.unshift(REFINE_INPUT_STALE_MESSAGE);
 
   let summary = "";
   let toolCallIds: string[] = [];

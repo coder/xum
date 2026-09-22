@@ -182,6 +182,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Initial prompt for a queued agent task (persisted only until the task actually starts).",
   }),
+  taskCarriesProjectSkillContent: z.boolean().optional().meta({
+    description:
+      "The agent task's prompt or title was authored from a context carrying project skill content: a queued launch stamps its opening row with it, and task_list withholds or stamps the title.",
+  }),
   taskExperiments: z
     .preprocess(
       // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a

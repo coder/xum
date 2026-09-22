@@ -21,8 +21,10 @@ import {
   reclaimSupersededSnapshotBlobs,
   SandboxHostService,
   VarsSnapshotBudgetError,
+  PROJECT_SKILL_TAINT_VAR,
 } from "./sandboxHostService";
 import { RESULT_HANDLE_BLOB_QUOTA_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
+import { TASK_REPORT_WITHHELD_MESSAGE } from "@/node/services/tools/taskReportProvenance";
 
 const runtimeFactory = new QuickJSRuntimeFactory();
 
@@ -175,6 +177,36 @@ describe("SandboxHostService", () => {
     expect(await journal.blobs.has(refs[2] as never)).toBe(true);
     expect(await journal.blobs.has(refs[1] as never)).toBe(false);
     expect(await journal.blobs.has(refs[0] as never)).toBe(true);
+  });
+
+  test("markerless vars snapshots with retained content restore tainted; persists write an explicit marker", async () => {
+    // A snapshot written before the taint marker existed may hold project
+    // skill content nobody classified: retained vars restore TAINTED (fail
+    // closed) while an empty namespace retains nothing. Every persist writes
+    // "1"/"0" so a verified-clean snapshot is distinguishable from a legacy one.
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-taint",
+      sessionDir: tmp.path,
+    });
+    await mount.restoreVars(JSON.stringify({ retained: "value" }));
+    expect(mount.projectSkillTainted).toBe(true);
+    await mount.restoreVars("{}");
+    expect(mount.projectSkillTainted).toBe(false);
+    await mount.restoreVars(JSON.stringify({ [PROJECT_SKILL_TAINT_VAR]: "0", retained: "value" }));
+    expect(mount.projectSkillTainted).toBe(false);
+    await mount.restoreVars(JSON.stringify({ [PROJECT_SKILL_TAINT_VAR]: "1" }));
+    expect(mount.projectSkillTainted).toBe(true);
+
+    mount.projectSkillTainted = false;
+    await mount.runtime.eval('vars.state = "clean"; return true;');
+    await mount.persistVars();
+    const persisted = JSON.parse(await mount.snapshotVars()) as Record<string, unknown>;
+    expect(persisted[PROJECT_SKILL_TAINT_VAR]).toBe("0");
+    await host.disposeScope("ws-taint");
   });
 
   test("superseded snapshot blobs are reclaimed; referenced blobs survive", async () => {
@@ -522,6 +554,106 @@ describe("SandboxHostService", () => {
       },
     ]);
     await host.disposeScope("ws-terminal");
+  });
+
+  test("postTaskTerminalEvent: a report distilled from project skill content taints the mount when the guest drains it", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal-taint",
+      sessionDir: tmp.path,
+    });
+
+    await host.postTaskTerminalEvent("ws-terminal-taint", {
+      taskId: "child-skill",
+      status: "completed",
+      reportMarkdown: "Quotes the skill.",
+      carriesProjectSkillContent: true,
+    });
+    // Queued, not guest-visible yet: nothing has reached vars.
+    expect(mount.projectSkillTainted).toBe(false);
+
+    const drained = await mount.runtime.eval("return drainHostEvents();");
+    expect(drained.success).toBe(true);
+    // The flag is host bookkeeping; the guest sees the documented HostEvent shape.
+    expect(drained.result).toEqual([
+      {
+        type: "task-terminal",
+        taskId: "child-skill",
+        status: "completed",
+        reportMarkdown: "Quotes the skill.",
+      },
+    ]);
+    expect(mount.projectSkillTainted).toBe(true);
+    await host.disposeScope("ws-terminal-taint");
+  });
+
+  test("postTaskTerminalEvent: a carrying report drained by a turn that excludes project skill content is withheld and leaves the mount clean", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal-withheld",
+      sessionDir: tmp.path,
+    });
+    await host.postTaskTerminalEvent("ws-terminal-withheld", {
+      taskId: "child-skill",
+      status: "completed",
+      reportMarkdown: "Quotes the skill.",
+      carriesProjectSkillContent: true,
+    });
+    await host.postTaskTerminalEvent("ws-terminal-withheld", {
+      taskId: "child-clean",
+      status: "completed",
+      reportMarkdown: "Clean report.",
+    });
+
+    // code_execution sets the policy before each eval; the raw guest global
+    // drains through the same mount method, so it cannot bypass it.
+    mount.hostEventsExcludeProjectSkillContent = true;
+    const drained = await mount.runtime.eval("return drainHostEvents();");
+    expect(drained.success).toBe(true);
+    expect(drained.result).toEqual([
+      {
+        type: "task-terminal",
+        taskId: "child-skill",
+        status: "completed",
+        reportMarkdown: TASK_REPORT_WITHHELD_MESSAGE,
+      },
+      {
+        type: "task-terminal",
+        taskId: "child-clean",
+        status: "completed",
+        reportMarkdown: "Clean report.",
+      },
+    ]);
+    expect(mount.projectSkillTainted).toBe(false);
+    await host.disposeScope("ws-terminal-withheld");
+  });
+
+  test("postTaskTerminalEvent: an oversized carrying report taints the mount as soon as its handle is stored", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-terminal-big-taint",
+      sessionDir: tmp.path,
+    });
+    await host.postTaskTerminalEvent("ws-terminal-big-taint", {
+      taskId: "child-big-skill",
+      status: "completed",
+      reportMarkdown: "S".repeat(20_000),
+      carriesProjectSkillContent: true,
+    });
+    // The full text sits in vars before any drain, where the guest can read it.
+    expect(mount.projectSkillTainted).toBe(true);
+    const persisted = JSON.parse(await mount.snapshotVars()) as Record<string, unknown>;
+    expect(persisted[PROJECT_SKILL_TAINT_VAR]).toBe("1");
+    await host.disposeScope("ws-terminal-big-taint");
   });
 
   test("postTaskTerminalEvent: no live mount for the scope is a harmless no-op", async () => {

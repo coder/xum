@@ -346,6 +346,12 @@ export const router = (authToken?: string) => {
           })
         ),
 
+      updateModelClass: t
+        .input(schemas.config.updateModelClass.input)
+        .output(schemas.config.updateModelClass.output)
+        .handler(({ context, input }) =>
+          context.config.updateModelClass(input.className, input.model)
+        ),
       updateAutoModelRouting: t
         .input(schemas.config.updateAutoModelRouting.input)
         .output(schemas.config.updateAutoModelRouting.output)

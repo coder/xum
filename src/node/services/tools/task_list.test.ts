@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
-import { createTaskListTool } from "./task_list";
+import { createTaskListTool, TASK_TITLE_WITHHELD_MESSAGE } from "./task_list";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import { Config, type Workspace } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
@@ -169,6 +169,64 @@ describe("task_list tool", () => {
         },
       ],
     });
+  });
+
+  it("withholds a title authored from project skill content or stamps the result", async () => {
+    // The title is repository-derived text persisted outside history: a turn
+    // that excludes project skill content must not see it, and a trusted
+    // turn's result is stamped so the next step's consent gate classifies it.
+    const run = async (excludeProjectSkillContent: boolean) => {
+      using tempDir = new TestTempDir("test-task-list-title-provenance");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+      const listDescendantAgentTasks = mock(() => [
+        { ...buildAgentTask("clean", "running"), title: "Mapped the tooling" },
+        {
+          ...buildAgentTask("derived", "running"),
+          title: "Applied the project conventions",
+          carriesProjectSkillContent: true,
+        },
+      ]);
+      const taskService = { listDescendantAgentTasks } as unknown as TaskService;
+      const tool = createTaskListTool({
+        ...baseConfig,
+        taskService,
+        ...(excludeProjectSkillContent ? { excludeProjectSkillContent: true } : {}),
+      });
+      return (await Promise.resolve(tool.execute!({}, mockToolCallOptions))) as {
+        tasks: Array<Record<string, unknown>>;
+        carriesProjectSkillContent?: boolean;
+      };
+    };
+
+    const trusted = await run(false);
+    expect(trusted.tasks.map((task) => task.title)).toEqual([
+      "Mapped the tooling",
+      "Applied the project conventions",
+    ]);
+    expect(trusted.carriesProjectSkillContent).toBe(true);
+    // The flag is a result-level stamp, never a row field.
+    expect(trusted.tasks[1]).not.toHaveProperty("carriesProjectSkillContent");
+
+    const excluded = await run(true);
+    expect(excluded.tasks.map((task) => task.title)).toEqual([
+      "Mapped the tooling",
+      TASK_TITLE_WITHHELD_MESSAGE,
+    ]);
+    expect(excluded.tasks[1]?.taskId).toBe("derived");
+    expect(excluded).not.toHaveProperty("carriesProjectSkillContent");
+  });
+
+  it("leaves a result unstamped when no listed title carries project skill content", async () => {
+    using tempDir = new TestTempDir("test-task-list-title-clean");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [
+        { ...buildAgentTask("clean", "running"), title: "Mapped the tooling" },
+      ]),
+    } as unknown as TaskService;
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
+    expect(result).not.toHaveProperty("carriesProjectSkillContent");
   });
 
   it("guides bounded retention when listed user-owned children are inactive", async () => {
@@ -952,6 +1010,52 @@ describe("task_list tool", () => {
       depth: 0,
     });
     expect(parsed.tasks[1].relationship).toBe("self");
+  });
+
+  it("tree scope withholds or stamps titles authored from project skill content", async () => {
+    const run = async (excludeProjectSkillContent: boolean) => {
+      using tempDir = new TestTempDir("test-task-list-tree-title-provenance");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+      const listTaskTreeAgents = mock(() => ({
+        rootWorkspaceId: "tree-root",
+        rootTitle: "Root workspace",
+        rootRelationship: "ancestor" as const,
+        tasks: [
+          { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+          {
+            ...buildAgentTask("task-sib", "running", "tree-root"),
+            title: "Applied the project conventions",
+            carriesProjectSkillContent: true,
+            relationship: "sibling" as const,
+          },
+        ],
+      }));
+      const tool = createTaskListTool({
+        ...baseConfig,
+        taskService: { listTaskTreeAgents } as unknown as TaskService,
+        ...(excludeProjectSkillContent ? { excludeProjectSkillContent: true } : {}),
+      });
+      return (await Promise.resolve(tool.execute!({ scope: "tree" }, mockToolCallOptions))) as {
+        tasks: Array<Record<string, unknown>>;
+        carriesProjectSkillContent?: boolean;
+      };
+    };
+
+    const trusted = await run(false);
+    expect(trusted.tasks[2]).toMatchObject({
+      taskId: "task-sib",
+      title: "Applied the project conventions",
+    });
+    expect(trusted.tasks[2]).not.toHaveProperty("carriesProjectSkillContent");
+    expect(trusted.carriesProjectSkillContent).toBe(true);
+
+    const excluded = await run(true);
+    expect(excluded.tasks[2]).toMatchObject({
+      taskId: "task-sib",
+      title: TASK_TITLE_WITHHELD_MESSAGE,
+    });
+    expect(excluded.tasks[1]?.title).toBe("task-self");
+    expect(excluded).not.toHaveProperty("carriesProjectSkillContent");
   });
 
   it("tree scope does not advertise queued reawakenings on peer rows", async () => {

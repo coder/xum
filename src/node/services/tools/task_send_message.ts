@@ -6,6 +6,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import type { AgentTreeTargetRelation } from "@/node/services/taskService";
+import { contextProjectSkillContentWithheld } from "@/node/services/tools/projectSkillContentGate";
 
 import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
 
@@ -27,6 +28,10 @@ function targetRelationLabel(
   }
 }
 
+/** Same sink rule as the task tool: the message text can carry the withheld content. */
+export const TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR =
+  "This turn's context holds project skill content that Project Trust does not allow to leave the workspace; it cannot be forwarded to another agent.";
+
 export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_send_message.description,
@@ -35,14 +40,34 @@ export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration
       const workspaceId = requireWorkspaceId(config, "task_send_message");
       const taskService = requireTaskService(config, "task_send_message");
 
+      // The target's request is outside this turn's consent gate (see
+      // contextProjectSkillContentWithheld).
+      if (await contextProjectSkillContentWithheld(config)) {
+        throw new Error(TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+      }
+      // Under trust the forwarded text can restate project skill content this
+      // turn's context holds: the target's rows are stamped so its own
+      // provenance tracking inherits it (see TaskService.sendAgentTreeMessage).
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+
       // The default dispatch mode depends on the target's relation (ancestors default to
       // turn-end), which only the service can compute — pass the raw arg through.
-      const result = await taskService.sendAgentTreeMessage(
-        workspaceId,
-        args.task_id,
-        args.message,
-        args.queue_dispatch_mode ?? undefined
-      );
+      const result = contextCarriesProjectSkillContent
+        ? await taskService.sendAgentTreeMessage(
+            workspaceId,
+            args.task_id,
+            args.message,
+            args.queue_dispatch_mode ?? undefined,
+            { carriesProjectSkillContent: true }
+          )
+        : await taskService.sendAgentTreeMessage(
+            workspaceId,
+            args.task_id,
+            args.message,
+            args.queue_dispatch_mode ?? undefined
+          );
 
       if (result.success) {
         const targetRelation = targetRelationLabel(result.data.relation);

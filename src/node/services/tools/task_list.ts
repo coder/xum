@@ -25,6 +25,7 @@ import {
 } from "@/node/services/taskHandleStore";
 
 import { buildWorkflowProgressSummary } from "./workflowProgress";
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { toBashTaskId } from "./taskId";
 import {
   parseToolResult,
@@ -98,6 +99,42 @@ const INSTANCE_SCOPE_TRUNCATED_NOTE =
   " More rows match; pass `nextOffset` as `offset` to continue. Paging is best-effort while workspaces are created, removed, or archived, so restart from offset 0 or deduplicate by ID when completeness matters.";
 
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;
+
+/** Replaces the title of a task authored from project skill content for a turn that excludes it. */
+export const TASK_TITLE_WITHHELD_MESSAGE =
+  "[title withheld: authored from project skill content that Project Trust does not allow to leave the workspace]";
+
+/**
+ * A task's public row: the internal execution fields stay out, and a title
+ * authored from project skill content is withheld for a turn that excludes it
+ * — otherwise the row keeps it and the caller stamps the whole result.
+ */
+function publicTaskRow<
+  T extends {
+    executionTaskId?: string;
+    executionStatus?: unknown;
+    carriesProjectSkillContent?: boolean;
+    title?: string;
+  },
+>(
+  task: T,
+  excludeProjectSkillContent: boolean
+): {
+  row: Omit<T, "executionTaskId" | "executionStatus" | "carriesProjectSkillContent">;
+  carries: boolean;
+} {
+  const {
+    executionTaskId: _executionTaskId,
+    executionStatus: _executionStatus,
+    carriesProjectSkillContent,
+    ...row
+  } = task;
+  const carries = carriesProjectSkillContent === true;
+  if (carries && excludeProjectSkillContent && row.title != null) {
+    return { row: { ...row, title: TASK_TITLE_WITHHELD_MESSAGE }, carries };
+  }
+  return { row, carries };
+}
 
 interface WorkspaceArchiveLookup {
   isArchivedInScope(workspaceId: string): boolean;
@@ -238,9 +275,11 @@ function shouldHideArchivedWorkspaceTurn(
 async function executeTreeScope(
   taskService: TaskService,
   workspaceId: string,
-  requestedStatuses: readonly TaskListStatus[] | null
+  requestedStatuses: readonly TaskListStatus[] | null,
+  excludeProjectSkillContent: boolean
 ): Promise<unknown> {
   const tree = taskService.listTaskTreeAgents(workspaceId);
+  let resultCarriesProjectSkillContent = false;
   const explicit = requestedStatuses != null && requestedStatuses.length > 0;
   const statusFilter = new Set<TaskListStatus>(
     explicit ? requestedStatuses : [...DEFAULT_STATUSES, "workspace"]
@@ -307,12 +346,9 @@ async function executeTreeScope(
     if (!statusFilter.has(status)) {
       continue;
     }
-    const {
-      executionTaskId: _executionTaskId,
-      executionStatus: _executionStatus,
-      ...publicTask
-    } = task;
-    tasks.push({ ...publicTask, status });
+    const { row, carries } = publicTaskRow(task, excludeProjectSkillContent);
+    if (carries && !excludeProjectSkillContent) resultCarriesProjectSkillContent = true;
+    tasks.push({ ...row, status });
   }
 
   return parseToolResult(
@@ -321,6 +357,7 @@ async function executeTreeScope(
       tasks,
       note:
         tree.callerPeerMessagingRestricted === true ? TREE_SCOPE_RESTRICTED_NOTE : TREE_SCOPE_NOTE,
+      ...(resultCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
     },
     "task_list"
   );
@@ -379,6 +416,9 @@ function executeInstanceScope(
     taskId: row.workspaceId,
     status: "workspace" as const,
     ...(row.name != null ? { workspaceName: row.name } : {}),
+    // No provenance gate here: instance rows are root workspaces only, and the
+    // project-skill title marker (taskCarriesProjectSkillContent) is stamped on
+    // task children alone — at launch and by a descendant retitle.
     ...(row.title != null ? { title: row.title } : {}),
     ...(row.createdAt != null ? { createdAt: row.createdAt } : {}),
     projectPath: row.projectPath,
@@ -409,6 +449,11 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
       const workspaceId = requireWorkspaceId(config, "task_list");
       const taskService = requireTaskService(config, "task_list");
       const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_list");
+      // A task title authored from project skill content is repository-derived
+      // text: withheld from a turn that must not carry it, and the result is
+      // stamped otherwise so the next step's consent gate classifies it.
+      const excludeProjectSkillContent = await toolExcludesProjectSkillContent(config);
+      let resultCarriesProjectSkillContent = false;
 
       const scope = args.scope ?? "descendants";
       if (scope !== "instance") {
@@ -428,7 +473,12 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
         return executeInstanceScope(taskService, workspaceId, args);
       }
       if (scope === "tree") {
-        return executeTreeScope(taskService, workspaceId, args.statuses ?? null);
+        return executeTreeScope(
+          taskService,
+          workspaceId,
+          args.statuses ?? null,
+          excludeProjectSkillContent
+        );
       }
 
       const statuses =
@@ -497,12 +547,9 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
         if (status === "reported" || status === "interrupted" || status === "failed") {
           listedInactiveChild = true;
         }
-        const {
-          executionTaskId: _executionTaskId,
-          executionStatus: _executionStatus,
-          ...publicTask
-        } = task;
-        tasks.push({ ...publicTask, status });
+        const { row, carries } = publicTaskRow(task, excludeProjectSkillContent);
+        if (carries && !excludeProjectSkillContent) resultCarriesProjectSkillContent = true;
+        tasks.push({ ...row, status });
       }
 
       // Workflow runs are workspace-scoped (not parent/child workspaces), so they surface as
@@ -606,6 +653,7 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
         {
           tasks,
           ...(listedInactiveChild ? { note: INACTIVE_CHILD_RETENTION_NOTE } : {}),
+          ...(resultCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
         },
         "task_list"
       );

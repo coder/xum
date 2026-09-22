@@ -50,6 +50,13 @@ export interface CompletedReportEntry {
   kind: "task" | "workflow";
   /** Sub-agent task title or workflow display name. */
   title?: string;
+  /**
+   * The report (and so its title) was distilled from a context carrying
+   * project skill content — persisted with the report artifact, unknown for
+   * legacy artifacts (read as carrying). A routed turn that excludes such
+   * content withholds the title; kept under trust, it arms the consent gate.
+   */
+  carriesProjectSkillContent?: boolean;
   completedAtMs: number;
   /** Estimated token count of the persisted report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
