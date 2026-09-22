@@ -3100,10 +3100,12 @@ export class AgentSession {
         const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
         const streamCursor = mode?.type === "since" ? mode.cursor.stream : undefined;
 
+        // Persisted rows can predate writer validation. Never coerce malformed
+        // sequences into pagination arguments or reconnect cursor anchors.
         let oldestHistorySequence: number | undefined;
         for (const message of history) {
           const historySequence = message.metadata?.historySequence;
-          if (historySequence === undefined) {
+          if (!isNonNegativeInteger(historySequence)) {
             continue;
           }
 
@@ -3218,7 +3220,7 @@ export class AgentSession {
           if (sinceHistorySequence !== undefined) {
             const messageHistorySequence = message.metadata?.historySequence;
             if (
-              messageHistorySequence !== undefined &&
+              isNonNegativeInteger(messageHistorySequence) &&
               messageHistorySequence < sinceHistorySequence
             ) {
               continue;
@@ -3234,7 +3236,7 @@ export class AgentSession {
         for (let index = history.length - 1; index >= 0; index -= 1) {
           const message = history[index];
           const historySequence = message.metadata?.historySequence;
-          if (historySequence === undefined) {
+          if (!isNonNegativeInteger(historySequence)) {
             continue;
           }
 
