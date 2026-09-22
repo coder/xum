@@ -1063,13 +1063,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const foreign = "att_00000000000000a7";
         const { config, projectPath } = await setupTree([]);
         stubStableIds(config, [taskId]);
-        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-        const { taskService } = createHarness(config, { workspaceService });
-        const svc = internals(taskService);
-        // A marker in the task's session dir: the launch's cleanup removes that dir.
-        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
-        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
-        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
         // Another backend recovered the row and re-reserved it under its own attempt.
         const supersede = () =>
           config.editConfig((cfg) => {
@@ -1079,6 +1072,23 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             }
             return cfg;
           });
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+          // "on-failure": the launch's post-materialization failure (its send fails) lands after
+          // the row was re-reserved; the failure handling must not touch the successor.
+          sendMessage: mock(async (): Promise<Result<void>> => {
+            if (when === "on-failure") {
+              await supersede();
+              return Err("send failed");
+            }
+            return Ok(undefined);
+          }),
+        });
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        // A marker in the task's session dir: the launch's cleanup removes that dir.
+        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
+        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
+        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
         const materialization = {
           workspacePath: projectPath,
           trunkBranch: "main",
@@ -1100,15 +1110,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           if (when === "during-materialize") await supersede();
           return materialization;
         });
-        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
-          async () => {
-            if (when === "on-failure") {
-              await supersede();
-              return "sanitize failed";
-            }
-            return undefined;
-          }
-        );
 
         const created = await taskService.createMany([
           {
@@ -1129,7 +1130,11 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           await settle();
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+        // "on-failure" is the one variant whose send ran (and failed) under the owned attempt;
+        // nothing is dispatched under the successor's.
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(
+          when === "on-failure" ? 1 : 0
+        );
         expect(entryOf(config, taskId)).toMatchObject({
           taskAttemptId: foreign,
           taskStatus: "starting",

@@ -4365,6 +4365,17 @@ export class WorkspaceMcpOverridesService {
        * by the prune's own budget.
        */
       shouldPrune?: () => Promise<boolean>;
+      /**
+       * Runs INSIDE the same held checkout and global override locks AFTER the
+       * prune's writes settled (also when `shouldPrune` allowed the prune and
+       * nothing needed rewriting): the task-checkout preparation producer binds
+       * the physical identity of the sanitized directory here, so what it binds
+       * is exactly what was pruned, with no window in which an alias writer could
+       * replace or re-consent the checkout. Read/stat plus the nonce write inside
+       * the git admin dir only; bounded by the prune's own budget. Not invoked
+       * when `shouldPrune` returned `false` (nothing was sanitized, nothing to bind).
+       */
+      afterPruneUnderLock?: () => Promise<void>;
     }
   ): Promise<void> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
@@ -4437,6 +4448,16 @@ export class WorkspaceMcpOverridesService {
             // locks release: a late write could otherwise overwrite a save made
             // by the registration that follows.
             await snapshot.settleSideEffects();
+          }
+          if (options?.afterPruneUnderLock !== undefined) {
+            if (budget.exhausted()) {
+              throw new Error(`binding ${label} exceeded the plugin-prune budget`);
+            }
+            await withDeadline(
+              options.afterPruneUnderLock(),
+              budget.remaining(),
+              `binding ${label} exceeded the plugin-prune budget`
+            );
           }
         }),
       WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS
