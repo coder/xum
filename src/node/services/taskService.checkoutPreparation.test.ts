@@ -206,7 +206,8 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
   test("a reserved dedicated checkout is forked, pruned, claimed and bound BEFORE its row is published; the launch reuses it without forking or pruning again", async () => {
     const taskId = "prepreserved1";
     const projectPath = await createRepoWithTrackedEnable();
-    const { config, taskService, workspaceService, sends } = await createRealStack(projectPath);
+    const { config, taskService, workspaceService, overridesService, sends } =
+      await createRealStack(projectPath);
     stubStableIds(config, [taskId]);
     const forkPath = forkPathFor(config.srcDir, taskId);
     const documentPath = path.join(forkPath, OVERRIDES_RELATIVE_PATH);
@@ -239,9 +240,43 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
     restores.push(() => prepareSpy.mockRestore());
     const sanitizeSpy = spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace");
     restores.push(() => sanitizeSpy.mockRestore());
+    // The claim (nonce write) rides the prune's MUTATING `claimUnderLock` hook — joined before
+    // the locks release — never the read-only `shouldPrune` verdict a deadline may detach.
+    const nonceExists = () =>
+      pathExists(path.join(forkPath, ".git")).then(async (isWorktree) => {
+        if (!isWorktree) return false;
+        const pointer = (await fsPromises.readFile(path.join(forkPath, ".git"), "utf-8"))
+          .replace(/^gitdir:\s*/, "")
+          .trim();
+        return pathExists(path.join(pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE));
+      });
+    const nonceAfterVerdict: boolean[] = [];
+    const nonceAfterClaim: boolean[] = [];
+    const realPrune =
+      overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
+    const pruneSpy = spyOn(
+      overridesService,
+      "prunePluginOverrideKeysForUnregisteredCheckout"
+    ).mockImplementation((target, keyPrefix, options) =>
+      realPrune(target, keyPrefix, {
+        ...options,
+        shouldPrune: async () => {
+          const verdict = (await options?.shouldPrune?.()) ?? true;
+          nonceAfterVerdict.push(await nonceExists());
+          return verdict;
+        },
+        claimUnderLock: async () => {
+          await options?.claimUnderLock?.();
+          nonceAfterClaim.push(await nonceExists());
+        },
+      })
+    );
+    restores.push(() => pruneSpy.mockRestore());
 
     const created = await taskService.createMany([createArgs("Reserved")]);
     expect(created).toMatchObject({ success: true });
+    expect(nonceAfterVerdict).toEqual([false]);
+    expect(nonceAfterClaim).toEqual([true]);
     expect(observedAtPublish).toHaveLength(1);
     const [atPublish] = observedAtPublish;
     expect(atPublish.rowPublished).toBe(false);
