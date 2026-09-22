@@ -396,7 +396,28 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
   }),
 ]);
 
+export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), modelIds: z.array(z.string()) }),
+  z.object({ status: z.literal("unsupported") }),
+  z.object({ status: z.literal("not-configured") }),
+  z.object({
+    status: z.literal("error"),
+    reason: z.enum([
+      "aborted",
+      "timeout",
+      "request-failed",
+      "invalid-response",
+      "limit-exceeded",
+      "stale-config",
+    ]),
+  }),
+]);
+
 export const providers = {
+  discoverModels: {
+    input: z.object({ provider: z.string() }),
+    output: ProviderModelDiscoveryResultSchema,
+  },
   addCustomProvider: {
     input: z.object({
       provider: z.string(),

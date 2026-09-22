@@ -183,6 +183,7 @@ export {
   secrets,
   CustomProviderMutationErrorSchema,
   ProviderConfigInfoSchema,
+  ProviderModelDiscoveryResultSchema,
   ProviderModelEntrySchema,
   muxGateway,
   muxGatewayOauth,
