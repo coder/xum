@@ -5444,6 +5444,7 @@ describe("WorkspaceMcpOverridesService", () => {
       // files), and bun's spyOn on an already-spied method returns that same mock — a later
       // test capturing "the real writeFile" would capture the mock and recurse. Fail loudly on
       // a leak, and restore this one in finally.
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- membership probe, not a call
       expect("mockRestore" in LocalBaseRuntime.prototype.writeFile).toBe(false);
       // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via .call below
       const realWriteFile = LocalBaseRuntime.prototype.writeFile;
