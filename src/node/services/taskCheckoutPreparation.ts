@@ -28,9 +28,10 @@ import assert from "@/common/utils/assert";
  *
  * Shared tasks (isolation "none", or LocalRuntime conversation forks that share the project
  * directory) carry NO proof of their own: their authority is derived, on every authorization,
- * from live same-path ancestry up to the nearest dedicated task (which must itself be `ready`)
- * or ordinary root workspace. Intermediates matter: an archived, missing or path-divergent hop
- * breaks the context. Ordinary roots and off-host task rows are outside the protocol.
+ * from live same-directory ancestry up to the nearest dedicated task (which must itself be
+ * `ready`) or ordinary root workspace. Intermediates matter: an archived, missing or
+ * directory-divergent hop breaks the context. Ordinary roots and off-host task rows are outside
+ * the protocol.
  *
  * Limits (by design): in-place edits inside a validated directory are not detected (later
  * legitimate consent is allowed); a local writer with access to `.git` can forge the nonce — this
@@ -83,6 +84,7 @@ export interface TaskCheckoutAuthority {
   authorizationRevision: string;
   /** Dedicated: the row itself. Shared: the dedicated task or ordinary root the context comes from. */
   anchorWorkspaceId: string;
+  /** Dedicated: the proof's path. Shared: the execution directory shared with the anchor. */
   anchorPath: string;
   /** Shared: every intermediate shared row walked (child → parent order); dedicated: empty. */
   ancestry: readonly string[];
@@ -160,13 +162,19 @@ export function classifyTaskCheckoutKind(row: Workspace): TaskCheckoutKind {
 // Bounded host reads
 // ---------------------------------------------------------------------------------------------
 
-class SpecialFileError extends Error {}
+/** Thrown by `readSmallRegularFile` when the path is not a small regular file. */
+export class SpecialFileError extends Error {}
 
 /**
- * Read a small REGULAR file without following symlinks and without ever blocking a libuv thread:
- * a FIFO/device at the path is refused by the lstat/fstat type checks and the O_NONBLOCK open.
+ * Read a small REGULAR file without following symlinks. FIFO/device protection: a special file
+ * at the path is refused by the lstat/fstat type checks and the O_NONBLOCK open, so a planted
+ * FIFO cannot park a libuv thread on `open`/`read` (ordinary filesystem syscalls on a regular
+ * file can still be slow — the callers' deadlines bound that, not this reader). Throws
+ * `SpecialFileError` for a symlink/directory/FIFO/device or an oversized file, and the raw fs
+ * error otherwise (ENOENT included). Shared with the structural-mutation guard's legacy `.git`
+ * reader: one bounded primitive, no parallel readers.
  */
-async function readSmallRegularFile(filePath: string, maxBytes: number): Promise<string> {
+export async function readSmallRegularFile(filePath: string, maxBytes: number): Promise<string> {
   const before = await fsPromises.lstat(filePath);
   if (!before.isFile()) throw new SpecialFileError(`${filePath} is not a regular file`);
   if (before.size > maxBytes) throw new SpecialFileError(`${filePath} exceeds ${maxBytes} bytes`);
@@ -295,11 +303,15 @@ export async function claimTaskCheckoutIdentity(
       await handle.close();
     }
     await fsPromises.rename(tmp, nonceFile);
-    const dir = await fsPromises.open(identity.gitdir.pointer, fsConstants.O_RDONLY);
-    try {
-      await dir.sync();
-    } finally {
-      await dir.close();
+    // Directory fsync makes the rename durable. Windows exposes no directory handle to sync
+    // (same policy as historyAppendProvenance / HistoryService: file fsync + rename only there).
+    if (process.platform !== "win32") {
+      const dir = await fsPromises.open(identity.gitdir.pointer, fsConstants.O_RDONLY);
+      try {
+        await dir.sync();
+      } finally {
+        await dir.close();
+      }
     }
     return identity;
   } catch (error) {
@@ -432,10 +444,26 @@ function readProof(
   return { kind: "proof", proof: parsed.data };
 }
 
+interface ConfigEntry {
+  projectPath: string;
+  workspace: Workspace;
+}
+
+/**
+ * The directory a host-local row executes in. LocalRuntime always runs in the PROJECT directory
+ * (LocalRuntime.getWorkspacePath ignores the persisted path, which is informational there); every
+ * other runtime runs in the row's path.
+ */
+function executionDirectory(entry: ConfigEntry): string {
+  return entry.workspace.runtimeConfig?.type === "local" ? entry.projectPath : entry.workspace.path;
+}
+
 /** The classification inputs of one row, as signed by an authority. */
-function rowSignatureInputs(row: Workspace): Record<string, unknown> {
+function rowSignatureInputs(entry: ConfigEntry): Record<string, unknown> {
+  const row = entry.workspace;
   return {
     id: row.id ?? null,
+    projectPath: entry.projectPath,
     kind: classifyTaskCheckoutKind(row),
     parentWorkspaceId: row.parentWorkspaceId ?? null,
     path: row.path,
@@ -467,32 +495,38 @@ function deriveDedicatedRow(
 }
 
 /**
- * Pure (config-only) live same-path ancestry walk of a shared row: child → parent while each hop
- * is a live shared row at the same path, ending at the nearest dedicated task or ordinary root.
+ * Pure (config-only) live same-directory ancestry walk of a shared row: child → parent while each
+ * hop is a live shared row executing in the same directory, ending at the nearest dedicated task
+ * or ordinary root.
  */
 function walkSharedAncestry(
   snapshot: ProjectsConfig,
-  row: Workspace
+  entry: ConfigEntry
 ):
-  | { ok: true; anchor: Workspace; anchorKind: "dedicated" | "root"; hops: Workspace[] }
+  | { ok: true; anchor: ConfigEntry; anchorKind: "dedicated" | "root"; hops: ConfigEntry[] }
   | { ok: false; detail: string } {
-  const hops: Workspace[] = [];
-  const visited = new Set<string>([row.id ?? ""]);
-  let current = row;
+  const hops: ConfigEntry[] = [];
+  const directory = executionDirectory(entry);
+  const visited = new Set<string>([entry.workspace.id ?? ""]);
+  let current = entry;
   for (let hop = 0; hop < MAX_SHARED_ANCESTRY_HOPS; hop++) {
-    const parentId = current.parentWorkspaceId;
-    if (parentId == null) return { ok: false, detail: `${current.id ?? "?"} has no parent` };
+    const parentId = current.workspace.parentWorkspaceId;
+    if (parentId == null) {
+      return { ok: false, detail: `${current.workspace.id ?? "?"} has no parent` };
+    }
     if (visited.has(parentId)) return { ok: false, detail: `ancestry cycle at ${parentId}` };
     visited.add(parentId);
-    const parent = findWorkspaceEntry(snapshot, parentId)?.workspace;
-    if (!parent) return { ok: false, detail: `ancestor ${parentId} not found` };
+    const parentEntry = findWorkspaceEntry(snapshot, parentId);
+    if (!parentEntry) return { ok: false, detail: `ancestor ${parentId} not found` };
+    const parent = parentEntry.workspace;
     if (isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)) {
       return { ok: false, detail: `ancestor ${parentId} is archived` };
     }
-    if (parent.path !== row.path)
-      return { ok: false, detail: `ancestor ${parentId} has a different path` };
     if (!isHostLocalRuntime(parent.runtimeConfig)) {
       return { ok: false, detail: `ancestor ${parentId} is not host-local` };
+    }
+    if (executionDirectory(parentEntry) !== directory) {
+      return { ok: false, detail: `ancestor ${parentId} executes in a different directory` };
     }
     const kind = classifyTaskCheckoutKind(parent);
     if (kind === "root") {
@@ -501,15 +535,17 @@ function walkSharedAncestry(
       if (parent.taskCheckoutPreparation !== undefined) {
         return { ok: false, detail: `root anchor ${parentId} carries a proof` };
       }
-      return { ok: true, anchor: parent, anchorKind: "root", hops };
+      return { ok: true, anchor: parentEntry, anchorKind: "root", hops };
     }
-    if (kind === "dedicated") return { ok: true, anchor: parent, anchorKind: "dedicated", hops };
+    if (kind === "dedicated") {
+      return { ok: true, anchor: parentEntry, anchorKind: "dedicated", hops };
+    }
     if (kind !== "shared") return { ok: false, detail: `ancestor ${parentId} is ${kind}` };
     if (parent.taskCheckoutPreparation !== undefined) {
       return { ok: false, detail: `shared ancestor ${parentId} carries a proof` };
     }
-    hops.push(parent);
-    current = parent;
+    hops.push(parentEntry);
+    current = parentEntry;
   }
   return { ok: false, detail: "ancestry exceeds the supported depth" };
 }
@@ -531,9 +567,10 @@ function deriveTaskCheckoutAuthorization(
       anchorProof: TaskCheckoutPreparation | null;
     }
   | Exclude<TaskCheckoutPreparationState, { kind: "ready" }> {
-  const row = findWorkspaceEntry(snapshot, workspaceId)?.workspace;
+  const entry = findWorkspaceEntry(snapshot, workspaceId);
   // A missing row is a REFUSAL, never an exemption: only an existing parent-less row is a root.
-  if (!row) return { kind: "unreadable", detail: `workspace ${workspaceId} not found` };
+  if (!entry) return { kind: "unreadable", detail: `workspace ${workspaceId} not found` };
+  const row = entry.workspace;
   const proofPresent = row.taskCheckoutPreparation !== undefined;
   const kind = classifyTaskCheckoutKind(row);
   if (kind === "root") {
@@ -546,10 +583,10 @@ function deriveTaskCheckoutAuthorization(
       ? { kind: "runtime-mismatch", detail: "proof present on a non-host-local runtime" }
       : { kind: "excluded-offhost" };
   }
-  const sign = (hops: Workspace[], anchor: Workspace): string =>
+  const sign = (hops: ConfigEntry[], anchor: ConfigEntry): string =>
     canonicalJson({
       v: 1,
-      row: rowSignatureInputs(row),
+      row: rowSignatureInputs(entry),
       ancestry: hops.map(rowSignatureInputs),
       anchor: rowSignatureInputs(anchor),
     });
@@ -567,7 +604,7 @@ function deriveTaskCheckoutAuthorization(
         anchorWorkspaceId: workspaceId,
         anchorPath: derived.proof.path,
         ancestry: [],
-        signature: sign([], row),
+        signature: sign([], entry),
       },
     };
   }
@@ -575,15 +612,15 @@ function deriveTaskCheckoutAuthorization(
   if (proofPresent) {
     return { kind: "unsupported", detail: "shared task rows carry no preparation proof" };
   }
-  const walk = walkSharedAncestry(snapshot, row);
+  const walk = walkSharedAncestry(snapshot, entry);
   if (!walk.ok) return { kind: "shared-broken", detail: walk.detail };
   let anchorProof: TaskCheckoutPreparation | null = null;
   if (walk.anchorKind === "dedicated") {
-    const derived = deriveDedicatedRow(walk.anchor);
+    const derived = deriveDedicatedRow(walk.anchor.workspace);
     if (derived.kind !== "proof") {
       return {
         kind: "shared-broken",
-        detail: `anchor ${walk.anchor.id ?? "?"} is ${derived.kind}`,
+        detail: `anchor ${walk.anchor.workspace.id ?? "?"} is ${derived.kind}`,
       };
     }
     anchorProof = derived.proof;
@@ -596,9 +633,10 @@ function deriveTaskCheckoutAuthorization(
       kind: "shared",
       materializationId: anchorProof?.materializationId ?? "",
       authorizationRevision: anchorProof?.authorizationRevision ?? "",
-      anchorWorkspaceId: walk.anchor.id ?? "",
-      anchorPath: walk.anchor.path,
-      ancestry: walk.hops.map((hop) => hop.id ?? ""),
+      anchorWorkspaceId: walk.anchor.workspace.id ?? "",
+      // The directory the shared row executes in (== the anchor's, by the walk).
+      anchorPath: executionDirectory(entry),
+      ancestry: walk.hops.map((hop) => hop.workspace.id ?? ""),
       signature: sign(walk.hops, walk.anchor),
     },
   };
@@ -635,8 +673,8 @@ export async function validateTaskCheckoutPreparation(
     }
   }
   if (derived.authority.kind === "shared") {
-    // The shared directory (the walk proved the row's path IS the anchor's path) must exist. For
-    // a dedicated anchor its proof was just revalidated at that path; a root anchor has no proof.
+    // The shared execution directory (the walk proved it is the anchor's too) must exist. For a
+    // dedicated anchor its proof was just revalidated there; a root anchor has no proof.
     try {
       if (!(await fsPromises.stat(derived.authority.anchorPath)).isDirectory()) {
         return { kind: "shared-broken", detail: "shared path is not a directory" };
@@ -649,6 +687,15 @@ export async function validateTaskCheckoutPreparation(
     }
   }
   return { kind: "ready", authority: derived.authority };
+}
+
+/** User-facing refusal text shared by every producer/consumer gate (one wording, one place). */
+export function taskCheckoutNotPreparedMessage(
+  state: Exclude<TaskCheckoutPreparationState, { kind: "ready" }>
+): string {
+  const detail =
+    "detail" in state ? `: ${state.detail}` : "dimension" in state ? ` (${state.dimension})` : "";
+  return `Task checkout is not prepared (${state.kind}${detail}). The task record and its files are retained for inspection and are not modified; start a fresh task to continue.`;
 }
 
 /**
