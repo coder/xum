@@ -1009,6 +1009,47 @@ describeIntegration("workspace.planReview", () => {
     expect(conversationText(request)).not.toContain("rec_malformed");
   }, 60_000);
 
+  test("feedback options cannot smuggle edit semantics that truncate history", async () => {
+    // An edit truncates history at its target before the row persists, which could delete the
+    // referenced snapshot. The endpoint strips edit fields, so the send is an ordinary append.
+    const state = await getState();
+    const snapshot = state.snapshots.at(-1);
+    expect(snapshot).toBeDefined();
+    if (!snapshot) return;
+    const history = new HistoryService(env.config);
+    const before = await history.getHistoryFromLatestBoundary(workspaceId);
+    expect(before.success).toBe(true);
+    if (!before.success) return;
+    const firstUser = before.data.find((m) => m.role === "user" && m.metadata?.synthetic !== true);
+    expect(firstUser).toBeDefined();
+    if (!firstUser) return;
+    collector.clear();
+    const sent = await planReview().submitFeedback({
+      workspaceId,
+      snapshotId: snapshot.snapshotId,
+      comments: [{ anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body: "Edit?" }],
+      replies: [],
+      // Typed as the schema output, but a raw client can still send these fields.
+      options: {
+        model: MODEL,
+        agentId: "plan",
+        editMessageId: firstUser.id,
+        unfencedEdit: true,
+      } as unknown as { model: string; agentId: "plan" },
+    });
+    expect(sent.success).toBe(true);
+    expect(await collector.waitForEvent("stream-end", STREAM_TIMEOUT_MS)).toBeDefined();
+    await env.services.workspaceService.getOrCreateSession(workspaceId).waitForIdle();
+    const after = await history.getHistoryFromLatestBoundary(workspaceId);
+    expect(after.success).toBe(true);
+    if (!after.success) return;
+    // Nothing before the edit target was removed: every prior row is still present, in order.
+    expect(after.data.slice(0, before.data.length).map((m) => m.id)).toEqual(
+      before.data.map((m) => m.id)
+    );
+    expect((await getState()).snapshots.map((s) => s.snapshotId)).toContain(snapshot.snapshotId);
+  }, 60_000);
+
   // Last on purpose: it clears the workspace history.
   test("feedback prepared against history that is cleared before the send is refused", async () => {
     const state = await getState();

@@ -11749,6 +11749,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // in-preflight and re-probes the epoch itself), so a discard either lands before this check
     // and is refused here, or is refused by acquireContextMutationAdmissionGuard until the row
     // is admitted. The user re-sends against fresh state.
+    // The oRPC schema omits edit fields; assert for internal callers because an edit would
+    // truncate history at its target before the feedback row persists.
+    assert(
+      input.options.editMessageId === undefined &&
+        input.options.historyEditPrecondition === undefined &&
+        input.options.unfencedEdit === undefined,
+      "plan review feedback cannot carry edit semantics"
+    );
     const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
@@ -13630,9 +13638,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           return Err(`Failed to answer ask_user_question: ${errorMessage}`);
         }
 
-        // Guard against answering stale tool calls.
+        // Guard against answering stale tool calls. Model-hidden records (plan-review
+        // snapshot/resolve/reopen rows, workflow display rows) are UI state, not conversational
+        // turns: resolving a review thread while a question is pending must not make the
+        // question unanswerable.
         const maxSeq = Math.max(
           ...historyResult.data
+            .filter((m) => !isModelHiddenMessage(m))
             .map((m) => m.metadata?.historySequence)
             .filter((n): n is number => typeof n === "number")
         );

@@ -1862,8 +1862,16 @@ export const workspace = {
             })
           )
           .max(PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK),
-        /** Agent/model/thinking for the resulting user turn, as the plan card's Implement sends them. */
-        options: SendMessageOptionsSchema,
+        /**
+         * Agent/model/thinking for the resulting user turn, as the plan card's Implement sends
+         * them. Edit semantics are excluded: an edit truncates history before the row persists,
+         * which could delete the very snapshot/thread the feedback references.
+         */
+        options: SendMessageOptionsSchema.omit({
+          editMessageId: true,
+          historyEditPrecondition: true,
+          unfencedEdit: true,
+        }),
       }),
       output: ResultSchema(
         z.object({ feedbackId: z.string(), state: PlanReviewStateSchema }),
