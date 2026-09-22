@@ -127,7 +127,12 @@ export const WorkflowEvaluateSpecSchema = z.strictObject({
     .string()
     .min(1)
     .refine((id) => id.trim().length > 0, "id must be a non-blank step id"),
-  title: z.string().optional(),
+  // Optional UI label. Blank is rejected rather than normalized because the
+  // `evaluation` run event requires a non-empty title when present.
+  title: z
+    .string()
+    .refine((title) => title.trim().length > 0, "title must be a non-blank string")
+    .optional(),
   // A blank model must not silently shadow the CLI/Settings default, so it is
   // rejected up front instead of reaching the resolver as an unknown model.
   model: z

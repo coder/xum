@@ -159,6 +159,18 @@ describe("WorkflowEvaluateSpecSchema", () => {
     ).toBe(false);
   });
 
+  it("rejects a blank title so every persisted evaluation event title is non-empty", () => {
+    expect(
+      WorkflowEvaluateSpecSchema.safeParse({ id: "screen", questions: QUESTIONS, title: "Screen" })
+        .success
+    ).toBe(true);
+    for (const title of ["", "  "]) {
+      expect(
+        WorkflowEvaluateSpecSchema.safeParse({ id: "screen", questions: QUESTIONS, title }).success
+      ).toBe(false);
+    }
+  });
+
   it("rejects a blank per-call model so it cannot shadow the configured default", () => {
     expect(
       WorkflowEvaluateSpecSchema.safeParse({
