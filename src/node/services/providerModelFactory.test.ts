@@ -4835,6 +4835,15 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
         expect(fingerprint).not.toBe(defaultFingerprint!);
       }
     );
+    // A hand-edited entry with surrounding whitespace is normalized the same
+    // way the credential resolver (and auto model routing) already normalize it.
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", baseUrl: " https://proxy.example/typesafe/v1 " } },
+      async (_c, factory, spy) => {
+        const { url } = await captureUrl(factory, spy);
+        expect(url).toBe("https://proxy.example/typesafe/v1/systemone");
+      }
+    );
   });
 
   it("rejects an unconfigured, disabled or custom-shadowed typesafe entry like any provider", async () => {

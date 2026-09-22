@@ -3014,8 +3014,11 @@ export class ProviderModelFactory {
         case TYPESAFE_PROVIDER_KEY: {
           // Evaluation-only provider with no chat sibling to mirror: the SDK
           // reads exactly apiKey/baseURL/headers/fetch, so pass those fields
-          // rather than spreading the raw providers.jsonc entry.
-          effectiveBaseURL = configuredBaseURL;
+          // rather than spreading the raw providers.jsonc entry. The credential
+          // resolver already read the (policy-forced or configured) base URL
+          // and trimmed it; the raw `configuredBaseURL` would embed a stray
+          // space before the SDK's `/systemone` suffix.
+          effectiveBaseURL = creds.baseUrl;
           model = createTypeSafeAi({
             apiKey: creds.apiKey,
             ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
