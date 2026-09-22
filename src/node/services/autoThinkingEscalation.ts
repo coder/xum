@@ -207,3 +207,15 @@ export function recordAutoThinkingEscalation(
 export function markAutoThinkingEscalationExhausted(state: AutoThinkingEscalationState): void {
   state.exhausted = true;
 }
+
+/**
+ * A mid-turn model swap (refusal fallback) moves the level the stream runs at; later raises
+ * climb from there, and a ceiling the refused model hit says nothing about the new one.
+ */
+export function rebaseAutoThinkingEscalation(
+  state: AutoThinkingEscalationState,
+  level: ThinkingLevel
+): void {
+  state.level = level;
+  state.exhausted = false;
+}

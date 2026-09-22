@@ -39,6 +39,7 @@ import type {
 } from "./thinkingOverride";
 import {
   createAutoThinkingEscalationState,
+  markAutoThinkingEscalationExhausted,
   type AutoThinkingEscalationState,
 } from "./autoThinkingEscalation";
 import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
@@ -8257,8 +8258,13 @@ describe("StreamManager - mid-turn thinking override", () => {
       pending: "high",
       onLiveRoutingChanged: (live) => sessionSaw.push(live),
     };
+    // Auto set "low"; the escalation ladder was seeded from it when the refused stream started
+    // and the refused model's ceiling already retired it.
+    const escalationState = createAutoThinkingEscalationState("low", [], () => undefined);
+    markAutoThinkingEscalationExhausted(escalationState);
     const startTime = Date.now() - 250;
     const streamInfo = createStreamInfoForTests({
+      stepTracker: { autoThinkingEscalation: escalationState },
       initialMetadata: {
         autoModelRouting: {
           status: "routed",
@@ -8322,5 +8328,9 @@ describe("StreamManager - mid-turn thinking override", () => {
         thinkingLevel: "high",
       },
     });
+    // The next raise climbs from the level the fallback runs at, not the refused model's, and
+    // the refused model's ceiling no longer retires it.
+    expect(escalationState.level).toBe("high");
+    expect(escalationState.exhausted).toBe(false);
   });
 });

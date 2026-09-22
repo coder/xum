@@ -75,6 +75,7 @@ import {
   createAutoThinkingEscalationState,
   markAutoThinkingEscalationExhausted,
   proposeAutoThinkingEscalation,
+  rebaseAutoThinkingEscalation,
   recordAutoThinkingEscalation,
   type AutoThinkingEscalationState,
 } from "@/node/services/autoThinkingEscalation";
@@ -3962,6 +3963,14 @@ export class StreamManager {
         ),
       }),
     };
+    // Escalation climbs from the level the stream runs at now: the fallback model's ladder
+    // may have clamped Auto's claim, and a raise proposed from the refused model's level
+    // would be a no-op here and retire escalation for the rest of the turn.
+    const escalationState = streamInfo.stepTracker.autoThinkingEscalation;
+    const claimedLevel = streamInfo.initialMetadata.autoModelRouting?.thinkingLevel;
+    if (escalationState && claimedLevel != null) {
+      rebaseAutoThinkingEscalation(escalationState, claimedLevel);
+    }
     // Release the refused model's transport resources now: the stream-exit
     // finally only cleans the final request's model, so without this the
     // refused model (e.g. an OpenAI WS transport socket) would leak per hop.

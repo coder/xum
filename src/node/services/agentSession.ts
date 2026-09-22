@@ -7245,7 +7245,8 @@ export class AgentSession {
    * stream on a non-active goal is not charged at all, so the far larger response cost would
    * escape the cap. The charge rides the preparation attempt until its stream is delivered
    * (adoptEvaluatorGoalCharge); an attempt that never streams settles it by itself
-   * (settleEvaluatorGoalCharge), so nothing owed leaks into a later, unrelated turn.
+   * (settleEvaluatorGoalCharge), as does a delivered stream that ends in a terminal error, so
+   * nothing owed leaks into a later, unrelated turn.
    * Compaction streams never charge the goal and leave it for the turn that follows their
    * boundary (an on-send compaction or a /compact follow-up).
    */
@@ -7456,13 +7457,18 @@ export class AgentSession {
     // Coder-gateway tier model and its direct twin are different runs) while a dimension is
     // still on Auto. With both dimensions concrete it survives only when the picks match what
     // ran (startup retries): a thinking-only routing resumed at a hand-picked level routed
-    // nothing, and the badge must not claim its tier.
-    const keepRecord =
-      modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model) &&
-      (autoModelRouting === true ||
+    // nothing, and the badge must not claim its tier. A different hand-picked model under
+    // thinking Auto still runs at Auto's level (with its raises), so a record that claims one
+    // survives as a thinking-only routing on the picked model: the escalation state seeds
+    // from it and the badge keeps the tier, while nothing about the model is Auto's any more.
+    const modelMatches =
+      modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model);
+    const keepRecord = modelMatches
+      ? autoModelRouting === true ||
         autoThinkingLevel === true ||
         record.thinkingLevel == null ||
-        thinkingLevel === record.thinkingLevel);
+        thinkingLevel === record.thinkingLevel
+      : autoThinkingLevel === true && record.thinkingLevel != null;
     // The record's thinkingLevel (and the raises that followed it) means "Auto set it"; a
     // concrete pick on resume replaces it.
     const {
@@ -7470,7 +7476,18 @@ export class AgentSession {
       escalations: _raises,
       ...recordWithoutThinking
     } = record;
-    const resumedRecord = autoThinkingLevel === true ? record : recordWithoutThinking;
+    const { reason: _modelFallbackReason, ...recordWithoutModelProvenance } = record;
+    const resumedRecord =
+      autoThinkingLevel !== true
+        ? recordWithoutThinking
+        : modelMatches
+          ? record
+          : {
+              ...recordWithoutModelProvenance,
+              requestedFallbackModel: model,
+              model,
+              status: "routed" as const,
+            };
     return {
       ...resumeOptions,
       model,
@@ -9230,10 +9247,13 @@ export class AgentSession {
     const streamErrorMessage = createStreamErrorMessage(data);
     this.setTerminalStreamLifecycle("failed");
     this.terminalStreamError = streamErrorMessage;
-    // The failed stream's cost is discarded below; the evaluator spend that routed it
-    // follows, rather than landing on whichever unrelated turn streams next.
+    // The failed stream's cost is discarded below, but the evaluator that routed it was
+    // billed: charge that spend by itself (captured before the await, so a superseding turn's
+    // charge is not swept up) rather than let it land on whichever unrelated turn streams next.
+    const evaluatorCostUsd = this.pendingEvaluatorGoalCostUsd;
     this.pendingEvaluatorGoalCostUsd = undefined;
     await this.restoreGoalAccountingSnapshot();
+    await this.chargeEvaluatorSpendToGoal(evaluatorCostUsd);
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     this.activeCompactionRequest = undefined;

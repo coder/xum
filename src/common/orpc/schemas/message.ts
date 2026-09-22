@@ -3,6 +3,7 @@ import { MCPToolCallDisplaySchema } from "./mcp";
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
 import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
@@ -144,13 +145,16 @@ export const AutoModelRoutingEscalationSchema = z.object({
 });
 
 // Auto-model-routing provenance (which tier the evaluator chose, which model and thinking level ran).
+// Both models are re-read from history to build requests (a resume continues on the routed
+// model, request preparation reverts to the fallback), so a damaged value must fail parsing
+// and drop the record rather than reach pricing or the provider.
 export const AutoModelRoutingRecordSchema = z.object({
-  requestedFallbackModel: z.string(),
+  requestedFallbackModel: z.string().refine(isValidModelFormat),
   tierId: z.string().optional(),
   tierLabel: z.string().optional(),
   confidence: z.number().optional(),
   probabilities: z.record(z.string(), z.number()).optional(),
-  model: z.string(),
+  model: z.string().refine(isValidModelFormat),
   thinkingLevel: ThinkingLevelSchema.optional(),
   escalations: z.array(AutoModelRoutingEscalationSchema).optional(),
   status: z.enum(["routed", "unmapped-tier", "fallback"]),

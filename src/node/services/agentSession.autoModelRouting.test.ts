@@ -34,11 +34,13 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  createFailedTurnHandle,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
   createTestAgentSession,
   runSessionTerminalPolicy,
 } from "./agentSession.testHarness";
+import { waitForCondition } from "./testDispatchHelpers";
 
 const COMPOSER_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const HARD_MODEL = "openai:gpt-5.5";
@@ -680,6 +682,36 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       requestedFallbackModel: COMPOSER_MODEL,
       model: HARD_MODEL,
       status: "bogus",
+    };
+    expect((await historyService.appendToHistory("ws-auto-routing", row)).success).toBe(true);
+
+    const result = await session.resumeStream({
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[0]?.[0];
+    expect(resumeOptions?.modelString).toBe(COMPOSER_MODEL);
+    expect(resumeOptions?.autoModelRouting).toBeUndefined();
+  });
+
+  it("treats a persisted routing record with a malformed model as absent on resume", async () => {
+    const { session, historyService, streamMessage } = await createHarness({
+      experimentEnabled: true,
+    });
+    const row = createMuxMessage("user-malformed-model", "user", "Refactor the scheduler", {
+      timestamp: Date.now() - 1_000,
+    });
+    // Every field is well-typed, but the routed model lost its provider prefix; under model
+    // Auto a resume would otherwise continue on it and fail at request preparation.
+    (row.metadata as Record<string, unknown>).autoModelRouting = {
+      requestedFallbackModel: COMPOSER_MODEL,
+      tierId: "hard",
+      model: "gpt-5.5",
+      status: "routed",
     };
     expect((await historyService.appendToHistory("ws-auto-routing", row)).success).toBe(true);
 
@@ -1476,6 +1508,58 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     ).toBeCloseTo(hardCost, 10);
   });
 
+  it("a routed stream that fails terminally still charges the evaluator's spend", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+      aiService.emit("stream-start", {
+        type: "stream-start",
+        workspaceId: "ws-auto-routing",
+        messageId: "assistant-failed",
+        model: opts.modelString,
+        historySequence: 1,
+        startTime: Date.now(),
+        autoModelRouting: opts.autoModelRouting,
+      });
+      return Promise.resolve(
+        Ok(createFailedTurnHandle("assistant-failed", { error: "boom", errorType: "unknown" }))
+      );
+    });
+    let streamErrored = false;
+    session.onChatEvent(({ message }) => {
+      if (message.type === "stream-error") streamErrored = true;
+    });
+    const result = await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(result.success).toBe(true);
+    await waitForCondition(() => streamErrored, { timeoutMs: 2_000 });
+
+    // The failed response's provisional cost is discarded, but the evaluator was billed.
+    expect(recordStreamAccounting.mock.calls.map((call) => call[0])).toEqual([
+      { workspaceId: "ws-auto-routing", costUsd: 0.0042, streamOriginKind: "user" },
+    ]);
+
+    // Nothing is left over for the next unrelated turn.
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    const accounting = session as unknown as {
+      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
+    };
+    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
+      hardCost,
+      10
+    );
+  });
+
   it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
     const { session, recordStreamAccounting } = await createHarness({
@@ -1540,7 +1624,41 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     const resumeOptions = streamMessage.mock.calls[1]?.[0];
     expect(resumeOptions?.modelString).toBe("anthropic:claude-3-5-haiku-latest");
     expect(resumeOptions?.thinkingLevel).toBe("high");
-    // The record names the routed model, which this resume no longer runs on.
+    // The resume still runs at the level Auto set, so its claim (and the escalation state
+    // and badge that hang off it) survives as a thinking-only routing on the picked model.
+    expect(resumeOptions?.autoModelRouting).toEqual({
+      status: "routed",
+      tierId: "hard",
+      tierLabel: "Hard",
+      confidence: 0.9,
+      probabilities: { easy: 0.05, hard: 0.9, extreme: 0.05 },
+      model: "anthropic:claude-3-5-haiku-latest",
+      requestedFallbackModel: "anthropic:claude-3-5-haiku-latest",
+      thinkingLevel: "high",
+    });
+  });
+
+  it("a resume that leaves thinking Auto too drops the record with the picked model", async () => {
+    const { session, streamMessage } = await createHarness({ experimentEnabled: true });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+    await session.waitForIdle();
+
+    await session.resumeStream({
+      model: "anthropic:claude-3-5-haiku-latest",
+      agentId: "exec",
+      thinkingLevel: "high",
+    });
+    await session.waitForIdle();
+
+    const resumeOptions = streamMessage.mock.calls[1]?.[0];
+    expect(resumeOptions?.modelString).toBe("anthropic:claude-3-5-haiku-latest");
+    // Both dimensions are the user's now, whatever the picks happen to match.
     expect(resumeOptions?.autoModelRouting).toBeUndefined();
   });
 
