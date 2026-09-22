@@ -33,8 +33,13 @@ void mock.module("@/browser/contexts/API", () => ({
 }));
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   useModelsFromSettings: () => ({
-    models: ["anthropic:claude-haiku-4-5", "openai:gpt-5", "xai:grok-code-fast-1"],
-    hiddenModelsForSelector: [],
+    models: [
+      "anthropic:claude-haiku-4-5",
+      "openai:gpt-5",
+      "xai:grok-code-fast-1",
+      "openrouter:openai/gpt-5",
+    ],
+    hiddenModelsForSelector: ["google:gemini-2.5-flash", "xai:grok-4-1-fast"],
   }),
 }));
 void mock.module("@/browser/hooks/useRouting", () => ({
@@ -46,11 +51,13 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
     emptyLabel?: string;
     onChange: (value: string) => void;
     models: string[];
+    hiddenModels?: string[];
   }) => (
     <select
       aria-label="Model"
       value={props.value}
       onChange={(event) => props.onChange(event.currentTarget.value)}
+      data-hidden-models={(props.hiddenModels ?? []).join(",")}
     >
       <option value="">{props.emptyLabel ?? ""}</option>
       {props.models.map((model) => (
@@ -64,8 +71,11 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
 
 import { EvaluationModelCard } from "./EvaluationModelCard";
 
-function renderCard(persistedModel?: string) {
-  const updateEvaluationDefaults = mock(() => Promise.resolve(undefined));
+function renderCard(
+  persistedModel?: string,
+  update: () => Promise<undefined> = () => Promise.resolve(undefined)
+) {
+  const updateEvaluationDefaults = mock(update);
   apiMock = {
     config: {
       getConfig: mock(() =>
@@ -99,16 +109,31 @@ describe("EvaluationModelCard", () => {
     const { view, select, updateEvaluationDefaults } = renderCard();
     await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
 
+    // Unsupported providers and explicit gateway selections are dropped from both
+    // the primary list and the "Show all models…" list.
     const options = Array.from(select().options).map((option) => option.value);
     expect(options).toEqual(["", "anthropic:claude-haiku-4-5", "openai:gpt-5"]);
+    expect(select().dataset.hiddenModels).toBe("google:gemini-2.5-flash");
     expect(view.queryByRole("button", { name: "Clear evaluation model" })).toBeNull();
 
     fireEvent.change(select(), { target: { value: "openai:gpt-5" } });
 
     expect(updateEvaluationDefaults).toHaveBeenCalledWith({ model: "openai:gpt-5" });
-    expect(select().value).toBe("openai:gpt-5");
+    await waitFor(() => expect(select().value).toBe("openai:gpt-5"));
     expect(view.getByRole("button", { name: "Clear evaluation model" })).toBeTruthy();
     expect(view.queryByRole("note")).toBeNull();
+  });
+
+  test("keeps showing the stored model when the write is rejected", async () => {
+    const { view, select } = renderCard("anthropic:claude-haiku-4-5", () =>
+      Promise.reject(new Error("disk full"))
+    );
+    await waitFor(() => expect(select().value).toBe("anthropic:claude-haiku-4-5"));
+
+    fireEvent.change(select(), { target: { value: "openai:gpt-5" } });
+
+    await waitFor(() => expect(view.getByText("disk full")).toBeTruthy());
+    expect(select().value).toBe("anthropic:claude-haiku-4-5");
   });
 
   test("loads the persisted default and clears it with null", async () => {
@@ -118,8 +143,18 @@ describe("EvaluationModelCard", () => {
     fireEvent.click(view.getByRole("button", { name: "Clear evaluation model" }));
 
     expect(updateEvaluationDefaults).toHaveBeenCalledWith({ model: null });
-    expect(select().value).toBe("");
+    await waitFor(() => expect(select().value).toBe(""));
     expect(view.queryByRole("button", { name: "Clear evaluation model" })).toBeNull();
+  });
+
+  test("flags an explicit gateway selection even when the canonical route is direct", async () => {
+    // resolveRoute canonicalizes `openrouter:openai/gpt-5` to a direct OpenAI route
+    // (mocked as "direct" here), but the backend rejects the raw gateway prefix.
+    const { view } = renderCard("openrouter:openai/gpt-5");
+
+    await waitFor(() =>
+      expect(view.getByRole("note").textContent).toContain("Gateway-scoped model strings")
+    );
   });
 
   test("flags a selection that would leave the direct route", async () => {

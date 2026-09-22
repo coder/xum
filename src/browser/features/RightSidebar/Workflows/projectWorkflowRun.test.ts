@@ -592,10 +592,26 @@ describe("projectWorkflowRun — non-task step events", () => {
         evaluation: { ...admission, attempt: 1 },
       },
       { stepId: "agent", inputHash: "h3", status: "started", startedAt: at(3), taskId: "task_1" },
+      // Same step id as the replayed record but a different input: a fresh attempt,
+      // not a replay, so the cached event for "h1" must not label it.
+      {
+        stepId: "replayed",
+        inputHash: "h4",
+        status: "started",
+        startedAt: at(4),
+        evaluation: { ...admission, attempt: 1 },
+      },
     ];
     const view = projectWorkflowRun(makeRun({ events, steps }));
 
-    expect(view.steps.find((step) => step.stepId === "replayed")?.evaluation).toEqual({
+    const replayedRecords = view.steps.filter((step) => step.stepId === "replayed");
+    expect(replayedRecords.map((step) => step.startedAt)).toEqual([at(0), at(4)]);
+    expect(replayedRecords[1]?.evaluation).toEqual({
+      modelString: "openai:gpt-5",
+      attempt: 1,
+      cached: false,
+    });
+    expect(replayedRecords[0]?.evaluation).toEqual({
       modelString: "openai:gpt-5",
       attempt: 2,
       responseModelId: "gpt-5-2026-01",

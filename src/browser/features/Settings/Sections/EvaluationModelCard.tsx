@@ -6,6 +6,19 @@ import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isEvaluationEligibleModelString } from "@/common/utils/ai/evaluationModels";
+import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
+
+/**
+ * Mirrors the backend resolver's two static gates: an eligible origin provider
+ * and no explicit gateway prefix (`openrouter:openai/gpt-5` is a deliberate
+ * gateway selection the resolver rejects before canonicalizing it).
+ */
+function canEvaluate(modelString: string): boolean {
+  return (
+    isEvaluationEligibleModelString(modelString) &&
+    getExplicitGatewayPrefix(modelString) === undefined
+  );
+}
 
 /**
  * Settings card for `evaluationDefaults.model`, the model workflow `evaluate()`
@@ -42,27 +55,36 @@ export function EvaluationModelCard() {
       });
   }, [api]);
 
-  const persist = (next: string) => {
+  // Persist first, publish second: the displayed default must never be ahead of
+  // the config a workflow started right now would read, and a rejected write
+  // keeps showing the value that is actually stored.
+  const persist = async (next: string) => {
     const trimmed = next.trim();
-    setModel(trimmed);
     setSaveError(null);
-    void api?.config
-      .updateEvaluationDefaults({ model: trimmed.length > 0 ? trimmed : null })
-      .catch((error: unknown) => setSaveError(getErrorMessage(error)));
+    try {
+      await api?.config.updateEvaluationDefaults({ model: trimmed.length > 0 ? trimmed : null });
+      setModel(trimmed);
+    } catch (error: unknown) {
+      setSaveError(getErrorMessage(error));
+    }
   };
 
-  // Only direct-provider models can evaluate; the selector never offers others,
-  // but a value written by an older build or by hand may still be ineligible.
-  const eligibleModels = models.filter(isEvaluationEligibleModelString);
+  // Only direct-provider models can evaluate; the selector never offers others
+  // (including through "Show all models…"), but a value written by an older
+  // build or by hand may still be ineligible.
+  const eligibleModels = models.filter(canEvaluate);
+  const eligibleHiddenModels = hiddenModelsForSelector.filter(canEvaluate);
   const route = model.length > 0 ? routing.resolveRoute(model) : null;
   const hint =
     model.length === 0
       ? null
       : !isEvaluationEligibleModelString(model)
         ? "This provider is not supported for evaluation; choose an OpenAI, Anthropic or Google model."
-        : route !== null && route.route !== "direct"
-          ? `Would route via ${route.displayName} — unsupported for evaluation. Configure the provider's own API key or pin this model to Direct in Routing.`
-          : null;
+        : getExplicitGatewayPrefix(model) !== undefined
+          ? "Gateway-scoped model strings are unsupported for evaluation; choose the provider's own model with its direct API key."
+          : route !== null && route.route !== "direct"
+            ? `Would route via ${route.displayName} — unsupported for evaluation. Configure the provider's own API key or pin this model to Direct in Routing.`
+            : null;
 
   return (
     <div
@@ -80,9 +102,9 @@ export function EvaluationModelCard() {
         <ModelSelector
           value={model}
           emptyLabel="Not set"
-          onChange={persist}
+          onChange={(value) => void persist(value)}
           models={eligibleModels}
-          hiddenModels={hiddenModelsForSelector}
+          hiddenModels={eligibleHiddenModels}
           variant="box"
           className="bg-modal-bg"
         />
@@ -93,7 +115,7 @@ export function EvaluationModelCard() {
             size="sm"
             className="h-9 px-2"
             aria-label="Clear evaluation model"
-            onClick={() => persist("")}
+            onClick={() => void persist("")}
           >
             Clear
           </Button>

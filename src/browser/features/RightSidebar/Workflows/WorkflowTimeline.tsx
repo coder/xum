@@ -217,9 +217,12 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
   const hasStandaloneStepMetadata = hasStepMetadata && !hasNestedWorkflow;
   const hasStepDetailContent =
     step.status === "failed" || hasStandaloneStepResult || hasStandaloneStepMetadata;
+  // Evaluation rows are expandable in every status: the admitted model and
+  // attempt are known from the moment the step starts, not only on completion.
   const expandable =
     step.status === "failed" ||
     hasNestedWorkflow ||
+    evaluation != null ||
     (step.status === "completed" && hasStepDetailContent);
   // Surface failures by default (including live failures that arrive after the row mounted while
   // running); active nested workflows also start open so their child progress is visible.
@@ -370,48 +373,48 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                       />
                     </div>
                   )}
-                  {hasStepMetadata && (
-                    <div className="border-border text-muted mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px] tabular-nums">
-                      {step.durationMs != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Clock className="h-3 w-3" /> {formatWorkflowDuration(step.durationMs)}
-                        </span>
-                      )}
-                      {step.usage?.tokens != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Zap className="h-3 w-3" /> {formatWorkflowTokens(step.usage.tokens)} tok
-                        </span>
-                      )}
-                      {step.usage?.costUsd != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Coins className="h-3 w-3" /> {formatWorkflowCost(step.usage.costUsd)}
-                        </span>
-                      )}
-                      {step.taskId != null && <span className="font-mono">task {step.taskId}</span>}
-                      {evaluation != null && (
-                        <>
-                          {/* Untrusted display text (model ids); React escaping is the only rendering path. */}
-                          <span className="min-w-0 truncate font-mono">
-                            {evaluation.modelString}
-                          </span>
-                          {evaluation.responseModelId != null &&
-                            evaluation.responseModelId !== evaluation.modelString && (
-                              <span className="min-w-0 truncate font-mono">
-                                ↳ {evaluation.responseModelId}
-                              </span>
-                            )}
-                          {evaluation.attempt > 1 && <span>attempt {evaluation.attempt}</span>}
-                          {evaluation.usage?.totalTokens != null && (
-                            <span className="inline-flex items-center gap-1">
-                              <Zap className="h-3 w-3" />{" "}
-                              {formatWorkflowTokens(evaluation.usage.totalTokens)} tok
-                            </span>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
                 </>
+              )}
+              {/* Shared by every status: a failed or still-running evaluation exposes its
+                  admitted model/attempt here, next to the error or the running marker. */}
+              {hasStepMetadata && (
+                <div className="border-border text-muted mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px] tabular-nums">
+                  {step.durationMs != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Clock className="h-3 w-3" /> {formatWorkflowDuration(step.durationMs)}
+                    </span>
+                  )}
+                  {step.usage?.tokens != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Zap className="h-3 w-3" /> {formatWorkflowTokens(step.usage.tokens)} tok
+                    </span>
+                  )}
+                  {step.usage?.costUsd != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Coins className="h-3 w-3" /> {formatWorkflowCost(step.usage.costUsd)}
+                    </span>
+                  )}
+                  {step.taskId != null && <span className="font-mono">task {step.taskId}</span>}
+                  {evaluation != null && (
+                    <>
+                      {/* Untrusted display text (model ids); React escaping is the only rendering path. */}
+                      <span className="min-w-0 truncate font-mono">{evaluation.modelString}</span>
+                      {evaluation.responseModelId != null &&
+                        evaluation.responseModelId !== evaluation.modelString && (
+                          <span className="min-w-0 truncate font-mono">
+                            ↳ {evaluation.responseModelId}
+                          </span>
+                        )}
+                      {evaluation.attempt > 1 && <span>attempt {evaluation.attempt}</span>}
+                      {evaluation.usage?.totalTokens != null && (
+                        <span className="inline-flex items-center gap-1">
+                          <Zap className="h-3 w-3" />{" "}
+                          {formatWorkflowTokens(evaluation.usage.totalTokens)} tok
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
               )}
               {nestedWorkflowPanel}
             </div>

@@ -531,7 +531,10 @@ export function projectWorkflowRun(
   // the ungrouped bucket even when a phase was active.
   const stepFirstEventSeq = new Map<string, number>();
   const stepTitle = new Map<string, string>();
-  const cachedEvaluationStepIds = new Set<string>();
+  // Keyed by (stepId, inputHash) like the run store's step records: the same
+  // step id may be evaluated with different inputs, and only the replayed
+  // input's record is "cached".
+  const cachedEvaluationStepKeys = new Set<string>();
   const stepTaskEventIds = new Map<string, Set<string>>();
   const nestedWorkflowAttempts = getWorkflowChildAttempts(events);
   for (const event of events) {
@@ -551,7 +554,7 @@ export function projectWorkflowRun(
       }
     }
     if (event.type === "evaluation" && event.status === "cached") {
-      cachedEvaluationStepIds.add(stepId);
+      cachedEvaluationStepKeys.add(`${event.stepId}\0${event.inputHash}`);
     }
     if (!stepTitle.has(stepId)) {
       if (
@@ -611,7 +614,10 @@ export function projectWorkflowRun(
       result: step.result,
       error: step.error,
       usage,
-      evaluation: projectStepEvaluation(step, cachedEvaluationStepIds.has(step.stepId)),
+      evaluation: projectStepEvaluation(
+        step,
+        cachedEvaluationStepKeys.has(`${step.stepId}\0${step.inputHash}`)
+      ),
       nestedWorkflowRunId: nestedWorkflowEvent?.runId,
       nestedWorkflowName: nestedWorkflowEvent?.name,
       nestedWorkflowStatus: nestedWorkflowEvent?.status,

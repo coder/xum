@@ -455,18 +455,22 @@ export const EvaluationSteps: AppStory = {
     await expect(canvas.getByText("evaluation · cached")).toBeVisible();
     await expect(canvas.getByText("Rate severity")).toBeVisible();
     await expect(canvas.getByText("Detect credential requests")).toBeVisible();
-    // The failed attempt opens by default with its template-only error.
+    // The failed attempt opens by default with its template-only error and, like
+    // every admitted evaluation, its selected model.
     await expect(
       canvas.getByText(/evaluation failed: provider-failure\/api-call status 429/)
     ).toBeVisible();
+    await expect(canvas.getAllByText("anthropic:claude-haiku-4-5")).toHaveLength(1);
     // Evaluate steps never spawn a workspace.
     await expect(
       canvas.queryByRole("button", { name: /^Open workspace for workflow step/ })
     ).not.toBeInTheDocument();
-    // The completed step's metadata line exposes the selected model and usage.
+    // The completed step's metadata line adds the provider-reported model id; the
+    // running step is expandable before completion and shows its admitted model.
     await userEvent.click(canvas.getByRole("button", { name: /Screen issue text/ }));
-    await expect(canvas.getByText("anthropic:claude-haiku-4-5")).toBeVisible();
     await expect(canvas.getByText("↳ claude-haiku-4-5-20251001")).toBeVisible();
+    await userEvent.click(canvas.getByRole("button", { name: /Detect credential requests/ }));
+    await expect(canvas.getAllByText("anthropic:claude-haiku-4-5")).toHaveLength(3);
   },
 };
 
