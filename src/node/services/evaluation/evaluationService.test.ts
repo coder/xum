@@ -154,6 +154,28 @@ describe("EvaluationService.evaluate", () => {
     }
   });
 
+  it("reports malformed token counts as unknown instead of failing or forwarding them", async () => {
+    const { model } = mockModel(() =>
+      Promise.resolve({
+        answers: VALID_ANSWERS,
+        usage: { inputTokens: -5, outputTokens: 2.5 },
+        providerMetadata: {
+          openai: { reasoningTokens: -1, responseId: "x" },
+          anthropic: { cacheCreationInputTokens: 1.5 },
+          xai: { costInUsdTicks: 7 },
+        },
+        warnings: [],
+      })
+    );
+    const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
+    // The answers are still valid, so the call succeeds; bookkeeping is unknown.
+    expect(result.answers).toEqual(VALID_ANSWERS);
+    expect(result.usage).toEqual({ inputTokens: null, outputTokens: null, totalTokens: null });
+    // Negative/fractional counts are dropped; the well-formed allowlisted key survives.
+    expect(result.usageProviderMetadata).toEqual({ xai: { costInUsdTicks: 7 } });
+    expect(JSON.stringify(result)).not.toContain("NaN");
+  });
+
   it("maps missing usage to nulls and absent provider metadata to null", async () => {
     const { model } = mockModel(() => Promise.resolve({ answers: VALID_ANSWERS, warnings: [] }));
     const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));

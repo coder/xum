@@ -120,12 +120,29 @@ function projectUsageProviderMetadata(
     }
     for (const key of keys) {
       const value: unknown = (namespaceValue as Record<string, unknown>)[key];
-      if ((typeof value === "number" && Number.isFinite(value)) || typeof value === "boolean") {
+      // Token counts must be whole and non-negative; `createDisplayUsage` does
+      // not re-check them, so a malformed provider/proxy value is dropped here
+      // rather than becoming a negative cache/reasoning count downstream.
+      if (isTokenCount(value) || typeof value === "boolean") {
         (projected[namespace] ??= {})[key] = value;
       }
     }
   }
   return Object.keys(projected).length > 0 ? projected : null;
+}
+
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Usage is accounting metadata, not an answer: a malformed count (negative,
+ * fractional, NaN) must not fail an otherwise valid, already-billed
+ * evaluation. It is reported as unknown (`null`) instead, which the ledger
+ * shows as unknown cost rather than $0 — the same contract as an absent count.
+ */
+function projectTokenCount(value: number | undefined): number | null {
+  return isTokenCount(value) ? value : null;
 }
 
 /**
@@ -229,9 +246,9 @@ export function makeEvaluationService(): EvaluationService {
           answers: validated.answers,
           rounding,
           usage: {
-            inputTokens: result.usage.inputTokens ?? null,
-            outputTokens: result.usage.outputTokens ?? null,
-            totalTokens: result.usage.totalTokens ?? null,
+            inputTokens: projectTokenCount(result.usage.inputTokens),
+            outputTokens: projectTokenCount(result.usage.outputTokens),
+            totalTokens: projectTokenCount(result.usage.totalTokens),
           },
           usageProviderMetadata: projectUsageProviderMetadata(result.providerMetadata),
           responseModelId: result.response.modelId,
