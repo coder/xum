@@ -274,9 +274,14 @@ function expectNoSentinels(text: string | undefined, allowed: string[] = []) {
 /** Seed a completed evaluate step as an older run would have left it. */
 async function seedCompletedStep(
   store: WorkflowRunStore,
-  input: { result: EvaluationStepResult; admission?: EvaluationAdmission }
+  input: { result: EvaluationStepResult; admission?: EvaluationAdmission; model?: string }
 ) {
-  const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+  const spec = {
+    id: STEP_ID,
+    title: SENTINEL_TITLE,
+    questions: QUESTIONS,
+    ...(input.model !== undefined ? { model: input.model } : {}),
+  };
   const inputHash = hashEvaluationStepInput(spec, STATE);
   await store.recordStepStarted(RUN_ID, {
     stepId: STEP_ID,
@@ -1244,6 +1249,185 @@ describe("WorkflowRunner evaluate()", () => {
       appendSpy.mockRestore();
       warn.mockRestore();
     }
+  });
+
+  test("an explicit per-call model refuses an admission that pinned another model", async () => {
+    // Same key, matching state/questions/provider-option receipts, but the record's
+    // admission pinned model B while the spec explicitly asks for model A. A
+    // completed record must not replay B's answers; a resumable record must not
+    // resume (and bill) B. A spec without an explicit model keeps trusting the
+    // pinned selection (covered by the checkpoint-retry test above).
+    const foreign = admissionFor({ attempt: 1, modelString: "openai:other-model" });
+    {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      await seedCompletedStep(store, {
+        result: {
+          ...storedResult,
+          model: { ...storedResult.model, modelString: "openai:other-model" },
+        },
+        admission: foreign,
+        model: SENTINEL_MODEL,
+      });
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+      const fake = createFakeAdapter();
+
+      await expect(
+        createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+      ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
+
+      expect(fake.resolveCalls).toHaveLength(0);
+      expect(fake.dispatchCalls).toHaveLength(0);
+      expect((await readStep(store))?.status).toBe("completed");
+    }
+    {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      await store.recordStepStarted(RUN_ID, {
+        stepId: STEP_ID,
+        inputHash: hashEvaluationStepInput(
+          { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS, model: SENTINEL_MODEL },
+          STATE
+        ),
+        startedAt: "2026-05-29T00:00:00.500Z",
+        evaluation: foreign,
+      });
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+      const fake = createFakeAdapter();
+
+      await expect(
+        createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+      ).rejects.toThrow(
+        `evaluation failed: admission-missing/admission-missing (step ${STEP_DIGEST}, attempt 1)`
+      );
+
+      expect(fake.resolveCalls).toHaveLength(0);
+      expect(fake.dispatchCalls).toHaveLength(0);
+      expect((await readStep(store))?.evaluation).toBeUndefined();
+    }
+  });
+
+  test("a cached result produced by a model other than the admitted one fails closed", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path);
+    await seedCompletedStep(store, {
+      // Valid answers and a matching state receipt, but the body claims another model.
+      result: {
+        ...storedResult,
+        model: { ...storedResult.model, modelString: "openai:other-model" },
+      },
+      admission: admissionFor({ attempt: 1 }),
+    });
+    await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    const fake = createFakeAdapter();
+
+    await expect(
+      createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+    ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
+
+    expect(fake.dispatchCalls).toHaveLength(0);
+    expect((await readStep(store))?.status).toBe("completed");
+    expect(evaluationEvents(await store.getRun(RUN_ID))).toHaveLength(0);
+  });
+
+  test("a rejected failed-event append keeps the typed failure and the run retryable", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const originalAppend = store.appendNextEvent.bind(store);
+    const appendSpy = spyOn(store, "appendNextEvent").mockImplementation(
+      async (runId, event, options) => {
+        if (event.type === "evaluation" && event.status === "failed") {
+          throw new Error("disk full");
+        }
+        return await originalAppend(runId, event, options);
+      }
+    );
+    try {
+      const fake = createFakeAdapter({
+        outcome: () => ({
+          status: "failed",
+          reason: "provider-failure",
+          code: "api-call",
+          statusCode: 503,
+          defect: false,
+        }),
+      });
+
+      await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(
+        `evaluation failed: provider-failure/api-call status 503 (step ${STEP_DIGEST}, attempt 1)`
+      );
+
+      const run = await store.getRun(RUN_ID);
+      expect(run.status).toBe("failed");
+      // The durable failed record still carries its admission and the run's latest
+      // error is the typed failure, so a checkpoint retry is offered.
+      expect(await readStep(store)).toMatchObject({
+        status: "failed",
+        evaluation: { attempt: 1, selection: { modelString: SENTINEL_MODEL } },
+      });
+      expect(errorMessages(run).at(-1)).toContain("evaluation failed: provider-failure/api-call");
+      expect(canRetryWorkflowFromCheckpoint(run)).toBe(true);
+    } finally {
+      appendSpy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  test("Stop during a stalled model resolution interrupts the run instead of hanging", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+    const controller = new AbortController();
+    const fake = createFakeAdapter();
+    const resolverEntered = Promise.withResolvers<void>();
+    const stalled: WorkflowEvaluationPort = {
+      ...fake.adapter,
+      resolveSelection() {
+        resolverEntered.resolve();
+        return new Promise<never>(() => undefined);
+      },
+    };
+    const run = createRunner(store, stalled).run(RUN_ID, { abortSignal: controller.signal });
+    await resolverEntered.promise;
+    controller.abort();
+
+    await expect(run).rejects.toThrow();
+
+    // Pre-admission stall: nothing was admitted or dispatched, so no record exists.
+    expect(await readStep(store)).toBeUndefined();
+    expect(fake.dispatchCalls).toHaveLength(0);
+    expect((await store.getRun(RUN_ID)).status).toBe("running");
+  });
+
+  test("a stalled model resolution settles on the attempt deadline", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path, {
+      spec: { model: SENTINEL_MODEL, timeoutMs: EVALUATION_MIN_TIMEOUT_MS },
+    });
+    const clock = createClock();
+    const fake = createFakeAdapter();
+    const stalled: WorkflowEvaluationPort = {
+      ...fake.adapter,
+      resolveSelection: () => new Promise<never>(() => undefined),
+    };
+    // Preparation (the record lookup) consumed all but 50 ms of the attempt
+    // budget before the resolver stalled; the step must give up when that
+    // remainder elapses instead of waiting on the resolver.
+    const originalGetStep = store.getStep.bind(store);
+    const getStepSpy = spyOn(store, "getStep").mockImplementation(async (...args) => {
+      clock.advance(EVALUATION_MIN_TIMEOUT_MS - 50);
+      return await originalGetStep(...args);
+    });
+    try {
+      await expect(createRunner(store, stalled, { clock }).run(RUN_ID)).rejects.toThrow(
+        `evaluation failed: deadline/deadline (step ${STEP_DIGEST}, attempt 1)`
+      );
+    } finally {
+      getStepSpy.mockRestore();
+    }
+
+    expect(fake.dispatchCalls).toHaveLength(0);
+    expect(await readStep(store)).toBeUndefined();
   });
 
   test("evaluate() inside parallel() is rejected before any host work", async () => {

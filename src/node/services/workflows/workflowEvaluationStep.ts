@@ -106,6 +106,7 @@ export const WORKFLOW_EVALUATION_INTERRUPTED_MESSAGE = "Task interrupted";
 export const EVALUATION_POST_COMMIT_EVENT_FAILED_CODE = "evaluation-post-commit-event-failed";
 export const EVALUATION_POST_COMMIT_USAGE_FAILED_CODE = "evaluation-post-commit-usage-failed";
 export const EVALUATION_CACHED_EVENT_FAILED_CODE = "evaluation-cached-event-failed";
+export const EVALUATION_FAILED_EVENT_FAILED_CODE = "evaluation-failed-event-failed";
 
 export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);
@@ -202,6 +203,7 @@ export async function runWorkflowEvaluationStep(
       questionsSha256,
       questionCount,
       providerOptions: spec.providerOptions,
+      model: spec.model,
     });
     if (existing.status === "completed") {
       if (admission === undefined) {
@@ -263,6 +265,7 @@ export async function runWorkflowEvaluationStep(
     persisted: persisted?.selection,
     stepDigest,
     attempt,
+    attemptDeadlineAt,
   });
   if (!selection.ok) {
     const error = new WorkflowEvaluationStepError(
@@ -362,6 +365,7 @@ export async function runWorkflowEvaluationStep(
     persisted: admission.selection,
     stepDigest,
     attempt,
+    attemptDeadlineAt,
   });
   if (!rechecked.ok) {
     return await failPostAdmission(rechecked.reason, rechecked.code);
@@ -487,6 +491,11 @@ export const EVALUATION_RESOLVER_THREW_CODE = "evaluation-resolver-threw";
  * exception as the run error and neither resume nor checkpoint retry can
  * match it. The failure identity is fixed (`provider-failure/unknown`); only
  * the error name reaches the log (text discipline).
+ *
+ * Resolution is bounded like dispatch: a resolver that stalls settles on Stop
+ * (thrown as an interruption) or on the attempt deadline (a `deadline`
+ * failure) instead of suspending the host call until the runtime's own limit.
+ * The stalled promise is abandoned; it performs no network I/O.
  */
 async function resolveSelectionOrFailure(
   context: WorkflowEvaluationStepContext,
@@ -496,37 +505,70 @@ async function resolveSelectionOrFailure(
     persisted: EvaluationAdmission["selection"] | undefined;
     stepDigest: string;
     attempt: number;
+    attemptDeadlineAt: number;
   }
 ): Promise<EvaluationSelection> {
-  try {
-    return await adapter.resolveSelection({ model: input.spec.model }, input.persisted);
-  } catch (error) {
+  const remainingMs = Math.max(0, input.attemptDeadlineAt - context.clock.nowMs());
+  const bound = AbortSignal.any([context.abortSignal, AbortSignal.timeout(remainingMs)]);
+  const settled = await new Promise<
+    | { kind: "resolved"; selection: EvaluationSelection }
+    | { kind: "threw"; error: unknown }
+    | { kind: "bounded" }
+  >((resolve) => {
+    if (bound.aborted) {
+      resolve({ kind: "bounded" });
+      return;
+    }
+    const onAbort = () => resolve({ kind: "bounded" });
+    bound.addEventListener("abort", onAbort, { once: true });
+    adapter.resolveSelection({ model: input.spec.model }, input.persisted).then(
+      (selection) => {
+        bound.removeEventListener("abort", onAbort);
+        resolve({ kind: "resolved", selection });
+      },
+      (error: unknown) => {
+        bound.removeEventListener("abort", onAbort);
+        resolve({ kind: "threw", error });
+      }
+    );
+  });
+  if (settled.kind === "bounded") {
+    if (context.abortSignal.aborted) {
+      throw interrupted();
+    }
+    return { ok: false, reason: "deadline", code: "deadline" };
+  }
+  if (settled.kind === "threw") {
     log.warn("Workflow evaluation model resolution threw", {
       code: EVALUATION_RESOLVER_THREW_CODE,
       runId: context.runId,
       stepDigest: input.stepDigest,
       attempt: input.attempt,
-      errorName: error instanceof Error ? error.name : typeof error,
+      errorName: settled.error instanceof Error ? settled.error.name : typeof settled.error,
     });
     return { ok: false, reason: "provider-failure", code: "unknown" };
   }
+  return settled.selection;
 }
 
 /**
  * The admission of an existing record for this key, when it parses and is
- * bound to the input being evaluated now: state and questions receipts plus
- * the request-shaping provider options it carries. The pinned model selection
- * is deliberately not compared with the spec or Settings — carrying it across
- * attempts is the admission's purpose, and the pre-dispatch recheck validates
- * it against the current endpoint. Anything else is corruption or a record
- * misassociated with this key, and the caller fails closed.
+ * bound to the input being evaluated now: state and questions receipts, the
+ * request-shaping provider options it carries and, when the spec names a model
+ * explicitly, that model (the pinned `modelString` is the requested string, so
+ * an explicit request must never trust an admission that pinned another
+ * model). A selection made from the mutable Settings/CLI default is
+ * deliberately not compared — carrying it across attempts is the admission's
+ * purpose, and the pre-dispatch recheck validates it against the current
+ * endpoint. Anything else is corruption or a record misassociated with this
+ * key, and the caller fails closed.
  */
 function parseTrustedAdmission(
   record: WorkflowStepRecord,
   expected: Pick<
     EvaluationAdmission,
     "stateSha256" | "stateBytes" | "questionsSha256" | "questionCount" | "providerOptions"
-  >
+  > & { model: string | undefined }
 ): EvaluationAdmission | undefined {
   const parsed = EvaluationAdmissionSchema.safeParse(record.evaluation);
   if (!parsed.success) {
@@ -539,7 +581,8 @@ function parseTrustedAdmission(
     admission.questionsSha256 === expected.questionsSha256 &&
     admission.questionCount === expected.questionCount &&
     canonicalEvaluationJson(admission.providerOptions ?? null) ===
-      canonicalEvaluationJson(expected.providerOptions ?? null);
+      canonicalEvaluationJson(expected.providerOptions ?? null) &&
+    (expected.model === undefined || admission.selection.modelString === expected.model);
   return bound ? admission : undefined;
 }
 
@@ -547,9 +590,10 @@ function parseTrustedAdmission(
  * A completed record is immutable for its `(stepId, inputHash)`: a valid stored
  * result is returned verbatim and never re-dispatched; a malformed one fails
  * the run without touching the record. "Valid" includes the result's own state
- * receipt matching the input being evaluated now (the admission was already
- * bound by the caller), so a record whose body was corrupted or misassociated
- * while keeping its key cannot return answers produced for a different state.
+ * receipt matching the input being evaluated now and its model matching the
+ * trusted admission (the admission itself was already bound by the caller), so
+ * a record whose body was corrupted or misassociated while keeping its key
+ * cannot return answers produced for a different state or by another model.
  */
 async function replayCompletedStep(
   context: WorkflowEvaluationStepContext,
@@ -574,7 +618,12 @@ async function replayCompletedStep(
     parsed.success &&
     parsed.data.state.sha256 === input.stateReceipt.sha256 &&
     parsed.data.state.bytes === input.stateReceipt.bytes;
-  if (!parsed.success || validated?.ok !== true || !stateReceiptMatches) {
+  // The stored result must come from the model the trusted admission pinned;
+  // otherwise a body misassociated with this key (same state and questions,
+  // another model) would be consumed as if that model had answered.
+  const modelMatches =
+    parsed.success && parsed.data.model.modelString === input.admission.selection.modelString;
+  if (!parsed.success || validated?.ok !== true || !stateReceiptMatches || !modelMatches) {
     throw new Error(`evaluation replay failed: cached result invalid (step ${input.stepDigest})`);
   }
   try {
@@ -625,20 +674,34 @@ async function recordFailure(
     completedAt: context.clock.nowIso(),
     ...(input.admission !== undefined ? { evaluation: input.admission } : {}),
   });
-  await context.journal.appendEvent({
-    type: "evaluation",
-    at: context.clock.nowIso(),
-    stepId: spec.id,
-    inputHash: input.inputHash,
-    attempt: error.attempt,
-    status: "failed",
-    ...(spec.title !== undefined ? { title: spec.title } : {}),
-    ...(input.admission !== undefined
-      ? { modelString: input.admission.selection.modelString }
-      : {}),
-    reason: error.reason,
-    code: error.code,
-    ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
-    ...(input.defect ? { defect: true } : {}),
-  });
+  try {
+    await context.journal.appendEvent({
+      type: "evaluation",
+      at: context.clock.nowIso(),
+      stepId: spec.id,
+      inputHash: input.inputHash,
+      attempt: error.attempt,
+      status: "failed",
+      ...(spec.title !== undefined ? { title: spec.title } : {}),
+      ...(input.admission !== undefined
+        ? { modelString: input.admission.selection.modelString }
+        : {}),
+      reason: error.reason,
+      code: error.code,
+      ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
+      ...(input.defect ? { defect: true } : {}),
+    });
+  } catch (appendError) {
+    // The failed record is durable and its `error` text is what checkpoint
+    // retry matches against the run's latest error; letting this progress
+    // event's rejection replace the typed failure would strand a recoverable
+    // run (same rule as the completed/cached appends).
+    log.warn("Workflow evaluation failed event append failed after the failed record", {
+      code: EVALUATION_FAILED_EVENT_FAILED_CODE,
+      runId: context.runId,
+      stepDigest: error.stepDigest,
+      attempt: error.attempt,
+      errorName: appendError instanceof Error ? appendError.name : typeof appendError,
+    });
+  }
 }
