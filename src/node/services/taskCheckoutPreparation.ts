@@ -290,8 +290,10 @@ function sameCheckoutIdentity(
 
 /**
  * Step 1 of preparation, BEFORE the prune and inside the prune's held checkout locks (its
- * `shouldPrune` callback): capture the physical identity of the fresh dedicated checkout that
- * is about to be sanitized and CLAIM it by writing the nonce (durably) into its git admin dir.
+ * `claimUnderLock` hook — the mutating hook the prune joins before releasing its locks, never the
+ * read-only `shouldPrune` verdict a deadline may leave detached): capture the physical identity of
+ * the fresh dedicated checkout that is about to be sanitized and CLAIM it by writing the nonce
+ * (durably) into its git admin dir.
  * Refuses a checkout that already carries a nonce: a cooperating materializer never blesses or
  * reuses another generation.
  *

@@ -3345,10 +3345,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const proofs: TaskCheckoutPreparation[] = [];
       for (const target of targets) {
-        // Identity claimed (stats + nonce) BEFORE the prune inside `shouldPrune`, under the held
-        // checkout locks; bound AFTER it inside `afterPruneUnderLock` (same locks) only if the
-        // directory is still that identity and still carries the claim: what the proof binds is
-        // exactly the directory that was claimed and pruned (see claimTaskCheckoutIdentity).
+        // Identity claimed (stats + nonce) BEFORE the prune inside `claimUnderLock` — the
+        // MUTATING hook the prune joins before its locks release, not the read-only verdict a
+        // deadline may leave detached — under the held checkout locks; bound AFTER it inside
+        // `afterPruneUnderLock` (same locks, read-only) only if the directory is still that
+        // identity and still carries the claim: what the proof binds is exactly the directory
+        // that was claimed and pruned (see claimTaskCheckoutIdentity).
         let claimed: CapturedTaskCheckoutIdentity | undefined;
         let bound: BoundTaskCheckoutIdentity | Error | undefined;
         const claim = async () => {
@@ -3380,9 +3382,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                     );
                   }
                   if (siblings !== "none") throw new Error(siblings.error);
-                  await claim();
                   return true;
                 },
+                claimUnderLock: claim,
                 afterPruneUnderLock: bind,
               }
             );
