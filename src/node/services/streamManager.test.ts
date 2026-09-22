@@ -49,6 +49,7 @@ import * as aiSdk from "ai";
 import {
   APICallError,
   RetryError,
+  StreamProviderError,
   tool,
   type LanguageModel,
   type ModelMessage,
@@ -63,6 +64,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { closeScopeBounded } from "./di/appRuntime";
 import { Effect, Scope } from "effect";
+import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import * as tokenizer from "@/node/utils/main/tokenizer";
@@ -6720,6 +6722,14 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
         data: { error: { type: "invalid_request_error", code: "invalid_encrypted_content" } },
       }),
     },
+    {
+      name: "streamed rs_ item not found",
+      error: new StreamProviderError({
+        message: "Item with id 'rs_stream' not found.",
+        statusCode: 500,
+        data: { type: "error", code: null },
+      }),
+    },
   ];
 
   const openAIResponsesModel = createTestLanguageModel("gpt-5.2-codex", "openai.responses");
@@ -6876,6 +6886,66 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       const retryCreateStreamResult = await run(retry, [successfulStream]);
       expect(retryCreateStreamResult).toHaveBeenCalledTimes(1);
       expect(errorEvents).toHaveLength(1);
+      expect(streamEndEvents).toHaveLength(1);
+    });
+  }
+
+  for (const { code, maxRetries } of [
+    { code: null, maxRetries: 0 },
+    { code: null, maxRetries: 1 },
+    { code: "invalid_encrypted_content", maxRetries: 0 },
+  ]) {
+    test(`repairs SDK-decoded streamed reasoning rejection (${code ?? "rs_ not found"}, SDK retries ${maxRetries}) only once`, async () => {
+      // The WebSocket adapter returns HTTP 200 and forwards error frames as SSE.
+      // Exercise the real SDK decoder: a null code gets a synthetic 500 status.
+      const event = {
+        type: "error",
+        sequence_number: 0,
+        code,
+        message: code
+          ? "The encrypted content could not be verified."
+          : "Item with id 'rs_stream' not found.",
+        param: null,
+      };
+      const result = aiSdk.streamText({
+        model: createOpenAI({
+          apiKey: "test-key",
+          fetch: Object.assign(
+            () =>
+              Promise.resolve(
+                new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+                  headers: { "content-type": "text/event-stream" },
+                })
+              ),
+            { preconnect: fetch.preconnect.bind(fetch) }
+          ),
+        }).responses("gpt-5.2"),
+        prompt: "continue",
+        maxRetries,
+      });
+      const errors: unknown[] = [];
+      for await (const part of result.fullStream) {
+        if (part.type === "error") errors.push(part.error);
+      }
+      expect(errors).toHaveLength(1);
+      expect(RetryError.isInstance(errors[0])).toBe(maxRetries > 0);
+      const apiError = RetryError.isInstance(errors[0]) ? errors[0].lastError : errors[0];
+      expect(APICallError.isInstance(apiError)).toBe(true);
+      expect(apiError).toMatchObject({ statusCode: code ? 400 : 500 });
+
+      const { errorEvents, streamEndEvents, run } = createRecoveryHarness("replay-streamed");
+      const repaired = await run(replayStreamInfo(failingStream(errors[0])), [successfulStream]);
+      expect(repaired).toHaveBeenCalledTimes(1);
+      expect(errorEvents).toEqual([]);
+      expect(streamEndEvents).toHaveLength(1);
+
+      const repeated = await run(
+        replayStreamInfo(failingStream(errors[0]), { historySequence: 2 }),
+        [() => failingStream(errors[0])]
+      );
+      expect(repeated).toHaveBeenCalledTimes(1);
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0]).toMatchObject({ errorType: "reasoning_rejected" });
       expect(streamEndEvents).toHaveLength(1);
     });
   }
@@ -7109,6 +7179,43 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
         responseBody:
           '{"error":{"message":"The encrypted content for item rs_09beb6f8c1d2e3f4 could not be verified."}}',
         isRetryable: false,
+      }),
+    },
+    {
+      name: "an HTTP 500 with an SSE header but no stream error frame",
+      model: openAIResponsesModel,
+      error: new APICallError({
+        message: "Item with id 'rs_stream' not found.",
+        url: "https://api.openai.com/v1/responses",
+        requestBodyValues: {},
+        statusCode: 500,
+        responseHeaders: { "content-type": "text/event-stream" },
+        data: { error: { message: "Item with id 'rs_stream' not found." } },
+      }),
+    },
+    {
+      name: "an SDK retry sequence whose final error is unrelated",
+      model: openAIResponsesModel,
+      error: new RetryError({
+        message: "AI SDK retry exhausted",
+        reason: "maxRetriesExceeded",
+        errors: [
+          openAIReasoningReplayRejections[0].error,
+          new StreamProviderError({ message: "Internal server error", statusCode: 500 }),
+        ],
+      }),
+    },
+    {
+      name: "an unrelated streamed server error",
+      model: openAIResponsesModel,
+      error: new StreamProviderError({ message: "Internal server error", statusCode: 500 }),
+    },
+    {
+      name: "an xAI streamed reasoning rejection",
+      model: createTestLanguageModel("grok-4", "xai.responses"),
+      error: new StreamProviderError({
+        message: "Item with id 'rs_stream' not found.",
+        statusCode: 500,
       }),
     },
     {

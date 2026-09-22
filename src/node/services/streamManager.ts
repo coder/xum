@@ -27,6 +27,7 @@ import {
   LoadAPIKeyError,
   APICallError,
   RetryError,
+  StreamProviderError,
 } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { ProviderOptions } from "@ai-sdk/provider-utils";
@@ -5364,8 +5365,23 @@ export class StreamManager {
   // blobs and same-turn reasoning references from a flapping route. Keep the
   // match narrow so unrelated provider errors retain their normal retry policy.
   private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
+    // The SDK can exhaust its own retries on a synthetic stream-error 500.
+    // Classify only the final cause; earlier failures must not taint a later one.
+    if (RetryError.isInstance(error)) {
+      error = error.lastError;
+    }
     const statusCode = this.extractStatusCode(error);
-    if (statusCode !== 400 && statusCode !== 404) {
+    // WebSocket/SSE validation errors have no HTTP failure status. The SDK
+    // assigns 500 to code-less frames, including missing reasoning references.
+    const isStreamError =
+      StreamProviderError.isInstance(error) ||
+      (APICallError.isInstance(error) &&
+        error.responseHeaders?.["content-type"]?.startsWith("text/event-stream") &&
+        typeof error.data === "object" &&
+        error.data !== null &&
+        "type" in error.data &&
+        (error.data.type === "error" || error.data.type === "response.failed"));
+    if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
       return false;
     }
     if (!isOpenAIResponsesModel(model)) {
