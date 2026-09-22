@@ -2470,13 +2470,23 @@ describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
     // Astra genuinely rejects "none"; keep the SDK's gating for it.
     ["gpt-6-astra", "none", undefined],
   ] as const;
+  // The SDK gates effort on the raw wire ID, so on Chat Completions an opaque alias
+  // mapped to Sol already keeps "none" (and so its tool calls) without the rewrite.
+  // On Responses the SDK treats opaque aliases as non-reasoning and drops every
+  // effort, a pre-existing alias limitation not specific to "none" or GPT-6.
+  const chatOnlyCases = [["team-model", "none", "none"]] as const;
   for (const wireFormat of ["responses", "chatCompletions"] as const) {
-    it.each(cases)(
+    it.each(wireFormat === "chatCompletions" ? [...cases, ...chatOnlyCases] : cases)(
       `sends %s requested effort %s as %s with tools over ${wireFormat}`,
       async (modelId, requestedEffort, expectedEffort) => {
         await withTempConfig(async (_config, factory, _oauth, store) => {
           store.saveProvidersConfig({
-            openai: { apiKey: "native-key", wireFormat, webSocketTransportEnabled: false },
+            openai: {
+              apiKey: "native-key",
+              wireFormat,
+              webSocketTransportEnabled: false,
+              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-sol" }],
+            },
           });
           const { calls, fakeFetch } = createCapturingFetch();
           const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
