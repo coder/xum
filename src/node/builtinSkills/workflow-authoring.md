@@ -418,14 +418,14 @@ Explicitly **not** guaranteed:
 - Downstream isolation of a general `agent()`: built-in agents keep their tools (Explore keeps `bash` and `web_fetch`), and a prompt saying "do not fetch the issue" is guidance, not enforcement. The example therefore never places issue text in an agent prompt — not even after a `not_detected` screen: triage answers (`kind`, `severity`) come from the same tool-free `evaluate()` call, and the **rejected/uncertain branch** passes only `{ repo, issueNumber, label, reasonCode, stateSha256 }` to the labeling agent. That is a data-flow restriction, not host-enforced tool isolation; there is no host-enforced GitHub label action.
 - Pre-agent screening when ingestion itself used an agent: the example ingests via trusted CLI (`gh issue view --json` → `xum workflow run … --args-stdin`), validates `repo` (`owner/name` pattern) and `issueNumber` (positive integer), and adds no in-sandbox fetch.
 
-The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`. The example sets no per-call `model`, so pass `--evaluation-model` unless `evaluationDefaults.model` is already persisted:
+The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`. The example sets no per-call `model`, so pass `--evaluation-model` unless `evaluationDefaults.model` is already persisted; `--model` sets the model of the labeling `agent()` step (it otherwise inherits the CLI default, which needs its own provider credentials):
 
 ```sh
 REPO="owner/repo"; N=123   # N must be a positive integer
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
   | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
-      --evaluation-model openai:gpt-5-mini
+      --evaluation-model openai:gpt-5-mini --model openai:gpt-5-mini
 ```
 
 ## Structured output schemas
