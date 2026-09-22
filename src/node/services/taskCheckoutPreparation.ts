@@ -9,7 +9,7 @@ import {
   type TaskCheckoutPreparation,
 } from "@/common/schemas/project";
 import type { Workspace } from "@/common/types/project";
-import type { RuntimeConfig } from "@/common/types/runtime";
+import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -149,12 +149,33 @@ function isHostLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   );
 }
 
+/**
+ * Project-dir LocalRuntime: `type: "local"` WITHOUT `srcBaseDir` — exactly runtimeFactory's
+ * dispatch (`hasSrcBaseDir` is string PRESENCE; an empty string still selects the WorktreeRuntime).
+ * A `local` config WITH `srcBaseDir` is a legacy WORKTREE: its rows execute in a directory of their
+ * own and are dedicated like any worktree row. Both the classification and the execution directory
+ * below, and the producers' fork/prepare decisions, must agree with the factory on this, or an
+ * unproven legacy-worktree row anchors on the ordinary root by project directory (bypassing the
+ * legacy refusal) and a producer skips preparing a fresh legacy-worktree fork.
+ */
+export function isProjectDirLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return runtimeConfig?.type === "local" && !hasSrcBaseDir(runtimeConfig);
+}
+
+/** Worktree semantics — a fork gets a directory of its own: `worktree`, or legacy `local` + `srcBaseDir`. */
+export function isWorktreeSemanticsRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return (
+    runtimeConfig?.type === "worktree" ||
+    (runtimeConfig?.type === "local" && hasSrcBaseDir(runtimeConfig))
+  );
+}
+
 export function classifyTaskCheckoutKind(row: Workspace): TaskCheckoutKind {
   if (row.parentWorkspaceId == null) return "root";
   if (!isHostLocalRuntime(row.runtimeConfig)) return "offhost";
   // LocalRuntime forks never get a directory of their own (LocalRuntime.forkWorkspace shares the
   // project directory), so they are shared by construction.
-  if (row.taskIsolation === "none" || row.runtimeConfig?.type === "local") return "shared";
+  if (row.taskIsolation === "none" || isProjectDirLocalRuntime(row.runtimeConfig)) return "shared";
   return "dedicated";
 }
 
@@ -455,7 +476,12 @@ interface ConfigEntry {
  * other runtime runs in the row's path.
  */
 function executionDirectory(entry: ConfigEntry): string {
-  return entry.workspace.runtimeConfig?.type === "local" ? entry.projectPath : entry.workspace.path;
+  // A scratch row's metadata projectPath IS its path (Config resolves it so; the `_scratch`
+  // bucket key is not a directory), so its LocalRuntime runs in the row's own path.
+  if (entry.workspace.kind === "scratch") return entry.workspace.path;
+  return isProjectDirLocalRuntime(entry.workspace.runtimeConfig)
+    ? entry.projectPath
+    : entry.workspace.path;
 }
 
 /** The classification inputs of one row, as signed by an authority. */
