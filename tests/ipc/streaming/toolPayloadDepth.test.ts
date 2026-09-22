@@ -397,6 +397,113 @@ describe("tool payload depth bound (persisted history)", () => {
     }
   );
 
+  // code_execution persists sub-calls under part.nestedCalls with their own payloads;
+  // a deep nested input/output must be bounded like the parent's, everything else kept.
+  test("a deep nested call inside a code_execution partial is bounded on read, promotion and rewrite", async () => {
+    const h = await createTestHistoryService();
+    const workspaceId = "deep-nested-partial";
+    try {
+      const first = await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "before")
+      );
+      if (!first.success) throw new Error(first.error);
+      const placeholder = await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("ce-assistant", "assistant", "")
+      );
+      if (!placeholder.success) throw new Error(placeholder.error);
+      const healthyCall = {
+        toolCallId: "n-healthy",
+        toolName: "bash",
+        input: { script: "true" },
+        output: { ok: true },
+        state: "output-available" as const,
+        timestamp: 2,
+      };
+      const row: MuxMessage = {
+        id: "ce-assistant",
+        role: "assistant",
+        metadata: { timestamp: 1, historySequence: 1 },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "ce-call",
+            toolName: "code_execution",
+            state: "output-available",
+            input: { code: "await xum.bash({ script: 'true' })" },
+            output: { ok: true },
+            timestamp: 1,
+            nestedCalls: [
+              healthyCall,
+              {
+                toolCallId: "n-deep",
+                toolName: "file_read",
+                input: "$NESTED_INPUT$",
+                output: { ok: true },
+                state: "output-available",
+                failed: false,
+                timestamp: 3,
+              },
+            ],
+          },
+        ],
+      };
+      const deep = "[".repeat(6000) + "1" + "]".repeat(6000);
+      const partialPath = path.join(h.config.sessionsDir, workspaceId, "partial.json");
+      await fs.writeFile(
+        partialPath,
+        JSON.stringify({ ...row, workspaceId }).replace('"$NESTED_INPUT$"', deep)
+      );
+
+      const partial = await h.historyService.readPartial(workspaceId);
+      const part = partial?.parts[0];
+      if (part?.type !== "dynamic-tool") throw new Error("Expected the code_execution part");
+      expect(part.input).toEqual({ code: "await xum.bash({ script: 'true' })" });
+      expect(part.nestedCalls?.[0]).toEqual(healthyCall);
+      expect(part.nestedCalls?.[1]).toEqual({
+        toolCallId: "n-deep",
+        toolName: "file_read",
+        input: TOOL_PAYLOAD_DEPTH_REJECTION,
+        output: { ok: true },
+        state: "output-available",
+        failed: false,
+        timestamp: 3,
+      });
+
+      const committed = await h.historyService.commitPartial(workspaceId);
+      expect(committed).toEqual({ success: true, data: undefined });
+      await expect(fs.access(partialPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+      const chat = await fs.readFile(chatPath, "utf8");
+      expect(chat).toContain(TOOL_PAYLOAD_DEPTH_REJECTION);
+      expect(chat).not.toContain("[".repeat(300));
+
+      // Healthy nested calls survive a rewrite byte-for-byte (same-reference rows stay raw).
+      const controlLine = chat.split("\n").find((line) => line.includes('"id":"ce-assistant"'));
+      const summary = createMuxMessage("summary", "assistant", "summary", {
+        timestamp: 1,
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      const persisted = await h.historyService.persistBoundaryWithTailCopies(
+        workspaceId,
+        summary,
+        [],
+        false
+      );
+      expect(persisted).toEqual({ success: true, data: undefined });
+      const archive = await fs.readFile(
+        path.join(h.config.sessionsDir, workspaceId, "chat-archive.jsonl"),
+        "utf8"
+      );
+      expect(archive).toContain(controlLine);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   test("a deep interrupted partial is recovered flattened and promoted", async () => {
     const h = await createTestHistoryService();
     const workspaceId = "deep-partial";

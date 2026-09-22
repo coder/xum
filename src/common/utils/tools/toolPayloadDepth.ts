@@ -69,11 +69,14 @@ export function valueExceedsDepth(value: unknown, limit = MAX_TOOL_PAYLOAD_JSON_
 }
 
 /**
- * Replace over-deep `input`/`output` of dynamic-tool parts on a persisted row
- * with TOOL_PAYLOAD_DEPTH_REJECTION so request building, partial promotion
- * and compaction rewrites (JSON.stringify, structuredClone, SDK clone) stay
- * shallow. Returns the SAME reference when nothing exceeds the bound: history
- * rewrites keep untouched rows byte-for-byte by identity.
+ * Replace over-deep `input`/`output` of dynamic-tool parts — and of their
+ * persisted `nestedCalls[*]` (code_execution sub-calls carry their own
+ * payloads) — with TOOL_PAYLOAD_DEPTH_REJECTION so request building, partial
+ * promotion and compaction rewrites (JSON.stringify, structuredClone, SDK
+ * clone) stay shallow. Only those known payload keys are touched; every other
+ * field (ids, state, timestamps, workflowRun, metadata) is retained. Returns
+ * the SAME reference when nothing exceeds the bound: history rewrites keep
+ * untouched rows byte-for-byte by identity.
  *
  * In-memory only. The on-disk row is untouched until a rewrite targets that
  * row itself; sealed epochs are archived as raw bytes.
@@ -84,16 +87,41 @@ export function boundToolPayloadDepth<Row extends { parts?: unknown }>(row: Row)
   for (let i = 0; i < row.parts.length; i++) {
     const part: unknown = row.parts[i];
     if (!isPlainObject(part) || part.type !== "dynamic-tool") continue;
-    let bounded = part;
-    for (const key of ["input", "output"] as const) {
-      if (key in part && valueExceedsDepth(part[key])) {
-        bounded = { ...bounded, [key]: TOOL_PAYLOAD_DEPTH_REJECTION };
-      }
-    }
+    const bounded = boundNestedCallPayloads(boundPayloadKeys(part));
     if (bounded !== part) {
       parts ??= row.parts.slice();
       parts[i] = bounded;
     }
   }
   return parts === undefined ? row : { ...row, parts };
+}
+
+const TOOL_PAYLOAD_KEYS = ["input", "output"] as const;
+
+/** Same reference unless a known payload key exceeds the bound. */
+function boundPayloadKeys<T extends Record<string, unknown>>(value: T): T {
+  let bounded = value;
+  for (const key of TOOL_PAYLOAD_KEYS) {
+    if (key in value && valueExceedsDepth(value[key])) {
+      bounded = { ...bounded, [key]: TOOL_PAYLOAD_DEPTH_REJECTION };
+    }
+  }
+  return bounded;
+}
+
+/** Bound each persisted nested call's payload keys; same reference when none change. */
+function boundNestedCallPayloads<T extends Record<string, unknown>>(part: T): T {
+  const nestedCalls = part.nestedCalls;
+  if (!Array.isArray(nestedCalls)) return part;
+  let copy: unknown[] | undefined;
+  for (let i = 0; i < nestedCalls.length; i++) {
+    const call: unknown = nestedCalls[i];
+    if (!isPlainObject(call)) continue;
+    const bounded = boundPayloadKeys(call);
+    if (bounded !== call) {
+      copy ??= nestedCalls.slice();
+      copy[i] = bounded;
+    }
+  }
+  return copy === undefined ? part : { ...part, nestedCalls: copy };
 }
