@@ -1350,6 +1350,38 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("startup recovery does not arm a budgeted kickoff on an unpriced persisted model", async () => {
+    // A goal created on a priced turn-model override persists without that
+    // override; after a restart the kickoff falls back to the persisted model.
+    // An unpriced one would be rejected by the send-time gate on every
+    // dispatch, so recovery must leave the goal idle instead of arming it.
+    await setGoalOk(service, {
+      workspaceId,
+      objective: "Created on a priced one-shot model",
+      budgetCents: 500,
+    });
+
+    const restartedService = new WorkspaceGoalService(
+      config,
+      historyService,
+      extensionMetadata,
+      analytics
+    );
+    const dispatcher = new IdleDispatcher();
+    const execute = mock(() => Promise.resolve(true));
+    restartedService.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(execute),
+      getKickoffSendOptions: () =>
+        Promise.resolve({ model: "custom:unpriced-model", agentId: "exec" }),
+    });
+
+    await restartedService.recoverPendingDispatchAfterRestart(workspaceId);
+    await drainPendingDispatches();
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(await restartedService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+  });
+
   test("rejected wrap-up send leaves the candidate retryable on the next dispatch", async () => {
     // Regression: tryMarkBudgetLimitInjected used to flip permanently before the
     // send. A transient sendMessage rejection (e.g. requireIdle race) then locked

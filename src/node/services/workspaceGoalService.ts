@@ -3624,6 +3624,22 @@ export class WorkspaceGoalService {
     if (sendOptions.agentId === "plan" || sendOptions.agentId === "compact") {
       return;
     }
+    // The send-time pricing gate always rejects a budgeted goal on an unpriced
+    // model, so arming such a kickoff only produces doomed dispatches. This is
+    // reachable when a goal created on a turn-model override (kickoffModel) is
+    // re-armed without it, e.g. restart recovery falls back to the persisted
+    // model. Leave the goal idle instead; the user's next turn resumes it via
+    // the stream-end continuation, which prefers the priced stream model.
+    if (
+      hasBudgetedResumableGoal(goal) &&
+      !modelHasPricingData(sendOptions.model, this.getProvidersConfigForPricing())
+    ) {
+      log.debug("Skipping goal kickoff: kickoff model has no pricing data for budgeted goal", {
+        workspaceId,
+        model: sendOptions.model,
+      });
+      return;
+    }
     // Codex P2 (PRRT_kwDOPxxmWM6cClKY): the kickoff-options await above runs
     // outside the goal file lock, so a newer setter can persist a replacement
     // goal AND arm its own candidate while this stale finalizer is suspended.

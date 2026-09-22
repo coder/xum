@@ -2567,6 +2567,9 @@ export class TurnRequestBuilder {
           {
             ...toolsForModelConfig,
             capabilityModelString: seed.capabilityModelString,
+            // Per attempt: a fallback model that calls set_goal must price and
+            // kick off the goal on itself, not on the primary it replaced.
+            goalKickoffModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
           },
