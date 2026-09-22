@@ -369,7 +369,7 @@ return { reportMarkdown: summary };
 
 ### `evaluate(state, options)` — structured classification without an agent
 
-Sends `state` (a string, a JSON array or a JSON object — a bare number, boolean or `null` fails with `invalid-input/invalid-state`) plus fixed `questions` to an AI SDK _evaluation model_ and returns validated answers. The evaluator gets no tools, no chat history, no workspace context and no Xum system prompt — only `state` and `questions` — so it is the right primitive for screening untrusted text before an agent reads it, cheap labeling, or gating a branch on a classification.
+Sends `state` (a string, a JSON array or a JSON object — a bare number, boolean or `null` fails with `invalid-input/invalid-state`) plus fixed `questions` to an AI SDK _evaluation model_ and returns validated answers. The evaluator gets no tools, no chat history, no workspace context and no Xum system prompt — only `state` and `questions` — so it is the right primitive for tool-free classification of untrusted text: screening, cheap labeling, gating a branch. It is not a sanitizer or a security boundary: a `not_detected` answer does not make the text safe to place in a tool-capable agent's prompt.
 
 ```js
 const screening = evaluate(
@@ -415,7 +415,7 @@ Explicitly **not** guaranteed:
 
 - Correct classification: adversarial text can steer any evaluator (adapters _and_ Jev); `probability` is uncalibrated across providers; thresholds must come from labeled data per model. A passing screen means _screened_, not trusted.
 - Secrecy of `run.args`: durable run arguments contain the ingested snapshot under existing session-dir protections; authors may log/return it. `run.args` and step results never automatically enter agent prompts or parent-chat notifications (only author-passed strings do).
-- Downstream isolation of a general `agent()`: a prompt saying "do not fetch the issue" is not enforcement. In the example, the **rejected/uncertain branch** passes only `{ repo, issueNumber, label, reasonCode, stateSha256 }` to the labeling agent (no body); the **continued branch** deliberately hands the _screened_ snapshot to the working agent — that agent stays least-privileged and the constrained label action is the stronger follow-up.
+- Downstream isolation of a general `agent()`: built-in agents keep their tools (Explore keeps `bash` and `web_fetch`), and a prompt saying "do not fetch the issue" is guidance, not enforcement. The example therefore never places issue text in an agent prompt — not even after a `not_detected` screen: triage answers (`kind`, `severity`) come from the same tool-free `evaluate()` call, and the **rejected/uncertain branch** passes only `{ repo, issueNumber, label, reasonCode, stateSha256 }` to the labeling agent. That is a data-flow restriction, not host-enforced tool isolation; there is no host-enforced GitHub label action.
 - Pre-agent screening when ingestion itself used an agent: the example ingests via trusted CLI (`gh issue view --json` → `xum workflow run … --args-stdin`), validates `repo` (`owner/name` pattern) and `issueNumber` (positive integer), and adds no in-sandbox fetch.
 
 The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`. The example sets no per-call `model`, so pass `--evaluation-model` unless `evaluationDefaults.model` is already persisted:

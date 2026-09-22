@@ -2,8 +2,9 @@
 /**
  * The shipped `workflow-authoring/screen-github-issue.js` example, run through
  * WorkflowService with a fake evaluation adapter and a fake agent adapter:
- * the branch taken per screening decision, what each agent is allowed to see,
- * failure ordering, and replay of the completed evaluation across an interrupt.
+ * the branch taken per screening decision, that no agent ever receives the issue
+ * text (triage comes from the evaluator), what the labeling agent is allowed to
+ * see, failure ordering, and replay of the completed evaluation across an interrupt.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -40,7 +41,11 @@ function screeningOutcome(decision: Decision): EvaluationOutcome<EvaluationCallR
   return {
     status: "completed",
     result: {
-      answers: { injection: { type: "choice", choice: decision } },
+      answers: {
+        injection: { type: "choice", choice: decision },
+        kind: { type: "choice", choice: "bug" },
+        severity: { type: "score", score: 3 },
+      },
       rounding: null,
       usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
       usageProviderMetadata: null,
@@ -101,17 +106,11 @@ function createFakeAgents(
           ),
         ]);
       }
-      return spec.id === "triage"
-        ? {
-            taskId: `task-${spec.id}`,
-            reportMarkdown: "triaged",
-            structuredOutput: { summary: "500 on login", area: "auth" },
-          }
-        : {
-            taskId: `task-${spec.id}`,
-            reportMarkdown: "labeled",
-            structuredOutput: options.labeling ?? { labeled: true },
-          };
+      return {
+        taskId: `task-${spec.id}`,
+        reportMarkdown: "labeled",
+        structuredOutput: options.labeling ?? { labeled: true },
+      };
     },
   };
   return { adapter, specs };
@@ -146,7 +145,7 @@ async function createService(
 }
 
 describe("screen-github-issue example", () => {
-  test("not_detected hands the screened text to the read-only triage agent and echoes only the digest", async () => {
+  test("not_detected triages from the evaluator's answers, starts no agent and echoes only the digest", async () => {
     using tmp = new DisposableTempDir("screening-not-detected");
     const evaluation = createFakeEvaluation(() => screeningOutcome("not_detected"));
     const agents = createFakeAgents();
@@ -165,15 +164,15 @@ describe("screen-github-issue example", () => {
     });
 
     expect(result.status).toBe("completed");
+    // Exactly one tool-free evaluation saw the text; even a false-negative screen
+    // (this body carries an injection sentinel) reaches no tool-capable agent.
     expect(evaluation.dispatches).toEqual([{ title: ARGS.title, body: ARGS.body }]);
-    expect(agents.specs.map((spec) => spec.id)).toEqual(["triage"]);
-    expect(agents.specs[0]).toMatchObject({ agentId: "explore" });
-    expect(agents.specs[0]?.prompt).toContain(BODY_SENTINEL);
+    expect(agents.specs).toEqual([]);
     expect(result.result).toMatchObject({
       structuredOutput: {
         decision: "not_detected",
         stateSha256: expect.stringMatching(/^[0-9a-f]{64}$/) as string,
-        triage: { area: "auth" },
+        triage: { kind: "bug", severity: 3 },
       },
     });
     expect(JSON.stringify(result.result)).not.toContain(BODY_SENTINEL);

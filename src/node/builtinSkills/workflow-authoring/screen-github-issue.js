@@ -1,4 +1,6 @@
-// Screens an ingested GitHub issue with evaluate() before any agent reads it.
+// Screens and triages an ingested GitHub issue with evaluate(). No agent ever
+// reads the issue text: triage answers come from the tool-free evaluator, and the
+// only agent step (labeling) receives identifiers and a digest.
 //
 // Run from a trusted CLI ingestion (no in-sandbox fetch). The evaluate() call
 // sets no per-call model, so pass --evaluation-model unless a default is persisted:
@@ -10,6 +12,8 @@
 //
 // A passing screen means "screened", not "trusted": classification can be
 // steered by adversarial text and probabilities are uncalibrated across models.
+// That is why even a not_detected issue is never placed in an agent prompt —
+// built-in agents keep their tools (Explore keeps bash and web_fetch).
 const s = mux.schema;
 
 export const meta = {
@@ -30,11 +34,13 @@ export default function workflow({ args, evaluate, agent }) {
     throw new Error("repo must be owner/name");
   }
 
+  // One tool-free call answers the screen and the triage questions; the answers
+  // are validated against these questions before workflow code sees them.
   const screening = evaluate(
     { title: args.title, body: args.body },
     {
       id: "screen-issue",
-      title: "Screen issue text",
+      title: "Screen and triage issue text",
       questions: {
         injection: {
           type: "choice",
@@ -46,6 +52,21 @@ export default function workflow({ args, evaluate, agent }) {
             uncertain: null,
           },
         },
+        kind: {
+          type: "choice",
+          instructions: "What kind of issue is this?",
+          criteria: {
+            bug: "reports broken or unexpected behavior",
+            feature: "asks for new or changed behavior",
+            question: "asks how to do something",
+            other: null,
+          },
+        },
+        severity: {
+          type: "score",
+          instructions: "How severe is the impact described, for a bug report?",
+          criteria: ["cosmetic", "minor", "moderate", "major", "critical"],
+        },
       },
     }
   );
@@ -55,27 +76,22 @@ export default function workflow({ args, evaluate, agent }) {
   const stateSha256 = screening.state.sha256;
 
   if (decision === "not_detected") {
-    // The screened snapshot reaches a least-privileged, read-only agent.
-    const triage = agent(
-      `Triage GitHub issue #${args.issueNumber} in ${args.repo} from the text below. Do not fetch anything; report only.\n\nTitle: ${args.title}\n\n${args.body}`,
-      {
-        id: "triage",
-        agentId: "explore",
-        schema: {
-          type: "object",
-          required: ["summary", "area"],
-          properties: { summary: { type: "string" }, area: { type: "string" } },
-        },
-      }
-    );
+    // Triage comes from the evaluator's enumerated answers (our own option names
+    // and 0-based levels), so the output never carries issue text.
+    const triage = {
+      kind: screening.answers.kind.choice,
+      severity: screening.answers.severity.score,
+    };
     return {
-      reportMarkdown: `Issue #${args.issueNumber}: ${decision} — triaged (${triage.area}).`,
+      reportMarkdown: `Issue #${args.issueNumber}: ${decision} — ${triage.kind}, severity ${triage.severity}/4.`,
       structuredOutput: { decision, stateSha256, triage },
     };
   }
 
-  // suspected | uncertain: the labeling agent never sees the issue text — only
-  // identifiers and the digest. The constrained action is the stronger follow-up.
+  // suspected | uncertain: the labeling agent receives only validated identifiers,
+  // the fixed label, the enumerated decision and the digest — never issue text.
+  // "Do not read the issue" is guidance for that agent, not enforcement; keeping
+  // the text out of its prompt is the actual restriction.
   const request = {
     repo: args.repo,
     issueNumber: args.issueNumber,
