@@ -73,7 +73,10 @@ function setupPersistentSubagentsStory() {
 
 function PhoneDecorator(Story: ComponentType) {
   return (
-    <div style={{ width: 390, height: 844, overflow: "hidden" }}>
+    <div
+      data-testid="subagent-phone-frame"
+      style={{ width: "100%", maxWidth: 390, height: 844, overflow: "hidden" }}
+    >
       <Story />
     </div>
   );
@@ -93,7 +96,7 @@ let emitMonitorCount: (activeBashMonitorCount: number) => void = () => {
   throw new Error("BackgroundMonitor story setup has not run");
 };
 
-function setupMonitoredSubagentStory() {
+function setupMonitoredSubagentStory(sidebarExpanded = true) {
   const parent = createWorkspace({
     id: PARENT_WORKSPACE_ID,
     name: "waiting-for-verification",
@@ -123,7 +126,11 @@ function setupMonitoredSubagentStory() {
   });
   const activityFeed = createActivityFeed();
   emitMonitorCount = (count) => activityFeed.emit(child.id, monitorActivity(count));
-  expandLeftSidebar();
+  if (sidebarExpanded) {
+    expandLeftSidebar();
+  } else {
+    collapseLeftSidebar();
+  }
   collapseRightSidebar();
   expandProjects([PROJECT_PATH]);
   selectWorkspace(parent);
@@ -144,6 +151,7 @@ export const BackgroundMonitor: AppStory = {
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } },
   },
   play: async ({ canvasElement, step }) => {
+    const sidebar = () => within(canvasElement).getByTestId("left-sidebar");
     const sidebarRow = () =>
       canvasElement.querySelector(`[data-workspace-id="${MONITORED_CHILD_ID}"][role="button"]`);
     const tray = () => {
@@ -170,7 +178,13 @@ export const BackgroundMonitor: AppStory = {
           awaitingUserQuestion: false,
           activeBashMonitorCount: monitorCount,
         });
-        await expect(sidebarRow()).toBeVisible();
+        // A closed phone drawer unmounts its rows; it must not prevent the
+        // visible composer from exercising the same live activity transitions.
+        if (sidebar().classList.contains("mobile-sidebar-collapsed")) {
+          await expect(sidebarRow()).toBeNull();
+        } else {
+          await expect(sidebarRow()).toBeVisible();
+        }
         await expect(tray()).toHaveTextContent("1 sub-agent · 1 active");
         await expect(trayRow()).toHaveTextContent("Monitoring");
       });
@@ -190,6 +204,9 @@ export const BackgroundMonitor: AppStory = {
 
     await step("A completed report fences off stale streaming without a monitor", async () => {
       await expectSettled();
+      await expect(sidebar().classList.contains("mobile-sidebar-collapsed")).toBe(
+        canvasElement.querySelector('[data-testid="subagent-phone-frame"]') !== null
+      );
     });
     await step("Arming a monitor activates the reported child in sidebar and tray", async () => {
       emitMonitorCount(1);
@@ -225,6 +242,7 @@ export const BackgroundMonitor: AppStory = {
 
 export const BackgroundMonitorPhone: AppStory = {
   ...BackgroundMonitor,
+  render: () => <AppWithMocks setup={() => setupMonitoredSubagentStory(false)} />,
   globals: { viewport: { value: "mobile1", isRotated: false } },
   decorators: [PhoneDecorator],
   parameters: {
