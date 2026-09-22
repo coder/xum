@@ -13,7 +13,7 @@ import {
   isProviderEligibleMessage,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
-import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
@@ -365,15 +365,13 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
 };
 
 /**
- * A user row the chat model itself would replay. Context-budget-rejected prompts and workflow
- * display rows stay in history for the UI but never reach a provider, so routing (evaluator
- * context, attachment gating) must not see them either.
+ * A user row the chat model itself would replay. Context-budget-rejected prompts and model-hidden
+ * records stay in history for the UI but never reach a provider, so routing (evaluator context,
+ * attachment gating) must use the same hidden-record filter as the chat request.
  */
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    isProviderEligibleMessage(message) &&
-    !isWorkflowDisplayOnlyMessage(message)
+    message.role === "user" && isProviderEligibleMessage(message) && !isModelHiddenMessage(message)
   );
 }
 

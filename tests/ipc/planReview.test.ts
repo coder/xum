@@ -8,6 +8,7 @@
  * `propose_plan` tool call so the session's tool-completion snapshot hook runs against the
  * actual tool result.
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
@@ -16,6 +17,7 @@ import * as path from "node:path";
 
 import { ProvidersConfigStore } from "@/node/config";
 import { getPlanFilePath } from "@/common/utils/planStorage";
+import { drainFifoReaders } from "./fifoRelease";
 import { createMuxMessage } from "@/common/types/message";
 import {
   buildPlanReviewMetadata,
@@ -173,15 +175,20 @@ async function createFixtureServer(): Promise<{
       const lastUserText = contentText(lastUser);
       // A held turn answers only after releaseHeld(), so sends issued meanwhile are queued.
       if (lastUserText.includes(HOLD_MARKER)) await held.promise;
-      const chunks = lastUserText.includes(PROPOSE_MARKER)
-        ? toolCallChunks(`call_plan_${requests.length}`, "propose_plan", {})
-        : lastUserText.includes(READ_MARKER) && messages.at(-1)?.role !== "tool"
-          ? toolCallChunks(`call_read_${requests.length}`, "file_read", { path: fixture.readPath })
-          : lastUserText.includes(ATTACH_MARKER) && messages.at(-1)?.role !== "tool"
-            ? toolCallChunks(`call_attach_${requests.length}`, "attach_file", {
-                path: fixture.attachPath,
+      // Propose once per turn: a failed propose_plan is not terminal, so without the tool-role
+      // guard the fixture would re-issue it every step and the turn would never end.
+      const chunks =
+        lastUserText.includes(PROPOSE_MARKER) && messages.at(-1)?.role !== "tool"
+          ? toolCallChunks(`call_plan_${requests.length}`, "propose_plan", {})
+          : lastUserText.includes(READ_MARKER) && messages.at(-1)?.role !== "tool"
+            ? toolCallChunks(`call_read_${requests.length}`, "file_read", {
+                path: fixture.readPath,
               })
-            : [chunk({ role: "assistant", content: "Fixture reply." }), chunk({}, "stop")];
+            : lastUserText.includes(ATTACH_MARKER) && messages.at(-1)?.role !== "tool"
+              ? toolCallChunks(`call_attach_${requests.length}`, "attach_file", {
+                  path: fixture.attachPath,
+                })
+              : [chunk({ role: "assistant", content: "Fixture reply." }), chunk({}, "stop")];
       response.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -342,6 +349,42 @@ describeIntegration("workspace.planReview", () => {
     expect(missing.success).toBe(false);
     if (!missing.success) expect(missing.error.type).toBe("plan_missing");
     await writePlan(PLAN_B);
+  }, 60_000);
+
+  test("a FIFO at the plan path is plan_missing for ensureSnapshot and a safe propose_plan error, promptly", async () => {
+    const before = (await getState()).snapshots.length;
+    await fs.rm(planPath, { force: true });
+    execFileSync("mkfifo", [planPath]);
+    // Owned read attempts against the FIFO; the finally block drains until they have settled.
+    const attempts: Array<Promise<unknown>> = [];
+    try {
+      // Writer-less FIFO: a plain open() would block a libuv worker; the regular-file read must not.
+      const started = performance.now();
+      const capture = planReview().ensureSnapshot({ workspaceId });
+      attempts.push(capture);
+      const captured = await capture;
+      expect(performance.now() - started).toBeLessThan(5000);
+      expect(captured.success).toBe(false);
+      if (!captured.success) expect(captured.error.type).toBe("plan_missing");
+
+      const turn = planTurn(`Propose over a FIFO ${PROPOSE_MARKER}`);
+      attempts.push(turn);
+      await turn;
+      const toolEnd = collector
+        .getEvents()
+        .find((event) => event.type === "tool-call-end" && event.toolName === "propose_plan");
+      expect(toolEnd?.type).toBe("tool-call-end");
+      if (toolEnd?.type === "tool-call-end") {
+        expect(toolEnd.result).toMatchObject({ success: false });
+      }
+      expect((await getState()).snapshots).toHaveLength(before);
+    } finally {
+      // Release readers a RED run left parked on the FIFO until the owned attempts have settled
+      // (async fs alone would queue behind the pinned libuv workers).
+      await drainFifoReaders(planPath, attempts);
+      await fs.rm(planPath, { force: true });
+      await writePlan(PLAN_B);
+    }
   }, 60_000);
 
   test("submitFeedback validates, stamps ids, persists one user row and wakes the agent", async () => {

@@ -618,6 +618,20 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       [UNSUPPORTED_IMAGE]
     );
     expect((await historyService.appendToHistory("ws-auto-routing", rejected)).success).toBe(true);
+    // Damaged review records remain hidden even if they carry an extra file part.
+    const hiddenReview = createMuxMessage(
+      "review-image",
+      "user",
+      "hidden plan snapshot",
+      {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "review-image" },
+      },
+      [UNSUPPORTED_IMAGE]
+    );
+    expect((await historyService.appendToHistory("ws-auto-routing", hiddenReview)).success).toBe(
+      true
+    );
 
     await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -1945,11 +1959,17 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
-  it("keeps display-only rows (rejected prompts, workflow triggers) out of the evaluator context", async () => {
+  it("keeps model-hidden rows out of the evaluator context", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
     for (const [id, text, metadata] of [
       ["user-kept", "kept earlier prompt", {}],
       ["user-rejected", "rejected oversized prompt", { contextBudgetRejected: true }],
+      // Missing synthetic metadata must not make a hidden review record visible.
+      [
+        "user-plan-review",
+        "hidden plan snapshot",
+        { muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "routing-snapshot" } },
+      ],
       [
         "user-workflow",
         "/workflow display-only trigger",
@@ -1984,6 +2004,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(recent).toContain("kept earlier prompt");
     expect(recent).not.toContain("rejected oversized prompt");
     expect(recent).not.toContain("/workflow display-only trigger");
+    expect(recent).not.toContain("hidden plan snapshot");
   });
 
   it("keeps an earlier prompt in the evaluator context behind more than twenty report rows", async () => {
