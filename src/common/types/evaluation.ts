@@ -632,6 +632,38 @@ export function canonicalEvaluationJson(value: unknown): string {
 }
 
 /**
+ * Cheap lower bound of a value's JSON byte size, computed without allocating
+ * the serialization: every node counts at least one byte and every string /
+ * key contributes its length (UTF-8 never needs fewer bytes than UTF-16 code
+ * units, and JSON escaping only adds). The walk stops as soon as `limit` is
+ * exceeded, so an oversized untrusted value is rejected before
+ * canonicalization builds a full-size string plus a second UTF-8 buffer.
+ * Iterative like `jsonDepth`; call it only after the depth check.
+ */
+export function jsonBytesLowerBound(value: unknown, limit: number): number {
+  const stack: unknown[] = [value];
+  let bytes = 0;
+  while (stack.length > 0 && bytes <= limit) {
+    const current = stack.pop();
+    bytes += 1;
+    if (typeof current === "string") {
+      bytes += current.length;
+    } else if (Array.isArray(current)) {
+      const items: unknown[] = current;
+      for (const item of items) {
+        stack.push(item);
+      }
+    } else if (current !== null && typeof current === "object") {
+      for (const key of Object.keys(current)) {
+        bytes += key.length;
+        stack.push((current as Record<string, unknown>)[key]);
+      }
+    }
+  }
+  return bytes;
+}
+
+/**
  * Canonical JSON of `{ state, questions }` with its UTF-8 byte length and
  * nesting depth (the wrapper object counts as one level), checked against
  * `EVALUATION_MAX_REQUEST_BYTES` / `EVALUATION_MAX_DEPTH`.
@@ -646,6 +678,13 @@ export function canonicalRequestBytes(request: {
   const depth = jsonDepth(payload, EVALUATION_MAX_DEPTH);
   if (depth > EVALUATION_MAX_DEPTH) {
     return { ok: false, violation: "request-too-deep", bytes: 0, depth };
+  }
+  // Size next, still without serializing: a value far above the cap must not
+  // cost a full canonical string and a second UTF-8 buffer before rejection.
+  // `bytes` is then the (lower-bound) count at which the walk stopped.
+  const lowerBound = jsonBytesLowerBound(payload, EVALUATION_MAX_REQUEST_BYTES);
+  if (lowerBound > EVALUATION_MAX_REQUEST_BYTES) {
+    return { ok: false, violation: "request-too-large", bytes: lowerBound, depth };
   }
   const canonical = canonicalEvaluationJson(payload);
   const bytes = new TextEncoder().encode(canonical).length;

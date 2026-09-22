@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import {
   EVALUATION_MAX_DEPTH,
   EVALUATION_MAX_QUESTIONS,
@@ -16,6 +16,7 @@ import {
   type EvaluationQuestion,
   type EvaluationQuestions,
   parseEvaluationInputBounded,
+  jsonBytesLowerBound,
 } from "./evaluation";
 
 function choiceQuestion(optionCount: number): EvaluationQuestion {
@@ -405,6 +406,27 @@ describe("canonicalRequestBytes", () => {
       questions: QUESTIONS,
     });
     expect(large).toMatchObject({ ok: false, violation: "request-too-large" });
+  });
+
+  it("rejects values far above the byte cap without canonicalizing them", () => {
+    // 40 MiB of state: the lower-bound walk must stop near the cap instead of
+    // building a full canonical string (+ UTF-8 buffer) first.
+    const huge = { chunks: Array.from({ length: 4_000 }, () => "x".repeat(10_000)) };
+    const stringifySpy = spyOn(JSON, "stringify");
+    try {
+      const result = canonicalRequestBytes({ state: huge, questions: QUESTIONS });
+      expect(result).toMatchObject({ ok: false, violation: "request-too-large" });
+      expect(result.bytes).toBeGreaterThan(EVALUATION_MAX_REQUEST_BYTES);
+      // Stopped shortly after crossing the cap, not at the true 40 MiB size.
+      expect(result.bytes).toBeLessThan(EVALUATION_MAX_REQUEST_BYTES + 20_000);
+      expect(stringifySpy).not.toHaveBeenCalled();
+    } finally {
+      stringifySpy.mockRestore();
+    }
+    // The estimate never exceeds the real size, so in-limit payloads still pass.
+    expect(jsonBytesLowerBound({ a: ["é", 1, null, {}], "": "" }, Infinity)).toBeLessThanOrEqual(
+      new TextEncoder().encode(JSON.stringify({ a: ["é", 1, null, {}], "": "" })).length
+    );
   });
 
   it("rejects payloads nested deeper than EVALUATION_MAX_DEPTH", () => {
