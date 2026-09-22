@@ -660,6 +660,58 @@ describe("GeneralSection", () => {
     });
   });
 
+  test.each([true, false])("reverts a rejected keep-awake save from %s", async (saved) => {
+    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({ keepScreenAwake: saved });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await act(() => Promise.resolve());
+    expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    updateKeepScreenAwakeMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe(String(!saved));
+    await waitFor(() => {
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: !saved });
+      expect(toggle.getAttribute("aria-checked")).toBe(String(saved));
+    });
+  });
+
+  test.each([true, false])(
+    "rolls rapid keep-awake toggles back to the confirmed value (first save succeeds: %s)",
+    async (firstSucceeds) => {
+      const { updateKeepScreenAwakeMock, view } = renderGeneralSection({ keepScreenAwake: true });
+      const toggle = view.getByRole("switch", {
+        name: "Toggle keep screen awake while agents are working",
+      });
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+      const writes: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+      updateKeepScreenAwakeMock.mockImplementation(
+        () => new Promise<void>((resolve, reject) => writes.push({ resolve, reject }))
+      );
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(writes).toHaveLength(1));
+      fireEvent.click(toggle);
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(writes).toHaveLength(1);
+
+      act(() => {
+        if (firstSucceeds) writes[0].resolve();
+        else writes[0].reject(new Error("first save failed"));
+      });
+      await waitFor(() => expect(writes).toHaveLength(2));
+      // A stale failure must not replace the newer selection, even before its write starts.
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[1].reject(new Error("second save failed")));
+      await waitFor(() => expect(writes).toHaveLength(3));
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      act(() => writes[2].reject(new Error("last save failed")));
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe(String(!firstSucceeds)));
+    }
+  );
+
   test("renders the worktree archive behavior copy and loads the saved value", async () => {
     const { view } = renderGeneralSection({
       coderWorkspaceArchiveBehavior: "delete",

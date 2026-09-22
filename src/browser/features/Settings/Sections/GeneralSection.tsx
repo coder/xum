@@ -311,6 +311,7 @@ export function GeneralSection() {
   const chatTranscriptFullWidthLoadNonceRef = useRef(0);
   const llmDebugLogsLoadNonceRef = useRef(0);
   const keepScreenAwakeLoadNonceRef = useRef(0);
+  const keepScreenAwakeSavedRef = useRef(false);
 
   // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
   // selections can't race and persist a stale value via out-of-order writes.
@@ -372,7 +373,8 @@ export function GeneralSection() {
         }
 
         if (keepScreenAwakeNonce === keepScreenAwakeLoadNonceRef.current) {
-          setKeepScreenAwake(cfg.keepScreenAwake === true);
+          keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
+          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
         }
       })
       .catch(() => {
@@ -509,22 +511,23 @@ export function GeneralSection() {
   };
 
   const handleKeepScreenAwakeChange = (checked: boolean) => {
-    // Invalidate any in-flight config load so it does not overwrite the user's selection.
-    keepScreenAwakeLoadNonceRef.current++;
-    setKeepScreenAwake(checked);
-
-    if (!api?.config?.updateKeepScreenAwake) {
+    if (!api) {
       return;
     }
+    // Invalidate any in-flight config load so it does not overwrite the user's selection.
+    const nonce = ++keepScreenAwakeLoadNonceRef.current;
+    setKeepScreenAwake(checked);
 
-    // Serialize writes so rapid toggles always persist the last user choice.
+    // Serialize writes, but only roll back the latest selection when persistence fails.
     keepScreenAwakeUpdateChainRef.current = keepScreenAwakeUpdateChainRef.current
-      .catch(() => {
-        // Best-effort only.
+      .then(async () => {
+        await api.config.updateKeepScreenAwake({ enabled: checked });
+        keepScreenAwakeSavedRef.current = checked;
       })
-      .then(() => api.config.updateKeepScreenAwake({ enabled: checked }))
       .catch(() => {
-        // Best-effort persistence.
+        if (nonce === keepScreenAwakeLoadNonceRef.current) {
+          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
+        }
       });
   };
 
