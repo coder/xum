@@ -676,6 +676,10 @@ describe("backup payload", () => {
     });
   });
 
+  // This boundary-sized round trip adds two markers per server, each applied as its own
+  // jsonc edit, and can exceed the default timeout late in the full `bun test src` process
+  // (measured 208 ms standalone vs 4.2 s after 825 files). Keep the fixture at the limit
+  // rather than reducing coverage; this is completion headroom, not a performance assertion.
   it("keeps a large backup restorable when deselecting a category adds many markers", async () => {
     const servers = Object.fromEntries(
       Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
@@ -705,7 +709,7 @@ describe("backup payload", () => {
     expect(jsonc.parse(await fs.readFile(path.join(restoreRoot, "mcp.jsonc"), "utf-8"))).toEqual({
       servers,
     });
-  });
+  }, 30_000);
 
   it("does not create manifests above the MCP redaction limit", async () => {
     const redactedValues = Object.fromEntries(
