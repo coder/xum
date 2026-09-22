@@ -11736,7 +11736,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     input: SubmitPlanReviewFeedbackInput & { options: SendMessageOptions }
   ): Promise<Result<{ feedbackId: string; state: PlanReviewState }, PlanReviewError>> {
-    const prepared = await preparePlanReviewFeedback(this.historyService, workspaceId, input);
+    const prepared = await preparePlanReviewFeedback(
+      this.historyService,
+      workspaceId,
+      input,
+      input.options
+    );
     if (!prepared.success) return prepared;
     const sent = await this.sendMessage(workspaceId, prepared.data.text, {
       ...input.options,

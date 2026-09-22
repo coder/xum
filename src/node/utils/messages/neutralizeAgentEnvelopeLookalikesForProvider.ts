@@ -188,33 +188,76 @@ function toRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Both neutralizers return the same reference when their tag is absent. */
+function neutralizeString(value: string): string {
+  return neutralizePlanReviewEnvelopeLookalikes(neutralizeAgentEnvelopeLookalikes(value));
+}
+
 /**
  * Shape-preserving deep neutralization for JSON-serializable tool payloads. Returns the SAME
- * reference when nothing contains the lookalike tag so unchanged parts/messages keep identity.
+ * reference when nothing contains the lookalike tag so unchanged parts/messages keep identity
+ * (binary leaves such as media byte arrays are never rebuilt because their entries never change).
+ *
+ * Iterative on purpose: tool results are arbitrary JSON from MCP/code-execution tools, and
+ * JSON.parse accepts nesting far deeper than a recursive walk survives — a RangeError here
+ * would fail the turn inside prepareStep. Post-order rebuild over an explicit stack, mirroring
+ * the attachment extractor's walk; repeated references are processed once and cycles are not
+ * descended twice.
  */
 function neutralizeStringsDeep(value: unknown): unknown {
-  if (typeof value === "string") {
-    // Both neutralizers return the same reference when their tag is absent.
-    return neutralizePlanReviewEnvelopeLookalikes(neutralizeAgentEnvelopeLookalikes(value));
-  }
-  if (Array.isArray(value)) {
-    let changed = false;
-    const next = value.map((item) => {
-      const out = neutralizeStringsDeep(item);
-      if (out !== item) changed = true;
-      return out;
-    });
-    return changed ? next : value;
-  }
-  if (typeof value === "object" && value !== null) {
-    let changed = false;
-    const next: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      const out = neutralizeStringsDeep(item);
-      if (out !== item) changed = true;
-      next[key] = out;
+  if (typeof value === "string") return neutralizeString(value);
+  if (typeof value !== "object" || value === null) return value;
+
+  /** Rebuilt replacement per changed node; nodes without changes keep their identity. */
+  const rebuilt = new Map<object, unknown>();
+  const processed = new Set<object>();
+  const visiting = new Set<object>();
+  const stack: Array<{ node: object; entered: boolean }> = [{ node: value, entered: false }];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (!frame.entered) {
+      if (processed.has(frame.node) || visiting.has(frame.node)) {
+        stack.pop();
+        continue;
+      }
+      frame.entered = true;
+      visiting.add(frame.node);
+      const children: unknown[] = Array.isArray(frame.node)
+        ? frame.node
+        : Object.values(frame.node);
+      for (const child of children) {
+        if (typeof child !== "object" || child === null) continue;
+        if (processed.has(child) || visiting.has(child)) continue;
+        stack.push({ node: child, entered: false });
+      }
+      continue;
     }
-    return changed ? next : value;
+    stack.pop();
+    visiting.delete(frame.node);
+    processed.add(frame.node);
+    let changed = false;
+    const rewrite = (child: unknown): unknown => {
+      if (typeof child === "string") {
+        const out = neutralizeString(child);
+        if (out !== child) changed = true;
+        return out;
+      }
+      if (typeof child === "object" && child !== null && rebuilt.has(child)) {
+        changed = true;
+        return rebuilt.get(child);
+      }
+      return child;
+    };
+    const next = Array.isArray(frame.node)
+      ? frame.node.map(rewrite)
+      : Object.fromEntries(
+          Object.entries(frame.node as Record<string, unknown>).map(([key, child]) => [
+            key,
+            rewrite(child),
+          ])
+        );
+    if (changed) rebuilt.set(frame.node, next);
   }
-  return value;
+  return rebuilt.has(value) ? rebuilt.get(value) : value;
 }

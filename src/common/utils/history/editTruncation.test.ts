@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { createMuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 
 import { buildHistoryEditPrecondition, getEditTruncateTargetFromMessages } from "./editTruncation";
 
@@ -115,5 +120,36 @@ describe("getEditTruncateTargetFromMessages", () => {
     expect(getEditTruncateTargetFromMessages([createMuxMessage("u1", "user", "x")], "ghost")).toBe(
       undefined
     );
+  });
+
+  test("does not cut independent plan-review records that merely precede the edited row", () => {
+    // A resolve/reopen appended while idle is a durable user mutation, not a prelude of the next
+    // turn: editing the ordinary message after it must not delete it (which would silently flip
+    // the thread back). Request-owned snapshots between the record and the edit are still cut.
+    const record: PlanReviewRecord = {
+      v: 1,
+      kind: "resolve",
+      recordId: "rec_1",
+      threadId: "thr_1",
+    };
+    const resolveRow = createMuxMessage("plan-review-1", "user", formatPlanReviewEnvelope(record), {
+      synthetic: true,
+      muxMetadata: buildPlanReviewMetadata(record),
+    });
+    const rows = [
+      createMuxMessage("u0", "user", "earlier"),
+      createMuxMessage("a0", "assistant", "answer"),
+      resolveRow,
+      createMuxMessage("u1", "user", "edited"),
+    ];
+    expect(getEditTruncateTargetFromMessages(rows, "u1")).toBe("u1");
+    const withPrelude = [
+      createMuxMessage("u0", "user", "earlier"),
+      createMuxMessage("a0", "assistant", "answer"),
+      resolveRow,
+      snapshot("snap-1"),
+      createMuxMessage("u1", "user", "edited"),
+    ];
+    expect(getEditTruncateTargetFromMessages(withPrelude, "u1")).toBe("snap-1");
   });
 });

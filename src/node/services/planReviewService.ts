@@ -2,8 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 
 import assert from "@/common/utils/assert";
 import type { PlanReviewError } from "@/common/types/errors";
+import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, pickStartupRetrySendOptions } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import {
@@ -313,7 +314,9 @@ export async function setPlanReviewThreadResolved(
 export async function preparePlanReviewFeedback(
   historyService: PlanReviewHistory,
   workspaceId: string,
-  input: SubmitPlanReviewFeedbackInput
+  input: SubmitPlanReviewFeedbackInput,
+  /** The send options the caller will pass to sendMessage; they are persisted on the row too. */
+  options: SendMessageOptions
 ): Promise<Result<PreparedPlanReviewFeedback, PlanReviewError>> {
   if (input.comments.length === 0 && input.replies.length === 0) {
     return Err({
@@ -372,10 +375,17 @@ export async function preparePlanReviewFeedback(
   const text = formatPlanReviewEnvelope(record);
   const muxMetadata = buildPlanReviewMetadata(record);
   // Per-field caps hold at the oRPC boundary, but the persisted row is the double-escaped
-  // envelope; refuse before sendMessage writes a row the history scanners would skip as
-  // unreadable (which would also silently drop the user's feedback from provider requests).
+  // envelope PLUS the send options sendMessage stamps on it (toolPolicy and the startup-retry
+  // snapshot, whose additionalSystemInstructions/providerOptions are unbounded); refuse before
+  // sendMessage writes a row the history scanners would skip as unreadable (which would also
+  // silently drop the user's feedback from provider requests).
   const rowBytes = measurePersistedRowBytes(
-    createMuxMessage(createUserMessageId(), "user", text, { timestamp: Date.now(), muxMetadata }),
+    createMuxMessage(createUserMessageId(), "user", text, {
+      timestamp: Date.now(),
+      toolPolicy: options.toolPolicy,
+      retrySendOptions: pickStartupRetrySendOptions(options),
+      muxMetadata,
+    }),
     workspaceId
   );
   const maxRowBytes = SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES;

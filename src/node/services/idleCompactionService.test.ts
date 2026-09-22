@@ -6,8 +6,27 @@ import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
+
+/** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
+function planReviewRecordRow(id: string, timestamp: number) {
+  const record = {
+    v: 1 as const,
+    kind: "resolve" as const,
+    recordId: `rec_${id}`,
+    threadId: "thr_1",
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+    timestamp,
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(record),
+  });
+}
 
 describe("IdleCompactionService", () => {
   // Mock services
@@ -204,6 +223,71 @@ describe("IdleCompactionService", () => {
       const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
       expect(result.eligible).toBe(false);
       expect(result.reason).toBe("awaiting_response");
+    });
+
+    test("ignores hidden plan-review record rows when judging an unanswered tail", async () => {
+      // A resolve/reopen appended while idle sits after the assistant's answer; it is not a
+      // prompt awaiting a response, so background compaction must stay eligible.
+      const idleTimestamp = now - 25 * oneHourMs;
+      spyOn(historyService, "getLastMessages").mockResolvedValueOnce(
+        Ok([
+          createMuxMessage("1", "user", "Hello", { timestamp: idleTimestamp }),
+          createMuxMessage("2", "assistant", "Hi!", { timestamp: idleTimestamp }),
+          planReviewRecordRow("3", idleTimestamp),
+          planReviewRecordRow("4", idleTimestamp),
+        ])
+      );
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+
+      // A real unanswered prompt followed by hidden rows keeps its protection.
+      spyOn(historyService, "getLastMessages").mockResolvedValueOnce(
+        Ok([
+          createMuxMessage("1", "user", "Hello", { timestamp: idleTimestamp }),
+          createMuxMessage("2", "assistant", "Hi!", { timestamp: idleTimestamp }),
+          createMuxMessage("3", "user", "Another question?", { timestamp: idleTimestamp }),
+          planReviewRecordRow("4", idleTimestamp),
+        ])
+      );
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+    });
+
+    test("looks past a tail window made only of hidden record rows", async () => {
+      // More hidden rows than the bounded tail read: the window alone cannot tell whether the
+      // last real row is an answered turn or a pending prompt, so the check must consult the
+      // history since the latest boundary rather than guess either way.
+      const idleTimestamp = now - 25 * oneHourMs;
+      const hiddenWindow = Array.from({ length: 50 }, (_, i) =>
+        planReviewRecordRow(`h${i}`, idleTimestamp)
+      );
+      spyOn(historyService, "getLastMessages").mockResolvedValue(Ok(hiddenWindow));
+      const fullSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+        Ok([
+          createMuxMessage("1", "user", "Hello", { timestamp: idleTimestamp }),
+          createMuxMessage("2", "assistant", "Hi!", { timestamp: idleTimestamp }),
+          ...hiddenWindow,
+        ])
+      );
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+      fullSpy.mockResolvedValueOnce(
+        Ok([
+          createMuxMessage("1", "user", "Hello", { timestamp: idleTimestamp }),
+          createMuxMessage("2", "assistant", "Hi!", { timestamp: idleTimestamp }),
+          createMuxMessage("3", "user", "Pending", { timestamp: idleTimestamp }),
+          ...hiddenWindow,
+        ])
+      );
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(2);
     });
 
     test("returns ineligible when messages have no timestamps", async () => {

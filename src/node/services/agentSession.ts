@@ -9025,6 +9025,7 @@ export class AgentSession {
           try {
             await capture.promise;
           } finally {
+            // No-op when completion policy already abandoned (detached) this capture.
             this.pendingPlanSnapshots.delete(capture);
           }
         }
@@ -9818,11 +9819,18 @@ export class AgentSession {
    */
   private async settlePendingPlanSnapshots(waitForCompletion: boolean): Promise<void> {
     if (this.pendingPlanSnapshots.size === 0) return;
-    const abortAll = () => {
-      for (const capture of this.pendingPlanSnapshots) capture.controller.abort();
+    // Abandoning aborts the capture AND detaches it from settlement tracking: a read that
+    // ignores the abort (a hung remote command) can stay pending for minutes, and while it sat
+    // in the set every later completed turn would wait through another full deadline. Its late
+    // result is still refused by ensurePlanSnapshot's admission checks on the aborted signal.
+    const abandonAll = () => {
+      for (const capture of this.pendingPlanSnapshots) {
+        capture.controller.abort();
+        this.pendingPlanSnapshots.delete(capture);
+      }
     };
     if (!waitForCompletion) {
-      abortAll();
+      abandonAll();
       return;
     }
     const deadline = Promise.withResolvers<"deadline">();
@@ -9831,7 +9839,8 @@ export class AgentSession {
       // Captures remove themselves from the set when they finish. The wait races the deadline
       // rather than relying on the capture to notice the abort: the stall can be inside the
       // plan read itself (a remote command can block for minutes), so the abandoned capture is
-      // left running and its late result is refused at ensurePlanSnapshot's admission checks.
+      // left running, detached from the set, and its late result is refused at
+      // ensurePlanSnapshot's admission checks.
       while (this.pendingPlanSnapshots.size > 0) {
         const outcome = await Promise.race([
           Promise.all([...this.pendingPlanSnapshots].map((capture) => capture.promise)).then(
@@ -9844,7 +9853,7 @@ export class AgentSession {
             workspaceId: this.workspaceId,
             timeoutMs: this.planSnapshotCaptureTimeoutMs,
           });
-          abortAll();
+          abandonAll();
           return;
         }
       }

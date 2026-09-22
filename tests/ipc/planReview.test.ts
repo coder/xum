@@ -919,6 +919,27 @@ describeIntegration("workspace.planReview", () => {
     expect(!dense.success && dense.error.type).toBe("feedback_too_large");
     const stateAfter = await getState();
     expect(stateAfter.feedbacks.length).toBe((await getState()).feedbacks.length);
+
+    // The persisted row also carries the send options (metadata.retrySendOptions, toolPolicy),
+    // which the API leaves unbounded: a small envelope with huge options is just as unreadable
+    // to the history scanners, so it must be refused up front instead of reported as sent.
+    const requestsBefore = fixture.requests.length;
+    const feedbacksBefore = (await getState()).feedbacks.length;
+    const heavyOptions = await planReview().submitFeedback({
+      workspaceId,
+      snapshotId: snapshot.snapshotId,
+      comments: [{ anchor, quote: "# Plan A", body: "small body" }],
+      replies: [],
+      options: { ...options, additionalSystemInstructions: "s".repeat(1024 * 1024 + 1) },
+    });
+    expect(!heavyOptions.success && heavyOptions.error.type).toBe("feedback_too_large");
+    expect(fixture.requests.length).toBe(requestsBefore);
+    expect((await getState()).feedbacks.length).toBe(feedbacksBefore);
+    // Nothing was written: the history tail is unchanged and readable.
+    const tail = await new HistoryService(env.config).getLastMessages(workspaceId, 1);
+    expect(
+      tail.success && tail.data[0]?.metadata?.retrySendOptions?.additionalSystemInstructions
+    ).toBeUndefined();
   }, 60_000);
   test("a persisted plan-review row with malformed parts cannot brick getState", async () => {
     // Valid JSON, valid discriminator, but `parts` is null: the full-history reader hands it to

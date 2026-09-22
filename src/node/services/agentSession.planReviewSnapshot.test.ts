@@ -210,6 +210,90 @@ describe("AgentSession plan-review snapshot capture", () => {
     }
   });
 
+  test("an abandoned capture stops delaying later turns and later captures still land", async () => {
+    // A read that ignores the abort (a hung remote command) stays pending long after the deadline.
+    // Once abandoned it must leave settlement tracking: the next completed turn settles at once
+    // and a later, healthy capture is neither delayed nor aborted with the stale one.
+    const workspaceId = "session-plan-capture-abandoned";
+    await writePlan(workspaceId, "# Plan\n\nStep one.\n");
+    const emitter = new EventEmitter();
+    let turns = 0;
+    let metadataCalls = 0;
+    const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
+    const streamEnd = (): TurnCompletion => ({
+      status: "completed",
+      streamEnd: {
+        type: "stream-end",
+        workspaceId,
+        metadata: { model },
+        parts: [{ type: "text", text: "ok" }],
+      },
+    });
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      planSnapshotCaptureTimeoutMs: 200,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          turns += 1;
+          const messageId = `assistant-${turns}`;
+          emitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            model,
+            startTime: Date.now(),
+          });
+          const completion = Promise.withResolvers<TurnCompletion>();
+          completions.push(completion);
+          return Promise.resolve(Ok({ messageId, completion: completion.promise }));
+        }),
+        getWorkspaceMetadata: mock(async () => {
+          metadataCalls += 1;
+          // Call 1 is the first send's preflight; call 2 is the first capture's read: hang it.
+          if (metadataCalls === 2) await Promise.withResolvers<never>().promise;
+          return Ok(metadataFor(workspaceId));
+        }),
+      },
+    });
+    const proposeAndComplete = async (toolCallId: string) => {
+      expect((await h.session.sendMessage("propose", sendOptions)).success).toBe(true);
+      emitter.emit("tool-call-end", {
+        type: "tool-call-end",
+        workspaceId,
+        messageId: `assistant-${turns}`,
+        toolCallId,
+        toolName: "propose_plan",
+        result: { success: true },
+        timestamp: Date.now(),
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      completions[turns - 1].resolve(streamEnd());
+      await h.session.waitForIdle();
+    };
+    try {
+      await proposeAndComplete("call-stalled");
+      expect(await planReviewRows(h, workspaceId)).toHaveLength(0);
+
+      // A plain completed turn: nothing to capture, so settlement must not wait the deadline.
+      expect((await h.session.sendMessage("hello", sendOptions)).success).toBe(true);
+      const started = Date.now();
+      completions[turns - 1].resolve(streamEnd());
+      await h.session.waitForIdle();
+      expect(Date.now() - started).toBeLessThan(150);
+
+      // A later healthy capture (fast read) still becomes durable.
+      await proposeAndComplete("call-healthy");
+      expect(await planReviewRows(h, workspaceId)).toHaveLength(1);
+    } finally {
+      completions.forEach((completion) =>
+        completion.resolve({ status: "aborted", abortReason: "user" })
+      );
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("ensurePlanSnapshot refuses an aborted capture at append admission, after the read", async () => {
     const workspaceId = "session-plan-capture-admission";
     await writePlan(workspaceId, "# Plan\n\nStep one.\n");

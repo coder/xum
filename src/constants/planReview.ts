@@ -42,9 +42,10 @@ export const PLAN_REVIEW_MAX_SUMMARY_CHARS = 2_000;
 export const PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK = 50;
 export const PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK = 50;
 /**
- * Bytes reserved when judging the persisted feedback row against SESSION_HISTORY_MAX_LINE_BYTES:
- * the send path stamps fields the prepare step cannot see (toolPolicy, retrySendOptions, agent
- * and goal ids), all small compared with this reserve.
+ * Bytes reserved when judging the persisted feedback row against SESSION_HISTORY_MAX_LINE_BYTES.
+ * The measured candidate already carries the send options the row will persist (toolPolicy and
+ * the startup-retry snapshot); this covers the remaining send-time stamps prepare cannot see
+ * (acp prompt id, goal kind/id, enqueue time), all small compared with the reserve.
  */
 export const PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES = 16 * 1024;
 

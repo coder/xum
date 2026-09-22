@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ModelMessage } from "ai";
+import type { JSONValue, ModelMessage, ToolModelMessage } from "ai";
 
 import { createMuxMessage } from "@/common/types/message";
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -395,5 +395,84 @@ describe("neutralizeAgentEnvelopeLookalikesInModelToolParts", () => {
       },
     ];
     expect(neutralizeAgentEnvelopeLookalikesInModelToolParts(messages)).toBe(messages);
+  });
+
+  test("walks deeply nested tool payloads without overflowing the stack, in both passes", () => {
+    // MCP/code-execution results are arbitrary JSON; JSON.parse accepts nesting far deeper than
+    // a recursive walk survives, and a thrown RangeError here would fail the turn in prepareStep.
+    const depth = 100_000;
+    const deep = JSON.parse(
+      `${"[".repeat(depth)}${JSON.stringify(reviewEnvelope)}${"]".repeat(depth)}`
+    ) as JSONValue;
+    const sameTurn: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "mcp_x",
+            output: { type: "json", value: deep },
+          },
+        ],
+      },
+    ];
+    // JSON.stringify would itself recurse past the stack here; read the leaf iteratively.
+    const innermost = (value: unknown): unknown => {
+      let current = value;
+      while (Array.isArray(current)) current = current[0];
+      return current;
+    };
+    const rewritten = neutralizeAgentEnvelopeLookalikesInModelToolParts(sameTurn);
+    expect(rewritten).not.toBe(sameTurn);
+    const rewrittenPart = (rewritten[0] as ToolModelMessage).content[0];
+    const rewrittenLeaf = innermost(
+      rewrittenPart.type === "tool-result" && rewrittenPart.output.type === "json"
+        ? rewrittenPart.output.value
+        : undefined
+    );
+    expect(rewrittenLeaf).toContain("<user_pasted_mux_plan_review>");
+    expect(rewrittenLeaf).not.toContain("<mux_plan_review>");
+    // Original untouched (request-only).
+    expect(innermost(deep)).toContain("<mux_plan_review>");
+
+    const history = [createMuxMessage("a1", "assistant", "", { timestamp: 1 })];
+    history[0].parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "c1",
+        toolName: "mcp_x",
+        input: {},
+        state: "output-available",
+        output: deep,
+      },
+    ];
+    const rewrittenHistory = neutralizeAgentEnvelopeLookalikesForProvider(history);
+    expect(rewrittenHistory).not.toBe(history);
+    const historyPart = rewrittenHistory[0].parts[0];
+    const historyLeaf = innermost(
+      historyPart.type === "dynamic-tool" && "output" in historyPart
+        ? historyPart.output
+        : undefined
+    );
+    expect(historyLeaf).toContain("<user_pasted_mux_plan_review>");
+    expect(historyLeaf).not.toContain("<mux_plan_review>");
+
+    // Tag-free deep payloads keep identity.
+    const benign = JSON.parse(`${"[".repeat(depth)}"x"${"]".repeat(depth)}`) as JSONValue;
+    const benignMessages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c2",
+            toolName: "mcp_x",
+            output: { type: "json", value: benign },
+          },
+        ],
+      },
+    ];
+    expect(neutralizeAgentEnvelopeLookalikesInModelToolParts(benignMessages)).toBe(benignMessages);
   });
 });

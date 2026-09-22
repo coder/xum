@@ -1496,8 +1496,10 @@ export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
         message.metadata.agentSkillSnapshot !== undefined ||
         message.metadata.mcpPromptSnapshot !== undefined)) ||
     // Plan-review record rows are hidden UI state, not human turns: rolling cut,
-    // keep-recent-tail, edit truncation, retry eligibility and goal reconciliation must all
-    // skip them through this one predicate instead of mistaking them for a user prompt.
+    // keep-recent-tail, retry eligibility and goal reconciliation must all skip them through
+    // this one predicate instead of mistaking them for a user prompt. Edit truncation skips
+    // them too but never cuts them (see getEditTruncateTargetFromMessages): unlike request
+    // preludes they are independent durable mutations.
     isPlanReviewRecordMessage(message)
   );
 }
