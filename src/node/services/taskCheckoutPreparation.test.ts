@@ -12,6 +12,7 @@ import {
   bindTaskCheckoutIdentity,
   buildTaskCheckoutPreparation,
   canonicalRuntimeConfigJson,
+  claimTaskCheckoutIdentity,
   classifyTaskCheckoutKind,
   newMaterializationId,
   revalidateTaskCheckoutIdentity,
@@ -51,7 +52,13 @@ describe("taskCheckoutPreparation", () => {
     const checkout = path.join(config.srcDir, "repo", `agent_explore_${id}`);
     git(projectPath, `worktree add -q -b ${id} "${checkout}" main`);
     const materializationId = newMaterializationId();
-    const identity = await bindTaskCheckoutIdentity({ workspacePath: checkout }, materializationId);
+    const claimed = await claimTaskCheckoutIdentity({ workspacePath: checkout }, materializationId);
+    if (claimed instanceof Error) throw claimed;
+    const identity = await bindTaskCheckoutIdentity(
+      { workspacePath: checkout },
+      materializationId,
+      claimed
+    );
     if (identity instanceof Error) throw identity;
     const proof = buildTaskCheckoutPreparation(identity, worktree);
     return {
@@ -119,9 +126,17 @@ describe("taskCheckoutPreparation", () => {
         )
       ).trim()
     ).toBe(proof.materializationId);
-    // A second bind must never bless or reuse an existing generation.
+    // A second claim/bind must never bless or reuse an existing generation.
     expect(
-      await bindTaskCheckoutIdentity({ workspacePath: checkout }, newMaterializationId())
+      await claimTaskCheckoutIdentity({ workspacePath: checkout }, newMaterializationId())
+    ).toBeInstanceOf(Error);
+    expect(
+      await bindTaskCheckoutIdentity({ workspacePath: checkout }, newMaterializationId(), {
+        path: checkout,
+        realpath: proof.realpath,
+        root: proof.root,
+        gitdir: proof.gitdir,
+      })
     ).toBeInstanceOf(Error);
     await publish([rootRow("root1", projectPath), row]);
     const result = await validateTaskCheckoutPreparation(config, "ded01");
@@ -135,6 +150,26 @@ describe("taskCheckoutPreparation", () => {
       anchorPath: checkout,
       ancestry: [],
     });
+    expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toEqual({ current: true });
+    // The authority signs EVERY input, not just id/revision: an unchanged revision with a changed
+    // proof field, runtime, path or parent is not current; attempt/status changes are irrelevant.
+    const republish = (extra: Partial<Workspace>) =>
+      publish([rootRow("root1", projectPath), { ...row, ...extra }]);
+    await republish({ taskAttemptId: "att_0123456789abcdef", taskStatus: "running" });
+    expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toEqual({ current: true });
+    await republish({ taskCheckoutPreparation: { ...proof, realpath: proof.realpath + "-x" } });
+    expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toMatchObject({
+      current: false,
+    });
+    await republish({ runtimeConfig: { type: "worktree", srcBaseDir: "/elsewhere" } });
+    expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toMatchObject({
+      current: false,
+    });
+    await republish({ parentWorkspaceId: undefined });
+    expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toMatchObject({
+      current: false,
+    });
+    await republish({});
     expect(assertCurrentTaskCheckoutAuthority(config, result.authority)).toEqual({ current: true });
     // Later legitimate consent (an override document edit) is NOT part of the identity.
     await fsPromises.mkdir(path.join(checkout, ".xum"), { recursive: true });
@@ -182,7 +217,50 @@ describe("taskCheckoutPreparation", () => {
     expect(await state(config, "ded02")).toBe("excluded-offhost");
     await publish([rootRow("root1", projectPath)]);
     expect(await state(config, "root1")).toBe("excluded-root");
+    // A PRESENT proof is inspected before any exemption: a proof-bearing row that lost its
+    // parent is unsupported, not an exempt root; a missing row is refused, never exempt.
+    await publish([rootRow("root1", projectPath, { taskCheckoutPreparation: proof })]);
+    expect(await state(config, "root1")).toBe("unsupported");
+    expect(await state(config, "nosuchrow")).toBe("unreadable");
   });
+
+  test("claim before the prune, bind after: a same-path replacement (even with reused inodes) is never bound", async () => {
+    const checkout = path.join(config.srcDir, "repo", "agent_explore_swap01");
+    git(projectPath, `worktree add -q -b swap01 "${checkout}" main`);
+    const id = newMaterializationId();
+    const claimed = await claimTaskCheckoutIdentity({ workspacePath: checkout }, id);
+    if (claimed instanceof Error) throw claimed;
+    const admin = await fsPromises.realpath(
+      path.join(projectPath, ".git", "worktrees", "agent_explore_swap01")
+    );
+    const nonce = path.join(admin, TASK_CHECKOUT_PREPARATION_NONCE_FILE);
+    expect((await fsPromises.readFile(nonce, "utf-8")).trim()).toBe(id);
+    // Same path, new directory (the older-build cleanup + re-fork shape) between claim and bind.
+    // Linux hands the re-created directories the same inodes back often enough that dev/ino
+    // identity alone would accept it; the missing nonce is what refuses.
+    git(projectPath, `worktree remove --force "${checkout}"`);
+    git(projectPath, `worktree add -q -b swap01b "${checkout}" main`);
+    expect(await bindTaskCheckoutIdentity({ workspacePath: checkout }, id, claimed)).toBeInstanceOf(
+      Error
+    );
+    expect(
+      await fsPromises
+        .lstat(nonce)
+        .then(() => "present")
+        .catch((error: unknown) => (error as { code?: string }).code)
+    ).toBe("ENOENT");
+    // A checkout claimed under another id never binds under this one; the intact claim binds.
+    const other = newMaterializationId();
+    const reclaimed = await claimTaskCheckoutIdentity({ workspacePath: checkout }, other);
+    if (reclaimed instanceof Error) throw reclaimed;
+    expect(
+      await bindTaskCheckoutIdentity({ workspacePath: checkout }, id, reclaimed)
+    ).toBeInstanceOf(Error);
+    expect(await bindTaskCheckoutIdentity({ workspacePath: checkout }, other, reclaimed)).toEqual({
+      ...reclaimed,
+      materializationId: other,
+    });
+  }, 20_000);
 
   test("physical identity: same-path re-add, nonce edit, missing, special .git file, .git directory all refuse", async () => {
     const { checkout, proof, row } = await prepareDedicated("ded03");
