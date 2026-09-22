@@ -95,6 +95,9 @@ export function makeAgentTaskIntegrationFake(
     acknowledgeAgentReports: () => Promise.resolve(new Set<string>()),
     backgroundForegroundWaitsForWorkspace: () => 0,
     markInterruptedTaskRunning: () => Promise.resolve(false),
+    // Fakes model non-task hosts by default: nothing is a prepared task row here.
+    preflightTaskWorkspacePreparation: (workspaceId: string) =>
+      Promise.resolve(Ok({ kind: "exempt" as const, workspaceId, exemption: "root" as const })),
     admitTaskWorkspaceTurn: () => ({ kind: "not-a-task" as const }),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,
@@ -106,8 +109,8 @@ export function makeAgentTaskIntegrationFake(
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
     // Derived from the (possibly overridden) boolean rescue, so suites that script only
     // markInterruptedTaskRunning keep driving the outcome WorkspaceService consumes.
-    reawakenInterruptedTask: async (workspaceId) =>
-      (await fake.markInterruptedTaskRunning(workspaceId))
+    reawakenInterruptedTask: async (workspaceId, options) =>
+      (await fake.markInterruptedTaskRunning(workspaceId, options))
         ? { kind: "reawakened", attemptId: FAKE_REAWAKENED_ATTEMPT_ID, statusChanged: true }
         : { kind: "not-applicable" },
     ...overrides,
