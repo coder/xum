@@ -37,6 +37,17 @@ describe("inheritOpenWorkspaceTurnMetadata", () => {
     expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
   });
 
+  test("a hidden plan-review record after the cut does not close the turn", () => {
+    // Resolving a review thread appends a synthetic user row as the history tail; it is UI
+    // state, not a human turn, so the wake must still reach the correlated assistant.
+    const resolved = createMuxMessage("resolve", "user", "<mux_plan_review>...</mux_plan_review>", {
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec_1", threadId: "thr_1" },
+    });
+    const messages = [turnPrompt("prompt"), cutAssistant("cut"), resolved, wake("wake")];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
   test("chained wake continuations keep inheriting through inherited assistants", () => {
     const messages = [
       turnPrompt("prompt"),

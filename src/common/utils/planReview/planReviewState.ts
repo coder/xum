@@ -305,8 +305,10 @@ export function formatPlanReviewStateBlock(
       latest !== undefined && thread.snapshotId === latest.snapshotId
         ? "current snapshot"
         : `earlier snapshot ${state.snapshots.find((s) => s.snapshotId === thread.snapshotId)?.contentHash.slice(0, 12) ?? "?"}`;
+    // Thread ids are persisted rows' data (a forged or corrupted authentic row may carry any
+    // non-empty string), so they are quoted like every other untrusted field of the block.
     const lines = [
-      `- thread ${thread.threadId} · ${revision} · lines ${thread.anchor.startLine}-${thread.anchor.endLine}`,
+      `- thread ${quoteForBlock(thread.threadId)} · ${revision} · lines ${thread.anchor.startLine}-${thread.anchor.endLine}`,
       `  quote: ${quoteForBlock(thread.quote)}`,
       `  comment: ${quoteForBlock(thread.body)}`,
     ];

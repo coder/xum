@@ -73,6 +73,9 @@ export function inheritOpenWorkspaceTurnMetadata(
 ): Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
+    // Model-hidden records (plan-review snapshot/resolve/reopen, workflow display rows) are
+    // UI state that can land after the correlated assistant cut; they are not turn boundaries.
+    if (isModelHiddenMessage(message)) continue;
     const muxMetadata = message.metadata?.muxMetadata;
     if (message.role === "assistant") {
       if (
