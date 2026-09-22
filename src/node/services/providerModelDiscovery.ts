@@ -123,6 +123,9 @@ export async function discoverProviderModels(
       for (const item of data.data) ids.add(item.id);
       if (anthropic && data.has_more === undefined) throw new Error();
       if (!anthropic || !data.has_more) {
+        // Teardown can yield to credential edits or cancellation; fence publication after it.
+        await agent.destroy().catch(() => undefined);
+        agent = undefined;
         current();
         const allowed = request.policy.allowedModels;
         return {
@@ -143,6 +146,7 @@ export async function discoverProviderModels(
     };
   } finally {
     clearTimeout(timeout);
-    await agent?.destroy().catch(() => undefined);
+    // Do not yield again after successful publication's fence, even by awaiting undefined.
+    if (agent) await agent.destroy().catch(() => undefined);
   }
 }

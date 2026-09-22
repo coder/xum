@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EnvHttpProxyAgent } from "undici/index.js";
 import { Config } from "@/node/config";
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
 import { PolicyService } from "./policyService";
@@ -283,4 +284,42 @@ it.each(["abort", "pre-aborted", "timeout"])(
     if (kind === "pre-aborted") expect(requests).toHaveLength(0);
   },
   15000
+);
+
+it.each(["unchanged", "key", "abort"])(
+  "rechecks publication after %s during dispatcher teardown",
+  async (change) => {
+    save("openai");
+    respond = () => Response.json({ data: [{ id: "old-model" }] });
+    const teardown = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    // Capture before spying; the callback overload is invoked below with its original receiver.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const destroy = EnvHttpProxyAgent.prototype.destroy;
+    const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
+      this: EnvHttpProxyAgent
+    ) {
+      // Close real sockets first, then hold the existing asynchronous cleanup boundary.
+      await new Promise<void>((done) => destroy.call(this, null, done));
+      teardown.resolve();
+      await release.promise;
+    });
+    cleanups.push(() => spy.mockRestore());
+    const abort = new AbortController();
+    const pending = service.discoverModels("openai", abort.signal);
+    try {
+      await teardown.promise;
+      if (change === "key") save("openai", { apiKey: "rotated" });
+      if (change === "abort") abort.abort(new Error("private-abort-reason"));
+      release.resolve();
+      expect(await pending).toEqual(
+        change === "unchanged"
+          ? { status: "ok", modelIds: ["old-model"] }
+          : { status: "error", reason: change === "key" ? "stale-config" : "aborted" }
+      );
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  }
 );
