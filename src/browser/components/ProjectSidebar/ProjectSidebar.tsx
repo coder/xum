@@ -69,6 +69,7 @@ import {
   orderMultiProjectSectionRows,
   resolveEffectiveSectionId,
   isSidebarSubAgentRunning,
+  isWorkspaceSidebarStateWorking,
   computeRowMetaForVisibleNodes,
   type AgentRowRenderMeta,
   type SidebarVisibleRowNode,
@@ -211,16 +212,8 @@ function getWorkspaceAttentionSignal(
 ): WorkspaceAttentionSignal | null {
   try {
     const sidebarState = workspaceStore.getWorkspaceSidebarState(workspaceId);
-    const isWorking =
-      (sidebarState.canInterrupt ||
-        sidebarState.isStarting ||
-        sidebarState.activeWorkflowRunCount > 0 ||
-        // An armed background bash monitor keeps the workspace "working" so collapsed
-        // project/parent rows don't look idle while it waits to be woken.
-        sidebarState.activeBashMonitorCount > 0) &&
-      !sidebarState.awaitingUserQuestion;
     return {
-      isWorking,
+      isWorking: isWorkspaceSidebarStateWorking(sidebarState),
       hasActiveBashMonitor: sidebarState.activeBashMonitorCount > 0,
       awaitingUserQuestion: sidebarState.awaitingUserQuestion,
       activeWorkflowRunIdsKey: (sidebarState.activeWorkflowRunIds ?? []).join("\u0000"),
