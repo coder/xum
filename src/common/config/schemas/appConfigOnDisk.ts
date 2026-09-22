@@ -111,6 +111,12 @@ export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchem
  * `evaluate()` steps that do not pass `model` themselves (a `provider:model`
  * string). Absent means "no default" — the step fails with
  * `invalid-input/no-model`; it is never inferred from the chat model.
+ *
+ * Deliberately separate from `autoModelRouting.evaluationModel` below: that one
+ * selects the prompt-difficulty classifier for automatic chat model routing
+ * (defaulting to TypeSafe's Jev), whereas this one selects an explicit,
+ * author-invoked workflow evaluator with its own admission and billing
+ * semantics. Neither falls back to the other.
  */
 export const EvaluationDefaultsSchema = z.object({
   model: z.string().min(1).optional(),
