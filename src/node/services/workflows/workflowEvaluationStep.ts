@@ -192,7 +192,13 @@ export async function runWorkflowEvaluationStep(
   // 3. Lookup.
   const existing = await journal.getStep(context.runId, spec.id, inputHash);
   if (existing?.status === "completed") {
-    return await replayCompletedStep(context, { spec, existing, inputHash, stepDigest });
+    return await replayCompletedStep(context, {
+      spec,
+      existing,
+      inputHash,
+      stepDigest,
+      receipts: { stateSha256, stateBytes, questionsSha256, questionCount },
+    });
   }
 
   let attempt = 1;
@@ -453,7 +459,11 @@ export async function runWorkflowEvaluationStep(
  * A completed record is immutable for its `(stepId, inputHash)`: a valid stored
  * result is returned verbatim and never re-dispatched; a malformed one fails
  * the run without touching the record (an older build's reader may have
- * written something this build cannot trust).
+ * written something this build cannot trust). "Valid" includes the receipts:
+ * the result's own state digest and the admission's state/questions digests
+ * must match the input being evaluated now, so a record whose body was
+ * corrupted or misassociated while keeping its key cannot return answers that
+ * were produced for a different state.
  */
 async function replayCompletedStep(
   context: WorkflowEvaluationStepContext,
@@ -462,6 +472,10 @@ async function replayCompletedStep(
     existing: WorkflowStepRecord;
     inputHash: string;
     stepDigest: string;
+    receipts: Pick<
+      EvaluationAdmission,
+      "stateSha256" | "stateBytes" | "questionsSha256" | "questionCount"
+    >;
   }
 ): Promise<EvaluationStepResult> {
   const parsed = EvaluationStepResultSchema.safeParse(input.existing.result?.structuredOutput);
@@ -472,10 +486,20 @@ async function replayCompletedStep(
         parsed.data.rounding
       )
     : undefined;
-  if (!parsed.success || validated?.ok !== true) {
+  const admission = EvaluationAdmissionSchema.safeParse(input.existing.evaluation);
+  const { receipts } = input;
+  const receiptsMatch =
+    parsed.success &&
+    parsed.data.state.sha256 === receipts.stateSha256 &&
+    parsed.data.state.bytes === receipts.stateBytes &&
+    (!admission.success ||
+      (admission.data.stateSha256 === receipts.stateSha256 &&
+        admission.data.stateBytes === receipts.stateBytes &&
+        admission.data.questionsSha256 === receipts.questionsSha256 &&
+        admission.data.questionCount === receipts.questionCount));
+  if (!parsed.success || validated?.ok !== true || !receiptsMatch) {
     throw new Error(`evaluation replay failed: cached result invalid (step ${input.stepDigest})`);
   }
-  const admission = EvaluationAdmissionSchema.safeParse(input.existing.evaluation);
   try {
     await context.journal.appendEvent({
       type: "evaluation",

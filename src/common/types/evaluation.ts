@@ -301,11 +301,23 @@ export function formatWorkflowEvaluationStepError(input: {
 }
 
 const WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE =
-  /^evaluation failed: [a-z-]+\/[a-z-]+( status \d+)? \(step [0-9a-f]+, attempt \d+\)$/;
+  /^evaluation failed: ([a-z-]+)\/([a-z-]+)( status \d+)? \(step [0-9a-f]+, attempt \d+\)$/;
 
-/** True for the exact text `formatWorkflowEvaluationStepError` produces. */
-export function isWorkflowEvaluationStepErrorMessage(message: string): boolean {
-  return WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE.test(message);
+/**
+ * Inverse of `formatWorkflowEvaluationStepError` for the exact text it
+ * produces: the reason/code pair, or null for any other text (including a
+ * message that merely embeds one, or names outside the enums).
+ */
+export function parseWorkflowEvaluationStepError(
+  message: string
+): { reason: EvaluationStepFailureReason; code: EvaluationStepFailureCode } | null {
+  const match = WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE.exec(message);
+  if (match === null) {
+    return null;
+  }
+  const reason = EvaluationStepFailureReasonSchema.safeParse(match[1]);
+  const code = EvaluationStepFailureCodeSchema.safeParse(match[2]);
+  return reason.success && code.success ? { reason: reason.data, code: code.data } : null;
 }
 
 export const EvaluationStepFailureReasonSchema = z.enum([

@@ -1,9 +1,10 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
 import { describe, expect, spyOn, test } from "bun:test";
-import type {
-  EvaluationAdmission,
-  EvaluationQuestions,
-  EvaluationStepResult,
+import {
+  canonicalEvaluationJson,
+  type EvaluationAdmission,
+  type EvaluationQuestions,
+  type EvaluationStepResult,
 } from "@/common/types/evaluation";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 import {
@@ -13,6 +14,7 @@ import {
 } from "@/constants/evaluation";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
 import type { EvaluationCallResult } from "@/node/services/evaluation/evaluationService";
+import { sha256Hex } from "@/node/services/evaluation/evaluationDigest";
 import { log } from "@/node/services/log";
 import type { PinnedEvaluationModel } from "@/node/services/providerModelFactory";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -66,6 +68,14 @@ const ANSWERS = {
   asksForSecrets: { type: "boolean", probability: 0.05 },
 } as const;
 const USAGE = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
+// Receipts the runner computes for STATE/QUESTIONS; replay verifies stored
+// records against them, so seeded fixtures must carry the real values.
+const STATE_CANONICAL = canonicalEvaluationJson(STATE);
+const STATE_RECEIPT = {
+  sha256: sha256Hex(STATE_CANONICAL),
+  bytes: Buffer.byteLength(STATE_CANONICAL, "utf8"),
+};
+const QUESTIONS_SHA256 = sha256Hex(canonicalEvaluationJson(QUESTIONS));
 
 const definition = {
   name: "screen-issue",
@@ -304,16 +314,16 @@ function admissionFor(input: {
     },
     timeoutMs: EVALUATION_DEFAULT_TIMEOUT_MS,
     attemptDeadlineAt: "2026-05-29T00:01:00.000Z",
-    stateSha256: "seeded",
-    stateBytes: 1,
-    questionsSha256: "seeded",
+    stateSha256: STATE_RECEIPT.sha256,
+    stateBytes: STATE_RECEIPT.bytes,
+    questionsSha256: QUESTIONS_SHA256,
     questionCount: 3,
   };
 }
 
 const storedResult: EvaluationStepResult = {
   ...EXPECTED_RESULT_SHAPE,
-  state: { sha256: "seeded", bytes: 1 },
+  state: STATE_RECEIPT,
 };
 
 describe("hashEvaluationStepInput", () => {
@@ -630,6 +640,8 @@ describe("WorkflowRunner evaluate()", () => {
     const step = await readStep(store);
     expect(step?.status).toBe("failed");
     expect(step?.evaluation).toBeUndefined();
+    // Corruption is not recoverable by configuration: no retry is offered.
+    expect(canRetryWorkflowFromCheckpoint(await store.getRun(RUN_ID))).toBe(false);
   });
 
   test("a failed record whose admission is malformed fails closed as admission-missing", async () => {
@@ -1050,6 +1062,36 @@ describe("WorkflowRunner evaluate()", () => {
     }
   });
 
+  test("a cached result whose receipts do not match the current input fails closed", async () => {
+    // Same (stepId, inputHash) key, but the record body describes another
+    // state: a mismatching result receipt or admission receipt must not replay.
+    const corruptions: Array<{ result: EvaluationStepResult; admission: EvaluationAdmission }> = [
+      {
+        result: { ...storedResult, state: { sha256: "other-state", bytes: STATE_RECEIPT.bytes } },
+        admission: admissionFor({ attempt: 1 }),
+      },
+      {
+        result: storedResult,
+        admission: { ...admissionFor({ attempt: 1 }), questionsSha256: "other-questions" },
+      },
+    ];
+    for (const corruption of corruptions) {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path);
+      await seedCompletedStep(store, corruption);
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+      const fake = createFakeAdapter();
+
+      await expect(
+        createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+      ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
+
+      expect(fake.dispatchCalls).toHaveLength(0);
+      expect((await readStep(store))?.status).toBe("completed");
+      expect(evaluationEvents(await store.getRun(RUN_ID))).toHaveLength(0);
+    }
+  });
+
   test("a rejected cached-event append on replay still returns the stored result", async () => {
     using tmp = new DisposableTempDir("workflow-eval");
     const store = await createStore(tmp.path);
@@ -1135,7 +1177,11 @@ describe("WorkflowRunner evaluate()", () => {
       `evaluation failed: invalid-input/invalid-state (step ${STEP_DIGEST}, attempt 1)`
     );
     expect(fake.resolveCalls).toHaveLength(0);
-    for (const message of errorMessages(await store2.getRun(RUN_ID))) expectNoSentinels(message);
+    const run2 = await store2.getRun(RUN_ID);
+    for (const message of errorMessages(run2)) expectNoSentinels(message);
+    // Deterministic for the same source and state, unlike no-model/unauthorized:
+    // a checkpoint retry could only fail the same way, so none is offered.
+    expect(canRetryWorkflowFromCheckpoint(run2)).toBe(false);
   });
 
   test("a runtime without an evaluation adapter fails closed as runtime-unavailable", async () => {

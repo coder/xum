@@ -1,6 +1,6 @@
 import type { EvaluationAdmission } from "@/common/types/evaluation";
 import {
-  isWorkflowEvaluationStepErrorMessage,
+  parseWorkflowEvaluationStepError,
   WORKFLOW_EVALUATION_STEP_ERROR_NAME,
 } from "@/common/types/evaluation";
 import type { WorkflowRunEvent, WorkflowRunRecord } from "@/common/types/workflow";
@@ -83,13 +83,32 @@ function findFailedEvaluationAdmission(
 }
 
 /**
+ * Pre-admission failures whose outcome can change between attempts without
+ * touching the workflow source: the evaluation model default, provider keys,
+ * route preferences and custom providers live in Settings, the deadline and
+ * the runtime depend on the environment. Everything else the runner can raise
+ * before admission is deterministic for the same source and state
+ * (spec/state validation, size bounds) or is corruption that fails closed
+ * (`admission-missing`), so offering a retry would only reproduce the failure.
+ */
+const RECOVERABLE_PRE_ADMISSION_EVALUATION_FAILURES: ReadonlySet<string> = new Set([
+  "invalid-input/no-model",
+  "unsupported/unsupported-provider",
+  "unsupported/unsupported-route",
+  "unsupported/unknown-model",
+  "unsupported/runtime-unavailable",
+  "unauthorized/unauthorized",
+  "deadline/deadline",
+]);
+
+/**
  * A first attempt that fails before admission (no configured model, missing
  * key, unsupported route, …) deliberately writes no step record, so nothing in
  * `run.steps` can be matched; the runner's exact error text (bare or
- * sandbox-prefixed, as above) is the only trace. Recognising it lets the user
- * fix the configuration and retry from the checkpoint at attempt 1 instead of
- * starting over; a matched record takes precedence so the attempt cap above
- * still applies.
+ * sandbox-prefixed, as above) is the only trace. Recognising the recoverable
+ * ones lets the user fix the configuration and retry from the checkpoint at
+ * attempt 1 instead of starting over; a matched record takes precedence so the
+ * attempt cap above still applies.
  */
 function isPreAdmissionEvaluationFailure(latestErrorMessage: string | undefined): boolean {
   if (latestErrorMessage === undefined) {
@@ -99,7 +118,11 @@ function isPreAdmissionEvaluationFailure(latestErrorMessage: string | undefined)
   const message = latestErrorMessage.startsWith(prefix)
     ? latestErrorMessage.slice(prefix.length)
     : latestErrorMessage;
-  return isWorkflowEvaluationStepErrorMessage(message);
+  const failure = parseWorkflowEvaluationStepError(message);
+  return (
+    failure !== null &&
+    RECOVERABLE_PRE_ADMISSION_EVALUATION_FAILURES.has(`${failure.reason}/${failure.code}`)
+  );
 }
 
 function getUnsafePatchRetryReason(run: WorkflowRunRecord): string | null {
