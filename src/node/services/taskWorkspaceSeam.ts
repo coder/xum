@@ -16,6 +16,7 @@ import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { TurnId } from "@/node/services/turnCoordinator";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type { TaskCheckoutPreparation } from "@/common/schemas/project";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
@@ -681,6 +682,23 @@ export interface WorkspaceProvisioningHost {
   registerSanitizedTaskCheckout<T>(
     target: { workspacePath: string; runtimeConfig: RuntimeConfig },
     publish: () => Promise<T>
+  ): Promise<Result<T, string>>;
+  /**
+   * One registration-lock hold for a batch of task rows: `materialize` (the forks of the batch's
+   * fresh DEDICATED host-local checkouts; may return none for shared / off-host batches), then
+   * per checkout the strict prune + identity bound under the checkout locks, then `publish` with
+   * their proofs. `Err` means nothing was published and any forked directories were retained;
+   * see WorkspaceService.prepareTaskCheckouts.
+   */
+  prepareTaskCheckouts<T>(
+    materialize: () => Promise<
+      ReadonlyArray<{
+        workspacePath: string;
+        runtimeConfig: RuntimeConfig;
+        materializationId: string;
+      }>
+    >,
+    publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>
   ): Promise<Result<T, string>>;
   discardExtensionMetadataEntry(workspaceId: string): Promise<void>;
   registerExternalBackgroundInit(

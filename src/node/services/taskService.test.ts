@@ -4,7 +4,7 @@ import { SecretsStore } from "@/node/config";
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import * as os from "os";
 import { execSync } from "node:child_process";
 import {
@@ -74,7 +74,6 @@ import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRu
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
-import { ContainerManager } from "@/node/multiProject/containerManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -131,7 +130,7 @@ import {
   findWorkspaceInConfig,
   initGitRepo,
   mergeTestAgentAiDefaults,
-  projectWorkspace,
+  projectWorkspace as projectWorkspaceEntry,
   saveLocalParentWorkspace,
   saveTestConfig,
   saveWorkspaces,
@@ -144,6 +143,32 @@ import {
   workspaceTurnStreamEndEvent,
   writeCustomAgentDefinition,
 } from "@/node/services/taskService.testHarness";
+import { prepareDedicatedTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
+
+/**
+ * This suite's rows default to the project-dir `local` runtime: its fixture directories are not
+ * git repositories (nothing can be forked or prepared in them), and a task row without a runtime
+ * would default to a worktree — a DEDICATED row that, seeded without a preparation proof, is a
+ * legacy row the checkout-preparation gate refuses at every admission by design. Project-dir
+ * rows share the project directory, so a whole seeded tree derives `ready` from its root through
+ * same-path ancestry. Fixtures about forks/worktrees pass their runtime explicitly.
+ */
+function projectWorkspace(
+  ...[projectPath, directoryName, id, options = {}]: Parameters<typeof projectWorkspaceEntry>
+): ReturnType<typeof projectWorkspaceEntry> {
+  // The gate stats a shared row's execution directory (the project directory): make the
+  // fixture's exist. A few fixtures name paths outside the temp root (`/test/project`) and never
+  // reach an admission; their mkdir failure is irrelevant.
+  try {
+    mkdirSync(projectPath, { recursive: true });
+  } catch {
+    // see above
+  }
+  return projectWorkspaceEntry(projectPath, directoryName, id, {
+    runtimeConfig: { type: "local" },
+    ...options,
+  });
+}
 
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
   const messages: MuxMessage[] = [];
@@ -6433,6 +6458,20 @@ describe("TaskService", () => {
     const acceptedStartingTaskId = "task-starting-accepted";
     const acceptedStartingWorkspaceName = "agent_explore_task-starting-accepted";
     const acceptedPrompt = "already accepted prompt";
+    // Dedicated rows are published PREPARED (the checkout exists, claimed and bound, before the
+    // row); a queued or starting dedicated row without a proof is a legacy row the launch refuses.
+    const prepared = async (workspaceName: string) => {
+      const checkout = runtime.getWorkspacePath(projectPath, workspaceName);
+      return {
+        path: checkout,
+        taskCheckoutPreparation: await prepareDedicatedTaskCheckout({
+          projectPath,
+          checkout,
+          branch: workspaceName,
+          runtimeConfig,
+        }),
+      };
+    };
     await saveWorkspaces(
       config,
       projectPath,
@@ -6445,10 +6484,10 @@ describe("TaskService", () => {
           runtimeConfig,
         },
         {
-          path: runtime.getWorkspacePath(projectPath, queuedWorkspaceName),
+          ...(await prepared(queuedWorkspaceName)),
           id: queuedTaskId,
           name: queuedWorkspaceName,
-          title: "Legacy queued task",
+          title: "Prepared queued task",
           createdAt: new Date().toISOString(),
           runtimeConfig,
           parentWorkspaceId: parentId,
@@ -6459,7 +6498,7 @@ describe("TaskService", () => {
           taskTrunkBranch: parentName,
         },
         {
-          path: runtime.getWorkspacePath(projectPath, acceptedStartingWorkspaceName),
+          ...(await prepared(acceptedStartingWorkspaceName)),
           id: acceptedStartingTaskId,
           name: acceptedStartingWorkspaceName,
           title: "Accepted starting task",
@@ -6735,6 +6774,13 @@ describe("TaskService", () => {
         projectName: path.basename(secondaryProjectPath),
       },
     ];
+    const queuedCheckout = runtime.getWorkspacePath(primaryProjectPath, queuedWorkspaceName);
+    const queuedPreparation = await prepareDedicatedTaskCheckout({
+      projectPath: primaryProjectPath,
+      checkout: queuedCheckout,
+      branch: queuedWorkspaceName,
+      runtimeConfig,
+    });
 
     await config.editConfig(() => ({
       projects: new Map([
@@ -6752,7 +6798,10 @@ describe("TaskService", () => {
                 projects,
               },
               {
-                path: runtime.getWorkspacePath(primaryProjectPath, queuedWorkspaceName),
+                // Prepared at creation (a queued dedicated row is never forked at launch): the
+                // primary project's checkout, claimed and bound.
+                path: queuedCheckout,
+                taskCheckoutPreparation: queuedPreparation,
                 id: queuedTaskId,
                 name: queuedWorkspaceName,
                 createdAt: new Date().toISOString(),
@@ -6778,41 +6827,9 @@ describe("TaskService", () => {
       { key: "SECONDARY_SECRET", value: "secondary-secret" },
     ]);
 
-    const targetRuntime = new MultiProjectRuntime(
-      new ContainerManager(config.srcDir),
-      [
-        {
-          projectPath: primaryProjectPath,
-          projectName: path.basename(primaryProjectPath),
-          runtime: {
-            getWorkspacePath: mock(() => path.join(primaryProjectPath, queuedWorkspaceName)),
-            initWorkspace: mock(() => Promise.resolve({ success: true })),
-          } as unknown as WorktreeRuntime,
-        },
-        {
-          projectPath: secondaryProjectPath,
-          projectName: path.basename(secondaryProjectPath),
-          runtime: {
-            getWorkspacePath: mock(() => path.join(secondaryProjectPath, queuedWorkspaceName)),
-            initWorkspace: mock(() => Promise.resolve({ success: true })),
-          } as unknown as WorktreeRuntime,
-        },
-      ],
-      queuedWorkspaceName
-    );
-
-    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork").mockResolvedValue({
-      success: true,
-      data: {
-        workspacePath: path.join(config.srcDir, "_workspaces", queuedWorkspaceName),
-        trunkBranch: "main",
-        forkedRuntimeConfig: runtimeConfig,
-        targetRuntime,
-        forkedFromSource: true,
-        sourceRuntimeConfigUpdated: false,
-        projects,
-      },
-    });
+    // The launch reuses the prepared checkout: nothing forks, and the multi-project runtime is
+    // rebuilt from the row's projects (see getExistingMaterializedTaskLaunch).
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -6823,7 +6840,7 @@ describe("TaskService", () => {
 
       await taskService.initialize();
 
-      expect(forkSpy).toHaveBeenCalledTimes(1);
+      expect(forkSpy).not.toHaveBeenCalled();
       expect(sendMessage).toHaveBeenCalledWith(
         queuedTaskId,
         "start queued task",
@@ -6835,7 +6852,7 @@ describe("TaskService", () => {
       const firstBackgroundInitCall = runBackgroundInitSpy.mock.calls[0];
       assert(firstBackgroundInitCall, "Expected queued task to trigger background init");
       const [runtimeArg, initParams] = firstBackgroundInitCall;
-      expect(runtimeArg).toBe(targetRuntime);
+      expect(initParams.workspacePath).toBe(queuedCheckout);
       expect(initParams.env).toEqual({ PRIMARY_SECRET: "primary-secret" });
       assert(
         runtimeArg instanceof MultiProjectRuntime,
@@ -7567,6 +7584,10 @@ describe("TaskService", () => {
       workspaceService,
       initStateManager: initStateManager as unknown as InitStateManager,
     });
+    // Call tracking only (the real init runs): which tasks had their init HOOK started.
+    const backgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit");
+    const backgroundInitsFor = (taskId: string) =>
+      backgroundInitSpy.mock.calls.filter((call) => call[2] === taskId).length;
 
     const running = await createAgentTask(taskService, parentId, "task 1");
     expect(running.success).toBe(true);
@@ -7580,29 +7601,26 @@ describe("TaskService", () => {
     if (!queued.success) return;
     expect(queued.data.status).toBe("queued");
 
-    // Queued tasks should not create a worktree directory until they're dequeued.
+    // A queued dedicated checkout is PREPARED at creation (forked, sanitized, its proof on the
+    // row) — it exists before the dequeue; only its init hook and send wait for a slot.
     const cfgBeforeStart = config.loadConfigOrDefault();
     const queuedEntryBeforeStart = Array.from(cfgBeforeStart.projects.values())
       .flatMap((p) => p.workspaces)
       .find((w) => w.id === queued.data.taskId);
     expect(queuedEntryBeforeStart).toBeTruthy();
-    await fsPromises.stat(queuedEntryBeforeStart!.path).then(
-      () => {
-        throw new Error("Expected queued task workspace path to not exist before start");
-      },
-      () => undefined
-    );
+    expect(queuedEntryBeforeStart?.taskCheckoutPreparation).toMatchObject({
+      path: queuedEntryBeforeStart!.path,
+    });
+    expect((await fsPromises.stat(queuedEntryBeforeStart!.path)).isDirectory()).toBe(true);
 
+    // The preparation is its own (completed) init record: the fork and sanitization ran, the
+    // init HOOK did not — that waits for the dequeue.
+    expect(backgroundInitsFor(running.data.taskId)).toBe(1);
+    expect(backgroundInitsFor(queued.data.taskId)).toBe(0);
     const queuedInitStatusPath = path.join(
       config.sessionsDir,
       queued.data.taskId,
       "init-status.json"
-    );
-    await fsPromises.stat(queuedInitStatusPath).then(
-      () => {
-        throw new Error("Expected queued task init-status to not exist before start");
-      },
-      () => undefined
     );
 
     // Free slot and start queued tasks.
@@ -7625,8 +7643,9 @@ describe("TaskService", () => {
       expect.objectContaining({ allowQueuedAgentTask: true })
     );
 
-    // Init should start only once the task is dequeued.
+    // The init hook starts only once the task is dequeued, in the prepared checkout.
     await initStateManager.waitForInit(queued.data.taskId);
+    expect(backgroundInitsFor(queued.data.taskId)).toBe(1);
     expect(await fsPromises.stat(queuedInitStatusPath)).toBeTruthy();
 
     const cfgAfterStart = config.loadConfigOrDefault();
@@ -7634,7 +7653,9 @@ describe("TaskService", () => {
       .flatMap((p) => p.workspaces)
       .find((w) => w.id === queued.data.taskId);
     expect(queuedEntryAfterStart).toBeTruthy();
+    expect(queuedEntryAfterStart?.path).toBe(queuedEntryBeforeStart!.path);
     expect(await fsPromises.stat(queuedEntryAfterStart!.path)).toBeTruthy();
+    backgroundInitSpy.mockRestore();
   }, 20_000);
 
   test("does not start queued tasks while a reported task is still streaming", async () => {
@@ -12163,6 +12184,7 @@ describe("TaskService", () => {
           {
             ...projectWorkspace(projectPath, "target", "target", {
               unrelatedWorkspaceConsent: "consent",
+              runtimeConfig: undefined,
             }),
             name: undefined,
           },
@@ -13860,7 +13882,10 @@ describe("TaskService", () => {
           optedInWorkspace(projectPath, `remote-${label}`, `remote-${label}`, { runtimeConfig })
         ),
         // Missing inline identity can defer runtime resolution to legacy session metadata.
-        { ...optedInWorkspace(projectPath, "partial", "partial"), name: undefined },
+        {
+          ...optedInWorkspace(projectPath, "partial", "partial", { runtimeConfig: undefined }),
+          name: undefined,
+        },
       ]);
       const legacyDir = path.join(config.sessionsDir, "partial");
       await fsPromises.mkdir(legacyDir, { recursive: true });
@@ -18130,6 +18155,14 @@ describe("TaskService", () => {
     const queuedWorkflowTaskId = "queued-inactive-workflow";
     const queuedTaskId = "queued-starts-after-interrupt";
     const workflowRunId = "wfr_queue_after_interrupt";
+    // The queued dedicated row that must START is a prepared checkout (a queued row without a
+    // proof is a legacy row the drain refuses); the two rows interrupted below need none.
+    const queuedPreparation = await prepareDedicatedTaskCheckout({
+      projectPath,
+      checkout: path.join(projectPath, "queued"),
+      branch: "agent_explore_queued",
+      runtimeConfig,
+    });
 
     await saveWorkspaces(
       config,
@@ -18172,6 +18205,7 @@ describe("TaskService", () => {
           taskPrompt: "queued work",
           taskModelString: defaultModel,
           runtimeConfig,
+          taskCheckoutPreparation: queuedPreparation,
         }),
       ],
       testTaskSettings(1, 3)
@@ -18248,13 +18282,20 @@ describe("TaskService", () => {
   test("initialize uses legacy agentType when modern agentId is unavailable for awaiting_report tasks", async () => {
     const config = await createTestConfig(rootDir);
 
-    const projectPath = path.join(rootDir, "repo");
+    const projectPath = await createTestProject(rootDir, "repo");
     const parentId = "parent-111";
     const childId = "child-custom-plan-222";
     const customAgentId = "custom_plan_runner";
     const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
     const parentWorkspacePath = path.join(projectPath, "parent");
     const childWorkspacePath = path.join(projectPath, "child-custom-plan");
+    // A dedicated (worktree) row is admitted only with its preparation proof: a real one.
+    const childPreparation = await prepareDedicatedTaskCheckout({
+      projectPath,
+      checkout: childWorkspacePath,
+      branch: "child-custom-plan",
+      runtimeConfig,
+    });
 
     const customAgentDir = path.join(parentWorkspacePath, ".mux", "agents");
     await fsPromises.mkdir(customAgentDir, { recursive: true });
@@ -18291,6 +18332,7 @@ describe("TaskService", () => {
           agentType: customAgentId,
           taskStatus: "awaiting_report",
           runtimeConfig,
+          taskCheckoutPreparation: childPreparation,
         },
       ],
       testTaskSettings(1, 3)
@@ -18315,12 +18357,20 @@ describe("TaskService", () => {
   test("initialize honors child project agent overrides before parent built-in fallback", async () => {
     const config = await createTestConfig(rootDir);
 
-    const projectPath = path.join(rootDir, "repo-child-override");
+    const projectPath = await createTestProject(rootDir, "repo-child-override");
     const parentId = "parent-child-override-111";
     const childId = "child-exec-override-222";
     const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
     const parentWorkspacePath = path.join(projectPath, "parent");
     const childWorkspacePath = path.join(projectPath, "child-exec-override");
+    // A dedicated (worktree) row is admitted only with its preparation proof: a real worktree,
+    // claimed and bound; the override below is written into it afterwards (content is not bound).
+    const childPreparation = await prepareDedicatedTaskCheckout({
+      projectPath,
+      checkout: childWorkspacePath,
+      branch: "child-exec-override",
+      runtimeConfig,
+    });
 
     const childAgentDir = path.join(childWorkspacePath, ".mux", "agents");
     await fsPromises.mkdir(childAgentDir, { recursive: true });
@@ -18357,6 +18407,7 @@ describe("TaskService", () => {
           agentType: "exec",
           taskStatus: "awaiting_report",
           runtimeConfig,
+          taskCheckoutPreparation: childPreparation,
         },
       ],
       testTaskSettings(1, 3)
@@ -19688,6 +19739,8 @@ describe("TaskService", () => {
           id: child.id,
           name: child.name,
           ...(child.title ? { title: child.title } : {}),
+          // Shared rows of the local parent (see projectWorkspace): admissible without a proof.
+          runtimeConfig: { type: "local" as const },
           parentWorkspaceId: params.parentId,
           agentType: child.agentType ?? "explore",
           ...(child.agentId ? { agentId: child.agentId } : {}),
@@ -34376,12 +34429,16 @@ describe("TaskService", () => {
           runtimeConfig: { type: "local" },
           aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
         },
-        projectWorkspace(projectPath, "root", rootId),
+        // A project-dir (local) tree: its tasks are SHARED rows (no checkout of their own), so
+        // reservations neither fork nor prepare anything here — this fixture is not a git
+        // repository and a row without a runtime would default to a worktree under ~/.xum/src.
+        projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
         ...descendantEntries.map(({ id, parent, overrides }) =>
           projectWorkspace(projectPath, id, id, {
             parentWorkspaceId: parent,
             agentType: "explore",
             taskStatus: "running",
+            runtimeConfig: { type: "local" },
             ...overrides,
           })
         ),
@@ -35949,7 +36006,7 @@ describe("TaskService", () => {
       }
     );
 
-    test("abort during materialization cleans the materialized workspace and never sends", async () => {
+    test("abort during materialization never sends; a prepared host-local checkout is retained (a published row's directory), not cleaned up", async () => {
       const spawnedId = "materializedchild";
       const { config } = await setupTree([]);
       stubStableIds(config, [spawnedId]);
@@ -35979,8 +36036,9 @@ describe("TaskService", () => {
         () => findWorkspaceInConfig(config, spawnedId)?.taskStatus === "interrupted",
         "the canceled launch to persist"
       );
-      expect(cleanup).toHaveBeenCalledTimes(1);
-      expect(cleanup.mock.calls[0]?.[3]).toBe(spawnedId);
+      // Only an off-host materialization (no proof, outside the protocol) is reclaimed on a
+      // launch failure; a prepared (here: shared, project-dir) checkout and its session stay.
+      expect(cleanup).not.toHaveBeenCalled();
       expect(sendMessage).not.toHaveBeenCalled();
       expect(findWorkspaceInConfig(config, spawnedId)?.taskLaunchError).toBe(
         "Reservation canceled"
@@ -36064,12 +36122,21 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { aiService });
       const internals = taskService as unknown as Internals;
       spyOn(internals, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
-      // The fixture parent has no runtimeConfig: a default (migrating) read would write it.
+      // A parent WITHOUT runtimeConfig: a default (migrating) read would write it. Its child
+      // shares its checkout (isolation "none"), so the reservation forks and prepares nothing —
+      // a dedicated child of a runtime-less parent would default to a worktree fork.
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const root = project.workspaces.find((ws) => ws.id === rootId);
+          if (root) delete root.runtimeConfig;
+        }
+        return cfg;
+      });
       expect(findWorkspaceInConfig(config, rootId)?.runtimeConfig).toBeUndefined();
       const editSpy = spyOn(config, "editConfig");
       let writesBeforeCommit = -1;
       let parentRuntimeConfigAtCheckpoint: unknown = "unset";
-      const created = await taskService.createMany([spawnArgs(rootId)], {
+      const created = await taskService.createMany([{ ...spawnArgs(rootId), isolation: "none" }], {
         onTaskReserved: () => {
           // Preparation + revalidation (both reads) are done; the commit has not run yet.
           writesBeforeCommit = editSpy.mock.calls.length;

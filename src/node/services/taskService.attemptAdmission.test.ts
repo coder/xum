@@ -1106,13 +1106,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const foreign = "att_00000000000000a7";
         const { config, projectPath } = await setupTree([]);
         stubStableIds(config, [taskId]);
-        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-        const { taskService } = createHarness(config, { workspaceService });
-        const svc = internals(taskService);
-        // A marker in the task's session dir: the launch's cleanup removes that dir.
-        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
-        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
-        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
         // Another backend recovered the row and re-reserved it under its own attempt.
         const supersede = () =>
           config.editConfig((cfg) => {
@@ -1122,6 +1115,23 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             }
             return cfg;
           });
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+          // "on-failure": the launch's post-materialization failure (its send fails) lands after
+          // the row was re-reserved; the failure handling must not touch the successor.
+          sendMessage: mock(async (): Promise<Result<void>> => {
+            if (when === "on-failure") {
+              await supersede();
+              return Err("send failed");
+            }
+            return Ok(undefined);
+          }),
+        });
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        // A marker in the task's session dir: the launch's cleanup removes that dir.
+        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
+        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
+        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
         const materialization = {
           workspacePath: projectPath,
           trunkBranch: "main",
@@ -1143,15 +1153,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           if (when === "during-materialize") await supersede();
           return materialization;
         });
-        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
-          async () => {
-            if (when === "on-failure") {
-              await supersede();
-              return "sanitize failed";
-            }
-            return undefined;
-          }
-        );
 
         const created = await taskService.createMany([
           {
@@ -1172,7 +1173,11 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           await settle();
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+        // "on-failure" is the one variant whose send ran (and failed) under the owned attempt;
+        // nothing is dispatched under the successor's.
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(
+          when === "on-failure" ? 1 : 0
+        );
         expect(entryOf(config, taskId)).toMatchObject({
           taskAttemptId: foreign,
           taskStatus: "starting",
@@ -1185,119 +1190,78 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
     );
 
-    test.each(["send failed", "sanitize failed", "sanitize failed, unpublish write lost"] as const)(
-      "a reserved launch whose %s after its row was published: artifacts are deleted only once the row is verifiably unpublished",
-      async (failure) => {
-        const sanitizeFails = failure !== "send failed";
-        const taskId = {
-          "send failed": "publishedkeep1",
-          "sanitize failed": "publishedkeep2",
-          "sanitize failed, unpublish write lost": "publishedkeep3",
-        }[failure];
-        const foreign = "att_00000000000000a8";
-        const { config, projectPath } = await setupTree([]);
-        stubStableIds(config, [taskId]);
-        const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-          sendMessage: mock(
-            (): Promise<Result<void>> => Promise.resolve(Err("provider exploded before streaming"))
-          ),
-        });
-        const { taskService } = createHarness(config, { workspaceService });
-        const svc = internals(taskService);
-        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
-        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
-        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
-        // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) tries to re-reserve the row while this
-        // launch's cleanup is inside the destructive call: its CAS succeeds only if the row is
-        // still published, and the session dir removed next would then be the successor's.
-        let rowPublishedAtDelete: boolean | undefined;
-        const deleteWorkspace = mock(async () => {
-          rowPublishedAtDelete = entryOf(config, taskId) != null;
-          await config.editConfig((cfg) => {
-            for (const project of cfg.projects.values()) {
-              const ws = project.workspaces.find((w) => w.id === taskId);
-              if (ws) ws.taskAttemptId = foreign;
-            }
-            return cfg;
-          });
-          return Ok(undefined);
-        });
-        spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
-          Promise.resolve({
-            workspacePath: projectPath,
-            trunkBranch: "main",
-            forkedRuntimeConfig: { type: "local" as const },
-            runtimeForTaskWorkspace: {
-              deleteWorkspace,
-              getWorkspacePath: () => "/tmp/published-keep",
-            },
-            inheritedProjects: undefined,
-          })
-        );
-        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
-          if (failure === "sanitize failed, unpublish write lost") {
-            // The next config save (the unpublication) is swallowed, as saveConfigEffect does
-            // with a failed write: editConfig resolves, the bytes on disk still hold the row.
-            spyOn(
-              config as unknown as { saveConfig: (config: unknown) => Promise<void> },
-              "saveConfig"
-            ).mockImplementationOnce(() => Promise.resolve());
+    test("a reserved launch whose send failed after its row was published: the checkout and session dir are retained", async () => {
+      const taskId = "publishedkeep1";
+      const foreign = "att_00000000000000a8";
+      const { config, projectPath } = await setupTree([]);
+      stubStableIds(config, [taskId]);
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        sendMessage: mock(
+          (): Promise<Result<void>> => Promise.resolve(Err("provider exploded before streaming"))
+        ),
+      });
+      const { taskService } = createHarness(config, { workspaceService });
+      const svc = internals(taskService);
+      const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
+      await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
+      await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
+      // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) re-reserves the published row while this
+      // launch's cleanup is inside the destructive call, AFTER its ownership check passed: the
+      // session dir removed next would be the successor's.
+      let superseded = false;
+      const deleteWorkspace = mock(async () => {
+        await config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const ws = project.workspaces.find((w) => w.id === taskId);
+            if (ws) ws.taskAttemptId = foreign;
           }
-          return Promise.resolve(sanitizeFails ? "sanitize failed" : undefined);
+          return cfg;
         });
-
-        const created = await taskService.createMany([
-          {
-            parentWorkspaceId: rootId,
-            kind: "agent",
-            agentId: "explore",
-            prompt: "go",
-            title: "T",
+        superseded = true;
+        return Ok(undefined);
+      });
+      spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve({
+          workspacePath: projectPath,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" as const },
+          runtimeForTaskWorkspace: {
+            deleteWorkspace,
+            getWorkspacePath: () => "/tmp/published-keep",
           },
-        ]);
-        expect(created.success).toBe(true);
-        const reserved = svc.ownedAttemptByTaskId.get(taskId)!.attemptId!;
-        const deadline = Date.now() + 2_000;
-        while (
-          entryOf(config, taskId) != null &&
-          entryOf(config, taskId)?.taskStatus !== "interrupted"
-        ) {
-          if (Date.now() > deadline) throw new Error("the launch never failed");
-          await settle();
-        }
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        if (failure === "sanitize failed") {
-          // The reclaim of a checkout whose stale plugin enables could not be pruned: the row is
-          // unpublished first (nothing re-sanitizes a retained checkout before a later send), so
-          // no backend can re-admit it while its checkout and session dir are deleted.
-          expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
-          expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-          expect(rowPublishedAtDelete).toBe(false);
-          expect(entryOf(config, taskId)).toBeUndefined();
-          // A sender that captured the old row's attempt is refused, not passed as a non-task.
-          expect(
-            taskService.admitTaskWorkspaceTurn(taskId, {
-              acceptanceOrigin: "automatic",
-              expectedAttemptId: reserved,
-            }).kind
-          ).toBe("refused");
-          return;
-        }
-        // Retained: nothing destructive ran, so no successor can be admitted in the middle of it
-        // (a failed send, or an unpublication the persisted bytes do not confirm).
-        expect(deleteWorkspace).not.toHaveBeenCalled();
-        expect(await fsPromises.readFile(sessionMarker, "utf-8")).toBe("keep");
-        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(
-          sanitizeFails ? 0 : 1
-        );
-        // The failure is still recorded on this launch's own (still owned) attempt.
-        expect(entryOf(config, taskId)).toMatchObject({
-          taskAttemptId: reserved,
-          taskStatus: "interrupted",
-          taskLaunchError: sanitizeFails ? "sanitize failed" : "provider exploded before streaming",
-        });
+          inheritedProjects: undefined,
+        })
+      );
+
+      const created = await taskService.createMany([
+        {
+          parentWorkspaceId: rootId,
+          kind: "agent",
+          agentId: "explore",
+          prompt: "go",
+          title: "T",
+        },
+      ]);
+      expect(created.success).toBe(true);
+      const reserved = svc.ownedAttemptByTaskId.get(taskId)!.attemptId!;
+      const deadline = Date.now() + 2_000;
+      while (!superseded && entryOf(config, taskId)?.taskStatus !== "interrupted") {
+        if (Date.now() > deadline) throw new Error("the launch never failed");
+        await settle();
       }
-    );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(1);
+      // A published reservation's artifacts are never deleted by the failed launch: nothing
+      // destructive runs, so no successor can be admitted in the middle of it.
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(await fsPromises.readFile(sessionMarker, "utf-8")).toBe("keep");
+      // The failure is still recorded on this launch's own (still owned) attempt.
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskAttemptId: reserved,
+        taskStatus: "interrupted",
+        taskLaunchError: "provider exploded before streaming",
+      });
+    });
 
     test.each(["admitted-after-sample", "pending-before-decision"] as const)(
       "terminal failure closes the attempt before sampling activity: a send %s is refused or drained, never run under a settled attempt",
