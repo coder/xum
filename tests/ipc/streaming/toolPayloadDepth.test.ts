@@ -14,8 +14,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import { tool, wrapLanguageModel } from "ai";
-import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import type { LanguageModelV4Prompt, LanguageModelV4StreamPart } from "@ai-sdk/provider";
+import { MockLanguageModelV3, MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import type {
+  LanguageModelV2,
+  LanguageModelV2StreamPart,
+  LanguageModelV3StreamPart,
+  LanguageModelV4Prompt,
+  LanguageModelV4StreamPart,
+} from "@ai-sdk/provider";
 import { createMuxMessage } from "@/common/types/message";
 import { MAX_TOOL_PAYLOAD_JSON_DEPTH } from "@/constants/json";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
@@ -34,7 +40,88 @@ const usage = {
   outputTokens: { total: 10, text: 10, reasoning: 0 },
 };
 
-async function runToolCallTurn(inputText: string) {
+type SpecVersion = "v2" | "v3" | "v4";
+type MockToolCall = { toolCallId: string; toolName: string; input: string };
+
+/**
+ * The same two-step stream in each provider spec shape. v2/v3 models reach the
+ * SDK through its own asLanguageModelV4 adapters, which is exactly how
+ * ProviderModelFactory wraps them (CopilotResponses is v2; gateway declared v3).
+ */
+function mockModel(
+  version: SpecVersion,
+  onStream: (call: number, prompt: LanguageModelV4Prompt) => "tool-call" | "text",
+  toolCall: MockToolCall
+) {
+  let calls = 0;
+  const v4Chunks = (kind: "tool-call" | "text"): LanguageModelV4StreamPart[] =>
+    kind === "tool-call"
+      ? [
+          { type: "stream-start", warnings: [] },
+          { type: "tool-call", ...toolCall },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" }, usage },
+        ]
+      : [
+          { type: "stream-start", warnings: [] },
+          { type: "text-start", id: "answer" },
+          { type: "text-delta", id: "answer", delta: "Done" },
+          { type: "text-end", id: "answer" },
+          { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+        ];
+  const next = (prompt: LanguageModelV4Prompt) => onStream(++calls, prompt);
+  if (version === "v4") {
+    return new MockLanguageModelV4({
+      doStream: (request) =>
+        Promise.resolve({
+          stream: simulateReadableStream({ chunks: v4Chunks(next(request.prompt)) }),
+        }),
+    });
+  }
+  if (version === "v3") {
+    return new MockLanguageModelV3({
+      // v3 and v4 share these part shapes.
+      doStream: (request) =>
+        Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: v4Chunks(
+              next(request.prompt as unknown as LanguageModelV4Prompt)
+            ) as unknown as LanguageModelV3StreamPart[],
+          }),
+        }),
+    });
+  }
+  const v2Usage = { inputTokens: 100, outputTokens: 10, totalTokens: 110 };
+  const v2Chunks = (kind: "tool-call" | "text"): LanguageModelV2StreamPart[] =>
+    kind === "tool-call"
+      ? [
+          { type: "stream-start", warnings: [] },
+          { type: "tool-call", ...toolCall },
+          { type: "finish", finishReason: "tool-calls", usage: v2Usage },
+        ]
+      : [
+          { type: "stream-start", warnings: [] },
+          { type: "text-start", id: "answer" },
+          { type: "text-delta", id: "answer", delta: "Done" },
+          { type: "text-end", id: "answer" },
+          { type: "finish", finishReason: "stop", usage: v2Usage },
+        ];
+  const v2: LanguageModelV2 = {
+    specificationVersion: "v2",
+    provider: "mock-v2",
+    modelId: "mock-v2",
+    supportedUrls: {},
+    doGenerate: () => Promise.reject(new Error("doGenerate is not used by this test")),
+    doStream: (request) =>
+      Promise.resolve({
+        stream: simulateReadableStream({
+          chunks: v2Chunks(next(request.prompt as unknown as LanguageModelV4Prompt)),
+        }),
+      }),
+  };
+  return v2;
+}
+
+async function runToolCallTurn(inputText: string, version: SpecVersion = "v4") {
   const h = await createTestHistoryService();
   const workspaceId = "tool-payload-depth";
   const messageId = "tool-payload-depth-assistant";
@@ -43,31 +130,15 @@ async function runToolCallTurn(inputText: string) {
   let providerCalls = 0;
   let retryPrompt: LanguageModelV4Prompt | undefined;
   const model = wrapLanguageModel({
-    model: new MockLanguageModelV4({
-      doStream: (request) => {
-        providerCalls++;
-        if (providerCalls === 2) retryPrompt = request.prompt;
-        const chunks: LanguageModelV4StreamPart[] =
-          providerCalls === 1
-            ? [
-                { type: "stream-start", warnings: [] },
-                { type: "tool-call", toolCallId, toolName: "permissive", input: inputText },
-                {
-                  type: "finish",
-                  finishReason: { unified: "tool-calls", raw: "tool_calls" },
-                  usage,
-                },
-              ]
-            : [
-                { type: "stream-start", warnings: [] },
-                { type: "text-start", id: "answer" },
-                { type: "text-delta", id: "answer", delta: "Done" },
-                { type: "text-end", id: "answer" },
-                { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
-              ];
-        return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    model: mockModel(
+      version,
+      (call, prompt) => {
+        providerCalls = call;
+        if (call === 2) retryPrompt = prompt;
+        return call === 1 ? "tool-call" : "text";
       },
-    }),
+      { toolCallId, toolName: "permissive", input: inputText }
+    ),
     middleware: createToolInputDepthGuardMiddleware(),
   });
   const manager = new StreamManager(h.historyService);
@@ -141,6 +212,30 @@ describe("tool payload depth guard (live stream)", () => {
       if (run.retryToolResult.output.type !== "error-text") throw new Error("Expected error-text");
       expect(run.retryToolResult.output.value).toContain(TOOL_PAYLOAD_DEPTH_REJECTION);
       expect(run.retryToolResult.output.value).not.toContain("[[[[");
+    }
+  );
+
+  // Non-v4 providers reach the SDK through its v2→v3→v4 adapters; the guard must see
+  // their raw tool-call text too (review finding: gateway v3 / CopilotResponses v2).
+  test.each([
+    ["v2", 2100],
+    ["v3", 2100],
+    ["v2", 6000],
+    ["v3", 6000],
+  ] as const)("%s model: depth %i input is rejected and never executed", async (version, depth) => {
+    const run = await runToolCallTurn(deepToolInputText(depth), version);
+    expect(run.completion.status).toBe("completed");
+    expect(run.providerCalls).toBe(2);
+    expect(run.executeInputs).toEqual([]);
+    expect(run.toolPart).toMatchObject({ input: TOOL_PAYLOAD_DEPTH_REJECTION });
+  });
+
+  test.each(["v2", "v3"] as const)(
+    "%s model: shallow input executes unchanged",
+    async (version) => {
+      const run = await runToolCallTurn(deepToolInputText(2), version);
+      expect(run.completion.status).toBe("completed");
+      expect(run.executeInputs).toEqual([JSON.parse(deepToolInputText(2))]);
     }
   );
 
