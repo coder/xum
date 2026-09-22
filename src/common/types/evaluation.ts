@@ -260,6 +260,40 @@ export const EvaluationErrorCodeSchema = z.enum([
 ]);
 export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
 
+/**
+ * Failure identity of a workflow `evaluate()` step: the service reasons above
+ * plus the runner's own lifecycle outcomes (attempt budget, model selection,
+ * persisted-admission checks). Persisted on `evaluation` run events and
+ * interpolated into the fixed failure template, so the set stays finite and
+ * free of provider or author text.
+ */
+export const EvaluationStepFailureReasonSchema = z.enum([
+  ...EvaluationErrorReasonSchema.options,
+  "deadline",
+  "unauthorized",
+  "admission-mismatch",
+  "admission-missing",
+  "attempts-exhausted",
+]);
+export type EvaluationStepFailureReason = z.infer<typeof EvaluationStepFailureReasonSchema>;
+
+export const EvaluationStepFailureCodeSchema = z.enum([
+  ...EvaluationErrorCodeSchema.options,
+  // Runner lifecycle outcomes mirror their reason (like `deadline/deadline`).
+  "deadline",
+  "unauthorized",
+  "admission-mismatch",
+  "admission-missing",
+  "attempts-exhausted",
+  // `invalid-input`: neither the call, the CLI, nor Settings named a model.
+  "no-model",
+  // `unsupported`: `createEvaluationModel` rejections.
+  "unsupported-provider",
+  "unsupported-route",
+  "unknown-model",
+]);
+export type EvaluationStepFailureCode = z.infer<typeof EvaluationStepFailureCodeSchema>;
+
 // ---------------------------------------------------------------------------
 // Question-aware answer validation
 // ---------------------------------------------------------------------------

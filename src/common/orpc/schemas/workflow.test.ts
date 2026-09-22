@@ -11,6 +11,7 @@ import {
   WorkflowRunIdSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusTransitionSchema,
+  WorkflowStepRecordSchema,
 } from "./workflow";
 
 describe("workflow domain schemas", () => {
@@ -206,6 +207,106 @@ describe("workflow domain schemas", () => {
     expect(
       WorkflowRunStatusTransitionSchema.safeParse({ from: "running", to: "interrupted" }).success
     ).toBe(true);
+  });
+
+  test("round-trips evaluation step records and events; agent records without an admission still parse", () => {
+    const admission = {
+      attempt: 2,
+      selection: {
+        modelString: "anthropic:claude-haiku-4-5",
+        effectiveModelString: "anthropic:claude-haiku-4-5",
+        wireProviderName: "anthropic",
+        routeKind: "direct" as const,
+        configFingerprint: "sha256:fp",
+      },
+      timeoutMs: 60_000,
+      attemptDeadlineAt: "2026-05-29T00:01:00.000Z",
+      stateSha256: "sha256:state",
+      stateBytes: 42,
+      questionsSha256: "sha256:questions",
+      questionCount: 1,
+    };
+    const record = WorkflowStepRecordSchema.parse({
+      stepId: "screen-issue",
+      inputHash: "sha256:screen-issue",
+      status: "completed",
+      startedAt: "2026-05-29T00:00:00.000Z",
+      completedAt: "2026-05-29T00:00:03.000Z",
+      evaluation: admission,
+    });
+    expect(record.evaluation).toEqual(admission);
+    expect(record.taskId).toBeUndefined();
+
+    // Agent/patch records never carry the field and must keep parsing.
+    const agentRecord = WorkflowStepRecordSchema.parse({
+      stepId: "reserve-child",
+      inputHash: "sha256:reserve-child",
+      status: "started",
+      taskId: "task_1",
+      startedAt: "2026-05-29T00:00:00.000Z",
+    });
+    expect(agentRecord.evaluation).toBeUndefined();
+
+    const events = WorkflowEventSequenceSchema.parse([
+      {
+        sequence: 1,
+        type: "evaluation",
+        at: "2026-05-29T00:00:00.000Z",
+        stepId: "screen-issue",
+        inputHash: "sha256:screen-issue",
+        attempt: 1,
+        status: "started",
+        title: "Screen issue text",
+        modelString: "anthropic:claude-haiku-4-5",
+        stateBytes: 42,
+        questionCount: 1,
+      },
+      {
+        sequence: 2,
+        type: "evaluation",
+        at: "2026-05-29T00:00:03.000Z",
+        stepId: "screen-issue",
+        inputHash: "sha256:screen-issue",
+        attempt: 1,
+        status: "failed",
+        reason: "provider-failure",
+        code: "api-call",
+        statusCode: 429,
+        defect: false,
+      },
+      {
+        sequence: 3,
+        type: "evaluation",
+        at: "2026-05-29T00:00:04.000Z",
+        stepId: "screen-issue",
+        inputHash: "sha256:screen-issue",
+        attempt: 2,
+        status: "completed",
+        responseModelId: "claude-haiku-4-5-20251001",
+        usage: { inputTokens: 120, outputTokens: null, totalTokens: null },
+      },
+    ]);
+    expect(events.map((event) => event.type === "evaluation" && event.status)).toEqual([
+      "started",
+      "failed",
+      "completed",
+    ]);
+
+    // Failure identity is a finite allowlist, never free text.
+    expect(
+      WorkflowEventSequenceSchema.safeParse([
+        {
+          sequence: 1,
+          type: "evaluation",
+          at: "2026-05-29T00:00:03.000Z",
+          stepId: "screen-issue",
+          inputHash: "sha256:screen-issue",
+          attempt: 1,
+          status: "failed",
+          reason: "Request failed with status 429",
+        },
+      ]).success
+    ).toBe(false);
   });
 });
 

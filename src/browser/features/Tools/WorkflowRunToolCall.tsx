@@ -509,6 +509,15 @@ function getWorkflowEventLabel(event: WorkflowRunEvent): string {
         ? `${event.stepId} validation ${verdict}: ${event.message}`
         : `${event.stepId} validation ${verdict}`;
     }
+    case "evaluation": {
+      // `title` is author-provided display text; React escaping is the only
+      // rendering path (see the schema comment), never string-interpolated
+      // into model-facing text.
+      const label = `${event.title ?? event.stepId} / evaluation / ${event.status}`;
+      return event.status === "failed" && event.reason
+        ? `${label} (${event.reason}/${event.code ?? "unknown"})`
+        : label;
+    }
     case "error":
       return event.message;
     case "status":
@@ -533,6 +542,8 @@ function getWorkflowEventDetail(event: WorkflowRunEvent): unknown {
       return event.data;
     case "result":
       return event.result;
+    case "evaluation":
+      return event.usage;
     case "task":
     case "validation":
     case "error":
@@ -575,6 +586,13 @@ function getEventTone(event: WorkflowRunEvent): "normal" | "success" | "warning"
     return event.status === "completed"
       ? "success"
       : event.status === "failed" || event.status === "interrupted"
+        ? "warning"
+        : "normal";
+  }
+  if (event.type === "evaluation") {
+    return event.status === "completed" || event.status === "cached"
+      ? "success"
+      : event.status === "failed"
         ? "warning"
         : "normal";
   }

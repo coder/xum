@@ -24,6 +24,7 @@ import type {
   AppConfigMigrations,
   AppConfigOnDisk,
   BaseProviderConfig as ProviderConfig,
+  EvaluationDefaults,
   ModelFallbacks,
 } from "@/common/config/schemas";
 import {
@@ -182,6 +183,19 @@ function parseOptionalNonEmptyString(value: unknown): string | undefined {
 
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+/**
+ * `evaluationDefaults` is stored only when it carries a model: a trimmed
+ * non-empty string. Blank or malformed input clears the block so a stale
+ * `{}` never lingers on disk and `getClientConfig()` reports "no default".
+ */
+function normalizeEvaluationDefaults(value: unknown): EvaluationDefaults | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const model = parseOptionalNonEmptyString((value as { model?: unknown }).model);
+  return model ? { model } : undefined;
 }
 
 interface LegacyTaskVariantGroup {
@@ -2048,6 +2062,7 @@ export class Config {
         parsed.heartbeatDefaultIntervalMs
       ),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
+      evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       muxGatewayModels,
       routePriority,
       routeOverrides,
@@ -2166,6 +2181,11 @@ export class Config {
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
+      }
+
+      const evaluationDefaults = normalizeEvaluationDefaults(config.evaluationDefaults);
+      if (evaluationDefaults !== undefined) {
+        data.evaluationDefaults = evaluationDefaults;
       }
 
       const muxGatewayModels = parseOptionalStringArray(config.muxGatewayModels);
@@ -2573,6 +2593,7 @@ export class Config {
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
+      evaluationDefaults: normalizeEvaluationDefaults(config.evaluationDefaults),
     };
   }
 
@@ -2630,6 +2651,16 @@ export class Config {
       ...config,
       goalDefaults: normalizeGoalDefaults(goalDefaults),
     }));
+  }
+
+  /** Settings → Tasks & Workflows → Evaluation model; blank/whitespace clears the default. */
+  async updateEvaluationDefaults(input: { model?: string | null }): Promise<void> {
+    await this.editConfig((config) => {
+      const evaluationDefaults = normalizeEvaluationDefaults(input);
+      if (evaluationDefaults) config.evaluationDefaults = evaluationDefaults;
+      else delete config.evaluationDefaults;
+      return config;
+    });
   }
 
   async unenrollMuxGovernor(): Promise<void> {
