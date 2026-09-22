@@ -53,7 +53,11 @@ const MUTATION_VERBS: Record<StructuralMutation, string> = {
 };
 
 export type StructuralMutationTarget =
-  /** No registered row: nothing known to protect (phantom/session-only cleanup). */
+  /**
+   * No registered row: refused. Absent metadata or a cached record cannot prove the id lies
+   * outside a protected footprint (an id-less legacy task, a row a cooperating backend just
+   * re-registered), so the former phantom session-only cleanup is gone with it.
+   */
   | { kind: "unregistered" }
   /** A host-local agent-task row (or one carrying a preparation proof): always refused. */
   | { kind: "protected-task"; row: Workspace }
@@ -128,19 +132,107 @@ export function deriveHostLocalCheckoutPath(
   return projectPath;
 }
 
-/** Persisted + derived + proof paths a row's physical footprint consists of. */
+/**
+ * Bounded filesystem probes (realpath, `.git` pointer reads). A stalled
+ * filesystem backing an UNRELATED task row must not hang every structural
+ * operation; a timeout is an unknown identity (refuse), never a fallback to
+ * spelling.
+ */
+const CANONICALIZE_TIMEOUT_MS = 2_000;
+
+/**
+ * Persisted + runtime-derived + proof paths a row's physical footprint consists of.
+ *
+ * The runtime-derived paths are REQUIRED, not a fallback: WorktreeRuntime's
+ * deleteWorkspace/renameWorkspace act on `<srcBaseDir>/<project>/<name>` for
+ * every project of the row (WorktreeManager derives by name), not on the
+ * persisted `path`. A stale or re-pointed stored path must never let an
+ * operation land on a derived target the scan did not cover, so both the
+ * stored path and every derived target are footprint. Project-dir local
+ * runtimes derive nothing extra: their operations are physical no-ops on the
+ * project directory the stored path already names.
+ */
 function footprintPathsForRow(row: Workspace, bucketProjectPath: string): string[] {
   const paths = [row.path];
-  const projects = row.projects ?? [];
-  if (projects.length > 1 && typeof row.name === "string" && row.name.length > 0) {
-    for (const project of projects) {
-      if (project.projectPath !== bucketProjectPath) {
-        paths.push(deriveHostLocalCheckoutPath(row.runtimeConfig, project.projectPath, row.name));
-      }
+  if (hasSrcBaseDir(row.runtimeConfig) && typeof row.name === "string" && row.name.length > 0) {
+    const projectPaths =
+      row.projects !== undefined && row.projects.length > 0
+        ? row.projects.map((project) => project.projectPath)
+        : [bucketProjectPath];
+    for (const projectPath of projectPaths) {
+      paths.push(deriveHostLocalCheckoutPath(row.runtimeConfig, projectPath, row.name));
     }
   }
   collectProofPaths(readTaskCheckoutPreparation(row), paths);
   return paths.filter((candidate) => candidate.length > 0);
+}
+
+/** Bounded read of a worktree's `.git` pointer file; longer files are not pointers. */
+const GIT_POINTER_MAX_BYTES = 4096;
+
+type GitBacking =
+  | { kind: "admin-dir"; adminDir: string }
+  /** No checkout, no `.git`, or `.git` is the repository itself (backing lives inside). */
+  | { kind: "none" }
+  | { kind: "unknown"; reason: string };
+
+/**
+ * The Git admin dir a checkout's `.git` FILE points at (`gitdir: <path>`),
+ * resolved against the checkout. Legacy task rows carry no proof, so this is
+ * the only way to learn that a task checkout OUTSIDE an ordinary root is backed
+ * by a repository nested INSIDE it — deleting or moving the root would destroy
+ * that backing. Mirrors the producer core's private `readGitAdminDir`. Read
+ * failures other than "absent" (and a `.git` file that is not a pointer) are
+ * unknown backing: they cannot authorize a mutation.
+ */
+async function readGitBacking(checkoutPath: string): Promise<GitBacking> {
+  const pointerPath = path.join(checkoutPath, ".git");
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const content = await Promise.race([
+      (async () => {
+        const stat = await fsPromises.stat(pointerPath);
+        if (stat.isDirectory()) return undefined;
+        if (!stat.isFile() || stat.size > GIT_POINTER_MAX_BYTES) {
+          throw new Error(`${pointerPath} is not a git pointer file`);
+        }
+        return await fsPromises.readFile(pointerPath, "utf-8");
+      })(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("reading the .git pointer timed out")),
+          CANONICALIZE_TIMEOUT_MS
+        );
+      }),
+    ]);
+    if (content === undefined) return { kind: "none" };
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(content);
+    if (!match?.[1]) return { kind: "unknown", reason: `${pointerPath} is not a git pointer file` };
+    return { kind: "admin-dir", adminDir: path.resolve(checkoutPath, match[1]) };
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return { kind: "none" };
+    return { kind: "unknown", reason: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Footprint paths plus the Git admin dirs backing the row's checkouts. `unknown`
+ * names the first backing that could not be established.
+ */
+async function footprintWithGitBacking(
+  row: Workspace,
+  bucketProjectPath: string
+): Promise<{ paths: string[]; unknown?: string }> {
+  const paths = footprintPathsForRow(row, bucketProjectPath);
+  let unknown: string | undefined;
+  for (const checkoutPath of [...paths]) {
+    const backing = await readGitBacking(checkoutPath);
+    if (backing.kind === "admin-dir") paths.push(backing.adminDir);
+    else if (backing.kind === "unknown") unknown ??= backing.reason;
+  }
+  return unknown === undefined ? { paths } : { paths, unknown };
 }
 
 export function classifyStructuralMutationTarget(
@@ -158,13 +250,6 @@ export function classifyStructuralMutationTarget(
   }
   return { kind: "unregistered" };
 }
-
-/**
- * Bounded canonicalization. A stalled filesystem backing an UNRELATED task row
- * must not hang every structural operation; a timeout is an unknown identity
- * (refuse), never a fallback to spelling.
- */
-const CANONICALIZE_TIMEOUT_MS = 2_000;
 
 type CanonicalPath =
   | { kind: "resolved"; realpath: string }
@@ -229,8 +314,9 @@ export async function findProtectedFootprintOverlap(
   snapshot: ProjectsConfig,
   target: { row: Workspace; bucketProjectPath: string; extraPaths?: string[] }
 ): Promise<FootprintOverlap> {
+  const targetFootprint = await footprintWithGitBacking(target.row, target.bucketProjectPath);
   const targetPaths = [
-    ...footprintPathsForRow(target.row, target.bucketProjectPath),
+    ...targetFootprint.paths,
     ...(target.extraPaths ?? []).filter((candidate) => candidate.length > 0),
   ];
   const targetIdentities = await Promise.all(targetPaths.map(identitiesForPath));
@@ -239,7 +325,14 @@ export async function findProtectedFootprintOverlap(
     for (const row of project.workspaces) {
       if (row.id === target.row.id || !isProtectedTaskRow(row)) continue;
       const taskWorkspaceId = row.id ?? row.path;
-      for (const taskPath of footprintPathsForRow(row, bucketProjectPath)) {
+      // Either side's Git backing could not be established: with a protected row in
+      // play, that unknown may be exactly the backing the mutation would destroy.
+      const taskFootprint = await footprintWithGitBacking(row, bucketProjectPath);
+      const unknownBacking = targetFootprint.unknown ?? taskFootprint.unknown;
+      if (unknownBacking !== undefined) {
+        return { kind: "unknown", taskWorkspaceId, reason: unknownBacking };
+      }
+      for (const taskPath of taskFootprint.paths) {
         const task = await identitiesForPath(taskPath);
         for (const [index, targetPath] of targetPaths.entries()) {
           const targetIdentity = targetIdentities[index];

@@ -93,4 +93,34 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
       )
     ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: gitAdminDir });
   });
+
+  test("a task checkout whose .git file is not a gitdir pointer is unknown backing, not permission", async () => {
+    const projectPath = path.join(tempDir, "repo");
+    const rootCheckout = path.join(tempDir, "src", "repo", "root");
+    const taskCheckout = path.join(tempDir, "src", "repo", "agent_task");
+    await fsPromises.mkdir(rootCheckout, { recursive: true });
+    await fsPromises.mkdir(taskCheckout, { recursive: true });
+    // Disjoint spellings; only the (unreadable) backing could tie the two together.
+    await fsPromises.writeFile(path.join(taskCheckout, ".git"), "not a pointer\n");
+    const root: Workspace = { path: rootCheckout, id: "root", name: "root" };
+    const task: Workspace = {
+      path: taskCheckout,
+      id: "task",
+      name: "agent_task",
+      parentWorkspaceId: "root",
+    };
+    const snapshot: ProjectsConfig = {
+      projects: new Map([[projectPath, { workspaces: [root, task] }]]),
+    };
+
+    expect(
+      await findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath })
+    ).toMatchObject({ kind: "unknown", taskWorkspaceId: "task" });
+    // A checkout that IS a repository (`.git` directory) has its backing inside itself: no alias.
+    await fsPromises.rm(path.join(taskCheckout, ".git"));
+    await fsPromises.mkdir(path.join(taskCheckout, ".git"));
+    expect(
+      await findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath })
+    ).toEqual({ kind: "none" });
+  });
 });
