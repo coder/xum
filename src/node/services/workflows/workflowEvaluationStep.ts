@@ -11,6 +11,7 @@ import {
   validateAnswersAgainstQuestions,
   type EvaluationAdmission,
   type EvaluationState,
+  WORKFLOW_EVALUATION_STEP_ERROR_NAME,
   type EvaluationStepFailureCode,
   type EvaluationStepFailureReason,
   type EvaluationStepResult,
@@ -94,7 +95,7 @@ export class WorkflowEvaluationStepError extends Error {
     readonly statusCode?: number
   ) {
     super(formatEvaluationFailure({ reason, code, statusCode, stepDigest, attempt }));
-    this.name = "WorkflowEvaluationStepError";
+    this.name = WORKFLOW_EVALUATION_STEP_ERROR_NAME;
   }
 }
 

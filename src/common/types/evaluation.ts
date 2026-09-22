@@ -277,6 +277,12 @@ export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
  * interpolated into the fixed failure template, so the set stays finite and
  * free of provider or author text.
  */
+/**
+ * `name` of the error the runner throws into the sandbox for a failed
+ * evaluate() step; the sandbox rethrow prefixes run-level error text with it.
+ */
+export const WORKFLOW_EVALUATION_STEP_ERROR_NAME = "WorkflowEvaluationStepError";
+
 export const EvaluationStepFailureReasonSchema = z.enum([
   ...EvaluationErrorReasonSchema.options,
   "deadline",
