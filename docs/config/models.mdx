@@ -18,9 +18,9 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Opus 5.5               | anthropic:claude-opus-5-5     | `opus`                                                       | ✓       |
 | Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |
 | Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |
-| GPT-5.6 Sol            | openai:gpt-5.6-sol            | `gpt`, `sol`                                                 |         |
+| GPT-6 Sol              | openai:gpt-6-sol              | `gpt`, `sol`                                                 |         |
 | GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |
-| GPT-5.6 Luna           | openai:gpt-5.6-luna           | `luna`                                                       |         |
+| GPT-6 Luna             | openai:gpt-6-luna             | `luna`                                                       |         |
 | GPT-6 Astra            | openai:gpt-6-astra            | `astra`, `gpt-6-astra`                                       |         |
 | GPT-5.5 Pro            | openai:gpt-5.5-pro            | `gpt-pro`, `gpt-5.5-pro`                                     |         |
 | GPT-5.4 Mini           | openai:gpt-5.4-mini           | `gpt-mini`                                                   |         |
@@ -41,9 +41,9 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 
 {/* END KNOWN_MODELS_TABLE */}
 
-### Pro reasoning mode (GPT-5.6 and GPT-6 Astra)
+### Pro reasoning mode (GPT-5.6 and GPT-6)
 
-GPT-6 Astra and every GPT-5.6 model (Sol, Terra, and Luna) support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
+GPT-6 models (Astra, Sol, and Luna) and every GPT-5.6 model support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
 
 For advisor calls, enable the Advisor Tool experiment and use its **Reasoning** picker under **Settings → Experiments**. Advisor Pro mode is saved independently of reasoning effort and the calling chat’s mode.
 

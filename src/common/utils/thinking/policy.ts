@@ -172,8 +172,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "medium", "high", "xhigh", "max"];
   }
 
-  // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
-  // the native "max" reasoning effort introduced at GA.
+  // GPT-5.6 and GPT-6 Sol/Luna support both disabled reasoning and native max.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }

@@ -6,14 +6,10 @@ import { getKnownModel } from "@/common/constants/knownModels";
  * WorkspaceService.getWorkspaceNamingCandidates); these only cover the unset case
  * or a failing configured model.
  *
- * Luna is the catalog's newer small OpenAI model (previously gpt-5.1-codex-mini) and
- * is also included in the Codex OAuth allowlist (CODEX_OAUTH_ALLOWED_MODELS), unlike
- * gpt-5.4-nano.
+ * Keep the naming fallback on GPT-5.6 Luna until GPT-6 Luna is verified on
+ * Codex OAuth; promoting the catalog must not break naming for OAuth-only users.
  */
-export const NAME_GEN_PREFERRED_MODELS = [
-  getKnownModel("HAIKU").id,
-  getKnownModel("GPT_56_LUNA").id,
-];
+export const NAME_GEN_PREFERRED_MODELS = [getKnownModel("HAIKU").id, "openai:gpt-5.6-luna"];
 
 /**
  * Output reserve for the propose_name tool call. Anthropic rejects requests whose
