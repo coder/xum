@@ -7,7 +7,9 @@
  */
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { AttachmentService } from "@/node/services/attachmentService";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { drainFifoReaders } from "./fifoRelease";
 import {
@@ -43,6 +45,8 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
   let repoPath: string;
   let workspaceId: string;
   let planPath: string;
+  let workspaceName: string;
+  let projectName: string;
 
   beforeAll(async () => {
     repoPath = await createTempGitRepo();
@@ -50,7 +54,9 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     const created = await createWorkspace(env, repoPath, generateBranchName("plan-nonregular"));
     if (!created.success) throw new Error(`Workspace creation failed: ${created.error}`);
     workspaceId = created.metadata.id;
-    planPath = expandTilde(getPlanFilePath(created.metadata.name, created.metadata.projectName));
+    workspaceName = created.metadata.name;
+    projectName = created.metadata.projectName;
+    planPath = expandTilde(getPlanFilePath(workspaceName, projectName));
     await fs.mkdir(planPath.slice(0, planPath.lastIndexOf("/")), { recursive: true });
   }, 150_000);
 
@@ -98,6 +104,59 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     }
     expect(drain.settled).toBe(true);
   }, 30_000);
+
+  test("post-compaction plan reference on writer-less canonical and legacy FIFOs settles safely", async () => {
+    // AttachmentService reads the plan directly (not via readPlanFile), so it needs its own guard:
+    // a FIFO at either the canonical or the legacy path must not park libuv workers.
+    const runtime = new LocalRuntime(repoPath);
+    const legacyPlanPath = expandTilde(getLegacyPlanFilePath(workspaceId, runtime.getXumHome()));
+    const generate = () =>
+      AttachmentService.generatePlanFileReference(workspaceName, projectName, workspaceId, runtime);
+    await fs.rm(planPath, { force: true });
+    await fs.rm(legacyPlanPath, { force: true });
+    execFileSync("mkfifo", [planPath]);
+    execFileSync("mkfifo", [legacyPlanPath]);
+
+    const attempts = Array.from({ length: 6 }, generate);
+    let drains: Awaited<ReturnType<typeof drainFifoReaders>>[] | undefined;
+    try {
+      await settleWithin(fs.stat(env.config.rootDir), 2000, "unrelated fs.stat");
+      const results = await settleWithin(
+        Promise.all(attempts),
+        5000,
+        "6 x generatePlanFileReference"
+      );
+      for (const r of results) expect(r).toBeNull();
+    } finally {
+      // A reader released from the canonical FIFO falls through to the legacy FIFO, so both are
+      // drained concurrently until all six attempts have settled.
+      drains = await Promise.all([
+        drainFifoReaders(planPath, attempts),
+        drainFifoReaders(legacyPlanPath, attempts),
+      ]);
+      await fs.rm(planPath, { force: true });
+      await fs.rm(legacyPlanPath, { force: true });
+    }
+    expect(drains.every((d) => d.settled)).toBe(true);
+
+    // Controls: canonical regular file wins; missing canonical falls back to a regular legacy file.
+    await fs.writeFile(planPath, "# canonical\n");
+    const canonical = await generate();
+    expect(canonical).toEqual({
+      type: "plan_file_reference",
+      planFilePath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
+      planContent: "# canonical\n",
+    });
+    await fs.rm(planPath);
+    await fs.writeFile(legacyPlanPath, "# legacy\n");
+    const legacy = await generate();
+    expect(legacy).toEqual({
+      type: "plan_file_reference",
+      planFilePath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
+      planContent: "# legacy\n",
+    });
+    await fs.rm(legacyPlanPath);
+  }, 60_000);
 
   test("regular file and symlink to a regular file read normally", async () => {
     const content = "# Plan\n\nStep one.\n";
