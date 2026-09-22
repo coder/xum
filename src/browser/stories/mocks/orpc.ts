@@ -1098,6 +1098,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providers: {
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
+      discoverModels: () => Promise.resolve({ status: "unsupported" }),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
