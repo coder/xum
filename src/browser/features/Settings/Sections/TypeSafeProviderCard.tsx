@@ -11,8 +11,12 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
+import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import type { AutoModelRoutingEvaluationStatus } from "@/common/types/autoModelRouting";
+import {
+  splitAutoModelRoutingEvaluationModel,
+  type AutoModelRoutingEvaluationStatus,
+} from "@/common/types/autoModelRouting";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
@@ -33,12 +37,18 @@ interface TypeSafeProviderCardProps {
 export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
   const { api } = useAPI();
   const { config: providersConfig } = useProvidersConfig();
+  const { config: routingConfig } = useAutoModelRouting();
   const [status, setStatus] = useState<AutoModelRoutingEvaluationStatus | null>(null);
-  const [keyDraft, setKeyDraft] = useState("");
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [keyBusy, setKeyBusy] = useState(false);
   // Bumped after a key write so the status re-checks without waiting for a config event.
   const [statusRefresh, setStatusRefresh] = useState(0);
+
+  // Probe the TypeSafe evaluator the user actually saved: an enforced policy can allow that
+  // model while denying the default one, and the credential is usable either way.
+  const probeModel =
+    splitAutoModelRoutingEvaluationModel(routingConfig.evaluationModel).provider ===
+    TYPESAFE_PROVIDER_KEY
+      ? routingConfig.evaluationModel
+      : DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL;
 
   // The backend resolves the key from providers.jsonc, the key file, or env vars, so the
   // evaluator status is the one source of truth for "configured".
@@ -46,9 +56,7 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
     if (!api) return;
     let cancelled = false;
     api.config
-      .getAutoModelRoutingEvaluationStatus({
-        evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
-      })
+      .getAutoModelRoutingEvaluationStatus({ evaluationModel: probeModel })
       .then((next) => {
         if (!cancelled) setStatus(next);
       })
@@ -56,30 +64,7 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
     return () => {
       cancelled = true;
     };
-  }, [api, statusRefresh, providersConfig]);
-
-  const writeKey = async (value: string) => {
-    if (!api) return;
-    setKeyBusy(true);
-    setKeyError(null);
-    try {
-      const result = await api.providers.setProviderConfig({
-        provider: TYPESAFE_PROVIDER_KEY,
-        keyPath: ["apiKey"],
-        value,
-      });
-      if (!result.success) {
-        setKeyError(result.error);
-        return;
-      }
-      setKeyDraft("");
-      setStatusRefresh((count) => count + 1);
-    } catch (error) {
-      setKeyError(getErrorMessage(error));
-    } finally {
-      setKeyBusy(false);
-    }
-  };
+  }, [api, probeModel, statusRefresh, providersConfig]);
 
   const configured = status?.available === true;
   const statusTitle = status == null ? "Checking" : configured ? "Configured" : "Not configured";
@@ -118,68 +103,111 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
       </Button>
 
       {props.expanded && (
-        <div className="border-border-medium space-y-3 border-t px-4 py-3">
-          <div className="text-muted text-xs">
-            Evaluation-only credential for Auto model and thinking routing. Also read from{" "}
-            {TYPESAFE_API_KEY_ENV_VARS.join(", ")}.
-          </div>
-          <div className="space-y-1">
-            <label className="text-foreground block text-xs font-medium" htmlFor="typesafe-api-key">
-              API Key
-            </label>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Input
-                id="typesafe-api-key"
-                type="password"
-                autoComplete="off"
-                value={keyDraft}
-                placeholder="Enter API key"
-                onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-                  setKeyDraft(event.target.value)
-                }
-                onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
-                  if (event.key === "Enter" && keyDraft.trim().length > 0) {
-                    void writeKey(keyDraft.trim());
-                  }
-                }}
-                className="border-border-medium bg-modal-bg h-9 min-w-0 flex-1"
-              />
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={keyBusy || keyDraft.trim().length === 0}
-                  onClick={() => void writeKey(keyDraft.trim())}
-                >
-                  Save
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={keyBusy}
-                  onClick={() => void writeKey("")}
-                >
-                  Clear
-                </Button>
-              </div>
-            </div>
-            <div
-              className={
-                configured || status == null ? "text-muted text-xs" : "text-danger-light text-xs"
+        <TypeSafeKeyEditor status={status} onSaved={() => setStatusRefresh((count) => count + 1)} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Mounted only while the card is expanded so that collapsing it (or opening another
+ * provider) discards an unsaved key instead of restoring it on the next expand.
+ */
+function TypeSafeKeyEditor(props: {
+  status: AutoModelRoutingEvaluationStatus | null;
+  onSaved: () => void;
+}) {
+  const { api } = useAPI();
+  const [keyDraft, setKeyDraft] = useState("");
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [keyBusy, setKeyBusy] = useState(false);
+
+  const writeKey = async (value: string) => {
+    if (!api) return;
+    setKeyBusy(true);
+    setKeyError(null);
+    try {
+      const result = await api.providers.setProviderConfig({
+        provider: TYPESAFE_PROVIDER_KEY,
+        keyPath: ["apiKey"],
+        value,
+      });
+      if (!result.success) {
+        setKeyError(result.error);
+        return;
+      }
+      setKeyDraft("");
+      props.onSaved();
+    } catch (error) {
+      setKeyError(getErrorMessage(error));
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  const configured = props.status?.available === true;
+
+  return (
+    <div className="border-border-medium space-y-3 border-t px-4 py-3">
+      <div className="text-muted text-xs">
+        Evaluation-only credential for Auto model and thinking routing. Also read from{" "}
+        {TYPESAFE_API_KEY_ENV_VARS.join(", ")}.
+      </div>
+      <div className="space-y-1">
+        <label className="text-foreground block text-xs font-medium" htmlFor="typesafe-api-key">
+          API Key
+        </label>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            id="typesafe-api-key"
+            type="password"
+            autoComplete="off"
+            value={keyDraft}
+            placeholder="Enter API key"
+            onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+              setKeyDraft(event.target.value)
+            }
+            onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
+              if (event.key === "Enter" && keyDraft.trim().length > 0) {
+                void writeKey(keyDraft.trim());
               }
-              data-typesafe-provider-status
+            }}
+            className="border-border-medium bg-modal-bg h-9 min-w-0 flex-1"
+          />
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={keyBusy || keyDraft.trim().length === 0}
+              onClick={() => void writeKey(keyDraft.trim())}
             >
-              {status == null
-                ? "Checking..."
-                : configured
-                  ? "Configured"
-                  : (status.reason ?? "Not configured")}
-            </div>
-            {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
+              Save
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={keyBusy}
+              onClick={() => void writeKey("")}
+            >
+              Clear
+            </Button>
           </div>
         </div>
-      )}
+        <div
+          className={
+            configured || props.status == null ? "text-muted text-xs" : "text-danger-light text-xs"
+          }
+          data-typesafe-provider-status
+        >
+          {props.status == null
+            ? "Checking..."
+            : configured
+              ? "Configured"
+              : (props.status.reason ?? "Not configured")}
+        </div>
+        {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
+      </div>
     </div>
   );
 }
