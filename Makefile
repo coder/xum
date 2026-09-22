@@ -87,7 +87,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build test-storybook
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
 .PHONY: check-eager-imports check-bundle-size check-startup
@@ -604,6 +604,12 @@ storybook-run: node_modules/.installed src/version.ts ## Run CMD with a ready St
 storybook-build: node_modules/.installed src/version.ts ## Build static Storybook
 	$(check_node_version)
 	@bun x storybook build
+
+storybook-flake-check: node_modules/.installed src/version.ts ## Replay Pixel captures to find nondeterministic stories (STORYBOOK_FLAKE_ARGS='--files a.stories.tsx --runs 5')
+	$(check_node_version)
+	@test -f storybook-static/index.json || bun x storybook build
+	@# Node, not Bun: relaunching Playwright under Bun intermittently hangs.
+	@node scripts/storybook-flake-check.mjs $(STORYBOOK_FLAKE_ARGS)
 
 capture-readme-screenshots: node_modules/.installed src/version.ts ## Capture README screenshots from running Storybook
 	@echo "Capturing README screenshots from Storybook (must be running on port 6006)..."

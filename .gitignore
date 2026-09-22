@@ -116,6 +116,7 @@ __pycache__
 tmpfork
 .mux-agent-cli
 storybook-static/
+storybook-flakes/
 *.tgz
 src/test-workspaces/
 terminal-bench-results/

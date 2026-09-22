@@ -21,6 +21,8 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          # The flake check diffs the PR merge commit against its base (first parent).
+          fetch-depth: 2
 
       - uses: ./.github/actions/setup-xum
 
@@ -41,6 +43,34 @@ jobs:
           PIXEL_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           # Auto-approve main builds so they become baselines without review.
           PIXEL_AUTO_REVIEW: ${{ github.event_name == 'push' && 'true' || 'false' }}
+
+      # A story whose final frame depends on timing shows up as a spurious "changed"
+      # snapshot on unrelated PRs. Replay Pixel's capture pipeline on the stories this PR
+      # touches (all stories when the shared harness changes) and fail on any variant
+      # that renders differently across runs. Reuses the storybook-static/ build above.
+      - name: Check stories for nondeterministic snapshots
+        if: github.event_name == 'pull_request' && env.PIXEL_KEY != ''
+        run: |
+          changed=$(git diff --name-only --diff-filter=AMR HEAD^1 HEAD)
+          if echo "$changed" | grep -qE '^(\.storybook/|src/browser/stories/(helpers|mocks)/|src/browser/stories/(meta\.tsx|storyPlayHelpers\.ts|storyTime\.ts)$|pixel\.jsonc$|scripts/storybook-flake-check\.mjs$)'; then
+            echo "Storybook harness changed; checking every story."
+            node scripts/storybook-flake-check.mjs --runs 3
+          else
+            stories=$(echo "$changed" | grep -E '\.stories\.tsx$' | paste -sd, - || true)
+            if [ -z "$stories" ]; then
+              echo "No story files changed; skipping."
+              exit 0
+            fi
+            node scripts/storybook-flake-check.mjs --runs 3 --files "$stories"
+          fi
+
+      - name: Upload nondeterministic renders
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: storybook-flakes
+          path: storybook-flakes/
+          if-no-files-found: ignore
 
       - name: Notice when Pixel is not configured
         if: env.PIXEL_KEY == ''

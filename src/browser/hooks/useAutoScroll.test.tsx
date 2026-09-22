@@ -655,6 +655,46 @@ describe("useAutoScroll", () => {
     }
   });
 
+  test("Space on a transcript button activates it without marking scroll intent", () => {
+    const { result } = renderHook(() => useAutoScroll());
+    const element = document.createElement("div");
+    const toggle = document.createElement("button");
+    element.append(toggle);
+    const metrics = attachScrollMetrics(element, {
+      scrollHeight: 1300,
+      clientHeight: 400,
+      initialScrollTop: 900,
+    });
+
+    const dateNowSpy = spyOn(Date, "now");
+    try {
+      let now = 1_000_000;
+      dateNowSpy.mockImplementation(() => now);
+
+      act(() => {
+        (result.current.contentRef as MutableRefObject<HTMLDivElement | null>).current = element;
+        result.current.handleScrollContainerKeyDown({
+          target: toggle,
+          currentTarget: element,
+          key: " ",
+        } as unknown as KeyboardEvent<HTMLDivElement>);
+      });
+
+      // The expanded card's layout growth reports a stale, off-bottom scrollTop
+      // before the re-pin runs; it must be corrected, not treated as user scroll.
+      metrics.setScrollTop(500);
+      act(() => {
+        now += 1;
+        result.current.handleScroll(createScrollEvent(element));
+      });
+
+      expect(metrics.scrollTop).toBe(metrics.maxScrollTop);
+      expect(result.current.autoScroll).toBe(true);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
   test("scroll keys inside editable transcript controls do not mark intent", () => {
     const { result } = renderHook(() => useAutoScroll());
     const element = document.createElement("div");
