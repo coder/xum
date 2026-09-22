@@ -13,7 +13,12 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import {
+  Config,
+  type ProjectsConfig,
+  type Workspace as WorkspaceConfigEntry,
+  type WorkspaceMetadataOptions,
+} from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -35297,7 +35302,11 @@ describe("TaskService", () => {
       prompt: "cancellable work",
       title: "Cancellable",
     });
-    const configSnapshot = (config: Config) => JSON.stringify(config.loadConfigOrDefault());
+    const configSnapshot = (config: Config) => {
+      const snapshot = config.loadConfigOrDefault();
+      // JSON.stringify alone drops Map entries and hides metadata migration writes.
+      return JSON.stringify({ ...snapshot, projects: [...snapshot.projects] });
+    };
     const taskRecordCount = (config: Config) =>
       [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
         project.workspaces.filter((ws) => ws.parentWorkspaceId != null)
@@ -35308,28 +35317,36 @@ describe("TaskService", () => {
       config: Config,
       hooks: { before?: () => void; after?: () => Promise<void> | void }
     ) =>
-      mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-        hooks.before?.();
-        const all = await config.getAllWorkspaceMetadata();
-        const found = all.find((m) => m.id === workspaceId);
-        await hooks.after?.();
-        return found ? Ok(found) : Err("not found");
-      });
+      mock(
+        async (
+          workspaceId: string,
+          options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+        ): Promise<Result<WorkspaceMetadata>> => {
+          hooks.before?.();
+          const found = await config.getWorkspaceMetadataById(workspaceId, options);
+          await hooks.after?.();
+          return found ? Ok(found) : Err("not found");
+        }
+      );
     /** Metadata reads where exactly the Nth call (1-based) blocks on a gate, like a stalled SSH read. */
     const heldMetadataMock = (config: Config, holdCall: number) => {
       const gate = Promise.withResolvers<void>();
       const held = Promise.withResolvers<void>();
       let calls = 0;
-      const read = mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-        calls += 1;
-        if (calls === holdCall) {
-          held.resolve();
-          await gate.promise;
+      const read = mock(
+        async (
+          workspaceId: string,
+          options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+        ): Promise<Result<WorkspaceMetadata>> => {
+          calls += 1;
+          if (calls === holdCall) {
+            held.resolve();
+            await gate.promise;
+          }
+          const found = await config.getWorkspaceMetadataById(workspaceId, options);
+          return found ? Ok(found) : Err("not found");
         }
-        const all = await config.getAllWorkspaceMetadata();
-        const found = all.find((m) => m.id === workspaceId);
-        return found ? Ok(found) : Err("not found");
-      });
+      );
       return { read, gate, held: held.promise, calls: () => calls };
     };
     interface Internals {
@@ -35419,18 +35436,19 @@ describe("TaskService", () => {
     test("abort during read-only preparation discards the late result without touching config or locks", async () => {
       const { config } = await setupTree([]);
       const controller = new AbortController();
-      const { aiService } = createAIServiceMocks(config, {
-        getWorkspaceMetadata: metadataMock(config, { before: () => controller.abort() }),
-      });
+      const metadata = metadataMock(config, { before: () => controller.abort() });
+      const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata });
       const { taskService } = createTaskServiceHarness(config, { aiService });
+      const before = configSnapshot(config);
       const recordsBefore = taskRecordCount(config);
       const result = await taskService.createMany([spawnArgs(rootId)], {
         abortSignal: controller.signal,
       });
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("prepare");
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      // No reservation record (metadata normalization writes are not reservation writes).
+      // Let the abandoned read settle before asserting or deleting its config root.
+      await metadata.mock.results[0]?.value;
+      expect(configSnapshot(config)).toBe(before);
       expect(taskRecordCount(config)).toBe(recordsBefore);
     });
 
@@ -35582,6 +35600,7 @@ describe("TaskService", () => {
     test("a held preparation read is cancellable: abort returns before the read releases and no late reservation follows", async () => {
       const { config } = await setupTree([]);
       const metadata = heldMetadataMock(config, 1);
+      const before = configSnapshot(config);
       const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata.read });
       const { taskService } = createTaskServiceHarness(config, { aiService });
       const onTaskReserved = mock(() => undefined);
@@ -35598,7 +35617,8 @@ describe("TaskService", () => {
       if (!result.success) expect(result.error).toContain("prepare");
       // The read is still blocked: cancellation did not wait for it.
       metadata.gate.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await metadata.read.mock.results[0]?.value;
+      expect(configSnapshot(config)).toBe(before);
       expect(onTaskReserved).not.toHaveBeenCalled();
       expect(taskRecordCount(config)).toBe(recordsBefore);
     });

@@ -8,6 +8,7 @@ import {
   type ProjectConfig,
   type ProjectsConfig,
   type Workspace as WorkspaceConfigEntry,
+  type WorkspaceMetadataOptions,
 } from "@/node/config";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -249,11 +250,16 @@ export function createAIServiceMocks(
   const isStreaming = overrides?.isStreaming ?? mock(() => false);
   const getWorkspaceMetadata =
     overrides?.getWorkspaceMetadata ??
-    mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-      const all = await config.getAllWorkspaceMetadata();
-      const found = all.find((m) => m.id === workspaceId);
-      return found ? Ok(found) : Err("not found");
-    });
+    mock(
+      async (
+        workspaceId: string,
+        options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+      ): Promise<Result<WorkspaceMetadata>> => {
+        // Match AIService: canceled preparation reads must not start migration writes.
+        const found = await config.getWorkspaceMetadataById(workspaceId, options);
+        return found ? Ok(found) : Err("not found");
+      }
+    );
 
   const stopStream =
     overrides?.stopStream ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
