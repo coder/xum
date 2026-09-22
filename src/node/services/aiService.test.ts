@@ -5,6 +5,7 @@ import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // For now, the commandProcessor tests demonstrate our testing approach
 
 import * as fs from "node:fs/promises";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 
@@ -254,6 +255,40 @@ function getFetchUrl(input: Parameters<typeof fetch>[0]): string {
     if (typeof possibleUrl === "string") return possibleUrl;
   }
   return "";
+}
+
+/**
+ * Register the workspace under test in the harness home's config.json (synchronously, merging
+ * with anything a test pre-wrote): the checkout-preparation gates classify the FRESH registry
+ * row (a parent-less row is an exempt root; a row with a parent is a task row), and a workspace
+ * without any row is refused — streaming for an unregistered id is not a supported path.
+ */
+function registerHarnessWorkspaceSync(root: string, metadata: WorkspaceMetadata): void {
+  const file = path.join(root, "config.json");
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
+  } catch {
+    // No config yet: start from an empty one.
+  }
+  const projects = Array.isArray(existing.projects)
+    ? (existing.projects as Array<[string, { workspaces: unknown[] }]>)
+    : [];
+  const row = {
+    id: metadata.id,
+    name: metadata.name,
+    path: metadata.projectPath,
+    runtimeConfig: metadata.runtimeConfig,
+    ...(metadata.parentWorkspaceId != null
+      ? { parentWorkspaceId: metadata.parentWorkspaceId }
+      : {}),
+    ...(metadata.taskIsolation != null ? { taskIsolation: metadata.taskIsolation } : {}),
+  };
+  const project = projects.find(([projectPath]) => projectPath === metadata.projectPath);
+  if (project) project[1].workspaces.push(row);
+  else projects.push([metadata.projectPath, { workspaces: [row] }]);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(file, JSON.stringify({ ...existing, projects }, null, 2), "utf-8");
 }
 
 function createLocalWorkspaceMetadata(
@@ -1175,6 +1210,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         policyService: options?.policyService,
       }
     );
+    registerHarnessWorkspaceSync(xumHomePath, metadata);
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
     const preparedToolNamesForSentinel: string[][] = [];
@@ -1451,6 +1487,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const player = service.mockAiStreamPlayer;
       nodeAssert(player);
       const workspaceId = "mock-admission";
+      registerHarnessWorkspaceSync(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, xumHome.path)
+      );
       const captured = await historyService.captureCompactionReplacement(workspaceId);
       nodeAssert(captured.success);
       if (stale)
@@ -1489,6 +1529,170 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(play).toHaveBeenCalledTimes(stale ? 0 : 1);
     }
   );
+
+  /**
+   * Checkout-preparation authority at the provider gate (tokenless paths included: auto-retry,
+   * compaction follow-ups, heartbeats and goal turns all reach the provider only through here).
+   * The builder captures a physically validated authority right after the runtime context; the
+   * engine hands it to the stream options; AIService re-checks it strictly against the fresh
+   * registry immediately before the provider start — no lock, no filesystem, just the registry.
+   */
+  describe("checkout-preparation authority", () => {
+    const rootId = "prep-root";
+    const sharedId = "prep-shared-child";
+
+    async function registerTree(config: Config, projectPath: string): Promise<void> {
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            { id: rootId, name: rootId, path: projectPath, runtimeConfig: { type: "local" } },
+            {
+              id: sharedId,
+              name: sharedId,
+              path: projectPath,
+              runtimeConfig: { type: "local" },
+              parentWorkspaceId: rootId,
+              taskIsolation: "none",
+              taskStatus: "running",
+              taskAttemptId: "att_00000000000000c1",
+            },
+          ],
+        });
+        return cfg;
+      });
+    }
+
+    async function archiveRoot(config: Config): Promise<void> {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const root = project.workspaces.find((w) => w.id === rootId);
+          if (root) root.archivedAt = new Date().toISOString();
+        }
+        return cfg;
+      });
+    }
+
+    it("threads the captured authority of a shared task row into the engine options", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prep-authority");
+      const projectPath = path.join(xumHome.path, "project");
+      const metadata = createLocalWorkspaceMetadata(sharedId, projectPath, {
+        parentWorkspaceId: rootId,
+        taskIsolation: "none",
+      });
+      const harness = createHarness(xumHome.path, metadata);
+      await registerTree(harness.config, projectPath);
+      const result = await harness.service.streamMessage({
+        workspaceId: sharedId,
+        messages: [createMuxMessage("prep-user", "user", "continue")],
+        modelString: "openai:gpt-5.2",
+      });
+      expect(result.success).toBe(true);
+      expect(harness.startStreamCalls).toHaveLength(1);
+      expect(harness.startStreamCalls[0].preparationAuthorization).toMatchObject({
+        kind: "authority",
+        authority: { workspaceId: sharedId, kind: "shared", anchorWorkspaceId: rootId },
+      });
+    });
+
+    it.each([false, true])(
+      "refuses the provider start when the fresh registry no longer supports the captured authority (prepared=%s)",
+      async (prepared) => {
+        using xumHome = new DisposableTempDir("ai-service-prep-barrier");
+        const projectPath = path.join(xumHome.path, "project");
+        const metadata = createLocalWorkspaceMetadata(sharedId, projectPath, {
+          parentWorkspaceId: rootId,
+          taskIsolation: "none",
+        });
+        const harness = createHarness(xumHome.path, metadata);
+        await registerTree(harness.config, projectPath);
+        const options = {
+          workspaceId: sharedId,
+          messages: [createMuxMessage("prep-user", "user", "continue")],
+          modelString: "openai:gpt-5.2",
+        };
+        let result: Awaited<ReturnType<AIService["streamMessage"]>>;
+        if (prepared) {
+          // Admission-only preparation captured the authority; the anchor root is archived
+          // before the deferred start — the engine must never see this request.
+          const candidate = await harness.service.prepareStreamMessage(options);
+          if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+          await using request = candidate.data;
+          await archiveRoot(harness.config);
+          result = await request.start(options);
+        } else {
+          // The builder's own awaits: the anchor root is archived after the async preflight
+          // validated the ancestry and before the provider start.
+          spyOn(messagePipeline, "prepareMessagesForProvider").mockImplementation(
+            async (pipelineArgs) => {
+              await archiveRoot(harness.config);
+              return pipelineArgs.messagesWithSentinel as unknown as Awaited<
+                ReturnType<typeof messagePipeline.prepareMessagesForProvider>
+              >;
+            }
+          );
+          result = await harness.service.streamMessage(options);
+        }
+        expect(result.success).toBe(false);
+        expect(harness.startStreamCalls).toHaveLength(0);
+      }
+    );
+
+    it("refuses a legacy host-local task row before any request is assembled", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prep-legacy");
+      const projectPath = path.join(xumHome.path, "project");
+      const legacyId = "prep-legacy-child";
+      const legacyPath = path.join(xumHome.path, "legacy-checkout");
+      await fs.mkdir(legacyPath, { recursive: true });
+      const metadata = createLocalWorkspaceMetadata(legacyId, projectPath, {
+        parentWorkspaceId: rootId,
+        runtimeConfig: { type: "worktree", srcBaseDir: xumHome.path },
+      });
+      const harness = createHarness(xumHome.path, metadata);
+      await registerTree(harness.config, projectPath);
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: legacyId,
+          name: legacyId,
+          path: legacyPath,
+          runtimeConfig: { type: "worktree", srcBaseDir: xumHome.path },
+          parentWorkspaceId: rootId,
+          taskStatus: "running",
+          taskAttemptId: "att_00000000000000c2",
+        });
+        return cfg;
+      });
+      const result = await harness.service.streamMessage({
+        workspaceId: legacyId,
+        messages: [createMuxMessage("prep-user", "user", "continue")],
+        modelString: "openai:gpt-5.2",
+      });
+      expect(result.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(0);
+      expect(harness.preparedPayloadMessageIds).toHaveLength(0);
+    });
+
+    it("mock playback is fenced by the same fresh check", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prep-mock");
+      const projectPath = path.join(xumHome.path, "project");
+      const { service, config } = createBasicAIService(xumHome.path);
+      await registerTree(config, projectPath);
+      service.enableMockMode();
+      const player = service.mockAiStreamPlayer;
+      nodeAssert(player);
+      const play = spyOn(player, "play").mockResolvedValue({ success: true, data: undefined });
+      const messages = [createMuxMessage("mock-input", "user", "hello")];
+      expect(
+        (await service.streamMessage({ workspaceId: sharedId, messages, modelString: "m" })).success
+      ).toBe(true);
+      expect(play).toHaveBeenCalledTimes(1);
+      await archiveRoot(config);
+      expect(
+        (await service.streamMessage({ workspaceId: sharedId, messages, modelString: "m" })).success
+      ).toBe(false);
+      expect(play).toHaveBeenCalledTimes(1);
+    });
+  });
 
   it.each(["request-row", "idle-row", "agent", "send-metadata", "ordinary", "historical"] as const)(
     "keeps oversized compaction recovery outside token-budget preflight: %s",
@@ -1601,6 +1805,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await fs.mkdir(projectPath, { recursive: true });
 
     const workspaceId = "workspace-set-goal-child-disabled";
+    // A project-dir child shares its parent's checkout: the parent root must be registered at
+    // the same path for the child's checkout-preparation authority to derive.
+    registerHarnessWorkspaceSync(
+      xumHome.path,
+      createLocalWorkspaceMetadata("parent-workspace", projectPath)
+    );
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
       parentWorkspaceId: "parent-workspace",
     });
@@ -3934,6 +4144,7 @@ describe("AIService.streamMessage multi-project trust gating", () => {
         experimentsService,
       }
     );
+    registerHarnessWorkspaceSync(xumHomePath, metadata);
     const getToolsForModelSpy = stubCommonStreamMessageDependencies({
       service,
       config,
@@ -3984,8 +4195,16 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     const harness = createHarness(xumHome.path, metadata);
 
     await harness.config.editConfig((cfg) => {
-      cfg.projects.set(projectAPath, { workspaces: [], trusted: true });
-      cfg.projects.set(projectBPath, { workspaces: [], trusted: false });
+      cfg.projects.set(projectAPath, {
+        // Keep the registered workspace row: the checkout-preparation gate reads it.
+        workspaces: cfg.projects.get(projectAPath)?.workspaces ?? [],
+        trusted: true,
+      });
+      cfg.projects.set(projectBPath, {
+        // Keep the registered workspace row: the checkout-preparation gate reads it.
+        workspaces: cfg.projects.get(projectBPath)?.workspaces ?? [],
+        trusted: false,
+      });
       return cfg;
     });
 
@@ -4016,8 +4235,16 @@ describe("AIService.streamMessage multi-project trust gating", () => {
 
     try {
       await harness.config.editConfig((cfg) => {
-        cfg.projects.set(projectAPath, { workspaces: [], trusted: true });
-        cfg.projects.set(projectBPath, { workspaces: [], trusted: true });
+        cfg.projects.set(projectAPath, {
+          // Keep the registered workspace row: the checkout-preparation gate reads it.
+          workspaces: cfg.projects.get(projectAPath)?.workspaces ?? [],
+          trusted: true,
+        });
+        cfg.projects.set(projectBPath, {
+          // Keep the registered workspace row: the checkout-preparation gate reads it.
+          workspaces: cfg.projects.get(projectBPath)?.workspaces ?? [],
+          trusted: true,
+        });
         return cfg;
       });
 
@@ -4075,6 +4302,7 @@ describe("AIService.streamMessage turn envelope", () => {
   ): TurnEnvelopeHarness {
     const { config, historyService, initStateManager, providersConfigStore, service } =
       createBasicAIService(xumHomePath);
+    registerHarnessWorkspaceSync(xumHomePath, metadata);
     const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,

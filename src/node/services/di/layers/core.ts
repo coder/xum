@@ -87,6 +87,7 @@ import {
   readWorkspaceOverridesEpochToken,
   WorkspaceMcpOverridesService,
 } from "@/node/services/workspaceMcpOverridesService";
+import { isTaskCheckoutAuthorizationCurrent } from "@/node/services/taskCheckoutAuthorization";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { StoresFromCoreOptionsLive } from "./stores";
@@ -430,6 +431,11 @@ export const MCPServerManagerLive = Layer.effect(
           // A sibling backend's override save/prune bumps this; the manager
           // refreshes or evicts its cached snapshots on the next serve.
           readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
+          // Synchronous, config-only re-check of the checkout-preparation authorization a serve
+          // was captured under (throwing registry read; no checkout locks, no filesystem) at
+          // every point the manager hands out enablement, including under the writer's fence.
+          isPreparationAuthorizationCurrent: (workspaceId, captured) =>
+            isTaskCheckoutAuthorizationCurrent(config, workspaceId, captured).current,
           // Served tool calls fence their dispatch against sibling-process
           // override writes with the writer's own lock.
           acquireOverridesLock: (options) =>

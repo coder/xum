@@ -88,6 +88,10 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
+import {
+  taskCheckoutAuthorizationEqual,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -477,7 +481,10 @@ function authorizationStateEqual(
     // serve must not hand out tools on the strength of the same value.
     (a.overridesAuthoritative !== false) === (b.overridesAuthoritative !== false) &&
     workspaceOverridesEqual(a.overrides, b.overrides) &&
-    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null)
+    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null) &&
+    // The checkout-preparation authorization is part of the enablement: a serve captured under
+    // another authorization (or none) is a different authorization state.
+    taskCheckoutAuthorizationEqual(a.preparation, b.preparation)
   );
 }
 
@@ -1267,6 +1274,15 @@ export interface MCPWorkspaceRequestOptions {
   overridesReadDeadlineAt?: number;
   projectSecrets?: Record<string, string>;
   agentPlugins?: AgentPluginsMcpContext | null;
+  /**
+   * The checkout-preparation authorization the caller's deep override read captured
+   * (WorkspaceMcpOverridesService.getOverridesForWorkspace). With the registry check wired
+   * (pluginInvalidation.isPreparationAuthorizationCurrent) the manager re-derives it
+   * synchronously from the fresh registry at every point that hands out enablement and fails
+   * closed on any difference. Nothing captured is not an allow: only a fresh exemption (an
+   * ordinary root, an off-host row) then passes.
+   */
+  preparation?: TaskCheckoutAuthorization;
 }
 
 export type MCPWorkspaceSecretsResolver = (
@@ -1422,6 +1438,17 @@ export interface MCPServerManagerOptions {
       signal?: AbortSignal;
       timeoutMs?: number;
     }) => Promise<() => Promise<void>>;
+    /**
+     * SYNCHRONOUS fresh re-check of a workspace's checkout-preparation authorization against the
+     * registry (taskCheckoutAuthorization.isTaskCheckoutAuthorizationCurrent: a throwing config
+     * read; never the manager's own caches, never checkout locks or filesystem, so it is safe
+     * under the override writer's fence). `false` fails the serve closed. With `captured`
+     * undefined only a fresh exemption (root / off-host row without a proof) is current.
+     */
+    isPreparationAuthorizationCurrent?: (
+      workspaceId: string,
+      captured: TaskCheckoutAuthorization | undefined
+    ) => boolean;
   };
 }
 
@@ -2800,7 +2827,43 @@ export class MCPServerManager {
     // finish must not be failed closed as if a publication had revoked it. A
     // publication or trust change records different overrides/trust and is
     // still detected.
-    return recorded !== undefined && authorizationStateEqual(recorded, derivedFrom);
+    return (
+      recorded !== undefined &&
+      authorizationStateEqual(recorded, derivedFrom) &&
+      // And the fresh registry must still derive the captured checkout-preparation authority:
+      // the caller's read validated it once; every hand-out re-checks it (config only).
+      this.isPreparationAuthorityCurrent(derivedFrom)
+    );
+  }
+
+  /**
+   * Whether the checkout-preparation authority `options` were captured under is still exactly
+   * what the fresh registry derives. Synchronous and config-only (the wired reader), so it can
+   * run at every post-await hand-out point and under the override writer's fence. Without a
+   * wired reader (tests, embedded managers) there is no authority to check; with one, a request
+   * that captured nothing cannot be vouched for and fails closed — never a permissive default.
+   */
+  private isPreparationAuthorityCurrent(
+    options: Pick<MCPWorkspaceRequestOptions, "workspaceId" | "preparation">
+  ): boolean {
+    const isCurrent = this.pluginInvalidation?.isPreparationAuthorizationCurrent;
+    if (isCurrent === undefined) return true;
+    try {
+      const current = isCurrent(options.workspaceId, options.preparation);
+      if (!current) {
+        log.debug("[MCP] Checkout-preparation authorization is not current; failing closed", {
+          workspaceId: options.workspaceId,
+          captured: options.preparation?.kind,
+        });
+      }
+      return current;
+    } catch (error) {
+      log.debug("[MCP] Checkout-preparation authorization could not be re-read; failing closed", {
+        workspaceId: options.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
   }
 
   private failClosedResult(): MCPToolsForWorkspaceResult {
@@ -2928,6 +2991,12 @@ export class MCPServerManager {
     // get the reader's default budget, not one that expired with this send.
     if (options.overridesReadDeadlineAt !== undefined) {
       options = { ...options, overridesReadDeadlineAt: undefined };
+    }
+    // Checkout-preparation authority AFTER the disk re-read's await and before anything is
+    // recorded or started: an authority change landing during that await must fail this serve
+    // closed (nothing enabled, nothing started), exactly like an unverifiable override document.
+    if (!this.isPreparationAuthorityCurrent(options)) {
+      overridesUnavailable = true;
     }
     const {
       workspaceId,
@@ -3072,7 +3141,7 @@ export class MCPServerManager {
         }
 
         try {
-          await this.assertOverridesEpochUnmovedBeforeStart();
+          await this.assertOverridesEpochUnmovedBeforeStart(options, serversToRetry);
           const {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
@@ -3290,7 +3359,7 @@ export class MCPServerManager {
           }
         }
 
-        await this.assertOverridesEpochUnmovedBeforeStart();
+        await this.assertOverridesEpochUnmovedBeforeStart(options, serversToRestart);
         const {
           instances: restartedInstances,
           failedServerNames: failedNames,
@@ -3538,7 +3607,7 @@ export class MCPServerManager {
       if (retained) retained.lastActivity = Date.now();
       else await this.stopServers(workspaceId, { retainRestartOptions: true });
 
-      await this.assertOverridesEpochUnmovedBeforeStart();
+      await this.assertOverridesEpochUnmovedBeforeStart(options, serversToStart);
       const {
         instances,
         failedServerNames: startedFailedNames,
@@ -5351,6 +5420,11 @@ export class MCPServerManager {
             if (this.overridesInvalidationGenerations.has(workspaceId)) {
               throw revoked(`server '${serverName}'`);
             }
+            // Fresh registry re-derivation of the checkout-preparation authority the served
+            // tools were handed out under (config only; inside the same synchronous decision).
+            if (!this.isPreparationAuthorityCurrent(recorded)) {
+              throw revoked(`server '${serverName}'`);
+            }
             const entry = this.workspaceServers.get(workspaceId);
             if (entry === undefined) {
               throw revoked(`server '${serverName}'`);
@@ -5547,7 +5621,18 @@ export class MCPServerManager {
    * revocation. The bracket's postflight alone would only close the server
    * after it had started. The next serve's preflight re-derives from disk.
    */
-  private async assertOverridesEpochUnmovedBeforeStart(): Promise<void> {
+  private async assertOverridesEpochUnmovedBeforeStart(
+    options: Pick<MCPWorkspaceRequestOptions, "workspaceId" | "preparation">,
+    /** The servers about to start; an empty batch (a serve already failing closed) starts nothing. */
+    servers: MCPServerMap
+  ): Promise<void> {
+    // Last synchronous point before server processes start: the captured checkout-preparation
+    // authorization must still be what the fresh registry derives.
+    if (Object.keys(servers).length > 0 && !this.isPreparationAuthorityCurrent(options)) {
+      throw new Error(
+        `Workspace ${options.workspaceId} checkout preparation changed while MCP servers were about to start; retry`
+      );
+    }
     const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
     if (readOverridesEpoch === undefined || !this.pluginInvalidationTokenSeen) {
       return;

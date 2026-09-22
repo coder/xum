@@ -12,6 +12,10 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config, ProjectsConfig } from "@/node/config";
+import {
+  captureTaskCheckoutAuthorization,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -1070,6 +1074,20 @@ function groupMetadataById(
   return grouped;
 }
 
+/**
+ * Result of getOverridesForWorkspace. `preparation` is the checkout-preparation authority the
+ * read validated (threaded by callers into MCPWorkspaceRequestOptions so the manager can re-check
+ * it against the fresh registry); `preparationRefusal` replaces it when the gate refused, in
+ * which case the read is never authoritative and carries no overrides.
+ */
+export interface WorkspaceMcpOverridesRead {
+  overrides: WorkspaceMCPOverrides;
+  revision: string;
+  authoritative: boolean;
+  preparation?: TaskCheckoutAuthorization;
+  preparationRefusal?: { message: string };
+}
+
 export class WorkspaceMcpOverridesService {
   /**
    * Root holding the cross-process coordination state (override epoch file,
@@ -1654,9 +1672,29 @@ export class WorkspaceMcpOverridesService {
       timeoutMs?: number;
       signal?: AbortSignal;
     }
-  ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string; authoritative: boolean }> {
-    const snapshot = new ConfigSnapshot(this.config);
+  ): Promise<WorkspaceMcpOverridesRead> {
     const mode = options?.mode ?? "lenient";
+    // Checkout-preparation authority — the deepest MCP gate. Every consumer that can activate
+    // MCP for a workspace (turn builder, prompt discovery, the manager's disk re-read, prompt
+    // materialization, served-tool dispatch) reads through here, so a host-local task row whose
+    // authority cannot be validated (bounded, async) yields a NON-authoritative read with no
+    // overrides — the manager then fails its serve closed — and never the document's own
+    // enablement. Roots and off-host rows resolve to an exempt authority the caller threads on.
+    const preparation = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+    if (!preparation.success) {
+      if (mode === "strict") throw new Error(preparation.error);
+      log.info("[MCP] Workspace MCP overrides withheld: checkout preparation refused", {
+        workspaceId,
+        message: preparation.error,
+      });
+      return {
+        overrides: {},
+        revision: computeOverridesRevision({}),
+        authoritative: false,
+        preparationRefusal: { message: preparation.error },
+      };
+    }
+    const snapshot = new ConfigSnapshot(this.config);
     const resolution = (async () =>
       this.resolveOverridesFor(
         await this.getWorkspaceMetadata(workspaceId, snapshot),
@@ -1689,7 +1727,12 @@ export class WorkspaceMcpOverridesService {
           throw new Error(reason);
         }
         log.warn(`[MCP] ${reason}; serving no overrides (non-authoritative)`, { workspaceId });
-        return { overrides: {}, revision: computeOverridesRevision({}), authoritative: false };
+        return {
+          overrides: {},
+          revision: computeOverridesRevision({}),
+          authoritative: false,
+          preparation: preparation.data,
+        };
       }
       resolved = raced.value;
     }
@@ -1697,6 +1740,7 @@ export class WorkspaceMcpOverridesService {
       overrides: resolved.overrides,
       revision: computeOverridesRevision(resolved.overrides),
       authoritative: resolved.authoritative,
+      preparation: preparation.data,
     };
   }
 

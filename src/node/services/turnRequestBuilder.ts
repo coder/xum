@@ -141,6 +141,10 @@ import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
   type WorkspaceMcpOverridesService,
 } from "./workspaceMcpOverridesService";
+import {
+  captureTaskCheckoutAuthorization,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import {
@@ -1345,6 +1349,25 @@ export class TurnRequestBuilder {
       };
     }
 
+    // Checkout-preparation authority (async, bounded): a host-local task row is executable only
+    // under a validated authority. Captured here — after the runtime context, before any MCP or
+    // provider work — and carried in the stream options so AIService re-checks it strictly
+    // against the fresh registry right before the provider start. This is the gate every
+    // tokenless path (auto-retry, compaction follow-up, heartbeat, goal turn) passes through.
+    const preparationStartedAt = Date.now();
+    const preparation = await captureTaskCheckoutAuthorization(
+      this.dependencies.config,
+      workspaceId
+    );
+    recordStartupPhaseTiming("checkoutPreparationMs", preparationStartedAt);
+    if (!preparation.success) {
+      workspaceLog.info("[stream-startup] Refused: checkout preparation", {
+        message: preparation.error,
+      });
+      return { type: "finished", result: Err({ type: "unknown", raw: preparation.error }) };
+    }
+    const preparationAuthorization = preparation.data;
+
     // Verify runtime is actually reachable after init completes.
     // For Docker workspaces, this checks the container exists and starts it if stopped.
     // For Coder workspaces, this may start a stopped workspace and wait for it.
@@ -1590,6 +1613,9 @@ export class TurnRequestBuilder {
     // overrides" would re-enable a globally enabled server that only the
     // unreadable document disables.
     let mcpOverridesAuthoritative = false;
+    // The checkout-preparation authority the deep override read validated, threaded into the
+    // MCP request so the manager re-checks it against the fresh registry at every hand-out.
+    let mcpPreparation: TaskCheckoutAuthorization | undefined;
     const loadWorkspaceMcpOverridesStartedAt = Date.now();
     try {
       // Bounded and cancellable: an inheriting child's resolution probes and
@@ -1603,6 +1629,7 @@ export class TurnRequestBuilder {
       );
       mcpOverrides = read.overrides;
       mcpOverridesAuthoritative = read.authoritative;
+      mcpPreparation = read.preparation;
     } catch (error) {
       log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
         workspaceId,
@@ -1861,6 +1888,7 @@ export class TurnRequestBuilder {
             trusted: projectTrusted,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
+            preparation: mcpPreparation,
             // A non-authoritative read that exhausted its budget (unreachable
             // remote ancestor) must not be followed by a second full-length
             // attempt inside the manager: it gets the remainder only.
@@ -3386,6 +3414,7 @@ export class TurnRequestBuilder {
         providersConfigSnapshot: requestProvidersConfig,
         onStreamConstructed: emitPrimaryEnvelope,
         rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
+        preparationAuthorization,
       };
 
       const logStartOutcome = (

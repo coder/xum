@@ -112,6 +112,14 @@ import {
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
+import {
+  captureTaskCheckoutAuthorization,
+  isTaskCheckoutAuthorizationCurrent,
+  isTaskCheckoutDomainRow,
+  snapshotConfigReader,
+  taskCheckoutStaleMessage,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -515,6 +523,11 @@ interface AdmittedSend {
   readonly attemptId: string;
   /** Set for sends admitted while this process owns the attempt (receipt authority, later change). */
   readonly attempt?: OwnedTaskAttempt;
+  /**
+   * The checkout-preparation authorization the send was admitted under (host-local task rows
+   * only). A pending/enqueued token reads stale once the fresh registry no longer derives it.
+   */
+  readonly preparation?: TaskCheckoutAuthorization;
   state: "pending" | "enqueued" | "admitted" | "discharged";
   /** The admitted turn generation; rebound to its successor on supersession. */
   turnId?: symbol;
@@ -2915,13 +2928,15 @@ export class TaskService implements AgentTaskIntegration {
   private createAdmittedSend(
     taskId: string,
     attemptId: string,
-    attempt: OwnedTaskAttempt | undefined
+    attempt: OwnedTaskAttempt | undefined,
+    preparation: TaskCheckoutAuthorization | undefined
   ): AdmittedSend {
     assertTaskAttemptId(attemptId, "createAdmittedSend");
     const send: AdmittedSend = {
       taskId,
       attemptId,
       ...(attempt != null ? { attempt } : {}),
+      ...(preparation != null ? { preparation } : {}),
       state: "pending",
       capturedBy: new Set(),
       token: {
@@ -2933,6 +2948,14 @@ export class TaskService implements AgentTaskIntegration {
           if (send.state === "discharged") return true;
           if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
           if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
+            return true;
+          }
+          // The checkout-preparation authorization the send was admitted under must still be
+          // what the fresh registry derives (strict, config only); unreadable registry = stale.
+          if (
+            send.preparation != null &&
+            !isTaskCheckoutAuthorizationCurrent(this.config, taskId, send.preparation).current
+          ) {
             return true;
           }
           // A send still in its preflight while the attempt's last stream is undecided, or was
@@ -3022,15 +3045,18 @@ export class TaskService implements AgentTaskIntegration {
    */
   admitTaskWorkspaceTurn(
     workspaceId: string,
-    options: { acceptanceOrigin: TurnAcceptanceOrigin; expectedAttemptId?: string }
+    options: {
+      acceptanceOrigin: TurnAcceptanceOrigin;
+      expectedAttemptId?: string;
+      preparation?: TaskCheckoutAuthorization;
+    }
   ): TaskTurnAdmission {
     assert(workspaceId.length > 0, "admitTaskWorkspaceTurn: workspaceId must be non-empty");
     let entry: WorkspaceConfigEntry | undefined;
+    let config: ProjectsConfig;
     try {
-      entry = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        workspaceId
-      )?.workspace;
+      config = this.config.loadConfigOrDefault({ throwOnError: true });
+      entry = findWorkspaceEntry(config, workspaceId)?.workspace;
     } catch (error: unknown) {
       // Unreadable registry: the classification itself is indeterminate. Absence from this
       // process's identity map (currentAttemptIdByTaskId) is no proof of "not a task" — a task
@@ -3051,6 +3077,24 @@ export class TaskService implements AgentTaskIntegration {
       return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
     }
     if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
+    // Checkout-preparation authority, before every other gate (including the pre-identity
+    // bypass below): a host-local task row is executable only under the authority the caller's
+    // async preflight captured, re-derived here strictly from the fresh registry. Off-host rows
+    // are excluded; a caller that captured nothing for a domain row is refused (fail closed).
+    const preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+      workspaceId,
+      entry,
+      config,
+      options.preparation
+    );
+    if (preparationRefusal != null) {
+      log.info("[task-attempt] send refused: checkout preparation authority", {
+        workspaceId,
+        acceptanceOrigin: options.acceptanceOrigin,
+        message: preparationRefusal,
+      });
+      return { kind: "refused", message: preparationRefusal };
+    }
     // The claim is monotonic and stronger than the id: a retired task refuses even when its id
     // is missing or malformed (fail closed on partial state), so check it before the id.
     if (entry.taskAttemptRetiredBy != null) {
@@ -3089,9 +3133,51 @@ export class TaskService implements AgentTaskIntegration {
     const send = this.createAdmittedSend(
       workspaceId,
       attemptId,
-      owned?.attemptId === attemptId ? owned : undefined
+      owned?.attemptId === attemptId ? owned : undefined,
+      isTaskCheckoutDomainRow(entry) ? options.preparation : undefined
     );
     return { kind: "admitted", token: send.token };
+  }
+
+  /**
+   * Async, bounded checkout-preparation preflight (AgentTaskIntegration): the authority every
+   * admission of this workspace must bind. Never throws; a refusal carries the inspectable
+   * message the caller returns to the sender.
+   */
+  async preflightTaskWorkspacePreparation(
+    workspaceId: string
+  ): Promise<Result<TaskCheckoutAuthorization, string>> {
+    assert(workspaceId.length > 0, "preflightTaskWorkspacePreparation: workspaceId");
+    const captured = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+    if (!captured.success) {
+      log.info("[task-prep] preflight refused", { workspaceId, message: captured.error });
+    }
+    return captured;
+  }
+
+  /**
+   * The fence's synchronous checkout-preparation check for a task row `entry` read from `config`:
+   * `undefined` when the captured authorization is exactly what the snapshot derives (or, for an
+   * off-host row with nothing captured, when the snapshot still proves its exemption); otherwise
+   * the refusal message. A host-local task row with nothing captured is refused: the physical
+   * validation belongs to the async preflight and cannot be replayed here. Config only — no
+   * filesystem, no locks (see isTaskCheckoutAuthorizationCurrent).
+   */
+  private checkTaskCheckoutAuthorityAtFence(
+    workspaceId: string,
+    entry: WorkspaceConfigEntry,
+    config: ProjectsConfig,
+    captured: TaskCheckoutAuthorization | undefined
+  ): string | undefined {
+    if (captured == null && isTaskCheckoutDomainRow(entry)) {
+      return `Task workspace ${workspaceId} cannot run: this send was not preflighted against its checkout preparation (PREP_PREFLIGHT_REQUIRED).`;
+    }
+    const check = isTaskCheckoutAuthorizationCurrent(
+      snapshotConfigReader(config),
+      workspaceId,
+      captured
+    );
+    return check.current ? undefined : taskCheckoutStaleMessage(workspaceId, check.reason);
   }
 
   /**
@@ -3187,18 +3273,36 @@ export class TaskService implements AgentTaskIntegration {
   private async rotateAttemptForStartupRedrive(
     taskId: string,
     snapshot: Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus">
-  ): Promise<string | undefined> {
+  ): Promise<{ attemptId: string; preparation: TaskCheckoutAuthorization } | undefined> {
+    // Checkout-preparation authority first (async, bounded): a row this process cannot authorize
+    // is never re-driven — no rotation, no send; it stays inspectable with its old attempt.
+    const preflight = await this.preflightTaskWorkspacePreparation(taskId);
+    if (!preflight.success) {
+      log.info("[startup] task skipped: checkout preparation refused", {
+        taskId,
+        message: preflight.error,
+      });
+      return undefined;
+    }
+    const preparation = preflight.data;
     const attemptId = newTaskAttemptId();
     let committed = false;
     let moved = false;
     try {
       await this.editWorkspaceEntry(
         taskId,
-        (ws) => {
+        (ws, freshConfig) => {
           if (ws.taskAttemptRetiredBy != null) return;
           if (
             ws.taskAttemptId !== snapshot.taskAttemptId ||
             ws.taskStatus !== snapshot.taskStatus
+          ) {
+            moved = true;
+            return;
+          }
+          // Strict re-derivation against the fresh row inside the CAS (config only).
+          if (
+            this.checkTaskCheckoutAuthorityAtFence(taskId, ws, freshConfig, preparation) != null
           ) {
             moved = true;
             return;
@@ -3225,7 +3329,7 @@ export class TaskService implements AgentTaskIntegration {
       return undefined;
     }
     this.publishAttemptRotation(taskId, attemptId);
-    return attemptId;
+    return { attemptId, preparation };
   }
 
   /**
@@ -3238,11 +3342,12 @@ export class TaskService implements AgentTaskIntegration {
    */
   private async dispatchFencedStartupCompactionFollowUp(
     taskId: string,
-    attemptId: string
+    rotated: { attemptId: string; preparation: TaskCheckoutAuthorization }
   ): Promise<Result<boolean>> {
     const admission = this.admitTaskWorkspaceTurn(taskId, {
       acceptanceOrigin: "automatic",
-      expectedAttemptId: attemptId,
+      expectedAttemptId: rotated.attemptId,
+      preparation: rotated.preparation,
     });
     if (admission.kind !== "admitted") {
       return Err(
@@ -4358,15 +4463,12 @@ export class TaskService implements AgentTaskIntegration {
       // the first send below; the sends are then fenced against the fresh id at the handoff.
       // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
       // admitted or stopped by another writer and must not be re-driven.
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
+      const rotated = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotated == null) {
         failedAwaitingReportCount += 1;
         continue;
       }
-      const followUp = await this.dispatchFencedStartupCompactionFollowUp(
-        task.id,
-        rotatedAttemptId
-      );
+      const followUp = await this.dispatchFencedStartupCompactionFollowUp(task.id, rotated);
       if (!followUp.success) failedAwaitingReportCount += 1;
       else if (followUp.data) resumedAwaitingReportCount += 1;
       if (!followUp.success || followUp.data) continue;
@@ -4376,7 +4478,8 @@ export class TaskService implements AgentTaskIntegration {
       // refuses the send at the gates instead of the handoff adopting the successor.
       const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
         acceptanceOrigin: "automatic",
-        expectedAttemptId: rotatedAttemptId,
+        expectedAttemptId: rotated.attemptId,
+        preparation: rotated.preparation,
       });
       if (completionAdmission.kind !== "admitted") {
         failedAwaitingReportCount += 1;
@@ -4384,7 +4487,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
-        fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
+        fence: { turnAdmission: completionAdmission.token, attemptId: rotated.attemptId },
         // The fence carries the attempt (see the option's doc).
         expectedAttemptId: null,
       });
@@ -4425,18 +4528,19 @@ export class TaskService implements AgentTaskIntegration {
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
       // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
+      const rotated = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotated == null) {
         failedRunningCount += 1;
         continue;
       }
+      const rotatedAttemptId = rotated.attemptId;
 
       // Restore compaction intent before new guidance/nudges make its tail stale.
       // Guidance then queues behind that continuation without losing either payload.
       const followUp =
         alreadyStreaming || queueOnly
           ? Ok(false)
-          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotatedAttemptId);
+          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotated);
       if (!followUp.success) failedRunningCount += 1;
       else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
       if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
@@ -4448,6 +4552,7 @@ export class TaskService implements AgentTaskIntegration {
         const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
           acceptanceOrigin: "automatic",
           expectedAttemptId: rotatedAttemptId,
+          preparation: rotated.preparation,
         });
         return admission.kind === "admitted" ? admission.token : undefined;
       };
@@ -4779,7 +4884,7 @@ export class TaskService implements AgentTaskIntegration {
 
   private async editActiveWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (workspace: WorkspaceConfigEntry, config: ProjectsConfig) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean> {
     // Admission protects only persistence. Never hold the desktop gate across nested sends.
@@ -4787,7 +4892,7 @@ export class TaskService implements AgentTaskIntegration {
       this.editWorkspaceEntry(
         workspaceId,
         (workspace, config) => {
-          updater(workspace);
+          updater(workspace, config);
           this.desktopInputCoordinator.assertAdmission(config, workspaceId);
         },
         options
@@ -7492,10 +7597,18 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // Checkout-preparation authority (async, bounded, outside the mutex like the lineage): a
+    // child this process cannot authorize is refused before any attempt rotates.
+    const preparationPreflight = await this.preflightTaskWorkspacePreparation(taskId);
+    if (!preparationPreflight.success) {
+      return Err({ code: "send_failed" as const, message: preparationPreflight.error });
+    }
+    const preparation = preparationPreflight.data;
     const lineage = await this.evaluateAttemptLineage(taskId, refreshedEntry.workspace);
     const reactivationAttemptId = newTaskAttemptId();
     let committedProven = false;
     let published = false;
+    let preparationRefusal: string | undefined;
     {
       // Critical section (see markInterruptedTaskRunning): the identity CAS, the row check and
       // the ownership install run under the global mutex every cascade's Phase A holds, so no
@@ -7512,8 +7625,16 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editWorkspaceEntry(
         taskId,
-        (ws) => {
+        (ws, freshConfig) => {
           if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) return;
+          // Strict re-derivation against the fresh row inside the CAS (config only).
+          preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+            taskId,
+            ws,
+            freshConfig,
+            preparation
+          );
+          if (preparationRefusal != null) return;
           ws.taskAttemptId = reactivationAttemptId;
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
@@ -7523,6 +7644,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       if (!published) {
         // Nothing was published: the previous attempt (owned or not) stays exactly as it was.
+        if (preparationRefusal != null) {
+          return Err({ code: "send_failed" as const, message: preparationRefusal });
+        }
         const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
         return Err({
           code: "send_failed" as const,
@@ -13974,9 +14098,28 @@ export class TaskService implements AgentTaskIntegration {
         // reservation already owns it; eligibility is read from the fresh row (another process's
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
+        // Checkout-preparation authority before the launch CAS: a queued row this process cannot
+        // authorize (a legacy row written before preparation existed, a proof that no longer
+        // validates) is never flipped to `starting`; it fails inspectably instead, exactly as the
+        // launch itself would refuse it. Async and bounded, outside the CAS.
+        const preparationPreflight = await this.preflightTaskWorkspacePreparation(taskId);
+        if (!preparationPreflight.success) {
+          await this.markTaskLaunchFailed(taskId, preparationPreflight.error);
+          continue;
+        }
+        const preparation = preparationPreflight.data;
+        let preparationRefusal: string | undefined;
         try {
-          await this.editActiveWorkspaceEntry(taskId, (workspace) => {
+          await this.editActiveWorkspaceEntry(taskId, (workspace, freshConfig) => {
             if (workspace.taskStatus !== "queued" || workspace.taskAttemptRetiredBy != null) return;
+            // Strict re-derivation against the fresh row inside the CAS (config only).
+            preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+              taskId,
+              workspace,
+              freshConfig,
+              preparation
+            );
+            if (preparationRefusal != null) return;
             const owned = this.ownedAttemptByTaskId.get(taskId);
             const attemptId =
               owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
@@ -13988,6 +14131,10 @@ export class TaskService implements AgentTaskIntegration {
           });
         } catch (error) {
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
+          continue;
+        }
+        if (preparationRefusal != null) {
+          await this.markTaskLaunchFailed(taskId, preparationRefusal);
           continue;
         }
         if (launch == null) {
@@ -14157,8 +14304,11 @@ export class TaskService implements AgentTaskIntegration {
    * status: manual follow-ups must not turn a historical report back into an active task.
    * Returns true only when taskStatus changed to running (and needs restoring on send failure).
    */
-  async markInterruptedTaskRunning(workspaceId: string): Promise<boolean> {
-    const outcome = await this.reawakenInterruptedTask(workspaceId);
+  async markInterruptedTaskRunning(
+    workspaceId: string,
+    options?: { preparation?: TaskCheckoutAuthorization }
+  ): Promise<boolean> {
+    const outcome = await this.reawakenInterruptedTask(workspaceId, options);
     return outcome.kind === "reawakened" && outcome.statusChanged;
   }
 
@@ -14167,7 +14317,10 @@ export class TaskService implements AgentTaskIntegration {
    * AgentTaskIntegration.reawakenInterruptedTask): a manual send must tell "nothing to reawaken"
    * from "decided to reawaken and lost the race", and bind to exactly the attempt it committed.
    */
-  async reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome> {
+  async reawakenInterruptedTask(
+    workspaceId: string,
+    options?: { preparation?: TaskCheckoutAuthorization }
+  ): Promise<TaskReawakenOutcome> {
     assert(workspaceId.length > 0, "reawakenInterruptedTask: workspaceId must be non-empty");
     const notApplicable = { kind: "not-applicable" } as const;
     // Stop-cascade barrier: a resume must not resurrect a task whose stop is still settling.
@@ -14233,6 +14386,22 @@ export class TaskService implements AgentTaskIntegration {
     // user's Stop came after this resume began, so the resume must not resurrect the task (a
     // recovery initiated after that Stop is a new decision and proceeds normally).
     const stopEpochAtStart = this.getWorkspaceStopEpoch(workspaceId);
+    // Checkout-preparation authority: the caller's preflight, or this rescue's own (async,
+    // bounded, outside the mutex like the lineage). A row that cannot be authorized never
+    // rotates — the send behind it is refused at the fence anyway, and the row stays inspectable.
+    let preparation = options?.preparation;
+    if (preparation == null && isTaskCheckoutDomainRow(entryAtStart.workspace)) {
+      const preflight = await this.preflightTaskWorkspacePreparation(workspaceId);
+      if (!preflight.success) {
+        log.info("markInterruptedTaskRunning refused: checkout preparation", {
+          workspaceId,
+          message: preflight.error,
+        });
+        // Not a lost race: the send behind it is refused at the fence (no preparation).
+        return notApplicable;
+      }
+      preparation = preflight.data;
+    }
     // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
     // mutex below: it must never hold up task creation or a cascade's Phase A.
     const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
@@ -14267,7 +14436,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editActiveWorkspaceEntry(
         workspaceId,
-        (ws) => {
+        (ws, freshConfig) => {
           // Only descendant task workspaces have task lifecycle status.
           if (!ws.parentWorkspaceId || this.isWorkspaceStopInProgress(workspaceId)) {
             return;
@@ -14281,6 +14450,14 @@ export class TaskService implements AgentTaskIntegration {
             return;
           }
           if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) {
+            return;
+          }
+          // The authority captured before the CAS must still be exactly what the fresh row (and
+          // its live ancestry) derives; otherwise nothing rotates (config only, no filesystem).
+          if (
+            this.checkTaskCheckoutAuthorityAtFence(workspaceId, ws, freshConfig, preparation) !=
+            null
+          ) {
             return;
           }
 
