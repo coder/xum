@@ -9,6 +9,7 @@ import type {
 } from "@/common/orpc/types";
 
 import type { ThinkingLevel } from "@/common/types/thinking";
+import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 import { AvailableModelSchema } from "@/common/utils/tools/toolDefinitions";
 
 import {
@@ -406,7 +407,13 @@ describe("listAvailableModels", () => {
       { model: "fixture:bad:id:colon", aliases: [], thinkingLevels: DEFAULT_POLICY },
       { model: FABLE, aliases: ["fable"], thinkingLevels: NO_OFF_POLICY },
       { model: KNOWN_MODELS.MYTHOS.id, aliases: ["mythos"], thinkingLevels: NO_OFF_POLICY },
-      { model: KNOWN_MODELS.OPUS.id, aliases: ["opus"], thinkingLevels: FULL_POLICY },
+      // Verify enrichment follows the authoritative policy as the opus alias advances;
+      // fixed model fixtures above still assert concrete thinking levels.
+      {
+        model: KNOWN_MODELS.OPUS.id,
+        aliases: ["opus"],
+        thinkingLevels: [...getThinkingPolicyForModel(KNOWN_MODELS.OPUS.id)],
+      },
       { model: KNOWN_MODELS.SONNET.id, aliases: ["sonnet"], thinkingLevels: FULL_POLICY },
     ]);
   });

@@ -3757,7 +3757,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     policyEnforced = true;
     effectivePolicy = {
       policyFormatVersion: "0.1",
-      providerAccess: [{ id: "bedrock", allowedModels: ["anthropic.claude-opus-5"] }],
+      // Follow the moving opus alias rather than allowing only one historical version.
+      providerAccess: [
+        { id: "bedrock", allowedModels: [`anthropic.${KNOWN_MODELS.OPUS.providerModelId}`] },
+      ],
       mcp: { allowUserDefined: { stdio: true, remote: true } },
       runtimes: null,
     };
