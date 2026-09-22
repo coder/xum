@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "child_process";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
@@ -123,4 +124,50 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
       await findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath })
     ).toEqual({ kind: "none" });
   });
+
+  test.skipIf(process.platform === "win32")(
+    "a symlinked or special .git entry is unknown backing: never followed, never opened",
+    async () => {
+      const projectPath = path.join(tempDir, "repo");
+      const rootCheckout = path.join(tempDir, "src", "repo", "root");
+      const taskCheckout = path.join(tempDir, "src", "repo", "agent_task");
+      const elsewhere = path.join(tempDir, "elsewhere");
+      await fsPromises.mkdir(rootCheckout, { recursive: true });
+      await fsPromises.mkdir(taskCheckout, { recursive: true });
+      await fsPromises.mkdir(path.join(elsewhere, "repo.git"), { recursive: true });
+      // A valid pointer file living OUTSIDE the checkout, reachable only through a symlink.
+      await fsPromises.writeFile(
+        path.join(elsewhere, "pointer"),
+        `gitdir: ${path.join(elsewhere, "repo.git", "worktrees", "task")}\n`
+      );
+      const root: Workspace = { path: rootCheckout, id: "root", name: "root" };
+      const task: Workspace = {
+        path: taskCheckout,
+        id: "task",
+        name: "agent_task",
+        parentWorkspaceId: "root",
+      };
+      const snapshot: ProjectsConfig = {
+        projects: new Map([[projectPath, { workspaces: [root, task] }]]),
+      };
+      const gitEntry = path.join(taskCheckout, ".git");
+      const scan = () =>
+        findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath });
+
+      // Symlink to a directory: following it would look like "a repository inside the
+      // checkout" (no alias) while the real backing lives elsewhere.
+      await fsPromises.symlink(path.join(elsewhere, "repo.git"), gitEntry);
+      expect(await scan()).toMatchObject({ kind: "unknown", taskWorkspaceId: "task" });
+      // Symlink to a regular pointer file: following it would read a pointer the checkout
+      // does not own.
+      await fsPromises.rm(gitEntry);
+      await fsPromises.symlink(path.join(elsewhere, "pointer"), gitEntry);
+      expect(await scan()).toMatchObject({ kind: "unknown", taskWorkspaceId: "task" });
+      // A FIFO: an unguarded open/read would block a libuv worker forever; the scan must
+      // refuse without opening it.
+      await fsPromises.rm(gitEntry);
+      execFileSync("mkfifo", [gitEntry]);
+      expect(await scan()).toMatchObject({ kind: "unknown", taskWorkspaceId: "task" });
+    }
+  );
 });
