@@ -20,4 +20,12 @@ export const MODEL_DISCOVERY_BASE_URLS: Partial<Record<ProviderName, string>> = 
   openrouter: "https://openrouter.ai/api/v1",
   ollama: "http://127.0.0.1:11434/api",
   zai: "https://api.z.ai/api/paas/v4",
+  "github-copilot": "https://api.githubcopilot.com",
+  "mux-gateway": "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai",
 };
+
+export const COPILOT_MODEL_DISCOVERY_INTENT = "conversation-edits";
+export const GATEWAY_MODEL_DISCOVERY_HEADERS = {
+  "ai-gateway-protocol-version": "0.0.1",
+  "ai-gateway-auth-method": "api-key",
+} as const;

@@ -36,6 +36,8 @@ const envKeys = [
   "DEEPSEEK_API_KEY",
   "MOONSHOT_API_KEY",
   "ZAI_API_KEY",
+  "GITHUB_COPILOT_TOKEN",
+  "AI_GATEWAY_API_KEY",
 ];
 let savedEnv: Array<string | undefined>;
 function save(provider: string, extra: BaseProviderConfig = {}) {
@@ -678,3 +680,311 @@ it("fences custom wire-type changes while a catalog is in flight", async () => {
     await pending;
   }
 });
+
+const specializedProviders = ["github-copilot", "mux-gateway"];
+function specializedCatalog(
+  provider: string,
+  models: unknown[] = [
+    { id: "vendor/model.v1" },
+    { id: "vendor/model.v1" },
+    { id: "embedding", modelType: "embedding" },
+  ]
+) {
+  return provider === "mux-gateway" ? { models } : { data: models };
+}
+function saveSpecialized(provider: string, overrides: BaseProviderConfig = {}) {
+  save(provider, { ...(provider === "mux-gateway" && { couponCode: "coupon-key" }), ...overrides });
+}
+
+it.each(specializedProviders)(
+  "specialized %s lists verbatim IDs with exact paths/headers and no writes",
+  async (provider) => {
+    saveSpecialized(provider, {
+      baseUrl: undefined,
+      baseURL: `${server.url}proxy?tenant=one`,
+      headers: { "x-custom": "private-header" },
+    });
+    await config.editConfig((current) => ({
+      ...current,
+      routePriority: [provider, "direct"],
+      routeOverrides: { openai: provider },
+    }));
+    const files = [service.providersConfigStore.providersFile, join(root, "config.json")];
+    const before = files.map((file) => readFileSync(file, "utf8"));
+    respond = () => Response.json(specializedCatalog(provider));
+    expect(await service.discoverModels(provider)).toEqual({
+      status: "ok",
+      modelIds: ["vendor/model.v1", "embedding"],
+    });
+    expect(requests[0].method).toBe("GET");
+    expect(requests[0].url).toBe(
+      `${server.url}proxy/${provider === "mux-gateway" ? "config" : "models"}?tenant=one`
+    );
+    expect(requests[0].headers.get("authorization")).toBe(
+      `Bearer ${provider === "mux-gateway" ? "coupon-key" : "private-key"}`
+    );
+    expect(requests[0].headers.get("x-custom")).toBe("private-header");
+    if (provider === "mux-gateway") {
+      expect(requests[0].headers.get("ai-gateway-protocol-version")).toBe("0.0.1");
+      expect(requests[0].headers.get("ai-gateway-auth-method")).toBe("api-key");
+    } else {
+      expect(requests[0].headers.get("openai-intent")).toBe("conversation-edits");
+      expect(requests[0].headers.get("accept")).toBe("application/json");
+    }
+    respond = () => Response.json(specializedCatalog(provider, []));
+    expect(await service.discoverModels(provider)).toEqual({ status: "ok", modelIds: [] });
+    expect(requests).toHaveLength(2);
+    expect(files.map((file) => readFileSync(file, "utf8"))).toEqual(before);
+  }
+);
+
+it.each(specializedProviders)(
+  "specialized %s preserves its configured-header precedence",
+  async (provider) => {
+    saveSpecialized(provider, {
+      headers: {
+        Authorization: "Bearer custom-auth",
+        "OPENAI-INTENT": "custom-intent",
+        "X-API-KEY": "extra-key",
+        "AI-GATEWAY-PROTOCOL-VERSION": "custom-protocol",
+        "AI-GATEWAY-AUTH-METHOD": "custom-method",
+      },
+    });
+    respond = () => Response.json(specializedCatalog(provider));
+    expect((await service.discoverModels(provider)).status).toBe("ok");
+    const headers = requests[0].headers;
+    expect(headers.get("authorization")).toBe(
+      provider === "github-copilot" ? "Bearer private-key" : "Bearer custom-auth"
+    );
+    expect(headers.get("openai-intent")).toBe(
+      provider === "github-copilot" ? "conversation-edits" : "custom-intent"
+    );
+    expect(headers.get("x-api-key")).toBe(provider === "github-copilot" ? null : "extra-key");
+    expect(headers.get("ai-gateway-protocol-version")).toBe("custom-protocol");
+    expect(headers.get("ai-gateway-auth-method")).toBe("custom-method");
+  }
+);
+
+it.each(["copilot-config", "copilot-file", "copilot-env", "gateway-coupon", "gateway-voucher"])(
+  "specialized %s uses only the existing credential resolver",
+  async (source) => {
+    process.env.GITHUB_COPILOT_TOKEN = "env-key";
+    process.env.AI_GATEWAY_API_KEY = "must-not-use-sdk-environment";
+    const file = join(root, "key");
+    writeFileSync(file, "file-key");
+    const copilot = source.startsWith("copilot");
+    const provider = copilot ? "github-copilot" : "mux-gateway";
+    save(
+      provider,
+      copilot
+        ? {
+            apiKey: source === "copilot-config" ? "config-key" : undefined,
+            apiKeyFile: source === "copilot-env" ? undefined : file,
+          }
+        : {
+            couponCode: source === "gateway-coupon" ? "coupon-key" : undefined,
+            voucher: "voucher-key",
+          }
+    );
+    respond = () => Response.json(specializedCatalog(provider));
+    expect((await service.discoverModels(provider)).status).toBe("ok");
+    expect(requests[0].headers.get("authorization")).toBe(`Bearer ${source.split("-")[1]}-key`);
+  }
+);
+
+it.each(specializedProviders)(
+  "specialized %s applies forced endpoints, model policy, disabled and shadow rules",
+  async (provider) => {
+    saveSpecialized(provider, { baseUrl: "http://must-not-contact.invalid" });
+    policySpy("isEnforced").mockReturnValue(true);
+    const allowed = policySpy("isProviderAllowed").mockReturnValue(true);
+    policySpy("getEffectivePolicy").mockReturnValue({
+      policyFormatVersion: "0.1",
+      providerAccess: [
+        { id: provider, forcedBaseUrl: `${server.url}forced`, allowedModels: ["embedding"] },
+      ],
+      mcp: { allowUserDefined: { remote: true, stdio: true } },
+      runtimes: null,
+    });
+    respond = () => Response.json(specializedCatalog(provider));
+    expect(await service.discoverModels(provider)).toEqual({
+      status: "ok",
+      modelIds: ["embedding"],
+    });
+    expect(new URL(requests[0].url).pathname).toBe(
+      `/forced/${provider === "mux-gateway" ? "config" : "models"}`
+    );
+    allowed.mockReturnValue(false);
+    expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
+    allowed.mockReturnValue(true);
+    saveSpecialized(provider, { enabled: false });
+    expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
+    saveSpecialized(provider, { providerType: "openai-compatible" });
+    expect(await service.discoverModels(provider)).toEqual({ status: "unsupported" });
+    expect(requests).toHaveLength(1);
+  }
+);
+
+it("specialized unconfigured providers never borrow generic Gateway credentials", async () => {
+  process.env.AI_GATEWAY_API_KEY = "must-not-use-sdk-environment";
+  expect(await service.discoverModels("github-copilot")).toEqual({ status: "not-configured" });
+  save("mux-gateway");
+  expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
+  save("mux-gateway", { couponCode: "", voucher: "not-a-fallback-for-blank-coupon" });
+  expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
+  expect(requests).toHaveLength(0);
+});
+
+it.each(specializedProviders)(
+  "specialized %s errors never log out, fall back, or return empty success",
+  async (provider) => {
+    saveSpecialized(provider);
+    const before = readFileSync(service.providersConfigStore.providersFile, "utf8");
+    for (const status of [404, 405, 401, 403, 429, 500]) {
+      respond = () => new Response("private-upstream-error", { status });
+      expect(await service.discoverModels(provider)).toEqual(
+        provider === "mux-gateway" && [404, 405].includes(status)
+          ? { status: "unsupported" }
+          : { status: "error", reason: "request-failed" }
+      );
+      expect(readFileSync(service.providersConfigStore.providersFile, "utf8")).toBe(before);
+    }
+    expect(requests).toHaveLength(6);
+  }
+);
+
+it.each(specializedProviders)(
+  "specialized %s rejects invalid, partial, oversized, and redirected catalogs",
+  async (provider) => {
+    saveSpecialized(provider);
+    for (const kind of ["json", "shape", "id", "partial", "items", "bytes", "redirect"]) {
+      requests = [];
+      respond = () => {
+        if (kind === "json") return new Response("private-body");
+        if (kind === "shape")
+          return Response.json(provider === "mux-gateway" ? { data: [] } : { models: [] });
+        if (kind === "id")
+          return Response.json(specializedCatalog(provider, [{ id: "valid" }, { id: " " }]));
+        if (kind === "partial")
+          return Response.json({ ...specializedCatalog(provider), has_more: true });
+        if (kind === "items")
+          return Response.json(
+            specializedCatalog(
+              provider,
+              Array.from({ length: 10001 }, () => ({ id: "duplicate" }))
+            )
+          );
+        if (kind === "bytes") return new Response("x".repeat(2 * 1024 * 1024 + 1));
+        return new Response(null, {
+          status: 302,
+          headers: { location: `${server.url}redirected` },
+        });
+      };
+      expect(await service.discoverModels(provider)).toEqual({
+        status: "error",
+        reason:
+          kind === "redirect"
+            ? "request-failed"
+            : ["items", "bytes"].includes(kind)
+              ? "limit-exceeded"
+              : "invalid-response",
+      });
+      expect(requests).toHaveLength(1);
+    }
+  }
+);
+
+const specializedRaceCases = [
+  "copilot-key",
+  "copilot-file",
+  "gateway-coupon",
+  "gateway-voucher",
+].flatMap((source) =>
+  ["request", "teardown"].flatMap((cut) =>
+    ["credential", "abort", "headers", "policy", "base"].map((change) => [source, cut, change])
+  )
+);
+it.each(specializedRaceCases)(
+  "specialized %s rejects %s-time %s changes",
+  async (source, cut, change) => {
+    const provider = source.startsWith("copilot") ? "github-copilot" : "mux-gateway";
+    const file = join(root, "key");
+    writeFileSync(file, "initial");
+    const field =
+      provider === "github-copilot"
+        ? "apiKey"
+        : source === "gateway-voucher"
+          ? "voucher"
+          : "couponCode";
+    const auth =
+      source === "copilot-file" ? { apiKey: undefined, apiKeyFile: file } : { [field]: "initial" };
+    save(provider, auth);
+    const barrier = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    respond = async () => {
+      if (cut === "request") {
+        barrier.resolve();
+        await release.promise;
+      }
+      return Response.json(specializedCatalog(provider));
+    };
+    if (cut === "teardown") {
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const destroy = EnvHttpProxyAgent.prototype.destroy;
+      const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
+        this: EnvHttpProxyAgent
+      ) {
+        await new Promise<void>((done) => destroy.call(this, null, done));
+        barrier.resolve();
+        await release.promise;
+      });
+      cleanups.push(() => spy.mockRestore());
+    }
+    const abort = new AbortController();
+    const pending = service.discoverModels(provider, abort.signal);
+    try {
+      await Promise.race([
+        barrier.promise,
+        pending.then(() => {
+          throw new Error("Expected active loopback request or teardown");
+        }),
+      ]);
+      if (change === "credential") {
+        if (source === "copilot-file") writeFileSync(file, "rotated");
+        else save(provider, { ...auth, [field]: "rotated" });
+      }
+      if (change === "abort") abort.abort(new Error("private-abort-reason"));
+      if (change === "headers") save(provider, { ...auth, headers: { "x-identity": "changed" } });
+      if (change === "base") save(provider, { ...auth, baseUrl: `${server.url}changed` });
+      if (change === "policy") {
+        policySpy("isEnforced").mockReturnValue(true);
+        policySpy("isProviderAllowed").mockReturnValue(false);
+      }
+      release.resolve();
+      expect(await pending).toEqual({
+        status: "error",
+        reason: change === "abort" ? "aborted" : "stale-config",
+      });
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  }
+);
+
+it.each(specializedProviders)(
+  "specialized %s bounds stalled metadata bodies",
+  async (provider) => {
+    saveSpecialized(provider);
+    respond = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{"));
+          },
+        })
+      );
+    expect(await service.discoverModels(provider)).toEqual({ status: "error", reason: "timeout" });
+  },
+  15000
+);
