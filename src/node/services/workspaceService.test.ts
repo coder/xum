@@ -11598,6 +11598,7 @@ describe("WorkspaceService rename lock", () => {
       acquireWorkspaceLock,
       prunePluginOverrideKeys: () => Promise.resolve(),
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
 
     const result = await workspaceService.rename(workspaceId, "new-name");
@@ -15950,6 +15951,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const error = await (
       service as unknown as SanitizeAccess
@@ -15974,6 +15976,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const persistentWith = (workspacePath: string): Pick<Config, "loadConfigOrDefault"> =>
       ({
@@ -16020,6 +16023,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const broken = {
       loadConfigOrDefault: (options?: { throwOnError?: boolean }) => {
@@ -16052,6 +16056,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const error = await (
       service as unknown as SanitizeAccess
@@ -16067,6 +16072,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
       prunePluginOverrideKeys: () =>
         Promise.reject(new Error('duplicate "enabledServers" properties')),
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const error = await (
       service as unknown as SanitizeAccess
@@ -16091,6 +16097,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const error = await (
       service as unknown as SanitizeAccess
@@ -16118,6 +16125,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
           return Promise.resolve();
         },
         copyOverridesToForkedCheckout: () => Promise.resolve(),
+        prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
       });
       const error = await (
         service as unknown as SanitizeAccess
@@ -16147,6 +16155,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
         return Promise.resolve();
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: () => Promise.resolve(),
     });
     const error = await (
       service as unknown as SanitizeAccess
@@ -24859,6 +24868,108 @@ describe("WorkspaceService disposal ownership", () => {
       await service.disposeSession("dispose-replacement");
       await h.cleanup();
       await replacement.cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService.registerSanitizedTaskCheckout", () => {
+  // Direct task creation registers a FRESH checkout: sanitize (explicit path target, no id to
+  // resolve yet), then publish, under one registration-lock hold. A refusal publishes nothing.
+  async function createService() {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const service = createWorkspaceServiceForTest({ config, historyService });
+    const pruned: string[] = [];
+    let pruneError: Error | undefined;
+    service.setWorkspaceMcpOverridesService({
+      acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
+      prunePluginOverrideKeys: () => Promise.resolve(),
+      copyOverridesToForkedCheckout: () => Promise.resolve(),
+      prunePluginOverrideKeysForUnregisteredCheckout: (target) => {
+        pruned.push(target.workspacePath);
+        return pruneError ? Promise.reject(pruneError) : Promise.resolve();
+      },
+    });
+    return {
+      config,
+      service,
+      pruned,
+      failPrune: (error: Error) => {
+        pruneError = error;
+      },
+      cleanup,
+    };
+  }
+
+  test("prunes the explicit path before publishing and returns the publication's result", async () => {
+    const { config, service, pruned, cleanup } = await createService();
+    try {
+      const workspacePath = path.join(config.srcDir, "proj", "fresh");
+      const order: string[] = [];
+      const result = await service.registerSanitizedTaskCheckout(
+        { workspacePath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
+        () => {
+          order.push(`publish after ${pruned.length} prune(s)`);
+          return Promise.resolve("published");
+        }
+      );
+      expect(result).toEqual({ success: true, data: "published" });
+      expect(pruned).toEqual([workspacePath]);
+      expect(order).toEqual(["publish after 1 prune(s)"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a refused sanitization returns the actionable error and never runs the publication", async () => {
+    const { config, service, failPrune, cleanup } = await createService();
+    try {
+      failPrune(new Error("Workspace MCP overrides file has JSONC parse errors"));
+      const workspacePath = path.join(config.srcDir, "proj", "broken");
+      const publish = mock(() => Promise.resolve("published"));
+      const result = await service.registerSanitizedTaskCheckout(
+        { workspacePath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
+        publish
+      );
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("JSONC parse errors");
+      expect(result.error).toContain(workspacePath);
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("skips the prune for an off-host runtime and for a checkout a live host-local workspace already resolves to", async () => {
+    const { config, service, pruned, cleanup } = await createService();
+    try {
+      const sshResult = await service.registerSanitizedTaskCheckout(
+        {
+          workspacePath: "/remote/src/fresh",
+          runtimeConfig: { type: "ssh", host: "box", srcBaseDir: "/remote/src" },
+        },
+        () => Promise.resolve("ssh")
+      );
+      expect(sshResult).toEqual({ success: true, data: "ssh" });
+      // A project-dir sibling registered on the same directory: its consent context is alive.
+      const sharedPath = path.join(config.srcDir, "shared-project");
+      await fsPromises.mkdir(sharedPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(sharedPath, {
+          workspaces: [
+            { path: sharedPath, id: "sibling", name: "sibling", runtimeConfig: { type: "local" } },
+          ],
+        });
+        return cfg;
+      });
+      const sharedResult = await service.registerSanitizedTaskCheckout(
+        { workspacePath: sharedPath, runtimeConfig: { type: "local" } },
+        () => Promise.resolve("shared")
+      );
+      expect(sharedResult).toEqual({ success: true, data: "shared" });
+      expect(pruned).toEqual([]);
+    } finally {
+      await cleanup();
     }
   });
 });

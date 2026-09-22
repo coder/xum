@@ -4959,4 +4959,132 @@ describe("WorkspaceMcpOverridesService", () => {
       disabledServers: ["server-a"],
     });
   });
+
+  describe("prunePluginOverrideKeysForUnregisteredCheckout", () => {
+    /** The checkout-lock keys one operation acquired, in acquisition order. */
+    function recordCheckoutLockKeys(service: WorkspaceMcpOverridesService): string[] {
+      const internals = service as unknown as {
+        acquireCheckoutLock: (key: string, timeoutMs?: number) => Promise<() => Promise<void>>;
+      };
+      const real = internals.acquireCheckoutLock.bind(service);
+      const keys: string[] = [];
+      spyOn(internals, "acquireCheckoutLock").mockImplementation((key, timeoutMs) => {
+        keys.push(key);
+        return real(key, timeoutMs);
+      });
+      return keys;
+    }
+
+    it("prunes canonical plugin keys from an unregistered checkout, preserves everything else, and bumps the epoch only when it rewrote", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "fresh-worktree");
+      const target = {
+        workspacePath,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      // No document: nothing to prune, no epoch owed by a brand-new identity.
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBeUndefined();
+
+      await fs.writeFile(
+        filePath,
+        `{
+  // tracked by the repository
+  "enabledServers": ["plugin:0123456789abcdef:evil", "ordinary", "plugin:not-canonical"],
+  "toolAllowlist": { "plugin:0123456789abcdef:evil": { "allow": ["x"] }, "ordinary": {} },
+  "futureField": { "kept": true }
+}`,
+        "utf-8"
+      );
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      const pruned = await fs.readFile(filePath, "utf-8");
+      expect(pruned).toContain("// tracked by the repository");
+      expect(JSON.parse(pruned.replace(/^\s*\/\/.*$/m, ""))).toEqual({
+        enabledServers: ["ordinary", "plugin:not-canonical"],
+        toolAllowlist: { ordinary: {} },
+        futureField: { kept: true },
+      });
+      const afterRewrite = await readWorkspaceOverridesEpochToken(config.rootDir);
+      expect(afterRewrite).toBeDefined();
+      // Idempotent, and a pass that rewrites nothing owes no epoch.
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      expect(await fs.readFile(filePath, "utf-8")).toBe(pruned);
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBe(afterRewrite);
+    });
+
+    it("refuses a document it cannot edit safely without touching it", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "duplicate-props");
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const original = '{"enabledServers": ["plugin:0123456789abcdef:evil"], "enabledServers": []}';
+      await fs.writeFile(filePath, original, "utf-8");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        service.prunePluginOverrideKeysForUnregisteredCheckout(
+          { workspacePath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
+          "plugin:"
+        )
+      ).rejects.toThrow("duplicate");
+      expect(await fs.readFile(filePath, "utf-8")).toBe(original);
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBeUndefined();
+    });
+
+    it("takes exactly the checkout locks a registration of the same physical path takes, so it serializes against that registration's writers", async () => {
+      // The unregistered target is the REAL directory; another process registered the same
+      // directory in place through a symlinked spelling (an older CLI run). A save through
+      // that registration and this prune must contend for one lock.
+      const realDir = path.join(config.srcDir, "unregistered", "shared-checkout");
+      await fs.mkdir(path.join(realDir, ".xum"), { recursive: true });
+      const aliasRoot = path.join(config.rootDir, "alias-root");
+      await fs.symlink(path.join(config.srcDir, "unregistered"), aliasRoot);
+      const aliasPath = path.join(aliasRoot, "shared-checkout");
+      const aliasId = "ws-cli-alias";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(aliasPath, {
+          workspaces: [
+            { path: aliasPath, id: aliasId, name: aliasPath, runtimeConfig: { type: "local" } },
+          ],
+        });
+        return cfg;
+      });
+      const filePath = path.join(realDir, ".xum", "mcp.local.jsonc");
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:evil"] }),
+        "utf-8"
+      );
+
+      // Key identity: derived deterministically from the path, not from any id.
+      const registered = new WorkspaceMcpOverridesService(config);
+      const registeredKeys = recordCheckoutLockKeys(registered);
+      const releaseAlias = await registered.acquireWorkspaceLock(aliasId);
+      const explicit = new WorkspaceMcpOverridesService(config);
+      const explicitKeys = recordCheckoutLockKeys(explicit);
+      const target = {
+        workspacePath: realDir,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      // Contention: the prune cannot complete while the alias registration holds its lock.
+      let pruned = false;
+      const pruning = explicit
+        .prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:")
+        .then(() => {
+          pruned = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(pruned).toBe(false);
+      expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({
+        enabledServers: ["plugin:0123456789abcdef:evil"],
+      });
+      expect(explicitKeys.length).toBeGreaterThan(0);
+      expect(registeredKeys.some((key) => explicitKeys.includes(key))).toBe(true);
+      await releaseAlias();
+      await pruning;
+      expect(pruned).toBe(true);
+      expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ enabledServers: [] });
+    });
+  });
 });

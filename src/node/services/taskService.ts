@@ -6547,7 +6547,21 @@ export class TaskService implements AgentTaskIntegration {
 
     // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
     // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
-    let materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
+    let materializedCheckout:
+      | {
+          initLogger: InitLogger;
+          runtime: Runtime;
+          workspacePath: string;
+          runtimeConfig: RuntimeConfig;
+        }
+      | undefined;
+    // Set the moment the config write is attempted. From then on an unset launchAttempt does NOT
+    // prove the record is unpublished (the write may have committed before the throw), so the
+    // failure path verifies the committed row instead of inferring a rollback.
+    let configWriteAttempted = false;
+    // Set when pre-publication sanitization refused: nothing is published and the materialized
+    // checkout is retained deliberately (see materialize).
+    let unregisteredCheckoutRetained = false;
     // Admission classification: a direct (unqueued) launch is the FIRST admission of a brand-new
     // task by construction, exactly like a reservation — the id minted here is persisted by the
     // write that creates the entry and owned by this process before anything can send into the
@@ -6557,8 +6571,10 @@ export class TaskService implements AgentTaskIntegration {
     const attemptId = newTaskAttemptId();
     let launchAttempt: OwnedTaskAttempt | undefined;
     /**
-     * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
-     * only the materialized checkout exists and the rollback removes it. Once the entry is
+     * Launch failure. Before the config write is ATTEMPTED (launchAttempt unset and
+     * configWriteAttempted false) nothing is published: only the materialized checkout exists
+     * and the rollback removes it. Once the write was attempted, an unset launchAttempt proves
+     * nothing — see failPotentiallyPublishedLaunch. Once the entry is
      * persisted the workspace IS published — a racing user or peer send can be admitted under
      * the attempt while the launch send is in flight, and another writer (a second backend's
      * startup re-drive or reawaken) can re-admit the row under its own attempt (A → B). Deleting
@@ -6690,6 +6706,60 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.emitWorkspaceMetadata(taskId);
     };
+    /**
+     * Launch failure after the config write was attempted but before this process took
+     * ownership (launchAttempt unset): editConfig threw, or the write committed and a later step
+     * threw. Whether the row is durable is unknown, so nothing is inferred from in-memory state:
+     * the registry is re-read authoritatively and only a row carrying exactly this launch's
+     * attempt, checkout path and runtime is claimed and ended through failLaunch — the
+     * published-failure shape (interrupted marker on the row this launch owns; no deletion).
+     * Every other outcome — absent row, a row another writer re-admitted, an unreadable
+     * registry — leaves rows and files untouched: the checkout is at worst an unregistered
+     * directory (unreachable, named for this task alone), and a foreign row is not ours to end.
+     * Returns whether the row was claimed and ended as this launch's.
+     */
+    const failPotentiallyPublishedLaunch = async (
+      message: string,
+      runtimeForRollback: Runtime
+    ): Promise<boolean> => {
+      const checkout = materializedCheckout;
+      assert(checkout != null, "failPotentiallyPublishedLaunch: no checkout");
+      let committed: WorkspaceConfigEntry | undefined;
+      try {
+        committed = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          taskId
+        )?.workspace;
+      } catch (error: unknown) {
+        log.error("Task.create: registry unreadable after a failed publication; nothing removed", {
+          taskId,
+          message,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+      const ours =
+        committed?.taskAttemptId === attemptId &&
+        committed.path === checkout.workspacePath &&
+        JSON.stringify(committed.runtimeConfig) === JSON.stringify(checkout.runtimeConfig);
+      if (!ours) {
+        log.warn("Task.create: publication failed; no owned record found, files left in place", {
+          taskId,
+          message,
+          workspacePath: checkout.workspacePath,
+          rowPresent: committed != null,
+        });
+        return false;
+      }
+      launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+        attemptId,
+        receiptEligible: true,
+      });
+      await failLaunch(message, runtimeForRollback, {});
+      return true;
+    };
+    const retainedCheckoutNotice = (workspacePath: string): string =>
+      `The task's checkout was created at ${workspacePath} but not registered; inspect or remove it manually.`;
     const materialize = async () => {
       const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
 
@@ -6774,7 +6844,12 @@ export class TaskService implements AgentTaskIntegration {
         inheritedProjects = forkResult.data.projects;
       }
 
-      materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
+      materializedCheckout = {
+        initLogger,
+        runtime: runtimeForTaskWorkspace,
+        workspacePath,
+        runtimeConfig: forkedRuntimeConfig,
+      };
 
       // Multi-project forks need per-project secrets for each runtime's init hook.
       this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
@@ -6800,62 +6875,93 @@ export class TaskService implements AgentTaskIntegration {
       });
 
       // Persist workspace entry before starting work so it's durable across crashes.
-      await this.config.editConfig((config) => {
-        let projectConfig = config.projects.get(configProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(configProjectPath, projectConfig);
-        }
+      const publish = async (): Promise<void> => {
+        await this.config.editConfig((config) => {
+          let projectConfig = config.projects.get(configProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(configProjectPath, projectConfig);
+          }
 
-        projectConfig.workspaces.push({
-          kind: parentIsScratch ? "scratch" : undefined,
-          path: workspacePath,
-          id: taskId,
-          name: workspaceName,
-          title: args.title,
-          createdAt,
-          runtimeConfig: forkedRuntimeConfig,
-          aiSettings: {
-            model: canonicalModel,
-            thinkingLevel: effectiveThinkingLevel,
-            ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
-          },
-          agentId,
-          parentWorkspaceId,
-          agentType,
-          workflowTask: args.workflowTask,
-          bestOf: normalizedBestOf,
-          taskStatus: "running",
-          // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
-          // send below is fenced against (WorkspaceService binds the obligation at handoff).
-          taskAttemptId: attemptId,
-          taskTrunkBranch: trunkBranch,
-          taskBaseCommitSha: taskBaseCommitSha ?? undefined,
-          taskBaseCommitShaByProjectPath,
-          taskModelString,
-          taskThinkingLevel: effectiveThinkingLevel,
-          taskOnRefusal: args.onRefusal,
-          taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
-          taskIsolation: useSharedWorkspace ? "none" : undefined,
-          taskAttentionPolicy: args.attentionPolicy,
-          taskDesktopOwnerWorkspaceId,
-          projects: inheritedProjects,
+          projectConfig.workspaces.push({
+            kind: parentIsScratch ? "scratch" : undefined,
+            path: workspacePath,
+            id: taskId,
+            name: workspaceName,
+            title: args.title,
+            createdAt,
+            runtimeConfig: forkedRuntimeConfig,
+            aiSettings: {
+              model: canonicalModel,
+              thinkingLevel: effectiveThinkingLevel,
+              ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+            },
+            agentId,
+            parentWorkspaceId,
+            agentType,
+            workflowTask: args.workflowTask,
+            bestOf: normalizedBestOf,
+            taskStatus: "running",
+            // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id
+            // the send below is fenced against (WorkspaceService binds the obligation at handoff).
+            taskAttemptId: attemptId,
+            taskTrunkBranch: trunkBranch,
+            taskBaseCommitSha: taskBaseCommitSha ?? undefined,
+            taskBaseCommitShaByProjectPath,
+            taskModelString,
+            taskThinkingLevel: effectiveThinkingLevel,
+            taskOnRefusal: args.onRefusal,
+            taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
+            taskIsolation: useSharedWorkspace ? "none" : undefined,
+            taskAttentionPolicy: args.attentionPolicy,
+            taskDesktopOwnerWorkspaceId,
+            projects: inheritedProjects,
+          });
+          this.desktopInputCoordinator.assertAdmission(config, taskId);
+          // Past the last pre-write refusal: from here the save may land whatever is thrown next.
+          configWriteAttempted = true;
+          return config;
         });
-        this.desktopInputCoordinator.assertAdmission(config, taskId);
-        return config;
-      });
-      // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
-      // this workspace, whoever issues it, is admitted under an attempt this process owns.
-      launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
-        attemptId,
-        receiptEligible: true,
-      });
+        // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
+        // this workspace, whoever issues it, is admitted under an attempt this process owns.
+        launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+          attemptId,
+          receiptEligible: true,
+        });
+      };
+      if (useSharedWorkspace) {
+        // The parent's checkout: its consent context is alive and was sanitized at its own
+        // registration; nothing to prune, nothing to fence.
+        await publish();
+      } else {
+        // SECURITY: this checkout materialized outside the host's create/fork paths, so
+        // registration-time plugin-override sanitization never saw it — a tracked stale
+        // `plugin:` enable would re-activate a same-name reinstall's default-disabled MCP server
+        // on the send below. Sanitized BEFORE the record is published (not merely before it is
+        // announced): a published record is discoverable and admittable by every ordinary
+        // reader — a user send, another backend's startup re-drive, an older build — while the
+        // stale enable is still in place, and a refused sanitization would otherwise leave that
+        // record behind as an interrupted task whose manual rescue activates the enable.
+        const registration = await this.workspaceService.registerSanitizedTaskCheckout(
+          { workspacePath, runtimeConfig: forkedRuntimeConfig },
+          publish
+        );
+        if (!registration.success) {
+          // Nothing published. The fresh worktree is NOT deleted: the refusal may stem from an
+          // indeterminate checkout identity or an unreadable registry, i.e. exactly the cases in
+          // which this path cannot prove no sibling registration resolves to the same files.
+          // Unregistered, it is unreachable for every send/rescue/activation path; its name is
+          // unique to this task id, so no later creation reuses it (the fork refuses an
+          // existing directory). Removing it is the user's call.
+          unregisteredCheckoutRetained = true;
+          return Err(`${registration.error} ${retainedCheckoutNotice(workspacePath)}`);
+        }
+      }
 
       return Ok({
         initLogger,
         workspacePath,
         trunkBranch,
-        forkedRuntimeConfig,
         runtimeForTaskWorkspace,
       });
     };
@@ -6864,38 +6970,35 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (!materialized.success) {
       if (materializedCheckout != null) {
-        // Runs after the desktop gate released: only the checkout and any persisted entry (which
-        // would otherwise hold the desktop reservation as a running child) need to go.
-        await failLaunch(materialized.error, materializedCheckout.runtime, {
-          preservePhysicalWorkspace: useSharedWorkspace,
-        });
+        if (unregisteredCheckoutRetained) {
+          // Sanitization refused before any publication (see materialize): retained on purpose.
+          log.warn("Task.create: checkout sanitization refused; unregistered checkout retained", {
+            taskId,
+            error: materialized.error,
+          });
+        } else if (configWriteAttempted) {
+          const claimed = await failPotentiallyPublishedLaunch(
+            materialized.error,
+            materializedCheckout.runtime
+          );
+          if (!claimed && !useSharedWorkspace) {
+            materializedCheckout.initLogger.logComplete(-1);
+            return Err(
+              `${materialized.error} ${retainedCheckoutNotice(materializedCheckout.workspacePath)}`
+            );
+          }
+        } else {
+          // Runs after the desktop gate released: only the checkout (nothing was persisted yet)
+          // needs to go.
+          await failLaunch(materialized.error, materializedCheckout.runtime, {
+            preservePhysicalWorkspace: useSharedWorkspace,
+          });
+        }
         materializedCheckout.initLogger.logComplete(-1);
       }
       return materialized;
     }
-    const { initLogger, workspacePath, trunkBranch, forkedRuntimeConfig, runtimeForTaskWorkspace } =
-      materialized.data;
-
-    if (!useSharedWorkspace) {
-      // SECURITY: this checkout materialized outside the host's create/fork paths, so
-      // registration-time plugin-override sanitization never saw it —
-      // a tracked stale `plugin:` enable would re-activate a same-name
-      // reinstall's default-disabled MCP server on the send below. Runs
-      // BEFORE emitWorkspaceMetadata (the pre-announcement invariant of
-      // normal workspace creation): once metadata is emitted, the UI or any
-      // subscriber can send to this running-status task workspace while
-      // sanitization is still waiting on the override lock.
-      const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
-        taskId,
-        workspacePath,
-        forkedRuntimeConfig
-      );
-      if (sanitizeError !== undefined) {
-        await failLaunch(sanitizeError, runtimeForTaskWorkspace, {});
-        initLogger.logComplete(-1);
-        return Err(sanitizeError);
-      }
-    }
+    const { initLogger, workspacePath, trunkBranch, runtimeForTaskWorkspace } = materialized.data;
 
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
@@ -6939,8 +7042,8 @@ export class TaskService implements AgentTaskIntegration {
     // send's staleness probe. A guarded send is never a user resume, so WorkspaceService skips
     // markInterruptedTaskRunning for it — which matters here because this method holds the global
     // mutex that method serializes on (a rescue reaching it from this send would self-deadlock).
-    // Bound to the attempt this launch persisted: the row was published above (metadata emitted,
-    // sanitization awaited), so another writer may have re-admitted it under its own attempt
+    // Bound to the attempt this launch persisted: the row was published above (sanitized first,
+    // then metadata emitted), so another writer may have re-admitted it under its own attempt
     // since — a launch decided for A never dispatches its prompt under B (refused, and the
     // failure path below leaves B's row alone).
     const admission = this.admitTaskWorkspaceTurn(taskId, {
