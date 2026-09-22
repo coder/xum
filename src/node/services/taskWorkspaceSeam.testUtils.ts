@@ -1,4 +1,10 @@
 import { Err, Ok } from "@/common/types/result";
+import {
+  bindTaskCheckoutIdentity,
+  buildTaskCheckoutPreparation,
+  claimTaskCheckoutIdentity,
+  type TaskCheckoutPreparation,
+} from "@/node/services/taskCheckoutPreparation";
 import type { AgentTaskIntegration, WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 
 export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): WorkspaceHost {
@@ -62,6 +68,21 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     registerSanitizedTaskCheckout: async (_target, publish) => Ok(await publish()),
+    // Real claim/bind/proof over the (real) forked worktrees, minus the override prune and its
+    // locks the real host wraps them in: the published dedicated rows derive `ready`, so
+    // launches through the fake host exercise the same preparation gate as production.
+    prepareTaskCheckouts: async (materialize, publish) => {
+      const targets = await materialize();
+      const proofs: TaskCheckoutPreparation[] = [];
+      for (const target of targets) {
+        const claimed = await claimTaskCheckoutIdentity(target, target.materializationId);
+        if (claimed instanceof Error) return Err(claimed.message);
+        const bound = await bindTaskCheckoutIdentity(target, target.materializationId, claimed);
+        if (bound instanceof Error) return Err(bound.message);
+        proofs.push(buildTaskCheckoutPreparation(bound, target.runtimeConfig));
+      }
+      return Ok(await publish(proofs));
+    },
     discardExtensionMetadataEntry: () => Promise.resolve(),
     registerExternalBackgroundInit: () => undefined,
     getInfo: () => Promise.resolve(null),

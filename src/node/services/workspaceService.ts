@@ -257,6 +257,16 @@ import {
   isWorkflowRunEmittingToolName,
 } from "@/common/utils/workflowRunMessages";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  bindTaskCheckoutIdentity,
+  buildTaskCheckoutPreparation,
+  claimTaskCheckoutIdentity,
+  isWorktreeSemanticsRuntime,
+  revalidateTaskCheckoutIdentity,
+  type BoundTaskCheckoutIdentity,
+  type CapturedTaskCheckoutIdentity,
+  type TaskCheckoutPreparation,
+} from "@/node/services/taskCheckoutPreparation";
 import type {
   PendingMaterialization,
   Runtime,
@@ -3270,6 +3280,143 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(unsanitizableOverridesMessage(target.workspacePath, error));
       }
       return Ok(await publish());
+    } finally {
+      await releaseRegistrationLock();
+    }
+  }
+
+  /**
+   * The task producers' ONE registration-lock hold: `materialize` (the forks of every fresh
+   * DEDICATED host-local checkout of the batch — nothing registered yet), then per checkout,
+   * under the checkout locks the prune holds: a strict live sibling scan — a live alias of a
+   * fresh dedicated fork is anomalous, so `found` REFUSES (a skipped prune is not a proof that
+   * the directory is sanitized) and an unreadable registry refuses too; the pre-prune identity
+   * CLAIM (stats + nonce); the strict prune; `bindTaskCheckoutIdentity` inside the SAME held
+   * locks, so the identity bound is exactly the directory that was claimed and pruned. Every
+   * identity is revalidated (read-only) immediately before `publish` (the config write that
+   * registers the batch's rows), which runs after the per-target checkout locks are released,
+   * still under the registration lock — the same shape as the single-target helper above, not
+   * a checkout-locked transaction.
+   *
+   * The forks run INSIDE the hold on purpose: a structural mutator (remove/rename/archive of an
+   * alias-free root or a backing repository) scans task rows and applies its effect under this
+   * same lock, so a fork that ran before acquiring it could write into a repository being torn
+   * down and then publish a row the scan never saw. One owner per hold; nothing here re-enters
+   * the registration lock (runtime forks do not go through WorkspaceService.create, and the
+   * config write inside `publish` takes the separate project-registration file lock as always).
+   * Batches with no dedicated checkout (shared / off-host rows) publish under the same hold so a
+   * mutator's scan sees every task row or none.
+   *
+   * `Err` means nothing was published (a throwing `materialize` is reported the same way: its
+   * message, verbatim); the caller retains the fresh directories (their names are unique to
+   * their task ids and a fork refuses an existing path, so no later creation reuses or removes
+   * them; a claimed one refuses adoption through its nonce) and reports their paths. A
+   * throwing `publish` propagates. A `local` runtime fork shares the project directory and is
+   * a shared task by construction: never a target here.
+   */
+  async prepareTaskCheckouts<T>(
+    materialize: () => Promise<
+      ReadonlyArray<{
+        workspacePath: string;
+        runtimeConfig: RuntimeConfig;
+        materializationId: string;
+      }>
+    >,
+    publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>
+  ): Promise<Result<T, string>> {
+    let releaseRegistrationLock: () => Promise<void>;
+    try {
+      releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    try {
+      let targets: Awaited<ReturnType<typeof materialize>>;
+      try {
+        targets = await materialize();
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+      for (const target of targets) {
+        assert(target.workspacePath.length > 0, "prepareTaskCheckouts: path is required");
+        assert(
+          isWorktreeSemanticsRuntime(target.runtimeConfig),
+          "prepareTaskCheckouts: dedicated host-local (worktree) checkouts only"
+        );
+      }
+      const proofs: TaskCheckoutPreparation[] = [];
+      for (const target of targets) {
+        // Identity claimed (stats + nonce) BEFORE the prune inside `shouldPrune`, under the held
+        // checkout locks; bound AFTER it inside `afterPruneUnderLock` (same locks) only if the
+        // directory is still that identity and still carries the claim: what the proof binds is
+        // exactly the directory that was claimed and pruned (see claimTaskCheckoutIdentity).
+        let claimed: CapturedTaskCheckoutIdentity | undefined;
+        let bound: BoundTaskCheckoutIdentity | Error | undefined;
+        const claim = async () => {
+          const identity = await claimTaskCheckoutIdentity(target, target.materializationId);
+          if (identity instanceof Error) throw identity;
+          claimed = identity;
+        };
+        const bind = async () => {
+          assert(claimed !== undefined, "prepareTaskCheckouts: bind before claim");
+          bound = await bindTaskCheckoutIdentity(target, target.materializationId, claimed);
+          if (bound instanceof Error) throw bound;
+        };
+        try {
+          if (this.workspaceMcpOverridesService) {
+            await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
+              target,
+              "plugin:",
+              {
+                shouldPrune: async () => {
+                  const siblings = await this.findLiveSiblingForCheckout(
+                    target.workspacePath,
+                    undefined,
+                    undefined,
+                    /* ownConfigStrict */ true
+                  );
+                  if (siblings === "found") {
+                    throw new Error(
+                      "a live workspace already resolves to this fresh checkout (alias); refusing to prepare it"
+                    );
+                  }
+                  if (siblings !== "none") throw new Error(siblings.error);
+                  await claim();
+                  return true;
+                },
+                afterPruneUnderLock: bind,
+              }
+            );
+          } else {
+            // No override store in this host composition: nothing can be pruned or activated
+            // through overrides, but the identity is still bound so the row is provable.
+            await claim();
+            await bind();
+          }
+        } catch (error) {
+          return Err(unsanitizableOverridesMessage(target.workspacePath, error));
+        }
+        if (bound === undefined || bound instanceof Error) {
+          return Err(
+            unsanitizableOverridesMessage(
+              target.workspacePath,
+              bound ?? new Error("preparation identity was not bound")
+            )
+          );
+        }
+        proofs.push(buildTaskCheckoutPreparation(bound, target.runtimeConfig));
+      }
+      // Read-only revalidation right before publication: the checkout locks are released, so a
+      // directory replaced meanwhile (only a non-cooperating writer can) must not be published.
+      for (const proof of proofs) {
+        const check = await revalidateTaskCheckoutIdentity(proof);
+        if (!check.ok) {
+          return Err(
+            `${proof.path} changed after sanitization (${check.state.kind}); nothing was published`
+          );
+        }
+      }
+      return Ok(await publish(proofs));
     } finally {
       await releaseRegistrationLock();
     }
