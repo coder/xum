@@ -642,6 +642,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     let writeSettled = false;
     // A leaked prototype spy from another file would be captured here as "the real writeFile"
     // and recurse (bun's spyOn returns the existing mock): fail loudly instead.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- membership probe, not a call
     expect("mockRestore" in LocalBaseRuntime.prototype.writeFile).toBe(false);
     // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via .call below
     const realWriteFile = LocalBaseRuntime.prototype.writeFile;
