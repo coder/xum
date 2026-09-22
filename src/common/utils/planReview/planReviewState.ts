@@ -7,6 +7,7 @@ import {
   PLAN_REVIEW_STATE_MAX_TEXT_CHARS,
   PLAN_REVIEW_STATE_MAX_THREADS,
 } from "@/constants/planReview";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { getAuthenticPlanReviewRecord } from "./planReviewEnvelope";
 import { PlanReviewAnchorSchema, isAnchorWithinSnapshot } from "./planReviewRecord";
 
@@ -117,8 +118,12 @@ export function derivePlanReviewState(
     }
     seenRecordIds.add(record.recordId);
     // Rows persisted by the backend always carry a sequence; fall back to the visiting index
-    // so relative order survives for rows that have not been stamped yet.
-    const historySequence = message.metadata.historySequence ?? index;
+    // so relative order survives for rows that have not been stamped yet. Persisted rows are
+    // parsed JSON without schema validation, so a damaged sequence (string, negative, fraction)
+    // takes the same fallback instead of being copied into state and failing oRPC output
+    // validation on every getState/mutation (self-healing rule).
+    const persistedSequence: unknown = message.metadata.historySequence;
+    const historySequence = isNonNegativeInteger(persistedSequence) ? persistedSequence : index;
 
     switch (record.kind) {
       case "snapshot": {

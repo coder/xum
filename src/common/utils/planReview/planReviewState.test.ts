@@ -10,6 +10,7 @@ import {
 import { buildPlanReviewMetadata, formatPlanReviewEnvelope } from "./planReviewEnvelope";
 import type { PlanReviewRecord } from "./planReviewRecord";
 import {
+  PlanReviewStateSchema,
   derivePlanReviewState,
   formatPlanReviewStateBlock,
   getUnresolvedPlanReviewThreads,
@@ -214,6 +215,31 @@ describe("derivePlanReviewState malformed rows", () => {
     expect(state.snapshots).toHaveLength(1);
     expect(state.threads).toHaveLength(0);
     expect(skipped).toEqual(["invalid-record", "invalid-record"]);
+  });
+
+  test("falls back to the visiting index for a malformed persisted historySequence", () => {
+    // chat.jsonl rows are parsed without schema validation, so a damaged row can carry a
+    // non-numeric sequence. Copying it verbatim would fail oRPC output validation on every
+    // getState/mutation and brick plan review; a valid sequence must still win over the index.
+    const malformed = (value: unknown, record: PlanReviewRecord) => {
+      const row = recordRow(record);
+      return {
+        ...row,
+        metadata: { ...row.metadata, historySequence: value },
+      } as unknown as MuxMessage;
+    };
+    const state = derivePlanReviewState([
+      malformed("7", snapshotA),
+      recordRow(feedback1, { historySequence: 7 }),
+      malformed(-3, snapshotB),
+      malformed(2.5, feedback2),
+    ]);
+
+    expect(PlanReviewStateSchema.safeParse(state).success).toBe(true);
+    expect(state.snapshots.map((snapshot) => snapshot.historySequence)).toEqual([0, 2]);
+    expect(state.threads.map((thread) => thread.historySequence)).toEqual([7, 7, 3]);
+    expect(state.threads[0].replies[0].historySequence).toBe(3);
+    expect(state.feedbacks.map((feedback) => feedback.historySequence)).toEqual([7, 3]);
   });
 });
 
