@@ -567,14 +567,49 @@ class CheckoutKeysChangedError extends Error {
     super("workspace checkout keys changed while acquiring their locks");
   }
 }
-/** Result of one checkout-lock key derivation (see checkoutLockKeys). */
-interface CheckoutLockKeys {
-  /** Every lock key of each resolvable workspace's checkout. */
+/** The locks one acquisition holds (see withCheckoutLocks). */
+interface LockedCheckouts {
+  /** Every lock key of each resolvable checkout, by the id the caller named it. */
   keys: Map<string, string[]>;
-  /** Workspaces whose checkout identity could not be established (not locked). */
+  /** Checkouts whose identity could not be established (not locked). */
   unresolvable: Array<{ workspaceId: string; error: Error }>;
+}
+/** Result of one registry-driven checkout-lock key derivation (see checkoutLockKeys). */
+interface CheckoutLockKeys extends LockedCheckouts {
   /** The registry view the derivation read (registry-only enumeration). */
   registry: FrontendWorkspaceMetadata[];
+}
+function lockKeyDigest(parts: string[]): string {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
+}
+/**
+ * The lock keys of a HOST checkout (see checkoutLockKeys): the spelled path
+ * plus, when it resolves, its realpath. Shared by registry-driven derivation
+ * and by the explicit-target prune of a checkout that has no registry entry
+ * yet, so both fence the same physical path. `label` names the checkout in
+ * the indeterminate-identity error.
+ */
+async function hostCheckoutLockKeys(
+  workspacePath: string,
+  label: string
+): Promise<string[] | Error> {
+  const spelled = path.resolve(workspacePath);
+  const keys = [lockKeyDigest(["host", spelled])];
+  try {
+    const real = await withDeadline(
+      fsPromises.realpath(spelled),
+      REALPATH_TIMEOUT_MS,
+      "realpath timed out"
+    );
+    if (real !== spelled) keys.push(lockKeyDigest(["host", real]));
+  } catch (error) {
+    if (!isPositivelyAbsent(error)) {
+      return new Error(
+        `Could not establish the checkout identity of ${label} (${getErrorMessage(error)}); retry once its filesystem responds.`
+      );
+    }
+  }
+  return keys;
 }
 const WORKSPACE_LOCK_TIMEOUT_MESSAGE =
   "Another Mux operation (a rename or an MCP settings update) is in progress for this workspace. Wait for it to finish and try again.";
@@ -3628,19 +3663,17 @@ export class WorkspaceMcpOverridesService {
     // sweep prunes EVERY such checkout, so the id's key set is the union over
     // all of them (any indeterminate entry makes the id unresolvable).
     const byId = groupMetadataById(all, /* hostLocalOnly */ false);
-    const digest = (parts: string[]): string =>
-      createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
     const keysFor = async (
       id: string,
       metadata: FrontendWorkspaceMetadata
     ): Promise<string[] | Error> => {
       const identity = runtimeFilesystemIdentity(metadata.runtimeConfig);
       if (identity === undefined) {
-        return [digest(["workspace", metadata.runtimeConfig.type, id])];
+        return [lockKeyDigest(["workspace", metadata.runtimeConfig.type, id])];
       }
       const { workspacePath } = this.resolveWorkspace(metadata);
       if (identity !== "host") {
-        const keys = [digest([identity, workspacePath])];
+        const keys = [lockKeyDigest([identity, workspacePath])];
         if (metadata.runtimeConfig.type === "ssh") {
           // SSH `host` may be an ssh_config alias: two aliases can name one
           // machine, and nothing here can resolve them to a stable remote
@@ -3649,27 +3682,11 @@ export class WorkspaceMcpOverridesService {
           // remote path also takes a path-only fence shared across SSH
           // identities (conservative: same path on different hosts
           // serializes needlessly, which only costs a short wait).
-          keys.push(digest(["ssh-path", workspacePath]));
+          keys.push(lockKeyDigest(["ssh-path", workspacePath]));
         }
         return keys;
       }
-      const spelled = path.resolve(workspacePath);
-      const keys = [digest([identity, spelled])];
-      try {
-        const real = await withDeadline(
-          fsPromises.realpath(spelled),
-          REALPATH_TIMEOUT_MS,
-          "realpath timed out"
-        );
-        if (real !== spelled) keys.push(digest([identity, real]));
-      } catch (error) {
-        if (!isPositivelyAbsent(error)) {
-          return new Error(
-            `Could not establish the checkout identity of workspace ${id} (${getErrorMessage(error)}); retry once its filesystem responds.`
-          );
-        }
-      }
-      return keys;
+      return hostCheckoutLockKeys(workspacePath, `workspace ${id}`);
     };
     const derived = await mapWithConcurrency(
       workspaceIds,
@@ -3677,7 +3694,7 @@ export class WorkspaceMcpOverridesService {
       async (id): Promise<string[] | Error> => {
         const entries = byId.get(id);
         if (entries === undefined) {
-          return [digest(["id", id])];
+          return [lockKeyDigest(["id", id])];
         }
         const union = new Set<string>();
         for (const metadata of entries) {
@@ -3710,20 +3727,32 @@ export class WorkspaceMcpOverridesService {
    * the batch then releases and retries with the current keys. `fn` receives
    * the registry view that verification read under the locks.
    */
-  private async withWorkspaceLocks<T>(
+  private withWorkspaceLocks<T>(
     workspaceIds: readonly string[],
     fn: (locked: CheckoutLockKeys) => Promise<T>,
     budgetMs = WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS
   ): Promise<T> {
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
+    return this.withCheckoutLocks(() => this.checkoutLockKeys(ids), fn, budgetMs);
+  }
+
+  /**
+   * The acquisition loop of withWorkspaceLocks over any key derivation: the
+   * registry-driven one, or the explicit host path of a checkout that has no
+   * registry entry yet (see prunePluginOverrideKeysForUnregisteredCheckout).
+   */
+  private async withCheckoutLocks<L extends LockedCheckouts, T>(
+    deriveKeys: () => Promise<L>,
+    fn: (locked: L) => Promise<T>,
+    budgetMs: number
+  ): Promise<T> {
     const deadlineAt = Date.now() + budgetMs;
     const remaining = () => Math.max(0, deadlineAt - Date.now());
     // Key derivation probes checkouts (bounded realpaths, but hundreds of
     // stalled ones add up): it draws from the same budget as the acquisition
     // — and the verification run below happens while every lock is held.
-    const derive = () =>
-      withDeadline(this.checkoutLockKeys(ids), remaining(), WORKSPACE_LOCK_TIMEOUT_MESSAGE);
-    const fingerprint = (derived: CheckoutLockKeys) =>
+    const derive = () => withDeadline(deriveKeys(), remaining(), WORKSPACE_LOCK_TIMEOUT_MESSAGE);
+    const fingerprint = (derived: LockedCheckouts) =>
       JSON.stringify([
         [...new Set([...derived.keys.values()].flat())].sort(),
         derived.unresolvable.map((entry) => entry.workspaceId).sort(),
@@ -4325,6 +4354,83 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * prunePluginOverrideKeys for a host-local checkout that has NO registry
+   * entry yet: direct task creation sanitizes its fresh worktree BEFORE the
+   * task record is published, so ordinary readers (older builds included)
+   * can never discover or admit the task while its tracked `plugin:` enables
+   * are still in place. The id-based entry point cannot serve this: an
+   * unregistered id derives the fallback id key (see checkoutLockKeys), which
+   * contends with nothing — the locks taken here are the very keys every
+   * registered writer of this physical path derives (spelled path + realpath),
+   * so a rename or save through an alias registration of the same checkout
+   * serializes against this prune. Same bound, write-join and epoch contract
+   * as registration sanitization (epoch only when this pass rewrote a file).
+   */
+  async prunePluginOverrideKeysForUnregisteredCheckout(
+    target: { workspacePath: string; runtimeConfig: RuntimeConfig },
+    keyPrefix: string
+  ): Promise<void> {
+    assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
+    assert(
+      isHostLocalRuntimeConfig(target.runtimeConfig),
+      "prunePluginOverrideKeysForUnregisteredCheckout: host-local checkouts only"
+    );
+    assert(path.isAbsolute(target.workspacePath), "workspacePath must be absolute");
+    const label = `checkout ${target.workspacePath}`;
+    const derive = async (): Promise<LockedCheckouts> => {
+      const keys = await hostCheckoutLockKeys(target.workspacePath, label);
+      return keys instanceof Error
+        ? { keys: new Map(), unresolvable: [{ workspaceId: label, error: keys }] }
+        : { keys: new Map([[label, keys]]), unresolvable: [] };
+    };
+    return this.withCheckoutLocks(
+      derive,
+      (locked) =>
+        this.runExclusive(async () => {
+          const unresolvable = locked.unresolvable[0];
+          if (unresolvable !== undefined) {
+            throw unresolvable.error;
+          }
+          const budget = createPublicationBudget();
+          const snapshot = new ConfigSnapshot(
+            this.config,
+            false,
+            undefined,
+            /* writerLocksHeld */ true
+          );
+          const step = snapshot.scoped();
+          try {
+            const { rewrote } = await withDeadline(
+              this.pruneResolvedWorkspace(
+                {
+                  // Host files read and written by absolute path, exactly as the
+                  // registered worktree's own runtime will read them later.
+                  runtime: createRuntime({ type: "local" }, { projectPath: target.workspacePath }),
+                  workspacePath: target.workspacePath,
+                  metadata: { runtimeConfig: target.runtimeConfig },
+                },
+                keyPrefix,
+                step
+              ),
+              budget.remaining(),
+              `pruning ${label} exceeded the plugin-prune budget`,
+              () => step.cancel()
+            );
+            if (rewrote) {
+              await this.bumpOverridesEpoch();
+            }
+          } finally {
+            // A rewrite the deadline abandoned must land (or fail) before the
+            // locks release: a late write could otherwise overwrite a save made
+            // by the registration that follows.
+            await snapshot.settleSideEffects();
+          }
+        }),
+      WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS
+    );
+  }
+
+  /**
    * prunePluginOverrideKeys across many workspaces under ONE lock acquisition
    * and ONE workspace-metadata/config load. The Agent Plugin installer sweeps
    * every local/worktree workspace (thousands in long-lived setups); resolving
@@ -4566,7 +4672,9 @@ export class WorkspaceMcpOverridesService {
    * this pass rewrote a document.
    */
   private async pruneResolvedWorkspace(
-    resolved: ResolvedWorkspace,
+    resolved: Pick<ResolvedWorkspace, "runtime" | "workspacePath"> & {
+      metadata: Pick<FrontendWorkspaceMetadata, "runtimeConfig">;
+    },
     keyPrefix: string,
     /**
      * Cancellable scope of this prune: a rewrite is registered here so a

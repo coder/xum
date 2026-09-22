@@ -713,8 +713,19 @@ type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "remo
  */
 type WorkspaceServiceMcpOverridesPort = Pick<
   WorkspaceMcpOverridesService,
-  "prunePluginOverrideKeys" | "copyOverridesToForkedCheckout" | "acquireWorkspaceLock"
+  | "prunePluginOverrideKeys"
+  | "prunePluginOverrideKeysForUnregisteredCheckout"
+  | "copyOverridesToForkedCheckout"
+  | "acquireWorkspaceLock"
 >;
+/**
+ * Registration aborts instead of proceeding with a stale override file:
+ * continuing would re-create the silent-activation path sanitization exists
+ * to close, with no durable record left to retry it.
+ */
+function unsanitizableOverridesMessage(workspacePath: string, error: unknown): string {
+  return `The directory's existing MCP overrides file could not be sanitized: ${getErrorMessage(error)}. Fix or remove the workspace MCP overrides file (.xum/mcp.local.jsonc, or legacy .mux/mcp.local.jsonc) in ${workspacePath} and try again.`;
+}
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
@@ -3069,6 +3080,102 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (!this.workspaceMcpOverridesService) {
       return undefined;
     }
+    const siblings = await this.findLiveSiblingForCheckout(
+      workspacePath,
+      workspaceId,
+      persistentSiblingConfig
+    );
+    if (siblings !== "none") {
+      return siblings === "found" ? undefined : siblings.error;
+    }
+    try {
+      // A new identity owes no earlier pass an epoch bump: require the
+      // cross-process signal only when this pass actually rewrote a file, so
+      // a fork copy's valid key-free document is not rolled back by a
+      // transiently unwritable epoch file.
+      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:", {
+        epochOnlyWhenRewritten: true,
+      });
+      return undefined;
+    } catch (error) {
+      return unsanitizableOverridesMessage(workspacePath, error);
+    }
+  }
+
+  /**
+   * Direct task creation's registration: sanitize a FRESH host-local checkout
+   * and publish its task record under ONE hold of the cross-process
+   * registration lock, in that order. Published-then-sanitized (the reserved
+   * launch's unavoidable order, and this path's former one) leaves a window
+   * in which every ordinary reader — older builds included — can discover
+   * and admit the task while its tracked `plugin:` enables are in place, and
+   * a failed sanitization then strands that record with its unsanitized
+   * checkout as a rescuable interrupted task. Sanitizing first closes both:
+   * a reader can only ever see a record whose checkout was pruned, and a
+   * refused sanitization publishes nothing.
+   *
+   * The lock covers scan + prune + publication so no sibling process can
+   * register the same physical path between the sibling scan and the
+   * publication and have both skip pruning (see acquireRegistrationSanitizeLock).
+   * Lock order: registration lock → checkout locks → global override lock
+   * (both released by the prune) → the config write's own project
+   * registration lock inside `publish`; nothing acquires the registration lock
+   * while holding any of the others. Off-host runtimes publish without the
+   * lock (plugin servers never spawn there).
+   *
+   * Returns `Err` when sanitization refused (NOTHING was published; the
+   * caller decides the fate of its unregistered files) and `Ok` with
+   * `publish`'s result once it ran; a throwing `publish` propagates.
+   */
+  async registerSanitizedTaskCheckout<T>(
+    target: { workspacePath: string; runtimeConfig: RuntimeConfig },
+    publish: () => Promise<T>
+  ): Promise<Result<T, string>> {
+    assert(target.workspacePath.length > 0, "registerSanitizedTaskCheckout: path is required");
+    const hostLocal =
+      target.runtimeConfig.type === "local" || target.runtimeConfig.type === "worktree";
+    if (!hostLocal || !this.workspaceMcpOverridesService) {
+      return Ok(await publish());
+    }
+    let releaseRegistrationLock: () => Promise<void>;
+    try {
+      releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    try {
+      // No own record to exclude: the checkout is unregistered until `publish`.
+      const siblings = await this.findLiveSiblingForCheckout(target.workspacePath, undefined);
+      if (siblings === "none") {
+        try {
+          await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
+            target,
+            "plugin:"
+          );
+        } catch (error) {
+          return Err(unsanitizableOverridesMessage(target.workspacePath, error));
+        }
+      } else if (siblings !== "found") {
+        return Err(siblings.error);
+      }
+      return Ok(await publish());
+    } finally {
+      await releaseRegistrationLock();
+    }
+  }
+
+  /**
+   * The sibling scan of registration-time sanitization: whether a LIVE
+   * host-local workspace other than `ownWorkspaceId` resolves to this checkout
+   * (its consent context is alive, so its enables must survive). Returns
+   * `{ error }` when the persistent config is unreadable — refusing to prune
+   * is the only safe answer to an unknown sibling set.
+   */
+  private async findLiveSiblingForCheckout(
+    workspacePath: string,
+    ownWorkspaceId: string | undefined,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<"found" | "none" | { error: string }> {
     // A sibling workspace resolving to the same checkout (local-runtime
     // conversation forks) means the consent context is still ALIVE — its
     // enables must survive, and the uninstaller can still reach the file
@@ -3133,13 +3240,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           : []),
       ];
     } catch (error) {
-      return `Cannot verify live sibling workspaces for plugin override sanitization (the persistent config is unreadable: ${getErrorMessage(error)}). Refusing to prune; fix the config and retry.`;
+      return {
+        error: `Cannot verify live sibling workspaces for plugin override sanitization (the persistent config is unreadable: ${getErrorMessage(error)}). Refusing to prune; fix the config and retry.`,
+      };
     }
     for (const config of configSnapshots) {
       for (const project of config.projects.values()) {
         for (const workspace of project.workspaces) {
           if (
-            workspace.id === workspaceId ||
+            (ownWorkspaceId !== undefined && workspace.id === ownWorkspaceId) ||
             // Registered-but-unsanitized entries from an overlapping creation
             // are not live consent contexts (see pendingPluginSanitizations).
             (workspace.id !== undefined && this.pendingPluginSanitizations.has(workspace.id)) ||
@@ -3151,26 +3260,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             stripTrailingSlashes(workspace.path) === normalizedPath ||
             (await canonicalize(workspace.path)) === canonicalPath
           ) {
-            return undefined;
+            return "found";
           }
         }
       }
     }
-    try {
-      // A new identity owes no earlier pass an epoch bump: require the
-      // cross-process signal only when this pass actually rewrote a file, so
-      // a fork copy's valid key-free document is not rolled back by a
-      // transiently unwritable epoch file.
-      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:", {
-        epochOnlyWhenRewritten: true,
-      });
-      return undefined;
-    } catch (error) {
-      // Abort creation instead of proceeding with the stale file: continuing
-      // would re-create the silent-activation path this sanitization exists
-      // to close, with no durable record left to retry it.
-      return `The directory's existing MCP overrides file could not be sanitized: ${getErrorMessage(error)}. Fix or remove the workspace MCP overrides file (.xum/mcp.local.jsonc, or legacy .mux/mcp.local.jsonc) in ${workspacePath} and try again.`;
-    }
+    return "none";
   }
 
   /**
