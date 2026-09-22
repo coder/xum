@@ -6851,22 +6851,28 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
     });
   }
 
-  test("a later unrelated failure after the repair keeps its ordinary classification", async () => {
-    const { errorEvents, run } = createRecoveryHarness("replay-then-503");
-    const serverError = createApiCallErrorForTests({
-      message: "The server is overloaded",
-      statusCode: 503,
-      responseBody: '{"error":{"message":"The server is overloaded","type":"server_error"}}',
-      isRetryable: true,
+  for (const [statusCode, errorType] of [
+    [503, "server_error"],
+    [401, "authentication"],
+    [429, "rate_limit"],
+  ] as const) {
+    test(`a later ${statusCode} after the repair keeps its ordinary classification`, async () => {
+      const { errorEvents, run } = createRecoveryHarness(`replay-then-${statusCode}`);
+      const laterError = createApiCallErrorForTests({
+        message: "The next request failed",
+        statusCode,
+        responseBody: '{"error":{"message":"The next request failed"}}',
+        isRetryable: statusCode !== 401,
+      });
+      const streamInfo = replayStreamInfo(failingStream(openAIReasoningReplayRejections[1].error));
+
+      const createStreamResult = await run(streamInfo, [() => failingStream(laterError)]);
+
+      expect(createStreamResult).toHaveBeenCalledTimes(1);
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0]).toMatchObject({ errorType });
     });
-    const streamInfo = replayStreamInfo(failingStream(openAIReasoningReplayRejections[1].error));
-
-    const createStreamResult = await run(streamInfo, [() => failingStream(serverError)]);
-
-    expect(createStreamResult).toHaveBeenCalledTimes(1);
-    expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]).toMatchObject({ errorType: "server_error" });
-  });
+  }
 
   test("step-boundary repair keeps prior-step parts and usage and replays the stripped step messages", async () => {
     const streamManager = new StreamManager(historyService);

@@ -594,15 +594,9 @@ const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+
 const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
   /encrypted content\b[\s\S]*?\bcould not be verified/;
 
-/**
- * True when the resolved model sends the OpenAI Responses wire, whichever
- * route built it: direct, custom openai-responses adapters and the Coder
- * gateway all instantiate `createOpenAI().responses()` (provider
- * `openai.responses`), while the Xum gateway wraps its OpenAI upstreams in
- * the Vercel gateway SDK (provider `gateway`, `openai/<model>` ids). Keyed on
- * the model instance, not the requested string, so `openrouter:openai/x`
- * (chat completions) and xAI Responses (`xai.responses`) stay out.
- */
+// Use the resolved SDK model, not the requested prefix: OpenAI Responses can
+// arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
+// and OpenRouter chat-completions models must not enter this recovery path.
 function isOpenAIResponsesModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
   return (
@@ -5366,17 +5360,9 @@ export class StreamManager {
     return true;
   }
 
-  /**
-   * OpenAI Responses rejected replayed reasoning on the failing request: an
-   * `rs_` item the route cannot resolve, or an encrypted_content blob it cannot
-   * verify (minted under another org/route, rotated keys). Phase 1 already
-   * replays by encrypted content only; these are the rejections that survive
-   * it, and they repeat deterministically for the same input. Strict on
-   * purpose: only these two shapes, only on a 400/404, and only when the
-   * request actually went out on the OpenAI Responses wire, so a loose `rs_`
-   * mention, another item type, xAI Responses (also `rs_`), or a
-   * chat-completions route never trigger the repair.
-   */
+  // These deterministic rejections survive encrypted-only replay: cross-org
+  // blobs and same-turn reasoning references from a flapping route. Keep the
+  // match narrow so unrelated provider errors retain their normal retry policy.
   private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
     const statusCode = this.extractStatusCode(error);
     if (statusCode !== 400 && statusCode !== 404) {
@@ -5401,16 +5387,9 @@ export class StreamManager {
     );
   }
 
-  /**
-   * One-shot mirror of retryStreamWithoutPreviousResponseId for rejected
-   * reasoning replay: drop every OpenAI reasoning part from the failing
-   * request and restart the current step. Same safety envelope (no abort or
-   * soft interrupt pending, no parts emitted by the current step, a step
-   * snapshot when earlier steps completed) so nothing already shown to the
-   * user or executed as a tool is repeated. The final matching error is then
-   * classified reasoning_rejected by buildStreamErrorPayload; no state
-   * outlives the attempt, so a manual continuation gets its own repair.
-   */
+  // Mirror previousResponseId recovery without repeating emitted output or
+  // completed tools. The repair budget belongs to this attempt, so a manual
+  // continuation may try again after the user changes route or credentials.
   private async retryStreamWithoutOpenAIReasoningReplay(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,

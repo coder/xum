@@ -193,16 +193,10 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
 }
 
 /**
- * Drop OpenAI reasoning replay from a prepared request after the Responses
- * wire rejected it (unresolvable `rs_` item, unverifiable encrypted_content).
- * OpenAI mints both, so nothing local can repair them and re-sending the same
- * input fails deterministically. Only reasoning parts carrying the `openai`
- * namespace go: persisted history bridged by attachReasoningReplayMetadata and
- * same-turn SDK step messages (itemId + encrypted content copied from
- * providerMetadata) alike. Text, tool parts, string assistants and other
- * providers' reasoning stay. An assistant emptied by the removal is dropped
- * (an empty content array is not valid input). Non-mutating and identity
- * preserving on no-op so the caller can tell "nothing to repair" apart.
+ * Remove rejected OpenAI reasoning from a request, not persisted history.
+ * SDK step messages also carry this namespace. Keep visible text, tools, and
+ * other-provider reasoning; drop only assistants emptied by this repair.
+ * Preserve input identities on no-op so the caller can decline a useless retry.
  */
 export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessage[] {
   let changed = false;

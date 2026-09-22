@@ -906,8 +906,7 @@ const RUNNING_TASK_TERMINAL_STREAM_ERRORS: ReadonlySet<StreamErrorType> = new Se
   "quota",
   "model_not_found",
   "runtime_not_ready",
-  // The child's StreamManager already spent its one in-stream repair before
-  // classifying the rejection; no in-session recovery remains.
+  // The child's in-stream repair failed or was unsafe; no automatic recovery remains.
   "reasoning_rejected",
 ]);
 

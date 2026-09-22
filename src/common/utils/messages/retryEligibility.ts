@@ -55,7 +55,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
   "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
-  "reasoning_rejected", // StreamManager already retried once without the rejected reasoning replay; the same request fails again
+  "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
