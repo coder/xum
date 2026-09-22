@@ -4,7 +4,7 @@
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
-import { generateText, streamText } from "ai";
+import { generateText, jsonSchema, streamText, tool } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
@@ -1964,6 +1964,89 @@ describe("buildProviderOptions - OpenAI", () => {
           mode: "pro",
         });
         expect(capturedBodies[1].reasoning_effort).toBe("max");
+      }
+    );
+
+    // Regression: @ai-sdk/openai 4.0.71 allowlists GPT-6 efforts without "none" and
+    // silently drops it. For Sol/Luna that breaks Chat Completions tool calls and makes
+    // Responses "off" fall back to the API's default effort; our bun patch fixes this.
+    test.each(["gpt-6-sol", "gpt-6-luna", "gpt-6-sol-2026-09-22", "gpt-6-astra"])(
+      "serializes reasoning effort none with tools for %s through the OpenAI SDK",
+      async (model) => {
+        const capturedBodies: Array<Record<string, unknown>> = [];
+        const captureFetch = Object.assign(
+          (
+            input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1]
+          ): Promise<Response> => {
+            if (typeof init?.body !== "string") {
+              throw new Error("Expected the OpenAI provider to send a JSON string body");
+            }
+            capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+            const url =
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : input.url;
+            const responseBody = url.endsWith("/responses")
+              ? { id: "resp_test", model, output: [], usage: { input_tokens: 1, output_tokens: 0 } }
+              : {
+                  id: "chat_test",
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      message: { role: "assistant", content: "ok" },
+                      finish_reason: "stop",
+                    },
+                  ],
+                  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+                };
+            return Promise.resolve(
+              new Response(JSON.stringify(responseBody), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            );
+          },
+          { preconnect: fetch.preconnect.bind(fetch) }
+        );
+        const openai = createOpenAI({
+          apiKey: "test",
+          baseURL: "https://example.test/v1",
+          fetch: captureFetch,
+        });
+        const tools = {
+          lookup: tool({
+            description: "Look something up",
+            inputSchema: jsonSchema<{ query: string }>({
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            }),
+          }),
+        };
+
+        for (const languageModel of [openai.chat(model), openai.responses(model)]) {
+          await generateText({
+            model: languageModel,
+            prompt: "Return ok.",
+            tools,
+            providerOptions: { openai: { reasoningEffort: "none" } },
+            maxRetries: 0,
+          });
+        }
+
+        const [chatBody, responsesBody] = capturedBodies;
+        expect(chatBody.tools).toHaveLength(1);
+        expect(responsesBody.tools).toHaveLength(1);
+        // Astra genuinely rejects "none", so the SDK must keep dropping it there.
+        const expectedEffort = model === "gpt-6-astra" ? undefined : "none";
+        expect(chatBody.reasoning_effort).toBe(expectedEffort);
+        expect((responsesBody.reasoning as { effort?: string } | undefined)?.effort).toBe(
+          expectedEffort
+        );
       }
     );
   });

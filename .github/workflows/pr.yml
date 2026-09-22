@@ -230,6 +230,11 @@ jobs:
             # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
             # making catalog-call assertions order-dependent in the shared process.
             src/node/services/coderOauthService.test.ts
+            # Loads the native sharp/libvips addon into the test process. In the shared
+            # coverage process Bun hit an allocator panic ("pas panic: deallocation did
+            # fail", exit 133) as this file started on main run 35782976621, with zero
+            # failing assertions; isolation gets it the signal-exit retry below.
+            src/node/services/mcpIconDecodeClient.test.ts
           )
           # One process per file rather than one shared isolated process. Sharing it still
           # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)

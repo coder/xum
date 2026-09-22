@@ -1,0 +1,30 @@
+diff --git a/dist/index.js b/dist/index.js
+index a7d20837fdbb038743a788954df9680e4c7fc33a..dbbc09f78efb0ecb39aa25fae3c127109636d608 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -63,7 +63,9 @@ function getOpenAILanguageModelCapabilities(modelId) {
+     supportsPriorityProcessing,
+     supportsConfigurationUpdate: isGpt6OrLaterModel,
+     supportsAsyncToolCalling: isGpt6OrLaterModel,
+-    supportedReasoningEfforts: isGpt6OrLaterModel ? ["low", "medium", "high", "xhigh", "max"] : void 0,
++    // xum patch: GPT-6 Sol/Luna accept "none" (and require it for Chat
++    // Completions function calling); only Astra rejects disabled reasoning.
++    supportedReasoningEfforts: isGpt6OrLaterModel ? /^gpt-6-(?:sol|luna)(?:-|$)/.test(modelId) ? ["none", "low", "medium", "high", "xhigh", "max"] : ["low", "medium", "high", "xhigh", "max"] : void 0,
+     isReasoningModel,
+     systemMessageMode,
+     supportsNonReasoningParameters
+diff --git a/dist/internal/index.js b/dist/internal/index.js
+index db8be69dc73c030792fd36f18dd9e37cf8d9e652..718c087dc2129807b4267e9d7b5ab534e5831844 100644
+--- a/dist/internal/index.js
++++ b/dist/internal/index.js
+@@ -53,7 +53,9 @@ function getOpenAILanguageModelCapabilities(modelId) {
+     supportsPriorityProcessing,
+     supportsConfigurationUpdate: isGpt6OrLaterModel,
+     supportsAsyncToolCalling: isGpt6OrLaterModel,
+-    supportedReasoningEfforts: isGpt6OrLaterModel ? ["low", "medium", "high", "xhigh", "max"] : void 0,
++    // xum patch: GPT-6 Sol/Luna accept "none" (and require it for Chat
++    // Completions function calling); only Astra rejects disabled reasoning.
++    supportedReasoningEfforts: isGpt6OrLaterModel ? /^gpt-6-(?:sol|luna)(?:-|$)/.test(modelId) ? ["none", "low", "medium", "high", "xhigh", "max"] : ["low", "medium", "high", "xhigh", "max"] : void 0,
+     isReasoningModel,
+     systemMessageMode,
+     supportsNonReasoningParameters
