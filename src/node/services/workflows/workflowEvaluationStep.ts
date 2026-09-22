@@ -189,26 +189,39 @@ export async function runWorkflowEvaluationStep(
   const inputHash = hashEvaluationStepInput(spec, state);
   leaseGuard.throwIfLost();
 
-  // 3. Lookup.
+  // 3. Lookup. Every record of an evaluate step carries its admission, bound
+  //    to the input it was admitted for; the one trust decision for an
+  //    existing record is made here, before replay or resume branches.
   const existing = await journal.getStep(context.runId, spec.id, inputHash);
-  if (existing?.status === "completed") {
-    return await replayCompletedStep(context, {
-      spec,
-      existing,
-      inputHash,
-      stepDigest,
-      receipts: { stateSha256, stateBytes, questionsSha256, questionCount },
-    });
-  }
-
   let attempt = 1;
   let persisted: EvaluationAdmission | undefined;
   if (existing !== null) {
-    // `started` (resume) or `failed`/`interrupted` (checkpoint retry): every
-    // record of an evaluate step carries its admission, so a missing or
-    // malformed one is corruption and fails closed instead of re-selecting.
-    const admission = EvaluationAdmissionSchema.safeParse(existing.evaluation);
-    if (!admission.success) {
+    const admission = parseTrustedAdmission(existing, {
+      stateSha256,
+      stateBytes,
+      questionsSha256,
+      questionCount,
+      providerOptions: spec.providerOptions,
+    });
+    if (existing.status === "completed") {
+      if (admission === undefined) {
+        // Untrusted completed record: fail the run without touching it and
+        // without dispatching (same as a malformed stored result).
+        throw new Error(`evaluation replay failed: cached result invalid (step ${stepDigest})`);
+      }
+      return await replayCompletedStep(context, {
+        spec,
+        existing,
+        inputHash,
+        stepDigest,
+        admission,
+        stateReceipt: { sha256: stateSha256, bytes: stateBytes },
+      });
+    }
+    // `started` (resume) or `failed`/`interrupted` (checkpoint retry): a
+    // missing, malformed or unbound admission is corruption and fails closed
+    // instead of re-selecting or advancing the attempt.
+    if (admission === undefined) {
       const error = new WorkflowEvaluationStepError(
         "admission-missing",
         "admission-missing",
@@ -224,7 +237,7 @@ export async function runWorkflowEvaluationStep(
       });
       throw error;
     }
-    persisted = admission.data;
+    persisted = admission;
     attempt = persisted.attempt + 1;
   }
   const timeoutMs = persisted?.timeoutMs ?? clampTimeoutMs(spec.timeoutMs);
@@ -456,14 +469,43 @@ export async function runWorkflowEvaluationStep(
 }
 
 /**
+ * The admission of an existing record for this key, when it parses and is
+ * bound to the input being evaluated now: state and questions receipts plus
+ * the request-shaping provider options it carries. The pinned model selection
+ * is deliberately not compared with the spec or Settings — carrying it across
+ * attempts is the admission's purpose, and the pre-dispatch recheck validates
+ * it against the current endpoint. Anything else is corruption or a record
+ * misassociated with this key, and the caller fails closed.
+ */
+function parseTrustedAdmission(
+  record: WorkflowStepRecord,
+  expected: Pick<
+    EvaluationAdmission,
+    "stateSha256" | "stateBytes" | "questionsSha256" | "questionCount" | "providerOptions"
+  >
+): EvaluationAdmission | undefined {
+  const parsed = EvaluationAdmissionSchema.safeParse(record.evaluation);
+  if (!parsed.success) {
+    return undefined;
+  }
+  const admission = parsed.data;
+  const bound =
+    admission.stateSha256 === expected.stateSha256 &&
+    admission.stateBytes === expected.stateBytes &&
+    admission.questionsSha256 === expected.questionsSha256 &&
+    admission.questionCount === expected.questionCount &&
+    canonicalEvaluationJson(admission.providerOptions ?? null) ===
+      canonicalEvaluationJson(expected.providerOptions ?? null);
+  return bound ? admission : undefined;
+}
+
+/**
  * A completed record is immutable for its `(stepId, inputHash)`: a valid stored
  * result is returned verbatim and never re-dispatched; a malformed one fails
- * the run without touching the record (an older build's reader may have
- * written something this build cannot trust). "Valid" includes the receipts:
- * the result's own state digest and the admission's state/questions digests
- * must match the input being evaluated now, so a record whose body was
- * corrupted or misassociated while keeping its key cannot return answers that
- * were produced for a different state.
+ * the run without touching the record. "Valid" includes the result's own state
+ * receipt matching the input being evaluated now (the admission was already
+ * bound by the caller), so a record whose body was corrupted or misassociated
+ * while keeping its key cannot return answers produced for a different state.
  */
 async function replayCompletedStep(
   context: WorkflowEvaluationStepContext,
@@ -472,10 +514,8 @@ async function replayCompletedStep(
     existing: WorkflowStepRecord;
     inputHash: string;
     stepDigest: string;
-    receipts: Pick<
-      EvaluationAdmission,
-      "stateSha256" | "stateBytes" | "questionsSha256" | "questionCount"
-    >;
+    admission: EvaluationAdmission;
+    stateReceipt: { sha256: string; bytes: number };
   }
 ): Promise<EvaluationStepResult> {
   const parsed = EvaluationStepResultSchema.safeParse(input.existing.result?.structuredOutput);
@@ -486,18 +526,11 @@ async function replayCompletedStep(
         parsed.data.rounding
       )
     : undefined;
-  const admission = EvaluationAdmissionSchema.safeParse(input.existing.evaluation);
-  const { receipts } = input;
-  const receiptsMatch =
+  const stateReceiptMatches =
     parsed.success &&
-    parsed.data.state.sha256 === receipts.stateSha256 &&
-    parsed.data.state.bytes === receipts.stateBytes &&
-    (!admission.success ||
-      (admission.data.stateSha256 === receipts.stateSha256 &&
-        admission.data.stateBytes === receipts.stateBytes &&
-        admission.data.questionsSha256 === receipts.questionsSha256 &&
-        admission.data.questionCount === receipts.questionCount));
-  if (!parsed.success || validated?.ok !== true || !receiptsMatch) {
+    parsed.data.state.sha256 === input.stateReceipt.sha256 &&
+    parsed.data.state.bytes === input.stateReceipt.bytes;
+  if (!parsed.success || validated?.ok !== true || !stateReceiptMatches) {
     throw new Error(`evaluation replay failed: cached result invalid (step ${input.stepDigest})`);
   }
   try {
@@ -506,7 +539,7 @@ async function replayCompletedStep(
       at: context.clock.nowIso(),
       stepId: input.spec.id,
       inputHash: input.inputHash,
-      attempt: admission.success ? admission.data.attempt : 1,
+      attempt: input.admission.attempt,
       status: "cached",
       ...(input.spec.title !== undefined ? { title: input.spec.title } : {}),
       modelString: parsed.data.model.modelString,

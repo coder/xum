@@ -1062,34 +1062,89 @@ describe("WorkflowRunner evaluate()", () => {
     }
   });
 
-  test("a cached result whose receipts do not match the current input fails closed", async () => {
-    // Same (stepId, inputHash) key, but the record body describes another
-    // state: a mismatching result receipt or admission receipt must not replay.
-    const corruptions: Array<{ result: EvaluationStepResult; admission: EvaluationAdmission }> = [
-      {
-        result: { ...storedResult, state: { sha256: "other-state", bytes: STATE_RECEIPT.bytes } },
-        admission: admissionFor({ attempt: 1 }),
-      },
-      {
-        result: storedResult,
-        admission: { ...admissionFor({ attempt: 1 }), questionsSha256: "other-questions" },
-      },
+  test("an existing record is trusted only with an admission bound to the current input", async () => {
+    // Same (stepId, inputHash) key, but the record's admission is missing or
+    // describes another request (the store's schema already rejects malformed
+    // admissions on write). A completed record must not replay and a resumable
+    // record must not resume or advance its attempt; neither may resolve a
+    // model or dispatch, and no retry is offered.
+    const bound = admissionFor({ attempt: 1 });
+    const untrusted: Array<[string, EvaluationAdmission | undefined]> = [
+      ["missing", undefined],
+      ["state receipt", { ...bound, stateSha256: "other-state" }],
+      ["questions receipt", { ...bound, questionsSha256: "other-questions" }],
+      ["provider options", { ...bound, providerOptions: { openai: { reasoningEffort: "low" } } }],
     ];
-    for (const corruption of corruptions) {
-      using tmp = new DisposableTempDir("workflow-eval");
-      const store = await createStore(tmp.path);
-      await seedCompletedStep(store, corruption);
-      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
-      const fake = createFakeAdapter();
+    for (const [label, admission] of untrusted) {
+      // Completed record → replay refused, record untouched.
+      {
+        using tmp = new DisposableTempDir("workflow-eval");
+        const store = await createStore(tmp.path);
+        await seedCompletedStep(store, { result: storedResult, admission });
+        await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+        const fake = createFakeAdapter();
 
-      await expect(
-        createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
-      ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
+        await expect(
+          createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true }),
+          label
+        ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
 
-      expect(fake.dispatchCalls).toHaveLength(0);
-      expect((await readStep(store))?.status).toBe("completed");
-      expect(evaluationEvents(await store.getRun(RUN_ID))).toHaveLength(0);
+        expect(fake.resolveCalls, label).toHaveLength(0);
+        expect(fake.dispatchCalls, label).toHaveLength(0);
+        const step = await readStep(store);
+        expect(step?.status, label).toBe("completed");
+        expect(step?.result?.structuredOutput, label).toEqual(storedResult);
+        const run = await store.getRun(RUN_ID);
+        expect(evaluationEvents(run), label).toHaveLength(0);
+        expect(canRetryWorkflowFromCheckpoint(run), label).toBe(false);
+      }
+      // Started record → admission-missing, no attempt advancement.
+      {
+        using tmp = new DisposableTempDir("workflow-eval");
+        const store = await createStore(tmp.path);
+        const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+        await store.recordStepStarted(RUN_ID, {
+          stepId: STEP_ID,
+          inputHash: hashEvaluationStepInput(spec, STATE),
+          startedAt: "2026-05-29T00:00:00.500Z",
+          ...(admission !== undefined ? { evaluation: admission } : {}),
+        });
+        await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+        const fake = createFakeAdapter({ defaultModel: SENTINEL_MODEL });
+
+        await expect(
+          createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true }),
+          label
+        ).rejects.toThrow(
+          `evaluation failed: admission-missing/admission-missing (step ${STEP_DIGEST}, attempt 1)`
+        );
+
+        expect(fake.resolveCalls, label).toHaveLength(0);
+        expect(fake.dispatchCalls, label).toHaveLength(0);
+        expect(await readStep(store), label).toMatchObject({ status: "failed" });
+        expect((await readStep(store))?.evaluation, label).toBeUndefined();
+        expect(canRetryWorkflowFromCheckpoint(await store.getRun(RUN_ID)), label).toBe(false);
+      }
     }
+  });
+
+  test("a cached result whose own state receipt does not match the current input fails closed", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path);
+    await seedCompletedStep(store, {
+      result: { ...storedResult, state: { sha256: "other-state", bytes: STATE_RECEIPT.bytes } },
+      admission: admissionFor({ attempt: 1 }),
+    });
+    await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    const fake = createFakeAdapter();
+
+    await expect(
+      createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+    ).rejects.toThrow(`evaluation replay failed: cached result invalid (step ${STEP_DIGEST})`);
+
+    expect(fake.dispatchCalls).toHaveLength(0);
+    expect((await readStep(store))?.status).toBe("completed");
+    expect(evaluationEvents(await store.getRun(RUN_ID))).toHaveLength(0);
   });
 
   test("a rejected cached-event append on replay still returns the stored result", async () => {
