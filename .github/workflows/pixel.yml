@@ -46,13 +46,14 @@ jobs:
 
       # A story whose final frame depends on timing shows up as a spurious "changed"
       # snapshot on unrelated PRs. Replay Pixel's capture pipeline on the stories this PR
-      # touches (all stories when the shared harness changes) and fail on any variant
+      # touches (all stories when the shared harness changes, including story support
+      # modules named *Story*, e.g. settingsStoryUtils.tsx) and fail on any variant
       # that renders differently across runs. Reuses the storybook-static/ build above.
       - name: Check stories for nondeterministic snapshots
         if: github.event_name == 'pull_request' && env.PIXEL_KEY != ''
         run: |
           changed=$(git diff --name-only --diff-filter=AMR HEAD^1 HEAD)
-          if echo "$changed" | grep -qE '^(\.storybook/|src/browser/stories/(helpers|mocks)/|src/browser/stories/(meta\.tsx|storyPlayHelpers\.ts|storyTime\.ts)$|pixel\.jsonc$|scripts/storybook-flake-check\.mjs$)'; then
+          if echo "$changed" | grep -qE '^(\.storybook/|src/browser/stories/(helpers|mocks)/|src/browser/stories/(meta\.tsx|storyPlayHelpers\.ts|storyTime\.ts)$|pixel\.jsonc$|scripts/storybook-flake-check\.mjs$)|(^|/)[^/]*Story[^/]*\.tsx?$'; then
             echo "Storybook harness changed; checking every story."
             node scripts/storybook-flake-check.mjs --runs 3
           else

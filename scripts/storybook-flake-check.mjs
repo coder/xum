@@ -24,18 +24,13 @@
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-
-// Deep imports: the package only exports its CLI + storyapi, but these are the
+// Deep file imports: the package only exports its CLI + storyapi, but these are the
 // exact modules `pixel-storybook` runs. Re-check them when bumping the pinned version.
-// File URLs keep dynamic import() working with Windows drive-letter paths.
-const PIXEL_BUILD = resolve("node_modules/@coder/pixel-storybook/build");
-const importPixel = (module) => import(pathToFileURL(join(PIXEL_BUILD, module)).href);
-const pixelConfig = await importPixel("config.js");
-const pixelCrawler = await importPixel("crawler/storybook.js");
-const pixelShots = await importPixel("shots/shots.js");
-const pixelUtils = await importPixel("utils.js");
+import * as pixelConfig from "../node_modules/@coder/pixel-storybook/build/config.js";
+import * as pixelCrawler from "../node_modules/@coder/pixel-storybook/build/crawler/storybook.js";
+import * as pixelShots from "../node_modules/@coder/pixel-storybook/build/shots/shots.js";
+import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.js";
 
 const { values } = parseArgs({
   options: {
@@ -132,14 +127,14 @@ if (baseItems.length === 0) {
 }
 console.log(`Capturing ${baseItems.length} Pixel variant(s) x ${runs} runs...`);
 
-const renderFailures = new Set();
-
 /**
  * Capture every item `count` times.
- * @returns {Promise<Map<string, Map<string, Buffer>>>} shot id -> image hash -> image
+ * @returns {Promise<{ renders: Map<string, Map<string, Buffer>>, renderFailures: Set<string> }>}
+ *   renders: shot id -> image hash -> image; renderFailures: ids whose play threw or timed out
  */
 async function captureRepeatedly(items, count, label) {
   const renders = new Map();
+  const renderFailures = new Set();
   const originalLog = console.log;
   for (let run = 0; run < count; run++) {
     // Fresh shot items per run: takeScreenShots mutates them (image, timings, logs).
@@ -159,17 +154,23 @@ async function captureRepeatedly(items, count, label) {
     }
     console.log(`  ${label} run ${run + 1}/${count} done`);
   }
-  return renders;
+  return { renders, renderFailures };
 }
 
-const renders = await captureRepeatedly(baseItems, runs, "sweep");
-const candidates = new Set([...renders].filter(([, v]) => v.size > 1).map(([id]) => id));
+const sweep = await captureRepeatedly(baseItems, runs, "sweep");
+const renders = sweep.renders;
+// A story that never reaches a clean final frame is as unreviewable as a flaky one.
+const candidates = new Set([
+  ...[...renders].filter(([, v]) => v.size > 1).map(([id]) => id),
+  ...sweep.renderFailures,
+]);
 
 // Confirm candidates in a smaller batch. A full sweep saturates the runner, and at that
 // load Chromium occasionally rasterizes an antialiased edge differently (one-pixel-row
 // diffs) in stories that are stable at Pixel's normal per-build load. Real timing races
 // (scroll locks, async data, arrival order) reproduce here too; that load noise does not.
 const flaky = [];
+const brokenRenders = [];
 if (candidates.size > 0) {
   console.log(`Confirming ${candidates.size} candidate(s)...`);
   const confirm = await captureRepeatedly(
@@ -178,20 +179,22 @@ if (candidates.size > 0) {
     "confirm"
   );
   for (const id of candidates) {
-    const variants = confirm.get(id);
-    if (variants && variants.size > 1) {
+    const variants = confirm.renders.get(id);
+    if (confirm.renderFailures.has(id)) {
+      brokenRenders.push(id);
+    } else if (variants && variants.size > 1) {
       flaky.push([id, variants]);
     } else {
-      console.log(`WARN differed only under full-sweep load (not failing): ${id}`);
+      console.log(`WARN did not reproduce during confirmation (not failing): ${id}`);
     }
   }
 }
 server.close();
 
-for (const id of renderFailures) {
-  console.log(`WARN story did not render cleanly (play threw or timed out): ${id}`);
+for (const id of brokenRenders) {
+  console.log(`BROKEN ${id}: play threw or timed out (or story errored) during confirmation`);
 }
-if (flaky.length === 0) {
+if (flaky.length === 0 && brokenRenders.length === 0) {
   console.log(`All ${renders.size} variant(s) were pixel-identical across ${runs} runs.`);
   process.exit(0);
 }
@@ -205,5 +208,7 @@ for (const [id, variants] of flaky) {
     writeFileSync(join(outDir, `${id.replace(/[^\w.-]+/g, "_")}.${n++}.png`), image);
   }
 }
-console.log(`\n${flaky.length} flaky variant(s); distinct renders written to ${outDir}`);
+console.log(
+  `\n${flaky.length} flaky and ${brokenRenders.length} broken variant(s); distinct renders written to ${outDir}`
+);
 process.exit(1);
