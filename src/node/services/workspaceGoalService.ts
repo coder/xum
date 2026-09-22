@@ -143,6 +143,15 @@ export interface SetGoalInput {
    * `GoalSetInputSchema` for the rationale.
    */
   editInPlace?: boolean | null;
+  /**
+   * Internal model-tool path: the model running the turn that called set_goal.
+   * When present, the budget pricing gate and the kickoff continuation use it
+   * instead of the workspace's persisted kickoff model. Those can differ (e.g.
+   * one-shot model sends or delegated turns skip AI-settings persistence), and
+   * checking the persisted model rejected goals set from a priced turn with
+   * "Target model has no pricing data". Not part of the public oRPC schema.
+   */
+  kickoffModel?: string | null;
 }
 
 export type { GoalStreamOriginKind } from "./goalContinuationPolicy";
@@ -309,6 +318,8 @@ interface PendingGoalMutation {
    * a queued rename preserves goalId + accounting when it drains.
    */
   editInPlace?: boolean | null;
+  /** Carries the setter's `kickoffModel` so the drain prices/kicks off on the same model. */
+  kickoffModel?: string | null;
 }
 
 interface GoalStreamStamp {
@@ -2884,7 +2895,11 @@ export class WorkspaceGoalService {
         }
         if (
           (projected.status === "active" || projected.status === "budget_limited") &&
-          !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, projected))
+          !(await this.canRunBudgetedGoalOnKickoffModel(
+            input.workspaceId,
+            projected,
+            input.kickoffModel
+          ))
         ) {
           return Err({
             type: "invalid_transition" as const,
@@ -2943,6 +2958,7 @@ export class WorkspaceGoalService {
           // agent is streaming still takes the rename branch when the
           // pending mutation drains.
           ...(input.editInPlace != null ? { editInPlace: input.editInPlace } : {}),
+          ...(input.kickoffModel != null ? { kickoffModel: input.kickoffModel } : {}),
         };
         this.pendingGoalMutations.set(input.workspaceId, pendingMutation);
         // A user can run /goal while the first turn is still streaming. The
@@ -3021,16 +3037,36 @@ export class WorkspaceGoalService {
 
   private async canRunBudgetedGoalOnKickoffModel(
     workspaceId: string,
-    goal: GoalRecordV1
+    goal: GoalRecordV1,
+    kickoffModel?: string | null
   ): Promise<boolean> {
     if (!hasBudgetedResumableGoal(goal)) {
       return true;
     }
-    const model = (await this.goalContinuationBridge?.getKickoffSendOptions?.(workspaceId))?.model;
+    const model = (await this.getKickoffSendOptions(workspaceId, kickoffModel))?.model;
     if (!model) {
       return true;
     }
     return modelHasPricingData(model, this.getProvidersConfigForPricing());
+  }
+
+  /**
+   * Kickoff send options from the workspace's persisted agent settings, with
+   * the model optionally overridden by the turn that set the goal. Only the
+   * model is overridden: agent/thinking still come from the persisted
+   * resolution (the send path re-clamps thinking for the model at request
+   * time), and the plan/compact kickoff exclusions keep working unchanged.
+   */
+  private async getKickoffSendOptions(
+    workspaceId: string,
+    kickoffModel?: string | null
+  ): Promise<SendMessageOptions | null> {
+    const persisted =
+      (await this.goalContinuationBridge?.getKickoffSendOptions?.(workspaceId)) ?? null;
+    if (persisted == null || kickoffModel == null || kickoffModel.trim().length === 0) {
+      return persisted;
+    }
+    return { ...persisted, model: kickoffModel };
   }
 
   private async setGoalImmediately(
@@ -3147,7 +3183,11 @@ export class WorkspaceGoalService {
         );
         if (
           (withEdits.status === "active" || withEdits.status === "budget_limited") &&
-          !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, withEdits))
+          !(await this.canRunBudgetedGoalOnKickoffModel(
+            input.workspaceId,
+            withEdits,
+            input.kickoffModel
+          ))
         ) {
           return Err({
             type: "invalid_transition" as const,
@@ -3226,7 +3266,11 @@ export class WorkspaceGoalService {
         if (hasMutableChange) {
           if (
             (updated.status === "active" || updated.status === "budget_limited") &&
-            !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, updated))
+            !(await this.canRunBudgetedGoalOnKickoffModel(
+              input.workspaceId,
+              updated,
+              input.kickoffModel
+            ))
           ) {
             return Err({
               type: "invalid_transition" as const,
@@ -3329,7 +3373,7 @@ export class WorkspaceGoalService {
       });
       if (
         (next.status === "active" || next.status === "budget_limited") &&
-        !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, next))
+        !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, next, input.kickoffModel))
       ) {
         return Err({
           type: "invalid_transition" as const,
@@ -3502,7 +3546,7 @@ export class WorkspaceGoalService {
 
     if (result.data.status === "active") {
       if (!stopVetoesArming()) {
-        await this.armKickoffContinuationIfIdle(input.workspaceId, result.data);
+        await this.armKickoffContinuationIfIdle(input.workspaceId, result.data, input.kickoffModel);
       }
       if (input.initiator === "model") {
         // A model-created set_goal starts from an ordinary user turn, not a
@@ -3544,7 +3588,8 @@ export class WorkspaceGoalService {
 
   private async armKickoffContinuationIfIdle(
     workspaceId: string,
-    goal: GoalRecordV1
+    goal: GoalRecordV1,
+    kickoffModel?: string | null
   ): Promise<void> {
     if (this.suppressKickoffContinuation) {
       return;
@@ -3572,7 +3617,7 @@ export class WorkspaceGoalService {
       }
       return;
     }
-    const sendOptions = await this.goalContinuationBridge.getKickoffSendOptions?.(workspaceId);
+    const sendOptions = await this.getKickoffSendOptions(workspaceId, kickoffModel);
     if (!sendOptions) {
       return;
     }

@@ -2096,6 +2096,68 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toBeNull();
   });
 
+  test("model set_goal prices and kicks off on the invoking turn's model, not the persisted one", async () => {
+    // Regression: set_goal checked only the workspace's persisted kickoff
+    // model. A turn running a priced model that differs from the persisted
+    // default (one-shot model sends, delegated turns) was rejected with
+    // "invalid_transition: Target model has no pricing data".
+    const dispatcher = new IdleDispatcher();
+    const executedModels: string[] = [];
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge((input) => {
+        executedModels.push(input.options.model);
+        return Promise.resolve(true);
+      }),
+      getKickoffSendOptions: () =>
+        Promise.resolve({ model: "custom:unpriced-model", agentId: "exec" }),
+    });
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    const queued = await service.setGoal({
+      workspaceId,
+      objective: "Model-created budgeted goal",
+      status: "active",
+      budgetCents: 500,
+      initiator: "model",
+      forceNewGoal: true,
+      kickoffModel: "openai:gpt-4o",
+    });
+    expect(queued.success).toBe(true);
+
+    await extensionMetadata.setStreaming(workspaceId, false);
+    const drained = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(drained).toMatchObject({ objective: "Model-created budgeted goal", status: "active" });
+
+    // The kickoff continuation must run on the turn's priced model; the
+    // persisted unpriced model would be rejected by the send-time pricing gate.
+    await waitForCondition(() => executedModels.length > 0, { timeoutMs: 1_000 });
+    expect(executedModels).toEqual(["openai:gpt-4o"]);
+  });
+
+  test("model set_goal still rejects when the invoking turn's model is unpriced", async () => {
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(),
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+
+    const result = await service.setGoal({
+      workspaceId,
+      objective: "Unpriced turn goal",
+      status: "active",
+      budgetCents: 500,
+      initiator: "model",
+      forceNewGoal: true,
+      kickoffModel: "custom:unpriced-model",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toMatchObject({ type: "invalid_transition" });
+    }
+    expect(await service.getGoal(workspaceId)).toBeNull();
+  });
+
   test("mid-stream editInPlace rename returns an optimistic snapshot that preserves goalId + accounting", async () => {
     // When an editInPlace rename arrives mid-stream, the
     // projected snapshot returned to the UI is what the Goal tab reads

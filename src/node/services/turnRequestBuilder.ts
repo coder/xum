@@ -2358,6 +2358,7 @@ export class TurnRequestBuilder {
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
+      goalKickoffModel: modelString,
       enableGoalTools: goalToolAvailability,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
