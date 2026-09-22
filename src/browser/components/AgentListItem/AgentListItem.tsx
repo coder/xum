@@ -1529,7 +1529,7 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
     );
   }
 
-  if (rowMeta !== undefined && rowMeta.childTrunkActive !== undefined) {
+  if (rowMeta?.childTrunkActive !== undefined) {
     // Primary rows with visible sub-agent children render the top of the
     // shared child trunk themselves, so the connector visibly starts at this
     // row instead of the first child guessing this row's center from below.

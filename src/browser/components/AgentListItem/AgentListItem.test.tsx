@@ -968,10 +968,10 @@ describe("AgentListItem", () => {
       rowRenderMeta: SUBAGENT_ROW_META,
     });
 
-    const topSegment = view.getByTestId("subagent-connector-top-segment");
+    const trunk = view.getByTestId("subagent-connector-trunk");
     const elbow = view.getByTestId("subagent-connector-elbow");
 
-    expect(topSegment.getAttribute("style")).toContain(`left: ${left}`);
+    expect(trunk.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`width: ${width}`);
   });

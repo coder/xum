@@ -441,8 +441,11 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
             throw new Error("Expected running child connector to be rendered");
           }
 
-          const activeSegments = connector.querySelectorAll("span.subagent-connector-active");
-          if (activeSegments.length === 0) {
+          // Trunk segments render on the row wrapper (siblings of the elbow
+          // overlay), so the active class lives one level above the connector.
+          const wrapper = connector.parentElement;
+          const activeSegments = wrapper?.querySelectorAll("span.subagent-connector-active");
+          if (!activeSegments || activeSegments.length === 0) {
             throw new Error("Expected active connector segments for running child");
           }
 

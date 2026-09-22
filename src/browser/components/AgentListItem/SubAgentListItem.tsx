@@ -38,14 +38,17 @@ interface SubAgentListItemProps {
  * recomputing it on unrelated re-renders would move animation-delay while the
  * animation runs and visibly jump the phase.
  */
-function useConnectorDashSyncStyle(active: boolean): React.CSSProperties | undefined {
+type ConnectorDashSyncStyle = React.CSSProperties & { "--connector-dash-delay": string };
+
+function useConnectorDashSyncStyle(active: boolean): ConnectorDashSyncStyle | undefined {
   return useMemo(() => {
     if (!active) {
       return undefined;
     }
-    return {
+    const style: ConnectorDashSyncStyle = {
       "--connector-dash-delay": `${-(performance.now() % CONNECTOR_DASH_CYCLE_MS)}ms`,
-    } as React.CSSProperties;
+    };
+    return style;
   }, [active]);
 }
 
@@ -59,6 +62,11 @@ function ConnectorTrunkSegment(props: {
   dataAttributes?: Record<string, string>;
 }) {
   const dashSyncStyle = useConnectorDashSyncStyle(props.active);
+  const segmentStyle: React.CSSProperties & { "--connector-color": string } = {
+    "--connector-color": props.isSelected ? "var(--color-border)" : "var(--color-border-light)",
+    ...props.style,
+    ...dashSyncStyle,
+  };
   return (
     <span
       aria-hidden
@@ -70,15 +78,7 @@ function ConnectorTrunkSegment(props: {
         props.className,
         props.active && "subagent-connector-active"
       )}
-      style={
-        {
-          "--connector-color": props.isSelected
-            ? "var(--color-border)"
-            : "var(--color-border-light)",
-          ...props.style,
-          ...dashSyncStyle,
-        } as React.CSSProperties
-      }
+      style={segmentStyle}
     />
   );
 }
