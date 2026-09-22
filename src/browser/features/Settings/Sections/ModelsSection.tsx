@@ -30,6 +30,7 @@ import {
 import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type {
+  EffectivePolicy,
   ProviderModelDiscoveryResult,
   ProviderModelEntry,
   ProvidersConfigMap,
@@ -149,12 +150,14 @@ export function ModelsSection() {
     session: object;
     provider: string;
     config: ProvidersConfigMap;
+    policy: EffectivePolicy | null;
     result: ProviderModelDiscoveryResult;
   } | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<{
     modelId: string;
     provider: string;
     config: ProvidersConfigMap | null;
+    policy: EffectivePolicy | null;
   } | null>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
   const suggestionsId = useId();
@@ -260,21 +263,29 @@ export function ModelsSection() {
     const controller = new AbortController();
     const publish = (result: ProviderModelDiscoveryResult) => {
       if (!controller.signal.aborted) {
-        setDiscovery({ session: suggestionsSession, provider: lastProvider, config, result });
+        setDiscovery({
+          session: suggestionsSession,
+          provider: lastProvider,
+          config,
+          policy: effectivePolicy,
+          result,
+        });
       }
     };
     api.providers
       .discoverModels({ provider: lastProvider }, { signal: controller.signal })
       .then(publish, () => publish({ status: "error", reason: "request-failed" }));
     return () => controller.abort();
-  }, [api, suggestionsSession, lastProvider, config]);
+  }, [api, suggestionsSession, lastProvider, config, effectivePolicy]);
 
   // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
   // well as replies by the config object itself, before effect cleanup gets to run.
+  // Policy events are independent of config refreshes and also revoke completed catalogs.
   const discoveryResult =
     discovery?.session === suggestionsSession &&
     discovery?.provider === lastProvider &&
-    discovery?.config === config
+    discovery?.config === config &&
+    discovery?.policy === effectivePolicy
       ? discovery.result
       : null;
   const discoveredModels =
@@ -307,7 +318,8 @@ export function ModelsSection() {
   const highlightedIndex =
     showSuggestions &&
     highlightedModel?.config === config &&
-    highlightedModel?.provider === lastProvider
+    highlightedModel?.provider === lastProvider &&
+    highlightedModel?.policy === effectivePolicy
       ? suggestions.indexOf(highlightedModel.modelId)
       : -1;
 
@@ -587,7 +599,9 @@ export function ModelsSection() {
                           : Math.max(highlightedIndex - 1, 0);
                     const modelId = suggestions[next];
                     setHighlightedModel(
-                      modelId ? { modelId, provider: lastProvider, config } : null
+                      modelId
+                        ? { modelId, provider: lastProvider, config, policy: effectivePolicy }
+                        : null
                     );
                   } else if (e.key === "Enter") {
                     e.preventDefault();

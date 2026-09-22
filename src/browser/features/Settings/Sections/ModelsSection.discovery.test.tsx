@@ -2,12 +2,18 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { wrapAsyncIterator } from "@orpc/shared";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
-import type { ProviderModelDiscoveryResult, ProvidersConfigMap } from "@/common/orpc/types";
+import type {
+  EffectivePolicy,
+  ProviderModelDiscoveryResult,
+  ProvidersConfigMap,
+} from "@/common/orpc/types";
+import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
 import { ModelsSection } from "./ModelsSection";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils";
 
@@ -20,7 +26,7 @@ interface DiscoveryRequest {
 
 // Use the real component/store/context stack; only the RPC boundary is controlled.
 // Deferred replies deliberately ignore abort to prove the UI also fences late results.
-async function setup(provider = "anthropic") {
+async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | null = null) {
   const config: ProvidersConfigMap = Object.fromEntries(
     ["anthropic", "openai", "coder"].map((id) => [
       id,
@@ -34,6 +40,25 @@ async function setup(provider = "anthropic") {
     ])
   );
   const client = setupSettingsStory({});
+  let policy = initialPolicy;
+  const policyEvents = createAsyncEventQueue<void>();
+  client.policy.get = () =>
+    Promise.resolve({
+      source: policy ? "governor" : "none",
+      status: { state: policy ? "enforced" : "disabled" },
+      policy,
+    });
+  client.policy.onChanged = (_input, options) => {
+    if (!options?.signal) throw new Error("Policy subscription requires cancellation");
+    options.signal.addEventListener("abort", policyEvents.end, { once: true });
+    return Promise.resolve(wrapAsyncIterator(policyEvents.iterate(), {}));
+  };
+  const replacePolicy = (next: EffectivePolicy) =>
+    act(() => {
+      policy = next;
+      policyEvents.push();
+      return Promise.resolve();
+    });
   client.providers.getConfig = () => Promise.resolve(structuredClone(config));
   const requests: DiscoveryRequest[] = [];
   client.providers.discoverModels = (input, options) => {
@@ -69,7 +94,7 @@ async function setup(provider = "anthropic") {
   const key = (key: string, isComposing = false) => fireEvent.keyDown(input, { key, isComposing });
   const reply = (index: number, result: ProviderModelDiscoveryResult) =>
     act(() => Promise.resolve(requests[index].resolve(result)));
-  return { view, input, add, requests, save, open, type, key, reply, user };
+  return { view, input, add, requests, save, open, type, key, reply, user, replacePolicy };
 }
 
 describe("ModelsSection asynchronous discovery", () => {
@@ -201,6 +226,75 @@ describe("ModelsSection asynchronous discovery", () => {
       expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model"] });
     }
   );
+
+  const initialPolicy: EffectivePolicy = {
+    policyFormatVersion: "0.1",
+    providerAccess: [{ id: "anthropic", allowedModels: null }],
+    mcp: { allowUserDefined: { stdio: true, remote: true } },
+    runtimes: null,
+  };
+
+  test.each(["allowedModels", "forcedBaseUrl"])(
+    "policy-only %s change invalidates a completed catalog and its highlight",
+    async (change) => {
+      const ui = await setup("anthropic", initialPolicy);
+      ui.open();
+      await ui.type("model");
+      await ui.reply(0, { status: "ok", modelIds: ["model-a"] });
+      ui.key("ArrowDown");
+      expect(ui.input.getAttribute("aria-activedescendant")).not.toBeNull();
+      const config = getProvidersConfigStore().getConfig();
+      await ui.replacePolicy({
+        ...initialPolicy,
+        providerAccess: [
+          change === "allowedModels"
+            ? { id: "anthropic", allowedModels: ["model", "model-b"] }
+            : { id: "anthropic", forcedBaseUrl: "https://new-endpoint.invalid" },
+        ],
+      });
+      // Real policy events must invalidate results without a provider refresh or remount.
+      expect(getProvidersConfigStore().getConfig()).toBe(config);
+      expect(ui.view.getByRole("combobox", { name: "Model ID" })).toBe(ui.input);
+      expect(ui.view.queryAllByRole("listbox")).toHaveLength(0);
+      expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
+      expect(ui.requests[0].signal.aborted).toBe(true);
+      expect(ui.requests.map((request) => request.provider)).toEqual(["anthropic", "anthropic"]);
+      expect(ui.input.value).toBe("model");
+      ui.key("Enter", true);
+      expect(ui.save).not.toHaveBeenCalled();
+      await ui.reply(1, {
+        status: "ok",
+        modelIds: change === "allowedModels" ? ["model-b"] : ["model-a", "model-b"],
+      });
+      expect(ui.view.getByRole("option", { name: "model-b" })).toBeTruthy();
+      // A repeated ID from a new endpoint must not restore the old keyboard choice.
+      expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
+      ui.key("Enter");
+      expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model"] });
+    }
+  );
+
+  test("policy-only changes cancel pending discovery and fence late old-policy replies", async () => {
+    const ui = await setup("anthropic", initialPolicy);
+    ui.open();
+    await ui.type("model");
+    const config = getProvidersConfigStore().getConfig();
+    await ui.replacePolicy({
+      ...initialPolicy,
+      providerAccess: [{ id: "anthropic", allowedModels: ["model-b"] }],
+    });
+    expect(getProvidersConfigStore().getConfig()).toBe(config);
+    expect(ui.requests[0].signal.aborted).toBe(true);
+    expect(ui.requests).toHaveLength(2);
+    await ui.reply(0, { status: "ok", modelIds: ["model-a"] });
+    expect(ui.view.queryAllByRole("listbox")).toHaveLength(0);
+    await ui.reply(1, { status: "ok", modelIds: ["model-b"] });
+    fireEvent.click(ui.view.getByRole("option", { name: "model-b" }));
+    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model-b"] });
+    // A policy event while the field is closed must not start background discovery.
+    await ui.replacePolicy(initialPolicy);
+    expect(ui.requests).toHaveLength(2);
+  });
 
   const unavailableResults: ProviderModelDiscoveryResult[] = [
     { status: "ok", modelIds: [] },
