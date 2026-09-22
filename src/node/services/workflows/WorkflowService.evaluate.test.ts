@@ -5,6 +5,11 @@
  * step with its persisted admission instead of refusing the failed run.
  */
 import { describe, expect, test } from "bun:test";
+import {
+  getWorkflowCheckpointRetryEligibility,
+  WORKFLOW_EVALUATION_ATTEMPTS_EXHAUSTED_RETRY_REASON,
+} from "@/common/utils/workflowRetryEligibility";
+import { EVALUATION_MAX_ATTEMPTS } from "@/constants/evaluation";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
 import type { EvaluationCallResult } from "@/node/services/evaluation/evaluationService";
 import type { PinnedEvaluationModel } from "@/node/services/providerModelFactory";
@@ -140,6 +145,53 @@ describe("WorkflowService checkpoint retry of failed evaluate() steps", () => {
     expect(run.steps[0]).toMatchObject({
       status: "completed",
       evaluation: { attempt: 2, selection: { modelString: "openai:gpt-5" } },
+    });
+  });
+
+  test("a run whose evaluation budget is exhausted is no longer offered a checkpoint retry", async () => {
+    using tmp = new DisposableTempDir("workflow-service-evaluate-exhausted");
+    const evaluation = createFakeEvaluation(
+      Array.from({ length: EVALUATION_MAX_ATTEMPTS }, () => PROVIDER_FAILURE)
+    );
+    const { service, runStore } = createService(tmp.path, evaluation.adapter, "wfr_eval_spent");
+    const retry = () =>
+      service.retryRunFromCheckpoint({
+        workspaceId: "workspace-1",
+        runId: "wfr_eval_spent",
+        projectTrusted: true,
+      });
+
+    await expect(
+      service.startWorkflow({
+        script: script(EVALUATE_SOURCE),
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      })
+    ).rejects.toThrow(/provider-failure/);
+    // Attempts 2..MAX are billable retries that fail the same way.
+    for (let attempt = 2; attempt <= EVALUATION_MAX_ATTEMPTS; attempt += 1) {
+      await expect(retry()).rejects.toThrow(/provider-failure/);
+      expect((await runStore.getRun("wfr_eval_spent")).steps[0]).toMatchObject({
+        status: "failed",
+        evaluation: { attempt },
+      });
+    }
+    expect(evaluation.dispatchCount()).toBe(EVALUATION_MAX_ATTEMPTS);
+
+    // The admission now sits at the cap: the shared predicate (UI, task_await,
+    // workflow_resume and this service) refuses instead of advertising a retry
+    // that could only record attempts-exhausted again.
+    const spent = await runStore.getRun("wfr_eval_spent");
+    expect(getWorkflowCheckpointRetryEligibility(spent)).toEqual({
+      canRetry: false,
+      reason: WORKFLOW_EVALUATION_ATTEMPTS_EXHAUSTED_RETRY_REASON,
+    });
+    await expect(retry()).rejects.toThrow(WORKFLOW_EVALUATION_ATTEMPTS_EXHAUSTED_RETRY_REASON);
+    expect(evaluation.dispatchCount()).toBe(EVALUATION_MAX_ATTEMPTS);
+    expect((await runStore.getRun("wfr_eval_spent")).steps[0]).toMatchObject({
+      status: "failed",
+      evaluation: { attempt: EVALUATION_MAX_ATTEMPTS },
     });
   });
 

@@ -5,6 +5,7 @@ import type {
   EvaluationQuestions,
   EvaluationStepResult,
 } from "@/common/types/evaluation";
+import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 import {
   EVALUATION_DEFAULT_TIMEOUT_MS,
   EVALUATION_MAX_ATTEMPTS,
@@ -895,7 +896,7 @@ describe("WorkflowRunner evaluate()", () => {
     expect((await readStep(store))?.evaluation?.selection.configFingerprint).toBe("fp-1");
   });
 
-  test("unauthorized on resume fails the persisted attempt", async () => {
+  test("unauthorized on resume is written onto the persisted record so the run stays retryable", async () => {
     using tmp = new DisposableTempDir("workflow-eval");
     const store = await createStore(tmp.path);
     const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
@@ -906,14 +907,42 @@ describe("WorkflowRunner evaluate()", () => {
       evaluation: admissionFor({ attempt: 1 }),
     });
     await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    let keyRevoked = true;
     const fake = createFakeAdapter({
-      selection: () => ({ ok: false, reason: "unauthorized", code: "unauthorized" }),
+      selection: () =>
+        keyRevoked ? { ok: false, reason: "unauthorized", code: "unauthorized" } : undefined,
     });
 
     await expect(
       createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
     ).rejects.toThrow(/unauthorized\/unauthorized .* attempt 2\)/);
     expect(fake.dispatchCalls).toHaveLength(0);
+
+    // The `started` record is not left dangling: the failure lands on it with
+    // the admission untouched (no billable attempt was admitted), which is what
+    // makes the run's error traceable to this step for checkpoint retry.
+    let run = await store.getRun(RUN_ID);
+    expect(run.status).toBe("failed");
+    expect(await readStep(store)).toMatchObject({
+      status: "failed",
+      error: expect.stringMatching(/unauthorized\/unauthorized .* attempt 2\)/) as unknown,
+      evaluation: { attempt: 1 },
+    });
+    expect(canRetryWorkflowFromCheckpoint(run)).toBe(true);
+
+    keyRevoked = false;
+    const result = await createRunner(store, fake.adapter).run(RUN_ID, {
+      allowRetryFromFailedCheckpoint: true,
+    });
+
+    expect(result.structuredOutput).toMatchObject(EXPECTED_RESULT_SHAPE);
+    run = await store.getRun(RUN_ID);
+    expect(run.status).toBe("completed");
+    expect(await readStep(store)).toMatchObject({
+      status: "completed",
+      evaluation: { attempt: 2, selection: { modelString: SENTINEL_MODEL } },
+    });
+    expect(fake.dispatchCalls).toHaveLength(1);
   });
 
   test("pre-admission failures write no step record and a later retry starts at attempt 1", async () => {

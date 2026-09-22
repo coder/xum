@@ -235,8 +235,9 @@ export async function runWorkflowEvaluationStep(
   const attemptDeadlineAt = enteredAt + timeoutMs;
   const startedAt = existing?.startedAt ?? clock.nowIso();
 
-  // 4. Selection (pre-admission: failures here write no step record, except
-  //    the two that concern an already admitted record).
+  // 4. Selection (pre-admission: on a first attempt failures here write no
+  //    step record; once a record is admitted, every failure is written onto
+  //    it so the run stays recoverable — see below).
   if (attempt > EVALUATION_MAX_ATTEMPTS) {
     assert(persisted !== undefined, "attempt > 1 requires a persisted admission");
     const error = new WorkflowEvaluationStepError(
@@ -256,9 +257,19 @@ export async function runWorkflowEvaluationStep(
       stepDigest,
       attempt
     );
-    if (selection.reason === "admission-mismatch") {
-      assert(persisted !== undefined, "admission-mismatch requires a persisted admission");
+    if (persisted !== undefined) {
+      // A resumed or retried step already owns a record. Writing this failure
+      // onto it (keeping the persisted admission — no billable attempt was
+      // admitted, so the budget is untouched) is what lets a later checkpoint
+      // retry match the run's error to a failed evaluation step; otherwise a
+      // revoked key would strand the run at a `started` or stale record with
+      // neither resume nor retry available after the credentials return.
       await recordFailure(context, { spec, inputHash, startedAt, admission: persisted, error });
+    } else {
+      assert(
+        selection.reason !== "admission-mismatch",
+        "admission-mismatch requires a persisted admission"
+      );
     }
     throw error;
   }
@@ -266,7 +277,12 @@ export async function runWorkflowEvaluationStep(
     throw interrupted();
   }
   if (clock.nowMs() >= attemptDeadlineAt) {
-    throw new WorkflowEvaluationStepError("deadline", "deadline", stepDigest, attempt);
+    const error = new WorkflowEvaluationStepError("deadline", "deadline", stepDigest, attempt);
+    if (persisted !== undefined) {
+      // Same recoverability rule as a failed selection above.
+      await recordFailure(context, { spec, inputHash, startedAt, admission: persisted, error });
+    }
+    throw error;
   }
   leaseGuard.throwIfLost();
 

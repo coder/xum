@@ -1,7 +1,11 @@
+import type { EvaluationAdmission } from "@/common/types/evaluation";
 import { WORKFLOW_EVALUATION_STEP_ERROR_NAME } from "@/common/types/evaluation";
 import type { WorkflowRunEvent, WorkflowRunRecord } from "@/common/types/workflow";
+import { EVALUATION_MAX_ATTEMPTS } from "@/constants/evaluation";
 
 export const WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE = "Execution interrupted";
+export const WORKFLOW_EVALUATION_ATTEMPTS_EXHAUSTED_RETRY_REASON =
+  "Workflow run cannot be retried from checkpoint: the failed evaluation step has no attempts left";
 
 export interface WorkflowCheckpointRetryEligibility {
   canRetry: boolean;
@@ -20,11 +24,18 @@ export function getWorkflowCheckpointRetryEligibility(
     return { canRetry: false, reason: `Workflow run is not failed: ${run.id}` };
   }
   const latestError = run.events.findLast((event) => event.type === "error");
+  const failedEvaluation = findFailedEvaluationAdmission(run, latestError?.message);
   if (
     latestError?.message !== WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE &&
-    !failedBecauseOfEvaluationStep(run, latestError?.message)
+    failedEvaluation === undefined
   ) {
     return { canRetry: false, reason: "Workflow run cannot be retried from checkpoint" };
+  }
+  // The admission's attempt is the last billable attempt admitted; once it
+  // reaches the cap the runner would only record `attempts-exhausted` (which
+  // keeps that admission), so offering another retry would loop forever.
+  if (failedEvaluation !== undefined && failedEvaluation.attempt >= EVALUATION_MAX_ATTEMPTS) {
+    return { canRetry: false, reason: WORKFLOW_EVALUATION_ATTEMPTS_EXHAUSTED_RETRY_REASON };
   }
   const unsafePatchReason = getUnsafePatchRetryReason(run);
   if (unsafePatchReason != null) {
@@ -46,21 +57,25 @@ export function canRetryWorkflowFromCheckpoint(run: WorkflowRunRecord | null | u
  * the error name when the sandbox rethrew it. Only those two exact forms
  * count: an author-thrown error that merely embeds the message does not.
  */
-function failedBecauseOfEvaluationStep(
+function findFailedEvaluationAdmission(
   run: WorkflowRunRecord,
   latestErrorMessage: string | undefined
-): boolean {
+): EvaluationAdmission | undefined {
   if (latestErrorMessage === undefined) {
-    return false;
+    return undefined;
   }
-  return run.steps.some(
-    (step) =>
+  for (const step of run.steps) {
+    if (
       step.status === "failed" &&
       step.evaluation != null &&
       step.error !== undefined &&
       (latestErrorMessage === step.error ||
         latestErrorMessage === `${WORKFLOW_EVALUATION_STEP_ERROR_NAME}: ${step.error}`)
-  );
+    ) {
+      return step.evaluation;
+    }
+  }
+  return undefined;
 }
 
 function getUnsafePatchRetryReason(run: WorkflowRunRecord): string | null {
