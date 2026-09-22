@@ -1,0 +1,614 @@
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fsPromises from "fs/promises";
+import { execSync } from "node:child_process";
+import * as path from "path";
+
+import { Config, SecretsStore } from "@/node/config";
+import { Ok } from "@/common/types/result";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { InitStateManager } from "@/node/services/initStateManager";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import { TaskService } from "@/node/services/taskService";
+import {
+  createAIServiceMocks,
+  createTestProject,
+  findWorkspaceInConfig,
+  saveWorkspaces,
+  stubStableIds,
+  testTaskSettings,
+} from "@/node/services/taskService.testHarness";
+import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceService } from "@/node/services/workspaceService";
+import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+
+/**
+ * Direct (unqueued) task creation must sanitize a fresh host-local checkout BEFORE the
+ * task record is published: a record published first is discoverable and admittable by
+ * every ordinary reader (older builds included) while its tracked `plugin:` enables are
+ * still in place, and a failed sanitization then leaves that record — with its unsanitized
+ * checkout — behind as a rescuable interrupted task.
+ *
+ * Real stack: Config + HistoryService + WorkspaceService + WorkspaceMcpOverridesService +
+ * TaskService over a real git repository and real worktree forks; only the model send and
+ * the background init hook are stubbed (no provider, no init process).
+ */
+const rootId = "directroot1";
+/** Canonical `plugin:<16-hex>:<server>` key: the only shape registration sanitization prunes. */
+const STALE_PLUGIN_KEY = "plugin:0123456789abcdef:evil";
+const OVERRIDES_RELATIVE_PATH = path.join(".xum", "mcp.local.jsonc");
+
+function git(cwd: string, args: string): void {
+  execSync(`git ${args}`, { cwd, stdio: "ignore" });
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, what: string) {
+  const deadline = Date.now() + 10_000;
+  while (!(await predicate())) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+    await settle();
+  }
+}
+
+describe("TaskService direct create: pre-publication sanitization of the forked checkout", () => {
+  let history: Awaited<ReturnType<typeof createTestHistoryService>>;
+  let rootDir: string;
+  const restores: Array<() => void> = [];
+
+  beforeEach(async () => {
+    history = await createTestHistoryService();
+    rootDir = history.tempDir;
+    await fsPromises.mkdir(history.config.srcDir, { recursive: true });
+    // Never run a real init hook: the fork target is a plain worktree.
+    const initSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    restores.push(() => initSpy.mockRestore());
+  });
+  afterEach(async () => {
+    for (const restore of restores.splice(0)) restore();
+    await history.cleanup();
+  });
+
+  /**
+   * A repository whose main branch TRACKS a workspace override enabling a plugin server:
+   * every fresh worktree materializes the stale enable (project plugin instance IDs are
+   * stable across a project's worktrees, so a committed enable activates in each fork).
+   */
+  async function createRepoWithTrackedEnable(
+    document = JSON.stringify({ enabledServers: [STALE_PLUGIN_KEY] })
+  ) {
+    const projectPath = await createTestProject(rootDir, "repo");
+    await fsPromises.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fsPromises.writeFile(path.join(projectPath, OVERRIDES_RELATIVE_PATH), document, "utf-8");
+    git(projectPath, "add .xum/mcp.local.jsonc");
+    git(projectPath, 'commit -m "track a workspace override"');
+    return projectPath;
+  }
+
+  async function createRealStack(projectPath: string) {
+    const { config, historyService } = history;
+    const runtimeConfig: RuntimeConfig = { type: "worktree", srcBaseDir: config.srcDir };
+    const parentRuntime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    const created = await parentRuntime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: {
+        logStep: () => undefined,
+        logStdout: () => undefined,
+        logStderr: () => undefined,
+        logComplete: () => undefined,
+        enterHookPhase: () => undefined,
+      },
+    });
+    if (!created.success) throw new Error(`parent worktree: ${created.error ?? "unknown"}`);
+    const parentPath = parentRuntime.getWorkspacePath(projectPath, parentName);
+    // The parent is registered below the way WorkspaceService.create leaves a checkout:
+    // registration-time sanitization already pruned ITS copy of the tracked enable (the
+    // committed file still carries it, so every fork of the parent's branch materializes it).
+    // Without this, a child's override read would inherit the key from the parent — the
+    // parent's own consent context, not the child's stale copy under test.
+    await fsPromises.writeFile(
+      path.join(parentPath, OVERRIDES_RELATIVE_PATH),
+      JSON.stringify({ enabledServers: [] }),
+      "utf-8"
+    );
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: parentPath,
+          id: rootId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const initStateManager = new InitStateManager(config);
+    const workspaceService = new WorkspaceService(
+      config,
+      historyService,
+      aiService,
+      new ContextManagementService({ config, historyService, aiService }),
+      initStateManager,
+      new ExtensionMetadataService(path.join(config.rootDir, "extension-metadata.json")),
+      new BackgroundProcessManager(path.join(config.rootDir, "bg"))
+    );
+    const overridesService = new WorkspaceMcpOverridesService(config);
+    workspaceService.setWorkspaceMcpOverridesService(overridesService);
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const taskService = new TaskService(
+      config,
+      historyService,
+      aiService,
+      workspaceService,
+      initStateManager,
+      undefined,
+      undefined,
+      new SecretsStore(config.rootDir),
+      terminalAttentionStore
+    );
+    taskService.setWorkspaceTurnManager(
+      new WorkspaceTurnManager(
+        config,
+        historyService,
+        aiService,
+        workspaceService,
+        initStateManager,
+        taskService,
+        terminalAttentionStore,
+        aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
+      )
+    );
+    workspaceService.setAgentTaskIntegration(taskService);
+    // The hosted send is the one seam stubbed here: no provider is available. The real
+    // WorkspaceService disposes the launch's admission token at its seams; the stub does the
+    // same so the launch's obligation is discharged and no stop latch is retained.
+    const sends: string[] = [];
+    const sendMessage = spyOn(workspaceService, "sendMessage").mockImplementation(((
+      ...args: Parameters<WorkspaceHost["sendMessage"]>
+    ) => {
+      sends.push(args[0]);
+      args[3]?.turnAdmission?.onDisposed("no-work");
+      return Promise.resolve(Ok(undefined));
+    }) as WorkspaceService["sendMessage"]);
+    restores.push(() => sendMessage.mockRestore());
+    return { config, taskService, workspaceService, overridesService, parentPath, sends };
+  }
+
+  const createArgs = (title: string) => ({
+    parentWorkspaceId: rootId,
+    kind: "agent" as const,
+    agentId: "explore",
+    prompt: "go",
+    title,
+  });
+
+  test("while the checkout's sanitization is held, no ordinary reader can discover or admit the task, and the record published afterwards reads sanitized content", async () => {
+    const taskId = "directbarrier1";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, workspaceService, overridesService } =
+      await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+
+    // Hold the global override write lock: the real sanitizer's prune queues behind it.
+    const releaseHeld = await overridesService.acquireExclusiveLock();
+    const exclusive = overridesService as unknown as {
+      runExclusive: <T>(fn: () => Promise<T>, options?: unknown) => Promise<T>;
+    };
+    const realRunExclusive = exclusive.runExclusive.bind(overridesService);
+    let sanitizerQueued = false;
+    const runExclusiveSpy = spyOn(exclusive, "runExclusive").mockImplementation(
+      <T>(fn: () => Promise<T>, options?: unknown) => {
+        sanitizerQueued = true;
+        return realRunExclusive(fn, options);
+      }
+    );
+    restores.push(() => runExclusiveSpy.mockRestore());
+
+    const creation = taskService.create(createArgs("Barrier"));
+    try {
+      await waitUntil(() => sanitizerQueued, "the sanitizer to queue behind the held lock");
+      // The fork exists (the sanitizer targets it) ...
+      const forkedPaths = (await fsPromises.readdir(path.join(config.srcDir, "repo"))).filter(
+        (name) => name.startsWith("agent_explore_")
+      );
+      expect(forkedPaths).toHaveLength(1);
+      const forkedPath = path.join(config.srcDir, "repo", forkedPaths[0]);
+      expect(
+        JSON.parse(
+          await fsPromises.readFile(path.join(forkedPath, OVERRIDES_RELATIVE_PATH), "utf-8")
+        )
+      ).toEqual({ enabledServers: [STALE_PLUGIN_KEY] });
+      // ... but no reader can see or admit the task while its checkout is unsanitized.
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+      expect((await config.getAllWorkspaceMetadata()).some((m) => m.id === taskId)).toBe(false);
+      expect(await workspaceService.getInfo(taskId)).toBeNull();
+      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        kind: "not-a-task",
+      });
+    } finally {
+      await releaseHeld();
+    }
+    const created = await creation;
+    expect(created).toMatchObject({ success: true, data: { taskId, status: "running" } });
+    const entry = findWorkspaceInConfig(config, taskId);
+    expect(entry).toMatchObject({ taskStatus: "running" });
+    // Published only after the prune: the record's checkout reads sanitized.
+    expect(
+      JSON.parse(
+        await fsPromises.readFile(path.join(entry!.path, OVERRIDES_RELATIVE_PATH), "utf-8")
+      )
+    ).toEqual({ enabledServers: [] });
+    const read = await overridesService.getOverridesForWorkspace(taskId, { timeoutMs: 5_000 });
+    expect(read.authoritative).toBe(true);
+    expect(read.overrides.enabledServers ?? []).not.toContain(STALE_PLUGIN_KEY);
+  }, 30_000);
+
+  /** The fork target of a task: `agent_<type>_<id>` under the project's worktree directory. */
+  const forkPathFor = (srcDir: string, taskId: string) =>
+    path.join(srcDir, "repo", `agent_explore_${taskId}`);
+
+  const pathExists = (candidate: string) =>
+    fsPromises
+      .access(candidate)
+      .then(() => true)
+      .catch(() => false);
+
+  test("a refused sanitization publishes no task record: the fresh worktree is retained, unregistered and named in the error; a later creation neither reuses nor removes it", async () => {
+    const failedId = "directrefuse1";
+    const retryId = "directrefuse2";
+    // Duplicate `enabledServers` properties: the strict pruner refuses to edit the document
+    // (last-wins parse vs first-wins edit could leave the key in place) and throws.
+    const projectPath = await createRepoWithTrackedEnable(
+      `{"enabledServers": ["${STALE_PLUGIN_KEY}"], "enabledServers": []}`
+    );
+    const { config, taskService, workspaceService, sends } = await createRealStack(projectPath);
+    stubStableIds(config, [failedId, retryId]);
+    const rollback = spyOn(
+      taskService as unknown as { rollbackFailedTaskCreate: () => Promise<void> },
+      "rollbackFailedTaskCreate"
+    );
+    restores.push(() => rollback.mockRestore());
+
+    const failedPath = forkPathFor(config.srcDir, failedId);
+    const refused = await taskService.create(createArgs("Refused"));
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("could not be sanitized");
+    expect(refused.error).toContain(`created at ${failedPath} but not registered`);
+    // Nothing published, nothing sent, nothing deleted.
+    expect(findWorkspaceInConfig(config, failedId)).toBeUndefined();
+    expect(await workspaceService.getInfo(failedId)).toBeNull();
+    expect(taskService.admitTaskWorkspaceTurn(failedId, { acceptanceOrigin: "manual" })).toEqual({
+      kind: "not-a-task",
+    });
+    expect(sends).toEqual([]);
+    expect(rollback).not.toHaveBeenCalled();
+    expect(await pathExists(path.join(failedPath, OVERRIDES_RELATIVE_PATH))).toBe(true);
+    // The unsanitized document is left verbatim for inspection.
+    expect(await fsPromises.readFile(path.join(failedPath, OVERRIDES_RELATIVE_PATH), "utf-8")).toBe(
+      `{"enabledServers": ["${STALE_PLUGIN_KEY}"], "enabledServers": []}`
+    );
+    // Creation released its lock: the next creation proceeds and owns a DIFFERENT checkout.
+    // Forks materialize the parent's committed state: repair the document on the parent's branch.
+    const parentPath = path.join(config.srcDir, "repo", "parent");
+    await fsPromises.writeFile(
+      path.join(parentPath, OVERRIDES_RELATIVE_PATH),
+      JSON.stringify({ enabledServers: [STALE_PLUGIN_KEY] }),
+      "utf-8"
+    );
+    git(parentPath, 'commit -am "repair the tracked override"');
+    const retried = await taskService.create(createArgs("Retry"));
+    expect(retried).toMatchObject({ success: true, data: { taskId: retryId } });
+    const retriedEntry = findWorkspaceInConfig(config, retryId);
+    expect(retriedEntry?.path).toBe(forkPathFor(config.srcDir, retryId));
+    expect(retriedEntry?.path).not.toBe(failedPath);
+    expect(await pathExists(path.join(failedPath, OVERRIDES_RELATIVE_PATH))).toBe(true);
+    expect(sends).toEqual([retryId]);
+  }, 30_000);
+
+  test("isolation: none shares the parent's checkout without any sanitization: the parent's consent survives and no lock is taken", async () => {
+    const taskId = "directshared1";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, workspaceService, overridesService, parentPath } =
+      await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    // Consent the parent saved for itself after its own registration.
+    const consented = { enabledServers: ["plugin:fedcba9876543210:consented"] };
+    await fsPromises.writeFile(
+      path.join(parentPath, OVERRIDES_RELATIVE_PATH),
+      JSON.stringify(consented),
+      "utf-8"
+    );
+    const register = spyOn(workspaceService, "registerSanitizedTaskCheckout");
+    const prune = spyOn(overridesService, "prunePluginOverrideKeysForUnregisteredCheckout");
+    restores.push(
+      () => register.mockRestore(),
+      () => prune.mockRestore()
+    );
+
+    const created = await taskService.create({ ...createArgs("Shared"), isolation: "none" });
+    expect(created).toMatchObject({ success: true, data: { taskId } });
+    expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+      path: parentPath,
+      taskIsolation: "none",
+      taskStatus: "running",
+    });
+    expect(register).not.toHaveBeenCalled();
+    expect(prune).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(await fsPromises.readFile(path.join(parentPath, OVERRIDES_RELATIVE_PATH), "utf-8"))
+    ).toEqual(consented);
+  }, 30_000);
+
+  test("a project-dir (local runtime) parent shares its directory with the task: the live sibling is found and its consent is preserved", async () => {
+    const taskId = "directlocal01";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, overridesService } = await createRealStack(projectPath);
+    // Re-register the parent as a project-dir workspace ON the project directory itself; a
+    // local-runtime fork resolves to that same directory (shared by design).
+    const consented = { enabledServers: ["plugin:fedcba9876543210:consented"] };
+    await fsPromises.writeFile(
+      path.join(projectPath, OVERRIDES_RELATIVE_PATH),
+      JSON.stringify(consented),
+      "utf-8"
+    );
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: rootId,
+          name: "repo",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+        },
+      ],
+      testTaskSettings()
+    );
+    stubStableIds(config, [taskId]);
+    const prune = spyOn(overridesService, "prunePluginOverrideKeysForUnregisteredCheckout");
+    restores.push(() => prune.mockRestore());
+
+    const created = await taskService.create(createArgs("Local"));
+    expect(created).toMatchObject({ success: true, data: { taskId } });
+    expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+      path: projectPath,
+      taskStatus: "running",
+    });
+    // Sibling found under the registration lock: no prune ran, the file is untouched.
+    expect(prune).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(
+        await fsPromises.readFile(path.join(projectPath, OVERRIDES_RELATIVE_PATH), "utf-8")
+      )
+    ).toEqual(consented);
+  }, 30_000);
+
+  test.each(["before-the-scan", "after-the-prune"] as const)(
+    "an older-style in-place registration of the same physical checkout through a symlinked spelling (%s) keeps its consent: the alias is recognized, and consent saved after the prune is never pruned again",
+    async (when) => {
+      const taskId = when === "before-the-scan" ? "directalias01" : "directalias02";
+      const aliasId = "cli-alias-registration";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, overridesService } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      // A second spelling of the worktree directory tree: `<root>/src-alias` -> `<root>/src`.
+      const srcAlias = path.join(rootDir, "src-alias");
+      await fsPromises.symlink(config.srcDir, srcAlias);
+      const aliasPath = path.join(srcAlias, "repo", `agent_explore_${taskId}`);
+      const forkPath = forkPathFor(config.srcDir, taskId);
+      const consented = "plugin:fedcba9876543210:consented";
+      // Another process (its own Config + overrides service on the same root) registers the
+      // checkout in place through the alias spelling — the shape `xum run` leaves behind — and
+      // then saves plugin consent for it through the ordinary save path. A save replaces the
+      // document's enable list: registered before the scan, the alias re-consents to the tracked
+      // key as well, so its survival proves the creation SKIPPED the prune (live sibling); saved
+      // after the prune, the consent alone must survive publication.
+      const aliasEnables = when === "before-the-scan" ? [STALE_PLUGIN_KEY, consented] : [consented];
+      const otherConfig = new Config(config.rootDir);
+      const otherOverrides = new WorkspaceMcpOverridesService(otherConfig);
+      const registerAliasAndConsent = async () => {
+        await otherConfig.editConfig((cfg) => {
+          cfg.projects.set(aliasPath, {
+            workspaces: [
+              {
+                path: aliasPath,
+                id: aliasId,
+                name: aliasPath,
+                createdAt: new Date().toISOString(),
+                runtimeConfig: { type: "local" },
+              },
+            ],
+          });
+          return cfg;
+        });
+        await otherOverrides.setOverridesForWorkspace(aliasId, { enabledServers: aliasEnables });
+      };
+      const pruneCalls: string[] = [];
+      if (when === "before-the-scan") {
+        const realPrune =
+          overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
+        const pruneSpy = spyOn(
+          overridesService,
+          "prunePluginOverrideKeysForUnregisteredCheckout"
+        ).mockImplementation((target, keyPrefix) => {
+          pruneCalls.push(target.workspacePath);
+          return realPrune(target, keyPrefix);
+        });
+        restores.push(() => pruneSpy.mockRestore());
+        // Injected the moment the fork exists, before the creation's sibling scan runs.
+        const realFork = forkOrchestrator.orchestrateFork;
+        const forkSpy = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(
+          async (params) => {
+            const result = await realFork(params);
+            await registerAliasAndConsent();
+            return result;
+          }
+        );
+        restores.push(() => forkSpy.mockRestore());
+      } else {
+        // Injected after the creation's prune, while it still holds the registration lock and
+        // before it publishes: the consent must survive publication.
+        const realPrune =
+          overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
+        const pruneSpy = spyOn(
+          overridesService,
+          "prunePluginOverrideKeysForUnregisteredCheckout"
+        ).mockImplementation(async (target, keyPrefix) => {
+          await realPrune(target, keyPrefix);
+          await registerAliasAndConsent();
+        });
+        restores.push(() => pruneSpy.mockRestore());
+      }
+
+      const created = await taskService.create(createArgs("Alias"));
+      expect(created).toMatchObject({ success: true, data: { taskId } });
+      expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+        path: forkPath,
+        taskStatus: "running",
+      });
+      const document = JSON.parse(
+        await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")
+      ) as { enabledServers?: string[] };
+      // The alias registration's consent is intact either way: a live sibling at scan time
+      // means no prune at all; a sibling arriving after the prune is never pruned again.
+      expect(document.enabledServers).toEqual(aliasEnables);
+      if (when === "before-the-scan") expect(pruneCalls).toEqual([]);
+      // Both registrations read the same document.
+      const viaAlias = await otherOverrides.getOverridesForWorkspace(aliasId, { timeoutMs: 5_000 });
+      expect(viaAlias.overrides.enabledServers).toEqual(document.enabledServers);
+      // The alias row was never touched by the task's publication.
+      expect(findWorkspaceInConfig(config, aliasId)).toMatchObject({ path: aliasPath });
+    },
+    30_000
+  );
+
+  test("later legitimate consent survives Stop and manual resume: nothing re-sanitizes a published task", async () => {
+    const taskId = "directresume1";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, overridesService } = await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    const created = await taskService.create(createArgs("Resume"));
+    expect(created).toMatchObject({ success: true, data: { taskId } });
+    const consented = "plugin:fedcba9876543210:consented";
+    await overridesService.setOverridesForWorkspace(taskId, { enabledServers: [consented] });
+
+    expect(await taskService.terminateAllDescendantAgentTasks(rootId)).toEqual([taskId]);
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
+    await waitUntil(
+      () => taskService.markInterruptedTaskRunning(taskId),
+      "the manual rescue to be admitted"
+    );
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("running");
+    const read = await overridesService.getOverridesForWorkspace(taskId, { timeoutMs: 5_000 });
+    expect(read.authoritative).toBe(true);
+    expect(read.overrides.enabledServers).toEqual([consented]);
+  }, 30_000);
+
+  test.each(["write-fails", "commits-then-throws", "commits-then-superseded"] as const)(
+    "a config write that %s never deletes the checkout or a record of unknown ownership; only a row proven to be this launch's is marked interrupted",
+    async (failure) => {
+      const taskId = {
+        "write-fails": "directcfg0001",
+        "commits-then-throws": "directcfg0002",
+        "commits-then-superseded": "directcfg0003",
+      }[failure];
+      const foreignAttempt = "att_00000000000000c7";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, sends } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      const forkPath = forkPathFor(config.srcDir, taskId);
+      const rollback = spyOn(
+        taskService as unknown as { rollbackFailedTaskCreate: () => Promise<void> },
+        "rollbackFailedTaskCreate"
+      );
+      restores.push(() => rollback.mockRestore());
+      const realEdit = config.editConfig.bind(config);
+      let sabotaged = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (mutator, options) => {
+        // Only the task's own publication (the write that adds its row) is sabotaged, and only
+        // after its mutator ran: a write that fails before the transform (a lock timeout) is
+        // provably unwritten and keeps the ordinary rollback.
+        let addsTask = false;
+        await realEdit((cfg) => {
+          const next = mutator(cfg);
+          addsTask = [...next.projects.values()].some((p) =>
+            p.workspaces.some((w) => w.id === taskId)
+          );
+          if (addsTask && failure === "write-fails") {
+            // The save never happens.
+            throw new Error("disk full");
+          }
+          return next;
+        }, options);
+        if (!addsTask || sabotaged) return;
+        sabotaged = true;
+        if (failure === "commits-then-superseded") {
+          // Another backend re-admits the just-committed row under its own attempt.
+          await realEdit((cfg) => {
+            for (const project of cfg.projects.values()) {
+              const ws = project.workspaces.find((w) => w.id === taskId);
+              if (ws) ws.taskAttemptId = foreignAttempt;
+            }
+            return cfg;
+          });
+        }
+        throw new Error("post-commit failure");
+      });
+      restores.push(() => editSpy.mockRestore());
+
+      const created = await taskService.create(createArgs("Config"));
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain(failure === "write-fails" ? "disk full" : "post-commit");
+      expect(sends).toEqual([]);
+      // Never a rollback (which removes the row, the checkout and the session directory) once
+      // the write was attempted: the checkout stays, sanitized, whatever the row's fate.
+      expect(rollback).not.toHaveBeenCalled();
+      expect(
+        JSON.parse(await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8"))
+      ).toEqual({ enabledServers: [] });
+      const row = findWorkspaceInConfig(config, taskId);
+      if (failure === "write-fails") {
+        expect(row).toBeUndefined();
+        expect(await workspaceService.getInfo(taskId)).toBeNull();
+      } else if (failure === "commits-then-throws") {
+        // Proven ours (attempt, path, runtime): ended as a published launch failure.
+        expect(row).toMatchObject({
+          taskStatus: "interrupted",
+          taskLaunchError: expect.stringContaining("post-commit") as unknown,
+          path: forkPath,
+        });
+      } else {
+        // The successor's row: neither marked nor removed.
+        expect(row).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: foreignAttempt,
+          path: forkPath,
+        });
+        expect(row?.taskLaunchError).toBeUndefined();
+      }
+    },
+    30_000
+  );
+});
