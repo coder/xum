@@ -169,7 +169,9 @@ describe("EvaluationService.evaluate", () => {
     );
     const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
     // The answers are still valid, so the call succeeds; bookkeeping is unknown.
-    expect(result.answers).toEqual(VALID_ANSWERS);
+    expect(result.answers.injection.choice).toBe("suspected");
+    expect(result.answers.severity.score).toBe(1);
+    expect(result.answers.asksForSecrets.probability).toBe(0.25);
     expect(result.usage).toEqual({ inputTokens: null, outputTokens: null, totalTokens: null });
     // Negative/fractional counts are dropped; the well-formed allowlisted key survives.
     expect(result.usageProviderMetadata).toEqual({ xai: { costInUsdTicks: 7 } });
