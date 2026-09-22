@@ -18,6 +18,7 @@ import type {
 } from "@/node/services/providerModelFactory";
 import {
   EVALUATION_LEDGER_FAILED_CODE,
+  EVALUATION_LEDGER_NOT_RECORDED_CODE,
   EVALUATION_LEDGER_SKIPPED_CODE,
   WorkflowEvaluationAdapter,
   type EvaluationSelectionFailure,
@@ -372,21 +373,32 @@ describe("WorkflowEvaluationAdapter.recordUsage", () => {
     });
   });
 
-  it("does not wake analytics ingestion when the ledger recorded nothing or failed", async () => {
+  it("logs a fixed not-recorded code with step context when the ledger returns no row (its swallowed failure / tombstone path) and does not wake ingestion", async () => {
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);
     const ingested: string[] = [];
-    const skipped = createHarness({
+    // The real SessionUsageService catches write errors and resolves undefined.
+    const notRecorded = createHarness({
       recordHeadlessUsage: () => Promise.resolve(undefined),
       requestAnalyticsIngest: (workspaceId) => ingested.push(workspaceId),
     });
-    await skipped.adapter.recordUsage(pinned("m"), RESULT, context);
+    await notRecorded.adapter.recordUsage(pinned("m"), RESULT, context);
+    expect(ingested).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[1]).toMatchObject({
+      code: EVALUATION_LEDGER_NOT_RECORDED_CODE,
+      workspaceId: "workspace-1",
+      runId: "wfr_123",
+      stepDigest: "abc123def456",
+      attempt: 1,
+    });
+
     const failed = createHarness({
       recordHeadlessUsage: () => Promise.reject(new Error("disk full")),
       requestAnalyticsIngest: (workspaceId) => ingested.push(workspaceId),
     });
     await failed.adapter.recordUsage(pinned("m"), RESULT, context);
     expect(ingested).toEqual([]);
-    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 
   it("passes no provider metadata when the service reported none", async () => {
@@ -395,7 +407,7 @@ describe("WorkflowEvaluationAdapter.recordUsage", () => {
     expect(h.recordCalls[0]?.[3]).toBeUndefined();
   });
 
-  it("never throws: a ledger failure is logged with the fixed code and digest fields only", async () => {
+  it("never throws on an unexpected ledger throw: logged with the fixed failed code and digest fields only", async () => {
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);
     const h = createHarness({
       recordHeadlessUsage: () => Promise.reject(new Error("disk full: SENTINEL-LEDGER-TEXT")),

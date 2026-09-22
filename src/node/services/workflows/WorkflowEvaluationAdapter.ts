@@ -93,6 +93,7 @@ export interface EvaluationUsageContext {
 }
 
 export const EVALUATION_LEDGER_FAILED_CODE = "evaluation-ledger-failed";
+export const EVALUATION_LEDGER_NOT_RECORDED_CODE = "evaluation-ledger-not-recorded";
 export const EVALUATION_LEDGER_SKIPPED_CODE = "evaluation-ledger-skipped-unknown-usage";
 
 /**
@@ -186,9 +187,13 @@ export class WorkflowEvaluationAdapter {
   /**
    * Write the headless usage row for a completed attempt. Called only after the
    * completed step record is durable, so a failure here must never turn a
-   * committed step into a failed one: it is logged with a fixed code and
-   * swallowed. There is no idempotency key — a crash between the journal
-   * commit and this write under-counts that attempt (documented contract).
+   * committed step into a failed one. `recordHeadlessUsage` swallows its own
+   * write failures (it logs the cause and resolves `undefined`, the same value
+   * it returns for a removal-tombstoned workspace), so the adapter logs a fixed
+   * code with run/step/attempt context whenever no row was recorded; the catch
+   * below is a defensive backstop for an unexpected throw. There is no
+   * idempotency key — a crash between the journal commit and this write
+   * under-counts that attempt (documented contract).
    *
    * Unknown token counts are skipped rather than recorded: the ledger has no
    * "unknown" signal and `createDisplayUsage` prices a missing count as zero,
@@ -221,9 +226,14 @@ export class WorkflowEvaluationAdapter {
         toProviderMetadataRecord(result.usageProviderMetadata),
         { analyticsSource: EVALUATION_ANALYTICS_SOURCE, metadataModel: pinned.metadataModel }
       );
-      if (recorded !== undefined) {
-        this.options.requestAnalyticsIngest?.(this.options.workspaceId);
+      if (recorded === undefined) {
+        log.warn("Workflow evaluation usage row was not recorded", {
+          code: EVALUATION_LEDGER_NOT_RECORDED_CODE,
+          ...logFields,
+        });
+        return;
       }
+      this.options.requestAnalyticsIngest?.(this.options.workspaceId);
     } catch (error) {
       // Deliberately no `error` text: it may echo provider payloads.
       log.warn("Workflow evaluation usage ledger write failed", {
