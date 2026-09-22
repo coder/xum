@@ -607,6 +607,15 @@ function findForbiddenJsonKey(value: unknown): string | undefined {
  * an oversized one, so the bounded size and depth walks run first and turn
  * such input into typed violations; keys zod would silently drop are rejected
  * before parsing for the same reason.
+ *
+ * Contract: this guarantees bounded *structural* parsing, not the exact
+ * serialized request size. Its `request-too-large` is conclusive (exceeding a
+ * lower bound proves the value is oversized), but a pass does not prove the
+ * value fits the cap: the lower bound counts UTF-16 units, so e.g.
+ * `"é".repeat(131072)` (262146 UTF-8 bytes) parses here. The exact UTF-8
+ * request limit is enforced by `canonicalRequestBytes({ state, questions })`,
+ * which the workflow runner must apply to the combined request before any
+ * provider dispatch.
  */
 export function parseEvaluationInputBounded<T>(
   schema: z.ZodType<T>,
