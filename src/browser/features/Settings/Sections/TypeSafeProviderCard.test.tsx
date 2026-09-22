@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
@@ -157,6 +157,32 @@ describe("TypeSafeProviderCard", () => {
     rerender(<TypeSafeProviderCard expanded onToggle={() => undefined} />);
     expect((getByLabelText("API Key") as HTMLInputElement).value).toBe("");
     expect(mockApi.providers.setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("a write rejected after the card collapsed still shows its error on the next expand", async () => {
+    let settle: ((result: { success: false; error: string }) => void) | null = null;
+    mockApi.providers.setProviderConfig.mockImplementation(
+      () =>
+        new Promise<{ success: false; error: string }>((resolve) => {
+          settle = resolve;
+        })
+    );
+    const { getByLabelText, getByRole, rerender, queryByText } = render(
+      <TypeSafeProviderCard expanded onToggle={() => undefined} />
+    );
+    await userEvent.type(getByLabelText("API Key"), "sk-replacement");
+    fireEvent.click(getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(settle).not.toBeNull());
+
+    // Collapse while the write is in flight, then let it fail.
+    rerender(<TypeSafeProviderCard expanded={false} onToggle={() => undefined} />);
+    await act(() => {
+      settle!({ success: false, error: "providers.jsonc is read-only" });
+      return Promise.resolve();
+    });
+    rerender(<TypeSafeProviderCard expanded onToggle={() => undefined} />);
+    expect(queryByText("providers.jsonc is read-only")).not.toBeNull();
+    expect((getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   test("a failed write surfaces the backend error", async () => {

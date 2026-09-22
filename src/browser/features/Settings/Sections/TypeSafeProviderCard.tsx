@@ -41,6 +41,34 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
   const [status, setStatus] = useState<AutoModelRoutingEvaluationStatus | null>(null);
   // Bumped after a key write so the status re-checks without waiting for a config event.
   const [statusRefresh, setStatusRefresh] = useState(0);
+  // The write and its outcome live here, not in the editor: collapsing the card mid-write
+  // unmounts the editor, and a rejection must still be visible on the next expand.
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
+
+  const writeKey = async (value: string): Promise<boolean> => {
+    if (!api) return false;
+    setKeyBusy(true);
+    setKeyError(null);
+    try {
+      const result = await api.providers.setProviderConfig({
+        provider: TYPESAFE_PROVIDER_KEY,
+        keyPath: ["apiKey"],
+        value,
+      });
+      if (!result.success) {
+        setKeyError(result.error);
+        return false;
+      }
+      setStatusRefresh((count) => count + 1);
+      return true;
+    } catch (error) {
+      setKeyError(getErrorMessage(error));
+      return false;
+    } finally {
+      setKeyBusy(false);
+    }
+  };
 
   // Probe the TypeSafe evaluator the user actually saved: an enforced policy can allow that
   // model while denying the default one, and the credential is usable either way.
@@ -103,7 +131,7 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
       </Button>
 
       {props.expanded && (
-        <TypeSafeKeyEditor status={status} onSaved={() => setStatusRefresh((count) => count + 1)} />
+        <TypeSafeKeyEditor status={status} busy={keyBusy} error={keyError} onWrite={writeKey} />
       )}
     </div>
   );
@@ -115,34 +143,14 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
  */
 function TypeSafeKeyEditor(props: {
   status: AutoModelRoutingEvaluationStatus | null;
-  onSaved: () => void;
+  busy: boolean;
+  error: string | null;
+  onWrite: (value: string) => Promise<boolean>;
 }) {
-  const { api } = useAPI();
   const [keyDraft, setKeyDraft] = useState("");
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [keyBusy, setKeyBusy] = useState(false);
 
   const writeKey = async (value: string) => {
-    if (!api) return;
-    setKeyBusy(true);
-    setKeyError(null);
-    try {
-      const result = await api.providers.setProviderConfig({
-        provider: TYPESAFE_PROVIDER_KEY,
-        keyPath: ["apiKey"],
-        value,
-      });
-      if (!result.success) {
-        setKeyError(result.error);
-        return;
-      }
-      setKeyDraft("");
-      props.onSaved();
-    } catch (error) {
-      setKeyError(getErrorMessage(error));
-    } finally {
-      setKeyBusy(false);
-    }
+    if (await props.onWrite(value)) setKeyDraft("");
   };
 
   const configured = props.status?.available === true;
@@ -178,7 +186,7 @@ function TypeSafeKeyEditor(props: {
             <Button
               type="button"
               size="sm"
-              disabled={keyBusy || keyDraft.trim().length === 0}
+              disabled={props.busy || keyDraft.trim().length === 0}
               onClick={() => void writeKey(keyDraft.trim())}
             >
               Save
@@ -187,7 +195,7 @@ function TypeSafeKeyEditor(props: {
               type="button"
               size="sm"
               variant="outline"
-              disabled={keyBusy}
+              disabled={props.busy}
               onClick={() => void writeKey("")}
             >
               Clear
@@ -206,7 +214,7 @@ function TypeSafeKeyEditor(props: {
               ? "Configured"
               : (props.status.reason ?? "Not configured")}
         </div>
-        {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
+        {props.error ? <div className="text-danger-light text-xs">{props.error}</div> : null}
       </div>
     </div>
   );
