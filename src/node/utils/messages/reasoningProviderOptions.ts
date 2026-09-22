@@ -5,8 +5,9 @@ export interface ReasoningProviderMetadata {
     signature?: string;
     redactedData?: string;
   };
-  // OpenAI/xAI Responses attach itemId (+ encrypted content under store=false/ZDR)
-  // so subsequent turns can restore reasoning without server-side response storage.
+  // OpenAI/xAI Responses attach itemId + encrypted content so subsequent turns
+  // can restore reasoning without server-side response storage. OpenAI is
+  // replayed by encrypted content only (see attachReasoningReplayMetadata).
   openai?: {
     itemId?: string;
     reasoningEncryptedContent?: string | null;
@@ -78,9 +79,10 @@ export function sanitizeReasoningReplayMetadata(
 
 /**
  * Extract replay data from stream providerMetadata into the persisted
- * providerOptions shape. Anthropic needs signatures; OpenAI/xAI Responses
- * need itemId + encrypted content when store=false (ZDR); Google needs
- * thought signatures. Replay happens via attachReasoningReplayMetadata.
+ * providerOptions shape. Anthropic needs signatures; xAI Responses needs
+ * itemId + encrypted content (store=false); OpenAI Responses needs encrypted
+ * content (the itemId is persisted for debugging only); Google needs thought
+ * signatures. Replay happens via attachReasoningReplayMetadata.
  */
 export function reasoningProviderOptionsFromMetadata(
   providerMetadata: ReasoningProviderMetadata | undefined
@@ -149,17 +151,30 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
       if (!replayMetadata) return part;
 
       // A bare itemId is the interrupted-stream shape: reasoning-end never
-      // delivered the encrypted content. Under store=false (always for frontier
-      // Grok, ZDR for OpenAI) the server-side reference is unresolvable and
-      // would fail every subsequent request; complete parts always carry
-      // encrypted content because requests include reasoning.encrypted_content.
-      // Drop bare references at replay time only; stream-time accumulation
-      // keeps partial metadata so reasoning-end can still complete it.
+      // delivered the encrypted content. There is nothing self-contained to
+      // replay, and a bare server-side reference (xAI store=false) is
+      // unresolvable and would fail every subsequent request; complete parts
+      // always carry encrypted content because requests include
+      // reasoning.encrypted_content. Drop bare references at replay time only;
+      // stream-time accumulation keeps partial metadata so reasoning-end can
+      // still complete it.
       for (const provider of ["openai", "xai"] as const) {
         const meta = replayMetadata[provider];
         if (meta && nonEmptyString(meta.reasoningEncryptedContent) == null) {
           delete replayMetadata[provider];
         }
+      }
+      // OpenAI Responses: never replay by server-side reference. With the SDK's
+      // default store=true an itemId becomes `item_reference` and the encrypted
+      // blob is ignored; that reference is unresolvable after a route/credential
+      // change (gateway<->direct, Codex store=false turns) or eviction, and
+      // OpenAI answers 400 "Item with id 'rs_…' not found" on every retry.
+      // Encrypted content is self-contained, so send only that. Request-only:
+      // the persisted part keeps its itemId. xAI is left as-is (already
+      // store=false; its converter behaviour without ids is not established).
+      if (replayMetadata.openai?.itemId != null) {
+        const { itemId: _omit, ...rest } = replayMetadata.openai;
+        replayMetadata.openai = rest;
       }
       if (Object.keys(replayMetadata).length === 0) return part;
 
