@@ -65,6 +65,7 @@ import {
   isLegacyOpApiKey,
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
+  resolveCustomProviderCredentials,
 } from "@/node/utils/providerRequirements";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
@@ -74,6 +75,7 @@ import {
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import type { PolicyService } from "@/node/services/policyService";
 import { getErrorMessage } from "@/common/utils/errors";
+import { MODEL_DISCOVERY_BASE_URLS } from "@/constants/modelDiscovery";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 function filterProviderModelsByPolicy(
@@ -684,24 +686,65 @@ export class ProviderService {
   ): Promise<ProviderModelDiscoveryResult> {
     // Autocomplete must never persist a catalog or change routing/user-managed models.
     return discoverProviderModels(() => {
-      if (provider !== "anthropic" && provider !== "openai") return { status: "unsupported" };
       const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
-      if (isCustomProviderConfig(config)) return { status: "unsupported" };
+      const custom = isCustomProviderConfig(config) ? config.providerType : undefined;
+      const defaultBaseUrl = isBuiltInProvider(provider)
+        ? MODEL_DISCOVERY_BASE_URLS[provider]
+        : undefined;
+      // Legacy shadowed built-ins remain unavailable, never inheriting official environment keys.
+      if (custom ? !validateCustomProviderId(provider).ok : !defaultBaseUrl)
+        return { status: "unsupported" };
       const enforced = this.policyService?.isEnforced() ?? false;
       if (
         isProviderDisabledInConfig(config) ||
         (enforced && !this.policyService?.isProviderAllowed(provider))
       )
         return { status: "not-configured" };
-      const credentials = resolveProviderCredentials(provider, config);
-      // OAuth access tokens are not API keys and must never be sent to the vendor API.
-      if (!credentials.apiKey) return { status: "not-configured" };
       const policy = this.getProviderPolicy(provider);
+      let apiKey: string | undefined, baseUrl: string | undefined, organization: string | undefined;
+      if (custom) {
+        const credentials = resolveCustomProviderCredentials(provider, {
+          ...config,
+          ...(policy.forcedBaseUrl && { baseUrl: policy.forcedBaseUrl }),
+        });
+        if (!credentials.ok)
+          return credentials.error.code === "missing_base_url"
+            ? { status: "not-configured" }
+            : { status: "error", reason: "request-failed" };
+        apiKey = credentials.apiKey;
+        baseUrl = credentials.baseURL;
+      } else {
+        if (!isBuiltInProvider(provider)) return { status: "unsupported" };
+        const credentials = resolveProviderCredentials(provider, config);
+        // OAuth tokens are not API keys; Ollama alone allows explicit keyless configuration.
+        if (!credentials.isConfigured) return { status: "not-configured" };
+        apiKey = credentials.apiKey;
+        baseUrl =
+          policy.forcedBaseUrl ??
+          credentials.baseUrl ??
+          resolveConfigBaseUrl(config) ??
+          defaultBaseUrl;
+        organization = credentials.organization;
+      }
+      if (!baseUrl) return { status: "not-configured" };
+      const format = custom
+        ? custom === "anthropic-messages"
+          ? "anthropic"
+          : "openai"
+        : provider === "anthropic" ||
+            provider === "google" ||
+            provider === "ollama" ||
+            provider === "openrouter"
+          ? provider
+          : "openai";
       return Object.freeze({
         provider,
-        baseUrl: policy.forcedBaseUrl ?? credentials.baseUrl,
-        apiKey: credentials.apiKey,
-        organization: credentials.organization,
+        providerType: custom,
+        format,
+        conditional: Boolean(custom) || provider === "zai",
+        baseUrl,
+        apiKey,
+        organization,
         headers: Object.freeze({ ...config.headers }),
         policy: Object.freeze({
           ...policy,
