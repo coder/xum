@@ -6,7 +6,9 @@ import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimiti
 import * as ActualAPIModule from "@/browser/contexts/API";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import {
   getDefaultAutoModelRoutingConfig,
@@ -28,6 +30,17 @@ const actualModelsFromSettingsModule = { ...ActualModelsFromSettingsModule };
 const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 let mockProvidersConfig: ProvidersConfigMap | null = null;
 const actualModelSelectorModule = { ...ActualModelSelectorModule };
+const actualWorkspaceContextModule = { ...ActualWorkspaceContextModule };
+// Settings renders inside the workspace shell; the panel resolves the billed workspace through
+// its metadata map. selectedWorkspace is null on /settings, as in the app.
+const SETTINGS_WORKSPACE = {
+  id: "ws-settings",
+  name: "routing",
+  projectName: "xum",
+  projectPath: "/repos/xum",
+  namedWorkspacePath: "/repos/xum/mike/routing",
+} as unknown as FrontendWorkspaceMetadata;
+let mockWorkspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
 
 interface MockApi {
   config: {
@@ -59,6 +72,13 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
 }));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({ config: mockProvidersConfig, loading: false }),
+}));
+void mock.module("@/browser/contexts/WorkspaceContext", () => ({
+  ...actualWorkspaceContextModule,
+  useOptionalWorkspaceContext: () => ({
+    selectedWorkspace: null,
+    workspaceMetadata: mockWorkspaceMetadata,
+  }),
 }));
 void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ModelSelector: (props: {
@@ -142,6 +162,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
       () => actualModelsFromSettingsModule
     );
     await mock.module("@/browser/hooks/useProvidersConfig", () => actualProvidersConfigModule);
+    await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
     await mock.module(
       "@/browser/components/ModelSelector/ModelSelector",
       () => actualModelSelectorModule
@@ -157,12 +178,9 @@ describe("AutoModelRoutingExperimentConfig", () => {
     mockApi = createMockApi();
     mockProvidersConfig = null;
     // Settings routes carry no workspace; the panel bills previews to the last selected one.
-    updatePersistedState(SELECTED_WORKSPACE_KEY, {
-      workspaceId: "ws-settings",
-      projectPath: "/repos/xum",
-      projectName: "xum",
-      namedWorkspacePath: "/repos/xum/mike/routing",
-    });
+    // Stored in the legacy id-only shape: the label must come from metadata, not from here.
+    updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: "ws-settings" });
+    mockWorkspaceMetadata = new Map([[SETTINGS_WORKSPACE.id, SETTINGS_WORKSPACE]]);
   });
 
   afterEach(() => {
@@ -488,8 +506,14 @@ describe("AutoModelRoutingExperimentConfig", () => {
     });
   });
 
-  test("Classify stays disabled while there is no workspace to bill the preview to", async () => {
-    updatePersistedState(SELECTED_WORKSPACE_KEY, null);
+  test.each([
+    ["no workspace was ever selected", () => updatePersistedState(SELECTED_WORKSPACE_KEY, null)],
+    [
+      "the last selected workspace no longer exists",
+      () => updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: "ws-removed" }),
+    ],
+  ])("Classify stays disabled when %s", async (_case, arrange) => {
+    arrange();
     const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
@@ -499,6 +523,23 @@ describe("AutoModelRoutingExperimentConfig", () => {
       container.querySelector("[data-auto-model-routing-preview-workspace]")?.textContent
     ).toContain("Open a workspace first");
     expect(mockApi.config.previewAutoModelRouting).not.toHaveBeenCalled();
+  });
+
+  test("re-checks the evaluator's availability when the providers config changes", async () => {
+    const getStatus = mockApi.config.getAutoModelRoutingEvaluationStatus;
+    const { container, rerender } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+    await waitFor(() => expect(getStatus.mock.calls.length).toBeGreaterThan(0));
+    const checksAfterLoad = getStatus.mock.calls.length;
+
+    // A key saved or a provider disabled from another window arrives as a new config
+    // snapshot; the evaluator text is unchanged, so only this dependency can trigger it.
+    const providersWithOpenAI: ProvidersConfigMap = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+    mockProvidersConfig = providersWithOpenAI;
+    rerender(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(getStatus).toHaveBeenCalledTimes(checksAfterLoad + 1));
   });
 
   test("classifying sends the tiers on screen, not the last persisted config", async () => {

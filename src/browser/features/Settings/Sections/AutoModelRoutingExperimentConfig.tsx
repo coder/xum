@@ -13,10 +13,9 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { useAPI } from "@/browser/contexts/API";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
-import { formatWorkspaceLabel } from "./LayoutsSection";
+import { formatWorkspaceLabel, isPersistedWorkspaceSelection } from "./LayoutsSection";
 import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -110,21 +109,25 @@ export function AutoModelRoutingExperimentConfig() {
   const [classifying, setClassifying] = useState(false);
   // The preview is a paid evaluator request billed to a workspace's usage ledger. Settings
   // routes carry no workspace in the URL, so it goes to the last selected one (the target
-  // LayoutsSection captures into as well), and only while that workspace still exists.
+  // LayoutsSection captures into as well). The stored selection is untrusted and may be a
+  // legacy shape, so only its id is read and the workspace itself is resolved through live
+  // metadata: a removed workspace disables the preview instead of being billed.
   const workspaceContext = useOptionalWorkspaceContext();
-  const [persistedSelection] = useState(() =>
-    readPersistedState<WorkspaceSelection | null>(SELECTED_WORKSPACE_KEY, null)
-  );
-  const previewWorkspace = workspaceContext?.selectedWorkspace ?? persistedSelection;
+  const [persistedWorkspaceId] = useState(() => {
+    const stored = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);
+    return isPersistedWorkspaceSelection(stored) ? stored.workspaceId : null;
+  });
   const previewWorkspaceId =
-    previewWorkspace != null &&
-    (workspaceContext == null ||
-      workspaceContext.workspaceMetadata.has(previewWorkspace.workspaceId))
-      ? previewWorkspace.workspaceId
-      : null;
+    workspaceContext?.selectedWorkspace?.workspaceId ?? persistedWorkspaceId;
+  const previewWorkspace =
+    previewWorkspaceId != null
+      ? workspaceContext?.workspaceMetadata.get(previewWorkspaceId)
+      : undefined;
 
   // The status follows the field as typed, not the saved value, so the user sees
-  // whether a candidate evaluator is usable before committing it.
+  // whether a candidate evaluator is usable before committing it. Availability is a
+  // credentials question, so it is re-checked whenever the providers config changes (a key
+  // added or a provider disabled from another window), not only after this panel's own write.
   useEffect(() => {
     if (!api || !evaluationValid) return;
     let cancelled = false;
@@ -137,7 +140,7 @@ export function AutoModelRoutingExperimentConfig() {
     return () => {
       cancelled = true;
     };
-  }, [api, evaluationValid, evaluationValue, statusRefresh]);
+  }, [api, evaluationValid, evaluationValue, statusRefresh, providersConfig]);
 
   const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
   const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
@@ -215,7 +218,7 @@ export function AutoModelRoutingExperimentConfig() {
   };
 
   const classifySample = async () => {
-    if (!api || samplePrompt.trim().length === 0 || previewWorkspaceId == null) return;
+    if (!api || samplePrompt.trim().length === 0 || previewWorkspace == null) return;
     setClassifying(true);
     setPreview(null);
     setPreviewError(null);
@@ -224,7 +227,7 @@ export function AutoModelRoutingExperimentConfig() {
       // the write may still be in flight when the click lands.
       const result = await api.config.previewAutoModelRouting({
         prompt: samplePrompt,
-        workspaceId: previewWorkspaceId,
+        workspaceId: previewWorkspace.id,
         config,
       });
       if (result.success) setPreview(result.data);
@@ -536,14 +539,14 @@ export function AutoModelRoutingExperimentConfig() {
           <Button
             type="button"
             size="sm"
-            disabled={classifying || samplePrompt.trim().length === 0 || previewWorkspaceId == null}
+            disabled={classifying || samplePrompt.trim().length === 0 || previewWorkspace == null}
             onClick={() => void classifySample()}
           >
             {classifying ? <Loader2 aria-hidden="true" className="animate-spin" /> : null}
             Classify
           </Button>
           <span className="text-muted text-xs" data-auto-model-routing-preview-workspace>
-            {previewWorkspaceId != null && previewWorkspace != null
+            {previewWorkspace != null
               ? `Usage is recorded under ${formatWorkspaceLabel(previewWorkspace.projectName, previewWorkspace.namedWorkspacePath)}.`
               : "Open a workspace first: usage is recorded under the last selected workspace."}
           </span>

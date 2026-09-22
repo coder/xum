@@ -160,7 +160,9 @@ interface PersistedWorkspaceSelection {
   workspaceId: string;
 }
 
-function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorkspaceSelection {
+export function isPersistedWorkspaceSelection(
+  value: unknown
+): value is PersistedWorkspaceSelection {
   if (!value || typeof value !== "object") {
     return false;
   }
