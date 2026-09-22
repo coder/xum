@@ -378,6 +378,13 @@ export const router = (authToken?: string) => {
         .output(schemas.config.previewAutoModelRouting.output)
         .handler(
           handlerGen(function* ({ context }, input) {
+            // Refuse before spending: the evaluator is billed to this workspace's ledger, and a
+            // stale selection (a workspace removed since) has nowhere to record it.
+            if (context.config.findWorkspace(input.workspaceId) == null) {
+              return Err(
+                "Preview usage is recorded under a workspace; open a workspace and try again."
+              );
+            }
             const router = yield* AutoModelRouterTag;
             const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
               input.config ?? context.config.loadConfigOrDefault().autoModelRouting
@@ -388,6 +395,17 @@ export const router = (authToken?: string) => {
               evaluationModel,
             });
             if (!decision.success) return decision;
+            // Billed like the send path's evaluation (AgentSession), and before the tier is
+            // mapped: an unmapped verdict cost the same tokens.
+            yield* atomicPromise(() =>
+              context.sessionUsageService.recordHeadlessUsage(
+                input.workspaceId,
+                decision.data.evaluationModel,
+                decision.data.usage,
+                decision.data.providerMetadata,
+                { analyticsSource: "auto_model_routing_preview" }
+              )
+            );
             const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
             return Ok({
               ...decision.data,

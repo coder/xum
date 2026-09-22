@@ -2728,6 +2728,12 @@ export const config = {
     input: z.object({
       prompt: z.string().min(1),
       /**
+       * The preview is a paid evaluator request outside any turn. Usage ledgers are
+       * per-workspace, so the panel names the workspace it bills (the one last selected) and
+       * the backend refuses to spend without one it knows.
+       */
+      workspaceId: z.string().min(1),
+      /**
        * The tiers and evaluator the panel shows. The panel saves edits optimistically, so a
        * preview must classify against what the user sees, not the last persisted config.
        */

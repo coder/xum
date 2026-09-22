@@ -17,6 +17,8 @@ import {
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
   TYPESAFE_PROVIDER_KEY,
 } from "@/constants/autoModelRouting";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
@@ -154,6 +156,13 @@ describe("AutoModelRoutingExperimentConfig", () => {
     cleanupDom = installDom();
     mockApi = createMockApi();
     mockProvidersConfig = null;
+    // Settings routes carry no workspace; the panel bills previews to the last selected one.
+    updatePersistedState(SELECTED_WORKSPACE_KEY, {
+      workspaceId: "ws-settings",
+      projectPath: "/repos/xum",
+      projectName: "xum",
+      namedWorkspacePath: "/repos/xum/mike/routing",
+    });
   });
 
   afterEach(() => {
@@ -462,6 +471,34 @@ describe("AutoModelRoutingExperimentConfig", () => {
     expect(preview.textContent).toContain("Hard");
     expect(preview.textContent).toContain("70%");
     expect(preview.textContent).toContain("GPT-5.5");
+  });
+
+  test("classifying bills the preview to the last selected workspace and says so", async () => {
+    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+    expect(
+      container.querySelector("[data-auto-model-routing-preview-workspace]")?.textContent
+    ).toContain("xum/routing");
+
+    await userEvent.type(getByLabelText("Sample prompt"), "Refactor the queue");
+    fireEvent.click(getByRole("button", { name: "Classify" }));
+    await waitFor(() => expect(mockApi.config.previewAutoModelRouting).toHaveBeenCalledTimes(1));
+    expect(mockApi.config.previewAutoModelRouting.mock.calls[0]?.[0]).toMatchObject({
+      workspaceId: "ws-settings",
+    });
+  });
+
+  test("Classify stays disabled while there is no workspace to bill the preview to", async () => {
+    updatePersistedState(SELECTED_WORKSPACE_KEY, null);
+    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
+
+    await userEvent.type(getByLabelText("Sample prompt"), "Refactor the queue");
+    expect((getByRole("button", { name: "Classify" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      container.querySelector("[data-auto-model-routing-preview-workspace]")?.textContent
+    ).toContain("Open a workspace first");
+    expect(mockApi.config.previewAutoModelRouting).not.toHaveBeenCalled();
   });
 
   test("classifying sends the tiers on screen, not the last persisted config", async () => {

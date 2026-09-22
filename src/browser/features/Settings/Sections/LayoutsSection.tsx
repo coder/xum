@@ -169,7 +169,7 @@ function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorksp
   return typeof candidate.workspaceId === "string";
 }
 
-function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
+export function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
   return `${projectName}/${namedWorkspacePath.split("/").pop() ?? namedWorkspacePath}`;
 }
 
