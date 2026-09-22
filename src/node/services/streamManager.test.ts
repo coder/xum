@@ -6823,6 +6823,35 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(streamEndEvents).toHaveLength(1);
     });
 
+    test(`repairs ${rejection.name} from the prepared first-step transcript`, async () => {
+      const { errorEvents, streamEndEvents, run } = createRecoveryHarness("replay-prepared-first");
+      // prepareStep can replace the initial transcript before any output exists.
+      // Recovery must not restore the context discarded by that preparation.
+      const preparedMessages: ModelMessage[] = [
+        { role: "user", content: "compacted summary" },
+        {
+          role: "assistant",
+          content: [openaiReasoningPart, { type: "text", text: "retained answer" }],
+        },
+        { role: "user", content: "now" },
+      ];
+      const streamInfo = replayStreamInfo(failingStream(rejection.error), {
+        stepTracker: { latestMessages: preparedMessages },
+      });
+      expect(streamInfo.parts).toEqual([]);
+
+      const createStreamResult = await run(streamInfo, [successfulStream]);
+
+      expect(createStreamResult).toHaveBeenCalledTimes(1);
+      expect((streamInfo.request as { messages: ModelMessage[] }).messages).toEqual([
+        { role: "user", content: "compacted summary" },
+        { role: "assistant", content: [{ type: "text", text: "retained answer" }] },
+        { role: "user", content: "now" },
+      ]);
+      expect(errorEvents).toEqual([]);
+      expect(streamEndEvents).toHaveLength(1);
+    });
+
     test(`surfaces a repeated ${rejection.name} as terminal reasoning_rejected after one repair`, async () => {
       const workspaceId = "replay-repeat";
       const { errorEvents, streamEndEvents, run } = createRecoveryHarness(workspaceId);

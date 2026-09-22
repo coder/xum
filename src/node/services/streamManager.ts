@@ -5414,13 +5414,13 @@ export class StreamManager {
       return false;
     }
 
-    // After completed steps only the SDK's prepared step messages carry the
-    // prior tool calls/results; the turn's own request is enough before that.
+    // Even step 0 can be compacted or rebuilt before output. Retry the prepared
+    // transcript so recovery cannot restore context that preparation discarded.
     const stepMessages = streamInfo.stepTracker.latestMessages;
     if (hasParts && !stepMessages) {
       return false;
     }
-    const sourceMessages = hasParts && stepMessages ? stepMessages : streamInfo.request.messages;
+    const sourceMessages = stepMessages ?? streamInfo.request.messages;
     const messages = stripOpenAIReasoningReplay(sourceMessages);
     if (messages === sourceMessages) {
       return false;
