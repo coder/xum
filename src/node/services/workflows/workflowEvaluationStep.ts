@@ -27,7 +27,7 @@ import {
 } from "@/constants/evaluation";
 import { sha256Hex } from "@/node/services/evaluation/evaluationDigest";
 import { log } from "@/node/services/log";
-import type { WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
+import type { EvaluationSelection, WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
 import type { WorkflowRunStore } from "./WorkflowRunStore";
 import { assertWorkflowStepId, hashWorkflowStepInput } from "./workflowReplayKey";
 
@@ -258,7 +258,12 @@ export async function runWorkflowEvaluationStep(
     await recordFailure(context, { spec, inputHash, startedAt, admission: persisted, error });
     throw error;
   }
-  const selection = await adapter.resolveSelection({ model: spec.model }, persisted?.selection);
+  const selection = await resolveSelectionOrFailure(context, adapter, {
+    spec,
+    persisted: persisted?.selection,
+    stepDigest,
+    attempt,
+  });
   if (!selection.ok) {
     const error = new WorkflowEvaluationStepError(
       selection.reason,
@@ -352,7 +357,12 @@ export async function runWorkflowEvaluationStep(
   if (clock.nowMs() >= attemptDeadlineAt) {
     return await failPostAdmission("deadline", "deadline");
   }
-  const rechecked = await adapter.resolveSelection({ model: spec.model }, admission.selection);
+  const rechecked = await resolveSelectionOrFailure(context, adapter, {
+    spec,
+    persisted: admission.selection,
+    stepDigest,
+    attempt,
+  });
   if (!rechecked.ok) {
     return await failPostAdmission(rechecked.reason, rechecked.code);
   }
@@ -466,6 +476,40 @@ export async function runWorkflowEvaluationStep(
     });
   }
   return result;
+}
+
+export const EVALUATION_RESOLVER_THREW_CODE = "evaluation-resolver-threw";
+
+/**
+ * `resolveSelection` reports failures as `{ ok: false }`; a resolver that
+ * throws instead (a lazy provider import, model construction) must take the
+ * same typed path, otherwise an admitted record is left `started` with a raw
+ * exception as the run error and neither resume nor checkpoint retry can
+ * match it. The failure identity is fixed (`provider-failure/unknown`); only
+ * the error name reaches the log (text discipline).
+ */
+async function resolveSelectionOrFailure(
+  context: WorkflowEvaluationStepContext,
+  adapter: WorkflowEvaluationPort,
+  input: {
+    spec: WorkflowEvaluateSpec;
+    persisted: EvaluationAdmission["selection"] | undefined;
+    stepDigest: string;
+    attempt: number;
+  }
+): Promise<EvaluationSelection> {
+  try {
+    return await adapter.resolveSelection({ model: input.spec.model }, input.persisted);
+  } catch (error) {
+    log.warn("Workflow evaluation model resolution threw", {
+      code: EVALUATION_RESOLVER_THREW_CODE,
+      runId: context.runId,
+      stepDigest: input.stepDigest,
+      attempt: input.attempt,
+      errorName: error instanceof Error ? error.name : typeof error,
+    });
+    return { ok: false, reason: "provider-failure", code: "unknown" };
+  }
 }
 
 /**

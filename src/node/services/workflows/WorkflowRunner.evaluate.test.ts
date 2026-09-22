@@ -895,6 +895,71 @@ describe("WorkflowRunner evaluate()", () => {
     });
   });
 
+  test("a resolver that throws is recorded on the admitted record like a typed failure", async () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      // Post-admission recheck throws (e.g. a lazy provider import fails): the
+      // admitted attempt is recorded as failed with a fixed identity, the run's
+      // error matches it, and a checkpoint retry is offered.
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      const fake = createFakeAdapter({
+        selection: ({ index }) => {
+          if (index === 1) throw new Error(`provider import failed ${SENTINEL_STATE}`);
+          return undefined;
+        },
+      });
+
+      await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(
+        `evaluation failed: provider-failure/unknown (step ${STEP_DIGEST}, attempt 1)`
+      );
+
+      expect(fake.dispatchCalls).toHaveLength(0);
+      expect(await readStep(store)).toMatchObject({
+        status: "failed",
+        evaluation: { attempt: 1, selection: { modelString: SENTINEL_MODEL } },
+      });
+      const run = await store.getRun(RUN_ID);
+      expect(canRetryWorkflowFromCheckpoint(run)).toBe(true);
+      for (const message of errorMessages(run)) expectNoSentinels(message);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expectNoSentinels(JSON.stringify(warn.mock.calls[0]));
+
+      // Resume with a persisted admission whose resolution throws: same path,
+      // record kept at the admitted attempt (no billable attempt admitted).
+      using tmp2 = new DisposableTempDir("workflow-eval");
+      const store2 = await createStore(tmp2.path);
+      const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+      await store2.recordStepStarted(RUN_ID, {
+        stepId: STEP_ID,
+        inputHash: hashEvaluationStepInput(spec, STATE),
+        startedAt: "2026-05-29T00:00:00.500Z",
+        evaluation: admissionFor({ attempt: 1 }),
+      });
+      await store2.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+      const throwing = createFakeAdapter({
+        selection: () => {
+          throw new Error(`provider import failed ${SENTINEL_STATE}`);
+        },
+      });
+
+      await expect(
+        createRunner(store2, throwing.adapter).run(RUN_ID, { allowResumeFromInterrupted: true })
+      ).rejects.toThrow(
+        `evaluation failed: provider-failure/unknown (step ${STEP_DIGEST}, attempt 2)`
+      );
+
+      expect(throwing.dispatchCalls).toHaveLength(0);
+      expect(await readStep(store2)).toMatchObject({
+        status: "failed",
+        evaluation: { attempt: 1 },
+      });
+      expect(canRetryWorkflowFromCheckpoint(await store2.getRun(RUN_ID))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test("an endpoint change on the pre-dispatch recheck fails admission-mismatch without dispatching", async () => {
     using tmp = new DisposableTempDir("workflow-eval");
     const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });

@@ -208,7 +208,11 @@ describe("WorkflowService checkpoint retry of failed evaluate() steps", () => {
     });
   });
 
-  test("a first attempt that failed before admission is retryable once a model is configured", async () => {
+  test("a first attempt that failed before admission is not offered a checkpoint retry", async () => {
+    // Known limitation of this layer: a pre-admission failure (no configured
+    // model here) writes no step record on purpose, and the gate only trusts
+    // records, so the run must be started again once a model is configured.
+    // Persisting a runner-decided failure classification is the follow-up.
     using tmp = new DisposableTempDir("workflow-service-evaluate-preadmission");
     const evaluation = createFakeEvaluation([COMPLETED], { failFirstResolution: true });
     const { service, runStore } = createService(tmp.path, evaluation.adapter, "wfr_eval_nomodel");
@@ -221,25 +225,19 @@ describe("WorkflowService checkpoint retry of failed evaluate() steps", () => {
         args: {},
       })
     ).rejects.toThrow(/evaluation failed: invalid-input\/no-model/);
-    // Pre-admission: deliberately no step record — the runner's exact error
-    // text is the run's only trace of the failed evaluation.
     const failed = await runStore.getRun("wfr_eval_nomodel");
     expect(failed.status).toBe("failed");
     expect(failed.steps).toHaveLength(0);
-    expect(getWorkflowCheckpointRetryEligibility(failed).canRetry).toBe(true);
+    expect(getWorkflowCheckpointRetryEligibility(failed).canRetry).toBe(false);
 
-    const retried = await service.retryRunFromCheckpoint({
-      workspaceId: "workspace-1",
-      runId: "wfr_eval_nomodel",
-      projectTrusted: true,
-    });
-
-    expect(retried.status).toBe("completed");
-    expect(evaluation.dispatchCount()).toBe(1);
-    expect((await runStore.getRun("wfr_eval_nomodel")).steps[0]).toMatchObject({
-      status: "completed",
-      evaluation: { attempt: 1 },
-    });
+    await expect(
+      service.retryRunFromCheckpoint({
+        workspaceId: "workspace-1",
+        runId: "wfr_eval_nomodel",
+        projectTrusted: true,
+      })
+    ).rejects.toThrow("Workflow run cannot be retried from checkpoint");
+    expect(evaluation.dispatchCount()).toBe(0);
   });
 
   test("a run failed by the author after catching the evaluation error is still not retryable", async () => {

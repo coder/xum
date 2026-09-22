@@ -285,9 +285,9 @@ export const WORKFLOW_EVALUATION_STEP_ERROR_NAME = "WorkflowEvaluationStepError"
 
 /**
  * Exact message of that error, built only from enum/number/digest fields (plan
- * §"Security model": no author text). The checkpoint-retry gate recognises this
- * text on a run whose failed evaluate step wrote no record (a first attempt that
- * failed before admission), so format and recogniser live together.
+ * §"Security model": no author text). Lives next to the error name because the
+ * checkpoint-retry gate compares a run's error against the text a failed
+ * evaluate step recorded (bare or prefixed with the name).
  */
 export function formatWorkflowEvaluationStepError(input: {
   reason: EvaluationStepFailureReason;
@@ -298,26 +298,6 @@ export function formatWorkflowEvaluationStepError(input: {
 }): string {
   const status = input.statusCode !== undefined ? ` status ${input.statusCode}` : "";
   return `evaluation failed: ${input.reason}/${input.code}${status} (step ${input.stepDigest}, attempt ${input.attempt})`;
-}
-
-const WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE =
-  /^evaluation failed: ([a-z-]+)\/([a-z-]+)( status \d+)? \(step [0-9a-f]+, attempt \d+\)$/;
-
-/**
- * Inverse of `formatWorkflowEvaluationStepError` for the exact text it
- * produces: the reason/code pair, or null for any other text (including a
- * message that merely embeds one, or names outside the enums).
- */
-export function parseWorkflowEvaluationStepError(
-  message: string
-): { reason: EvaluationStepFailureReason; code: EvaluationStepFailureCode } | null {
-  const match = WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE.exec(message);
-  if (match === null) {
-    return null;
-  }
-  const reason = EvaluationStepFailureReasonSchema.safeParse(match[1]);
-  const code = EvaluationStepFailureCodeSchema.safeParse(match[2]);
-  return reason.success && code.success ? { reason: reason.data, code: code.data } : null;
 }
 
 export const EvaluationStepFailureReasonSchema = z.enum([

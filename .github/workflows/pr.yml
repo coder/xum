@@ -195,6 +195,10 @@ jobs:
             # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
             # when sharing the monolithic process; keep them in fresh isolated processes.
             src/node/services/workflows/WorkflowRunner.test.ts
+            # The evaluate() lifecycle suites run a QuickJS workflow per case (~40 runtimes);
+            # the shared process segfaulted Bun twice on the same head with them included.
+            src/node/services/workflows/WorkflowRunner.evaluate.test.ts
+            src/node/services/workflows/WorkflowService.evaluate.test.ts
             src/node/services/ptc/quickjsRuntime.test.ts
             src/node/services/tools/code_execution.test.ts
             # This suite also creates QuickJS runtimes. Shared coverage can trap during startup.
