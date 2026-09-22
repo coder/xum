@@ -12130,6 +12130,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
+   * Manual rescue of an interrupted/reported task before a send or resume. The preflight's
+   * captured authority rides along when there is one; otherwise the rescue is called exactly as
+   * before (no options) and runs its own preflight.
+   */
+  private rescueInterruptedTask(
+    workspaceId: string,
+    preparation: TaskCheckoutAuthorization | undefined
+  ): Promise<boolean> {
+    const integration = this.agentTaskIntegration;
+    if (integration == null) return Promise.resolve(false);
+    return preparation != null
+      ? integration.markInterruptedTaskRunning(workspaceId, { preparation })
+      : integration.markInterruptedTaskRunning(workspaceId);
+  }
+
+  /**
    * Checkout-preparation preflight for a stream-starting entry point (sendMessage/resumeStream):
    * runs the task integration's async, bounded validation for an agent-task workspace (a row with
    * a parent) that will mint its own obligation here. Resolves `undefined` when nothing has to be
@@ -12768,11 +12784,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(
-            workspaceId,
-            taskPreparation != null ? { preparation: taskPreparation } : undefined
-          )) ?? false;
+        resumedInterruptedTask = await this.rescueInterruptedTask(workspaceId, taskPreparation);
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under) and before the session's own admission awaits.
@@ -13121,11 +13133,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!preflight.success) return preflight;
       const taskPreparation = preflight.data;
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-      resumedInterruptedTask =
-        (await this.agentTaskIntegration?.markInterruptedTaskRunning(
-          workspaceId,
-          taskPreparation != null ? { preparation: taskPreparation } : undefined
-        )) ?? false;
+      resumedInterruptedTask = await this.rescueInterruptedTask(workspaceId, taskPreparation);
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
       // carries the same obligation, bound after the rescue above. Disposed as no-work when the
