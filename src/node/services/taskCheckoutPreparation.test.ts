@@ -18,6 +18,7 @@ import {
   revalidateTaskCheckoutIdentity,
   validateTaskCheckoutPreparation,
 } from "@/node/services/taskCheckoutPreparation";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { createTestProject, saveWorkspaces } from "@/node/services/taskService.testHarness";
 
 /**
@@ -109,6 +110,83 @@ describe("taskCheckoutPreparation", () => {
     expect(canonicalRuntimeConfigJson({ type: "worktree", srcBaseDir: "/b" })).toBe(
       canonicalRuntimeConfigJson({ srcBaseDir: "/b", type: "worktree" } as never)
     );
+  });
+
+  test("legacy worktree rows (`local` + srcBaseDir, an empty string included) are DEDICATED exactly as runtimeFactory dispatches them: unproven refuses as legacy, a real proof validates, a shared child anchors on the persisted path; project-dir `local` stays shared", async () => {
+    const legacy = { type: "local" as const, srcBaseDir: config.srcDir };
+    const legacyEmpty = { type: "local" as const, srcBaseDir: "" };
+    expect(classifyTaskCheckoutKind(taskRow("lw", "/x", { runtimeConfig: legacy }))).toBe(
+      "dedicated"
+    );
+    expect(classifyTaskCheckoutKind(taskRow("lwe", "/x", { runtimeConfig: legacyEmpty }))).toBe(
+      "dedicated"
+    );
+    expect(classifyTaskCheckoutKind(taskRow("l", "/x", { runtimeConfig: { type: "local" } }))).toBe(
+      "shared"
+    );
+    // Unproven legacy-worktree row: refused as legacy — never anchored on the ordinary root by
+    // project directory (it executes in its own worktree, not in the project directory).
+    const checkout = path.join(config.srcDir, "repo", "agent_explore_lw05");
+    git(projectPath, `worktree add -q -b lw05 "${checkout}" main`);
+    for (const runtimeConfig of [legacy, legacyEmpty]) {
+      await publish([rootRow("root1", projectPath), taskRow("lw05", checkout, { runtimeConfig })]);
+      expect(await state(config, "lw05")).toBe("legacy");
+    }
+    // A real proof bound to the legacy runtime validates as a dedicated authority.
+    const materializationId = newMaterializationId();
+    const claimed = await claimTaskCheckoutIdentity({ workspacePath: checkout }, materializationId);
+    if (claimed instanceof Error) throw claimed;
+    const bound = await bindTaskCheckoutIdentity(
+      { workspacePath: checkout },
+      materializationId,
+      claimed
+    );
+    if (bound instanceof Error) throw bound;
+    const proven = taskRow("lw05", checkout, {
+      runtimeConfig: legacy,
+      taskCheckoutPreparation: buildTaskCheckoutPreparation(bound, legacy),
+    });
+    await publish([rootRow("root1", projectPath), proven]);
+    expect(await validateTaskCheckoutPreparation(config, "lw05")).toMatchObject({
+      kind: "ready",
+      authority: { kind: "dedicated", anchorPath: checkout },
+    });
+    // Its shared child executes where its persisted path says (WorktreeRuntime): same-path
+    // ancestry to the proven row, not the project directory.
+    const child = taskRow("lwc05", checkout, {
+      runtimeConfig: legacy,
+      parentWorkspaceId: "lw05",
+      taskIsolation: "none",
+    });
+    await publish([rootRow("root1", projectPath), proven, child]);
+    expect(await validateTaskCheckoutPreparation(config, "lwc05")).toMatchObject({
+      kind: "ready",
+      authority: { kind: "shared", anchorWorkspaceId: "lw05", anchorPath: checkout },
+    });
+    await publish([rootRow("root1", projectPath), proven, { ...child, path: projectPath }]);
+    expect(await state(config, "lwc05")).toBe("shared-broken");
+  });
+
+  test("scratch rows execute in their OWN path (their metadata projectPath is the row's path, not the `_scratch` bucket): a scratch child anchors on its scratch root", async () => {
+    const scratchPath = path.join(rootDir, "scratch", "scr01");
+    await fsPromises.mkdir(scratchPath, { recursive: true });
+    const scratch = (id: string, extra: Partial<Workspace> = {}): Workspace => ({
+      kind: "scratch",
+      id,
+      name: id,
+      path: scratchPath,
+      createdAt: new Date().toISOString(),
+      runtimeConfig: { type: "local" },
+      ...extra,
+    });
+    await saveWorkspaces(config, SCRATCH_PROJECT_CONFIG_KEY, [
+      scratch("scr01"),
+      scratch("scrchild01", { parentWorkspaceId: "scr01", agentId: "explore", agentType: "explore" }),
+    ]);
+    expect(await validateTaskCheckoutPreparation(config, "scrchild01")).toMatchObject({
+      kind: "ready",
+      authority: { kind: "shared", anchorWorkspaceId: "scr01", anchorPath: scratchPath },
+    });
   });
 
   test("bind on a real worktree: proof binds root+admin dev/ino, .git pointer and nonce; validates ready; sync assert agrees", async () => {
@@ -336,13 +414,19 @@ describe("taskCheckoutPreparation", () => {
     // Anchor dedicated but legacy (no proof) → broken; anchor ordinary root → ready with empty revision.
     await publish([rootRow("root1", projectPath), taskRow("ded04", checkout), mid, leaf]);
     expect(await state(config, "leaf04")).toBe("shared-broken");
+    // LocalRuntime rows execute in the PROJECT directory whatever their persisted path says
+    // (LocalRuntime.getWorkspacePath), so a local child anchors on its local root by project.
     const local = taskRow("loc04", projectPath, { runtimeConfig: { type: "local" } });
-    await publish([rootRow("root1", projectPath, { runtimeConfig: { type: "local" } }), local]);
+    await publish([
+      rootRow("root1", path.join(projectPath, "root"), { runtimeConfig: { type: "local" } }),
+      local,
+    ]);
     expect(await validateTaskCheckoutPreparation(config, "loc04")).toMatchObject({
       kind: "ready",
       authority: {
         kind: "shared",
         anchorWorkspaceId: "root1",
+        anchorPath: projectPath,
         authorizationRevision: "",
         ancestry: [],
       },
