@@ -8,6 +8,8 @@
  *    `context_exceeded`). With the depth guard the call is rejected before
  *    parsing, never executed (even for a permissive schema), and the turn
  *    settles normally.
+ * 2. Persisted: an already-committed deep row must not brick request
+ *    building or later compactions (boundary + tail-copy re-serialization).
  */
 import { tmpdir } from "node:os";
 import * as fs from "node:fs/promises";
@@ -22,7 +24,7 @@ import type {
   LanguageModelV4Prompt,
   LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { MAX_TOOL_PAYLOAD_JSON_DEPTH } from "@/constants/json";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -257,5 +259,184 @@ describe("tool payload depth guard (live stream)", () => {
     const text = JSON.stringify({ script: "[".repeat(MAX_TOOL_PAYLOAD_JSON_DEPTH * 2) + '\\"[[' });
     const run = await runToolCallTurn(text);
     expect(run.executeInputs).toEqual([JSON.parse(text)]);
+  });
+});
+
+/** Assistant row with one completed dynamic-tool part carrying the given input/output. */
+function toolRow(id: string, input: unknown, output: unknown): MuxMessage {
+  return {
+    id,
+    role: "assistant",
+    metadata: { timestamp: 1 },
+    parts: [
+      {
+        type: "dynamic-tool",
+        toolCallId: `${id}-call`,
+        toolName: "permissive",
+        state: "output-available",
+        input,
+        output,
+        timestamp: 1,
+      },
+    ],
+  };
+}
+
+function nestedArray(depth: number): unknown {
+  let value: unknown = 1;
+  for (let i = 0; i < depth; i++) value = [value];
+  return value;
+}
+
+/** JSON.stringify without recursion: serialize the deep array by text. */
+function toolRowLine(id: string, workspaceId: string, sequence: number, depth: number): string {
+  const row = toolRow(id, "$INPUT$", "$OUTPUT$");
+  row.metadata = { ...row.metadata, historySequence: sequence };
+  const shallow = JSON.stringify({ ...row, workspaceId });
+  const deep = "[".repeat(depth) + "1" + "]".repeat(depth);
+  return shallow.replace('"$INPUT$"', deep).replace('"$OUTPUT$"', deep) + "\n";
+}
+
+describe("tool payload depth bound (persisted history)", () => {
+  // 2101 is the observed persisted depth; 6000 fails JSON.stringify/structuredClone
+  // deterministically in isolation on Node 22, so it proves the rewrite path itself.
+  test.each([2101, 6000])(
+    "a committed depth-%i row loads flattened and survives two boundary commits with tail copies",
+    async (depth) => {
+      const h = await createTestHistoryService();
+      const workspaceId = "deep-row-compaction";
+      try {
+        const first = await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("u1", "user", "before")
+        );
+        if (!first.success) throw new Error(first.error);
+        const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+        const deepLine = toolRowLine("deep", workspaceId, 1, depth);
+        await fs.appendFile(chatPath, deepLine);
+        const control = toolRow("control", nestedArray(MAX_TOOL_PAYLOAD_JSON_DEPTH), { ok: true });
+        const appended = await h.historyService.appendManyToHistory(workspaceId, [
+          control,
+          createMuxMessage("u2", "user", "after"),
+        ]);
+        if (!appended.success) throw new Error(appended.error);
+        const controlLine = (await fs.readFile(chatPath, "utf8"))
+          .split("\n")
+          .find((line) => line.includes('"id":"control"'));
+
+        const loaded = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!loaded.success) throw new Error(loaded.error);
+        expect(loaded.data.map((row) => row.id)).toEqual(["u1", "deep", "control", "u2"]);
+        const deepRow = loaded.data[1];
+        expect(deepRow.metadata).toMatchObject({ historySequence: 1, timestamp: 1 });
+        expect(deepRow.parts[0]).toMatchObject({
+          type: "dynamic-tool",
+          toolCallId: "deep-call",
+          input: TOOL_PAYLOAD_DEPTH_REJECTION,
+          output: TOOL_PAYLOAD_DEPTH_REJECTION,
+        });
+        // At the bound: untouched (the value walker agrees with the text scanner).
+        expect(loaded.data[2].parts[0]).toMatchObject({
+          input: nestedArray(MAX_TOOL_PAYLOAD_JSON_DEPTH),
+          output: { ok: true },
+        });
+
+        // Two consecutive compactions, each re-serializing the flattened deep row as a tail copy.
+        for (let round = 0; round < 2; round++) {
+          const view = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+          if (!view.success) throw new Error(view.error);
+          const tailCopies = view.data
+            .filter((row) => row.id === "deep" || row.id.startsWith("copy-"))
+            .map((row) => ({
+              ...row,
+              id: `copy-${round}-${row.id}`,
+              metadata: { synthetic: true, rlmPreservedTailCopy: true },
+            }));
+          expect(tailCopies.length).toBeGreaterThan(0);
+          // Same durable-boundary metadata the compaction handler writes.
+          const summary = createMuxMessage(`summary-${round}`, "assistant", "summary", {
+            timestamp: 1,
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: round + 1,
+          });
+          const persisted = await h.historyService.persistBoundaryWithTailCopies(
+            workspaceId,
+            summary,
+            tailCopies,
+            false
+          );
+          expect(persisted).toEqual({ success: true, data: undefined });
+          const after = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+          if (!after.success) throw new Error(after.error);
+          expect(after.data[0].id).toBe(`summary-${round}`);
+          expect(after.data.map((row) => row.id)).toEqual(
+            expect.arrayContaining(tailCopies.map((copy) => copy.id))
+          );
+        }
+
+        // Raw evidence: the sealed epoch was archived byte-for-byte, including the deep row.
+        const archive = await fs.readFile(
+          path.join(h.config.sessionsDir, workspaceId, "chat-archive.jsonl"),
+          "utf8"
+        );
+        expect(archive).toContain(deepLine);
+        expect(archive).toContain(controlLine);
+        // Every row now in the active epoch (or archived) has a bounded copy or original.
+        const everything = await h.historyService.getLastMessages(workspaceId, 100);
+        if (!everything.success) throw new Error(everything.error);
+        for (const row of everything.data) {
+          for (const part of row.parts) {
+            if (part.type !== "dynamic-tool") continue;
+            expect(() => JSON.stringify(part)).not.toThrow();
+          }
+        }
+      } finally {
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("a deep interrupted partial is recovered flattened and promoted", async () => {
+    const h = await createTestHistoryService();
+    const workspaceId = "deep-partial";
+    try {
+      const first = await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u1", "user", "before")
+      );
+      if (!first.success) throw new Error(first.error);
+      // The streaming placeholder row already holds the sequence the partial carries.
+      const placeholder = await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("partial-assistant", "assistant", "")
+      );
+      if (!placeholder.success) throw new Error(placeholder.error);
+      const partialPath = path.join(h.config.sessionsDir, workspaceId, "partial.json");
+      await fs.writeFile(partialPath, toolRowLine("partial-assistant", workspaceId, 1, 6000));
+      const partial = await h.historyService.readPartial(workspaceId);
+      expect(partial?.parts[0]).toMatchObject({
+        input: TOOL_PAYLOAD_DEPTH_REJECTION,
+        output: TOOL_PAYLOAD_DEPTH_REJECTION,
+      });
+      const committed = await h.historyService.commitPartial(workspaceId);
+      expect(committed).toEqual({ success: true, data: undefined });
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((row) => row.id)).toEqual(["u1", "partial-assistant"]);
+      expect(history.data[1].parts[0]).toMatchObject({ input: TOOL_PAYLOAD_DEPTH_REJECTION });
+      // Receipt of intentional replacement: promotion persists the flattened row and
+      // deletes partial.json, so — unlike archive rotation — the deep raw partial is NOT
+      // retained anywhere on disk.
+      await expect(fs.access(partialPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const chat = await fs.readFile(
+        path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
+        "utf8"
+      );
+      expect(chat).toContain(TOOL_PAYLOAD_DEPTH_REJECTION);
+      expect(chat).not.toContain("[".repeat(300));
+    } finally {
+      await h.cleanup();
+    }
   });
 });

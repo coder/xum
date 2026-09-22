@@ -15,7 +15,7 @@ export const JSON_SAFE_CLONE_MAX_BIGINT_DIGITS = 4_096;
  * test harness from ~4000; a persisted deep row then fails every later
  * compaction that re-serializes it. 256 is a policy safety bound chosen well
  * below those observed failures. Payloads above it are rejected explicitly
- * (the live guard turns the call into an invalid tool call); no claim is made
- * that every external tool stays below it.
+ * (live: invalid tool call; persisted: in-memory diagnostic replacement); no
+ * claim is made that every external tool stays below it.
  */
 export const MAX_TOOL_PAYLOAD_JSON_DEPTH = 256;

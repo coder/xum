@@ -21,6 +21,7 @@ import {
   isDurableContextBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
+import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
 import {
   isHistoryIdentifierRepresentable,
   type HistoryArtifact,
@@ -220,7 +221,7 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
     // Readable payloads may discuss resets; only their top-level metadata can
     // mark one. Raw evidence is reserved for unreadable/ambiguous rows above.
     probe.possibleReset = false;
-    return normalizeLegacyMuxMetadata(raw);
+    return normalizePersistedMessage(raw);
   } catch {
     return null;
   }
@@ -445,7 +446,7 @@ export function readProviderHistoryFromLatestBoundary(
   return readHistoryProjectionFromLatestBoundary(
     paths,
     skip,
-    (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
+    (value) => (isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null),
     options?.includeReadableResetFloor
   ).then((view) => view.messages);
 }
