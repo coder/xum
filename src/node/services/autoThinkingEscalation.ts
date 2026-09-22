@@ -2,8 +2,8 @@
  * Mid-turn thinking escalation for turns whose thinking level Auto chose.
  *
  * Auto classifies a prompt once, before the turn starts. When the model then gets
- * stuck (every tool call in the last few steps failed, or one identical call keeps
- * being replayed), the tier's thinking level was too low for this prompt, so the
+ * stuck (every tool call in the last few steps failed, or the same calls keep being
+ * replayed with the same results), the tier's thinking level was too low for this prompt, so the
  * remaining steps run one level higher instead of spinning. The signal is read
  * from the step transcript StreamManager already has, so it costs nothing until it
  * fires; no evaluator call runs per step. The user's slider always wins: a manual
@@ -135,6 +135,19 @@ export function collectTurnToolSteps(messages: ModelMessage[]): TurnToolStep[] {
   return steps;
 }
 
+/**
+ * Everything a step called and got back, in one canonical string, so two steps compare
+ * equal only when every call and every result match; undefined while a result is outstanding.
+ */
+function stepSignature(step: TurnToolStep): string | undefined {
+  const pairs: string[] = [];
+  for (const call of step.calls) {
+    if (call.resultKey == null) return undefined;
+    pairs.push(JSON.stringify([call.key, call.resultKey]));
+  }
+  return pairs.sort().join("\n");
+}
+
 /** The stuck signal in the trailing window of steps, phrased for the badge; undefined when none. */
 export function detectStuckReason(
   steps: TurnToolStep[],
@@ -145,20 +158,22 @@ export function detectStuckReason(
   if (window.every((step) => step.allFailed)) {
     return `${windowSteps} consecutive steps with only failing tool calls`;
   }
-  // A replay counts only when it made no progress (same call, same result every time);
-  // re-issuing a wait tool while a long task runs is what those tools are for.
+  // A replay counts only when the whole step made no progress: every call and every result
+  // the same as the step before. A repeated status check beside new edits is work, not a
+  // loop, and re-issuing a wait tool while a long task runs is what those tools are for, so
+  // a step of nothing but waits never counts either.
   const [first, ...rest] = window;
-  const replayed = first.calls.find(
-    (call) =>
-      call.resultKey != null &&
-      !AUTO_THINKING_ESCALATION_WAIT_TOOLS.includes(call.toolName) &&
-      rest.every((step) =>
-        step.calls.some((other) => other.key === call.key && other.resultKey === call.resultKey)
-      )
+  const signature = stepSignature(first);
+  if (signature == null || !rest.every((step) => stepSignature(step) === signature)) {
+    return undefined;
+  }
+  const [replayed, ...moreReplayed] = first.calls.filter(
+    (call) => !AUTO_THINKING_ESCALATION_WAIT_TOOLS.includes(call.toolName)
   );
-  return replayed
+  if (replayed == null) return undefined;
+  return moreReplayed.length === 0
     ? `the same ${replayed.toolName} call and result repeated ${windowSteps} times`
-    : undefined;
+    : `the same ${first.calls.length} tool calls and results repeated ${windowSteps} times`;
 }
 
 export function nextThinkingLevel(level: ThinkingLevel): ThinkingLevel | undefined {

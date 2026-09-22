@@ -97,10 +97,7 @@ describe("detectStuckReason", () => {
     const replayed = collectTurnToolSteps([
       { role: "user", content: "go" },
       ...toolStep([{ toolName: "grep", input: { pattern: "x", path: "src" }, output: succeeded }]),
-      ...toolStep([
-        { toolName: "file_read", input: { path: "other" }, output: succeeded },
-        { toolName: "grep", input: { path: "src", pattern: "x" }, output: succeeded },
-      ]),
+      ...toolStep([{ toolName: "grep", input: { path: "src", pattern: "x" }, output: succeeded }]),
       ...toolStep([{ toolName: "grep", input: { pattern: "x", path: "src" }, output: succeeded }]),
     ]);
     expect(detectStuckReason(replayed)).toContain("grep");
@@ -111,6 +108,42 @@ describe("detectStuckReason", () => {
       ...toolStep([{ toolName: "grep", input: { pattern: "x" }, output: succeeded }]),
     ]);
     expect(detectStuckReason(varied)).toBeUndefined();
+  });
+
+  it("judges the whole step: a repeated call beside new work is progress, a repeated step is not", () => {
+    const status = { toolName: "bash", input: { command: "git status" }, output: succeeded };
+    const edit = (path: string) => ({ toolName: "file_edit", input: { path }, output: succeeded });
+    const working = collectTurnToolSteps([
+      { role: "user", content: "go" },
+      ...toolStep([status, edit("a.ts")]),
+      ...toolStep([status, edit("b.ts")]),
+      ...toolStep([status, edit("c.ts")]),
+    ]);
+    expect(detectStuckReason(working)).toBeUndefined();
+    const spinning = collectTurnToolSteps([
+      { role: "user", content: "go" },
+      ...toolStep([status, edit("a.ts")]),
+      ...toolStep([edit("a.ts"), status]),
+      ...toolStep([status, edit("a.ts")]),
+    ]);
+    expect(detectStuckReason(spinning)).toContain("2 tool calls");
+    // A wait tool beside the replay does not hide it; a step of only waits is not a loop.
+    const waitingBeside = collectTurnToolSteps([
+      { role: "user", content: "go" },
+      ...toolStep([
+        { toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded },
+        status,
+      ]),
+      ...toolStep([
+        { toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded },
+        status,
+      ]),
+      ...toolStep([
+        { toolName: "task_await", input: { task_ids: ["t1"] }, output: succeeded },
+        status,
+      ]),
+    ]);
+    expect(detectStuckReason(waitingBeside)).toContain("bash");
   });
 
   it("does not treat a replay that makes progress, or a re-issued wait tool, as stuck", () => {
