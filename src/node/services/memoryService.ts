@@ -2428,7 +2428,7 @@ export class MemoryService extends EventEmitter {
    * Strict manifest read that self-heals a MALFORMED file: its bytes are the
    * file's state, and refusing forever would block every access-time pass
    * and non-forced removal of the child. The file is quarantined beside
-   * itself (`<name>.malformed-<ts>`) and the pass continues from an empty
+   * itself (`<name>.malformed-<ts>-<uuid>`) and the pass continues from an empty
    * record map — safe because adoption is idempotent: identical files are
    * skipped and differing ones land under imported/<child>/. Only the
    * provenance of copies this adoption created is lost (they read as the
@@ -2454,7 +2454,8 @@ export class MemoryService extends EventEmitter {
     childId: string,
     error: LegacyAdoptionManifestMalformedError
   ): Promise<void> {
-    const quarantined = `${manifestPath}.malformed-${Date.now()}`;
+    // Multiple quarantines can share a clock tick; never replace earlier recovery bytes.
+    const quarantined = `${manifestPath}.malformed-${Date.now()}-${randomUUID()}`;
     try {
       await fsPromises.rename(manifestPath, quarantined);
     } catch (renameError) {
