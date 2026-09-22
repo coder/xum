@@ -372,6 +372,7 @@ import {
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
   type SendMessageInternalOptions,
+  type TaskReawakenOutcome,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
   type WorkspaceHost,
@@ -12162,6 +12163,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
+   * Manual rescue of an interrupted/reported task before a send or resume. The preflight's
+   * captured authority rides along when there is one; otherwise the rescue is called exactly as
+   * before (no options) and runs its own preflight.
+   */
+  private rescueInterruptedTask(
+    workspaceId: string,
+    preparation: TaskCheckoutAuthorization | undefined
+  ): Promise<TaskReawakenOutcome | undefined> {
+    const integration = this.agentTaskIntegration;
+    if (integration == null) return Promise.resolve(undefined);
+    return preparation != null
+      ? integration.reawakenInterruptedTask(workspaceId, { preparation })
+      : integration.reawakenInterruptedTask(workspaceId);
+  }
+
+  /**
    * Checkout-preparation preflight for a stream-starting entry point (sendMessage/resumeStream):
    * runs the task integration's async, bounded validation for an agent-task workspace (a row with
    * a parent) that will mint its own obligation here. Resolves `undefined` when nothing has to be
@@ -12805,10 +12822,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(
-          workspaceId,
-          taskPreparation != null ? { preparation: taskPreparation } : undefined
-        );
+        const reawaken = await this.rescueInterruptedTask(workspaceId, taskPreparation);
         // A rescue that lost its identity CAS (another backend resumed the task first) refuses:
         // binding generically would adopt the winner's attempt and stream it from two sessions.
         if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
@@ -13184,10 +13198,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!preflight.success) return preflight;
       const taskPreparation = preflight.data;
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-      const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(
-        workspaceId,
-        taskPreparation != null ? { preparation: taskPreparation } : undefined
-      );
+      const reawaken = await this.rescueInterruptedTask(workspaceId, taskPreparation);
       // Same as sendMessage: a lost reawaken refuses, a won one binds to exactly its attempt.
       if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
       resumedInterruptedTask = reawaken?.kind === "reawakened" && reawaken.statusChanged;
