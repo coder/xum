@@ -246,6 +246,26 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test.each(["gpt-6-sol", "gpt-6-luna"])("preserves off and native max for %s", (model) => {
+    for (const id of [
+      `openai:${model}`,
+      `mux-gateway:openai/${model}`,
+      `openrouter:openai/${model}-2026-09-22`,
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual([
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+      expect(enforceThinkingPolicy(id, "off")).toBe("off");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    expect(enforceThinkingPolicy(`openai:${model}-mini`, "max")).toBe("high");
+  });
+
   // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
   // is not offered. Named variants and other GPT-6 ids stay outside the rule.
   test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {

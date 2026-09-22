@@ -93,18 +93,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["haiku"],
     tokenizerOverride: "anthropic/claude-3.5-haiku",
   },
-  // GPT-5.6 Sol - flagship tier of the GPT-5.6 family, released July 9, 2026.
-  // Sol/Terra/Luna are durable capability tiers; the bare `gpt` alias tracks the
-  // latest flagship GPT tier (previously gpt-5.5, which stays usable as the
-  // custom model string `openai:gpt-5.5`). $5/M input, $30/M output; 1M context
-  // (launch value). Native "max" reasoning effort is available across the GPT-5.6 family.
+  // September 22 releases: keep the durable gpt/sol and luna aliases on their
+  // latest tiers without moving users to the more expensive Astra tier. Retired
+  // GPT-5.6 Sol/Luna remain usable as custom model strings with their own metadata.
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-5.6-sol",
+    providerModelId: "gpt-6-sol",
     aliases: ["gpt", "sol"],
     warm: true,
-    // GPT-5.6 tokenizer not published upstream; reuse gpt-5 for approximate
-    // counting (same approach as gpt-5.5).
+    // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
   },
   // GPT-5.6 Terra - balanced everyday tier, released July 9, 2026.
@@ -115,19 +112,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["terra"],
     tokenizerOverride: "openai/gpt-5",
   },
-  // GPT-5.6 Luna - fastest, most cost-efficient tier, released July 9, 2026.
-  // $0.20/M input, $1.20/M output; 1.05M context (GA model page; 400K was a stale launch value).
-  GPT_56_LUNA: {
+  // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
+  GPT_6_LUNA: {
     provider: "openai",
-    providerModelId: "gpt-5.6-luna",
+    providerModelId: "gpt-6-luna",
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
-  // GPT-6 Astra - Released September 3, 2026; OpenAI's frontier tier above the
-  // GPT-5.6 family (API id `gpt-6-astra`, no bare `gpt-6` alias). The bare `gpt`
-  // alias stays on Sol: Astra bills 2x Sol's rates, and ordering after the GPT-5.6
-  // tiers keeps Sol as the first 1.05M-context candidate for compaction "switch
-  // model" suggestions. Not warmed: its tokenizer override is already warmed via GPT.
+  // Astra stays a separate frontier-tier choice rather than taking over `gpt`.
+  // Not warmed: its tokenizer override is already warmed via GPT.
   GPT_6_ASTRA: {
     provider: "openai",
     providerModelId: "gpt-6-astra",
@@ -321,6 +314,8 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:gpt-5.6-sol": "openai/gpt-5",
+  "openai:gpt-5.6-luna": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {

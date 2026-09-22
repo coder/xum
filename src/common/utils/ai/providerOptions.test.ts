@@ -1803,6 +1803,32 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai?.reasoningMode).toBe("pro");
     });
 
+    test.each(["openai:gpt-6-sol", "openai:gpt-6-luna"])(
+      "preserves none/max and gates pro by wire format for %s",
+      (model) => {
+        expect(buildWithMode(model, "standard")?.reasoningEffort).toBe("none");
+        const options = buildWithMode(model, "pro", { thinkingLevel: "max" });
+        expect(options?.reasoningEffort).toBe("max");
+        expect(options?.reasoningMode).toBe("pro");
+        expect(buildWithMode(model, "standard")?.reasoningMode).toBeUndefined();
+        expect(
+          buildWithMode(model, "pro", {
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+          })?.reasoningMode
+        ).toBeUndefined();
+        expect(buildWithMode(`${model}-mini`, "pro")?.reasoningMode).toBeUndefined();
+        for (const id of [model, `${model}-2026-09-22`, "openai:team-model"]) {
+          const chatOptions = buildWithMode(id, "pro", {
+            thinkingLevel: "max",
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+            providersConfig: createMockProvidersConfig({ "openai:team-model": model }),
+          });
+          expect(chatOptions?.reasoningEffort).toBe("none");
+          expect(chatOptions?.reasoningMode).toBeUndefined();
+        }
+      }
+    );
+
     test("supports pro mode across the GPT-5.6 family", () => {
       for (const model of [
         "openai:gpt-5.6",
