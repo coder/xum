@@ -277,8 +277,7 @@ describe("descendant activity hints", () => {
   });
 
   test("monitors arming and retiring on an unchanged child flip the snapshot and the row", () => {
-    // Same mounted tray, same metadata: only the child's monitor count moves 0 -> 1 -> 0
-    // while a stale live hint stays true throughout.
+    // Only the monitor count moves 0 -> 1 -> 0; the stale live hint stays true throughout.
     const keys = [0, 1, 0].map((count) =>
       encodeDescendantActivity([completed.id], () =>
         sidebarState({ activeBashMonitorCount: count, canInterrupt: true })
@@ -309,7 +308,6 @@ describe("descendant activity hints", () => {
   test("counts monitored children, not monitors, and partial retirement stays active", () => {
     const two = encodeDescendantActivity([reported.id], () => monitors(2));
     const one = encodeDescendantActivity([reported.id], () => monitors(1));
-    // 2 -> 1 is invisible to the tray: same snapshot, still one active child.
     expect(one).toBe(two);
     expect(isSubAgentActive(reported, decodeDescendantActivity(two).get(reported.id))).toBe(true);
   });
@@ -341,8 +339,8 @@ describe("descendant activity hints", () => {
       taskExecutionStatus: "running",
     });
     expect(isSubAgentActive(reawakened, decode(reawakened, noMonitor))).toBe(true);
-    // An interrupted task without a finalized report may still be streaming: the
-    // sidebar-compatible live hint decides, exactly as it does for the sidebar.
+    // An interrupted child without a finalized report may still be streaming, so the
+    // live hint decides, as it does for the sidebar.
     const interrupted = workspace("interrupted", { taskStatus: "interrupted" });
     expect(isSubAgentActive(interrupted, decode(interrupted, noMonitor))).toBe(false);
     expect(isSubAgentActive(interrupted, decode(interrupted, live))).toBe(true);

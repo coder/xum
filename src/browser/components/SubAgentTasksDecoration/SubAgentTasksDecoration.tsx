@@ -41,10 +41,9 @@ const RUN_DISCOVERY_RETRY_BASE_MS = 1_000;
 const RUN_DISCOVERY_RETRY_MAX_MS = 30_000;
 
 /**
- * Live-store hints for one descendant, read from its WorkspaceStore sidebar state.
- * Task metadata alone cannot tell that a reported child is still waiting on an armed
- * background bash monitor (#4327); these hints feed the same delegated-activity
- * predicate the sidebar uses so the tray and the sidebar agree.
+ * Live-store hints for one descendant. Task metadata alone cannot tell that a reported
+ * child is still waiting on an armed background bash monitor (#4327); these hints feed
+ * the same delegated-activity predicate the sidebar uses so both surfaces agree.
  */
 export interface DescendantActivityHints {
   hasActiveBashMonitor: boolean;
@@ -61,11 +60,9 @@ const HINT_ENTRY_SEPARATOR = "\u0000";
 const HINT_FLAGS_SEPARATOR = "\u0001";
 
 /**
- * Encode every descendant's hints into one primitive so a useSyncExternalStore
- * snapshot stays Object.is-stable across recomputes, while any monitor-only change
- * and a monitor moving between two children (same active total) still re-render.
- * Only presentation-relevant booleans are encoded, so 2 -> 1 monitors is a no-op.
- * A descendant whose sidebar state is missing (removed mid-render) reads as no hints.
+ * One primitive keeps the useSyncExternalStore snapshot Object.is-stable across
+ * recomputes, while per-child booleans still re-render when a monitor arms, retires,
+ * or moves between children. Counts are not encoded, so 2 -> 1 monitors is a no-op.
  */
 export function encodeDescendantActivity(
   workspaceIds: readonly string[],
@@ -510,12 +507,11 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     }
     return ids.join("\u0000");
   });
-  // Per-descendant live hints (armed monitors, sidebar "working" signal): the same
-  // store publishes monitor-count changes through states.bump, and the encoded
-  // primitive re-renders only when some child's presentation-relevant flag moved.
+  // Per-descendant live hints (armed monitors, sidebar "working" signal), subscribed and
+  // encoded for the same reasons as activeRunIdsKey above.
   const descendantActivityKey = useSyncExternalStore(workspaceStore.subscribe, () =>
     encodeDescendantActivity(descendantWorkspaceIds, (workspaceId) =>
-      // A descendant removed between metadata and store updates has no state yet/anymore.
+      // Metadata can lead or trail store registration; an unregistered descendant has no state.
       workspaceStore.hasRegisteredWorkspace(workspaceId)
         ? workspaceStore.getWorkspaceSidebarState(workspaceId)
         : null
@@ -690,7 +686,6 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     return null;
   }
 
-  // Counts children, not monitors: a child with several armed monitors is one active row.
   const activeCount = subAgents.filter(({ workspace }) =>
     isSubAgentActive(workspace, descendantActivity.get(workspace.id))
   ).length;

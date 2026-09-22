@@ -169,8 +169,8 @@ export const BackgroundMonitor: AppStory = {
     // Store propagation through activity -> sidebar state -> both surfaces can exceed the
     // 1s default on loaded CI runners.
     const settle = (assertion: () => Promise<void>) => waitFor(assertion, { timeout: 5_000 });
-    // Both surfaces read the same store, so the sidebar row (the fixed #4328 side) and
-    // the composer tray must agree at every step (#4327).
+    // Both surfaces read the same store, so the sidebar row (#4328) and the composer
+    // tray (#4327) must agree at every step.
     const expectMonitored = (monitorCount = 1) =>
       settle(async () => {
         await expect(workspaceStore.getWorkspaceSidebarState(MONITORED_CHILD_ID)).toMatchObject({
