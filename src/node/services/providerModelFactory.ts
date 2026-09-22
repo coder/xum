@@ -2883,8 +2883,13 @@ export class ProviderModelFactory {
         ...providerConfig,
         headers: buildAppAttributionHeaders(providerConfig.headers),
       };
+      // A blank configured base URL counts as unset (same as
+      // resolveConfigBaseUrl in the credential resolver), so it never shadows a
+      // proxy supplied via *_BASE_URL for any of the three providers below.
       const configuredBaseURL =
-        typeof providerConfig.baseURL === "string" ? providerConfig.baseURL : undefined;
+        typeof providerConfig.baseURL === "string" && providerConfig.baseURL.trim() !== ""
+          ? providerConfig.baseURL
+          : undefined;
 
       const creds = resolveProviderCredentials(providerName, providerConfig);
 
@@ -2971,13 +2976,8 @@ export class ProviderModelFactory {
         }
         case "google": {
           // Mirrors the generic provider branch of createModelCoreEffect
-          // (credential merge; env base URL whenever config sets no usable one —
-          // an empty string counts as unset there, so it must here too, or an
-          // empty `google.baseURL` would bypass a GOOGLE_BASE_URL proxy).
-          effectiveBaseURL =
-            configuredBaseURL !== undefined && configuredBaseURL.trim() !== ""
-              ? configuredBaseURL
-              : creds.baseUrl;
+          // (credential merge; env base URL when config sets no usable one).
+          effectiveBaseURL = configuredBaseURL ?? creds.baseUrl;
           const configWithCreds = {
             ...providerConfig,
             apiKey: creds.apiKey,

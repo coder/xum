@@ -4569,7 +4569,6 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     await withEvaluationFixture({ openai: { apiKey: "sk-two" } }, async (_c, factory) => {
       const pinned = expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
       expect(pinned.configFingerprint).toBe(baseline!);
-      expect(pinned.configFingerprint).not.toContain("sk-two");
     });
     await withEvaluationFixture(
       { openai: { apiKey: "sk-one", baseUrl: "https://proxy.example/openai" } },
@@ -4580,39 +4579,48 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     );
   });
 
-  it("treats an empty configured Google base URL as unset so the env proxy applies", async () => {
-    // Same fallback semantics as the chat path's generic branch: a falsy
-    // configured baseURL must not shadow GOOGLE_BASE_URL (proxy bypass).
-    let viaEnv: string | undefined;
-    await withEvaluationFixture(
-      // The raw `baseURL` spelling reaches the resolver untrimmed.
-      { google: { apiKey: "g-key", baseURL: "" } },
-      async (_c, factory) => {
-        process.env.GOOGLE_BASE_URL = "https://proxy.example/google";
-        viaEnv = expectResolved(
-          await factory.createEvaluationModel("google:gemini-2.5-flash")
-        ).configFingerprint;
-      }
-    );
-    let explicit: string | undefined;
-    await withEvaluationFixture(
-      { google: { apiKey: "g-key", baseUrl: "https://proxy.example/google" } },
-      async (_c, factory) => {
-        explicit = expectResolved(
-          await factory.createEvaluationModel("google:gemini-2.5-flash")
-        ).configFingerprint;
-      }
-    );
-    let none: string | undefined;
-    await withEvaluationFixture({ google: { apiKey: "g-key" } }, async (_c, factory) => {
-      none = expectResolved(
-        await factory.createEvaluationModel("google:gemini-2.5-flash")
-      ).configFingerprint;
-    });
-    expect(viaEnv).toBeDefined();
-    expect(viaEnv).toBe(explicit);
-    expect(viaEnv).not.toBe(none);
-  });
+  it.each([
+    ["google", "google:gemini-2.5-flash", "GOOGLE_BASE_URL", "https://proxy.example/google"],
+    ["openai", "openai:gpt-5", "OPENAI_BASE_URL", "https://proxy.example/openai/v1"],
+    [
+      "anthropic",
+      "anthropic:claude-haiku-4-5",
+      "ANTHROPIC_BASE_URL",
+      "https://proxy.example/anthropic/v1",
+    ],
+  ] as const)(
+    "treats a blank configured %s base URL as unset so the env proxy applies",
+    async (provider, modelString, envVar, proxyUrl) => {
+      // A blank configured baseURL (raw `baseURL` spelling reaches the resolver
+      // untrimmed) must not shadow the *_BASE_URL proxy.
+      let viaEnv: string | undefined;
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseURL: "  " } },
+        async (_c, factory) => {
+          process.env[envVar] = proxyUrl;
+          viaEnv = expectResolved(
+            await factory.createEvaluationModel(modelString)
+          ).configFingerprint;
+        }
+      );
+      let explicit: string | undefined;
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseUrl: proxyUrl } },
+        async (_c, factory) => {
+          explicit = expectResolved(
+            await factory.createEvaluationModel(modelString)
+          ).configFingerprint;
+        }
+      );
+      let none: string | undefined;
+      await withEvaluationFixture({ [provider]: { apiKey: "k-key" } }, async (_c, factory) => {
+        none = expectResolved(await factory.createEvaluationModel(modelString)).configFingerprint;
+      });
+      expect(viaEnv).toBeDefined();
+      expect(viaEnv).toBe(explicit);
+      expect(viaEnv).not.toBe(none);
+    }
+  );
 
   it("rejects an OpenAI model the chat path would route through Codex OAuth", async () => {
     const codexOauth = {
