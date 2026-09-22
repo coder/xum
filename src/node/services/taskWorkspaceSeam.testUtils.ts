@@ -92,6 +92,9 @@ export function makeAgentTaskIntegrationFake(
     acknowledgeAgentReports: () => Promise.resolve(new Set<string>()),
     backgroundForegroundWaitsForWorkspace: () => 0,
     markInterruptedTaskRunning: () => Promise.resolve(false),
+    // Fakes model non-task hosts by default: nothing is a prepared task row here.
+    preflightTaskWorkspacePreparation: (workspaceId: string) =>
+      Promise.resolve(Ok({ kind: "exempt" as const, workspaceId, exemption: "root" as const })),
     admitTaskWorkspaceTurn: () => ({ kind: "not-a-task" as const }),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,

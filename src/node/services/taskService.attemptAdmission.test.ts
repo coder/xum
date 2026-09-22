@@ -212,8 +212,15 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       config,
       projectPath,
       [
-        projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
-        ...descendants.map(({ id, overrides, inProjectDir }) => ({
+        // Project-dir local runtimes execute in the project root: the root's checkout IS the
+        // project directory, and every local task child shares it (the checkout-preparation
+        // authority of a shared child derives from this same-path ancestry). `inProjectDir`
+        // is retained for callers that spell the intent out.
+        {
+          ...projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
+          path: projectPath,
+        },
+        ...descendants.map(({ id, overrides, inProjectDir: _inProjectDir }) => ({
           ...projectWorkspace(projectPath, id, id, {
             parentWorkspaceId: rootId,
             agentType: "explore",
@@ -223,7 +230,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             runtimeConfig: { type: "local" },
             ...overrides,
           }),
-          ...(inProjectDir ? { path: projectPath } : {}),
+          path: projectPath,
         })),
       ],
       testTaskSettings(4, 3)
@@ -294,6 +301,23 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         for (const listener of supersededListeners) listener(workspaceId, previous, next);
       },
     };
+  }
+
+  /**
+   * The fence requires the checkout-preparation authority the async preflight captured for a
+   * host-local task row; roots and off-host rows ignore it. Every direct fence call in these
+   * tests goes through here so the token binds a real authority.
+   */
+  async function admitWithPreparation(
+    taskService: TaskService,
+    workspaceId: string,
+    options: Parameters<TaskService["admitTaskWorkspaceTurn"]>[1]
+  ): Promise<TaskTurnAdmission> {
+    const preflight = await taskService.preflightTaskWorkspacePreparation(workspaceId);
+    return taskService.admitTaskWorkspaceTurn(workspaceId, {
+      ...options,
+      ...(preflight.success ? { preparation: preflight.data } : {}),
+    });
   }
 
   function admitted(admission: TaskTurnAdmission): TurnAdmissionToken {
@@ -654,7 +678,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const { taskService } = createHarness(config);
       const svc = internals(taskService);
       const oldToken = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       svc.attemptSettlementByTaskId.set(taskId, {
         attemptId,
@@ -678,7 +702,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         expect(oldToken.admissionStale()).toBe(true);
         const freshToken = admitted(
-          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
         );
         expect(freshToken.admissionStale()).toBe(false);
         freshToken.onDisposed("no-work");
@@ -737,7 +761,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // The historical report still decides the task's outcome for its ancestors.
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
       const sendToken = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect(svc.admittedSendsByTaskId.get(taskId)?.size).toBe(1);
       for (const send of svc.admittedSendsByTaskId.get(taskId) ?? []) {
@@ -753,7 +777,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(false);
       expect(entryOf(config, taskId)?.taskAttemptId).toBe(continuedAttemptId);
       const resumeToken = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect(resumeToken.admissionStale()).toBe(false);
       resumeToken.onDisposed("no-work");
@@ -849,7 +873,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const { taskService } = createHarness(config);
         const svc = internals(taskService);
         const oldToken = admitted(
-          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
         );
         const settlement = { attemptId, phase: "settled" as const, source: "idle-settled" };
         svc.attemptSettlementByTaskId.set(taskId, settlement);
@@ -1138,7 +1162,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         let pending: TurnAdmissionToken | undefined;
         if (race === "pending-before-decision") {
           pending = admitted(
-            taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+            await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
           );
         }
         // A send reaching the fence after the producer sampled activity but before its config
@@ -1148,7 +1172,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         spyOn(taskService, "editWorkspaceEntry").mockImplementation(
           async (id, updater, options) => {
             if (id === taskId && raced == null) {
-              raced = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" });
+              raced = await admitWithPreparation(taskService, taskId, {
+                acceptanceOrigin: "automatic",
+              });
               if (raced.kind === "admitted") raced.token.onAdmitted(Symbol("late-turn"));
             }
             return edit(id, updater, options);
@@ -1307,7 +1333,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // WorkspaceService binds the obligation, the send fails before a turn: the token is refused
       // and the status restored.
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       token.onDisposed("refused");
       await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted");
@@ -1334,7 +1360,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: rotated,
         phase: "settled",
       });
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+      ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
       });
@@ -1414,10 +1442,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // revoked by the commit), never against an id that is not published yet.
       const edit = svc.editActiveWorkspaceEntry.bind(taskService);
       const racing: TurnAdmissionToken[] = [];
-      spyOn(svc, "editActiveWorkspaceEntry").mockImplementation((...args) => {
+      spyOn(svc, "editActiveWorkspaceEntry").mockImplementation(async (...args) => {
         if (args[0] === taskId && racing.length === 0) {
           racing.push(
-            admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" }))
+            admitted(
+              await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+            )
           );
         }
         return edit(...args);
@@ -1445,7 +1475,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: winner,
       });
       const next = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect([...svc.admittedSendsByTaskId.get(taskId)!].map((s) => s.attemptId)).toEqual([winner]);
       expect(next.admissionStale()).toBe(false);
@@ -1542,7 +1572,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           attemptId: fresh,
           ownedAttempt: svc.ownedAttemptByTaskId.get(taskId),
         });
-        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        expect(
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+        ).toEqual({
           kind: "refused",
           message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
         });
@@ -1563,7 +1595,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "terminal-no-report",
         });
-        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        expect(
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+        ).toEqual({
           kind: "refused",
           message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
         });
@@ -1581,7 +1615,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // nobody owns it yet) rather than refusing or binding to the predecessor.
       const fresh = entryOf(config, taskId)!.taskAttemptId!;
       const gapSend = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       const sends = [...svc.admittedSendsByTaskId.get(taskId)!];
       expect(sends.map((s) => s.attemptId)).toEqual([fresh]);
@@ -1647,7 +1681,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
       expect(svc.currentAttemptIdByTaskId.has(taskId)).toBe(false);
       // The predecessor is closed by that Stop; a recovery initiated afterwards is a new decision.
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+      ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
       });
@@ -1677,7 +1713,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(committed).not.toBe(successor);
       // Nothing of the successor's admission is touched: the fence binds to it, unowned.
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect([...svc.admittedSendsByTaskId.get(taskId)!].map((s) => s.attemptId)).toEqual([
         successor,
@@ -1725,7 +1761,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
         const owned = entryOf(config, taskId)!.taskAttemptId!;
         const token = admitted(
-          taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
         );
         expect(token.admissionStale()).toBe(false);
         const load =
@@ -1760,7 +1796,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const owned = entryOf(config, taskId)!.taskAttemptId!;
       expect(svc.currentAttemptIdByTaskId.get(taskId)).toBe(owned);
       const beforeRotation = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect(beforeRotation.admissionStale()).toBe(false);
 
@@ -1784,7 +1820,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(beforeRotation.admissionStale()).toBe(true);
       beforeRotation.onDisposed("refused");
       const afterRotation = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       const sends = [...svc.admittedSendsByTaskId.get(taskId)!];
       expect(sends).toHaveLength(1);
@@ -1857,19 +1893,19 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         let racingToken: TurnAdmissionToken | undefined;
         let liveTurn: symbol | undefined;
         const host = hostWithTurnEvents({
-          sendMessage: mock((workspaceId: string) => {
+          sendMessage: mock(async (workspaceId: string) => {
             // The entry is persisted and announced, so a concurrent (user/peer) send reaches the
             // fence while the launch send is in flight and is admitted under the launch's attempt:
             // still in its own preflight (pending) or already the live turn (admitted) when the
             // launch fails.
             racingToken = admitted(
-              taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+              await admitWithPreparation(taskService, workspaceId, { acceptanceOrigin: "manual" })
             );
             if (racing.startsWith("admitted")) {
               racingToken.onAdmitted(racingTurn);
               liveTurn = racingTurn;
             }
-            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+            return Err({ type: "unknown", raw: "provider unavailable" });
           }),
           clearQueue: mock(() => {
             order.push("clearQueue");
@@ -1957,7 +1993,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           );
           expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
           expect(
-            taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" })
+            await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "manual" })
           ).toEqual({
             kind: "refused",
             message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2058,7 +2094,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         // B's row stays open to its own writer's sends (bound unowned here).
         expect(
-          taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" }).kind
+          await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "manual" }).kind
         ).toBe("admitted");
       } finally {
         rollbackSpy.mockRestore();
@@ -2084,12 +2120,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         let liveTurn: symbol | undefined;
         let launchSendFailed = false;
         const host = hostWithTurnEvents({
-          sendMessage: mock((workspaceId: string) => {
+          sendMessage: mock(async (workspaceId: string) => {
             if (liveness !== "idle") {
               // A user send admitted under A while the launch send is in flight: still in its
               // own preflight (pending) or already the live turn (admitted) when the launch fails.
               racingToken = admitted(
-                taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+                await admitWithPreparation(taskService, workspaceId, { acceptanceOrigin: "manual" })
               );
               if (liveness === "admitted") {
                 racingToken.onAdmitted(racingTurn);
@@ -2097,7 +2133,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
               }
             }
             launchSendFailed = true;
-            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+            return Err({ type: "unknown", raw: "provider unavailable" });
           }),
           getActiveTurnGeneration: mock(() => liveTurn),
         });
@@ -2216,14 +2252,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       let racingToken: TurnAdmissionToken | undefined;
       let liveTurn: symbol | undefined;
       const host = hostWithTurnEvents({
-        sendMessage: mock((workspaceId: string) => {
+        sendMessage: mock(async (workspaceId: string) => {
           // A user send admitted under A is already the live turn when the launch fails.
           racingToken = admitted(
-            taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
+            await admitWithPreparation(taskService, workspaceId, { acceptanceOrigin: "manual" })
           );
           racingToken.onAdmitted(racingTurn);
           liveTurn = racingTurn;
-          return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
+          return Err({ type: "unknown", raw: "provider unavailable" });
         }),
         getActiveTurnGeneration: mock(() => liveTurn),
       });
@@ -2392,16 +2428,20 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       ]);
       const { taskService } = createHarness(config);
       const svc = internals(taskService);
-      expect(taskService.admitTaskWorkspaceTurn(rootId, { acceptanceOrigin: "manual" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, rootId, { acceptanceOrigin: "manual" })
+      ).toEqual({
         kind: "not-a-task",
       });
-      expect(taskService.admitTaskWorkspaceTurn(legacy, { acceptanceOrigin: "manual" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, legacy, { acceptanceOrigin: "manual" })
+      ).toEqual({
         kind: "not-a-task",
       });
       expect(await taskService.markInterruptedTaskRunning(owned)).toBe(true);
       const attemptId = entryOf(config, owned)!.taskAttemptId!;
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(owned, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, owned, { acceptanceOrigin: "automatic" })
       );
       expect(token.admissionStale()).toBe(false);
       const [send] = [...svc.admittedSendsByTaskId.get(owned)!];
@@ -2409,7 +2449,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // A closure recorded for the current id refuses further sends and marks the token stale.
       svc.closeAttemptAdmission(owned, attemptId, undefined, "test");
       expect(token.admissionStale()).toBe(true);
-      expect(taskService.admitTaskWorkspaceTurn(owned, { acceptanceOrigin: "automatic" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, owned, { acceptanceOrigin: "automatic" })
+      ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
       });
@@ -2433,10 +2475,10 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const svc = internals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const pending = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       const adopted = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       const turn = Symbol("turn");
       adopted.onAdmitted(turn);
@@ -2468,7 +2510,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // Legitimate reawaken publishes a fresh id; the fence admits it and installs ownership.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const fresh = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
       );
       expect(fresh.admissionStale()).toBe(false);
       expect(svc.attemptSettlementByTaskId.get(taskId)).toBeUndefined();
@@ -2496,7 +2538,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       shortenTerminationTimers();
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
 
       await taskService.terminateAllDescendantAgentTasks(rootId);
@@ -2528,12 +2570,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         kind: "terminal-no-report",
       });
       // Settlement closed the attempt: a continuation is refused; only a reawaken reopens.
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })).toEqual(
-        {
-          kind: "refused",
-          message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
-        }
-      );
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
+      ).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
     });
 
     test("supersession rebinds admitted obligations and captured turns to the successor", async () => {
@@ -2555,7 +2597,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       shortenTerminationTimers();
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       token.onAdmitted(first);
       activeTurn = first;
@@ -2597,17 +2639,17 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       shortenTerminationTimers();
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const beforeStop = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       beforeStop.onDisposed("no-work");
       await taskService.terminateAllDescendantAgentTasks(rootId);
       // Stop in progress (cleanup hung): refused with the stop message, no obligation created.
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })).toEqual(
-        {
-          kind: "refused",
-          message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
-        }
-      );
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
+      ).toEqual({
+        kind: "refused",
+        message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+      });
       expect(internals(taskService).admittedSendsByTaskId.get(taskId)).toBeUndefined();
     });
 
@@ -2649,7 +2691,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         kind: "terminal-no-report",
       });
       expect(
-        taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "automatic" })
       ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
@@ -2695,7 +2737,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         kind: "cleanup-pending",
       });
       expect(
-        taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, spawnedId, { acceptanceOrigin: "automatic" })
       ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
@@ -2728,7 +2770,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const svc = internals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
       );
       await svc.releaseSharedDesktopTaskOnUserStop(taskId);
       // The pending send keeps the task live: no transition, no closure.
@@ -2764,16 +2806,16 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "stop-settled",
       });
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })).toEqual(
-        {
-          kind: "refused",
-          message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
-        }
-      );
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "automatic" })
+      ).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
       // A user reawaken mints a fresh id and reopens admission.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(attemptId);
-      const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+      const fresh = await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" });
       expect(fresh.kind).toBe("admitted");
       if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");
     });
@@ -2808,7 +2850,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           ): ReturnType<WorkspaceHost["sendMessage"]> => {
             await args[3]?.onAccepted?.();
             const token = admitted(
-              harness.taskService!.admitTaskWorkspaceTurn(args[0], {
+              await admitWithPreparation(harness.taskService!, args[0], {
                 acceptanceOrigin: "automatic",
               })
             );
@@ -2865,7 +2907,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       });
       // The stop is not permanent: a later reawaken mints a fresh id and is admitted again.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+      const fresh = await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" });
       expect(fresh.kind).toBe("admitted");
       if (fresh.kind === "admitted") fresh.token.onDisposed("no-work");
     });
@@ -2888,7 +2930,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           async (
             ...args: Parameters<WorkspaceHost["sendMessage"]>
           ): ReturnType<WorkspaceHost["sendMessage"]> => {
-            const admission = harness.taskService!.admitTaskWorkspaceTurn(args[0], {
+            const admission = await admitWithPreparation(harness.taskService!, args[0], {
               acceptanceOrigin: "automatic",
             });
             if (admission.kind === "refused") {
@@ -3012,7 +3054,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           },
         ]);
         const { taskService } = createHarness(config);
-        expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        expect(
+          await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+        ).toEqual({
           kind: "refused",
           message: retiredAttemptMessage(claim),
         });
@@ -3035,7 +3079,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         return { projects: new Map() } as unknown as ReturnType<Config["loadConfigOrDefault"]>;
       });
       try {
-        const admission = taskService.admitTaskWorkspaceTurn(taskId, {
+        const admission = await admitWithPreparation(taskService, taskId, {
           acceptanceOrigin: "manual",
         });
         expect(admission.kind).toBe("refused");

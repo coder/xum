@@ -24,6 +24,12 @@ import {
   type PreparedTurnRequest,
   type TurnRequestBuildContext,
 } from "./turnRequestBuilder";
+import {
+  captureTaskCheckoutAuthorization,
+  isTaskCheckoutAuthorizationCurrent,
+  taskCheckoutStaleMessage,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 export { replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
 
@@ -914,6 +920,21 @@ export class AIService extends EventEmitter {
     }
   }
 
+  /**
+   * Synchronous provider-start fence for the checkout-preparation authorization: throws (into
+   * streamMessage's pre-start error path) when the fresh registry no longer derives `captured`.
+   * Nothing captured is not an allow — only a fresh exemption (root / off-host row) passes then.
+   */
+  private assertTaskCheckoutAuthorizationBeforeStart(
+    workspaceId: string,
+    captured: TaskCheckoutAuthorization | undefined
+  ): void {
+    const check = isTaskCheckoutAuthorizationCurrent(this.config, workspaceId, captured);
+    if (!check.current) {
+      throw new Error(taskCheckoutStaleMessage(workspaceId, check.reason));
+    }
+  }
+
   /** Stream a message conversation to the AI model. */
   async streamMessage(
     opts: StreamMessageOptions,
@@ -954,9 +975,16 @@ export class AIService extends EventEmitter {
         if (combinedAbortSignal.aborted) {
           return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         }
+        // Mock playback has no request builder: capture the checkout-preparation authorization
+        // here (async, bounded), then re-check it synchronously right before playback starts.
+        const mockPreparation = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+        if (!mockPreparation.success) {
+          return Err({ type: "unknown", raw: mockPreparation.error });
+        }
         if (!combinedAbortSignal.aborted) await opts.assertAdmissionCurrent?.();
         if (combinedAbortSignal.aborted)
           return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
+        this.assertTaskCheckoutAuthorizationBeforeStart(workspaceId, mockPreparation.data);
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
@@ -1018,6 +1046,14 @@ export class AIService extends EventEmitter {
         buildOutcome.logStartOutcome("stream_start_failed", "stop_in_progress");
         pendingStart.abort("startup");
       }
+      // Checkout-preparation gate, immediately before the provider start and after every await
+      // of the build (prepared candidates included): the authorization the builder captured must
+      // still be what the fresh registry derives — strict, config only. Every tokenless path
+      // (auto-retry, compaction follow-up, heartbeat, goal turn) passes through here.
+      this.assertTaskCheckoutAuthorizationBeforeStart(
+        workspaceId,
+        buildOutcome.turnExecutionOptions.preparationAuthorization
+      );
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);

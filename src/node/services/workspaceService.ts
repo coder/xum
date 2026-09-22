@@ -378,6 +378,7 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import type { TaskCheckoutAuthorization } from "@/node/services/taskCheckoutAuthorization";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -12128,6 +12129,32 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     });
   }
 
+  /**
+   * Checkout-preparation preflight for a stream-starting entry point (sendMessage/resumeStream):
+   * runs the task integration's async, bounded validation for an agent-task workspace (a row with
+   * a parent) that will mint its own obligation here. Resolves `undefined` when nothing has to be
+   * captured — no integration, a root, or a caller-minted token (already admitted under its own
+   * authority). A refusal is the sender's error; nothing downstream runs.
+   */
+  private async preflightTaskPreparationForSend(
+    workspaceId: string,
+    callerToken: TurnAdmissionToken | undefined
+  ): Promise<Result<TaskCheckoutAuthorization | undefined, SendMessageError>> {
+    const integration = this.agentTaskIntegration;
+    if (integration == null || callerToken != null) return Ok(undefined);
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (entry?.parentWorkspaceId == null) return Ok(undefined);
+    const preflight = await integration.preflightTaskWorkspacePreparation(workspaceId);
+    if (!preflight.success) {
+      log.debug("send refused by the checkout-preparation preflight", {
+        workspaceId,
+        message: preflight.error,
+      });
+      return Err({ type: "unknown", raw: preflight.error });
+    }
+    return Ok(preflight.data);
+  }
+
   async sendMessage(
     workspaceId: string,
     message: string,
@@ -12166,11 +12193,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
     };
     let taskTurnAdmissionComposed = false;
+    // The checkout-preparation authority the async preflight below captured for an agent-task
+    // workspace; the fence (and the manual rescue) re-check it against the fresh registry.
+    let taskPreparation: TaskCheckoutAuthorization | undefined;
     const admitTaskTurn = (): Result<void, SendMessageError> => {
       if (taskTurnAdmissionComposed) return Ok(undefined);
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(taskPreparation != null ? { preparation: taskPreparation } : {}),
         });
         if (admission == null || admission.kind === "not-a-task") return Ok(undefined);
         if (admission.kind === "refused") {
@@ -12195,6 +12226,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Ok(undefined);
     };
     try {
+      // Checkout-preparation preflight (async, bounded) for a send that will mint its own
+      // obligation into an agent-task workspace: BEFORE the synchronous entry checks below, so
+      // those stay in one synchronous block with the preflight counter they pair with. A
+      // caller-minted token was admitted under its own authority; roots never preflight.
+      const preflight = await this.preflightTaskPreparationForSend(workspaceId, taskTurnAdmission);
+      if (!preflight.success) return preflight;
+      taskPreparation = preflight.data;
+
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
         log.debug("sendMessage blocked: workspace is being renamed", { workspaceId });
@@ -12730,7 +12769,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(
+            workspaceId,
+            taskPreparation != null ? { preparation: taskPreparation } : undefined
+          )) ?? false;
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under) and before the session's own admission awaits.
@@ -13070,9 +13112,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           Promise.resolve(undefined)
         );
       }
+      // Checkout-preparation preflight (see sendMessage): captured before the rescue so both
+      // the rescue's CAS and the fence below re-check the same authority.
+      const preflight = await this.preflightTaskPreparationForSend(
+        workspaceId,
+        internal?.turnAdmission
+      );
+      if (!preflight.success) return preflight;
+      const taskPreparation = preflight.data;
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
       resumedInterruptedTask =
-        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+        (await this.agentTaskIntegration?.markInterruptedTaskRunning(
+          workspaceId,
+          taskPreparation != null ? { preparation: taskPreparation } : undefined
+        )) ?? false;
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
       // carries the same obligation, bound after the rescue above. Disposed as no-work when the
@@ -13081,6 +13134,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(taskPreparation != null ? { preparation: taskPreparation } : {}),
         });
         if (admission?.kind === "refused") {
           return Err({ type: "unknown", raw: admission.message });
