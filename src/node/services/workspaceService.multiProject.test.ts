@@ -1458,6 +1458,28 @@ describe("WorkspaceService multi-project lifecycle", () => {
           projects: new Map([
             [projectAPath, { workspaces: [], trusted: true }],
             [projectBPath, { workspaces: [], trusted: true }],
+            // The registered multi-project root row: the structural guard refuses
+            // unregistered ids and scans the row's derived per-project paths for aliases.
+            [
+              MULTI_PROJECT_CONFIG_KEY,
+              {
+                workspaces: [
+                  {
+                    id: workspaceId,
+                    name: workspaceName,
+                    path: path.join(rootDir, "src", "_workspaces", workspaceName),
+                    runtimeConfig: {
+                      type: "worktree" as const,
+                      srcBaseDir: path.join(rootDir, "src"),
+                    },
+                    projects: [
+                      { projectPath: projectAPath, projectName: "project-a" },
+                      { projectPath: projectBPath, projectName: "project-b" },
+                    ],
+                  },
+                ],
+              },
+            ],
           ]),
         })),
         sessionsDir: path.join(rootDir, "sessions"),
@@ -1554,6 +1576,28 @@ describe("WorkspaceService multi-project lifecycle", () => {
           projects: new Map([
             [projectAPath, { workspaces: [], trusted: true }],
             [projectBPath, { workspaces: [], trusted: true }],
+            // The registered multi-project root row: the structural guard refuses
+            // unregistered ids and scans the row's derived per-project paths for aliases.
+            [
+              MULTI_PROJECT_CONFIG_KEY,
+              {
+                workspaces: [
+                  {
+                    id: workspaceId,
+                    name: workspaceName,
+                    path: path.join(rootDir, "src", "_workspaces", workspaceName),
+                    runtimeConfig: {
+                      type: "worktree" as const,
+                      srcBaseDir: path.join(rootDir, "src"),
+                    },
+                    projects: [
+                      { projectPath: projectAPath, projectName: "project-a" },
+                      { projectPath: projectBPath, projectName: "project-b" },
+                    ],
+                  },
+                ],
+              },
+            ],
           ]),
         })),
         sessionsDir: path.join(rootDir, "sessions"),
@@ -1672,6 +1716,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         ]),
       };
       const mockConfig: Partial<Config> = {
+        // Structural guard: a root rename holds the registration lock under rootDir.
+        rootDir,
         srcDir,
         loadConfigOrDefault: mock(() => configState),
         findWorkspace: mock(() => ({
@@ -1845,6 +1891,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         ]),
       };
       const mockConfig: Partial<Config> = {
+        // Structural guard: a root rename holds the registration lock under rootDir.
+        rootDir,
         srcDir,
         loadConfigOrDefault: mock(() => configState),
         findWorkspace: mock(() => ({
@@ -2007,6 +2055,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         return Promise.resolve();
       });
       const mockConfig: Partial<Config> = {
+        // Structural guard: a root rename holds the registration lock under rootDir.
+        rootDir,
         srcDir,
         loadConfigOrDefault: mock(() => configState),
         findWorkspace: mock(() => ({
@@ -2200,6 +2250,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         return Promise.resolve();
       });
       const mockConfig: Partial<Config> = {
+        // Structural guard: a root rename holds the registration lock under rootDir.
+        rootDir,
         srcDir,
         loadConfigOrDefault: mock(() => configState),
         findWorkspace: mock(() => ({
@@ -2447,6 +2499,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         return Promise.resolve();
       });
       const mockConfig: Partial<Config> = {
+        // Structural guard: a root rename holds the registration lock under rootDir.
+        rootDir,
         srcDir,
         loadConfigOrDefault: mock(() => configState),
         findWorkspace: mock(() => ({
