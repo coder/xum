@@ -220,6 +220,36 @@ describe("EvaluationModelCard", () => {
     expect(select().value).toBe("");
   });
 
+  test("keeps the controls disabled until the persisted default has been read", async () => {
+    // A selection made before the initial read resolves would be persisted and
+    // then overwritten on screen by that read's older value; the controls stay
+    // disabled until the read lands so no such selection can start.
+    let resolveLoad: (config: { evaluationDefaults?: { model: string } }) => void = () => undefined;
+    apiMock = {
+      config: {
+        getConfig: mock(
+          () =>
+            new Promise<{ evaluationDefaults?: { model: string } }>((resolve) => {
+              resolveLoad = resolve;
+            })
+        ),
+        updateEvaluationDefaults: mock(() => Promise.resolve(undefined)),
+        checkEvaluationModel: mock(() => Promise.resolve({ ok: true as const })),
+      },
+    };
+    const view = render(<EvaluationModelCard />);
+    const select = () => view.getByLabelText("Model") as HTMLSelectElement;
+    const controls = () => select().closest("fieldset");
+
+    await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
+    expect(controls()?.disabled).toBe(true);
+
+    resolveLoad({ evaluationDefaults: { model: "anthropic:claude-haiku-4-5" } });
+
+    await waitFor(() => expect(select().value).toBe("anthropic:claude-haiku-4-5"));
+    expect(controls()?.disabled).toBe(false);
+  });
+
   test("drops models whose built-in id is shadowed by a custom provider", async () => {
     providersConfigMock = { openai: { isCustom: true } };
     const { select } = renderCard();

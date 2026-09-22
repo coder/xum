@@ -125,7 +125,12 @@ export function EvaluationModelCard() {
         keys only (gateway and OAuth routes are rejected). The model must support the
         provider&apos;s structured-output API; unsupported models fail at run time.
       </div>
-      <div className="mt-3 flex items-center gap-2">
+      {/* Disabled until the initial read lands: a selection persisted before
+          then would be overwritten on screen by the older value that read
+          returns, leaving the card behind the on-disk default. A disabled
+          fieldset disables every descendant control, so ModelSelector needs
+          no prop for it. */}
+      <fieldset disabled={!loaded} className="mt-3 flex min-w-0 items-center gap-2">
         <ModelSelector
           value={model}
           emptyLabel="Not set"
@@ -147,7 +152,7 @@ export function EvaluationModelCard() {
             Clear
           </Button>
         ) : null}
-      </div>
+      </fieldset>
       {loaded && hint !== null ? (
         <div role="note" className="text-warning mt-2 text-xs">
           {hint}
