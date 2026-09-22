@@ -3114,9 +3114,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * a reader can only ever see a record whose checkout was pruned, and a
    * refused sanitization publishes nothing.
    *
-   * The lock covers scan + prune + publication so no sibling process can
-   * register the same physical path between the sibling scan and the
-   * publication and have both skip pruning (see acquireRegistrationSanitizeLock).
+   * The registration lock covers prune + publication so no sibling
+   * registration through THIS path can land between the two and have both
+   * skip pruning (see acquireRegistrationSanitizeLock); the sibling scan
+   * itself runs under the prune's checkout and global override locks, which
+   * every writer of the document takes, so an in-place registration that never
+   * takes the registration lock is still seen or excluded (see
+   * prunePluginOverrideKeysForUnregisteredCheckout's `shouldPrune`).
    * Lock order: registration lock → checkout locks → global override lock
    * (both released by the prune) → the config write's own project
    * registration lock inside `publish`; nothing acquires the registration lock
@@ -3144,25 +3148,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err(getErrorMessage(error));
     }
     try {
-      // No own record to exclude: the checkout is unregistered until `publish`. Strict own
-      // read: nothing has proved the store readable yet in this operation.
-      const siblings = await this.findLiveSiblingForCheckout(
-        target.workspacePath,
-        undefined,
-        undefined,
-        /* ownConfigStrict */ true
-      );
-      if (siblings === "none") {
-        try {
-          await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
-            target,
-            "plugin:"
-          );
-        } catch (error) {
-          return Err(unsanitizableOverridesMessage(target.workspacePath, error));
-        }
-      } else if (siblings !== "found") {
-        return Err(siblings.error);
+      try {
+        await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
+          target,
+          "plugin:",
+          {
+            // The sibling scan runs under the checkout locks the prune holds (not merely under
+            // the registration lock): an in-place registration of this path by a process that
+            // takes no registration lock can land, and save consent, at any point before those
+            // locks are held. No own record to exclude — the checkout is unregistered until
+            // `publish`. Strict own read: nothing has proved the store readable yet.
+            shouldPrune: async () => {
+              const siblings = await this.findLiveSiblingForCheckout(
+                target.workspacePath,
+                undefined,
+                undefined,
+                /* ownConfigStrict */ true
+              );
+              if (siblings === "found") return false;
+              if (siblings !== "none") throw new Error(siblings.error);
+              return true;
+            },
+          }
+        );
+      } catch (error) {
+        return Err(unsanitizableOverridesMessage(target.workspacePath, error));
       }
       return Ok(await publish());
     } finally {
