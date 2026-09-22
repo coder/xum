@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
+import type { LanguageModel } from "ai";
+
 import { StreamManager } from "./streamManager";
 import { onTurnEngineEvent } from "./streamManager.testHarness";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+
+const model: LanguageModel = {
+  specificationVersion: "v3",
+  provider: "noop",
+  modelId: "model",
+  supportedUrls: {},
+  doGenerate: () => Promise.reject(new Error("Unexpected generation in notification test")),
+  doStream: () => Promise.reject(new Error("Unexpected stream in notification test")),
+};
 
 describe("StreamManager - model-only tool notifications", () => {
   let historyService: HistoryService;
@@ -20,6 +31,10 @@ describe("StreamManager - model-only tool notifications", () => {
 
   test("strips __mux_notifications before emitting tool-call-end", async () => {
     const streamManager = new StreamManager(historyService);
+    let completed = false;
+    onTurnEngineEvent(streamManager, "stream-end", () => {
+      completed = true;
+    });
 
     // Avoid tokenizer worker usage in unit tests.
     (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
@@ -74,6 +89,8 @@ describe("StreamManager - model-only tool notifications", () => {
       token: "test-token",
       startTime: Date.now(),
       model: "noop:model",
+      // A stream owns its request even when its output comes from a test generator.
+      request: { model, messages: [] },
       historySequence: 1,
       stepStartIndices: [0],
       parts: [],
@@ -97,6 +114,7 @@ describe("StreamManager - model-only tool notifications", () => {
     await (
       method as (workspaceId: string, streamInfo: unknown, historySequence: number) => Promise<void>
     ).call(streamManager, "test-workspace", streamInfo, 1);
+    expect(completed).toBe(true);
 
     const toolEnd = events.find((e) => e.toolName === "bash");
     expect(toolEnd).toBeDefined();
@@ -107,6 +125,10 @@ describe("StreamManager - model-only tool notifications", () => {
 
   test("persists orphan web_search tool-result when tool-call mapping is missing", async () => {
     const streamManager = new StreamManager(historyService);
+    let completed = false;
+    onTurnEngineEvent(streamManager, "stream-end", () => {
+      completed = true;
+    });
 
     // Avoid tokenizer worker usage in unit tests.
     (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
@@ -169,6 +191,8 @@ describe("StreamManager - model-only tool notifications", () => {
       token: "test-token",
       startTime: Date.now(),
       model: "noop:model",
+      // A stream owns its request even when its output comes from a test generator.
+      request: { model, messages: [] },
       historySequence: 1,
       stepStartIndices: [0],
       parts: [],
@@ -192,6 +216,7 @@ describe("StreamManager - model-only tool notifications", () => {
     await (
       method as (workspaceId: string, streamInfo: unknown, historySequence: number) => Promise<void>
     ).call(streamManager, "test-workspace", streamInfo, 1);
+    expect(completed).toBe(true);
 
     const webSearchPart = streamInfo.parts.find(
       (part: { toolCallId?: string }) => part.toolCallId === "orphan-web-search-1"
