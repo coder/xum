@@ -35,8 +35,9 @@ import assert from "@/common/utils/assert";
  * Limits (by design): in-place edits inside a validated directory are not detected (later
  * legitimate consent is allowed); a local writer with access to `.git` can forge the nonce — this
  * is an integrity check against accidental and older-build replacement, not a security boundary;
- * inode reuse alone is not relied upon (the nonce and the admin dir identity must match too).
- * Concurrent access by builds that do not implement this protocol is unsupported.
+ * inode reuse alone is not relied upon (the nonce and the admin dir identity must match too, and
+ * the nonce is claimed BEFORE the sanitizing prune for that reason). Concurrent access by builds
+ * that do not implement this protocol is unsupported.
  */
 export type { TaskCheckoutPreparation };
 
@@ -70,10 +71,14 @@ export type TaskCheckoutPreparationState =
   | { kind: "shared-broken"; detail: string }
   | { kind: "ready"; authority: TaskCheckoutAuthority };
 
+/**
+ * What a `ready` derivation authorized against. Plain JSON data: consumers thread it from the
+ * asynchronous validation to the synchronous admission fence, which re-derives and compares.
+ */
 export interface TaskCheckoutAuthority {
   workspaceId: string;
   kind: "dedicated" | "shared";
-  /** The anchor's proof identity ("" for an ordinary-root anchor). */
+  /** The anchor's proof identity ("" for an ordinary-root anchor). Convenience; also signed. */
   materializationId: string;
   authorizationRevision: string;
   /** Dedicated: the row itself. Shared: the dedicated task or ordinary root the context comes from. */
@@ -81,15 +86,28 @@ export interface TaskCheckoutAuthority {
   anchorPath: string;
   /** Shared: every intermediate shared row walked (child → parent order); dedicated: empty. */
   ancestry: readonly string[];
+  /**
+   * Canonical JSON of EVERY config input the derivation authorized against: the row's own
+   * classification inputs (parent, path, canonical runtime, isolation, the raw proof value) and
+   * the same inputs of every ancestry hop and of the anchor. `assertCurrentTaskCheckoutAuthority`
+   * re-derives this from the current rows and compares it byte for byte, so a proof field, path,
+   * runtime, isolation or parent that changed under an unchanged revision refuses. Attempt ids,
+   * task status and consent content (override documents) are deliberately NOT part of it.
+   */
+  signature: string;
 }
 
-/** Identity captured under the checkout locks, before the proof is built. */
-export interface BoundTaskCheckoutIdentity {
-  materializationId: string;
+/** Physical identity of a checkout, captured (and claimed) BEFORE the prune under its locks. */
+export interface CapturedTaskCheckoutIdentity {
   path: string;
   realpath: string;
   root: { dev: string; ino: string };
   gitdir: { pointer: string; dev: string; ino: string };
+}
+
+/** The claimed identity, re-verified after the prune together with the nonce it carries. */
+export interface BoundTaskCheckoutIdentity extends CapturedTaskCheckoutIdentity {
+  materializationId: string;
 }
 
 type ConfigReader = Pick<Config, "loadConfigOrDefault">;
@@ -99,21 +117,26 @@ const hex16 = () => randomBytes(8).toString("hex");
 export const newMaterializationId = (): string => `mat_${hex16()}`;
 const newAuthorizationRevision = (): string => `rev_${hex16()}`;
 
-/** Sorted-key JSON of the row's runtime config: a full binding (type alone is not enough). */
-export function canonicalRuntimeConfigJson(runtimeConfig: RuntimeConfig | undefined): string {
-  const sort = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(sort);
-    if (value !== null && typeof value === "object") {
+/** Sorted-key JSON (no `undefined` members): the stable serialization proofs and signatures use. */
+function canonicalJson(value: unknown): string {
+  const sort = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(sort);
+    if (node !== null && typeof node === "object") {
       return Object.fromEntries(
-        Object.keys(value as Record<string, unknown>)
+        Object.keys(node as Record<string, unknown>)
           .sort()
-          .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
-          .map((key) => [key, sort((value as Record<string, unknown>)[key])])
+          .filter((key) => (node as Record<string, unknown>)[key] !== undefined)
+          .map((key) => [key, sort((node as Record<string, unknown>)[key])])
       );
     }
-    return value;
+    return node;
   };
-  return JSON.stringify(sort(runtimeConfig ?? null));
+  return JSON.stringify(sort(value ?? null));
+}
+
+/** Sorted-key JSON of the row's runtime config: a full binding (type alone is not enough). */
+export function canonicalRuntimeConfigJson(runtimeConfig: RuntimeConfig | undefined): string {
+  return canonicalJson(runtimeConfig);
 }
 
 function isHostLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
@@ -185,33 +208,83 @@ const isEnoent = (error: unknown): boolean =>
   typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT";
 
 // ---------------------------------------------------------------------------------------------
-// Producer side: bind under the held checkout locks, revalidate before publication
+// Producer side: CLAIM before the prune, BIND after it (same held checkout locks), revalidate
+// before publication
 // ---------------------------------------------------------------------------------------------
 
+/** Read-only capture of a checkout's identity and whether it already carries a nonce. */
+async function captureIdentity(
+  workspacePath: string
+): Promise<{ identity: CapturedTaskCheckoutIdentity; nonce: string | null } | Error> {
+  const realpath = await fsPromises.realpath(workspacePath);
+  const root = await statIds(workspacePath);
+  if (!root.isDirectory) return new Error(`${workspacePath} is not a directory`);
+  const pointer = await readGitAdminDir(workspacePath);
+  const admin = await statIds(pointer);
+  if (!admin.isDirectory) return new Error(`${pointer} is not a directory`);
+  let nonce: string | null = null;
+  try {
+    nonce = (
+      await readSmallRegularFile(
+        path.join(pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE),
+        NONCE_MAX_BYTES
+      )
+    ).trim();
+  } catch (error) {
+    if (!isEnoent(error)) throw error;
+  }
+  return {
+    identity: {
+      path: workspacePath,
+      realpath,
+      root: { dev: root.dev, ino: root.ino },
+      gitdir: { pointer, dev: admin.dev, ino: admin.ino },
+    },
+    nonce,
+  };
+}
+
+function sameCheckoutIdentity(
+  a: CapturedTaskCheckoutIdentity,
+  b: CapturedTaskCheckoutIdentity
+): boolean {
+  return (
+    a.path === b.path &&
+    a.realpath === b.realpath &&
+    a.root.dev === b.root.dev &&
+    a.root.ino === b.root.ino &&
+    a.gitdir.pointer === b.gitdir.pointer &&
+    a.gitdir.dev === b.gitdir.dev &&
+    a.gitdir.ino === b.gitdir.ino
+  );
+}
+
 /**
- * Capture the physical identity of a freshly sanitized dedicated checkout and write the nonce.
- * MUST run inside the prune's held checkout locks (after the prune's writes settled). Refuses a
- * pre-existing nonce: a cooperating materializer never blesses or reuses another generation.
+ * Step 1 of preparation, BEFORE the prune and inside the prune's held checkout locks (its
+ * `shouldPrune` callback): capture the physical identity of the fresh dedicated checkout that
+ * is about to be sanitized and CLAIM it by writing the nonce (durably) into its git admin dir.
+ * Refuses a checkout that already carries a nonce: a cooperating materializer never blesses or
+ * reuses another generation.
+ *
+ * The claim is written before, not after, the prune on purpose: a directory removed and
+ * re-created at the same path can get the SAME root and admin inodes back (observed on Linux),
+ * so device/inode identity alone cannot tell the pruned directory from a replacement, while a
+ * replacement never carries a nonce only this process knows. A claimed checkout whose
+ * preparation then fails is retained unpublished and refused by every later claim.
  */
-export async function bindTaskCheckoutIdentity(
+export async function claimTaskCheckoutIdentity(
   target: { workspacePath: string },
   materializationId: string
-): Promise<BoundTaskCheckoutIdentity | Error> {
-  assert(target.workspacePath.length > 0, "bindTaskCheckoutIdentity: workspacePath required");
-  assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "bindTaskCheckoutIdentity: bad id");
+): Promise<CapturedTaskCheckoutIdentity | Error> {
+  assert(target.workspacePath.length > 0, "claimTaskCheckoutIdentity: workspacePath required");
+  assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "claimTaskCheckoutIdentity: bad id");
   try {
-    const realpath = await fsPromises.realpath(target.workspacePath);
-    const rootBefore = await statIds(target.workspacePath);
-    if (!rootBefore.isDirectory) return new Error(`${target.workspacePath} is not a directory`);
-    const pointer = await readGitAdminDir(target.workspacePath);
-    const adminBefore = await statIds(pointer);
-    if (!adminBefore.isDirectory) return new Error(`${pointer} is not a directory`);
-    const nonceFile = path.join(pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE);
-    try {
-      await fsPromises.lstat(nonceFile);
+    const captured = await captureIdentity(target.workspacePath);
+    if (captured instanceof Error) return captured;
+    const { identity, nonce } = captured;
+    const nonceFile = path.join(identity.gitdir.pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE);
+    if (nonce !== null) {
       return new Error(`${nonceFile} already exists: this checkout carries another preparation`);
-    } catch (error) {
-      if (!isEnoent(error)) throw error;
     }
     const tmp = `${nonceFile}.tmp-${process.pid}-${hex16()}`;
     const handle = await fsPromises.open(tmp, "wx", 0o600);
@@ -222,30 +295,43 @@ export async function bindTaskCheckoutIdentity(
       await handle.close();
     }
     await fsPromises.rename(tmp, nonceFile);
-    const dir = await fsPromises.open(pointer, fsConstants.O_RDONLY);
+    const dir = await fsPromises.open(identity.gitdir.pointer, fsConstants.O_RDONLY);
     try {
       await dir.sync();
     } finally {
       await dir.close();
     }
-    // The directory must not have changed identity while the nonce landed.
-    const rootAfter = await statIds(target.workspacePath);
-    const adminAfter = await statIds(pointer);
-    if (
-      rootAfter.dev !== rootBefore.dev ||
-      rootAfter.ino !== rootBefore.ino ||
-      adminAfter.dev !== adminBefore.dev ||
-      adminAfter.ino !== adminBefore.ino
-    ) {
-      return new Error(`${target.workspacePath} changed identity while binding its preparation`);
+    return identity;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(getErrorMessage(error));
+  }
+}
+
+/**
+ * Step 2, AFTER the prune's writes settled and still inside the same held checkout locks: the
+ * directory must be exactly the one claimed before the prune — same path, realpath, root and
+ * admin device/inode AND carrying this materialization's nonce — only then is the identity bound
+ * (the proof is built from it). Anything else refuses: nothing is written here, so a replacement
+ * is never stamped and never published.
+ */
+export async function bindTaskCheckoutIdentity(
+  target: { workspacePath: string },
+  materializationId: string,
+  expected: CapturedTaskCheckoutIdentity
+): Promise<BoundTaskCheckoutIdentity | Error> {
+  assert(target.workspacePath.length > 0, "bindTaskCheckoutIdentity: workspacePath required");
+  assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "bindTaskCheckoutIdentity: bad id");
+  assert(expected.path === target.workspacePath, "bindTaskCheckoutIdentity: expected other path");
+  try {
+    const captured = await captureIdentity(target.workspacePath);
+    if (captured instanceof Error) return captured;
+    if (!sameCheckoutIdentity(captured.identity, expected)) {
+      return new Error(`${target.workspacePath} changed identity between claim and bind`);
     }
-    return {
-      materializationId,
-      path: target.workspacePath,
-      realpath,
-      root: { dev: rootBefore.dev, ino: rootBefore.ino },
-      gitdir: { pointer, dev: adminBefore.dev, ino: adminBefore.ino },
-    };
+    if (captured.nonce !== materializationId) {
+      return new Error(`${target.workspacePath} does not carry the claimed preparation nonce`);
+    }
+    return { ...expected, materializationId };
   } catch (error) {
     return error instanceof Error ? error : new Error(getErrorMessage(error));
   }
@@ -346,6 +432,20 @@ function readProof(
   return { kind: "proof", proof: parsed.data };
 }
 
+/** The classification inputs of one row, as signed by an authority. */
+function rowSignatureInputs(row: Workspace): Record<string, unknown> {
+  return {
+    id: row.id ?? null,
+    kind: classifyTaskCheckoutKind(row),
+    parentWorkspaceId: row.parentWorkspaceId ?? null,
+    path: row.path,
+    runtimeConfigJson: canonicalRuntimeConfigJson(row.runtimeConfig),
+    taskIsolation: row.taskIsolation ?? null,
+    proof:
+      row.taskCheckoutPreparation === undefined ? null : canonicalJson(row.taskCheckoutPreparation),
+  };
+}
+
 /** Config-only part of the dedicated derivation (no filesystem): everything but physical identity. */
 function deriveDedicatedRow(
   row: Workspace
@@ -374,14 +474,14 @@ function walkSharedAncestry(
   snapshot: ProjectsConfig,
   row: Workspace
 ):
-  | { ok: true; anchor: Workspace; anchorKind: "dedicated" | "root"; ancestry: string[] }
+  | { ok: true; anchor: Workspace; anchorKind: "dedicated" | "root"; hops: Workspace[] }
   | { ok: false; detail: string } {
-  const ancestry: string[] = [];
+  const hops: Workspace[] = [];
   const visited = new Set<string>([row.id ?? ""]);
   let current = row;
   for (let hop = 0; hop < MAX_SHARED_ANCESTRY_HOPS; hop++) {
     const parentId = current.parentWorkspaceId;
-    if (parentId == null) return { ok: false, detail: `${current.id} has no parent` };
+    if (parentId == null) return { ok: false, detail: `${current.id ?? "?"} has no parent` };
     if (visited.has(parentId)) return { ok: false, detail: `ancestry cycle at ${parentId}` };
     visited.add(parentId);
     const parent = findWorkspaceEntry(snapshot, parentId)?.workspace;
@@ -395,20 +495,120 @@ function walkSharedAncestry(
       return { ok: false, detail: `ancestor ${parentId} is not host-local` };
     }
     const kind = classifyTaskCheckoutKind(parent);
-    if (kind === "root") return { ok: true, anchor: parent, anchorKind: "root", ancestry };
-    if (kind === "dedicated")
-      return { ok: true, anchor: parent, anchorKind: "dedicated", ancestry };
+    if (kind === "root") {
+      // A proof on an ordinary root is never an anchor (a proof-bearing row cannot become exempt
+      // by losing its parent).
+      if (parent.taskCheckoutPreparation !== undefined) {
+        return { ok: false, detail: `root anchor ${parentId} carries a proof` };
+      }
+      return { ok: true, anchor: parent, anchorKind: "root", hops };
+    }
+    if (kind === "dedicated") return { ok: true, anchor: parent, anchorKind: "dedicated", hops };
     if (kind !== "shared") return { ok: false, detail: `ancestor ${parentId} is ${kind}` };
-    ancestry.push(parentId);
+    if (parent.taskCheckoutPreparation !== undefined) {
+      return { ok: false, detail: `shared ancestor ${parentId} carries a proof` };
+    }
+    hops.push(parent);
     current = parent;
   }
   return { ok: false, detail: "ancestry exceeds the supported depth" };
 }
 
 /**
+ * The config-only derivation shared by the asynchronous validator and the synchronous authority
+ * re-check: classification (a PRESENT proof is inspected before any root/off-host exemption — a
+ * proof-bearing row cannot become exempt by changing its parent or runtime), the dedicated proof
+ * checks that need no filesystem, the live same-path ancestry of shared rows, and the signature
+ * over every input used. `anchorProof` is what the validator then revalidates physically.
+ */
+function deriveTaskCheckoutAuthorization(
+  snapshot: ProjectsConfig,
+  workspaceId: string
+):
+  | {
+      kind: "derived";
+      authority: TaskCheckoutAuthority;
+      anchorProof: TaskCheckoutPreparation | null;
+    }
+  | Exclude<TaskCheckoutPreparationState, { kind: "ready" }> {
+  const row = findWorkspaceEntry(snapshot, workspaceId)?.workspace;
+  // A missing row is a REFUSAL, never an exemption: only an existing parent-less row is a root.
+  if (!row) return { kind: "unreadable", detail: `workspace ${workspaceId} not found` };
+  const proofPresent = row.taskCheckoutPreparation !== undefined;
+  const kind = classifyTaskCheckoutKind(row);
+  if (kind === "root") {
+    return proofPresent
+      ? { kind: "unsupported", detail: "proof present on an ordinary root row" }
+      : { kind: "excluded-root" };
+  }
+  if (kind === "offhost") {
+    return proofPresent
+      ? { kind: "runtime-mismatch", detail: "proof present on a non-host-local runtime" }
+      : { kind: "excluded-offhost" };
+  }
+  const sign = (hops: Workspace[], anchor: Workspace): string =>
+    canonicalJson({
+      v: 1,
+      row: rowSignatureInputs(row),
+      ancestry: hops.map(rowSignatureInputs),
+      anchor: rowSignatureInputs(anchor),
+    });
+  if (kind === "dedicated") {
+    const derived = deriveDedicatedRow(row);
+    if (derived.kind !== "proof") return derived;
+    return {
+      kind: "derived",
+      anchorProof: derived.proof,
+      authority: {
+        workspaceId,
+        kind: "dedicated",
+        materializationId: derived.proof.materializationId,
+        authorizationRevision: derived.proof.authorizationRevision,
+        anchorWorkspaceId: workspaceId,
+        anchorPath: derived.proof.path,
+        ancestry: [],
+        signature: sign([], row),
+      },
+    };
+  }
+  // shared
+  if (proofPresent) {
+    return { kind: "unsupported", detail: "shared task rows carry no preparation proof" };
+  }
+  const walk = walkSharedAncestry(snapshot, row);
+  if (!walk.ok) return { kind: "shared-broken", detail: walk.detail };
+  let anchorProof: TaskCheckoutPreparation | null = null;
+  if (walk.anchorKind === "dedicated") {
+    const derived = deriveDedicatedRow(walk.anchor);
+    if (derived.kind !== "proof") {
+      return {
+        kind: "shared-broken",
+        detail: `anchor ${walk.anchor.id ?? "?"} is ${derived.kind}`,
+      };
+    }
+    anchorProof = derived.proof;
+  }
+  return {
+    kind: "derived",
+    anchorProof,
+    authority: {
+      workspaceId,
+      kind: "shared",
+      materializationId: anchorProof?.materializationId ?? "",
+      authorizationRevision: anchorProof?.authorizationRevision ?? "",
+      anchorWorkspaceId: walk.anchor.id ?? "",
+      anchorPath: walk.anchor.path,
+      ancestry: walk.hops.map((hop) => hop.id ?? ""),
+      signature: sign(walk.hops, walk.anchor),
+    },
+  };
+}
+
+/**
  * Derive the preparation state of a task row from a strict config snapshot and the host
  * filesystem. Lock-free (stats and bounded reads only): safe to call inside lifecycle mutexes and
- * inside the pruner's locked callbacks. Never throws; every failure is a refusing state.
+ * inside the pruner's locked callbacks. Never throws; every failure is a refusing state. A
+ * workspace id without a row is `unreadable` (refused), never an exemption.
  */
 export async function validateTaskCheckoutPreparation(
   config: ConfigReader,
@@ -421,136 +621,63 @@ export async function validateTaskCheckoutPreparation(
   } catch (error) {
     return { kind: "unreadable", detail: `task registry unreadable: ${getErrorMessage(error)}` };
   }
-  const row = findWorkspaceEntry(snapshot, workspaceId)?.workspace;
-  if (!row) return { kind: "unreadable", detail: `workspace ${workspaceId} not found` };
-  const kind = classifyTaskCheckoutKind(row);
-  if (kind === "root") return { kind: "excluded-root" };
-  if (kind === "offhost") {
-    // A proof cannot be carried onto a non-host-local runtime to escape the protocol.
-    return row.taskCheckoutPreparation === undefined
-      ? { kind: "excluded-offhost" }
-      : { kind: "runtime-mismatch", detail: "proof present on a non-host-local runtime" };
-  }
-  if (kind === "dedicated") {
-    const derived = deriveDedicatedRow(row);
-    if (derived.kind !== "proof") return derived;
-    const physical = await revalidateTaskCheckoutIdentity(derived.proof);
-    if (!physical.ok) return physical.state;
-    return {
-      kind: "ready",
-      authority: {
-        workspaceId,
-        kind: "dedicated",
-        materializationId: derived.proof.materializationId,
-        authorizationRevision: derived.proof.authorizationRevision,
-        anchorWorkspaceId: workspaceId,
-        anchorPath: derived.proof.path,
-        ancestry: [],
-      },
-    };
-  }
-  // shared
-  if (row.taskCheckoutPreparation !== undefined) {
-    return { kind: "unsupported", detail: "shared task rows carry no preparation proof" };
-  }
-  const walk = walkSharedAncestry(snapshot, row);
-  if (!walk.ok) return { kind: "shared-broken", detail: walk.detail };
-  let materializationId = "";
-  let authorizationRevision = "";
-  if (walk.anchorKind === "dedicated") {
-    const derived = deriveDedicatedRow(walk.anchor);
-    if (derived.kind !== "proof") {
-      return { kind: "shared-broken", detail: `anchor ${walk.anchor.id} is ${derived.kind}` };
-    }
-    const physical = await revalidateTaskCheckoutIdentity(derived.proof);
+  const derived = deriveTaskCheckoutAuthorization(snapshot, workspaceId);
+  if (derived.kind !== "derived") return derived;
+  if (derived.anchorProof !== null) {
+    const physical = await revalidateTaskCheckoutIdentity(derived.anchorProof);
     if (!physical.ok) {
+      return derived.authority.kind === "dedicated"
+        ? physical.state
+        : {
+            kind: "shared-broken",
+            detail: `anchor ${derived.authority.anchorWorkspaceId} is ${physical.state.kind}`,
+          };
+    }
+  }
+  if (derived.authority.kind === "shared") {
+    // The shared directory (the walk proved the row's path IS the anchor's path) must exist. For
+    // a dedicated anchor its proof was just revalidated at that path; a root anchor has no proof.
+    try {
+      if (!(await fsPromises.stat(derived.authority.anchorPath)).isDirectory()) {
+        return { kind: "shared-broken", detail: "shared path is not a directory" };
+      }
+    } catch (error) {
       return {
         kind: "shared-broken",
-        detail: `anchor ${walk.anchor.id} is ${physical.state.kind}`,
+        detail: `shared checkout unreadable: ${getErrorMessage(error)}`,
       };
     }
-    materializationId = derived.proof.materializationId;
-    authorizationRevision = derived.proof.authorizationRevision;
   }
-  // The shared directory itself must exist and be the anchor's directory.
-  try {
-    const own = await fsPromises.realpath(row.path);
-    const anchor = await fsPromises.realpath(walk.anchor.path);
-    if (own !== anchor)
-      return { kind: "shared-broken", detail: "shared path diverges from its anchor" };
-    if (!(await fsPromises.stat(own)).isDirectory()) {
-      return { kind: "shared-broken", detail: "shared path is not a directory" };
-    }
-  } catch (error) {
-    return {
-      kind: "shared-broken",
-      detail: `shared checkout unreadable: ${getErrorMessage(error)}`,
-    };
-  }
-  return {
-    kind: "ready",
-    authority: {
-      workspaceId,
-      kind: "shared",
-      materializationId,
-      authorizationRevision,
-      anchorWorkspaceId: walk.anchor.id ?? "",
-      anchorPath: walk.anchor.path,
-      ancestry: walk.ancestry,
-    },
-  };
+  return { kind: "ready", authority: derived.authority };
 }
 
 /**
  * Synchronous, config-only re-comparison of a previously derived authority against the CURRENT
- * rows: proof identity/revision and published path for the anchor, and the same live same-path
- * ancestry for shared rows. For the send-admission fence, which runs synchronously after the
- * asynchronous validation. No filesystem access.
+ * rows: the derivation is repeated on a strict snapshot and its signature (every classification
+ * input of the row, its ancestry and its anchor, including every proof field) must be identical.
+ * For the send-admission fence, which runs synchronously after the asynchronous validation. No
+ * filesystem access; a derivation that no longer authorizes is not current either.
  */
 export function assertCurrentTaskCheckoutAuthority(
   config: ConfigReader,
   expected: TaskCheckoutAuthority
 ): { current: true } | { current: false; reason: string } {
+  assert(expected.signature.length > 0, "assertCurrentTaskCheckoutAuthority: unsigned authority");
   let snapshot: ProjectsConfig;
   try {
     snapshot = config.loadConfigOrDefault({ throwOnError: true });
   } catch (error) {
     return { current: false, reason: `task registry unreadable: ${getErrorMessage(error)}` };
   }
-  const row = findWorkspaceEntry(snapshot, expected.workspaceId)?.workspace;
-  if (!row) return { current: false, reason: "workspace row missing" };
-  const kind = classifyTaskCheckoutKind(row);
-  if (kind !== expected.kind) return { current: false, reason: `row is now ${kind}` };
-  const checkAnchorProof = (
-    anchor: Workspace
-  ): { current: true } | { current: false; reason: string } => {
-    const derived = deriveDedicatedRow(anchor);
-    if (derived.kind !== "proof") return { current: false, reason: `anchor is ${derived.kind}` };
-    if (
-      derived.proof.materializationId !== expected.materializationId ||
-      derived.proof.authorizationRevision !== expected.authorizationRevision ||
-      derived.proof.path !== expected.anchorPath
-    ) {
-      return { current: false, reason: "anchor proof differs from the validated one" };
-    }
-    return { current: true };
-  };
-  if (kind === "dedicated") return checkAnchorProof(row);
-  if (row.taskCheckoutPreparation !== undefined) {
-    return { current: false, reason: "shared row now carries a proof" };
+  const derived = deriveTaskCheckoutAuthorization(snapshot, expected.workspaceId);
+  if (derived.kind !== "derived") {
+    return {
+      current: false,
+      reason: `row no longer authorizes: ${derived.kind}${"detail" in derived ? ` (${derived.detail})` : ""}`,
+    };
   }
-  const walk = walkSharedAncestry(snapshot, row);
-  if (!walk.ok) return { current: false, reason: walk.detail };
-  if (
-    walk.anchor.id !== expected.anchorWorkspaceId ||
-    walk.anchor.path !== expected.anchorPath ||
-    walk.ancestry.length !== expected.ancestry.length ||
-    walk.ancestry.some((id, index) => id !== expected.ancestry[index])
-  ) {
-    return { current: false, reason: "shared ancestry differs from the validated one" };
+  if (derived.authority.signature !== expected.signature) {
+    return { current: false, reason: "authorization inputs differ from the validated ones" };
   }
-  if (walk.anchorKind === "dedicated") return checkAnchorProof(walk.anchor);
-  return expected.materializationId === "" && expected.authorizationRevision === ""
-    ? { current: true }
-    : { current: false, reason: "root anchor carries no proof" };
+  return { current: true };
 }
