@@ -122,7 +122,8 @@ export interface WorkspaceDelegatedActivity {
   workflowQueuedCount: number;
 }
 
-interface DelegatedActivityOptions {
+export interface DelegatedActivityOptions {
+  hasActiveBashMonitor?: (workspaceId: string) => boolean;
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }
 
@@ -157,6 +158,7 @@ export function isSidebarSubAgentRunning(
     workspace.taskExecutionStatus === "starting" ||
     workspace.taskExecutionStatus === "running" ||
     isRunningOrStartingTaskStatus(workspace.taskStatus) ||
+    options.hasActiveBashMonitor?.(workspace.id) === true ||
     getIsWorkspaceLiveActive(workspace.id, options)
   );
 }
@@ -212,6 +214,11 @@ export function isWorkspaceDelegatedActivityActive(
     workspace.taskExecutionStatus === "running" ||
     isActiveOrStartingTaskStatus(workspace.taskStatus)
   ) {
+    return true;
+  }
+  // A report ends the agent turn, not its armed background monitors. Keep these
+  // children visible while they wait for a wake, without trusting stale stream state.
+  if (options.hasActiveBashMonitor?.(workspace.id) === true) {
     return true;
   }
   if (hasCompletedAgentReport(workspace)) {
@@ -286,7 +293,12 @@ export function computeDelegatedActivityByWorkspaceId(
 
     for (const child of childrenByParentId.get(workspace.id) ?? []) {
       const childWorkflowOwned = ownWorkflowOwned || child.workflowTask != null;
-      if (isWorkspaceDelegatedActivityActive(child, { isWorkspaceLiveActive: getIsLiveActive })) {
+      if (
+        isWorkspaceDelegatedActivityActive(child, {
+          ...options,
+          isWorkspaceLiveActive: getIsLiveActive,
+        })
+      ) {
         descendantActivity.activeCount += 1;
         if (childWorkflowOwned) {
           descendantActivity.workflowActiveCount += 1;

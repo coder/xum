@@ -1388,6 +1388,49 @@ describe("sub-agent row render metadata", () => {
     ).toBe(false);
   });
 
+  it("keeps reported children visible while a background Bash monitor is active", () => {
+    const flattened = [
+      createWorkspace("parent"),
+      createWorkspace("reported-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        taskExecutionStatus: "completed",
+      }),
+    ];
+    let monitorActive = true;
+    const options = {
+      isWorkspaceLiveActive: () => false,
+      hasActiveBashMonitor: (workspaceId: string) =>
+        workspaceId === "reported-child" && monitorActive,
+    };
+
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+      "reported-child",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount
+    ).toBe(1);
+    expect(
+      computeSubAgentsSummaryByWorkspaceId(flattened, options).get("parent")?.runningSubAgentCount
+    ).toBe(1);
+    const metadata = computeAgentRowRenderMeta(
+      flattened,
+      computeWorkspaceDepthMap(flattened),
+      new Set(),
+      options
+    );
+    expect(metadata.get("reported-child")?.sharedTrunkActiveThroughRow).toBe(true);
+
+    monitorActive = false;
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount ?? 0
+    ).toBe(0);
+  });
+
   it("does not resurrect reported children from stale live workspace state", () => {
     const flattened = [
       createWorkspace("parent"),
