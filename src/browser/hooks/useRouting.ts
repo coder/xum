@@ -3,6 +3,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
+  DEFAULT_ROUTE_PRIORITY,
   availableRoutes as listAvailableRoutes,
   resolveRoute as resolveRouteForModel,
   type AvailableRoute,
@@ -16,7 +17,6 @@ import { isCustomProviderConfig } from "@/common/utils/providers/customProviders
 
 import { useProvidersConfig } from "./useProvidersConfig";
 
-const DEFAULT_ROUTE_PRIORITY = ["direct"];
 // Stable fallback so snapshot-less renders don't churn referential equality.
 const EMPTY_ROUTE_OVERRIDES: Record<string, string> = {};
 
