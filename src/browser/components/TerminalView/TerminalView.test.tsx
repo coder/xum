@@ -3,6 +3,10 @@ import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
+
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;

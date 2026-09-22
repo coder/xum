@@ -1,3 +1,6 @@
+import "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -61,6 +64,8 @@ const setAutoRetryEnabled = mock((input: unknown) => {
   });
 });
 
+// Later full-app tests must not inherit this tool's partial, per-render API client.
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({
     api: {
@@ -82,10 +87,11 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-// Overlay (not replace) the raw store: bun evaluates every test file before running tests
-// and static import bindings freeze at eval time, so this file-scope mock is what any
-// later-evaluated file in the same bun process gets forever. A bare fake missing store
-// methods (e.g. setNavigateToWorkspace) breaks those files' cleanup and cascades.
+// The overlay also changes the store identity, so it must stay local to this suite.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
+
+// Overlay (not replace) the raw store so modules imported while this stub is active
+// retain methods such as setNavigateToWorkspace that their cleanup needs.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceStoreRaw: () =>
