@@ -389,7 +389,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
               {/* Shared by every status: a failed or still-running evaluation exposes its
                   admitted model/attempt here, next to the error or the running marker. */}
               {hasStepMetadata && (
-                <div className="border-border text-muted mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px] tabular-nums">
+                <div className="border-border text-muted counter-nums mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px]">
                   {step.durationMs != null && (
                     <span className="inline-flex items-center gap-1">
                       <Clock className="h-3 w-3" /> {formatWorkflowDuration(step.durationMs)}
