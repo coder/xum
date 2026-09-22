@@ -15,6 +15,33 @@ import { streamToString } from "./streamUtils";
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
+ * Shell command for ReadFileOptions.requireRegularFile on exec-backed runtimes.
+ * `quotedPath` must already be shell-safe (quoteForRemote / an env-var reference).
+ *
+ * Acquire the descriptor first (`exec 3<`), classify THAT descriptor via
+ * `/dev/fd/3`, then stream from the same descriptor (`cat <&3`) — so the type
+ * check applies to the inode actually read, never to a stat→open pre-check.
+ * Exit codes: 65 open failed, 66 not a regular file, 67 `/dev/fd` missing
+ * (fail closed rather than silently dropping the guarantee). stderr text
+ * reaches callers through readFileViaExec's RuntimeError message.
+ *
+ * The leading `[ -e ] && ! [ -f ]` precheck is advisory only: it fails fast on
+ * a FIFO that is already sitting at the path (otherwise `exec 3<` on a
+ * writer-less FIFO blocks until the exec timeout/abort). It does not close the
+ * check→open race; the same-descriptor check after acquisition is what does.
+ * Requires POSIX sh + procfs/devfs `/dev/fd` (Linux, macOS) — the same
+ * assumptions as the plain `cat` command.
+ */
+export function buildRegularFileReadCommand(quotedPath: string): string {
+  return [
+    `if [ -e ${quotedPath} ] && ! [ -f ${quotedPath} ]; then echo 'not a regular file' >&2; exit 66; fi`,
+    `exec 3<${quotedPath} || { echo 'open failed' >&2; exit 65; }`,
+    `if [ -e /dev/fd/3 ]; then [ -f /dev/fd/3 ] || { echo 'not a regular file' >&2; exit 66; }; else echo 'cannot verify regular file' >&2; exit 67; fi`,
+    `cat <&3`,
+  ].join("; ");
+}
+
+/**
  * Read file contents as a stream via exec.
  */
 export function readFileViaExec(

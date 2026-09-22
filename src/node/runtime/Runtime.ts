@@ -159,6 +159,25 @@ export interface FileStat {
 }
 
 /**
+ * Optional constraints for Runtime.readFile. Absent ⇒ every runtime reads exactly as before
+ * (FIFOs, devices and sockets stream with their native semantics).
+ */
+export interface ReadFileOptions {
+  /**
+   * Refuse anything that is not a regular file (or a symlink to one) with a `file_io`
+   * RuntimeError whose message contains "not a regular file".
+   *
+   * Why: a plain open() of a FIFO with no writer blocks in the kernel; in Node that parks a
+   * libuv threadpool worker, and a handful of such reads (plan-file readers all hit the same
+   * path) exhaust the pool so unrelated fs/DNS/zlib work stalls process-wide. An abort signal
+   * cannot settle a kernel-blocked open — only a nonblocking acquisition can. The check is done
+   * on the ACQUIRED descriptor (fstat / `/dev/fd/N`), never as a stat-then-open pre-check, so a
+   * path swapped between check and read cannot change what is streamed.
+   */
+  requireRegularFile?: boolean;
+}
+
+/**
  * Logger for streaming workspace initialization events to frontend.
  * Used to report progress during workspace creation and init hook execution.
  */
@@ -412,10 +431,15 @@ export interface Runtime {
    * Read file contents as a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
+   * @param options Optional read constraints (see ReadFileOptions)
    * @returns Readable stream of file contents
    * @throws RuntimeError if file cannot be read
    */
-  readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
+  readFile(
+    path: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array>;
 
   /**
    * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.

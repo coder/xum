@@ -37,10 +37,15 @@ export const createProposePlanTool: ToolFactory = (config) => {
         };
       }
 
-      // Read plan file using workspace runtime (works for both local and SSH)
+      // Read plan file using workspace runtime (works for both local and SSH).
+      // requireRegularFile: a FIFO at the plan path would otherwise block this
+      // read (and a libuv worker) indefinitely; it lands in the RuntimeError
+      // branch below like any other unreadable plan.
       let planContent: string;
       try {
-        planContent = await readFileString(config.runtime, planPath);
+        planContent = await readFileString(config.runtime, planPath, undefined, {
+          requireRegularFile: true,
+        });
       } catch (err) {
         if (err instanceof RuntimeError) {
           return {

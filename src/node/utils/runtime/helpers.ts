@@ -1,4 +1,4 @@
-import type { Runtime, ExecOptions } from "@/node/runtime/Runtime";
+import type { Runtime, ExecOptions, ReadFileOptions } from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
@@ -84,9 +84,10 @@ export async function execBuffered(
 export async function readFileString(
   runtime: Runtime,
   path: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: ReadFileOptions
 ): Promise<string> {
-  const stream = runtime.readFile(path, abortSignal);
+  const stream = runtime.readFile(path, abortSignal, options);
   return streamToString(stream);
 }
 
@@ -141,14 +142,19 @@ export async function readPlanFile(
   // For local runtimes this expands ~ to /home/user; for SSH it resolves remotely
   const resolvedPath = await runtime.resolvePath(planPath);
 
+  // The plan path is user/agent-writable: a FIFO (or other special file) there
+  // must not block the reader, so only regular files count as a plan. Anything
+  // else is reported as missing (the callers' existing "no plan file" path).
+  const planReadOptions: ReadFileOptions = { requireRegularFile: true };
+
   // Try new path first
   try {
-    const content = await readFileString(runtime, planPath);
+    const content = await readFileString(runtime, planPath, undefined, planReadOptions);
     return { content, exists: true, path: resolvedPath };
   } catch {
     // Fall back to legacy path
     try {
-      const content = await readFileString(runtime, legacyPath);
+      const content = await readFileString(runtime, legacyPath, undefined, planReadOptions);
       // Migrate: move to new location.
       try {
         const planDir = planPath.substring(0, planPath.lastIndexOf("/"));

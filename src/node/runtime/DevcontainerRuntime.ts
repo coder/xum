@@ -13,6 +13,7 @@ import type {
   EnsureReadyResult,
   EnsureReadyOptions,
   FileStat,
+  ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { buildShellPathExport } from "./shellEnv";
@@ -38,6 +39,7 @@ import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import {
+  buildRegularFileReadCommand,
   ensureDirViaExec,
   readFileViaExec,
   statViaExec,
@@ -564,15 +566,24 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     });
   }
 
-  override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  override readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     const hostPath = this.resolveHostPathForMounted(filePath);
     if (hostPath) {
-      return super.readFile(hostPath, abortSignal);
+      return super.readFile(hostPath, abortSignal, options);
     }
+    // Unmounted paths only exist inside the container, so the regular-file
+    // check must run there too (env-var quoting as for the plain cat).
+    const command = options?.requireRegularFile
+      ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
+      : `cat "$${FILE_PATH_ENV}"`;
     return readFileViaExec(
       filePath,
       (signal) =>
-        this.exec(`cat "$${FILE_PATH_ENV}"`, {
+        this.exec(command, {
           cwd: this.getContainerBasePath(),
           pathEnv: { [FILE_PATH_ENV]: filePath },
           timeout: 300,
