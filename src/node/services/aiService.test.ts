@@ -921,7 +921,8 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     const requests: RecordedFetchRequest[] = [];
     configureOpenAICodexOAuth(service, providersConfigStore, requests, { defaultAuth });
 
-    await createGeneratedModel(service, KNOWN_MODELS.GPT.id, [
+    // GPT-6 Sol is intentionally not in the Codex OAuth allowlist yet.
+    await createGeneratedModel(service, KNOWN_MODELS.GPT_56_TERRA.id, [
       { role: "user", content: [{ type: "text", text: "Hello" }] },
     ]);
 
