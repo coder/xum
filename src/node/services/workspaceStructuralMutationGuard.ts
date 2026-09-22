@@ -1,10 +1,12 @@
 import assert from "node:assert";
+import type { Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
+import { readSmallRegularFile } from "@/node/services/taskCheckoutPreparation";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getProjectName } from "@/node/utils/runtime/helpers";
@@ -133,10 +135,11 @@ export function deriveHostLocalCheckoutPath(
 }
 
 /**
- * Bounded filesystem probes (realpath, `.git` pointer reads). A stalled
- * filesystem backing an UNRELATED task row must not hang every structural
- * operation; a timeout is an unknown identity (refuse), never a fallback to
- * spelling.
+ * Bounded realpath probes. A stalled filesystem backing an UNRELATED task row
+ * must not hang every structural operation; a timeout is an unknown identity
+ * (refuse), never a fallback to spelling. (`.git` pointer reads are bounded by
+ * construction in `readGitBacking` instead: a timer cannot cancel a blocked
+ * read, so the reader never issues one.)
  */
 const CANONICALIZE_TIMEOUT_MS = 2_000;
 
@@ -181,39 +184,37 @@ type GitBacking =
  * resolved against the checkout. Legacy task rows carry no proof, so this is
  * the only way to learn that a task checkout OUTSIDE an ordinary root is backed
  * by a repository nested INSIDE it — deleting or moving the root would destroy
- * that backing. Mirrors the producer core's private `readGitAdminDir`. Read
- * failures other than "absent" (and a `.git` file that is not a pointer) are
- * unknown backing: they cannot authorize a mutation.
+ * that backing.
+ *
+ * The entry is inspected with lstat and read through the producer core's
+ * bounded reader (no symlink following, non-blocking open, fstat re-check,
+ * size cap), so the scan never blocks a libuv worker on a FIFO/device and never
+ * follows a symlink: a literal `.git` DIRECTORY has its backing inside the
+ * checkout (none), a regular pointer file names the backing, and every other
+ * entry type — symlink, FIFO, socket, device, or an entry that changed under
+ * the read — is unknown backing that cannot authorize a mutation. A missing
+ * `.git` is no backing at all.
  */
 async function readGitBacking(checkoutPath: string): Promise<GitBacking> {
   const pointerPath = path.join(checkoutPath, ".git");
-  let timer: NodeJS.Timeout | undefined;
+  let entry: Stats;
   try {
-    const content = await Promise.race([
-      (async () => {
-        const stat = await fsPromises.stat(pointerPath);
-        if (stat.isDirectory()) return undefined;
-        if (!stat.isFile() || stat.size > GIT_POINTER_MAX_BYTES) {
-          throw new Error(`${pointerPath} is not a git pointer file`);
-        }
-        return await fsPromises.readFile(pointerPath, "utf-8");
-      })(),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("reading the .git pointer timed out")),
-          CANONICALIZE_TIMEOUT_MS
-        );
-      }),
-    ]);
-    if (content === undefined) return { kind: "none" };
+    entry = await fsPromises.lstat(pointerPath);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return { kind: "none" };
+    return { kind: "unknown", reason: error instanceof Error ? error.message : String(error) };
+  }
+  if (entry.isDirectory()) return { kind: "none" };
+  if (!entry.isFile()) return { kind: "unknown", reason: `${pointerPath} is not a regular file` };
+  try {
+    const content = await readSmallRegularFile(pointerPath, GIT_POINTER_MAX_BYTES);
     const match = /^gitdir:\s*(.+?)\s*$/m.exec(content);
     if (!match?.[1]) return { kind: "unknown", reason: `${pointerPath} is not a git pointer file` };
     return { kind: "admin-dir", adminDir: path.resolve(checkoutPath, match[1]) };
   } catch (error) {
-    if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return { kind: "none" };
+    // lstat saw a regular file, so any failure here (vanished, swapped for a
+    // symlink or special file, grown past the cap) is a concurrent change.
     return { kind: "unknown", reason: error instanceof Error ? error.message : String(error) };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
