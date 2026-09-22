@@ -294,6 +294,182 @@ async function expectRawStages(canvasElement: HTMLElement, stages: unknown[]) {
 
 const runningFixture = createWorkflowFixture(RUN);
 
+// --- evaluate() steps ---------------------------------------------------------
+// Three evaluate steps in one screening run: a replayed (cached) completion, a
+// failed attempt, and a live attempt. None has a task or workspace, so no
+// "Open" action may appear; the badge and the metadata line carry the facts.
+const EVALUATION_ADMISSION = {
+  attempt: 1,
+  selection: {
+    modelString: "anthropic:claude-haiku-4-5",
+    effectiveModelString: "anthropic:claude-haiku-4-5",
+    wireProviderName: "anthropic",
+    routeKind: "direct" as const,
+    configFingerprint: "fp-story",
+  },
+  timeoutMs: 60_000,
+  attemptDeadlineAt: "2026-05-29T12:01:02.000Z",
+  stateSha256: "state-digest",
+  stateBytes: 412,
+  questionsSha256: "questions-digest",
+  questionCount: 3,
+};
+const EVALUATION_RESULT = {
+  answers: {
+    injection: {
+      type: "choice",
+      choice: "not_detected",
+      probabilities: { not_detected: 0.94, suspected: 0.06 },
+    },
+    severity: { type: "score", score: 2 },
+    asksForSecrets: { type: "boolean", probability: 0.03 },
+  },
+  rounding: { probabilityDecimals: 2 },
+  model: {
+    modelString: "anthropic:claude-haiku-4-5",
+    responseModelId: "claude-haiku-4-5-20251001",
+  },
+  usage: { inputTokens: 1_284, outputTokens: 42, totalTokens: 1_326 },
+  state: { sha256: "state-digest", bytes: 412 },
+};
+const EVALUATION_RUN: WorkflowRunRecord = {
+  id: "wfr_evaluation_story",
+  workspaceId: WORKSPACE_ID,
+  workflow: {
+    name: "screen-github-issue",
+    description: "Screen an issue snapshot before delegating",
+    scope: "project",
+    sourceKind: "inline",
+    executable: true,
+  },
+  source: "export default function workflow() { return null; }",
+  sourceHash: "sha256:evaluation-story",
+  args: { repo: "acme/widgets", issueNumber: 42 },
+  status: "running",
+  createdAt: CREATED_AT,
+  updatedAt: UPDATED_AT,
+  events: [
+    { sequence: 1, type: "status", at: CREATED_AT, status: "running" },
+    { sequence: 2, type: "phase", at: STARTED_AT, name: "screen" },
+    {
+      sequence: 3,
+      type: "evaluation",
+      at: STARTED_AT,
+      stepId: "screen-issue",
+      inputHash: "sha256:screen-issue",
+      attempt: 1,
+      status: "cached",
+      title: "Screen issue text",
+      modelString: "anthropic:claude-haiku-4-5",
+      responseModelId: "claude-haiku-4-5-20251001",
+      usage: EVALUATION_RESULT.usage,
+      stateBytes: 412,
+      questionCount: 3,
+    },
+    {
+      sequence: 4,
+      type: "evaluation",
+      at: STARTED_AT,
+      stepId: "rate-severity",
+      inputHash: "sha256:rate-severity",
+      attempt: 1,
+      status: "started",
+      title: "Rate severity",
+      modelString: "anthropic:claude-haiku-4-5",
+    },
+    {
+      sequence: 5,
+      type: "evaluation",
+      at: UPDATED_AT,
+      stepId: "rate-severity",
+      inputHash: "sha256:rate-severity",
+      attempt: 1,
+      status: "failed",
+      title: "Rate severity",
+      modelString: "anthropic:claude-haiku-4-5",
+      reason: "provider-failure",
+      code: "api-call",
+      statusCode: 429,
+    },
+    {
+      sequence: 6,
+      type: "evaluation",
+      at: UPDATED_AT,
+      stepId: "detect-secrets",
+      inputHash: "sha256:detect-secrets",
+      attempt: 1,
+      status: "started",
+      title: "Detect credential requests",
+      modelString: "anthropic:claude-haiku-4-5",
+    },
+  ],
+  steps: [
+    {
+      stepId: "screen-issue",
+      inputHash: "sha256:screen-issue",
+      status: "completed",
+      startedAt: CREATED_AT,
+      completedAt: STARTED_AT,
+      result: {
+        reportMarkdown: "Evaluation step completed (3 answers)",
+        structuredOutput: EVALUATION_RESULT,
+      },
+      evaluation: EVALUATION_ADMISSION,
+    },
+    {
+      stepId: "rate-severity",
+      inputHash: "sha256:rate-severity",
+      status: "failed",
+      startedAt: STARTED_AT,
+      completedAt: UPDATED_AT,
+      error:
+        "evaluation failed: provider-failure/api-call status 429 (step 3f9c2a1b8d7e, attempt 1)",
+      evaluation: EVALUATION_ADMISSION,
+    },
+    {
+      stepId: "detect-secrets",
+      inputHash: "sha256:detect-secrets",
+      status: "started",
+      startedAt: UPDATED_AT,
+      evaluation: EVALUATION_ADMISSION,
+    },
+  ],
+};
+const evaluationFixture = createWorkflowFixture(EVALUATION_RUN);
+
+export const EvaluationSteps: AppStory = {
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+  render: () => <AppWithMocks setup={evaluationFixture.setup} />,
+  play: async ({ canvasElement }) => {
+    await waitForChatInputAutofocusDone(canvasElement);
+    const canvas = within(canvasElement);
+    // done counts completed steps only: the failed and running attempts are not done.
+    // The header mounts before the sidebar finishes laying out, so wait for visibility.
+    await waitFor(() => expect(canvas.getByText("1/3 steps")).toBeVisible());
+    const phase = canvas.getByRole("button", { name: /^screen/ });
+    if (phase.getAttribute("aria-expanded") === "false") {
+      await userEvent.click(phase);
+    }
+    await expect(canvas.getByText("Screen issue text")).toBeVisible();
+    await expect(canvas.getByText("evaluation · cached")).toBeVisible();
+    await expect(canvas.getByText("Rate severity")).toBeVisible();
+    await expect(canvas.getByText("Detect credential requests")).toBeVisible();
+    // The failed attempt opens by default with its template-only error.
+    await expect(
+      canvas.getByText(/evaluation failed: provider-failure\/api-call status 429/)
+    ).toBeVisible();
+    // Evaluate steps never spawn a workspace.
+    await expect(
+      canvas.queryByRole("button", { name: /^Open workspace for workflow step/ })
+    ).not.toBeInTheDocument();
+    // The completed step's metadata line exposes the selected model and usage.
+    await userEvent.click(canvas.getByRole("button", { name: /Screen issue text/ }));
+    await expect(canvas.getByText("anthropic:claude-haiku-4-5")).toBeVisible();
+    await expect(canvas.getByText("↳ claude-haiku-4-5-20251001")).toBeVisible();
+  },
+};
+
 export const PlannedStages: AppStory = {
   globals: { viewport: { value: "laptop1200", isRotated: false } },
   parameters: { pixel: { matrix: { viewports: ["laptop"] } } },

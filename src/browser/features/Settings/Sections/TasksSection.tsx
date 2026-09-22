@@ -6,6 +6,7 @@ import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
+import { EvaluationModelCard } from "./EvaluationModelCard";
 import { ThinkingSelectorControl } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import {
   Select,
@@ -1253,6 +1254,11 @@ export function TasksSection() {
         </div>
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-3 text-sm font-medium">Workflow Evaluation</h3>
+        <EvaluationModelCard />
       </div>
 
       <div>

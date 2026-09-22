@@ -525,6 +525,92 @@ describe("projectWorkflowRun — non-task step events", () => {
     expect(view.phases.some((phase) => phase.name === "")).toBe(false);
   });
 
+  test("projects evaluation facts from the admission, the committed result and replay events", () => {
+    const admission = {
+      attempt: 2,
+      selection: {
+        modelString: "openai:gpt-5",
+        effectiveModelString: "openai:gpt-5",
+        wireProviderName: "openai",
+        routeKind: "direct" as const,
+        configFingerprint: "fp",
+      },
+      timeoutMs: 60_000,
+      attemptDeadlineAt: at(60),
+      stateSha256: "s",
+      stateBytes: 12,
+      questionsSha256: "q",
+      questionCount: 1,
+    };
+    const result = {
+      answers: { ok: { type: "boolean", probability: 0.9 } },
+      rounding: null,
+      model: { modelString: "openai:gpt-5", responseModelId: "gpt-5-2026-01" },
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      state: { sha256: "s", bytes: 12 },
+    };
+    const events: WorkflowRunEvent[] = [
+      {
+        sequence: 1,
+        type: "evaluation",
+        at: at(1),
+        stepId: "replayed",
+        inputHash: "h1",
+        attempt: 2,
+        status: "cached",
+        modelString: "openai:gpt-5",
+      },
+      {
+        sequence: 2,
+        type: "evaluation",
+        at: at(2),
+        stepId: "live",
+        inputHash: "h2",
+        attempt: 1,
+        status: "started",
+        modelString: "openai:gpt-5",
+      },
+    ];
+    const steps: WorkflowStepRecord[] = [
+      {
+        stepId: "replayed",
+        inputHash: "h1",
+        status: "completed",
+        startedAt: at(0),
+        completedAt: at(1),
+        result: {
+          reportMarkdown: "Evaluation step completed (1 answers)",
+          structuredOutput: result,
+        },
+        evaluation: admission,
+      },
+      {
+        stepId: "live",
+        inputHash: "h2",
+        status: "started",
+        startedAt: at(2),
+        evaluation: { ...admission, attempt: 1 },
+      },
+      { stepId: "agent", inputHash: "h3", status: "started", startedAt: at(3), taskId: "task_1" },
+    ];
+    const view = projectWorkflowRun(makeRun({ events, steps }));
+
+    expect(view.steps.find((step) => step.stepId === "replayed")?.evaluation).toEqual({
+      modelString: "openai:gpt-5",
+      attempt: 2,
+      responseModelId: "gpt-5-2026-01",
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      cached: true,
+    });
+    // A running attempt has no committed result yet, so only the admission shows.
+    expect(view.steps.find((step) => step.stepId === "live")?.evaluation).toEqual({
+      modelString: "openai:gpt-5",
+      attempt: 1,
+      cached: false,
+    });
+    expect(view.steps.find((step) => step.stepId === "agent")?.evaluation).toBeUndefined();
+  });
+
   test("synthesizes a running step for reservation-only agent-step events", () => {
     const events: WorkflowRunEvent[] = [
       { sequence: 1, type: "phase", at: at(1), name: "branch-recon" },

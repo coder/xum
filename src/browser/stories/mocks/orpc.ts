@@ -180,6 +180,8 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Initial workflow `evaluate()` default model for config.getConfig */
+  evaluationDefaultModel?: string;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -429,6 +431,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    evaluationDefaultModel: initialEvaluationDefaultModel,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -589,6 +592,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
+  let evaluationDefaultModel: string | undefined = initialEvaluationDefaultModel;
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
   let routeOverrides = { ...initialRouteOverrides };
@@ -820,6 +824,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
+          ...(evaluationDefaultModel !== undefined
+            ? { evaluationDefaults: { model: evaluationDefaultModel } }
+            : {}),
           autoModelRouting,
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
@@ -949,6 +956,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateGoalDefaults: (input: { goalDefaults: GoalDefaults }) => {
         goalDefaults = normalizeGoalDefaults(input.goalDefaults);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateEvaluationDefaults: (input: { model?: string | null }) => {
+        const trimmed = input.model?.trim() ?? "";
+        evaluationDefaultModel = trimmed.length > 0 ? trimmed : undefined;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

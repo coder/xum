@@ -205,11 +205,13 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
   );
   const hasResultTitle = step.result?.title != null && step.result.title.length > 0;
   const hasStructuredOutput = step.result?.structuredOutput !== undefined;
+  const evaluation = step.evaluation;
   const hasStepMetadata =
     step.durationMs != null ||
     step.usage?.tokens != null ||
     step.usage?.costUsd != null ||
-    step.taskId != null;
+    step.taskId != null ||
+    evaluation != null;
   const hasStandaloneStepResult =
     !hasNestedWorkflow && (hasResultTitle || showReport || hasStructuredOutput);
   const hasStandaloneStepMetadata = hasStepMetadata && !hasNestedWorkflow;
@@ -263,6 +265,11 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
       {hasNestedWorkflow && (
         <span className="border-border text-plan-mode shrink-0 rounded border px-1.5 py-px text-[10px]">
           nested
+        </span>
+      )}
+      {evaluation != null && (
+        <span className="border-border text-muted shrink-0 rounded border px-1.5 py-px text-[10px]">
+          {evaluation.cached ? "evaluation · cached" : "evaluation"}
         </span>
       )}
       {expandable &&
@@ -381,6 +388,27 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                         </span>
                       )}
                       {step.taskId != null && <span className="font-mono">task {step.taskId}</span>}
+                      {evaluation != null && (
+                        <>
+                          {/* Untrusted display text (model ids); React escaping is the only rendering path. */}
+                          <span className="min-w-0 truncate font-mono">
+                            {evaluation.modelString}
+                          </span>
+                          {evaluation.responseModelId != null &&
+                            evaluation.responseModelId !== evaluation.modelString && (
+                              <span className="min-w-0 truncate font-mono">
+                                ↳ {evaluation.responseModelId}
+                              </span>
+                            )}
+                          {evaluation.attempt > 1 && <span>attempt {evaluation.attempt}</span>}
+                          {evaluation.usage?.totalTokens != null && (
+                            <span className="inline-flex items-center gap-1">
+                              <Zap className="h-3 w-3" />{" "}
+                              {formatWorkflowTokens(evaluation.usage.totalTokens)} tok
+                            </span>
+                          )}
+                        </>
+                      )}
                     </div>
                   )}
                 </>

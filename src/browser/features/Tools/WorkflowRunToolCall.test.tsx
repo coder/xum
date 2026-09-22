@@ -1648,6 +1648,116 @@ describe("WorkflowRunToolCall", () => {
     expect(view.container.textContent).toContain("commitCount");
   });
 
+  test("coalesces evaluation attempts into one row that keeps the started title", () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <TooltipProvider>
+          <WorkflowRunToolCall
+            args={{ name: "screening", args: {}, run_in_background: true }}
+            status="completed"
+            result={{
+              status: "completed",
+              runId: "wfr_evaluation_rows",
+              result: null,
+              run: {
+                id: "wfr_evaluation_rows",
+                workspaceId: "workspace-1",
+                workflow: {
+                  name: "screening",
+                  description: "Screening",
+                  scope: "built-in",
+                  executable: true,
+                },
+                source: "export default function workflow() { return null; }",
+                sourceHash: "sha256:evaluations",
+                args: {},
+                status: "completed",
+                createdAt: "2026-05-29T00:00:00.000Z",
+                updatedAt: "2026-05-29T00:00:03.000Z",
+                events: [
+                  {
+                    sequence: 1,
+                    type: "evaluation",
+                    at: "2026-05-29T00:00:00.000Z",
+                    stepId: "screen-issue",
+                    inputHash: "sha256:eval-1",
+                    attempt: 1,
+                    status: "started",
+                    title: "Screen issue text",
+                    modelString: "openai:gpt-5",
+                  },
+                  {
+                    sequence: 2,
+                    type: "evaluation",
+                    at: "2026-05-29T00:00:01.000Z",
+                    stepId: "screen-issue",
+                    inputHash: "sha256:eval-1",
+                    attempt: 1,
+                    status: "failed",
+                    title: "Screen issue text",
+                    modelString: "openai:gpt-5",
+                    reason: "provider-failure",
+                    code: "api-call",
+                    statusCode: 500,
+                  },
+                  {
+                    sequence: 3,
+                    type: "evaluation",
+                    at: "2026-05-29T00:00:02.000Z",
+                    stepId: "screen-issue",
+                    inputHash: "sha256:eval-1",
+                    attempt: 2,
+                    status: "started",
+                    title: "Screen issue text",
+                    modelString: "openai:gpt-5",
+                  },
+                  // A terminal event written without a title must not fall back to the step id.
+                  {
+                    sequence: 4,
+                    type: "evaluation",
+                    at: "2026-05-29T00:00:03.000Z",
+                    stepId: "screen-issue",
+                    inputHash: "sha256:eval-1",
+                    attempt: 2,
+                    status: "completed",
+                    modelString: "openai:gpt-5",
+                    responseModelId: "gpt-5-2026",
+                    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                  },
+                  {
+                    sequence: 5,
+                    type: "evaluation",
+                    at: "2026-05-29T00:00:03.000Z",
+                    stepId: "screen-other",
+                    inputHash: "sha256:eval-2",
+                    attempt: 1,
+                    status: "started",
+                    title: "Screen other text",
+                    modelString: "openai:gpt-5",
+                  },
+                ],
+                steps: [],
+              },
+            }}
+          />
+        </TooltipProvider>
+      </ThemeProvider>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+
+    expect(view.getByText("Workflow events (2)")).toBeTruthy();
+    expect(view.getAllByText("Screen issue text / evaluation / completed")).toHaveLength(1);
+    expect(view.queryByText(/screen-issue \/ evaluation/)).toBeNull();
+    expect(view.queryByText(/Screen issue text \/ evaluation \/ (started|failed)/)).toBeNull();
+    expect(view.getByText("Screen other text / evaluation / started")).toBeTruthy();
+    expect(view.getByText("#1").getAttribute("aria-label")).toBe("Raw event #1");
+
+    fireEvent.click(view.getByText("Screen issue text / evaluation / completed"));
+
+    expect(view.container.textContent).toContain("totalTokens");
+  });
+
   test("leaves cached action events separate from pending started rows", () => {
     const view = render(
       <ThemeProvider forcedTheme="dark">

@@ -132,6 +132,8 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 
 interface SetupSettingsStoryOptions {
   layoutPresets?: LayoutPresetsConfig;
+  /** Persisted workflow `evaluate()` default model (Settings → Workflow Evaluation card). */
+  evaluationDefaultModel?: string;
   providersConfig?: Record<
     string,
     {
@@ -183,6 +185,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     heartbeatDefaultPrompt: options.heartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: options.heartbeatDefaultIntervalMs,
     goalDefaults: options.goalDefaults,
+    evaluationDefaultModel: options.evaluationDefaultModel,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
     layoutPresets: options.layoutPresets,
