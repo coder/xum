@@ -181,7 +181,11 @@ describe("taskCheckoutPreparation", () => {
     });
     await saveWorkspaces(config, SCRATCH_PROJECT_CONFIG_KEY, [
       scratch("scr01"),
-      scratch("scrchild01", { parentWorkspaceId: "scr01", agentId: "explore", agentType: "explore" }),
+      scratch("scrchild01", {
+        parentWorkspaceId: "scr01",
+        agentId: "explore",
+        agentType: "explore",
+      }),
     ]);
     expect(await validateTaskCheckoutPreparation(config, "scrchild01")).toMatchObject({
       kind: "ready",
