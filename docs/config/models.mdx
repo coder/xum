@@ -41,6 +41,8 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 
 {/* END KNOWN_MODELS_TABLE */}
 
+GPT-6 Sol and Luna support thinking from off through max on the default Responses API route. On the opt-in Chat Completions route, Xum disables their reasoning because OpenAI only supports function calling there with reasoning off.
+
 ### Pro reasoning mode (GPT-5.6 and GPT-6)
 
 GPT-6 models (Astra, Sol, and Luna) and every GPT-5.6 model support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.

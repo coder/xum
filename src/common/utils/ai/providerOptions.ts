@@ -27,6 +27,7 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   getOpenAIReasoningEffort,
+  isGpt6SolOrLunaModel,
   grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
@@ -473,15 +474,12 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: native-max models (the GPT-5.6 family and GPT-6 Astra, see
+    // Model-aware: native-max models (the GPT-5.6 and GPT-6 families, see
     // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
     // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
-    // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
-    // and Chat Completions, so both wire formats now preserve the selected level.
-    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium;
-    // Astra rejects "none", so its "off" clamps to "low".
-    const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // native effort. GPT-5.6 and GPT-6 Sol/Luna "off" must be explicit "none"
+    // because omission defaults to medium; Astra instead clamps "off" to "low".
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.
@@ -498,6 +496,13 @@ export function buildProviderOptions(
     const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
     const store = muxProviderOptions?.openai?.store;
     const isResponses = wireFormat === "responses";
+    // Sol/Luna only support Chat Completions function calls at effort none.
+    // Xum turns are tool-driven, so keep tools working on this opt-in route;
+    // Responses (the default) preserves the selected reasoning effort.
+    const reasoningEffort =
+      !isResponses && isGpt6SolOrLunaModel(capabilityModel)
+        ? "none"
+        : getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&

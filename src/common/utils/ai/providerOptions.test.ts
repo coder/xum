@@ -1817,6 +1817,15 @@ describe("buildProviderOptions - OpenAI", () => {
           })?.reasoningMode
         ).toBeUndefined();
         expect(buildWithMode(`${model}-mini`, "pro")?.reasoningMode).toBeUndefined();
+        for (const id of [model, `${model}-2026-09-22`, "openai:team-model"]) {
+          const chatOptions = buildWithMode(id, "pro", {
+            thinkingLevel: "max",
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+            providersConfig: createMockProvidersConfig({ "openai:team-model": model }),
+          });
+          expect(chatOptions?.reasoningEffort).toBe("none");
+          expect(chatOptions?.reasoningMode).toBeUndefined();
+        }
       }
     );
 

@@ -279,10 +279,10 @@ export function isGpt6AstraModel(modelString: string): boolean {
   return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
-/** Released GPT-6 tiers only; don't infer capabilities for unannounced variants. */
-function isGpt6FamilyModel(modelString: string): boolean {
+/** Released tiers with optional reasoning; do not match unannounced variants. */
+export function isGpt6SolOrLunaModel(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-(?:astra|sol|luna)(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+  return /^gpt-6-(?:sol|luna)(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
 /**
@@ -299,7 +299,11 @@ function isGpt6FamilyModel(modelString: string): boolean {
  * Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString) || isGpt6FamilyModel(modelString);
+  return (
+    isGpt56FamilyModel(modelString) ||
+    isGpt6AstraModel(modelString) ||
+    isGpt6SolOrLunaModel(modelString)
+  );
 }
 
 /**
@@ -343,7 +347,11 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * effort so choosing native max does not silently opt users into Pro serving.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString) || isGpt6FamilyModel(modelString);
+  return (
+    isGpt56FamilyModel(modelString) ||
+    isGpt6AstraModel(modelString) ||
+    isGpt6SolOrLunaModel(modelString)
+  );
 }
 
 /**
