@@ -53,8 +53,6 @@ jobs:
         if: github.event_name == 'pull_request' && env.PIXEL_KEY != ''
         run: node scripts/storybook-flake-check.mjs --runs 3
 
-i
-
       - name: Upload nondeterministic renders
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
