@@ -325,6 +325,39 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     expect(sends).toEqual([retryId]);
   }, 30_000);
 
+  test("a registry that turns unreadable after the fork refuses strictly: nothing is pruned or published, the worktree is retained verbatim", async () => {
+    const taskId = "directstrict01";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, sends } = await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    const configPath = path.join(config.rootDir, "config.json");
+    // Corrupt the registry the moment the fork exists: the pre-publication scan must not read
+    // an unparseable store as "no live sibling" and prune (the lenient read yields an empty map).
+    const realFork = forkOrchestrator.orchestrateFork;
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(
+      async (params) => {
+        const result = await realFork(params);
+        await fsPromises.writeFile(configPath, "{ not json", "utf-8");
+        return result;
+      }
+    );
+    restores.push(() => forkSpy.mockRestore());
+    const forkPath = forkPathFor(config.srcDir, taskId);
+
+    const refused = await taskService.create(createArgs("Strict"));
+    expect(refused.success).toBe(false);
+    if (refused.success) throw new Error("unreachable");
+    expect(refused.error).toContain("unreadable");
+    expect(refused.error).toContain(`created at ${forkPath} but not registered`);
+    expect(sends).toEqual([]);
+    // Neither pruned nor published: the tracked enable is still in the retained worktree and the
+    // registry bytes are exactly what the test wrote (no row appended, no repair).
+    expect(
+      JSON.parse(await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8"))
+    ).toEqual({ enabledServers: [STALE_PLUGIN_KEY] });
+    expect(await fsPromises.readFile(configPath, "utf-8")).toBe("{ not json");
+  }, 30_000);
+
   test("isolation: none shares the parent's checkout without any sanitization: the parent's consent survives and no lock is taken", async () => {
     const taskId = "directshared1";
     const projectPath = await createRepoWithTrackedEnable();
