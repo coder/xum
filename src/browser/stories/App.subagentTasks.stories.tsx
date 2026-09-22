@@ -7,6 +7,7 @@ import { expandLeftSidebar, expandProjects, selectWorkspace } from "./helpers/ui
 
 import { getSubAgentTasksExpandedKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
@@ -113,7 +114,9 @@ function setupMonitoredSubagentStory() {
   };
   const monitorActivity = (activeBashMonitorCount: number) => ({
     recency: STABLE_TIMESTAMP,
-    streaming: false,
+    // Keep the stale live hint armed even after the final monitor retires. The
+    // completed report, not a conveniently idle stream, must fence off activity.
+    streaming: true,
     lastModel: null,
     lastThinkingLevel: null,
     activeBashMonitorCount,
@@ -128,7 +131,7 @@ function setupMonitoredSubagentStory() {
   const client = createMockORPCClient({
     projects: groupWorkspacesByProject([parent, child]),
     workspaces: [parent, child],
-    workspaceActivitySnapshots: { [child.id]: monitorActivity(1) },
+    workspaceActivitySnapshots: { [child.id]: monitorActivity(0) },
   });
   client.workspace.activity.subscribe = activityFeed.subscribe;
   return client;
@@ -160,20 +163,36 @@ export const BackgroundMonitor: AppStory = {
     const settle = (assertion: () => Promise<void>) => waitFor(assertion, { timeout: 5_000 });
     // Both surfaces read the same store, so the sidebar row (the fixed #4328 side) and
     // the composer tray must agree at every step (#4327).
-    const expectMonitored = () =>
+    const expectMonitored = (monitorCount = 1) =>
       settle(async () => {
+        await expect(workspaceStore.getWorkspaceSidebarState(MONITORED_CHILD_ID)).toMatchObject({
+          canInterrupt: true,
+          awaitingUserQuestion: false,
+          activeBashMonitorCount: monitorCount,
+        });
         await expect(sidebarRow()).toBeVisible();
         await expect(tray()).toHaveTextContent("1 sub-agent · 1 active");
         await expect(trayRow()).toHaveTextContent("Monitoring");
       });
     const expectSettled = () =>
       settle(async () => {
+        // Assert the actual store hint, not just the mock input: otherwise the
+        // completed-report fence could pass without ever seeing stale activity.
+        await expect(workspaceStore.getWorkspaceSidebarState(MONITORED_CHILD_ID)).toMatchObject({
+          canInterrupt: true,
+          awaitingUserQuestion: false,
+          activeBashMonitorCount: 0,
+        });
         await expect(sidebarRow()).toBeNull();
         await expect(tray()).toHaveTextContent("1 sub-agent · inactive");
         await expect(trayRow()).toHaveTextContent("Completed");
       });
 
-    await step("Reported child with an armed monitor is active in sidebar and tray", async () => {
+    await step("A completed report fences off stale streaming without a monitor", async () => {
+      await expectSettled();
+    });
+    await step("Arming a monitor activates the reported child in sidebar and tray", async () => {
+      emitMonitorCount(1);
       await expectMonitored();
     });
     await step("Collapsing hides the rows; expanding brings them back", async () => {
@@ -187,7 +206,7 @@ export const BackgroundMonitor: AppStory = {
     });
     await step("A second monitor counts the same child once", async () => {
       emitMonitorCount(2);
-      await expectMonitored();
+      await expectMonitored(2);
     });
     await step("Retiring one of two monitors keeps the child active", async () => {
       emitMonitorCount(1);

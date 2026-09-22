@@ -303,10 +303,11 @@ const INACTIVE_PRESENTATION: SubAgentStatusPresentation = {
   iconClassName: "text-muted",
 };
 // The agent's turn ended but a background bash monitor is armed to wake it on match.
+// Normal foreground keeps the icon legible in both themes; waiting is not a warning.
 const MONITORING_PRESENTATION: SubAgentStatusPresentation = {
   label: "Monitoring",
   icon: Radar,
-  iconClassName: "text-warning",
+  iconClassName: "text-foreground",
 };
 
 function getTaskStatusPresentation(
