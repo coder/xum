@@ -527,7 +527,8 @@ export type CanonicalRequestResult =
  * walk (or `JSON.stringify`) over a pathologically deep or cyclic value would
  * throw `RangeError` instead of a typed violation. Counting stops as soon as
  * `limit + 1` is reached; the returned depth is then exactly `limit + 1`. The
- * limit is mandatory because a cyclic value never runs out of depth.
+ * limit is mandatory because a cyclic value never runs out of depth. Its stack
+ * is O(width), so run `jsonBytesLowerBound` first on untrusted input.
  */
 export function jsonDepth(value: unknown, limit: number): number {
   if (value === null || typeof value !== "object") {
@@ -557,6 +558,7 @@ export function jsonDepth(value: unknown, limit: number): number {
 
 export type BoundedParseResult<T> =
   | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly violation: "request-too-large"; readonly bytes: number }
   | { readonly ok: false; readonly violation: "request-too-deep"; readonly depth: number }
   | { readonly ok: false; readonly violation: "forbidden-key"; readonly key: string }
   | { readonly ok: false; readonly violation: "invalid"; readonly error: z.ZodError };
@@ -601,14 +603,21 @@ function findForbiddenJsonKey(value: unknown): string | undefined {
  * The only supported way to apply the evaluation schemas to untrusted raw
  * values (sandbox `state`/spec, or persisted records read back from disk).
  * The recursive schemas (`z.lazy`) and canonicalization would overflow the
- * stack on a pathologically deep or cyclic value, so the bounded iterative
- * depth walk runs first and turns such input into a typed violation; keys
- * zod would silently drop are rejected before parsing for the same reason.
+ * stack on a pathologically deep or cyclic value and cost O(size) memory on
+ * an oversized one, so the bounded size and depth walks run first and turn
+ * such input into typed violations; keys zod would silently drop are rejected
+ * before parsing for the same reason.
  */
 export function parseEvaluationInputBounded<T>(
   schema: z.ZodType<T>,
   raw: unknown
 ): BoundedParseResult<T> {
+  // Same order as canonicalRequestBytes: size (memory-bounded on any input),
+  // then depth, then the key scan, then zod.
+  const bytes = jsonBytesLowerBound(raw, EVALUATION_MAX_REQUEST_BYTES);
+  if (bytes > EVALUATION_MAX_REQUEST_BYTES) {
+    return { ok: false, violation: "request-too-large", bytes };
+  }
   const depth = jsonDepth(raw, EVALUATION_MAX_DEPTH);
   if (depth > EVALUATION_MAX_DEPTH) {
     return { ok: false, violation: "request-too-deep", depth };
@@ -633,30 +642,45 @@ export function canonicalEvaluationJson(value: unknown): string {
 
 /**
  * Cheap lower bound of a value's JSON byte size, computed without allocating
- * the serialization: every node counts at least one byte and every string /
- * key contributes its length (UTF-8 never needs fewer bytes than UTF-16 code
- * units, and JSON escaping only adds). The walk stops as soon as `limit` is
- * exceeded, so an oversized untrusted value is rejected before
- * canonicalization builds a full-size string plus a second UTF-8 buffer.
- * Iterative like `jsonDepth`; call it only after the depth check.
+ * the serialization: the root counts one byte, every child of a container
+ * costs at least one byte and is charged when its parent is visited, and
+ * every string / key contributes its length (UTF-8 never needs fewer bytes
+ * than UTF-16 code units, and JSON quoting/escaping only adds).
+ *
+ * Bounded in time AND memory: the walk stops as soon as `limit` is exceeded,
+ * children are charged before they are enqueued (so a 50M-element array is
+ * rejected without being copied onto the stack), and object keys are iterated
+ * without materializing a key array. Every iteration that enqueues anything
+ * also adds bytes, so cyclic values terminate as well — this is therefore the
+ * first check to run on untrusted input, ahead of `jsonDepth`.
  */
 export function jsonBytesLowerBound(value: unknown, limit: number): number {
   const stack: unknown[] = [value];
-  let bytes = 0;
+  let bytes = 1;
   while (stack.length > 0 && bytes <= limit) {
     const current = stack.pop();
-    bytes += 1;
     if (typeof current === "string") {
       bytes += current.length;
     } else if (Array.isArray(current)) {
       const items: unknown[] = current;
+      bytes += items.length;
+      if (bytes > limit) {
+        break;
+      }
       for (const item of items) {
         stack.push(item);
       }
     } else if (current !== null && typeof current === "object") {
-      for (const key of Object.keys(current)) {
-        bytes += key.length;
-        stack.push((current as Record<string, unknown>)[key]);
+      const record = current as Record<string, unknown>;
+      for (const key in record) {
+        if (!Object.hasOwn(record, key)) {
+          continue;
+        }
+        bytes += 1 + key.length;
+        if (bytes > limit) {
+          break;
+        }
+        stack.push(record[key]);
       }
     }
   }
@@ -673,18 +697,19 @@ export function canonicalRequestBytes(request: {
   readonly questions: EvaluationQuestions;
 }): CanonicalRequestResult {
   const payload = { state: request.state, questions: request.questions };
-  // Depth first: canonicalization recurses, so it must never see a payload
-  // that exceeds the depth limit (or a cyclic one). Bytes are unknown then.
-  const depth = jsonDepth(payload, EVALUATION_MAX_DEPTH);
-  if (depth > EVALUATION_MAX_DEPTH) {
-    return { ok: false, violation: "request-too-deep", bytes: 0, depth };
-  }
-  // Size next, still without serializing: a value far above the cap must not
-  // cost a full canonical string and a second UTF-8 buffer before rejection.
+  // Size first, without serializing: it is the only walk whose memory is
+  // bounded on arbitrary input, and once it passes the payload holds at most
+  // EVALUATION_MAX_REQUEST_BYTES nodes, which bounds the depth walk's stack.
   // `bytes` is then the (lower-bound) count at which the walk stopped.
   const lowerBound = jsonBytesLowerBound(payload, EVALUATION_MAX_REQUEST_BYTES);
   if (lowerBound > EVALUATION_MAX_REQUEST_BYTES) {
-    return { ok: false, violation: "request-too-large", bytes: lowerBound, depth };
+    return { ok: false, violation: "request-too-large", bytes: lowerBound, depth: 0 };
+  }
+  // Depth next: canonicalization recurses, so it must never see a payload
+  // that exceeds the depth limit (or a cyclic one).
+  const depth = jsonDepth(payload, EVALUATION_MAX_DEPTH);
+  if (depth > EVALUATION_MAX_DEPTH) {
+    return { ok: false, violation: "request-too-deep", bytes: lowerBound, depth };
   }
   const canonical = canonicalEvaluationJson(payload);
   const bytes = new TextEncoder().encode(canonical).length;

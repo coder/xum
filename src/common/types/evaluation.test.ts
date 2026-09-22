@@ -429,6 +429,33 @@ describe("canonicalRequestBytes", () => {
     );
   });
 
+  it("charges wide containers before enqueuing their children", () => {
+    // 5M scalars: the elements are charged up front, so the walk stops at the
+    // array itself instead of copying every element onto the stack. The
+    // returned count proves it stopped there (exactly root + key + length).
+    const wide = { items: Array<number>(5_000_000).fill(0) };
+    const bytes = jsonBytesLowerBound(wide, EVALUATION_MAX_REQUEST_BYTES);
+    expect(bytes).toBe(1 + (1 + "items".length) + 5_000_000);
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, wide)).toEqual({
+      ok: false,
+      violation: "request-too-large",
+      bytes,
+    });
+    expect(canonicalRequestBytes({ state: wide, questions: QUESTIONS })).toMatchObject({
+      ok: false,
+      violation: "request-too-large",
+    });
+    // Wide objects are handled the same way, without materializing a key array.
+    const wideObject: Record<string, number> = {};
+    for (let index = 0; index < 300_000; index++) {
+      wideObject[`k${index}`] = 0;
+    }
+    expect(parseEvaluationInputBounded(EvaluationStateSchema, wideObject)).toMatchObject({
+      ok: false,
+      violation: "request-too-large",
+    });
+  });
+
   it("rejects payloads nested deeper than EVALUATION_MAX_DEPTH", () => {
     const nest = (levels: number): EvaluationJsonValue[] => {
       let value: EvaluationJsonValue[] = [];
@@ -462,15 +489,20 @@ describe("canonicalRequestBytes", () => {
     });
     expect(jsonDepth(deep, EVALUATION_MAX_DEPTH)).toBe(EVALUATION_MAX_DEPTH + 1);
 
+    // A cyclic value has unbounded JSON size, so the size bound (which runs
+    // first) rejects it; either request violation is acceptable — the contract
+    // is a typed rejection, never an exception or a hang.
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     expect(jsonDepth(cyclic, EVALUATION_MAX_DEPTH)).toBe(EVALUATION_MAX_DEPTH + 1);
-    expect(
-      canonicalRequestBytes({
-        state: cyclic as unknown as EvaluationJsonValue[],
-        questions: QUESTIONS,
-      })
-    ).toMatchObject({ ok: false, violation: "request-too-deep" });
+    const cyclicRequest = canonicalRequestBytes({
+      state: cyclic as unknown as EvaluationJsonValue[],
+      questions: QUESTIONS,
+    });
+    expect(cyclicRequest.ok).toBe(false);
+    if (!cyclicRequest.ok) {
+      expect(["request-too-large", "request-too-deep"]).toContain(cyclicRequest.violation);
+    }
 
     // The schema entry point is bounded too: zod's z.lazy recursion never runs
     // on such values.
@@ -479,13 +511,15 @@ describe("canonicalRequestBytes", () => {
       violation: "request-too-deep",
       depth: EVALUATION_MAX_DEPTH + 1,
     });
-    expect(parseEvaluationInputBounded(EvaluationStateSchema, cyclic)).toMatchObject({
-      ok: false,
-      violation: "request-too-deep",
-    });
-    expect(
-      parseEvaluationInputBounded(WorkflowEvaluateSpecSchema, { id: "s", questions: cyclic })
-    ).toMatchObject({ ok: false, violation: "request-too-deep" });
+    for (const parsed of [
+      parseEvaluationInputBounded(EvaluationStateSchema, cyclic),
+      parseEvaluationInputBounded(WorkflowEvaluateSpecSchema, { id: "s", questions: cyclic }),
+    ]) {
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(["request-too-large", "request-too-deep"]).toContain(parsed.violation);
+      }
+    }
   });
 });
 
