@@ -10,6 +10,7 @@ import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { createWorktreeArchiveHook } from "@/node/runtime/worktreeLifecycleHooks";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
@@ -131,7 +132,11 @@ describe("WorkspaceService structural mutation guard", () => {
       (runtimeConfig) => {
         const derive = (targetProjectPath: string, name: string) =>
           hasSrcBaseDir(runtimeConfig)
-            ? path.join(runtimeConfig.srcBaseDir, path.basename(targetProjectPath), name)
+            ? path.join(
+                expandTilde(runtimeConfig.srcBaseDir),
+                path.basename(targetProjectPath),
+                name
+              )
             : targetProjectPath;
         const fake = {
           getWorkspacePath: derive,
@@ -482,6 +487,58 @@ describe("WorkspaceService structural mutation guard", () => {
       await expectIntact(root);
       expect(physical.deleted).toEqual([]);
       expect(physical.renamed).toEqual([]);
+    });
+
+    describe("rows the runtime derives through the default worktree config or a tilde srcBaseDir", () => {
+      // Config.getAllMetadata substitutes DEFAULT_RUNTIME_CONFIG (worktree, `~/.xum/src`) for a
+      // missing runtimeConfig and WorktreeManager expands the tilde through getXumHome(), so
+      // with XUM_ROOT pointed at the harness root both spell <tempDir>/src == srcBaseDir.
+      let previousXumRoot: string | undefined;
+      beforeEach(() => {
+        previousXumRoot = process.env.XUM_ROOT;
+        process.env.XUM_ROOT = tempDir;
+      });
+      afterEach(() => {
+        if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousXumRoot;
+      });
+
+      test("a legacy root without a runtimeConfig still protects a task at its default-derived target", async () => {
+        const legacyRoot = row("root", ROOT_ID, {
+          path: checkoutPath("root-stored"),
+          runtimeConfig: undefined,
+        });
+        const taskAtDerivedTarget = taskRow("agent_at_target", TASK_ID, {
+          path: checkoutPath("root"),
+        });
+        await seed([legacyRoot, taskAtDerivedTarget]);
+        expect(persistedRow(ROOT_ID)?.runtimeConfig).toBeUndefined();
+
+        expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+        expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+        await expectIntact(taskAtDerivedTarget);
+        await expectIntact(legacyRoot);
+        expect(physical.deleted).toEqual([]);
+        expect(physical.renamed).toEqual([]);
+      });
+
+      test("a root whose srcBaseDir is spelled with a tilde protects a task at the expanded target", async () => {
+        const tildeRoot = row("root", ROOT_ID, {
+          path: checkoutPath("root-stored"),
+          runtimeConfig: { type: "worktree", srcBaseDir: "~/.xum/src" },
+        });
+        const taskAtDerivedTarget = taskRow("agent_at_target", TASK_ID, {
+          path: checkoutPath("root"),
+        });
+        await seed([tildeRoot, taskAtDerivedTarget]);
+
+        expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+        expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+        await expectIntact(taskAtDerivedTarget);
+        await expectIntact(tildeRoot);
+        expect(physical.deleted).toEqual([]);
+        expect(physical.renamed).toEqual([]);
+      });
     });
 
     test("a local-runtime task's project execution directory protects it even when its stored path is unrelated", async () => {
