@@ -133,6 +133,13 @@ export class WorkflowEvaluationAdapter {
     spec: Pick<WorkflowEvaluateSpec, "model">,
     persisted?: EvaluationAdmission["selection"]
   ): Promise<EvaluationSelection> {
+    // `WorkflowEvaluateSpecSchema` already rejects a blank per-call model; the
+    // assert keeps a blank from ever shadowing the fallbacks if a caller skips
+    // that validation.
+    assert(
+      spec.model === undefined || spec.model.trim().length > 0,
+      "resolveSelection requires a non-blank per-call model when provided"
+    );
     const modelString = persisted
       ? persisted.modelString
       : (spec.model ??

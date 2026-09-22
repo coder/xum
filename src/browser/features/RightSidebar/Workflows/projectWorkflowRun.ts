@@ -514,7 +514,7 @@ export function projectWorkflowRun(
     }
     if (!stepTitle.has(stepId)) {
       if (
-        (event.type === "agent-step" || event.type === "task") &&
+        (event.type === "agent-step" || event.type === "task" || event.type === "evaluation") &&
         event.title != null &&
         event.title.length > 0
       ) {

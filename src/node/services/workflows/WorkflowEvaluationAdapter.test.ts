@@ -240,6 +240,19 @@ describe("WorkflowEvaluationAdapter.resolveSelection", () => {
     });
   });
 
+  it("refuses a blank per-call model instead of letting it shadow the fallbacks", async () => {
+    const h = createHarness({ configModel: "google:gemini-2.5-flash" });
+    let thrown: unknown;
+    try {
+      await h.adapter.resolveSelection({ model: "  " });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/non-blank/);
+    expect(h.resolveCalls).toEqual([]);
+  });
+
   it("rejects a blank CLI override at construction", () => {
     expect(() => createHarness({ evaluationModelOverride: "   " })).toThrow(
       /evaluationModelOverride/

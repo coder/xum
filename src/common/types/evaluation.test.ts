@@ -158,6 +158,21 @@ describe("WorkflowEvaluateSpecSchema", () => {
         .success
     ).toBe(false);
   });
+
+  it("rejects a blank per-call model so it cannot shadow the configured default", () => {
+    expect(
+      WorkflowEvaluateSpecSchema.safeParse({
+        id: "screen",
+        questions: QUESTIONS,
+        model: "anthropic:claude-haiku-4-5",
+      }).success
+    ).toBe(true);
+    for (const model of ["", "   "]) {
+      expect(
+        WorkflowEvaluateSpecSchema.safeParse({ id: "screen", questions: QUESTIONS, model }).success
+      ).toBe(false);
+    }
+  });
 });
 
 describe("validateAnswersAgainstQuestions", () => {

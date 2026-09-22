@@ -128,7 +128,12 @@ export const WorkflowEvaluateSpecSchema = z.strictObject({
     .min(1)
     .refine((id) => id.trim().length > 0, "id must be a non-blank step id"),
   title: z.string().optional(),
-  model: z.string().optional(),
+  // A blank model must not silently shadow the CLI/Settings default, so it is
+  // rejected up front instead of reaching the resolver as an unknown model.
+  model: z
+    .string()
+    .refine((model) => model.trim().length > 0, "model must be a non-blank model string")
+    .optional(),
   timeoutMs: z.number().int().positive().optional(),
   questions: EvaluationQuestionsSchema,
   providerOptions: EvaluationProviderOptionsSchema.optional(),
