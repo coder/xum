@@ -418,6 +418,43 @@ function createOpenAIModelWithPreservedOptions(
   });
 }
 
+/**
+ * GPT-6 Sol/Luna Chat Completions accepts function calling only with
+ * reasoning_effort "none". buildProviderOptions clamps the options agent turns
+ * record and send, but headless tool loops (Dream consolidation, memory
+ * harvest, refine, sidebar status) call streamText with tools and no provider
+ * options, so nothing requests "none" and the API defaults to medium. The model
+ * boundary is the one place every caller's tools are known, so it fills in
+ * "none" for tool-bearing requests that requested no effort; tool-free requests
+ * and explicit caller efforts are left alone. Wrap this OUTSIDE
+ * createOpenAIModelWithPreservedOptions: the injected "none" must be visible
+ * to that wrapper's body patch, or the SDK strips it.
+ */
+export function clampGpt6ChatCompletionsToolReasoning(
+  model: LanguageModelV4,
+  capabilityModel: string
+): LanguageModelV4 {
+  if (!isGpt6SolOrLunaModel(capabilityModel)) return model;
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      transformParams: ({ params }) =>
+        Promise.resolve(
+          params.tools?.length && params.providerOptions?.openai?.reasoningEffort == null
+            ? {
+                ...params,
+                providerOptions: {
+                  ...params.providerOptions,
+                  openai: { ...params.providerOptions?.openai, reasoningEffort: "none" },
+                },
+              }
+            : params
+        ),
+    },
+  });
+}
+
 type FetchWithBunExtensions = typeof fetch & {
   preconnect?: typeof fetch extends { preconnect: infer P } ? P : unknown;
   certificate?: typeof fetch extends { certificate: infer C } ? C : unknown;
@@ -2013,9 +2050,9 @@ export class ProviderModelFactory {
           // Mappings are metadata, not authority over the raw/proxy model's tier support.
           // Explicit mappings forward the requested tier for upstream validation;
           // only unmapped native IDs retain the SDK's name-based restrictions.
-          const isMappedAlias =
-            resolveModelForMetadata(fullModelId, providersConfig) !== fullModelId;
-          const model = createOpenAIModelWithPreservedOptions(
+          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
+          const isMappedAlias = capabilityModel !== fullModelId;
+          const preservedModel = createOpenAIModelWithPreservedOptions(
             createNativeModel,
             webSocketTransport.fetch,
             {
@@ -2025,6 +2062,10 @@ export class ProviderModelFactory {
               wireModelId: modelId,
             }
           );
+          const model =
+            effectiveWireFormat === "chatCompletions"
+              ? clampGpt6ChatCompletionsToolReasoning(preservedModel, capabilityModel)
+              : preservedModel;
           if (webSocketTransport.active) {
             attachLanguageModelCleanup(model, webSocketTransport.close);
           }
@@ -2697,11 +2738,20 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
+          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
+            serviceTierAvailable,
+            wireModelId: originModelId,
+          });
+          // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
+          // is the only capability identity an openai-compat instance has; the raw
+          // originModelId would miss the clamp. Same resolution as buildProviderOptions.
           return Ok(
-            createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
-              serviceTierAvailable,
-              wireModelId: originModelId,
-            })
+            wire === "openai-responses"
+              ? coderModel
+              : clampGpt6ChatCompletionsToolReasoning(
+                  coderModel,
+                  resolveModelForMetadata(`coder:${modelId}`, providersConfig)
+                )
           );
         }
 
