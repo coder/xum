@@ -4,7 +4,6 @@ import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
-import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
 import { UserPreferencesSchema } from "./userPreferences";
@@ -181,12 +180,17 @@ export const AppConfigOnDiskSchema = z
      */
     modelFallbacks: ModelFallbacksSchema.optional(),
     /**
-     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized
-     * on read (see normalizeAutoModelRoutingConfig); absent means the defaults.
-     * `.catch`: a hand-edited or damaged tier must not fail the whole document (this
-     * schema also validates unrelated config-tool writes); the read path heals it.
+     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized on read
+     * (see normalizeAutoModelRoutingConfig), which heals each tier and field on its own;
+     * absent means the defaults. The document therefore only requires the block's shape:
+     * a hand-edited tier must neither fail the whole document (this schema also validates
+     * unrelated config-tool writes) nor take the valid tiers and evaluator down with it.
+     * `.catch`: anything that is not an object degrades to absent.
      */
-    autoModelRouting: AutoModelRoutingConfigSchema.optional().catch(undefined),
+    autoModelRouting: z
+      .object({ tiers: z.array(z.unknown()).optional(), evaluationModel: z.unknown().optional() })
+      .optional()
+      .catch(undefined),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
