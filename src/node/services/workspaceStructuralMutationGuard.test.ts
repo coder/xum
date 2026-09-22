@@ -125,6 +125,38 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
     ).toEqual({ kind: "none" });
   });
 
+  test("a local-runtime task row's footprint covers every project directory it executes in", async () => {
+    const rootCheckout = path.join(tempDir, "src", "repo", "root");
+    const primaryProject = path.join(tempDir, "repo");
+    // The row's secondary project lives INSIDE the root's checkout; its stored path does not.
+    const secondaryProject = path.join(rootCheckout, "nested-project");
+    await fsPromises.mkdir(rootCheckout, { recursive: true });
+    await fsPromises.mkdir(primaryProject, { recursive: true });
+    await fsPromises.mkdir(secondaryProject, { recursive: true });
+    const root: Workspace = { path: rootCheckout, id: "root", name: "root" };
+    const localTask: Workspace = {
+      path: path.join(tempDir, "unrelated-stored"),
+      id: "task",
+      name: "local-task",
+      parentWorkspaceId: "root",
+      runtimeConfig: { type: "local" },
+      projects: [
+        { projectPath: primaryProject, projectName: "repo" },
+        { projectPath: secondaryProject, projectName: "nested-project" },
+      ],
+    };
+    const snapshot: ProjectsConfig = {
+      projects: new Map([[primaryProject, { workspaces: [root, localTask] }]]),
+    };
+
+    expect(
+      await findProtectedFootprintOverlap(snapshot, {
+        row: root,
+        bucketProjectPath: primaryProject,
+      })
+    ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: secondaryProject });
+  });
+
   test.skipIf(process.platform === "win32")(
     "a symlinked or special .git entry is unknown backing: never followed, never opened",
     async () => {

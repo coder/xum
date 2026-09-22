@@ -151,20 +151,27 @@ const CANONICALIZE_TIMEOUT_MS = 2_000;
  * every project of the row (WorktreeManager derives by name), not on the
  * persisted `path`. A stale or re-pointed stored path must never let an
  * operation land on a derived target the scan did not cover, so both the
- * stored path and every derived target are footprint. Project-dir local
- * runtimes derive nothing extra: their operations are physical no-ops on the
- * project directory the stored path already names.
+ * stored path and every derived target are footprint.
+ *
+ * LocalRuntime rows execute in the PROJECT directory of every project they
+ * belong to (LocalRuntime.forkWorkspace shares the project directory; the
+ * producer core's execution directory is the bucket path, not the stored
+ * path), so those directories are footprint too — a stored path that is stale
+ * or points elsewhere must not hide the directory the task actually runs in.
  */
 function footprintPathsForRow(row: Workspace, bucketProjectPath: string): string[] {
   const paths = [row.path];
+  const projectPaths =
+    row.projects !== undefined && row.projects.length > 0
+      ? row.projects.map((project) => project.projectPath)
+      : [bucketProjectPath];
   if (hasSrcBaseDir(row.runtimeConfig) && typeof row.name === "string" && row.name.length > 0) {
-    const projectPaths =
-      row.projects !== undefined && row.projects.length > 0
-        ? row.projects.map((project) => project.projectPath)
-        : [bucketProjectPath];
     for (const projectPath of projectPaths) {
       paths.push(deriveHostLocalCheckoutPath(row.runtimeConfig, projectPath, row.name));
     }
+  }
+  if (row.runtimeConfig?.type === "local") {
+    paths.push(bucketProjectPath, ...projectPaths);
   }
   collectProofPaths(readTaskCheckoutPreparation(row), paths);
   return paths.filter((candidate) => candidate.length > 0);
