@@ -5140,6 +5140,7 @@ describe("WorkspaceMcpOverridesService", () => {
       let clockOffsetMs = 0;
       const clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
       try {
+        // (pruneSpy is restored in finally)
         // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
         await expect(
           service.prunePluginOverrideKeysForUnregisteredCheckout(
@@ -5160,6 +5161,7 @@ describe("WorkspaceMcpOverridesService", () => {
         expect(await fs.readFile(filePath, "utf-8")).toBe(original);
       } finally {
         clock.mockRestore();
+        pruneSpy.mockRestore();
       }
     });
 
@@ -5200,20 +5202,27 @@ describe("WorkspaceMcpOverridesService", () => {
       const realNow = Date.now.bind(Date);
       let clockOffsetMs = 0;
       const clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
-      spyOn(internals, "pruneResolvedWorkspace").mockImplementation((resolved, keyPrefix, s) => {
-        step = s;
-        // Between createPublicationBudget() and budget.remaining(): ~2 s of budget left. Mirrors
-        // the service's private PUBLICATION_TIMEOUT_MS; a shorter production budget makes the
-        // deadline fire before the write starts and this test then fails loudly (see below).
-        clockOffsetMs = PRUNE_BUDGET_MIRROR_MS - 2_000;
-        return realPrune(resolved, keyPrefix, s);
-      });
+      const pruneSpy = spyOn(internals, "pruneResolvedWorkspace").mockImplementation(
+        (resolved, keyPrefix, s) => {
+          step = s;
+          // Between createPublicationBudget() and budget.remaining(): ~2 s of budget left. Mirrors
+          // the service's private PUBLICATION_TIMEOUT_MS; a shorter production budget makes the
+          // deadline fire before the write starts and this test then fails loudly (see below).
+          clockOffsetMs = PRUNE_BUDGET_MIRROR_MS - 2_000;
+          return realPrune(resolved, keyPrefix, s);
+        }
+      );
       const gate = Promise.withResolvers<void>();
       let writeStarted = false;
       let writeSettled = false;
+      // A PROTOTYPE spy outlives this file unless restored (bun test shares one process across
+      // files), and bun's spyOn on an already-spied method returns that same mock — a later
+      // test capturing "the real writeFile" would capture the mock and recurse. Fail loudly on
+      // a leak, and restore this one in finally.
+      expect("mockRestore" in LocalBaseRuntime.prototype.writeFile).toBe(false);
       // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via .call below
       const realWriteFile = LocalBaseRuntime.prototype.writeFile;
-      spyOn(LocalBaseRuntime.prototype, "writeFile").mockImplementation(function (
+      const writeSpy = spyOn(LocalBaseRuntime.prototype, "writeFile").mockImplementation(function (
         this: LocalBaseRuntime,
         target: string,
         abortSignal?: AbortSignal
@@ -5291,6 +5300,8 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       } finally {
         clock.mockRestore();
+        pruneSpy.mockRestore();
+        writeSpy.mockRestore();
       }
     });
   });
