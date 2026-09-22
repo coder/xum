@@ -1,5 +1,8 @@
 import type { EvaluationAdmission } from "@/common/types/evaluation";
-import { WORKFLOW_EVALUATION_STEP_ERROR_NAME } from "@/common/types/evaluation";
+import {
+  isWorkflowEvaluationStepErrorMessage,
+  WORKFLOW_EVALUATION_STEP_ERROR_NAME,
+} from "@/common/types/evaluation";
 import type { WorkflowRunEvent, WorkflowRunRecord } from "@/common/types/workflow";
 import { EVALUATION_MAX_ATTEMPTS } from "@/constants/evaluation";
 
@@ -27,7 +30,8 @@ export function getWorkflowCheckpointRetryEligibility(
   const failedEvaluation = findFailedEvaluationAdmission(run, latestError?.message);
   if (
     latestError?.message !== WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE &&
-    failedEvaluation === undefined
+    failedEvaluation === undefined &&
+    !isPreAdmissionEvaluationFailure(latestError?.message)
   ) {
     return { canRetry: false, reason: "Workflow run cannot be retried from checkpoint" };
   }
@@ -76,6 +80,26 @@ function findFailedEvaluationAdmission(
     }
   }
   return undefined;
+}
+
+/**
+ * A first attempt that fails before admission (no configured model, missing
+ * key, unsupported route, …) deliberately writes no step record, so nothing in
+ * `run.steps` can be matched; the runner's exact error text (bare or
+ * sandbox-prefixed, as above) is the only trace. Recognising it lets the user
+ * fix the configuration and retry from the checkpoint at attempt 1 instead of
+ * starting over; a matched record takes precedence so the attempt cap above
+ * still applies.
+ */
+function isPreAdmissionEvaluationFailure(latestErrorMessage: string | undefined): boolean {
+  if (latestErrorMessage === undefined) {
+    return false;
+  }
+  const prefix = `${WORKFLOW_EVALUATION_STEP_ERROR_NAME}: `;
+  const message = latestErrorMessage.startsWith(prefix)
+    ? latestErrorMessage.slice(prefix.length)
+    : latestErrorMessage;
+  return isWorkflowEvaluationStepErrorMessage(message);
 }
 
 function getUnsafePatchRetryReason(run: WorkflowRunRecord): string | null {

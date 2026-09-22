@@ -41,7 +41,12 @@ const PROVIDER_FAILURE = {
   defect: false,
 } as unknown as Outcome;
 
-function createFakeEvaluation(outcomes: Outcome[]) {
+function createFakeEvaluation(
+  outcomes: Outcome[],
+  options: {
+    /** The very first resolution finds no model (nothing configured yet). */ failFirstResolution?: boolean;
+  } = {}
+) {
   const pinned: PinnedEvaluationModel = {
     model: Object.create(null) as PinnedEvaluationModel["model"],
     modelString: "openai:gpt-5",
@@ -55,7 +60,15 @@ function createFakeEvaluation(outcomes: Outcome[]) {
   let dispatches = 0;
   const adapter: WorkflowEvaluationPort = {
     resolveSelection(_spec, persisted) {
+      const index = resolutions.length;
       resolutions.push({ persistedAttempt: persisted === undefined ? undefined : 1 });
+      if (options.failFirstResolution === true && index === 0) {
+        return Promise.resolve({
+          ok: false as const,
+          reason: "invalid-input" as const,
+          code: "no-model" as const,
+        });
+      }
       return Promise.resolve({ ok: true as const, pinned });
     },
     dispatch: (() => {
@@ -192,6 +205,40 @@ describe("WorkflowService checkpoint retry of failed evaluate() steps", () => {
     expect((await runStore.getRun("wfr_eval_spent")).steps[0]).toMatchObject({
       status: "failed",
       evaluation: { attempt: EVALUATION_MAX_ATTEMPTS },
+    });
+  });
+
+  test("a first attempt that failed before admission is retryable once a model is configured", async () => {
+    using tmp = new DisposableTempDir("workflow-service-evaluate-preadmission");
+    const evaluation = createFakeEvaluation([COMPLETED], { failFirstResolution: true });
+    const { service, runStore } = createService(tmp.path, evaluation.adapter, "wfr_eval_nomodel");
+
+    await expect(
+      service.startWorkflow({
+        script: script(EVALUATE_SOURCE),
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      })
+    ).rejects.toThrow(/evaluation failed: invalid-input\/no-model/);
+    // Pre-admission: deliberately no step record — the runner's exact error
+    // text is the run's only trace of the failed evaluation.
+    const failed = await runStore.getRun("wfr_eval_nomodel");
+    expect(failed.status).toBe("failed");
+    expect(failed.steps).toHaveLength(0);
+    expect(getWorkflowCheckpointRetryEligibility(failed).canRetry).toBe(true);
+
+    const retried = await service.retryRunFromCheckpoint({
+      workspaceId: "workspace-1",
+      runId: "wfr_eval_nomodel",
+      projectTrusted: true,
+    });
+
+    expect(retried.status).toBe("completed");
+    expect(evaluation.dispatchCount()).toBe(1);
+    expect((await runStore.getRun("wfr_eval_nomodel")).steps[0]).toMatchObject({
+      status: "completed",
+      evaluation: { attempt: 1 },
     });
   });
 

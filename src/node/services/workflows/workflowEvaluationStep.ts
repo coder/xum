@@ -16,6 +16,7 @@ import {
   type EvaluationStepFailureReason,
   type EvaluationStepResult,
   type WorkflowEvaluateSpec,
+  formatWorkflowEvaluationStepError,
 } from "@/common/types/evaluation";
 import assert from "@/common/utils/assert";
 import {
@@ -94,7 +95,7 @@ export class WorkflowEvaluationStepError extends Error {
     readonly attempt: number,
     readonly statusCode?: number
   ) {
-    super(formatEvaluationFailure({ reason, code, statusCode, stepDigest, attempt }));
+    super(formatWorkflowEvaluationStepError({ reason, code, statusCode, stepDigest, attempt }));
     this.name = WORKFLOW_EVALUATION_STEP_ERROR_NAME;
   }
 }
@@ -105,17 +106,6 @@ export const WORKFLOW_EVALUATION_INTERRUPTED_MESSAGE = "Task interrupted";
 export const EVALUATION_POST_COMMIT_EVENT_FAILED_CODE = "evaluation-post-commit-event-failed";
 export const EVALUATION_POST_COMMIT_USAGE_FAILED_CODE = "evaluation-post-commit-usage-failed";
 export const EVALUATION_CACHED_EVENT_FAILED_CODE = "evaluation-cached-event-failed";
-
-export function formatEvaluationFailure(input: {
-  reason: EvaluationStepFailureReason;
-  code: EvaluationStepFailureCode;
-  statusCode?: number;
-  stepDigest: string;
-  attempt: number;
-}): string {
-  const status = input.statusCode !== undefined ? ` status ${input.statusCode}` : "";
-  return `evaluation failed: ${input.reason}/${input.code}${status} (step ${input.stepDigest}, attempt ${input.attempt})`;
-}
 
 export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);

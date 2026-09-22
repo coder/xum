@@ -283,6 +283,31 @@ export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
  */
 export const WORKFLOW_EVALUATION_STEP_ERROR_NAME = "WorkflowEvaluationStepError";
 
+/**
+ * Exact message of that error, built only from enum/number/digest fields (plan
+ * §"Security model": no author text). The checkpoint-retry gate recognises this
+ * text on a run whose failed evaluate step wrote no record (a first attempt that
+ * failed before admission), so format and recogniser live together.
+ */
+export function formatWorkflowEvaluationStepError(input: {
+  reason: EvaluationStepFailureReason;
+  code: EvaluationStepFailureCode;
+  statusCode?: number;
+  stepDigest: string;
+  attempt: number;
+}): string {
+  const status = input.statusCode !== undefined ? ` status ${input.statusCode}` : "";
+  return `evaluation failed: ${input.reason}/${input.code}${status} (step ${input.stepDigest}, attempt ${input.attempt})`;
+}
+
+const WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE =
+  /^evaluation failed: [a-z-]+\/[a-z-]+( status \d+)? \(step [0-9a-f]+, attempt \d+\)$/;
+
+/** True for the exact text `formatWorkflowEvaluationStepError` produces. */
+export function isWorkflowEvaluationStepErrorMessage(message: string): boolean {
+  return WORKFLOW_EVALUATION_STEP_ERROR_MESSAGE.test(message);
+}
+
 export const EvaluationStepFailureReasonSchema = z.enum([
   ...EvaluationErrorReasonSchema.options,
   "deadline",
