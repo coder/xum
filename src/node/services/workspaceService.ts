@@ -11741,6 +11741,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     input: SubmitPlanReviewFeedbackInput & { options: SendMessageOptions }
   ): Promise<Result<{ feedbackId: string; state: PlanReviewState }, PlanReviewError>> {
+    // The feedback binds snapshot/thread ids read from history BEFORE sendMessage's entry
+    // check, so a context clear/reset/replace committed in that gap (idle workspace, another
+    // window) would append a row whose references were just discarded — the projection would
+    // skip it as dangling while the transcript still shows it as sent. Compare the mutation
+    // epoch in the same synchronous block that enters sendMessage (which counts the send as
+    // in-preflight and re-probes the epoch itself), so a discard either lands before this check
+    // and is refused here, or is refused by acquireContextMutationAdmissionGuard until the row
+    // is admitted. The user re-sends against fresh state.
+    const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
       workspaceId,
@@ -11748,6 +11757,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       input.options
     );
     if (!prepared.success) return prepared;
+    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
+      return Err({
+        type: "send_failed",
+        error: {
+          type: "unknown",
+          raw: "Plan review feedback was not sent: the workspace context was cleared or reset while it was being prepared. Review the current plan and send again.",
+        },
+      });
+    }
     const sent = await this.sendMessage(workspaceId, prepared.data.text, {
       ...input.options,
       muxMetadata: prepared.data.muxMetadata,

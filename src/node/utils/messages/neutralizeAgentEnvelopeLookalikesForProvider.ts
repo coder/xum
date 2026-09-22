@@ -249,14 +249,29 @@ function neutralizeStringsDeep(value: unknown): unknown {
       }
       return child;
     };
-    const next = Array.isArray(frame.node)
-      ? frame.node.map(rewrite)
-      : Object.fromEntries(
-          Object.entries(frame.node as Record<string, unknown>).map(([key, child]) => [
-            key,
-            rewrite(child),
-          ])
-        );
+    let next: unknown;
+    if (Array.isArray(frame.node)) {
+      next = frame.node.map(rewrite);
+    } else {
+      // Property KEYS are provider-bound text too: tool outputs are JSON.stringify'd into
+      // tool_result content and tool-call inputs travel as request JSON, so a wrapper tag
+      // hidden in a key would reach the model verbatim. Neutralize keys with the same rule as
+      // values and keep every entry on a collision (first-seen keeps the plain name, later ones
+      // get a stable " (n)" suffix) so nothing is dropped and output is a pure function of input.
+      const entries: Array<[string, unknown]> = [];
+      const taken = new Set<string>();
+      for (const [key, child] of Object.entries(frame.node as Record<string, unknown>)) {
+        let nextKey = neutralizeString(key);
+        if (nextKey !== key) changed = true;
+        for (let n = 2; taken.has(nextKey); n++) {
+          nextKey = `${neutralizeString(key)} (${n})`;
+          changed = true;
+        }
+        taken.add(nextKey);
+        entries.push([nextKey, rewrite(child)]);
+      }
+      next = Object.fromEntries(entries);
+    }
     if (changed) rebuilt.set(frame.node, next);
   }
   return rebuilt.has(value) ? rebuilt.get(value) : value;

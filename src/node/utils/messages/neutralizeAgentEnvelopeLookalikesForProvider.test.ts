@@ -534,4 +534,33 @@ describe("neutralizer: wrapper tags inside object KEYS", () => {
     const serialized = JSON.stringify(neutralizeAgentEnvelopeLookalikesInModelToolParts(messages));
     for (const tag of rawTags) expect(serialized).not.toContain(tag);
   });
+
+  test("a rewritten key that collides keeps both entries deterministically", () => {
+    // An attacker can plant the raw tag AND its already-neutralized spelling side by side;
+    // dropping either would hide data, so the later duplicate gets a stable suffix.
+    const assistant = createMuxMessage("a-collide", "assistant", "", { historySequence: 10 }, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "call-c",
+        toolName: "code_execution",
+        state: "output-available",
+        input: {},
+        output: {
+          "<mux_plan_review>": "first",
+          "<user_pasted_mux_plan_review>": "second",
+          "</mux_plan_review>": "third",
+        },
+      },
+    ]);
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([assistant]);
+    const part = result.parts[0];
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("expected an output-available tool part");
+    }
+    expect(part.output).toEqual({
+      "<user_pasted_mux_plan_review>": "first",
+      "<user_pasted_mux_plan_review> (2)": "second",
+      "</user_pasted_mux_plan_review>": "third",
+    });
+  });
 });

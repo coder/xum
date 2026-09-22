@@ -1008,4 +1008,55 @@ describeIntegration("workspace.planReview", () => {
     const request = await planTurn("Still fine?");
     expect(conversationText(request)).not.toContain("rec_malformed");
   }, 60_000);
+
+  // Last on purpose: it clears the workspace history.
+  test("feedback prepared against history that is cleared before the send is refused", async () => {
+    const state = await getState();
+    const snapshot = state.snapshots.at(-1);
+    expect(snapshot).toBeDefined();
+    if (!snapshot) return;
+    const options = { model: MODEL, agentId: "plan" as const };
+    const comment = { anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body: "Stale?" };
+
+    // Interleave a full clear (another window) between the feedback's history read and its
+    // send: the first forward full-history read is the preparation's projection scan. The
+    // container's history service is the one the workspace service reads through.
+    const historyService = env.services.toORPCContext().historyService;
+    const original = historyService.iterateFullHistory.bind(historyService);
+    let cleared = false;
+    const spy = jest
+      .spyOn(historyService, "iterateFullHistory")
+      .mockImplementation(async (id, direction, visitor) => {
+        const result = await original(id, direction, visitor);
+        if (!cleared && id === workspaceId && direction === "forward") {
+          cleared = true;
+          const clear = await client().workspace.truncateHistory({ workspaceId, percentage: 1 });
+          expect(clear.success).toBe(true);
+        }
+        return result;
+      });
+    const requestsBefore = fixture.requests.length;
+    try {
+      const sent = await planReview().submitFeedback({
+        workspaceId,
+        snapshotId: snapshot.snapshotId,
+        comments: [comment],
+        replies: [],
+        options,
+      });
+      expect(cleared).toBe(true);
+      // Refused instead of appended: the snapshot it referenced no longer exists, so an
+      // appended row would be a dangling feedback the projection skips while the transcript
+      // shows it as sent.
+      expect(!sent.success && sent.error.type).toBe("send_failed");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fixture.requests.length).toBe(requestsBefore);
+    expect((await getState()).feedbacks).toHaveLength(0);
+    const tail = await new HistoryService(env.config).getLastMessages(workspaceId, 5);
+    expect(
+      tail.success && tail.data.some((m) => m.metadata?.muxMetadata?.type === "plan-review")
+    ).toBe(false);
+  }, 60_000);
 });

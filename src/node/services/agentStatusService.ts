@@ -18,6 +18,7 @@ import {
 import type { Config } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -559,12 +560,18 @@ export class AgentStatusService {
     // instead would let a burst of hidden records (resolving many threads) evict the
     // recent conversation, and each hidden append would change the hash by evicting
     // a visible row. Newest-first scan, stopped as soon as the window is full.
+    //
+    // A durable manual reset is a privacy floor: the user discarded everything before it,
+    // so a short post-reset conversation must not be topped up with pre-reset rows (the
+    // scan would otherwise continue into the archive). Same stop as the plan-review-state
+    // block; the reset marker row itself is structure, not conversation.
     const newestFirst: MuxMessage[] = [];
     const scanned = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (chunk) => {
         for (const message of chunk) {
+          if (isDurableContextResetBoundaryMarker(message)) return false;
           if (isModelHiddenMessage(message)) continue;
           newestFirst.push(message);
           if (newestFirst.length >= AGENT_STATUS_MAX_TRAILING_MESSAGES) return false;
