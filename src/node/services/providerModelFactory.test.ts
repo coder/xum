@@ -2459,6 +2459,62 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
   return JSON.parse(call.init.body as string) as Record<string, unknown>;
 }
 
+// @ai-sdk/openai strips reasoningEffort "none" for every gpt-6-* ID; Xum must still
+// serialize it for Sol/Luna (Chat Completions function calling requires it).
+describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
+  const cases = [
+    ["gpt-6-sol", "none", "none"],
+    ["gpt-6-luna", "none", "none"],
+    ["gpt-6-sol-2026-09-22", "none", "none"],
+    ["gpt-6-sol", "high", "high"],
+    // Astra genuinely rejects "none"; keep the SDK's gating for it.
+    ["gpt-6-astra", "none", undefined],
+  ] as const;
+  for (const wireFormat of ["responses", "chatCompletions"] as const) {
+    it.each(cases)(
+      `sends %s requested effort %s as %s with tools over ${wireFormat}`,
+      async (modelId, requestedEffort, expectedEffort) => {
+        await withTempConfig(async (_config, factory, _oauth, store) => {
+          store.saveProvidersConfig({
+            openai: { apiKey: "native-key", wireFormat, webSocketTransportEnabled: false },
+          });
+          const { calls, fakeFetch } = createCapturingFetch();
+          const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+          try {
+            const result = await factory.createModel(`openai:${modelId}`);
+            if (!result.success) throw new Error(result.error.type);
+            await generateText({
+              model: result.data,
+              prompt: "hello",
+              tools: {
+                lookup: tool({
+                  inputSchema: jsonSchema<{ query: string }>({
+                    type: "object",
+                    properties: { query: { type: "string" } },
+                    required: ["query"],
+                  }),
+                }),
+              },
+              providerOptions: { openai: { reasoningEffort: requestedEffort } },
+              maxRetries: 0,
+            }).catch(() => undefined);
+            expect(calls).toHaveLength(1);
+            const body = parseSentBody(calls[0]);
+            expect(body.tools).toHaveLength(1);
+            const sentEffort =
+              wireFormat === "chatCompletions"
+                ? body.reasoning_effort
+                : (body.reasoning as { effort?: unknown } | undefined)?.effort;
+            expect(sentEffort).toBe(expectedEffort);
+          } finally {
+            fetchSpy.mockRestore();
+          }
+        });
+      }
+    );
+  }
+});
+
 describe("wrapFetchWithXAIServiceTier", () => {
   it("injects priority processing into xAI request bodies", async () => {
     const { calls, fakeFetch } = createCapturingFetch();
