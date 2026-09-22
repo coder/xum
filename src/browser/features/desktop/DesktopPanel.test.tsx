@@ -1,3 +1,6 @@
+import "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 // Keep the fake transport and its events in one realm even after other UI tests install a DOM.
@@ -17,6 +20,8 @@ const api = {
     detachViewer: () => Promise.resolve(),
   },
 };
+// Other UI suites need their provider's full API, not this desktop-only client.
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({ api }),
 }));

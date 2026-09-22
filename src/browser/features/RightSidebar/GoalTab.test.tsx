@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { createContext } from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
 import type { GoalSnapshot } from "@/common/types/goal";
 
 // The GoalTab now reaches into `useAPI` (via `useGoalDefaults`) when the
@@ -16,6 +18,8 @@ import type { GoalSnapshot } from "@/common/types/goal";
 // context with a null default; otherwise the `useContext(APIContext)`
 // call inside those hooks would crash with `undefined is not iterable`
 // This keeps tests outside an APIProvider aligned with Storybook rendering.
+// Restore the real context so later suites can issue requests through their APIProvider.
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
 void mock.module("@/browser/contexts/API", () => ({
   APIContext: createContext(null),
   useAPI: () => ({
