@@ -11,6 +11,8 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { TaskService } from "@/node/services/taskService";
@@ -44,6 +46,8 @@ const rootId = "directroot1";
 /** Canonical `plugin:<16-hex>:<server>` key: the only shape registration sanitization prunes. */
 const STALE_PLUGIN_KEY = "plugin:0123456789abcdef:evil";
 const OVERRIDES_RELATIVE_PATH = path.join(".xum", "mcp.local.jsonc");
+/** Test mirror of WorkspaceMcpOverridesService's private PUBLICATION_TIMEOUT_MS (the plugin-prune budget). */
+const PRUNE_BUDGET_MIRROR_MS = 30_000;
 
 function git(cwd: string, args: string): void {
   execSync(`git ${args}`, { cwd, stdio: "ignore" });
@@ -395,7 +399,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
   test("a project-dir (local runtime) parent shares its directory with the task: the live sibling is found and its consent is preserved", async () => {
     const taskId = "directlocal01";
     const projectPath = await createRepoWithTrackedEnable();
-    const { config, taskService, overridesService } = await createRealStack(projectPath);
+    const { config, taskService } = await createRealStack(projectPath);
     // Re-register the parent as a project-dir workspace ON the project directory itself; a
     // local-runtime fork resolves to that same directory (shared by design).
     const consented = { enabledServers: ["plugin:fedcba9876543210:consented"] };
@@ -419,8 +423,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       testTaskSettings()
     );
     stubStableIds(config, [taskId]);
-    const prune = spyOn(overridesService, "prunePluginOverrideKeysForUnregisteredCheckout");
-    restores.push(() => prune.mockRestore());
+    const before = await fsPromises.stat(path.join(projectPath, OVERRIDES_RELATIVE_PATH));
 
     const created = await taskService.create(createArgs("Local"));
     expect(created).toMatchObject({ success: true, data: { taskId } });
@@ -428,8 +431,9 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       path: projectPath,
       taskStatus: "running",
     });
-    // Sibling found under the registration lock: no prune ran, the file is untouched.
-    expect(prune).not.toHaveBeenCalled();
+    // Sibling found under the checkout locks: the document was never rewritten.
+    const after = await fsPromises.stat(path.join(projectPath, OVERRIDES_RELATIVE_PATH));
+    expect(after.mtimeMs).toBe(before.mtimeMs);
     expect(
       JSON.parse(
         await fsPromises.readFile(path.join(projectPath, OVERRIDES_RELATIVE_PATH), "utf-8")
@@ -477,18 +481,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
         });
         await otherOverrides.setOverridesForWorkspace(aliasId, { enabledServers: aliasEnables });
       };
-      const pruneCalls: string[] = [];
       if (when === "before-the-scan") {
-        const realPrune =
-          overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
-        const pruneSpy = spyOn(
-          overridesService,
-          "prunePluginOverrideKeysForUnregisteredCheckout"
-        ).mockImplementation((target, keyPrefix) => {
-          pruneCalls.push(target.workspacePath);
-          return realPrune(target, keyPrefix);
-        });
-        restores.push(() => pruneSpy.mockRestore());
         // Injected the moment the fork exists, before the creation's sibling scan runs.
         const realFork = forkOrchestrator.orchestrateFork;
         const forkSpy = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(
@@ -507,8 +500,8 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
         const pruneSpy = spyOn(
           overridesService,
           "prunePluginOverrideKeysForUnregisteredCheckout"
-        ).mockImplementation(async (target, keyPrefix) => {
-          await realPrune(target, keyPrefix);
+        ).mockImplementation(async (target, keyPrefix, options) => {
+          await realPrune(target, keyPrefix, options);
           await registerAliasAndConsent();
         });
         restores.push(() => pruneSpy.mockRestore());
@@ -524,9 +517,9 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
         await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")
       ) as { enabledServers?: string[] };
       // The alias registration's consent is intact either way: a live sibling at scan time
-      // means no prune at all; a sibling arriving after the prune is never pruned again.
+      // means no prune at all (the tracked key it re-consented to survives); a sibling arriving
+      // after the prune is never pruned again.
       expect(document.enabledServers).toEqual(aliasEnables);
-      if (when === "before-the-scan") expect(pruneCalls).toEqual([]);
       // Both registrations read the same document.
       const viaAlias = await otherOverrides.getOverridesForWorkspace(aliasId, { timeoutMs: 5_000 });
       expect(viaAlias.overrides.enabledServers).toEqual(document.enabledServers);
@@ -535,6 +528,201 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     },
     30_000
   );
+
+  test("an alias registration that lands after the sibling scan but before the checkout lock is acquired keeps its consent: the creator re-checks siblings under the path lock", async () => {
+    // The plan's scan-under-relevant-locks gate. A registration-lock snapshot alone provides
+    // no exclusion against an older-CLI-style in-place registration (which never takes that
+    // lock): it can register the same physical checkout through a symlinked spelling and save
+    // legitimate plugin consent in the window between the creator's "no live sibling" verdict
+    // and the creator's acquisition of the checkout lock. Interleaved deterministically at the
+    // creator's own lock acquisition; the alias save takes and releases the SAME path lock first.
+    const taskId = "directalias03";
+    const aliasId = "cli-alias-late";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, overridesService } = await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    const srcAlias = path.join(rootDir, "src-alias");
+    await fsPromises.symlink(config.srcDir, srcAlias);
+    const aliasPath = path.join(srcAlias, "repo", `agent_explore_${taskId}`);
+    const forkPath = forkPathFor(config.srcDir, taskId);
+    const consented = "plugin:fedcba9876543210:consented";
+    const otherConfig = new Config(config.rootDir);
+    const otherOverrides = new WorkspaceMcpOverridesService(otherConfig);
+    const lockAccess = overridesService as unknown as {
+      acquireCheckoutLock: (key: string, timeoutMs?: number) => Promise<() => Promise<void>>;
+    };
+    const realAcquire = lockAccess.acquireCheckoutLock.bind(overridesService);
+    let interleaved = false;
+    const acquireSpy = spyOn(lockAccess, "acquireCheckoutLock").mockImplementation(
+      async (key, timeoutMs) => {
+        if (!interleaved) {
+          interleaved = true;
+          // The creator has scanned (no sibling) and is about to fence the path.
+          await otherConfig.editConfig((cfg) => {
+            cfg.projects.set(aliasPath, {
+              workspaces: [
+                {
+                  path: aliasPath,
+                  id: aliasId,
+                  name: aliasPath,
+                  createdAt: new Date().toISOString(),
+                  runtimeConfig: { type: "local" },
+                },
+              ],
+            });
+            return cfg;
+          });
+          await otherOverrides.setOverridesForWorkspace(aliasId, { enabledServers: [consented] });
+          savedAt = (await fsPromises.stat(path.join(forkPath, OVERRIDES_RELATIVE_PATH))).mtimeMs;
+        }
+        return realAcquire(key, timeoutMs);
+      }
+    );
+    restores.push(() => acquireSpy.mockRestore());
+    let savedAt: number | undefined;
+
+    const created = await taskService.create(createArgs("Late alias"));
+    expect(created).toMatchObject({ success: true, data: { taskId } });
+    expect(interleaved).toBe(true);
+    const document = JSON.parse(
+      await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")
+    ) as { enabledServers?: string[] };
+    // Newly saved legitimate consent must never be revoked by the creation's prune — the prune
+    // was skipped outright: the document was not rewritten after the alias's save.
+    expect(document.enabledServers).toEqual([consented]);
+    expect(savedAt).toBeDefined();
+    expect((await fsPromises.stat(path.join(forkPath, OVERRIDES_RELATIVE_PATH))).mtimeMs).toBe(
+      savedAt ?? Number.NaN
+    );
+    const viaAlias = await otherOverrides.getOverridesForWorkspace(aliasId, { timeoutMs: 5_000 });
+    expect(viaAlias.overrides.enabledServers).toEqual([consented]);
+    expect(findWorkspaceInConfig(config, taskId)).toMatchObject({ path: forkPath });
+    expect(findWorkspaceInConfig(config, aliasId)).toMatchObject({ path: aliasPath });
+  }, 30_000);
+
+  test("a prune deadline that fires while the rewrite is in flight publishes nothing: the path lock stays held until the write lands, then the creation fails with the retained path", async () => {
+    // No budget knob: the clock (still ticking) is shifted forward between the budget's
+    // creation and the prune deadline's `remaining()` read, leaving ~2 s; the document write is
+    // held open so the deadline provably fires with the rewrite in flight.
+    const taskId = "directdeadline1";
+    const projectPath = await createRepoWithTrackedEnable();
+    const { config, taskService, overridesService, sends } = await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    const forkPath = forkPathFor(config.srcDir, taskId);
+    const lockAccess = overridesService as unknown as {
+      acquireCheckoutLock: (key: string, timeoutMs?: number) => Promise<() => Promise<void>>;
+      pruneResolvedWorkspace: (
+        resolved: unknown,
+        keyPrefix: string,
+        step: { readonly cancelled: boolean }
+      ) => Promise<unknown>;
+    };
+    const lockKeys: string[] = [];
+    const realAcquire = lockAccess.acquireCheckoutLock.bind(overridesService);
+    const acquireSpy = spyOn(lockAccess, "acquireCheckoutLock").mockImplementation(
+      (key, timeoutMs) => {
+        lockKeys.push(key);
+        return realAcquire(key, timeoutMs);
+      }
+    );
+    const realNow = Date.now.bind(Date);
+    let clockOffsetMs = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+    const realPrune = lockAccess.pruneResolvedWorkspace.bind(overridesService);
+    let step: { readonly cancelled: boolean } | undefined;
+    const pruneSpy = spyOn(lockAccess, "pruneResolvedWorkspace").mockImplementation(
+      (resolved, keyPrefix, s) => {
+        step = s;
+        clockOffsetMs = PRUNE_BUDGET_MIRROR_MS - 2_000;
+        return realPrune(resolved, keyPrefix, s);
+      }
+    );
+    const gate = Promise.withResolvers<void>();
+    let writeStarted = false;
+    let writeSettled = false;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via .call below
+    const realWriteFile = LocalBaseRuntime.prototype.writeFile;
+    const writeSpy = spyOn(LocalBaseRuntime.prototype, "writeFile").mockImplementation(function (
+      this: LocalBaseRuntime,
+      target: string,
+      abortSignal?: AbortSignal
+    ) {
+      const real = realWriteFile.call(this, target, abortSignal).getWriter();
+      return new WritableStream<Uint8Array>({
+        write: (chunk) => {
+          writeStarted = true;
+          return real.write(chunk);
+        },
+        close: async () => {
+          await gate.promise;
+          await real.close();
+          writeSettled = true;
+        },
+      });
+    });
+    restores.push(
+      () => acquireSpy.mockRestore(),
+      () => clock.mockRestore(),
+      () => pruneSpy.mockRestore(),
+      () => writeSpy.mockRestore()
+    );
+    try {
+      let outcome: Awaited<ReturnType<typeof taskService.create>> | undefined;
+      const creation = taskService.create(createArgs("Deadline")).then((result) => {
+        outcome = result;
+        return result;
+      });
+      const waitUntilMs = realNow() + 10_000;
+      while (!(writeStarted && step?.cancelled)) {
+        if (realNow() > waitUntilMs) {
+          throw new Error(
+            `expected the deadline to fire with the write in flight (writeStarted=${String(writeStarted)}, cancelled=${String(step?.cancelled)})`
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // Pending, unpublished, and the path lock is still held while the rewrite is in flight.
+      expect(outcome).toBeUndefined();
+      expect(writeSettled).toBe(false);
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+      expect(lockKeys.length).toBeGreaterThan(0);
+      for (const key of lockKeys) {
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          acquireCrossProcessLock({
+            lockPath: path.join(config.rootDir, "mcp-overrides-locks", `${key}.lock`),
+            acquireTimeoutMs: 200,
+            staleMs: 60_000,
+            timeoutMessage: "checkout lock still held",
+          })
+        ).rejects.toThrow("checkout lock still held");
+      }
+      gate.resolve();
+      const result = await creation;
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("exceeded the plugin-prune budget");
+      expect(result.error).toContain(`created at ${forkPath} but not registered`);
+      expect(writeSettled).toBe(true);
+      // The write joined before the locks released: the pruned text is on disk, and the lock is free.
+      expect(
+        JSON.parse(await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8"))
+      ).toEqual({ enabledServers: [] });
+      for (const key of lockKeys) {
+        const release = await acquireCrossProcessLock({
+          lockPath: path.join(config.rootDir, "mcp-overrides-locks", `${key}.lock`),
+          acquireTimeoutMs: 2_000,
+          staleMs: 60_000,
+          timeoutMessage: "checkout lock still held after settlement",
+        });
+        await release();
+      }
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+      expect(sends).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
+  }, 30_000);
 
   test("later legitimate consent survives Stop and manual resume: nothing re-sanitizes a published task", async () => {
     const taskId = "directresume1";

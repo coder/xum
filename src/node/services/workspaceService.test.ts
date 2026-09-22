@@ -24885,9 +24885,11 @@ describe("WorkspaceService.registerSanitizedTaskCheckout", () => {
       acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: () => Promise.resolve(),
       copyOverridesToForkedCheckout: () => Promise.resolve(),
-      prunePluginOverrideKeysForUnregisteredCheckout: (target) => {
+      // Honors the under-lock verdict like the real service: the scan decides, then the prune.
+      prunePluginOverrideKeysForUnregisteredCheckout: async (target, _keyPrefix, options) => {
+        if (options?.shouldPrune !== undefined && !(await options.shouldPrune())) return;
         pruned.push(target.workspacePath);
-        return pruneError ? Promise.reject(pruneError) : Promise.resolve();
+        if (pruneError) throw pruneError;
       },
     });
     return {

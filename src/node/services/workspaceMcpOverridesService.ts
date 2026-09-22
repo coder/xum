@@ -4307,7 +4307,21 @@ export class WorkspaceMcpOverridesService {
    */
   async prunePluginOverrideKeysForUnregisteredCheckout(
     target: { workspacePath: string; runtimeConfig: RuntimeConfig },
-    keyPrefix: string
+    keyPrefix: string,
+    options?: {
+      /**
+       * Decided INSIDE the held checkout and global override locks, right
+       * before the prune: `false` returns without touching the document. A
+       * registry snapshot taken before the locks provides no exclusion — an
+       * in-place registration of the same physical path (an older CLI run)
+       * takes no registration lock and can register and save consent between
+       * that snapshot and this acquisition; its save takes these same locks,
+       * so a verdict reached under them is the one the prune can trust.
+       * Read-only by contract (no config write, no lock acquisition); bounded
+       * by the prune's own budget.
+       */
+      shouldPrune?: () => Promise<boolean>;
+    }
   ): Promise<void> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
     assert(
@@ -4330,7 +4344,23 @@ export class WorkspaceMcpOverridesService {
           if (unresolvable !== undefined) {
             throw unresolvable.error;
           }
+          // ONE budget for the verdict and the prune (the prune sweep's shape): a
+          // slow registry walk under the locks must not leave a full prune budget
+          // behind it, and an expired verdict must not launch a mutating prune
+          // at all — the only detached work a deadline can leave here is the
+          // read-only verdict itself.
           const budget = createPublicationBudget();
+          if (options?.shouldPrune !== undefined) {
+            const prune = await withDeadline(
+              options.shouldPrune(),
+              budget.remaining(),
+              `verifying the siblings of ${label} exceeded the plugin-prune budget`
+            );
+            if (!prune) return;
+          }
+          if (budget.exhausted()) {
+            throw new Error(`pruning ${label} exceeded the plugin-prune budget`);
+          }
           const snapshot = new ConfigSnapshot(
             this.config,
             false,
