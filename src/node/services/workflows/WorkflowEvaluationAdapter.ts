@@ -54,6 +54,13 @@ export interface WorkflowEvaluationAdapterOptions {
   readonly workspaceId: string;
   /** CLI `--evaluation-model`: beats the Settings default, loses to a per-call `model`. */
   readonly evaluationModelOverride?: string;
+  /**
+   * Wakes the analytics sidecar after a ledger row lands. Headless runs have
+   * no chat `stream-end` to trigger ingestion, so without this the spend stays
+   * out of the dashboards until an unrelated stream or restart (same hook as
+   * `AgentStatusService`).
+   */
+  readonly requestAnalyticsIngest?: (workspaceId: string) => void;
 }
 
 export interface EvaluationSelectionFailure {
@@ -86,6 +93,7 @@ export interface EvaluationUsageContext {
 }
 
 export const EVALUATION_LEDGER_FAILED_CODE = "evaluation-ledger-failed";
+export const EVALUATION_LEDGER_SKIPPED_CODE = "evaluation-ledger-skipped-unknown-usage";
 
 /**
  * `createEvaluationModel` rejections → step failure identity. Exhaustive so a
@@ -174,40 +182,67 @@ export class WorkflowEvaluationAdapter {
    * committed step into a failed one: it is logged with a fixed code and
    * swallowed. There is no idempotency key — a crash between the journal
    * commit and this write under-counts that attempt (documented contract).
+   *
+   * Unknown token counts are skipped rather than recorded: the ledger has no
+   * "unknown" signal and `createDisplayUsage` prices a missing count as zero,
+   * which would silently under-count spend while looking like a real row.
    */
   async recordUsage(
     pinned: Pick<PinnedEvaluationModel, "modelString" | "metadataModel">,
     result: Pick<EvaluationCallResult<EvaluationQuestions>, "usage" | "usageProviderMetadata">,
     context: EvaluationUsageContext
   ): Promise<void> {
+    const logFields = {
+      workspaceId: this.options.workspaceId,
+      runId: context.runId,
+      stepDigest: context.stepDigest,
+      attempt: context.attempt,
+    };
+    const usage = toAiSdkUsage(result.usage);
+    if (usage === undefined) {
+      log.warn("Workflow evaluation usage not recorded: provider reported unknown token counts", {
+        code: EVALUATION_LEDGER_SKIPPED_CODE,
+        ...logFields,
+      });
+      return;
+    }
     try {
-      await this.options.sessionUsageService.recordHeadlessUsage(
+      const recorded = await this.options.sessionUsageService.recordHeadlessUsage(
         this.options.workspaceId,
         pinned.modelString,
-        toAiSdkUsage(result.usage),
+        usage,
         toProviderMetadataRecord(result.usageProviderMetadata),
         { analyticsSource: EVALUATION_ANALYTICS_SOURCE, metadataModel: pinned.metadataModel }
       );
+      if (recorded !== undefined) {
+        this.options.requestAnalyticsIngest?.(this.options.workspaceId);
+      }
     } catch (error) {
       // Deliberately no `error` text: it may echo provider payloads.
       log.warn("Workflow evaluation usage ledger write failed", {
         code: EVALUATION_LEDGER_FAILED_CODE,
-        workspaceId: this.options.workspaceId,
-        runId: context.runId,
-        stepDigest: context.stepDigest,
-        attempt: context.attempt,
+        ...logFields,
         errorName: error instanceof Error ? error.name : typeof error,
       });
     }
   }
 }
 
-/** Unknown counts are `null` in the step result but absent for the ledger. */
-function toAiSdkUsage(usage: EvaluationCallResult<EvaluationQuestions>["usage"]): AiSdkUsageLike {
+/**
+ * Ledger usage, or `undefined` when a billable count is unknown (`null` in the
+ * step result). A missing total is derived; a missing input or output count is
+ * not guessable and disqualifies the row (see `recordUsage`).
+ */
+function toAiSdkUsage(
+  usage: EvaluationCallResult<EvaluationQuestions>["usage"]
+): AiSdkUsageLike | undefined {
+  if (usage.inputTokens === null || usage.outputTokens === null) {
+    return undefined;
+  }
   return {
-    ...(usage.inputTokens !== null ? { inputTokens: usage.inputTokens } : {}),
-    ...(usage.outputTokens !== null ? { outputTokens: usage.outputTokens } : {}),
-    ...(usage.totalTokens !== null ? { totalTokens: usage.totalTokens } : {}),
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens,
   };
 }
 

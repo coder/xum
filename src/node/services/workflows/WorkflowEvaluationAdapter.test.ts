@@ -3,6 +3,7 @@ import { Effect } from "effect";
 import { Experimental_EvaluationMockModelV4 } from "ai/test";
 import type { EvaluationAdmission, EvaluationQuestions } from "@/common/types/evaluation";
 import { EVALUATION_ANALYTICS_SOURCE } from "@/common/utils/ai/evaluationModels";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { Err, Ok } from "@/common/types/result";
 import { log } from "@/node/services/log";
 import {
@@ -17,6 +18,7 @@ import type {
 } from "@/node/services/providerModelFactory";
 import {
   EVALUATION_LEDGER_FAILED_CODE,
+  EVALUATION_LEDGER_SKIPPED_CODE,
   WorkflowEvaluationAdapter,
   type EvaluationSelectionFailure,
   type WorkflowEvaluationAdapterOptions,
@@ -33,7 +35,7 @@ const QUESTIONS = {
 const RESULT: EvaluationCallResult<typeof QUESTIONS> = {
   answers: { injection: { type: "choice", choice: "suspected" } },
   rounding: null,
-  usage: { inputTokens: 120, outputTokens: null, totalTokens: 120 },
+  usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
   usageProviderMetadata: { anthropic: { cacheReadInputTokens: 7 } },
   responseModelId: "claude-haiku-4-5-20251001",
   warningsCount: 0,
@@ -80,6 +82,7 @@ function createHarness(input: {
   configModel?: string;
   evaluationModelOverride?: string;
   recordHeadlessUsage?: WorkflowEvaluationAdapterOptions["sessionUsageService"]["recordHeadlessUsage"];
+  requestAnalyticsIngest?: (workspaceId: string) => void;
 }): Harness {
   const resolveCalls: string[] = [];
   const evaluateCalls: Harness["evaluateCalls"] = [];
@@ -104,9 +107,10 @@ function createHarness(input: {
     sessionUsageService: {
       recordHeadlessUsage: (...args) => {
         recordCalls.push(args);
-        return input.recordHeadlessUsage
-          ? input.recordHeadlessUsage(...args)
-          : Promise.resolve(undefined);
+        if (input.recordHeadlessUsage) return input.recordHeadlessUsage(...args);
+        // Mirror the real service: a written row echoes the priced display usage.
+        const usage = createDisplayUsage(args[2], args[1], args[3]);
+        return Promise.resolve(usage ? { model: args[1], usage } : undefined);
       },
     },
     config: {
@@ -125,6 +129,9 @@ function createHarness(input: {
     workspaceId: "workspace-1",
     ...(input.evaluationModelOverride !== undefined
       ? { evaluationModelOverride: input.evaluationModelOverride }
+      : {}),
+    ...(input.requestAnalyticsIngest
+      ? { requestAnalyticsIngest: input.requestAnalyticsIngest }
       : {}),
   });
   return { adapter, resolveCalls, evaluateCalls, recordCalls };
@@ -304,14 +311,18 @@ describe("WorkflowEvaluationAdapter.dispatch", () => {
 describe("WorkflowEvaluationAdapter.recordUsage", () => {
   const context = { runId: "wfr_123", stepDigest: "abc123def456", attempt: 1 };
 
-  it("writes one headless usage row tagged as workflow evaluation with null counts dropped", async () => {
-    const h = createHarness({});
+  it("writes one headless usage row tagged as workflow evaluation and wakes analytics ingestion", async () => {
+    const ingested: string[] = [];
+    const h = createHarness({
+      requestAnalyticsIngest: (workspaceId) => ingested.push(workspaceId),
+    });
     await h.adapter.recordUsage(pinned("anthropic:claude-haiku-4-5"), RESULT, context);
+    expect(ingested).toEqual(["workspace-1"]);
     expect(h.recordCalls).toEqual([
       [
         "workspace-1",
         "anthropic:claude-haiku-4-5",
-        { inputTokens: 120, totalTokens: 120 },
+        { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
         { anthropic: { cacheReadInputTokens: 7 } },
         {
           analyticsSource: EVALUATION_ANALYTICS_SOURCE,
@@ -319,6 +330,50 @@ describe("WorkflowEvaluationAdapter.recordUsage", () => {
         },
       ],
     ]);
+  });
+
+  it("derives a missing total but skips the row (with a fixed-code log) when input or output is unknown", async () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const h = createHarness({});
+    await h.adapter.recordUsage(
+      pinned("m"),
+      { ...RESULT, usage: { inputTokens: 120, outputTokens: 30, totalTokens: null } },
+      context
+    );
+    expect(h.recordCalls[0]?.[2]).toEqual({ inputTokens: 120, outputTokens: 30, totalTokens: 150 });
+
+    for (const usage of [
+      { inputTokens: null, outputTokens: 30, totalTokens: 30 },
+      { inputTokens: 120, outputTokens: null, totalTokens: 120 },
+    ]) {
+      await h.adapter.recordUsage(pinned("m"), { ...RESULT, usage }, context);
+    }
+    // Never priced as zero: no ledger write for the two unknown cases.
+    expect(h.recordCalls).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0]?.[1]).toMatchObject({
+      code: EVALUATION_LEDGER_SKIPPED_CODE,
+      runId: "wfr_123",
+      stepDigest: "abc123def456",
+      attempt: 1,
+    });
+  });
+
+  it("does not wake analytics ingestion when the ledger recorded nothing or failed", async () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const ingested: string[] = [];
+    const skipped = createHarness({
+      recordHeadlessUsage: () => Promise.resolve(undefined),
+      requestAnalyticsIngest: (workspaceId) => ingested.push(workspaceId),
+    });
+    await skipped.adapter.recordUsage(pinned("m"), RESULT, context);
+    const failed = createHarness({
+      recordHeadlessUsage: () => Promise.reject(new Error("disk full")),
+      requestAnalyticsIngest: (workspaceId) => ingested.push(workspaceId),
+    });
+    await failed.adapter.recordUsage(pinned("m"), RESULT, context);
+    expect(ingested).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it("passes no provider metadata when the service reported none", async () => {
