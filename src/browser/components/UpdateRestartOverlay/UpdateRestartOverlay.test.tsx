@@ -6,7 +6,11 @@ import type { UpdateStatus } from "@/common/orpc/types";
 import type * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
 import { ThemeProvider } from "../../contexts/ThemeContext";
+
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 // SVG ?react imports don't work in happy-dom; stub them as simple svgs.
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({

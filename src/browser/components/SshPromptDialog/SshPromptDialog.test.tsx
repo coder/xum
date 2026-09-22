@@ -11,8 +11,12 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as realAPI from "@/browser/contexts/API";
 
-restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+restoreModulesAfterSuite([
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  ["@/browser/contexts/API", { ...realAPI }],
+]);
 
 // Self-contained dialog stub — bun's mock.module is process-global, so other
 // test files may register incomplete Dialog stubs that omit

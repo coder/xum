@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { useTheme } from "../../contexts/ThemeContext";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
+
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 let cleanupDom: (() => void) | null = null;
 
