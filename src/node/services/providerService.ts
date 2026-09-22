@@ -21,6 +21,7 @@
  * add fiber overhead without composition benefit.
  */
 import { discoverProviderModels } from "./providerModelDiscovery";
+import { discoverBedrockModels } from "./bedrockModelDiscovery";
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
 import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
@@ -685,6 +686,19 @@ export class ProviderService {
     signal?: AbortSignal
   ): Promise<ProviderModelDiscoveryResult> {
     // Autocomplete must never persist a catalog or change routing/user-managed models.
+    if (provider === "bedrock") {
+      return discoverBedrockModels(() => {
+        const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+        const enforced = this.policyService?.isEnforced() ?? false;
+        return {
+          config,
+          enabled:
+            !isProviderDisabledInConfig(config) &&
+            (!enforced || (this.policyService?.isProviderAllowed(provider) ?? false)),
+          policy: { ...this.getProviderPolicy(provider), enforced },
+        };
+      }, signal);
+    }
     return discoverProviderModels(() => {
       const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
       const custom = isCustomProviderConfig(config) ? config.providerType : undefined;
