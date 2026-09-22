@@ -346,6 +346,23 @@ describe("router config transcript mutation", () => {
     expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
   });
 
+  test("persists the keep-screen-awake config flag", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+    await client.config.updateKeepScreenAwake({ enabled: true });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(true);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBe(true);
+    expect(config.getKeepScreenAwakeEnabled()).toBe(true);
+
+    // Off state removes the key entirely (absent = off) instead of persisting `false`.
+    await client.config.updateKeepScreenAwake({ enabled: false });
+    expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
+    expect(config.loadConfigOrDefault().keepScreenAwake).toBeUndefined();
+    expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+  });
+
   test("refuses procedure calls once the server has begun shutting down", async () => {
     let shuttingDown = false;
     const context = {

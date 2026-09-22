@@ -154,6 +154,8 @@ export const AppConfigOnDiskSchema = z
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
+    /** Desktop only: hold a display-sleep blocker while any local agent is working. */
+    keepScreenAwake: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()

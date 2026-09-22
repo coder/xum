@@ -301,6 +301,7 @@ export function GeneralSection() {
   const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
   const [chatTranscriptFullWidth, setChatTranscriptFullWidth] = useState(false);
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
+  const [keepScreenAwake, setKeepScreenAwake] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
   const archiveBehaviorRef = useRef<CoderWorkspaceArchiveBehavior>(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
   const worktreeArchiveBehaviorRef = useRef<WorktreeArchiveBehavior>(
@@ -309,12 +310,14 @@ export function GeneralSection() {
 
   const chatTranscriptFullWidthLoadNonceRef = useRef(0);
   const llmDebugLogsLoadNonceRef = useRef(0);
+  const keepScreenAwakeLoadNonceRef = useRef(0);
 
   // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
   // selections can't race and persist a stale value via out-of-order writes.
   const archiveBehaviorUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const chatTranscriptFullWidthUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const llmDebugLogsUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
+  const keepScreenAwakeUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const archiveBehaviorPendingUpdateRef = useRef<CoderWorkspaceArchiveBehavior | undefined>(
     undefined
   );
@@ -331,6 +334,7 @@ export function GeneralSection() {
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const chatTranscriptFullWidthNonce = ++chatTranscriptFullWidthLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
+    const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;
 
     void api.config
       .getConfig()
@@ -365,6 +369,10 @@ export function GeneralSection() {
 
         if (llmDebugLogsNonce === llmDebugLogsLoadNonceRef.current) {
           setLlmDebugLogs(cfg.llmDebugLogs === true);
+        }
+
+        if (keepScreenAwakeNonce === keepScreenAwakeLoadNonceRef.current) {
+          setKeepScreenAwake(cfg.keepScreenAwake === true);
         }
       })
       .catch(() => {
@@ -495,6 +503,26 @@ export function GeneralSection() {
       .then(() => {
         // Coerce the chain back to Promise<void>.
       })
+      .catch(() => {
+        // Best-effort persistence.
+      });
+  };
+
+  const handleKeepScreenAwakeChange = (checked: boolean) => {
+    // Invalidate any in-flight config load so it does not overwrite the user's selection.
+    keepScreenAwakeLoadNonceRef.current++;
+    setKeepScreenAwake(checked);
+
+    if (!api?.config?.updateKeepScreenAwake) {
+      return;
+    }
+
+    // Serialize writes so rapid toggles always persist the last user choice.
+    keepScreenAwakeUpdateChainRef.current = keepScreenAwakeUpdateChainRef.current
+      .catch(() => {
+        // Best-effort only.
+      })
+      .then(() => api.config.updateKeepScreenAwake({ enabled: checked }))
       .catch(() => {
         // Best-effort persistence.
       });
@@ -984,6 +1012,29 @@ export function GeneralSection() {
               </div>
             </>
           )}
+        </div>
+      </div>
+
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">System</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">
+                Keep screen awake while agents are working
+              </div>
+              <div className="text-muted mt-0.5 text-xs">
+                Prevents display sleep and the idle screen lock while any chat is streaming or
+                waiting on background bash or workflow activity. Released as soon as all agents are
+                idle. Desktop app only.
+              </div>
+            </div>
+            <Switch
+              checked={keepScreenAwake}
+              onCheckedChange={handleKeepScreenAwakeChange}
+              aria-label="Toggle keep screen awake while agents are working"
+            />
+          </div>
         </div>
       </div>
 

@@ -29,6 +29,7 @@ interface MockConfig {
   worktreeArchiveBehavior: WorktreeArchiveBehavior;
   chatTranscriptFullWidth: boolean;
   llmDebugLogs: boolean;
+  keepScreenAwake: boolean;
 }
 
 type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
@@ -46,6 +47,7 @@ interface MockAPIClient {
     }) => Promise<void>;
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
+    updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -234,6 +236,7 @@ interface RenderGeneralSectionOptions {
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   chatTranscriptFullWidth?: boolean;
+  keepScreenAwake?: boolean;
   localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
@@ -256,6 +259,9 @@ interface MockAPISetup {
   updateChatTranscriptFullWidthMock: ReturnType<
     typeof mock<(input: { enabled: boolean }) => Promise<void>>
   >;
+  updateKeepScreenAwakeMock: ReturnType<
+    typeof mock<(input: { enabled: boolean }) => Promise<void>>
+  >;
 }
 
 function createMockAPI(
@@ -275,6 +281,7 @@ function createMockAPI(
     worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     chatTranscriptFullWidth: false,
     llmDebugLogs: false,
+    keepScreenAwake: false,
     ...configOverrides,
   };
 
@@ -297,6 +304,12 @@ function createMockAPI(
     return Promise.resolve();
   });
 
+  const updateKeepScreenAwakeMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.keepScreenAwake = enabled;
+
+    return Promise.resolve();
+  });
+
   return {
     api: {
       experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
@@ -309,6 +322,7 @@ function createMockAPI(
 
           return Promise.resolve();
         }),
+        updateKeepScreenAwake: updateKeepScreenAwakeMock,
       },
       server: {
         getSshHost: mock(() => Promise.resolve(null)),
@@ -325,6 +339,7 @@ function createMockAPI(
     getConfigMock,
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
+    updateKeepScreenAwakeMock,
   };
 }
 
@@ -350,6 +365,7 @@ describe("GeneralSection", () => {
     const setup = createMockAPI(
       {
         chatTranscriptFullWidth: options.chatTranscriptFullWidth,
+        keepScreenAwake: options.keepScreenAwake,
         coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
         worktreeArchiveBehavior: options.worktreeArchiveBehavior,
       },
@@ -621,6 +637,26 @@ describe("GeneralSection", () => {
     await waitFor(() => {
       expect(toggle.getAttribute("aria-checked")).toBe("false");
       expect(updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false });
+    });
+  });
+
+  test("loads and persists the keep screen awake toggle", async () => {
+    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      keepScreenAwake: true,
+    });
+
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(updateKeepScreenAwakeMock).toHaveBeenCalledWith({ enabled: false });
     });
   });
 

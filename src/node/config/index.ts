@@ -2043,6 +2043,7 @@ export class Config {
       chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
       muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+      keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
@@ -2150,6 +2151,11 @@ export class Config {
       const llmDebugLogs = parseOptionalBoolean(config.llmDebugLogs);
       if (llmDebugLogs !== undefined) {
         data.llmDebugLogs = llmDebugLogs;
+      }
+
+      // Opt-in flag: only the enabled state is written so "off" leaves no key behind.
+      if (parseOptionalBoolean(config.keepScreenAwake) === true) {
+        data.keepScreenAwake = true;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -2570,6 +2576,7 @@ export class Config {
       muxGovernorEnrolled: Boolean(config.muxGovernorUrl && config.muxGovernorToken),
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
+      keepScreenAwake: config.keepScreenAwake === true,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -2604,6 +2611,14 @@ export class Config {
 
   async updateLlmDebugLogs(enabled: boolean): Promise<void> {
     await this.editConfig((config) => ({ ...config, llmDebugLogs: enabled }));
+  }
+
+  async updateKeepScreenAwake(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.keepScreenAwake = true;
+      else delete config.keepScreenAwake;
+      return config;
+    });
   }
 
   async updateHeartbeatDefaultPrompt(defaultPrompt: string | null | undefined): Promise<void> {
@@ -3011,6 +3026,10 @@ export class Config {
 
   getLlmDebugLogsEnabled(): boolean {
     return this.loadConfigOrDefault().llmDebugLogs === true;
+  }
+
+  getKeepScreenAwakeEnabled(): boolean {
+    return this.loadConfigOrDefault().keepScreenAwake === true;
   }
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {

@@ -170,6 +170,8 @@ export interface MockORPCClientOptions {
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
+  /** Initial keep-screen-awake toggle for config.getConfig */
+  keepScreenAwake?: boolean;
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
@@ -424,6 +426,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
+    keepScreenAwake: initialKeepScreenAwake = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
@@ -576,6 +579,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
+  let keepScreenAwake = initialKeepScreenAwake;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -824,6 +828,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
+          keepScreenAwake,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -923,6 +928,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateChatTranscriptFullWidth: (input: { enabled: boolean }) => {
         chatTranscriptFullWidth = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateKeepScreenAwake: (input: { enabled: boolean }) => {
+        keepScreenAwake = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
