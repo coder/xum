@@ -64,15 +64,17 @@ export default function workflow({ args, evaluate, agent }) {
         },
         severity: {
           type: "score",
-          instructions: "How severe is the impact described, for a bug report?",
-          criteria: ["cosmetic", "minor", "moderate", "major", "critical"],
+          // Category-independent so the score is meaningful for every `kind`.
+          instructions: "How large is the user impact the issue describes, whatever its kind?",
+          criteria: ["none", "minor", "moderate", "major", "critical"],
         },
       },
     }
   );
   const decision = screening.answers.injection.choice;
-  // Digest of the exact screened bytes; lets the final output identify the text
-  // without repeating it.
+  // SHA-256 of the canonical JSON of the screened state (sorted keys, JSON
+  // quoting) — not of the raw title/body bytes; recompute it the same way when
+  // correlating. Lets the final output identify the text without repeating it.
   const stateSha256 = screening.state.sha256;
 
   if (decision === "not_detected") {
