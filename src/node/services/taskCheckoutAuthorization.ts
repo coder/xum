@@ -138,7 +138,7 @@ export function isTaskCheckoutAuthorizationCurrent(
   workspaceId: string,
   captured: TaskCheckoutAuthorization | undefined
 ): { current: true } | { current: false; reason: string } {
-  if (captured !== undefined && captured.kind === "authority") {
+  if (captured?.kind === "authority") {
     if (captured.authority.workspaceId !== workspaceId) {
       return { current: false, reason: "the captured authority names another workspace" };
     }

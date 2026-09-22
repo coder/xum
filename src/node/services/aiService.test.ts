@@ -1,4 +1,5 @@
 import nodeAssert from "node:assert/strict";
+import { execSync } from "node:child_process";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
@@ -28,6 +29,8 @@ import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { prepareDedicatedTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
+import { initGitRepo } from "@/node/services/taskService.testHarness";
 
 import { createTaskTool } from "./tools/task";
 import { createTestToolConfig } from "./tools/testHelpers";
@@ -1593,6 +1596,70 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         kind: "authority",
         authority: { workspaceId: sharedId, kind: "shared", anchorWorkspaceId: rootId },
       });
+    });
+
+    it("threads the proof authority of a dedicated task row with a real prepared checkout; a same-path replacement before the next start refuses it", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prep-dedicated");
+      const projectPath = path.join(xumHome.path, "project");
+      const dedicatedId = "prep-dedicated-child";
+      await fs.mkdir(projectPath, { recursive: true });
+      initGitRepo(projectPath);
+      // The worktree runtime's name-derived checkout: <srcBaseDir>/<project>/<name>.
+      const checkout = path.join(xumHome.path, "project", dedicatedId);
+      const runtimeConfig = { type: "worktree", srcBaseDir: xumHome.path } as const;
+      const taskCheckoutPreparation = await prepareDedicatedTaskCheckout({
+        projectPath,
+        checkout,
+        branch: dedicatedId,
+        runtimeConfig,
+      });
+      const metadata = createLocalWorkspaceMetadata(dedicatedId, projectPath, {
+        name: dedicatedId,
+        parentWorkspaceId: rootId,
+        runtimeConfig,
+      });
+      const harness = createHarness(xumHome.path, metadata);
+      await registerTree(harness.config, projectPath);
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: dedicatedId,
+          name: dedicatedId,
+          path: checkout,
+          runtimeConfig,
+          parentWorkspaceId: rootId,
+          taskStatus: "running",
+          taskAttemptId: "att_00000000000000c3",
+          taskCheckoutPreparation,
+        });
+        return cfg;
+      });
+      const options = {
+        workspaceId: dedicatedId,
+        messages: [createMuxMessage("prep-user", "user", "continue")],
+        modelString: "openai:gpt-5.2",
+      };
+      expect((await harness.service.streamMessage(options)).success).toBe(true);
+      expect(harness.startStreamCalls).toHaveLength(1);
+      expect(harness.startStreamCalls[0].preparationAuthorization).toMatchObject({
+        kind: "authority",
+        authority: {
+          workspaceId: dedicatedId,
+          kind: "dedicated",
+          anchorWorkspaceId: dedicatedId,
+          materializationId: taskCheckoutPreparation.materializationId,
+        },
+      });
+
+      // The checkout is replaced at the same path (row unchanged): the builder's physical
+      // preflight refuses before any request is assembled.
+      execSync(`git worktree remove --force "${checkout}"`, { cwd: projectPath, stdio: "ignore" });
+      execSync(`git worktree add -q -b ${dedicatedId}-again "${checkout}" main`, {
+        cwd: projectPath,
+        stdio: "ignore",
+      });
+      const refused = await harness.service.streamMessage(options);
+      expect(refused.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(1);
     });
 
     it.each([false, true])(

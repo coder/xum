@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "fs/promises";
+import { execSync } from "node:child_process";
 import * as os from "os";
 import * as path from "path";
 
@@ -7,6 +8,7 @@ import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { SecretsStore } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import { prepareDedicatedTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
 import { TaskService } from "@/node/services/taskService";
 import {
   createAIServiceMocks,
@@ -15,6 +17,7 @@ import {
   createTestProject,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
+  initGitRepo,
   saveWorkspaces,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
@@ -60,13 +63,15 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
 
   /**
    * A project-dir root (its checkout IS the project directory) with task rows beneath it. Shared
-   * rows (isolation none) point at the parent's checkout; a "legacy" dedicated row is a worktree
-   * task row written before preparation existed (no proof field); an off-host row is excluded.
+   * rows (isolation none) point at the parent's checkout; a "dedicated" row is a REAL prepared
+   * worktree (claimed, bound, proof on the row — what the materializer publishes); a "legacy"
+   * dedicated row is a worktree task row written before preparation existed (no proof field); an
+   * off-host row is excluded.
    */
   async function setupTree(
     rows: Array<{
       id: string;
-      kind: "shared" | "legacy" | "offhost";
+      kind: "shared" | "dedicated" | "legacy" | "offhost";
       parentId?: string;
       overrides?: Partial<WorkspaceConfigEntry>;
     }>
@@ -79,6 +84,7 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
         runtimeConfig: { type: "local" },
       },
     ];
+    if (rows.some((row) => row.kind === "dedicated")) initGitRepo(projectPath);
     for (const row of rows) {
       const base = {
         id: row.id,
@@ -96,6 +102,22 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
           path: projectPath,
           runtimeConfig: { type: "local" },
           taskIsolation: "none",
+          ...row.overrides,
+        });
+      } else if (row.kind === "dedicated") {
+        const checkout = path.join(config.srcDir, "repo", row.id);
+        await fsPromises.mkdir(path.dirname(checkout), { recursive: true });
+        const runtimeConfig = { type: "worktree", srcBaseDir: config.srcDir } as const;
+        entries.push({
+          ...base,
+          path: checkout,
+          runtimeConfig,
+          taskCheckoutPreparation: await prepareDedicatedTaskCheckout({
+            projectPath,
+            checkout,
+            branch: row.id,
+            runtimeConfig,
+          }),
           ...row.overrides,
         });
       } else if (row.kind === "legacy") {
@@ -297,6 +319,71 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
       );
     });
 
+    test("a dedicated child with a real prepared checkout is admitted under its proof authority; a proof edit stales the fence, a same-path replacement refuses the next preflight", async () => {
+      await setupTree([{ id: "ded-child", kind: "dedicated" }]);
+      const { taskService } = createHarness();
+      const preflight = await taskService.preflightTaskWorkspacePreparation("ded-child");
+      expect(preflight.success).toBe(true);
+      if (!preflight.success) return;
+      expect(preflight.data).toMatchObject({
+        kind: "authority",
+        authority: { kind: "dedicated", workspaceId: "ded-child", anchorWorkspaceId: "ded-child" },
+      });
+      const admission = taskService.admitTaskWorkspaceTurn("ded-child", {
+        acceptanceOrigin: "manual",
+        preparation: preflight.data,
+      });
+      expect(admission.kind).toBe("admitted");
+      if (admission.kind !== "admitted") return;
+      expect(admission.token.admissionStale()).toBe(false);
+      // Nothing captured is never an allow for a dedicated row either.
+      expectRefused(
+        taskService.admitTaskWorkspaceTurn("ded-child", { acceptanceOrigin: "manual" })
+      );
+
+      // The proof is immutable: a row whose proof field changed under the pending send (any
+      // writer, any field) no longer derives the captured signature → stale + refused.
+      const checkout = entryOf("ded-child")!.path;
+      await editEntry("ded-child", (ws) => {
+        ws.taskCheckoutPreparation = {
+          ...(ws.taskCheckoutPreparation as Record<string, unknown>),
+          authorizationRevision: "rev_ffffffffffffffff",
+        };
+      });
+      expect(admission.token.admissionStale()).toBe(true);
+      admission.token.onDisposed("refused");
+      expect(
+        expectRefused(
+          taskService.admitTaskWorkspaceTurn("ded-child", {
+            acceptanceOrigin: "manual",
+            preparation: preflight.data,
+          })
+        )
+      ).toMatch(/PREP_STALE/);
+      // The edited row still validates physically (same directory) — a fresh preflight is what
+      // every stream-starting path runs, and it captures the new signature.
+      const fresh = await taskService.preflightTaskWorkspacePreparation("ded-child");
+      expect(fresh.success).toBe(true);
+
+      // A same-path replacement of the checkout (an older build re-materializing it) leaves the
+      // row byte-identical, so only the physical preflight can catch it — and it refuses.
+      execSync(`git worktree remove --force "${checkout}"`, { cwd: projectPath, stdio: "ignore" });
+      execSync(`git worktree add -q -b ded-child-again "${checkout}" main`, {
+        cwd: projectPath,
+        stdio: "ignore",
+      });
+      const replaced = await taskService.preflightTaskWorkspacePreparation("ded-child");
+      expect(replaced.success).toBe(false);
+      if (replaced.success) return;
+      expect(replaced.error).toMatch(/PREP_MISMATCH/);
+      // The row is inspectable and untouched: no rotation, no launch error, no ownership.
+      expect(entryOf("ded-child")).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: "att_00000000000000a1",
+      });
+      expect(internals(taskService).ownedAttemptByTaskId.has("ded-child")).toBe(false);
+    });
+
     test("a pending token goes stale when the fresh registry no longer supports its authority", async () => {
       await setupTree([{ id: "shared-token", kind: "shared" }]);
       const { taskService } = createHarness();
@@ -345,6 +432,31 @@ describe("TaskService checkout-preparation authority at the admissions", () => {
       expect(rotated?.taskStatus).toBe("running");
       expect(rotated?.taskAttemptId).toMatch(ATTEMPT_ID);
       expect(rotated?.taskAttemptId).not.toBe("att_00000000000000a1");
+    });
+
+    test("a dedicated interrupted child rotates at the manual rescue and a dedicated running child is re-driven at startup, both under their proof authority", async () => {
+      await setupTree([
+        { id: "ded-int", kind: "dedicated", overrides: { taskStatus: "interrupted" } },
+        { id: "ded-run", kind: "dedicated" },
+      ]);
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createHarness({ workspaceService });
+      const proofBefore = entryOf("ded-int")?.taskCheckoutPreparation;
+      expect(proofBefore).toBeDefined();
+      expect(await taskService.markInterruptedTaskRunning("ded-int")).toBe(true);
+      const rotated = entryOf("ded-int");
+      expect(rotated?.taskStatus).toBe("running");
+      expect(rotated?.taskAttemptId).toMatch(ATTEMPT_ID);
+      expect(rotated?.taskAttemptId).not.toBe("att_00000000000000a1");
+      // The rescue rotated the attempt, not the proof (immutable: admissions never rebind it).
+      expect(rotated?.taskCheckoutPreparation).toEqual(proofBefore);
+
+      await taskService.recoverInterruptedTasks();
+      await settle();
+      const redriven = entryOf("ded-run");
+      expect(redriven?.taskAttemptId).toMatch(ATTEMPT_ID);
+      expect(redriven?.taskAttemptId).not.toBe("att_00000000000000a1");
+      expect(sendMessage.mock.calls.filter((call) => call[0] === "ded-run")).toHaveLength(1);
     });
 
     test("the rescue re-checks the authority at its CAS: an ancestry change landing after the preflight refuses the rotation", async () => {
