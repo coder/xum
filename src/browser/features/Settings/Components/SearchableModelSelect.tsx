@@ -6,9 +6,7 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
 import { getModelName, getModelProvider } from "@/common/utils/ai/models";
 
-// The full model catalog is ~2k entries; rendering every row makes the popover
-// janky, so cap the list and prompt the user to narrow the search instead.
-const MAX_RENDERED_MODELS = 200;
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
 
 /** Searchable model dropdown with keyboard navigation */
 export function SearchableModelSelect(props: {

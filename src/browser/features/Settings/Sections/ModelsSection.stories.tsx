@@ -123,14 +123,22 @@ export const ModelsConfigured: Story = {
       { timeout: 5000 }
     );
 
-    // No provider here has a discovered catalog, so the add row stays free-text only.
-    await expect(canvas.queryByRole("button", { name: /Discovered models/ })).toBeNull();
+    // A provider without a catalog still accepts arbitrary model IDs.
+    await userEvent.click(canvas.getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(within(document.body).getByRole("option", { name: /Anthropic/ }));
+    const input = canvas.getByRole("combobox", { name: "Model ID" });
+    await userEvent.click(input);
+    await expect(canvas.queryByRole("listbox")).toBeNull();
+    await userEvent.type(input, "custom/manual-model");
+    await userEvent.click(canvas.getByRole("button", { name: "Add" }));
+    await canvas.findByText("custom/manual-model");
+    await expect(input).toHaveValue("");
   },
 };
 
 // The Coder catalog never adds rows by itself: unconfigured catalog entries
-// are offered in the add row's "Discovered models…" dropdown, and picking one
-// persists through providers.setModels exactly like the free-text Add button.
+// are suggestions in the same field used for manual IDs. Picking one persists
+// through providers.setModels exactly like the free-text Add button.
 const CODER_DISCOVERED_MODELS = ["anthropic/claude-x", "anthropic/claude-y", "openai/gpt-z"];
 const coderSetModelsCalls: Array<{ provider: string; models: ProviderModelEntry[] }> = [];
 
@@ -166,19 +174,6 @@ function setupCoderCatalogStory() {
   return client;
 }
 
-async function pickDiscoveredModel(canvasElement: HTMLElement, label: RegExp): Promise<void> {
-  const canvas = within(canvasElement);
-  await userEvent.click(canvas.getByRole("button", { name: /Discovered models/ }));
-  // Radix portals the popover list to document.body.
-  const dialog = await within(document.body).findByRole("dialog");
-  await userEvent.click(within(dialog).getByRole("button", { name: label }));
-  await waitFor(() => {
-    if (within(document.body).queryByRole("dialog") !== null) {
-      throw new Error("Expected the dropdown to close after picking a model");
-    }
-  });
-}
-
 export const CoderCatalogDiscovered: Story = {
   render: () => (
     <SettingsSectionStory setup={setupCoderCatalogStory}>
@@ -187,41 +182,65 @@ export const CoderCatalogDiscovered: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-
-    // Only the explicitly configured entry is a row; the catalog adds none.
     await canvas.findByText("anthropic/claude-x");
     await expect(canvas.queryByText(/claude-y/)).toBeNull();
-    await expect(canvas.queryByText(/gpt-z/)).toBeNull();
+    const input = canvas.getByRole("combobox", { name: "Model ID" });
+    await userEvent.click(input);
+    const list = await canvas.findByRole("listbox");
+    await expect(within(list).getAllByRole("option")).toHaveLength(2);
+    await expect(within(list).queryByRole("option", { name: /claude-x/ })).toBeNull();
 
-    // The dropdown offers the catalog minus configured IDs.
-    await userEvent.click(canvas.getByRole("button", { name: /Discovered models/ }));
-    const dialog = await within(document.body).findByRole("dialog");
-    const options = within(dialog).getAllByRole("button");
-    await expect(options).toHaveLength(2);
-    await expect(within(dialog).queryByRole("button", { name: /claude-x/ })).toBeNull();
-    await expect(within(dialog).getByRole("button", { name: /claude-y/ })).toBeVisible();
-    await expect(within(dialog).getByRole("button", { name: /gpt-z/ })).toBeVisible();
-
-    // Picking an entry adds it immediately and persists the full list.
-    await userEvent.click(within(dialog).getByRole("button", { name: /claude-y/ }));
-    await canvas.findByText("anthropic/claude-y");
-    await expect(coderSetModelsCalls).toEqual([
-      { provider: "coder", models: ["anthropic/claude-x", "anthropic/claude-y"] },
+    // Typing filters suggestions, but Enter must not silently replace a manual ID.
+    await userEvent.type(input, "anthropic/claude");
+    await expect(within(list).getAllByRole("option")).toHaveLength(1);
+    // Switching providers clears a previous keyboard selection.
+    await userEvent.keyboard("{ArrowDown}");
+    await userEvent.click(canvas.getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(within(document.body).getByRole("option", { name: /Anthropic/ }));
+    await userEvent.click(input);
+    await expect(canvas.queryByRole("listbox")).toBeNull();
+    await userEvent.click(canvas.getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(within(document.body).getByRole("option", { name: /Coder/ }));
+    await userEvent.click(input);
+    await userEvent.keyboard("{Enter}");
+    await canvas.findByText("anthropic/claude");
+    await expect(coderSetModelsCalls.at(-1)?.models).toEqual([
+      "anthropic/claude-x",
+      "anthropic/claude",
     ]);
+    await expect(input).toHaveValue("");
 
-    // The remaining entry keeps the dropdown; configuring it too hides the dropdown.
-    await pickDiscoveredModel(canvasElement, /gpt-z/);
-    await canvas.findByText("openai/gpt-z");
+    // Rejected duplicates keep the typed ID and do not persist another entry.
+    await userEvent.type(input, "anthropic/claude{Enter}");
+    await canvas.findByText(/already exists for this provider/);
+    await expect(input).toHaveValue("anthropic/claude");
+    await expect(coderSetModelsCalls).toHaveLength(1);
+    await userEvent.clear(input);
+    await userEvent.click(input);
+
+    // Pointer selection adds immediately via the same persistence path.
+    await userEvent.click(canvas.getByRole("option", { name: "anthropic/claude-y" }));
+    await canvas.findByText("anthropic/claude-y");
     await expect(coderSetModelsCalls).toHaveLength(2);
-    await expect(coderSetModelsCalls[1]).toEqual({
+    await expect(input).toHaveValue("");
+
+    // Escape keeps the query without adding; explicit arrow navigation selects.
+    await userEvent.type(input, "gpt");
+    await userEvent.keyboard("{ArrowDown}{Escape}");
+    await expect(canvas.queryByRole("listbox")).toBeNull();
+    await expect(input).toHaveValue("gpt");
+    await expect(coderSetModelsCalls).toHaveLength(2);
+    await userEvent.keyboard("{ArrowDown}{Enter}");
+    await canvas.findByText("openai/gpt-z");
+    await expect(coderSetModelsCalls.at(-1)).toEqual({
       provider: "coder",
-      models: ["anthropic/claude-x", "anthropic/claude-y", "openai/gpt-z"],
+      models: ["anthropic/claude-x", "anthropic/claude", "anthropic/claude-y", "openai/gpt-z"],
     });
-    await waitFor(() => {
-      if (canvas.queryByRole("button", { name: /Discovered models/ }) !== null) {
-        throw new Error("Expected the dropdown to disappear once the catalog is fully configured");
-      }
-    });
+    await userEvent.click(input);
+    await expect(canvas.queryByRole("listbox")).toBeNull();
+    // The same field remains usable when every discovered entry is configured.
+    await userEvent.type(input, "custom/after-catalog{Enter}");
+    await canvas.findByText("custom/after-catalog");
   },
 };
 
@@ -232,7 +251,7 @@ export const CoderCatalogDiscoveredPhone: Story = {
     docs: {
       description: {
         story:
-          "Pins the phone-width contract for the add row: the provider select and discovered-models dropdown share the first line and the free-text input wraps below without right-edge overflow.",
+          "Pins the phone-width contract for the add row: the single model field and its suggestions fit without right-edge overflow.",
       },
     },
   },
@@ -248,19 +267,17 @@ export const CoderCatalogDiscoveredPhone: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("anthropic/claude-x");
 
-    const trigger = canvas.getByRole("button", { name: /Discovered models/ });
-    const input = canvas.getByPlaceholderText("model-id");
-    // The add row is the wrapping flex container two levels above the trigger
-    // (trigger → min-width wrapper → row).
-    const row = trigger.parentElement?.parentElement;
-    if (!row?.contains(input)) {
-      throw new Error("Expected the dropdown and the model-id input to share the add row");
-    }
+    const input = canvas.getByRole("combobox", { name: "Model ID" });
+    const row = input.parentElement?.parentElement;
+    if (!row) throw new Error("Expected the model field in the add row");
     await expect(row.getBoundingClientRect().width).toBeLessThanOrEqual(390);
     await expect(row.scrollWidth).toBeLessThanOrEqual(row.clientWidth);
-    // Wrapped: the free-text input starts below the dropdown instead of overflowing.
-    await expect(input.getBoundingClientRect().top).toBeGreaterThanOrEqual(
-      trigger.getBoundingClientRect().bottom
+    await userEvent.click(input);
+    const list = await canvas.findByRole("listbox");
+    await expect(within(list).getAllByRole("option")).toHaveLength(2);
+    await expect(list.getBoundingClientRect().right).toBeLessThanOrEqual(
+      row.getBoundingClientRect().right
     );
+    await expect(list.scrollWidth).toBeLessThanOrEqual(list.clientWidth);
   },
 };
