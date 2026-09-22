@@ -3144,8 +3144,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err(getErrorMessage(error));
     }
     try {
-      // No own record to exclude: the checkout is unregistered until `publish`.
-      const siblings = await this.findLiveSiblingForCheckout(target.workspacePath, undefined);
+      // No own record to exclude: the checkout is unregistered until `publish`. Strict own
+      // read: nothing has proved the store readable yet in this operation.
+      const siblings = await this.findLiveSiblingForCheckout(
+        target.workspacePath,
+        undefined,
+        undefined,
+        /* ownConfigStrict */ true
+      );
       if (siblings === "none") {
         try {
           await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
@@ -3174,7 +3180,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async findLiveSiblingForCheckout(
     workspacePath: string,
     ownWorkspaceId: string | undefined,
-    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">,
+    /**
+     * Read the service's OWN config in throwing mode as well. Registration
+     * paths that just persisted their entry keep the lenient read (their write
+     * proved the store readable); the pre-publication scan has written nothing
+     * yet, so a malformed own config must refuse instead of reading as "no
+     * sibling" and pruning a live sibling's consent.
+     */
+    ownConfigStrict = false
   ): Promise<"found" | "none" | { error: string }> {
     // A sibling workspace resolving to the same checkout (local-runtime
     // conversation forks) means the consent context is still ALIVE — its
@@ -3234,7 +3248,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     let configSnapshots: ProjectsConfig[];
     try {
       configSnapshots = [
-        this.config.loadConfigOrDefault(),
+        this.config.loadConfigOrDefault(ownConfigStrict ? { throwOnError: true } : undefined),
         ...(persistentSiblingConfig
           ? [persistentSiblingConfig.loadConfigOrDefault({ throwOnError: true })]
           : []),

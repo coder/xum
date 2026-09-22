@@ -45,6 +45,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -24944,6 +24945,78 @@ describe("WorkspaceService.registerSanitizedTaskCheckout", () => {
       expect(result.error).toContain("JSONC parse errors");
       expect(result.error).toContain(workspacePath);
       expect(publish).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('a malformed own config refuses (it never reads as "no sibling"): no prune, no publication', async () => {
+    const { config, service, pruned, cleanup } = await createService();
+    try {
+      // A registered project-dir sibling whose consent a lenient (empty) read would hide.
+      const sharedPath = path.join(config.srcDir, "shared-project");
+      await fsPromises.mkdir(sharedPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(sharedPath, {
+          workspaces: [
+            { path: sharedPath, id: "sibling", name: "sibling", runtimeConfig: { type: "local" } },
+          ],
+        });
+        return cfg;
+      });
+      await fsPromises.writeFile(path.join(config.rootDir, "config.json"), "{ not json", "utf-8");
+      const publish = mock(() => Promise.resolve("published"));
+      const result = await service.registerSanitizedTaskCheckout(
+        { workspacePath: sharedPath, runtimeConfig: { type: "local" } },
+        publish
+      );
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("unreachable");
+      expect(result.error).toContain("unreadable");
+      expect(pruned).toEqual([]);
+      expect(publish).not.toHaveBeenCalled();
+      expect(await fsPromises.readFile(path.join(config.rootDir, "config.json"), "utf-8")).toBe(
+        "{ not json"
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("holds the registration lock through the publication and releases it afterwards", async () => {
+    const { config, service, cleanup } = await createService();
+    try {
+      const lockPath = path.join(config.rootDir, "workspace-registration.lock");
+      const tryAcquire = () =>
+        acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 300,
+          staleMs: 60_000,
+          timeoutMessage: "registration lock busy",
+        });
+      let contendedDuringPublish: string | undefined;
+      const result = await service.registerSanitizedTaskCheckout(
+        {
+          workspacePath: path.join(config.srcDir, "proj", "fresh"),
+          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        },
+        async () => {
+          // A sibling registrant arriving between prune and publication must wait.
+          try {
+            const release = await tryAcquire();
+            await release();
+            contendedDuringPublish = "acquired";
+          } catch (error) {
+            contendedDuringPublish = error instanceof Error ? error.message : String(error);
+          }
+          return "published";
+        }
+      );
+      expect(result).toEqual({ success: true, data: "published" });
+      expect(contendedDuringPublish).toBe("registration lock busy");
+      // Released on return: the next registrant proceeds.
+      const release = await tryAcquire();
+      await release();
     } finally {
       await cleanup();
     }
