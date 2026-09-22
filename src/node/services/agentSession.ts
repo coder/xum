@@ -1212,7 +1212,12 @@ export class AgentSession {
     modelString: string;
     contextBudgetRetried?: boolean;
     requestAssemblySnapshot?: RequestAssemblySnapshot;
-    options?: SendMessageOptions;
+    /**
+     * The options the automatic recoveries (context-window rollover, compaction retry) replay
+     * through streamWithHistory; their routing record follows the stream's mid-turn changes
+     * like `autoModelRouting` below.
+     */
+    options?: ResolvedSendMessageOptions;
     /**
      * Auto routing decision of the streaming request. Starts as the session's pre-stream
      * decision, is replaced by the prepared record on stream-start (request preparation
@@ -7974,8 +7979,10 @@ export class AgentSession {
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
         // Mid-stream compaction follow-ups are built from this context after the stream is
-        // stopped: what the Auto-routed stream runs on (a raise, a slider move, a refusal
-        // fallback) must land here, or the resumed turn drops back to the tier's model and level.
+        // stopped, and the automatic recoveries (context-window rollover, compaction retry)
+        // replay its options through streamWithHistory: what the Auto-routed stream runs on (a
+        // raise, a slider move, a refusal fallback) must land on both, or the resumed turn
+        // drops back to the tier's model and level and re-arms the pre-change provenance.
         activeTurnThinkingOverride.onLiveRoutingChanged = (live) => {
           if (this.activeStreamContext !== streamContext) return;
           streamContext.modelString = live.model;
@@ -7983,7 +7990,9 @@ export class AgentSession {
           if (streamContext.options != null) {
             streamContext.options = {
               ...streamContext.options,
+              model: live.model,
               thinkingLevel: live.thinkingLevel ?? streamContext.options.thinkingLevel,
+              autoModelRoutingRecord: live.autoModelRouting,
             };
           }
         };

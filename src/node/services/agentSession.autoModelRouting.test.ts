@@ -995,6 +995,65 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     to: "xhigh",
     reason: "3 consecutive steps with only failing tool calls",
   };
+  it("a live routing change lands on the send options the automatic recoveries replay", async () => {
+    const { session, aiService, streamMessage } = await createHarness({
+      experimentEnabled: true,
+      classify: () => Promise.resolve(Ok(decision("hard"))),
+    });
+    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+      aiService.emit("stream-start", {
+        type: "stream-start",
+        workspaceId: "ws-auto-routing",
+        messageId: "assistant-routed",
+        model: opts.modelString,
+        historySequence: 1,
+        startTime: Date.now(),
+        autoModelRouting: opts.autoModelRouting,
+      });
+      if (opts.autoModelRouting == null) throw new Error("Expected a routed request");
+      // A refusal fallback that also clamped Auto's level, then a raise on the fallback.
+      opts.activeTurnThinkingOverride?.onLiveRoutingChanged?.({
+        model: "openai:gpt-4.1",
+        thinkingLevel: "xhigh",
+        autoModelRouting: {
+          ...opts.autoModelRouting,
+          model: "openai:gpt-4.1",
+          thinkingLevel: "medium",
+          escalations: [RAISE],
+        },
+      });
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      thinkingLevel: "low",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+
+    // The context-window rollover and the compaction retry rebuild the request from these
+    // options (streamWithHistory republishes options.autoModelRoutingRecord), so a stale
+    // record here would resume the recovered turn under the pre-change provenance.
+    const internals = session as unknown as {
+      activeStreamContext?: {
+        modelString: string;
+        options?: { model: string; thinkingLevel?: string; autoModelRoutingRecord?: unknown };
+      };
+    };
+    expect(internals.activeStreamContext?.modelString).toBe("openai:gpt-4.1");
+    expect(internals.activeStreamContext?.options).toMatchObject({
+      model: "openai:gpt-4.1",
+      thinkingLevel: "xhigh",
+      autoModelRoutingRecord: {
+        tierId: "hard",
+        model: "openai:gpt-4.1",
+        thinkingLevel: "medium",
+        escalations: [RAISE],
+      },
+    });
+  });
+
   const FALLBACK_MODEL = "openai:gpt-4.1";
   // StreamManager reports each of these through the turn's override holder; the compaction
   // follow-up must be built from what the stream ran on afterwards.
