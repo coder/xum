@@ -1,3 +1,5 @@
+import type { ModelMessage } from "ai";
+
 import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 
 export interface ReasoningProviderMetadata {
@@ -188,6 +190,41 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
 
     return changed ? { ...message, parts } : message;
   });
+}
+
+/**
+ * Drop OpenAI reasoning replay from a prepared request after the Responses
+ * wire rejected it (unresolvable `rs_` item, unverifiable encrypted_content).
+ * OpenAI mints both, so nothing local can repair them and re-sending the same
+ * input fails deterministically. Only reasoning parts carrying the `openai`
+ * namespace go: persisted history bridged by attachReasoningReplayMetadata and
+ * same-turn SDK step messages (itemId + encrypted content copied from
+ * providerMetadata) alike. Text, tool parts, string assistants and other
+ * providers' reasoning stay. An assistant emptied by the removal is dropped
+ * (an empty content array is not valid input). Non-mutating and identity
+ * preserving on no-op so the caller can tell "nothing to repair" apart.
+ */
+export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessage[] {
+  let changed = false;
+  const stripped: ModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || typeof message.content === "string") {
+      stripped.push(message);
+      continue;
+    }
+    const content = message.content.filter(
+      (part) => !(part.type === "reasoning" && part.providerOptions?.openai != null)
+    );
+    if (content.length === message.content.length) {
+      stripped.push(message);
+      continue;
+    }
+    changed = true;
+    if (content.length > 0) {
+      stripped.push({ ...message, content });
+    }
+  }
+  return changed ? stripped : messages;
 }
 
 /**

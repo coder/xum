@@ -415,6 +415,20 @@ describe("isEligibleForAutoRetry", () => {
       ];
       expect(isEligibleForAutoRetry(messages)).toBe(false);
     });
+
+    it("keeps manual retry for a persisted reasoning_rejected error but never auto-retries it", () => {
+      // Startup recovery reads this row back from history: the in-stream repair
+      // already ran, so replaying the same request would be rejected again.
+      const messages: DisplayedMessage[] = [
+        userMessage(),
+        streamErrorMessage({
+          error: "The encrypted content for item rs_1 could not be verified.",
+          errorType: "reasoning_rejected",
+        }),
+      ];
+      expect(hasInterruptedStream(messages)).toBe(true);
+      expect(isEligibleForAutoRetry(messages)).toBe(false);
+    });
   });
 
   describe("retryable error types", () => {

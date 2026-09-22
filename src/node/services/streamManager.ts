@@ -59,6 +59,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
+  stripOpenAIReasoningReplay,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
 import {
@@ -586,6 +587,30 @@ function isStreamTruncatedMessage(message: string): boolean {
   );
 }
 
+// OpenAI Responses rejecting replayed reasoning. Exact item type on purpose:
+// `rs_` is a reasoning item; message/tool items use other prefixes.
+const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+' not found/;
+// "The encrypted content [for item rs_…] <blob> could not be verified. Reason: …"
+const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
+  /encrypted content\b[\s\S]*?\bcould not be verified/;
+
+/**
+ * True when the resolved model sends the OpenAI Responses wire, whichever
+ * route built it: direct, custom openai-responses adapters and the Coder
+ * gateway all instantiate `createOpenAI().responses()` (provider
+ * `openai.responses`), while the Xum gateway wraps its OpenAI upstreams in
+ * the Vercel gateway SDK (provider `gateway`, `openai/<model>` ids). Keyed on
+ * the model instance, not the requested string, so `openrouter:openai/x`
+ * (chat completions) and xAI Responses (`xai.responses`) stay out.
+ */
+function isOpenAIResponsesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  return (
+    model.provider === "openai.responses" ||
+    (model.provider === "gateway" && model.modelId.startsWith("openai/"))
+  );
+}
+
 // Stream state enum for exhaustive checking
 enum StreamState {
   IDLE = "idle",
@@ -793,6 +818,8 @@ interface WorkspaceStreamInfo {
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
+  // Same for a step-boundary retry without OpenAI reasoning replay.
+  didRetryReasoningReplayAtStep?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
   // be rebuilt for a different model. System, tools, and messages are rebuilt
@@ -1588,7 +1615,9 @@ export class StreamManager {
   ): LanguageModelV2Usage | undefined {
     const cumulativeUsage = streamInfo.cumulativeUsage;
     if (
-      (streamInfo.didRetryPreviousResponseIdAtStep || streamInfo.didRetryAfterEmptyOutput) &&
+      (streamInfo.didRetryPreviousResponseIdAtStep ||
+        streamInfo.didRetryAfterEmptyOutput ||
+        streamInfo.didRetryReasoningReplayAtStep) &&
       hasTokenUsage(cumulativeUsage)
     ) {
       return cumulativeUsage;
@@ -4088,6 +4117,7 @@ export class StreamManager {
       await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
       let didRetryPreviousResponseId = false;
+      let didRetryReasoningReplay = false;
       let emptyStreamRecoveryAttempts = 0;
       const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
       let orphanToolResultCount = 0;
@@ -4805,18 +4835,32 @@ export class StreamManager {
           let handledError: unknown = error;
           let retried = false;
           try {
-            retried = await this.retryStreamWithoutPreviousResponseId(
-              workspaceId,
-              streamInfo,
-              error,
-              didRetryPreviousResponseId
-            );
+            if (
+              await this.retryStreamWithoutPreviousResponseId(
+                workspaceId,
+                streamInfo,
+                error,
+                didRetryPreviousResponseId
+              )
+            ) {
+              didRetryPreviousResponseId = true;
+              retried = true;
+            } else if (
+              await this.retryStreamWithoutOpenAIReasoningReplay(
+                workspaceId,
+                streamInfo,
+                error,
+                didRetryReasoningReplay
+              )
+            ) {
+              didRetryReasoningReplay = true;
+              retried = true;
+            }
           } catch (retryError) {
             handledError = retryError;
           }
 
           if (retried) {
-            didRetryPreviousResponseId = true;
             continue;
           }
 
@@ -4939,6 +4983,15 @@ export class StreamManager {
     }
 
     let errorType = this.categorizeError(actualError);
+
+    // A matching rejection that reaches failure handling is final: the one-shot
+    // repair (retryStreamWithoutOpenAIReasoningReplay) already ran, or was
+    // unsafe/no-op. Its generic `api` class is auto-retryable, and every outer
+    // retry would resend the same rejected input, so classify it terminal.
+    // Only this exact shape is reclassified; a later 503/401/429 keeps its own.
+    if (this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+      errorType = "reasoning_rejected";
+    }
 
     // Enhance previous-response and model-not-found error messages
 
@@ -5304,6 +5357,121 @@ export class StreamManager {
       ...(stepMessages ? { messages: stepMessages } : {}),
       providerOptions,
     };
+    streamInfo.streamResult = this.createStreamResult(
+      streamInfo.request,
+      streamInfo.abortController,
+      streamInfo.stepTracker
+    );
+
+    return true;
+  }
+
+  /**
+   * OpenAI Responses rejected replayed reasoning on the failing request: an
+   * `rs_` item the route cannot resolve, or an encrypted_content blob it cannot
+   * verify (minted under another org/route, rotated keys). Phase 1 already
+   * replays by encrypted content only; these are the rejections that survive
+   * it, and they repeat deterministically for the same input. Strict on
+   * purpose: only these two shapes, only on a 400/404, and only when the
+   * request actually went out on the OpenAI Responses wire, so a loose `rs_`
+   * mention, another item type, xAI Responses (also `rs_`), or a
+   * chat-completions route never trigger the repair.
+   */
+  private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
+    const statusCode = this.extractStatusCode(error);
+    if (statusCode !== 400 && statusCode !== 404) {
+      return false;
+    }
+    if (!isOpenAIResponsesModel(model)) {
+      return false;
+    }
+    if (this.extractErrorCode(error) === "invalid_encrypted_content") {
+      return true;
+    }
+    // Gateways can drop the structured code and forward only the message.
+    const texts = [
+      APICallError.isInstance(error) ? error.responseBody : undefined,
+      error instanceof Error ? error.message : undefined,
+    ];
+    return texts.some(
+      (text) =>
+        typeof text === "string" &&
+        (OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN.test(text) ||
+          OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN.test(text))
+    );
+  }
+
+  /**
+   * One-shot mirror of retryStreamWithoutPreviousResponseId for rejected
+   * reasoning replay: drop every OpenAI reasoning part from the failing
+   * request and restart the current step. Same safety envelope (no abort or
+   * soft interrupt pending, no parts emitted by the current step, a step
+   * snapshot when earlier steps completed) so nothing already shown to the
+   * user or executed as a tool is repeated. The final matching error is then
+   * classified reasoning_rejected by buildStreamErrorPayload; no state
+   * outlives the attempt, so a manual continuation gets its own repair.
+   */
+  private async retryStreamWithoutOpenAIReasoningReplay(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    error: unknown,
+    hasRetried: boolean
+  ): Promise<boolean> {
+    if (hasRetried) {
+      return false;
+    }
+
+    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
+      return false;
+    }
+
+    const hasParts = streamInfo.parts.length > 0;
+    // If the current step already emitted parts, retrying would duplicate output/tool calls.
+    if (hasParts && streamInfo.currentStepStartIndex !== streamInfo.parts.length) {
+      return false;
+    }
+
+    if (!this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+      return false;
+    }
+
+    // After completed steps only the SDK's prepared step messages carry the
+    // prior tool calls/results; the turn's own request is enough before that.
+    const stepMessages = streamInfo.stepTracker.latestMessages;
+    if (hasParts && !stepMessages) {
+      return false;
+    }
+    const sourceMessages = hasParts && stepMessages ? stepMessages : streamInfo.request.messages;
+    const messages = stripOpenAIReasoningReplay(sourceMessages);
+    if (messages === sourceMessages) {
+      return false;
+    }
+
+    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
+    const errorCode = this.extractErrorCode(error);
+    const statusCode = this.extractStatusCode(error);
+
+    // Step-boundary retries restart the SDK stream, so totalUsage only reflects
+    // the retried step. Track this to prefer cumulativeUsage at stream end.
+    if (hasParts) {
+      streamInfo.didRetryReasoningReplayAtStep = true;
+    }
+
+    workspaceLog.info("Retrying stream without OpenAI reasoning replay", {
+      messageId: streamInfo.messageId,
+      model: streamInfo.model,
+      retryScope: hasParts ? "step" : "stream",
+      errorCode,
+      statusCode,
+    });
+
+    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
+      preserveParts: hasParts,
+      preserveUsage: hasParts,
+      workspaceLog,
+    });
+
+    streamInfo.request = { ...streamInfo.request, messages };
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,

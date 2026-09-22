@@ -49,17 +49,21 @@ describe("RetryManager", () => {
     expect(calculateBackoffDelay(6)).toBe(60000);
   });
 
-  it("abandons non-retryable errors", async () => {
-    const { manager, onRetry, onStatusChange, events } = createRetryManager();
+  // reasoning_rejected: StreamManager already spent its one in-stream repair, so
+  // an outer retry would resend the same rejected reasoning replay forever.
+  for (const type of ["api_key_not_found", "reasoning_rejected"]) {
+    it(`abandons non-retryable ${type} errors`, async () => {
+      const { manager, onRetry, onStatusChange, events } = createRetryManager();
 
-    manager.handleStreamFailure({ type: "api_key_not_found" });
+      manager.handleStreamFailure({ type });
 
-    expect(onStatusChange).toHaveBeenCalledTimes(1);
-    expect(events).toEqual([{ type: "auto-retry-abandoned", reason: "api_key_not_found" }]);
-    expect(manager.isRetryPending).toBe(false);
-    await adjustPastAnyBackoff();
-    expect(onRetry).not.toHaveBeenCalled();
-  });
+      expect(onStatusChange).toHaveBeenCalledTimes(1);
+      expect(events).toEqual([{ type: "auto-retry-abandoned", reason: type }]);
+      expect(manager.isRetryPending).toBe(false);
+      await adjustPastAnyBackoff();
+      expect(onRetry).not.toHaveBeenCalled();
+    });
+  }
 
   it("non-retryable error cancels pending retryable timer", async () => {
     const { manager, onRetry, events } = createRetryManager();

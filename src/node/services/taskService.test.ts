@@ -25421,79 +25421,93 @@ describe("TaskService", () => {
     expect(childWorkspace?.taskStatus).toBe("interrupted");
   });
 
-  test("running tasks settle terminally on model_refusal without any recovery prompt", async () => {
-    const config = await createTestConfig(rootDir);
+  // reasoning_rejected joins model_refusal in RUNNING_TASK_TERMINAL_STREAM_ERRORS:
+  // the child's StreamManager already spent its one in-stream repair, so the
+  // rejected replay cannot recover in-session either.
+  for (const terminal of [
+    {
+      errorType: "model_refusal" as const,
+      message:
+        "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.",
+    },
+    {
+      errorType: "reasoning_rejected" as const,
+      message: "The encrypted content for item rs_1 could not be verified.",
+    },
+  ]) {
+    test(`running tasks settle terminally on ${terminal.errorType} without any recovery prompt`, async () => {
+      const config = await createTestConfig(rootDir);
 
-    const projectPath = path.join(rootDir, "repo");
-    const parentId = "parent-111";
-    const childId = "child-222";
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-111";
+      const childId = "child-222";
 
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentId),
-        projectWorkspace(projectPath, "child", childId, {
-          name: "agent_explore_child",
-          parentWorkspaceId: parentId,
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: "anthropic:claude-fable-5",
-        }),
-      ],
-      testTaskSettings(1, 3)
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
-    const refusalMessage =
-      "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.";
-
-    // Waiter registered before the failure must reject promptly with the refusal
-    // text — not block until the 10-minute report timeout.
-    const waiterOutcome = taskService
-      .waitForAgentReport(childId, { timeoutMs: 10_000, requestingWorkspaceId: parentId })
-      .then(
-        () => null,
-        (error: unknown) => error
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: "anthropic:claude-fable-5",
+          }),
+        ],
+        testTaskSettings(1, 3)
       );
 
-    await internal.handleTaskStreamError({
-      type: "error",
-      workspaceId: childId,
-      messageId: "assistant-error-refusal",
-      error: refusalMessage,
-      errorType: "model_refusal",
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const internal = taskService as unknown as {
+        handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
+      };
+
+      const refusalMessage = terminal.message;
+
+      // Waiter registered before the failure must reject promptly with the refusal
+      // text — not block until the 10-minute report timeout.
+      const waiterOutcome = taskService
+        .waitForAgentReport(childId, { timeoutMs: 10_000, requestingWorkspaceId: parentId })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+
+      await internal.handleTaskStreamError({
+        type: "error",
+        workspaceId: childId,
+        messageId: "assistant-error-refusal",
+        error: refusalMessage,
+        errorType: terminal.errorType,
+      });
+
+      const rejection = await waiterOutcome;
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe(refusalMessage);
+
+      // Terminal settlement: no agent_report recovery prompt is sent afterwards.
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      const postCfg = config.loadConfigOrDefault();
+      const childWorkspace = Array.from(postCfg.projects.values())
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === childId);
+      expect(childWorkspace?.taskStatus).toBe("interrupted");
+      expect(childWorkspace?.taskLaunchError).toBe(refusalMessage);
+
+      // Durable failure artifact persisted in the parent's session dir.
+      const failure = await readSubagentFailureArtifact(
+        path.join(config.sessionsDir, parentId),
+        childId
+      );
+      expect(failure).not.toBeNull();
+      expect(failure?.errorType).toBe(terminal.errorType);
+      expect(failure?.errorMessage).toBe(refusalMessage);
     });
-
-    const rejection = await waiterOutcome;
-    expect(rejection).toBeInstanceOf(Error);
-    expect((rejection as Error).message).toBe(refusalMessage);
-
-    // Terminal settlement: no agent_report recovery prompt is sent afterwards.
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    const postCfg = config.loadConfigOrDefault();
-    const childWorkspace = Array.from(postCfg.projects.values())
-      .flatMap((project) => project.workspaces)
-      .find((workspace) => workspace.id === childId);
-    expect(childWorkspace?.taskStatus).toBe("interrupted");
-    expect(childWorkspace?.taskLaunchError).toBe(refusalMessage);
-
-    // Durable failure artifact persisted in the parent's session dir.
-    const failure = await readSubagentFailureArtifact(
-      path.join(config.sessionsDir, parentId),
-      childId
-    );
-    expect(failure).not.toBeNull();
-    expect(failure?.errorType).toBe("model_refusal");
-    expect(failure?.errorMessage).toBe(refusalMessage);
-  });
+  }
 
   test("awaiting_report tasks settle terminally on model_refusal", async () => {
     const config = await createTestConfig(rootDir);

@@ -6475,10 +6475,28 @@ describe("WorkspaceTurnManager", () => {
         errorType: "context_exceeded",
       } satisfies ErrorEvent,
     },
+    // Terminal provider rejection of replayed reasoning: StreamManager already
+    // spent its one in-stream repair, so even a pending retry must not keep the
+    // parent's handle running.
+    {
+      name: "workspace-turn reasoning_rejected stream errors mark the handle failed despite a pending retry",
+      event: {
+        type: "error",
+        workspaceId: "childworkspace",
+        messageId: "msg_reasoning_rejected",
+        error: "The encrypted content for item rs_1 could not be verified.",
+        errorType: "reasoning_rejected",
+      } satisfies ErrorEvent,
+      retryPending: true,
+    },
   ]) {
     test(scenario.name, async () => {
       const hasPendingQueuedOrPreparingTurn = scenario.queuedOnly ? mock(() => true) : undefined;
-      const hasPendingAutoRetry = scenario.queuedOnly ? mock(() => false) : undefined;
+      const hasPendingAutoRetry = scenario.queuedOnly
+        ? mock(() => false)
+        : scenario.retryPending
+          ? mock(() => true)
+          : undefined;
       const { parentId, taskService } = await startWorkspaceTurnForTest({
         ...(hasPendingQueuedOrPreparingTurn != null ? { hasPendingQueuedOrPreparingTurn } : {}),
         ...(hasPendingAutoRetry != null ? { hasPendingAutoRetry } : {}),
