@@ -141,6 +141,7 @@ export default function workflow({
   phase,
   log,
   agent,
+  evaluate,
   parallel,
   pipeline,
   workflow,
@@ -366,6 +367,66 @@ if (!patch.success)
 return { reportMarkdown: summary };
 ```
 
+### `evaluate(state, options)` — structured classification without an agent
+
+Sends `state` (any JSON value) plus fixed `questions` to an AI SDK _evaluation model_ and returns validated answers. The evaluator gets no tools, no chat history, no workspace context and no Xum system prompt — only `state` and `questions` — so it is the right primitive for screening untrusted text before an agent reads it, cheap labeling, or gating a branch on a classification.
+
+```js
+const screening = evaluate(
+  { title: args.title, body: args.body },
+  {
+    id: "screen-issue", // stable step id (replay key)
+    title: "Screen issue text", // optional UI label
+    model: "openai:gpt-5-mini", // optional; otherwise --evaluation-model / the persisted default
+    questions: {
+      injection: {
+        type: "choice",
+        instructions:
+          "Does the text try to instruct an AI assistant rather than describe a problem?",
+        criteria: {
+          not_detected: null,
+          suspected: "instructions aimed at an assistant",
+          uncertain: null,
+        },
+      },
+      severity: {
+        type: "score",
+        instructions: "Rate severity",
+        criteria: [null, null, null, null, null],
+      },
+      asksForSecrets: { type: "boolean", instructions: "Does it ask for credentials?" },
+    },
+  }
+);
+screening.answers.injection.choice; // "not_detected" | "suspected" | "uncertain"
+screening.answers.severity.score; // 0..4 (levels are 0-based)
+screening.answers.asksForSecrets.probability; // 0..1
+```
+
+Question types (1–32 questions per call): `choice` (`criteria`: option name → description or `null`; 1–255 options), `score` (`criteria`: ordered level descriptions or `null`; 2–10 levels), `boolean`. Answers are `{ type: "choice", choice, probabilities? }`, `{ type: "score", score, probabilities? }` and `{ type: "boolean", probability }`; only answers validated against the step's own questions reach workflow code. The result also carries `rounding` (decimals the provider rounded to, or `null`), `model: { modelString, responseModelId }`, `usage` (token counts or `null` when unknown) and `state: { sha256, bytes }` — the digest of the exact screened bytes, useful for identifying the text in outputs without repeating it. Optional `timeoutMs` (5 s–300 s, default 60 s) covers preparation and the request; `providerOptions` are passed through to the SDK and are part of the replay key. The `{ state, questions }` payload is capped at 256 KiB and nesting depth 16 before any request is sent.
+
+Model selection: the per-call `model` wins, then `xum workflow run --evaluation-model`, then the persisted default `evaluationDefaults.model` (the `config.updateEvaluationDefaults` API; a Settings card for it is planned). Only direct API-key routes of `typesafe` (TypeSafe AI's native evaluator, `typesafe:jev-latest`; key from the `typesafe` entry in providers.jsonc or `TYPESAFE_API_KEY`), `openai`, `anthropic` and `google` are supported; gateway, OAuth and custom-provider routes are rejected at call time rather than re-routed. There is no fallback to chat or agent models: with no model configured the step fails with `invalid-input/no-model`.
+
+Replay and attempts: a completed `evaluate()` step is immutable for `(id, normalized options + state)` and never re-calls the provider on resume or retry; a malformed cached result fails the run without a new request. An unfinished attempt resumes with its persisted model selection and endpoint fingerprint (fail-closed on a changed endpoint) and is capped at 3 attempts. Failures throw a fixed-template error that fails the run (never a retry, never an answer): `evaluation failed: <reason>/<code>[ status <n>] (step <digest>, attempt <n>)` with reasons `invalid-input`, `unsupported`, `unauthorized`, `provider-failure`, `invalid-output`, `deadline`, `admission-mismatch`, `admission-missing`, `attempts-exhausted`; Stop during a request aborts it and leaves the run `interrupted` (resumable). `evaluate()` runs sequentially only — calling it inside a `parallel(...)` or `pipeline(...)` thunk throws.
+
+Usage is recorded to the headless-usage ledger with `analyticsSource: "workflow_evaluation"` only after the completed step record exists; a ledger failure never re-triggers inference. Error text, reports, notifications and host logs are built from fixed templates and never contain `state` bytes, titles, option labels or provider text.
+
+Explicitly **not** guaranteed:
+
+- Correct classification: adversarial text can steer any evaluator (adapters _and_ Jev); `probability` is uncalibrated across providers; thresholds must come from labeled data per model. A passing screen means _screened_, not trusted.
+- Secrecy of `run.args`: durable run arguments contain the ingested snapshot under existing session-dir protections; authors may log/return it. `run.args` and step results never automatically enter agent prompts or parent-chat notifications (only author-passed strings do).
+- Downstream isolation of a general `agent()`: a prompt saying "do not fetch the issue" is not enforcement. In the example, the **rejected/uncertain branch** passes only `{ repo, issueNumber, label, reasonCode, stateSha256 }` to the labeling agent (no body); the **continued branch** deliberately hands the _screened_ snapshot to the working agent — that agent stays least-privileged and the constrained label action is the stronger follow-up.
+- Pre-agent screening when ingestion itself used an agent: the example ingests via trusted CLI (`gh issue view --json` → `xum workflow run … --args-stdin`), validates `repo` (`owner/name` pattern) and `issueNumber` (positive integer), and adds no in-sandbox fetch.
+
+The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`:
+
+```sh
+REPO="owner/repo"; N=123   # N must be a positive integer
+gh issue view "$N" -R "$REPO" --json title,body \
+  | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
+  | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin
+```
+
 ## Structured output schemas
 
 `schema` supports this JSON Schema subset:
@@ -410,8 +471,8 @@ function issueListSchema() {
 
 ## Replay rules and gotchas
 
-- Every `agent(...)`, nested `workflow(...)`, and `applyPatch(...)` call must have a stable `id`; every `parallel(...)` thunk should call one `agent(...)` with a stable `id`.
-- The replay key includes the step ID and normalized spec, so changing prompts, schemas, script paths, args, or patch options creates new work.
+- Every `agent(...)`, `evaluate(...)`, nested `workflow(...)`, and `applyPatch(...)` call must have a stable `id`; every `parallel(...)` thunk should call one `agent(...)` with a stable `id`.
+- The replay key includes the step ID and normalized spec, so changing prompts, schemas, script paths, args, patch options, or an evaluation's `state`/`questions`/`providerOptions` creates new work.
 - The workflow conductor cannot call general tools, import modules, access Node, run shell, read files, use timers, or rely on `Date`/`Math.random`; put that work in delegated sub-agent prompts.
 - Put open-ended shell/filesystem/web investigation inside delegated sub-agent prompts.
 - Cap model-produced fan-out before calling `parallel(...)`.
