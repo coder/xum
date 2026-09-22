@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
@@ -876,8 +877,12 @@ function collectWorkspaceTitleContextTurns(
 ): WorkspaceTitleContextTurn[] {
   const turns: WorkspaceTitleContextTurn[] = [];
 
+  // Hidden records must not select the naming objective or consume the title's turn budget.
   for (const message of messages) {
-    if (message.role !== "user" && message.role !== "assistant") {
+    if (
+      isModelHiddenMessage(message) ||
+      (message.role !== "user" && message.role !== "assistant")
+    ) {
       continue;
     }
 

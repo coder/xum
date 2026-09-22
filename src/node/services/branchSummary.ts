@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 /**
  * Branch summarization on fork/truncate (rlm-mode experiment).
  *
@@ -148,7 +149,11 @@ function formatMessageForBranchTranscript(message: MuxMessage): string {
  */
 export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   assert(Array.isArray(messages), "buildAbandonedBranchTranscript requires a message array");
-  const formatted = messages.map(formatMessageForBranchTranscript).filter((s) => s.length > 0);
+  // Both /refine and abandoned-branch summaries must exclude hidden state before the char cap.
+  const formatted = messages
+    .filter((message) => !isModelHiddenMessage(message))
+    .map(formatMessageForBranchTranscript)
+    .filter((s) => s.length > 0);
 
   let totalChars = formatted.reduce((sum, s) => sum + s.length, 0);
   let drop = 0;
@@ -715,8 +720,10 @@ export async function maybeAppendAbandonedBranchSummary(
     // Filtered here — NOT in buildAbandonedBranchTranscript, which /refine
     // also uses on the active epoch where the preserved copies are the tail's
     // only representation.
+    // Hidden records also cannot make a tiny visible segment eligible for a model call.
     const abandonedMessages = input.abandonedMessages.filter(
       (message) =>
+        !isModelHiddenMessage(message) &&
         message.metadata?.rlmPreservedTailCopy !== true &&
         (message.metadata?.compacted === undefined || message.metadata.compacted === false)
     );

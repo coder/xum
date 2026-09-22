@@ -1,3 +1,8 @@
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, spyOn, test } from "bun:test";
 
 import * as fs from "node:fs/promises";
@@ -182,6 +187,41 @@ describe("isRlmModeEnabled", () => {
 });
 
 describe("buildAbandonedBranchTranscript", () => {
+  test("hidden review rows do not consume transcript space and authentic feedback survives", () => {
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    const feedbackText = formatPlanReviewEnvelope(feedback);
+    const visible = [
+      createMuxMessage("visible", "user", "visible work"),
+      createMuxMessage("feedback", "user", feedbackText, {
+        muxMetadata: buildPlanReviewMetadata(feedback),
+      }),
+    ];
+    const hidden = (["snapshot", "resolve", "reopen"] as const).map((kind) =>
+      createMuxMessage(
+        kind,
+        "user",
+        "HIDDEN_REVIEW_SENTINEL".repeat(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS),
+        {
+          muxMetadata: { type: "plan-review", kind, recordId: kind },
+        }
+      )
+    );
+    expect(buildAbandonedBranchTranscript([...visible, ...hidden])).toBe(
+      buildAbandonedBranchTranscript(visible)
+    );
+    expect(buildAbandonedBranchTranscript(visible)).toContain(feedbackText);
+  });
+
   test("keeps text and tool markers, strips reasoning parts", () => {
     const message: MuxMessage = {
       id: "a1",
@@ -402,6 +442,38 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       const history = await historyService.getHistoryFromLatestBoundary("ws-off");
       expect(history.success).toBe(true);
       expect(history.success && history.data.length).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("hidden review tokens cannot make a tiny abandoned segment eligible", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    let calls = 0;
+    try {
+      const result = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        workspaceId: "hidden-review-budget",
+        experiments: RLM_ON,
+        aiService: fakeAiService(
+          summaryModel("summary", () => {
+            calls++;
+          })
+        ),
+        abandonedMessages: [
+          createMuxMessage("visible", "user", "tiny visible turn"),
+          createMuxMessage(
+            "hidden",
+            "user",
+            "hidden tokens ".repeat(BRANCH_SUMMARY_MIN_SEGMENT_TOKENS * 3),
+            {
+              muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "hidden" },
+            }
+          ),
+        ],
+      });
+      expect(result).toBeNull();
+      expect(calls).toBe(0);
     } finally {
       await cleanup();
     }

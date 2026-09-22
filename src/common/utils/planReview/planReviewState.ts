@@ -285,7 +285,10 @@ export function formatPlanReviewStateBlock(
     "Threads are listed most recent user activity first; each lists the opening comment and the newest replies in order.",
   ];
   if (latest !== undefined) {
-    header.push(`Current plan snapshot: sha256 ${latest.contentHash} (${latest.planPath})`);
+    // Repository-controlled path names are quoted data, not additional system instructions.
+    header.push(
+      `Current plan snapshot: sha256 ${latest.contentHash} (${quoteForBlock(latest.planPath)})`
+    );
   }
   header.push(`Unresolved threads: ${unresolved.length}`);
   const footer = "</plan-review-state>";
