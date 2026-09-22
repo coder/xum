@@ -369,7 +369,7 @@ return { reportMarkdown: summary };
 
 ### `evaluate(state, options)` — structured classification without an agent
 
-Sends `state` (any JSON value) plus fixed `questions` to an AI SDK _evaluation model_ and returns validated answers. The evaluator gets no tools, no chat history, no workspace context and no Xum system prompt — only `state` and `questions` — so it is the right primitive for screening untrusted text before an agent reads it, cheap labeling, or gating a branch on a classification.
+Sends `state` (a string, a JSON array or a JSON object — a bare number, boolean or `null` fails with `invalid-input/invalid-state`) plus fixed `questions` to an AI SDK _evaluation model_ and returns validated answers. The evaluator gets no tools, no chat history, no workspace context and no Xum system prompt — only `state` and `questions` — so it is the right primitive for screening untrusted text before an agent reads it, cheap labeling, or gating a branch on a classification.
 
 ```js
 const screening = evaluate(
@@ -407,7 +407,7 @@ Question types (1–32 questions per call): `choice` (`criteria`: option name �
 
 Model selection: the per-call `model` wins, then `xum workflow run --evaluation-model`, then the persisted default `evaluationDefaults.model` (the `config.updateEvaluationDefaults` API; a Settings card for it is planned). Only direct API-key routes of `typesafe` (TypeSafe AI's native evaluator, `typesafe:jev-latest`; key from the `typesafe` entry in providers.jsonc or `TYPESAFE_API_KEY`), `openai`, `anthropic` and `google` are supported; gateway, OAuth and custom-provider routes are rejected at call time rather than re-routed. There is no fallback to chat or agent models: with no model configured the step fails with `invalid-input/no-model`.
 
-Replay and attempts: a completed `evaluate()` step is immutable for `(id, normalized options + state)` and never re-calls the provider on resume or retry; a malformed cached result fails the run without a new request. An unfinished attempt resumes with its persisted model selection and endpoint fingerprint (fail-closed on a changed endpoint) and is capped at 3 attempts. Failures throw a fixed-template error that fails the run (never a retry, never an answer): `evaluation failed: <reason>/<code>[ status <n>] (step <digest>, attempt <n>)` with reasons `invalid-input`, `unsupported`, `unauthorized`, `provider-failure`, `invalid-output`, `deadline`, `admission-mismatch`, `admission-missing`, `attempts-exhausted`; Stop during a request aborts it and leaves the run `interrupted` (resumable). `evaluate()` runs sequentially only — calling it inside a `parallel(...)` or `pipeline(...)` thunk throws.
+Replay and attempts: a completed `evaluate()` step is immutable for `(id, normalized options + state)` and never re-calls the provider on resume or retry; a malformed cached result fails the run without a new request. An unfinished attempt resumes with its persisted model selection and endpoint fingerprint (fail-closed on a changed endpoint) and is capped at 3 attempts. Failures throw a fixed-template error that fails the run (never an answer, and the step never re-requests on its own): `evaluation failed: <reason>/<code>[ status <n>] (step <digest>, attempt <n>)` with reasons `invalid-input`, `unsupported`, `unauthorized`, `provider-failure`, `invalid-output`, `deadline`, `admission-mismatch`, `admission-missing`, `attempts-exhausted`. A run that failed on an admitted attempt (provider error, deadline, a key revoked mid-run, …) is eligible for `workflow_resume` with `mode: "retry_from_checkpoint"` (also the run's Retry action): the step re-attempts with its persisted model selection (attempt + 1, up to the cap) and every completed step replays. A first attempt that fails before admission — no step record yet, e.g. `invalid-input/no-model` or an invalid `state` — is not retryable from checkpoint: fix the configuration or the workflow and start a new run. Stop during a request aborts it and leaves the run `interrupted` (resumable). `evaluate()` runs sequentially only — calling it inside a `parallel(...)` or `pipeline(...)` thunk throws.
 
 Usage is recorded to the headless-usage ledger with `analyticsSource: "workflow_evaluation"` only after the completed step record exists; a ledger failure never re-triggers inference. Error text, reports, notifications and host logs are built from fixed templates and never contain `state` bytes, titles, option labels or provider text.
 
@@ -418,13 +418,14 @@ Explicitly **not** guaranteed:
 - Downstream isolation of a general `agent()`: a prompt saying "do not fetch the issue" is not enforcement. In the example, the **rejected/uncertain branch** passes only `{ repo, issueNumber, label, reasonCode, stateSha256 }` to the labeling agent (no body); the **continued branch** deliberately hands the _screened_ snapshot to the working agent — that agent stays least-privileged and the constrained label action is the stronger follow-up.
 - Pre-agent screening when ingestion itself used an agent: the example ingests via trusted CLI (`gh issue view --json` → `xum workflow run … --args-stdin`), validates `repo` (`owner/name` pattern) and `issueNumber` (positive integer), and adds no in-sandbox fetch.
 
-The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`:
+The complete screening example ships with this skill: `agent_skill_read_file({ name: "workflow-authoring", filePath: "screen-github-issue.js" })`, runnable as `skill://workflow-authoring/screen-github-issue.js`. The example sets no per-call `model`, so pass `--evaluation-model` unless `evaluationDefaults.model` is already persisted:
 
 ```sh
 REPO="owner/repo"; N=123   # N must be a positive integer
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
-  | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin
+  | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
+      --evaluation-model openai:gpt-5-mini
 ```
 
 ## Structured output schemas

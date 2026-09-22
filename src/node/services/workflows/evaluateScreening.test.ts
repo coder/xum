@@ -78,7 +78,13 @@ function createFakeEvaluation(outcome: () => ScreeningOutcome | Promise<Screenin
   return { adapter, dispatches };
 }
 
-function createFakeAgents(options: { holdLabeling?: Promise<void> } = {}) {
+function createFakeAgents(
+  options: {
+    holdLabeling?: Promise<void>;
+    /** What the labeling agent reports back; the example must honor `labeled: false`. */
+    labeling?: { labeled: boolean; detail?: string };
+  } = {}
+) {
   const specs: WorkflowAgentSpec[] = [];
   const adapter: WorkflowTaskAdapter = {
     async runAgent(spec, _lifecycle, waitOptions) {
@@ -101,7 +107,11 @@ function createFakeAgents(options: { holdLabeling?: Promise<void> } = {}) {
             reportMarkdown: "triaged",
             structuredOutput: { summary: "500 on login", area: "auth" },
           }
-        : { taskId: `task-${spec.id}`, reportMarkdown: "labeled" };
+        : {
+            taskId: `task-${spec.id}`,
+            reportMarkdown: "labeled",
+            structuredOutput: options.labeling ?? { labeled: true },
+          };
     },
   };
   return { adapter, specs };
@@ -198,12 +208,47 @@ describe("screen-github-issue example", () => {
       expect(prompt).toContain(`"issueNumber":42`);
       expect(prompt).toContain(`"reasonCode":"${decision}"`);
       expect(prompt).toContain("--add-label needs-human-review");
+      // The labeling agent reports through a schema so the example can check it.
+      expect(agents.specs[0]?.outputSchema).toMatchObject({ required: ["labeled"] });
       expect(result.result).toMatchObject({
         structuredOutput: { decision, reasonCode: decision, label: "needs-human-review" },
       });
       expect(JSON.stringify(result.result)).not.toContain(BODY_SENTINEL);
     }
   );
+
+  test("a labeling agent that could not apply the label fails the run instead of reporting success", async () => {
+    using tmp = new DisposableTempDir("screening-label-failed");
+    const evaluation = createFakeEvaluation(() => screeningOutcome("suspected"));
+    const agents = createFakeAgents({
+      labeling: { labeled: false, detail: "gh: 'needs-human-review' not found" },
+    });
+    const { service, script, runStore } = await createService(
+      tmp.path,
+      evaluation.adapter,
+      agents.adapter,
+      "wfr_label_failed"
+    );
+
+    await expect(
+      service.startWorkflow({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: ARGS,
+      })
+    ).rejects.toThrow(
+      /label needs-human-review not applied to issue #42 in acme\/widgets: gh: 'needs-human-review' not found/
+    );
+
+    expect(agents.specs.map((spec) => spec.id)).toEqual(["label-for-review"]);
+    const run = await runStore.getRun("wfr_label_failed");
+    expect(run.status).toBe("failed");
+    expect(run.events.some((event) => event.type === "result")).toBe(false);
+    const error = run.events.findLast((event) => event.type === "error");
+    expect(error?.message).toContain("label needs-human-review not applied to issue #42");
+    expect(error?.message).not.toContain(BODY_SENTINEL);
+  });
 
   test("an evaluator failure fails the run before any agent step", async () => {
     using tmp = new DisposableTempDir("screening-eval-failure");

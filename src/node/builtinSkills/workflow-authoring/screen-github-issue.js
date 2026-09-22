@@ -1,10 +1,12 @@
 // Screens an ingested GitHub issue with evaluate() before any agent reads it.
 //
-// Run from a trusted CLI ingestion (no in-sandbox fetch):
+// Run from a trusted CLI ingestion (no in-sandbox fetch). The evaluate() call
+// sets no per-call model, so pass --evaluation-model unless a default is persisted:
 //   REPO="owner/repo"; N=123
 //   gh issue view "$N" -R "$REPO" --json title,body \
 //     | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
-//     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin
+//     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
+//         --evaluation-model openai:gpt-5-mini
 //
 // A passing screen means "screened", not "trusted": classification can be
 // steered by adversarial text and probabilities are uncalibrated across models.
@@ -81,10 +83,26 @@ export default function workflow({ args, evaluate, agent }) {
     reasonCode: decision,
     stateSha256,
   };
-  agent(
-    `Apply a GitHub label using exactly this request and nothing else: ${JSON.stringify(request)}. Run \`gh issue edit ${request.issueNumber} -R ${request.repo} --add-label ${request.label}\`. Do not read or fetch the issue body.`,
-    { id: "label-for-review", agentId: "exec" }
+  const labeling = agent(
+    `Apply a GitHub label using exactly this request and nothing else: ${JSON.stringify(request)}. Run \`gh issue edit ${request.issueNumber} -R ${request.repo} --add-label ${request.label}\`. Do not read or fetch the issue body. Report labeled: true only if the command exited 0; otherwise report labeled: false with the command's error output as detail.`,
+    {
+      id: "label-for-review",
+      agentId: "exec",
+      schema: {
+        type: "object",
+        required: ["labeled"],
+        properties: { labeled: { type: "boolean" }, detail: { type: "string" } },
+      },
+    }
   );
+  // A suspicious issue must not be reported as labeled when `gh` failed (no
+  // auth, unknown label, no write access): fail the run instead of claiming
+  // success. `detail` is the agent's own error report; it never saw the body.
+  if (labeling.labeled !== true) {
+    throw new Error(
+      `label ${REVIEW_LABEL} not applied to issue #${args.issueNumber} in ${args.repo}: ${labeling.detail ?? "no detail reported"}`
+    );
+  }
   return {
     reportMarkdown: `Issue #${args.issueNumber}: ${decision} — labeled ${REVIEW_LABEL} for human review.`,
     structuredOutput: { decision, reasonCode: decision, stateSha256, label: REVIEW_LABEL },
