@@ -1,13 +1,17 @@
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import assert from "@/common/utils/assert";
 import {
   isGatewayModelAccessibleForUi,
   isModelAllowedByPolicy,
 } from "@/common/utils/policy/modelPolicy";
 import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
+import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 
 /**
  * Selectable-models pipeline shared by the composer model picker
@@ -30,6 +34,18 @@ export interface SelectableModelsInput {
   routePriority: string[];
   routeOverrides: Record<string, string>;
 }
+
+/** One `models_list` entry: a picker selection in the form the `task` tool accepts. */
+export interface AvailableModel {
+  /** Normalized selection ID accepted by task.model (explicit gateway prefixes preserved). */
+  model: string;
+  /** MODEL_ABBREVIATIONS keys that normalize to `model` (e.g. ["sonnet"]); [] for custom models. */
+  aliases: string[];
+  /** Xum's thinking policy for this model (getThinkingPolicyForModel), not a provider capability probe. */
+  thinkingLevels: ThinkingLevel[];
+}
+
+export type SkippedModelReason = "malformed" | "unchecked_identity";
 
 export function getCustomModels(config: ProvidersConfigMap | null): string[] {
   if (!config) return [];
@@ -237,4 +253,56 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
   });
 
   return effectivePolicy ? next.filter(allowedByPolicy) : next;
+}
+
+/**
+ * The picker entries in the form `task.model` accepts: each raw entry is run
+ * through `normalizeModelInput` (what `parseTaskAiOverrides` does), so the
+ * emitted IDs are exactly the strings the task tool will accept unchanged.
+ *
+ * Omissions (reported through `onSkipped` so the Node boundary can log them —
+ * this module imports no logger):
+ * - `malformed`: a persisted custom ID `normalizeModelInput` rejects (input
+ *   data, not a programmer invariant, hence no assert).
+ * - `unchecked_identity`: normalization changed the identity (e.g. a
+ *   whitespace-padded custom entry) and the normalized ID is not itself a
+ *   picker entry — advertising it would bypass the routing/credential/catalog/
+ *   policy/hidden checks the picker applied to the raw string.
+ * Two raw entries normalizing to the same ID collapse into one.
+ */
+export function listAvailableModels(
+  input: SelectableModelsInput & { providersConfig: ProvidersConfigMap },
+  onSkipped?: (raw: string, reason: SkippedModelReason) => void
+): AvailableModel[] {
+  const rawEntries = computeSelectableModels(input);
+  const selectable = new Set(rawEntries);
+
+  const aliasesByModel = new Map<string, string[]>();
+  for (const alias of Object.keys(MODEL_ABBREVIATIONS)) {
+    const target = normalizeModelInput(alias).model;
+    if (target == null) continue;
+    aliasesByModel.set(target, [...(aliasesByModel.get(target) ?? []), alias]);
+  }
+
+  const emitted = new Set<string>();
+  const models: AvailableModel[] = [];
+  for (const raw of rawEntries) {
+    const model = normalizeModelInput(raw).model;
+    if (model == null) {
+      onSkipped?.(raw, "malformed");
+      continue;
+    }
+    if (model !== raw && !selectable.has(model)) {
+      onSkipped?.(raw, "unchecked_identity");
+      continue;
+    }
+    if (emitted.has(model)) continue;
+    emitted.add(model);
+
+    const thinkingLevels = [...getThinkingPolicyForModel(model, input.providersConfig)];
+    // getThinkingPolicyForModel always falls back to a non-empty default policy.
+    assert(thinkingLevels.length > 0, `empty thinking policy for ${model}`);
+    models.push({ model, aliases: aliasesByModel.get(model) ?? [], thinkingLevels });
+  }
+  return models;
 }

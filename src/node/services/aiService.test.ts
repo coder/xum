@@ -50,8 +50,11 @@ import type {
   StreamEndEvent,
 } from "@/common/types/stream";
 import { log } from "./log";
+import type { PolicyService } from "./policyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { AvailableModel } from "@/common/types/tools";
 import type { SendMessageError } from "@/common/types/errors";
 import type {
   StreamManager,
@@ -116,6 +119,7 @@ function createBasicAIService(
     sessionUsageService?: SessionUsageService;
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
+    policyService?: PolicyService;
   }
 ): BasicAIServiceParts {
   const config = new Config(root);
@@ -131,7 +135,7 @@ function createBasicAIService(
     undefined,
     options?.sessionUsageService,
     undefined,
-    undefined,
+    options?.policyService,
     undefined,
     options?.devToolsService,
     options?.experimentsService,
@@ -1136,6 +1140,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId?: string;
       useRequestedModelString?: boolean;
       experimentsService?: ExperimentsService;
+      policyService?: PolicyService;
     }
   ): StreamMessageHarness {
     const { config, historyService, initStateManager, service } = createBasicAIService(
@@ -1143,6 +1148,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       {
         sessionUsageService: options?.sessionUsageService,
         experimentsService: options?.experimentsService,
+        policyService: options?.policyService,
       }
     );
     const planPayloadMessageIds: string[][] = [];
@@ -3674,6 +3680,88 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         model: event.model,
       })
     );
+  });
+
+  it("wires models_list to live provider, config and policy state on every call", async () => {
+    using xumHome = new DisposableTempDir("ai-service-models-list-closure");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-models-list";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    // Policy stays unenforced while the stream is assembled; it flips only after the
+    // tool configuration has been captured, so the closure must read it at call time.
+    let policyEnforced = false;
+    let effectivePolicy: EffectivePolicy | null = null;
+    const policyService = {
+      isEnforced: () => policyEnforced,
+      getEffectivePolicy: () => effectivePolicy,
+      isRuntimeAllowed: () => true,
+    } as unknown as PolicyService;
+    const harness = createHarness(xumHome.path, metadata, { policyService });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    const toolConfig = getToolConfigFromHarness(harness) as {
+      listAvailableModels?: () => AvailableModel[];
+    };
+    const listModels = toolConfig.listAvailableModels;
+    expect(typeof listModels).toBe("function");
+    if (!listModels) {
+      throw new Error("Expected listAvailableModels on the production tool configuration");
+    }
+
+    const providerService = Reflect.get(harness.service, "providerService") as ProviderService;
+    const configured = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    let providersConfig: ProvidersConfigMap = { anthropic: configured, bedrock: configured };
+    spyOn(providerService, "getConfig").mockImplementation(() => providersConfig);
+    const baseAppConfig = harness.config.loadConfigOrDefault();
+    let appConfig = baseAppConfig;
+    spyOn(harness.config, "loadConfigOrDefault").mockImplementation(() => appConfig);
+
+    const anthropicBuiltIns = [
+      KNOWN_MODELS.FABLE.id,
+      KNOWN_MODELS.MYTHOS.id,
+      KNOWN_MODELS.OPUS.id,
+      KNOWN_MODELS.SONNET.id,
+      KNOWN_MODELS.HAIKU.id,
+    ];
+    const modelIds = () => listModels().map((entry) => entry.model);
+
+    // 1. Direct anthropic configured; bedrock is configured but not in the default priority.
+    expect(modelIds()).toEqual(anthropicBuiltIns);
+    // Real enrichment runs through the production closure (aliases, thinking levels).
+    const opus = listModels().find((entry) => entry.model === KNOWN_MODELS.OPUS.id);
+    expect(opus?.aliases).toEqual(["opus"]);
+    expect(opus?.thinkingLevels.length).toBeGreaterThan(0);
+
+    // 2. Provider disabled: nothing routes anthropic any more.
+    providersConfig = { anthropic: { ...configured, isEnabled: false }, bedrock: configured };
+    expect(modelIds()).toEqual([]);
+
+    // 3. Gateway added to routePriority: anthropic built-ins come back via bedrock.
+    appConfig = { ...baseAppConfig, routePriority: ["direct", "bedrock"] };
+    expect(modelIds()).toEqual(anthropicBuiltIns);
+
+    // 4. A model hidden in config.json disappears.
+    appConfig = { ...appConfig, hiddenModels: [KNOWN_MODELS.SONNET.id] };
+    expect(modelIds()).toEqual(anthropicBuiltIns.filter((id) => id !== KNOWN_MODELS.SONNET.id));
+
+    // 5. Policy enforced on the active (bedrock) route: only the allowed gateway model remains.
+    policyEnforced = true;
+    effectivePolicy = {
+      policyFormatVersion: "0.1",
+      providerAccess: [{ id: "bedrock", allowedModels: ["anthropic.claude-opus-5"] }],
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    };
+    expect(modelIds()).toEqual([KNOWN_MODELS.OPUS.id]);
   });
 });
 

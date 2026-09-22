@@ -8,10 +8,16 @@ import type {
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { AvailableModelSchema } from "@/common/utils/tools/toolDefinitions";
+
 import {
   BUILT_IN_MODELS,
   computeSelectableModels,
+  listAvailableModels,
+  type AvailableModel,
   type SelectableModelsInput,
+  type SkippedModelReason,
 } from "./selectableModels";
 
 // Explicit per-provider built-in lists in KNOWN_MODELS (= picker) order. The
@@ -341,5 +347,91 @@ describe("computeSelectableModels", () => {
         })
       ).toEqual(ANTHROPIC);
     });
+  });
+});
+
+describe("listAvailableModels", () => {
+  const FABLE = KNOWN_MODELS.FABLE.id;
+  const DEFAULT_POLICY: ThinkingLevel[] = ["off", "low", "medium", "high"];
+  const NO_OFF_POLICY: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+  const FULL_POLICY: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+
+  // Key order = picker order (custom entries are emitted per provider in insertion order).
+  const providersConfig: ProvidersConfigMap = {
+    anthropic: provider(),
+    openai: provider({ isConfigured: false, apiKeySet: false }),
+    openrouter: provider({ models: ["anthropic/claude-sonnet-5"] }),
+    fixture: customProvider([
+      "fixture-echo",
+      // Whitespace-padded persisted IDs are trimmed by getProviderModelEntryId before
+      // they reach the pipeline, so this duplicate collapses in the picker itself and
+      // "lonely " surfaces as its trimmed identity. normalizeModelInput therefore never
+      // changes a picker entry's identity today; the unchecked_identity guard in
+      // listAvailableModels is defense-in-depth for future normalization changes.
+      "fixture-echo ",
+      "lonely ",
+      { id: "fixture-mapped", mappedToModel: FABLE },
+      // Colons inside a model ID are valid (ollama:gpt-oss:20b style), so this survives.
+      "bad:id:colon",
+      // A leading colon in the model ID is rejected by normalizeModelInput → malformed.
+      ":colon-lead",
+    ]),
+  };
+
+  function list(): { models: AvailableModel[]; skipped: Array<[string, SkippedModelReason]> } {
+    const skipped: Array<[string, SkippedModelReason]> = [];
+    const models = listAvailableModels(
+      {
+        providersConfig,
+        hiddenModels: [KNOWN_MODELS.HAIKU.id],
+        effectivePolicy: null,
+        routePriority: ["direct"],
+        routeOverrides: {},
+      },
+      (raw, reason) => skipped.push([raw, reason])
+    );
+    return { models, skipped };
+  }
+
+  test("emits normalized, deduped entries with aliases and thinking levels", () => {
+    const { models } = list();
+
+    expect(models).toEqual([
+      // Explicit gateway selection preserved, not collapsed into the canonical ID.
+      { model: "openrouter:anthropic/claude-sonnet-5", aliases: [], thinkingLevels: FULL_POLICY },
+      { model: "fixture:fixture-echo", aliases: [], thinkingLevels: DEFAULT_POLICY },
+      { model: "fixture:lonely", aliases: [], thinkingLevels: DEFAULT_POLICY },
+      // mappedToModel resolves to the target's (no-off) thinking policy.
+      { model: "fixture:fixture-mapped", aliases: [], thinkingLevels: NO_OFF_POLICY },
+      { model: "fixture:bad:id:colon", aliases: [], thinkingLevels: DEFAULT_POLICY },
+      { model: FABLE, aliases: ["fable"], thinkingLevels: NO_OFF_POLICY },
+      { model: KNOWN_MODELS.MYTHOS.id, aliases: ["mythos"], thinkingLevels: NO_OFF_POLICY },
+      { model: KNOWN_MODELS.OPUS.id, aliases: ["opus"], thinkingLevels: FULL_POLICY },
+      { model: KNOWN_MODELS.SONNET.id, aliases: ["sonnet"], thinkingLevels: FULL_POLICY },
+    ]);
+  });
+
+  test("reports the malformed omission and nothing else", () => {
+    const { skipped } = list();
+
+    expect(skipped).toEqual([["fixture::colon-lead", "malformed"]]);
+  });
+
+  test("every entry satisfies the strict tool result schema", () => {
+    for (const entry of list().models) {
+      expect(AvailableModelSchema.parse(entry)).toEqual(entry);
+    }
+  });
+
+  test("returns [] for a configuration with nothing selectable", () => {
+    expect(
+      listAvailableModels({
+        providersConfig: {},
+        hiddenModels: [],
+        effectivePolicy: null,
+        routePriority: ["direct"],
+        routeOverrides: {},
+      })
+    ).toEqual([]);
   });
 });

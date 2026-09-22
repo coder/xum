@@ -9,6 +9,7 @@ import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
   MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -74,6 +75,11 @@ export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
+
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
 
 // agent_skill_write result
 export type AgentSkillWriteToolResult =

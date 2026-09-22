@@ -692,6 +692,21 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("mux_config_write");
   });
 
+  it("always includes the read-only model catalog, including for sub-agent option sets", () => {
+    expect(getAvailableTools("openai:gpt-4o")).toContain("models_list");
+    expect(
+      getAvailableTools("anthropic:claude-sonnet-5", {
+        enableAgentReport: true,
+        enableReviewPane: false,
+      })
+    ).toContain("models_list");
+    // No parameters: the strict schema rejects anything the model might invent.
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({}).success).toBe(true);
+    expect(TOOL_DEFINITIONS.models_list.schema.safeParse({ includeHidden: true }).success).toBe(
+      false
+    );
+  });
+
   it("includes skills catalog tools", () => {
     const tools = getAvailableTools("openai:gpt-4o");
 

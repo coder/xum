@@ -116,8 +116,11 @@ function buildParentRuntimeAiSettings(
  * thinking indices stay deferred as a `ParsedThinkingInput` so they resolve
  * against the sub-agent's chosen model in `resolveTaskAISettings`. Throws a
  * descriptive error on invalid input so the model can correct the call.
+ *
+ * Exported so the models_list tests can prove every advertised model/alias/level
+ * is accepted by exactly this parser.
  */
-function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+export function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
 } {

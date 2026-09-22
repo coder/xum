@@ -13,6 +13,7 @@ import {
   Brain,
   BrainCircuit,
   CircleCheck,
+  Cpu,
   Database,
   FileText,
   GitCommit,
@@ -254,6 +255,9 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // LayoutGrid (a 2×2 catalog of tiles) reads as "the index of skills you can pick
   // from" — distinct from the GraduationCap used when reading a single skill.
   agent_skill_list: LayoutGrid,
+  // Cpu reads as "the models (compute) you can pick from"; distinct from the
+  // Brain/BrainCircuit glyphs used for memory tools.
+  models_list: Cpu,
   advisor: Lightbulb,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,

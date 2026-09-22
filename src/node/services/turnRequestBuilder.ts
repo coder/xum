@@ -80,6 +80,9 @@ import {
 import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { listAvailableModels } from "@/common/utils/ai/selectableModels";
+import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -2458,6 +2461,23 @@ export class TurnRequestBuilder {
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
+      // models_list: same pipeline as the composer picker, read from live backend
+      // state on every call (the tool object outlives config edits). Models are
+      // resolved on the Xum host, so this is the source even for SSH workspaces.
+      listAvailableModels: () => {
+        const appConfig = this.dependencies.config.loadConfigOrDefault();
+        const policy = this.dependencies.policyService;
+        return listAvailableModels(
+          {
+            providersConfig: this.dependencies.providerService.getConfig(),
+            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
+            routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
+            routeOverrides: appConfig.routeOverrides ?? {},
+            effectivePolicy: policy?.isEnforced() ? policy.getEffectivePolicy() : null,
+          },
+          (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
+        );
+      },
       analyticsService: this.dependencies.bindings.analyticsService,
       desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
       // Agent memory (memory experiment): per-scope write policy derived from
