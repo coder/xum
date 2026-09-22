@@ -695,6 +695,42 @@ describe("useAutoScroll", () => {
     }
   });
 
+  test("Space on a transcript link still marks scroll intent", () => {
+    const { result } = renderHook(() => useAutoScroll());
+    const element = document.createElement("div");
+    const link = document.createElement("a");
+    link.href = "https://example.com";
+    element.append(link);
+    const metrics = attachScrollMetrics(element, {
+      scrollHeight: 1300,
+      clientHeight: 400,
+      initialScrollTop: 900,
+    });
+
+    const dateNowSpy = spyOn(Date, "now");
+    try {
+      let now = 1_000_000;
+      dateNowSpy.mockImplementation(() => now);
+
+      act(() => {
+        (result.current.contentRef as MutableRefObject<HTMLDivElement | null>).current = element;
+        // Links activate on Enter; Space scrolls the transcript like a page-down.
+        result.current.handleScrollContainerKeyDown({
+          target: link,
+          currentTarget: element,
+          key: " ",
+        } as unknown as KeyboardEvent<HTMLDivElement>);
+        now += 1;
+        metrics.setScrollTop(500);
+        result.current.handleScroll(createScrollEvent(element));
+      });
+
+      expect(result.current.autoScroll).toBe(false);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
   test("scroll keys inside editable transcript controls do not mark intent", () => {
     const { result } = renderHook(() => useAutoScroll());
     const element = document.createElement("div");

@@ -607,7 +607,8 @@ storybook-build: node_modules/.installed src/version.ts ## Build static Storyboo
 
 storybook-flake-check: node_modules/.installed src/version.ts ## Replay Pixel captures to find nondeterministic stories (STORYBOOK_FLAKE_ARGS='--files a.stories.tsx --runs 5')
 	$(check_node_version)
-	@test -f storybook-static/index.json || bun x storybook build
+	@# Always rebuild: a stale storybook-static/ would vouch for code that is no longer there.
+	@bun x storybook build
 	@# Node, not Bun: relaunching Playwright under Bun intermittently hangs.
 	@node scripts/storybook-flake-check.mjs $(STORYBOOK_FLAKE_ARGS)
 
