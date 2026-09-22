@@ -2,12 +2,15 @@ import { useEffect, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
 import { useAPI } from "@/browser/contexts/API";
+import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useRouting } from "@/browser/hooks/useRouting";
+import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import type { EvaluationModelCheck, ProvidersConfigMap } from "@/common/orpc/types";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isEvaluationEligibleModelString } from "@/common/utils/ai/evaluationModels";
-import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
+import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 
 /**
  * Settings card for `evaluationDefaults.model`, the model workflow `evaluate()`
@@ -19,7 +22,9 @@ import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
  * Two different gates (plan §L4 item 2):
  * - The offered lists are pre-filtered by static predicates the backend
  *   resolver also applies (eligible origin provider, no explicit gateway prefix,
- *   not shadowed by a custom provider, allowed by the enforced policy).
+ *   not shadowed by a custom provider, origin allowed by the enforced policy —
+ *   the resolver checks policy against the canonical origin, not the active
+ *   route, so a policy that only permits a gateway does not qualify a model).
  * - The hint for the SELECTED model comes from the backend's own resolver
  *   (`config.checkEvaluationModel`, network-free), so auth-mode, route and
  *   credential rules are never re-implemented here. Call-time admission of a
@@ -28,9 +33,13 @@ import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
  */
 export function EvaluationModelCard() {
   const { api } = useAPI();
-  const { models, hiddenModelsForSelector, isAllowedByPolicyOnActiveRoute } =
-    useModelsFromSettings();
+  const { models, hiddenModelsForSelector } = useModelsFromSettings();
   const { config: providersConfig } = useProvidersConfig();
+  const policyState = usePolicy();
+  const effectivePolicy =
+    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
+  // Only read for re-check triggers: route preferences change the verdict.
+  const { routePriority, routeOverrides } = useRouting();
   const [model, setModel] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -52,8 +61,8 @@ export function EvaluationModelCard() {
       });
   }, [api]);
 
-  // Re-check whenever the selection or the providers configuration changes
-  // (adding a key or changing routing can flip the verdict).
+  // Re-check whenever the selection or anything the resolver reads changes:
+  // providers config (keys, custom providers), route preferences and policy.
   useEffect(() => {
     if (!api || model.length === 0) return;
     let cancelled = false;
@@ -68,16 +77,22 @@ export function EvaluationModelCard() {
     return () => {
       cancelled = true;
     };
-  }, [api, model, providersConfig]);
+  }, [api, model, providersConfig, routePriority, routeOverrides, effectivePolicy]);
 
   // Persist first, publish second: the displayed default must never be ahead of
   // the config a workflow started right now would read, and a rejected write
   // keeps showing the value that is actually stored.
   const persist = async (next: string) => {
     const trimmed = next.trim();
+    // No API client (connecting, re-authenticating, error): nothing can be
+    // persisted, so nothing is published either.
+    if (!api) {
+      setSaveError("Not connected; the evaluation model was not saved.");
+      return;
+    }
     setSaveError(null);
     try {
-      await api?.config.updateEvaluationDefaults({ model: trimmed.length > 0 ? trimmed : null });
+      await api.config.updateEvaluationDefaults({ model: trimmed.length > 0 ? trimmed : null });
       setModel(trimmed);
     } catch (error: unknown) {
       setSaveError(getErrorMessage(error));
@@ -88,7 +103,7 @@ export function EvaluationModelCard() {
     isEvaluationEligibleModelString(modelString) &&
     getExplicitGatewayPrefix(modelString) === undefined &&
     !isShadowedByCustomProvider(modelString, providersConfig) &&
-    isAllowedByPolicyOnActiveRoute(modelString);
+    isModelAllowedByPolicy(effectivePolicy, normalizeToCanonical(modelString));
   // The same gate for the primary list and "Show all models…": a value written
   // by an older build or by hand may still be ineligible, which the hint covers.
   const eligibleModels = models.filter(canOffer);

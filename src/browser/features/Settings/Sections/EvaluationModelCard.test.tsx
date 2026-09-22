@@ -4,7 +4,9 @@ import * as RealAPIModule from "@/browser/contexts/API";
 import * as RealModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import * as RealModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
-import type { EvaluationModelCheck } from "@/common/orpc/types";
+import * as RealRoutingModule from "@/browser/hooks/useRouting";
+import * as RealPolicyModule from "@/browser/contexts/PolicyContext";
+import type { EffectivePolicy, EvaluationModelCheck } from "@/common/orpc/types";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
@@ -17,9 +19,14 @@ let apiMock: {
 } | null = null;
 // Backend verdict per model string; unknown models read as admissible.
 let checkResults: Record<string, EvaluationModelCheck | Promise<EvaluationModelCheck>> = {};
-// Policy predicate shared with the chat pickers; models not listed here are disallowed.
-let policyDisallowed: string[] = [];
+// Enforced policy (null = not enforced), as PolicyContext would expose it.
+let enforcedPolicy: EffectivePolicy | null = null;
 let providersConfigMock: Record<string, { isCustom?: boolean }> = {};
+let routingMock: { routePriority: string[]; routeOverrides: Record<string, string> } = {
+  routePriority: ["direct"],
+  routeOverrides: {},
+};
+let apiMockNull = false;
 
 // Capture the real exports BEFORE any mock.module call in this file: the spread
 // must see the real module, or the afterAll restore would reinstall the stub.
@@ -27,11 +34,22 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/API", { ...RealAPIModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...RealModelsModule }],
   ["@/browser/hooks/useProvidersConfig", { ...RealProvidersConfigModule }],
+  ["@/browser/hooks/useRouting", { ...RealRoutingModule }],
+  ["@/browser/contexts/PolicyContext", { ...RealPolicyModule }],
   ["@/browser/components/ModelSelector/ModelSelector", { ...RealModelSelectorModule }],
 ]);
 
 void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: apiMock }),
+  useAPI: () => ({ api: apiMockNull ? null : apiMock }),
+}));
+void mock.module("@/browser/hooks/useRouting", () => ({
+  useRouting: () => routingMock,
+}));
+void mock.module("@/browser/contexts/PolicyContext", () => ({
+  usePolicy: () =>
+    enforcedPolicy === null
+      ? { status: { state: "none" }, policy: null, source: "none", loading: false }
+      : { status: { state: "enforced" }, policy: enforcedPolicy, source: "file", loading: false },
 }));
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   useModelsFromSettings: () => ({
@@ -46,7 +64,6 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
       "xai:grok-4-1-fast",
       "google:gemini-2.5-pro",
     ],
-    isAllowedByPolicyOnActiveRoute: (model: string) => !policyDisallowed.includes(model),
   }),
 }));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
@@ -108,8 +125,10 @@ describe("EvaluationModelCard", () => {
   beforeEach(() => {
     restoreDom = installDom();
     checkResults = {};
-    policyDisallowed = [];
+    enforcedPolicy = null;
     providersConfigMock = {};
+    routingMock = { routePriority: ["direct"], routeOverrides: {} };
+    apiMockNull = false;
   });
 
   afterEach(() => {
@@ -119,8 +138,15 @@ describe("EvaluationModelCard", () => {
   });
 
   test("offers only evaluation-eligible models and persists a selection through the dedicated endpoint", async () => {
-    // A policy-disallowed model hides in "Show all models…": it must not be offered there either.
-    policyDisallowed = ["google:gemini-2.5-pro"];
+    // The enforced policy allows Anthropic, OpenAI's gpt-5 and one hidden Google
+    // model; the other hidden Google model must not be offered via "Show all models…".
+    enforcedPolicy = {
+      providerAccess: [
+        { id: "anthropic", allowedModels: null },
+        { id: "openai", allowedModels: ["gpt-5"] },
+        { id: "google", allowedModels: ["gemini-2.5-flash"] },
+      ],
+    } as unknown as EffectivePolicy;
     const { view, select, updateEvaluationDefaults, checkEvaluationModel } = renderCard();
     await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
 
@@ -142,6 +168,56 @@ describe("EvaluationModelCard", () => {
     );
     expect(view.getByRole("button", { name: "Clear evaluation model" })).toBeTruthy();
     expect(view.queryByRole("note")).toBeNull();
+  });
+
+  test("gates options on the origin provider's policy, not on a permitted gateway route", async () => {
+    // OpenRouter may be allowed and routing may prefer it, but evaluation runs on
+    // the origin's direct route and the resolver checks policy against `openai`.
+    enforcedPolicy = {
+      providerAccess: [
+        { id: "anthropic", allowedModels: null },
+        { id: "openrouter", allowedModels: null },
+      ],
+    } as unknown as EffectivePolicy;
+    routingMock = { routePriority: ["openrouter", "direct"], routeOverrides: {} };
+    const { select } = renderCard();
+    await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
+
+    const options = Array.from(select().options).map((option) => option.value);
+    expect(options).toEqual(["", "anthropic:claude-haiku-4-5"]);
+  });
+
+  test("re-checks the selected model when route preferences or policy change", async () => {
+    const { view, checkEvaluationModel } = renderCard("openai:gpt-5");
+    await waitFor(() => expect(checkEvaluationModel).toHaveBeenCalledTimes(1));
+
+    checkResults = {
+      "openai:gpt-5": {
+        ok: false,
+        reason: "unsupported-route",
+        routeKind: "gateway",
+        providerName: "openrouter",
+      },
+    };
+    routingMock = { routePriority: ["openrouter", "direct"], routeOverrides: {} };
+    view.rerender(<EvaluationModelCard />);
+
+    await waitFor(() => expect(checkEvaluationModel).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(view.getByRole("note").textContent).toContain("Would route via openrouter")
+    );
+  });
+
+  test("publishes nothing while no API client is available", async () => {
+    apiMockNull = true;
+    const { view, select } = renderCard();
+    // No API: the card cannot load either, so the selector shows "Not set".
+    expect(select().value).toBe("");
+
+    fireEvent.change(select(), { target: { value: "openai:gpt-5" } });
+
+    await waitFor(() => expect(view.getByText(/Not connected/)).toBeTruthy());
+    expect(select().value).toBe("");
   });
 
   test("drops models whose built-in id is shadowed by a custom provider", async () => {
