@@ -414,7 +414,6 @@ export function computeTaskGroupMemberRowMeta(params: {
       depth: memberDepth,
       rowKind: "subagent",
       connectorPosition,
-      connectorStartsAtParent: index === 0,
       sharedTrunkActiveThroughRow: lastRunningMemberIndex >= 0 && index <= lastRunningMemberIndex,
       sharedTrunkActiveBelowRow: lastRunningMemberIndex >= 0 && index < lastRunningMemberIndex,
       ancestorTrunks,

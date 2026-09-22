@@ -318,7 +318,6 @@ function renderIdleState(isUnread: boolean) {
 const SUB_AGENT_ROW_META_BASE = {
   depth: 1,
   rowKind: "subagent",
-  connectorStartsAtParent: true,
   sharedTrunkActiveThroughRow: false,
   sharedTrunkActiveBelowRow: false,
   ancestorTrunks: [],
@@ -329,10 +328,7 @@ const SUB_AGENT_ROW_META_BASE = {
 function createSubAgentRowRenderMeta(
   connectorPosition: AgentRowRenderMeta["connectorPosition"],
   overrides?: Partial<
-    Pick<
-      AgentRowRenderMeta,
-      "connectorStartsAtParent" | "sharedTrunkActiveThroughRow" | "sharedTrunkActiveBelowRow"
-    >
+    Pick<AgentRowRenderMeta, "sharedTrunkActiveThroughRow" | "sharedTrunkActiveBelowRow">
   >
 ): AgentRowRenderMeta {
   return {
@@ -346,9 +342,11 @@ const NESTED_CONNECTOR_PARENT_ROW_META = {
   depth: 0,
   rowKind: "primary",
   connectorPosition: "single",
-  connectorStartsAtParent: false,
   sharedTrunkActiveThroughRow: false,
   sharedTrunkActiveBelowRow: false,
+  // The parent owns the top of the shared child trunk, so the connector run
+  // starts at the parent row instead of the first child row.
+  childTrunkActive: true,
   ancestorTrunks: [],
   hasHiddenCompletedChildren: false,
   visibleCompletedChildrenCount: 0,
@@ -413,7 +411,6 @@ function renderAppSidebarThreeActiveSubAgents() {
         projectName={PROJECT_NAME}
         depth={1}
         rowRenderMeta={createSubAgentRowRenderMeta("middle", {
-          connectorStartsAtParent: true,
           sharedTrunkActiveThroughRow: true,
           sharedTrunkActiveBelowRow: true,
         })}
@@ -429,7 +426,6 @@ function renderAppSidebarThreeActiveSubAgents() {
         projectName={PROJECT_NAME}
         depth={1}
         rowRenderMeta={createSubAgentRowRenderMeta("middle", {
-          connectorStartsAtParent: false,
           sharedTrunkActiveThroughRow: true,
           sharedTrunkActiveBelowRow: true,
         })}
@@ -445,7 +441,6 @@ function renderAppSidebarThreeActiveSubAgents() {
         projectName={PROJECT_NAME}
         depth={1}
         rowRenderMeta={createSubAgentRowRenderMeta("last", {
-          connectorStartsAtParent: false,
           sharedTrunkActiveThroughRow: true,
           sharedTrunkActiveBelowRow: false,
         })}
@@ -551,7 +546,6 @@ const PRIMARY_ROW_META_WITH_HIDDEN_COMPLETED_CHILDREN = {
   depth: 0,
   rowKind: "primary",
   connectorPosition: "single",
-  connectorStartsAtParent: false,
   sharedTrunkActiveThroughRow: false,
   sharedTrunkActiveBelowRow: false,
   ancestorTrunks: [],
@@ -595,7 +589,6 @@ function renderSubAgentGallery() {
         <WorkspaceRow
           workspace={{ ...idle, taskStatus: "running" }}
           rowRenderMeta={createSubAgentRowRenderMeta("middle", {
-            connectorStartsAtParent: true,
             sharedTrunkActiveThroughRow: true,
             sharedTrunkActiveBelowRow: true,
           })}
@@ -684,6 +677,56 @@ export const AppSidebarThreeActiveSubAgents: Story = {
   args: undefined as never,
   name: "SubAgent States/App Sidebar Three Active Sub-Agents",
   render: renderAppSidebarThreeActiveSubAgents,
+};
+
+// Permanent regression story for connector-line continuity: a parent with
+// several running sub-agents must render one uninterrupted trunk from the
+// parent row's center down to the last child's elbow (parent-side child-trunk
+// stub + full-height middle trunks + curve-only last elbow). The middle child
+// carries status text so the story also covers trunk continuity across mixed
+// row heights. Connector animations are frozen
+// (storybook-static-subagent-connectors) so snapshots capture a deterministic
+// dash phase.
+function renderParentTrunkContinuity() {
+  updatePersistedState(getStatusStateKey("ws-sidebar-sub-2"), {
+    emoji: "🔧",
+    message: "Two-line row keeps the trunk continuous",
+  });
+  const runningSubAgentMeta = createSubAgentRowRenderMeta("middle", {
+    sharedTrunkActiveThroughRow: true,
+    sharedTrunkActiveBelowRow: true,
+  });
+  return (
+    <StoryScaffold
+      workspaces={APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES}
+      rowContainerClassName="storybook-static-subagent-connectors space-y-0"
+    >
+      <WorkspaceRow
+        workspace={APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[0]}
+        rowRenderMeta={NESTED_CONNECTOR_PARENT_ROW_META}
+      />
+      <WorkspaceRow
+        workspace={{ ...APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[1], taskStatus: "running" }}
+        rowRenderMeta={runningSubAgentMeta}
+      />
+      <WorkspaceRow
+        workspace={{ ...APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[2], taskStatus: "running" }}
+        rowRenderMeta={runningSubAgentMeta}
+      />
+      <WorkspaceRow
+        workspace={{ ...APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[3], taskStatus: "running" }}
+        rowRenderMeta={createSubAgentRowRenderMeta("last", {
+          sharedTrunkActiveThroughRow: true,
+        })}
+      />
+    </StoryScaffold>
+  );
+}
+
+export const ParentTrunkContinuity: Story = {
+  args: undefined as never,
+  name: "SubAgent States/Parent Trunk Continuity",
+  render: renderParentTrunkContinuity,
 };
 
 export const ClickKebabButton: Story = {

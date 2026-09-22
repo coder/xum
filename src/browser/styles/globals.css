@@ -2599,10 +2599,10 @@ html[data-renderer-inactive] *::after {
 /* Animated dashed connector for active sub-agents */
 @keyframes connector-dash-scroll {
   from {
-    transform: translateY(-6px);
+    background-position-y: 0;
   }
   to {
-    transform: translateY(0);
+    background-position-y: 6px;
   }
 }
 
@@ -2625,19 +2625,26 @@ html[data-renderer-inactive] *::after {
 .subagent-connector-active::before {
   content: "";
   position: absolute;
-  left: 0;
-  top: 0;
-  width: 100%;
-  /* Extra height of one dash cycle (6px) so translateY animation has no gaps */
-  height: calc(100% + 6px);
-  background: repeating-linear-gradient(
+  inset: 0;
+  /* The dash pattern is anchored to the viewport (background-attachment:
+     fixed) rather than to each segment's own box: a connector run is stitched
+     together from per-row segments whose heights vary, so box-anchored
+     gradients would restart the dash phase at every row seam. One shared
+     anchor keeps the pattern continuous across rows; the scroll animation
+     moves background-position (viewport-relative) instead of the box. */
+  background-image: repeating-linear-gradient(
     to bottom,
     var(--connector-color) 0px,
     var(--connector-color) 3px,
     transparent 3px,
     transparent 6px
   );
+  background-attachment: fixed;
   animation: connector-dash-scroll 0.4s linear infinite;
+  /* Segments start animating whenever their row mounts or turns active, so the
+     component supplies a page-clock-aligned negative delay
+     (see useConnectorDashSyncStyle) to keep every segment on one dash phase. */
+  animation-delay: var(--connector-dash-delay, 0s);
 }
 
 
@@ -2657,6 +2664,8 @@ html[data-renderer-inactive] *::after {
   stroke-linejoin: round;
   stroke-dasharray: 3 3;
   animation: connector-elbow-dash-scroll 0.4s linear infinite;
+  /* Same page-clock phase sync as the trunk dashes above. */
+  animation-delay: var(--connector-dash-delay, 0s);
 }
 
 @media (prefers-reduced-motion: reduce) {

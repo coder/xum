@@ -226,7 +226,6 @@ describe("computeTaskGroupMemberRowMeta", () => {
     depth: 1,
     rowKind: "subagent",
     connectorPosition: "middle",
-    connectorStartsAtParent: true,
     sharedTrunkActiveThroughRow: true,
     sharedTrunkActiveBelowRow: true,
     ancestorTrunks: [{ depth: 1, active: false }],
@@ -252,7 +251,6 @@ describe("computeTaskGroupMemberRowMeta", () => {
     const firstMeta = meta.get("first");
     const secondMeta = meta.get("second");
     expect(firstMeta?.connectorPosition).toBe("middle");
-    expect(firstMeta?.connectorStartsAtParent).toBe(true);
     // Trunk animates down to the lowest running member.
     expect(firstMeta?.sharedTrunkActiveThroughRow).toBe(true);
     expect(firstMeta?.sharedTrunkActiveBelowRow).toBe(true);

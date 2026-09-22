@@ -567,9 +567,16 @@ export interface AgentRowRenderMeta {
   // Sub-agent trunks should render as a single continuous line, so each row
   // receives explicit geometry/animation flags derived from its visible sibling
   // order and the lowest running child in that sibling group.
-  connectorStartsAtParent: boolean;
   sharedTrunkActiveThroughRow: boolean;
   sharedTrunkActiveBelowRow: boolean;
+  /**
+   * Present when this row has visible sub-agent children. The parent row then
+   * renders a trunk stub from its status-dot center down to its bottom edge, so
+   * the shared child trunk visibly starts at the parent instead of each child
+   * guessing the parent's center with negative offsets. The value carries the
+   * shared-trunk animation state (true while any visible child is running).
+   */
+  childTrunkActive?: boolean;
   // Nested sub-agents need ancestor continuation columns whenever an ancestor
   // branch has visible lower siblings, so connector rendering receives one trunk
   // descriptor per continuing ancestor depth.
@@ -692,7 +699,6 @@ export function computeAgentRowRenderMeta(
     const rowKind = effectiveParentId != null ? "subagent" : "primary";
 
     let connectorPosition: AgentRowRenderMeta["connectorPosition"] = "single";
-    let connectorStartsAtParent = false;
     let sharedTrunkActiveThroughRow = false;
     let sharedTrunkActiveBelowRow = false;
     let ancestorTrunks: AgentRowRenderMeta["ancestorTrunks"] = [];
@@ -705,8 +711,6 @@ export function computeAgentRowRenderMeta(
       }
 
       if (siblingIndex >= 0) {
-        connectorStartsAtParent = siblingIndex === 0;
-
         let lastRunningSiblingIndex = -1;
         for (let index = siblings.length - 1; index >= 0; index -= 1) {
           const sibling = siblings[index];
@@ -753,14 +757,24 @@ export function computeAgentRowRenderMeta(
       effectiveParentId != null
         ? (metadataByWorkspaceId.get(effectiveParentId)?.depth ?? 0) + 1
         : 0;
+    const visibleChildren = visibleChildrenByParent.get(workspace.id);
     metadataByWorkspaceId.set(workspace.id, {
       depth: effectiveDepth,
       ...(effectiveParentId != null ? { visibleParentWorkspaceId: effectiveParentId } : {}),
       rowKind,
       connectorPosition,
-      connectorStartsAtParent,
       sharedTrunkActiveThroughRow,
       sharedTrunkActiveBelowRow,
+      // Rows with visible children own the top of the shared child trunk; it
+      // animates while any visible child is running so the run reads from the
+      // parent down to the lowest running child.
+      ...(visibleChildren != null && visibleChildren.length > 0
+        ? {
+            childTrunkActive: visibleChildren.some((child) =>
+              isSidebarSubAgentRunning(child, options)
+            ),
+          }
+        : {}),
       ancestorTrunks,
       // Inactive sub-agents are intentionally absent from the sidebar; the transcript decoration
       // is the canonical place to inspect and manage the persistent hierarchy.
@@ -808,10 +822,21 @@ export function computeRowMetaForVisibleNodes(
     childrenByParentId.set(node.parentId, siblings);
   }
 
+  // Recomputed for the final visible node set: base meta may carry a stale
+  // childTrunkActive from a pass where different children were visible.
+  const getChildTrunkMeta = (nodeId: string): { childTrunkActive?: boolean } => {
+    const children = childrenByParentId.get(nodeId);
+    if (children == null || children.length === 0) {
+      return {};
+    }
+    return { childTrunkActive: children.some((child) => child.isRunning) };
+  };
+
   const metaById = new Map<string, AgentRowRenderMeta>();
   for (const node of nodes) {
     if (node.parentId == null) {
-      metaById.set(node.id, { ...node.baseMeta, ancestorTrunks: [] });
+      const { childTrunkActive: _staleChildTrunkActive, ...baseMeta } = node.baseMeta;
+      metaById.set(node.id, { ...baseMeta, ancestorTrunks: [], ...getChildTrunkMeta(node.id) });
       continue;
     }
 
@@ -830,7 +855,6 @@ export function computeRowMetaForVisibleNodes(
       }
     }
 
-    const connectorStartsAtParent = siblingIndex === 0;
     const sharedTrunkActiveThroughRow =
       siblingIndex >= 0 && lastRunningSiblingIndex >= 0 && siblingIndex <= lastRunningSiblingIndex;
     const sharedTrunkActiveBelowRow =
@@ -859,13 +883,14 @@ export function computeRowMetaForVisibleNodes(
     }
     ancestorTrunks.sort((left, right) => left.depth - right.depth);
 
+    const { childTrunkActive: _staleChildTrunkActive, ...baseMeta } = node.baseMeta;
     metaById.set(node.id, {
-      ...node.baseMeta,
+      ...baseMeta,
       depth: node.depth,
       connectorPosition,
-      connectorStartsAtParent,
       sharedTrunkActiveThroughRow,
       sharedTrunkActiveBelowRow,
+      ...getChildTrunkMeta(node.id),
       ancestorTrunks,
     });
   }
