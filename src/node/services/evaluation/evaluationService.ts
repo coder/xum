@@ -200,6 +200,25 @@ function projectRounding(raw: unknown): EvaluationRounding | null | undefined {
   return rounding;
 }
 
+/**
+ * Upper bound for the provider-reported model id kept in results. It is
+ * untrusted display metadata (rendered React-escaped, never model-facing), so
+ * the only hazard is unbounded growth of persisted records; real ids are short.
+ */
+const MAX_RESPONSE_MODEL_ID_LENGTH = 200;
+
+/**
+ * Bound the provider-reported response model id. A missing, empty or
+ * non-string value falls back to the id we asked for, and an oversized one is
+ * truncated: display metadata must never fail an already-billed evaluation.
+ */
+function projectResponseModelId(reported: unknown, requested: string): string {
+  const candidate = typeof reported === "string" && reported.length > 0 ? reported : requested;
+  return candidate.length > MAX_RESPONSE_MODEL_ID_LENGTH
+    ? candidate.slice(0, MAX_RESPONSE_MODEL_ID_LENGTH)
+    : candidate;
+}
+
 export function makeEvaluationService(): EvaluationService {
   return {
     evaluate: <const Q extends EvaluationQuestions>(call: EvaluationCall<Q>) =>
@@ -251,7 +270,7 @@ export function makeEvaluationService(): EvaluationService {
             totalTokens: projectTokenCount(result.usage.totalTokens),
           },
           usageProviderMetadata: projectUsageProviderMetadata(result.providerMetadata),
-          responseModelId: result.response.modelId,
+          responseModelId: projectResponseModelId(result.response.modelId, call.model.modelId),
           warningsCount: result.warnings.length,
         } satisfies EvaluationCallResult<Q>;
       }),

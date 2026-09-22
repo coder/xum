@@ -178,6 +178,27 @@ describe("EvaluationService.evaluate", () => {
     expect(JSON.stringify(result)).not.toContain("NaN");
   });
 
+  it("bounds the provider-reported response model id", async () => {
+    const { model: oversized } = mockModel(() =>
+      Promise.resolve({
+        answers: VALID_ANSWERS,
+        warnings: [],
+        response: { modelId: `judge-${"x".repeat(5_000)}${SENTINEL}` },
+      })
+    );
+    const truncated = await Effect.runPromise(service.evaluate(call(oversized, QUESTIONS)));
+    expect(truncated.responseModelId.length).toBe(200);
+    expect(truncated.responseModelId.startsWith("judge-x")).toBe(true);
+    expect(JSON.stringify(truncated)).not.toContain(SENTINEL);
+
+    // Missing / empty ids fall back to the requested model id.
+    const { model: empty } = mockModel(() =>
+      Promise.resolve({ answers: VALID_ANSWERS, warnings: [], response: { modelId: "" } })
+    );
+    const fallback = await Effect.runPromise(service.evaluate(call(empty, QUESTIONS)));
+    expect(fallback.responseModelId).toBe("mock-judge");
+  });
+
   it("maps missing usage to nulls and absent provider metadata to null", async () => {
     const { model } = mockModel(() => Promise.resolve({ answers: VALID_ANSWERS, warnings: [] }));
     const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
