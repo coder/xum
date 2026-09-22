@@ -92,6 +92,7 @@ import {
   DevTools,
   Editor,
   Experiments,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   Heartbeat,
@@ -199,6 +200,7 @@ export class ServiceContainer {
   public readonly mcpConfigService: CoreServices["mcpConfigService"];
   public readonly mcpServerManager: CoreServices["mcpServerManager"];
   public readonly sessionUsageService: CoreServices["sessionUsageService"];
+  public readonly evaluationService: CoreServices["evaluationService"];
   public readonly workspaceGoalService: CoreServices["workspaceGoalService"];
   public readonly memoryService: CoreServices["memoryService"];
   public readonly memoryMetaService: CoreServices["memoryMetaService"];
@@ -292,6 +294,7 @@ export class ServiceContainer {
     this.mcpConfigService = get(MCPConfig);
     this.mcpServerManager = get(MCPServerManagerTag);
     this.sessionUsageService = get(SessionUsage);
+    this.evaluationService = get(Evaluation);
     this.workspaceGoalService = get(WorkspaceGoal);
     this.memoryService = get(Memory);
     this.memoryMetaService = get(MemoryMeta);
@@ -601,6 +604,7 @@ export class ServiceContainer {
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
       sessionUsageService: this.sessionUsageService,
+      evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
       memoryService: this.memoryService,
       memoryMetaService: this.memoryMetaService,

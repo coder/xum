@@ -295,8 +295,16 @@ export const EvaluationStepFailureCodeSchema = z.enum([
   "admission-mismatch",
   "admission-missing",
   "attempts-exhausted",
-  // `invalid-input`: neither the call, the CLI, nor Settings named a model.
+  // `invalid-input`: neither the call, the CLI, nor Settings named a model, or
+  // the state/spec failed the bounded request checks.
   "no-model",
+  "request-too-large",
+  "request-too-deep",
+  "forbidden-key",
+  "invalid-spec",
+  "invalid-state",
+  // `unsupported`: this runtime was built without an evaluation adapter.
+  "runtime-unavailable",
   // `unsupported`: `createEvaluationModel` rejections.
   "unsupported-provider",
   "unsupported-route",

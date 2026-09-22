@@ -25,6 +25,7 @@ import {
   type WorkflowStepRecord,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import type { EvaluationAdmission } from "@/common/types/evaluation";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -574,6 +575,8 @@ export class WorkflowRunStore {
       inputHash: string;
       taskId?: string;
       startedAt: string;
+      /** `evaluate()` steps: the admission, written atomically with the started record. */
+      evaluation?: EvaluationAdmission;
     },
     options: AppendWorkflowRunEventOptions = {}
   ): Promise<void> {
@@ -585,6 +588,7 @@ export class WorkflowRunStore {
         taskId: input.taskId,
         startedAt: input.startedAt,
         status: "started",
+        ...(input.evaluation !== undefined ? { evaluation: input.evaluation } : {}),
       },
       options
     );
@@ -599,6 +603,8 @@ export class WorkflowRunStore {
       result: StructuredTaskOutput;
       startedAt: string;
       completedAt: string;
+      /** `evaluate()` steps re-carry the admission: the merge is latest-wins per record. */
+      evaluation?: EvaluationAdmission;
     },
     options: AppendWorkflowRunEventOptions = {}
   ): Promise<void> {
@@ -612,6 +618,7 @@ export class WorkflowRunStore {
         startedAt: input.startedAt,
         completedAt: input.completedAt,
         status: "completed",
+        ...(input.evaluation !== undefined ? { evaluation: input.evaluation } : {}),
       },
       options
     );
@@ -940,6 +947,8 @@ export class WorkflowRunStore {
       error: string;
       startedAt: string;
       completedAt: string;
+      /** `evaluate()` steps re-carry the admission so a later retry can validate against it. */
+      evaluation?: EvaluationAdmission;
     },
     options: AppendWorkflowRunEventOptions = {}
   ): Promise<void> {
@@ -953,6 +962,7 @@ export class WorkflowRunStore {
         startedAt: input.startedAt,
         completedAt: input.completedAt,
         status: "failed",
+        ...(input.evaluation !== undefined ? { evaluation: input.evaluation } : {}),
       },
       options
     );

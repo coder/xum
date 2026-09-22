@@ -35,6 +35,12 @@ async function trustProject(muxRoot: string, repo: string): Promise<void> {
     .quiet();
 }
 
+async function seedEvaluationDefault(muxRoot: string, model: string): Promise<void> {
+  await Bun.$`${BUN_EXECUTABLE} -e ${`import { Config } from "./src/node/config"; const c = new Config(); await c.editConfig((cfg) => ({ ...cfg, evaluationDefaults: { model: process.argv[1] } }));`} ${model}`
+    .env({ ...process.env, MUX_ROOT: muxRoot })
+    .quiet();
+}
+
 describe("xum workflow CLI helpers", () => {
   test("rejects ambiguous structured args modes", async () => {
     expect(
@@ -212,6 +218,74 @@ describe("xum workflow CLI helpers", () => {
       "xum workflow currently supports only local runtime"
     );
   });
+
+  // Each model source resolves to a distinct, key-independent failure code, so the
+  // reported code identifies which source won: nothing → no-model; an unknown
+  // provider → unsupported-provider; an explicit gateway prefix → unsupported-route.
+  test("CLI --evaluation-model sits between the per-call model and the Settings default", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-evaluation-model");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "probe.js"),
+      `export default function workflow({ args, evaluate }) {
+  try {
+    evaluate("probe", {
+      id: "probe",
+      questions: { ok: { type: "boolean", instructions: "Is it ok?" } },
+      ...(args.model ? { model: args.model } : {}),
+    });
+    return { reportMarkdown: "unexpected success" };
+  } catch (error) {
+    return { reportMarkdown: error.message };
+  }
+}
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+    const probe = async (...extra: string[]) => {
+      const result =
+        await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --quiet ${extra}`
+          .env({ ...process.env, MUX_ROOT: muxRoot })
+          .nothrow()
+          .quiet();
+      return { exitCode: result.exitCode, stdout: result.stdout.toString().trim() };
+    };
+
+    const unconfigured = await probe();
+    expect(unconfigured.exitCode).toBe(0);
+    expect(unconfigured.stdout).toContain("evaluation failed: invalid-input/no-model");
+
+    // The Settings default must come from the real config, not the ephemeral run copy.
+    await seedEvaluationDefault(muxRoot, "nope:settings-model");
+    expect((await probe()).stdout).toContain("evaluation failed: unsupported/unsupported-provider");
+
+    expect((await probe("--evaluation-model", "mux-gateway:openai:gpt-5")).stdout).toContain(
+      "evaluation failed: unsupported/unsupported-route"
+    );
+
+    expect(
+      (
+        await probe(
+          "--evaluation-model",
+          "mux-gateway:openai:gpt-5",
+          "--args-json",
+          '{"model":"nope:per-call"}'
+        )
+      ).stdout
+    ).toContain("evaluation failed: unsupported/unsupported-provider");
+
+    const blank =
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --evaluation-model ${" "}`
+        .env({ ...process.env, MUX_ROOT: muxRoot })
+        .nothrow()
+        .quiet();
+    expect(blank.exitCode).not.toBe(0);
+    expect(blank.stderr.toString()).toContain("Invalid --evaluation-model");
+  }, 60_000);
 
   test("CLI runs a trusted explicit workflow script with structured args", async () => {
     using tmp = new DisposableTempDir("workflow-cli-e2e");

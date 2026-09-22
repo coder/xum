@@ -31,6 +31,11 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
  * in-progress events may never materialize in the final outcome — so drop the record from
  * model-bound copies (persisted-history requests and internal stream steps alike) while the
  * persisted output keeps rendering the card.
+ *
+ * Audit (workflow `evaluate()`): this strip is also what keeps evaluate step records (their
+ * admissions and cached results) and `evaluation` progress events out of any agent prompt.
+ * `run.args` never enter model text except as the invoking tool call's own `input.args`, and
+ * an evaluate result reaches the parent chat only when the script returns it as its result.
  */
 export function isTerminalWorkflowRunToolOutput(
   toolName: string,

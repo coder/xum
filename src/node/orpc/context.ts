@@ -42,6 +42,7 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { InstructionsService } from "@/node/services/instructionsService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TaskService } from "@/node/services/taskService";
@@ -109,6 +110,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   memoryConsolidationService: MemoryConsolidationService;
   refineService: RefineService;
   sessionUsageService: SessionUsageService;
+  evaluationService: EvaluationService;
   instructionsService: InstructionsService;
   workspaceGoalService: WorkspaceGoalService;
   devToolsService: DevToolsService;
