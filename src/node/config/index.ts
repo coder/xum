@@ -4118,6 +4118,10 @@ export class Config {
           taskAttemptId: existing.taskAttemptId,
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
+          // The checkout preparation proof is server-owned too: written once by the producer
+          // that forked and sanitized the checkout, never rebound. A metadata round trip must
+          // neither strip it (the row would read `legacy` and refuse) nor replace it.
+          taskCheckoutPreparation: existing.taskCheckoutPreparation,
         };
       } else {
         // Add new workspace
