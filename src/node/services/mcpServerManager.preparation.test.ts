@@ -205,6 +205,60 @@ describe("MCPServerManager checkout-preparation gate", () => {
     await expect(manager.getPrompt(sharedId, "echo", "review", {})).rejects.toThrow();
   });
 
+  test("a proof change landing after the launch fence's final epoch read (under the writer's lock) refuses the spawn: no process starts", async () => {
+    // Real start chain (no startSingleServer mock): serve → startServers (semaphore) →
+    // startStdioInstance → launchUnderOverrideFence (writer's lock → fenced epoch read → plugin
+    // admission → exec). The cooperating writer edits the registry INSIDE that fenced epoch read,
+    // i.e. after every earlier preparation check ran; the launch boundary must still refuse.
+    const execs: string[] = [];
+    const runtime = {
+      exec: mock((command: string) => {
+        execs.push(command);
+        return Promise.reject(new Error("a repository-configured command must not execute"));
+      }),
+    } as unknown as Runtime;
+    let writerLockHeld = false;
+    const readOverridesEpoch = mock(async () => {
+      if (writerLockHeld) await archiveRoot();
+      return "epoch-1";
+    });
+    const acquireOverridesLock = mock(() => {
+      writerLockHeld = true;
+      return Promise.resolve(() => {
+        writerLockHeld = false;
+        return Promise.resolve();
+      });
+    });
+    const configService = {
+      listServers: mock(() =>
+        Promise.resolve({ echo: { transport: "stdio" as const, command: "echo", disabled: false } })
+      ),
+      acquireGlobalPluginEnablementFence: () => Promise.resolve(() => Promise.resolve()),
+      configGeneration: 0,
+    };
+    const fenced = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("token-1"),
+        readWorkspaceOverrides: readOverrides,
+        readOverridesEpoch,
+        acquireOverridesLock,
+        isPreparationAuthorizationCurrent: isCurrent,
+      },
+    });
+    try {
+      const result = await fenced.getToolsForWorkspace(request({ runtime }));
+      // The writer's lock was taken and the fenced epoch read ran (the edit landed there)…
+      expect(acquireOverridesLock).toHaveBeenCalled();
+      expect(writerLockHeld).toBe(false);
+      // …and nothing was spawned: the launch boundary re-derived the authority and refused.
+      expect(execs).toEqual([]);
+      expect(result.tools).toEqual({});
+    } finally {
+      fenced.dispose();
+    }
+  });
+
   test("a root workspace serves under its exemption, captured or re-proven fresh", async () => {
     const captured = await manager.getToolsForWorkspace(
       request({ workspaceId: rootId, preparation: rootAuthorization })
