@@ -1,6 +1,15 @@
+// Real Radix exports must initialize after the DOM, even when this suite runs first.
+import { installDom } from "../../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import * as ActualAPIModule from "@/browser/contexts/API";
+import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualModelsModule from "@/browser/hooks/useModelsFromSettings";
+import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
+import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import * as ActualMinThinkingLevelsModule from "@/browser/hooks/useMinThinkingLevels";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
@@ -13,7 +22,6 @@ import {
   type ThinkingLevel,
   type OpenAIReasoningMode,
 } from "@/common/types/thinking";
-import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
 interface MockConfig {
@@ -41,9 +49,18 @@ interface MockAPIClient {
   };
 }
 
-// Capture before installing module mocks; mock.restore() does not undo them.
-const actualMinThinkingLevelsModule = { ...ActualMinThinkingLevelsModule };
-const actualRoutingModule = { ...ActualRoutingModule };
+// Capture every dependency before mocking: later settings tests mount the real provider stack.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...ActualAPIModule }],
+  ["@/browser/contexts/ExperimentsContext", { ...ActualExperimentsModule }],
+  ["@/browser/hooks/useModelsFromSettings", { ...ActualModelsModule }],
+  ["@/browser/components/ModelSelector/ModelSelector", { ...ActualModelSelectorModule }],
+  ["@/browser/hooks/useTelemetry", { ...ActualTelemetryModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
+  ["@/browser/hooks/useMinThinkingLevels", { ...ActualMinThinkingLevelsModule }],
+  ["@/browser/hooks/useRouting", { ...ActualRoutingModule }],
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...ActualSelectPrimitiveModule }],
+]);
 
 let mockApi: MockAPIClient;
 let providersConfig: ProvidersConfigMap | null = null;
@@ -167,11 +184,6 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
 describe("ExperimentsSection advisor config", () => {
   let cleanupDom: (() => void) | null = null;
 
-  afterAll(async () => {
-    await mock.module("@/browser/hooks/useMinThinkingLevels", () => actualMinThinkingLevelsModule);
-    await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
-  });
-
   beforeEach(() => {
     cleanupDom = installDom();
     window.api = { platform: "linux", versions: {} };
@@ -183,10 +195,6 @@ describe("ExperimentsSection advisor config", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    void mock.module(
-      "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
-    );
     cleanupDom?.();
     cleanupDom = null;
   });
