@@ -2898,6 +2898,11 @@ export class TaskService implements AgentTaskIntegration {
       }
       return { kind: "not-a-task" };
     }
+    // A send decided for a specific attempt whose row is gone (unpublished, removed) is stale,
+    // never an ordinary send into a workspace that is not a task.
+    if (entry == null && options.expectedAttemptId != null) {
+      return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
+    }
     if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
     // The claim is monotonic and stronger than the id: a retired task refuses even when its id
     // is missing or malformed (fail closed on partial state), so check it before the id.
@@ -5537,12 +5542,6 @@ export class TaskService implements AgentTaskIntegration {
        * working tree. Session/config cleanup still runs.
        */
       preservePhysicalWorkspace?: boolean;
-      /**
-       * The launch failed because this checkout's stale plugin overrides could not be sanitized.
-       * Nothing re-sanitizes a retained checkout before a later resume sends into it, so it is
-       * reclaimed even while its row is published (see the retention rule below).
-       */
-      reclaimUnsanitizedCheckout?: boolean;
     }
   ): Promise<void> {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
@@ -5560,8 +5559,9 @@ export class TaskService implements AgentTaskIntegration {
     // destructive awaits below run, so deleting would destroy the successor's artifacts. Nothing
     // in-process can serialize with that writer, so a failed launch retains them instead — the
     // row is marked interrupted (launch error recorded) and stays inspectable and resumable;
-    // removing the task deletes them through the ordinary workspace removal.
-    if (row != null && options?.reclaimUnsanitizedCheckout !== true) {
+    // removing the task deletes them through the ordinary workspace removal. (An unsanitized
+    // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
+    if (row != null) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
         taskId,
       });
@@ -5596,6 +5596,64 @@ export class TaskService implements AgentTaskIntegration {
         error: getErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * Reclaim a launch's checkout whose stale plugin overrides could not be sanitized. Nothing
+   * re-sanitizes a retained checkout before a later resume sends into it, so it must go — but
+   * only once no backend can re-admit its row: the row is unpublished first, in one config edit
+   * (edits run on fresh bytes under the cross-process registration lock), and only while it still
+   * names `expectedAttemptId`, the attempt this process owns and launched. editConfig swallows a
+   * failed write, so the removal must also be confirmed from the persisted bytes. The checkout
+   * and session dir are named after the task id, so no other task can reuse them once the row is
+   * gone. Anything short of a confirmed unpublication — no or another owner, a moved row, a lost
+   * or unverifiable write — retains everything; the failure is then recorded on the row.
+   */
+  private async reclaimUnsanitizedTaskCheckout(
+    runtime: Runtime,
+    projectPath: string,
+    workspaceName: string,
+    taskId: string,
+    expectedAttemptId: string | undefined
+  ): Promise<void> {
+    let unpublished = false;
+    if (
+      expectedAttemptId != null &&
+      this.ownedAttemptByTaskId.get(taskId)?.attemptId === expectedAttemptId
+    ) {
+      try {
+        await this.config.editConfig((config) => {
+          for (const project of config.projects.values()) {
+            const index = project.workspaces.findIndex((ws) => ws.id === taskId);
+            if (index === -1) continue;
+            if (project.workspaces[index]?.taskAttemptId === expectedAttemptId) {
+              project.workspaces.splice(index, 1);
+              unpublished = true;
+            }
+            break;
+          }
+          return config;
+        });
+        unpublished &&=
+          findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId) ==
+          null;
+      } catch (error: unknown) {
+        log.warn("Task launch: could not unpublish the unsanitized task row", {
+          taskId,
+          error: getErrorMessage(error),
+        });
+        unpublished = false;
+      }
+    }
+    if (!unpublished) {
+      log.warn("Task launch: unsanitized checkout retained (its row is still published)", {
+        taskId,
+      });
+      return;
+    }
+    await this.rollbackFailedTaskCreate(runtime, projectPath, workspaceName, taskId, {
+      rowUnpublished: true,
+    });
   }
 
   private async getExistingMaterializedTaskLaunch(
@@ -6034,12 +6092,12 @@ export class TaskService implements AgentTaskIntegration {
         // launch: the throw reaches scheduleReservedTaskLaunch, which only
         // marks the task interrupted — without this cleanup the physical
         // checkout would accumulate and collide with later same-name forks.
-        await this.cleanupMaterializedTaskWorkspace(
+        await this.reclaimUnsanitizedTaskCheckout(
           runtimeForTaskWorkspace,
           plan.parentMeta.projectPath,
           plan.workspaceName,
           plan.taskId,
-          { preservePhysicalWorkspace: false, reclaimUnsanitizedCheckout: true }
+          plan.attemptId
         );
         throw new Error(sanitizeError);
       }
@@ -9178,12 +9236,16 @@ export class TaskService implements AgentTaskIntegration {
        * working tree. Session/config cleanup still runs.
        */
       preservePhysicalWorkspace?: boolean;
+      /** The caller already removed the row (and confirmed it): see reclaimUnsanitizedTaskCheckout. */
+      rowUnpublished?: boolean;
     }
   ): Promise<void> {
-    let removedFromConfig = false;
+    let removedFromConfig = options?.rowUnpublished === true;
     try {
-      await this.config.removeWorkspace(taskId);
-      removedFromConfig = true;
+      if (!removedFromConfig) {
+        await this.config.removeWorkspace(taskId);
+        removedFromConfig = true;
+      }
     } catch (error: unknown) {
       log.error("Task.create rollback: failed to remove workspace from config", {
         taskId,

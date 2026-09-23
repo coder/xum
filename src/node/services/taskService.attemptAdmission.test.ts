@@ -1124,10 +1124,15 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
     );
 
-    test.each(["send failed", "sanitize failed"] as const)(
-      "a reserved launch whose %s after its row was published: the checkout and session dir are retained unless the checkout is unsanitized",
+    test.each(["send failed", "sanitize failed", "sanitize failed, unpublish write lost"] as const)(
+      "a reserved launch whose %s after its row was published: artifacts are deleted only once the row is verifiably unpublished",
       async (failure) => {
-        const taskId = failure === "send failed" ? "publishedkeep1" : "publishedkeep2";
+        const sanitizeFails = failure !== "send failed";
+        const taskId = {
+          "send failed": "publishedkeep1",
+          "sanitize failed": "publishedkeep2",
+          "sanitize failed, unpublish write lost": "publishedkeep3",
+        }[failure];
         const foreign = "att_00000000000000a8";
         const { config, projectPath } = await setupTree([]);
         stubStableIds(config, [taskId]);
@@ -1141,11 +1146,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
         await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
         await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
-        // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) re-reserves the published row while this
-        // launch's cleanup is inside the destructive call, AFTER its ownership check passed: the
-        // session dir removed next would be the successor's.
-        let superseded = false;
+        // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) tries to re-reserve the row while this
+        // launch's cleanup is inside the destructive call: its CAS succeeds only if the row is
+        // still published, and the session dir removed next would then be the successor's.
+        let rowPublishedAtDelete: boolean | undefined;
         const deleteWorkspace = mock(async () => {
+          rowPublishedAtDelete = entryOf(config, taskId) != null;
           await config.editConfig((cfg) => {
             for (const project of cfg.projects.values()) {
               const ws = project.workspaces.find((w) => w.id === taskId);
@@ -1153,7 +1159,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             }
             return cfg;
           });
-          superseded = true;
           return Ok(undefined);
         });
         spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
@@ -1168,9 +1173,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             inheritedProjects: undefined,
           })
         );
-        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
-          Promise.resolve(failure === "sanitize failed" ? "sanitize failed" : undefined)
-        );
+        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
+          if (failure === "sanitize failed, unpublish write lost") {
+            // The next config save (the unpublication) is swallowed, as saveConfigEffect does
+            // with a failed write: editConfig resolves, the bytes on disk still hold the row.
+            spyOn(config, "saveConfig").mockImplementationOnce(() => Promise.resolve());
+          }
+          return Promise.resolve(sanitizeFails ? "sanitize failed" : undefined);
+        });
 
         const created = await taskService.createMany([
           {
@@ -1184,28 +1194,43 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(created.success).toBe(true);
         const reserved = svc.ownedAttemptByTaskId.get(taskId)!.attemptId!;
         const deadline = Date.now() + 2_000;
-        while (!superseded && entryOf(config, taskId)?.taskStatus !== "interrupted") {
+        while (
+          entryOf(config, taskId) != null &&
+          entryOf(config, taskId)?.taskStatus !== "interrupted"
+        ) {
           if (Date.now() > deadline) throw new Error("the launch never failed");
           await settle();
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
         if (failure === "sanitize failed") {
-          // The one reclaim that stays: a checkout whose stale plugin enables could not be pruned
-          // must not survive under a resumable row (nothing re-sanitizes it before a later send).
+          // The reclaim of a checkout whose stale plugin enables could not be pruned: the row is
+          // unpublished first (nothing re-sanitizes a retained checkout before a later send), so
+          // no backend can re-admit it while its checkout and session dir are deleted.
           expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
           expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+          expect(rowPublishedAtDelete).toBe(false);
+          expect(entryOf(config, taskId)).toBeUndefined();
+          // A sender that captured the old row's attempt is refused, not passed as a non-task.
+          expect(
+            taskService.admitTaskWorkspaceTurn(taskId, {
+              acceptanceOrigin: "automatic",
+              expectedAttemptId: reserved,
+            }).kind
+          ).toBe("refused");
           return;
         }
-        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(1);
-        // A published reservation's artifacts are never deleted by the failed launch: nothing
-        // destructive runs, so no successor can be admitted in the middle of it.
+        // Retained: nothing destructive ran, so no successor can be admitted in the middle of it
+        // (a failed send, or an unpublication the persisted bytes do not confirm).
         expect(deleteWorkspace).not.toHaveBeenCalled();
         expect(await fsPromises.readFile(sessionMarker, "utf-8")).toBe("keep");
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(
+          sanitizeFails ? 0 : 1
+        );
         // The failure is still recorded on this launch's own (still owned) attempt.
         expect(entryOf(config, taskId)).toMatchObject({
           taskAttemptId: reserved,
           taskStatus: "interrupted",
-          taskLaunchError: "provider exploded before streaming",
+          taskLaunchError: sanitizeFails ? "sanitize failed" : "provider exploded before streaming",
         });
       }
     );
