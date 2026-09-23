@@ -65,7 +65,7 @@ afterEach(async () => {
   Object.assign(process.env, savedEnv);
 });
 
-it("lists text foundations and both active profile types verbatim without writes", async () => {
+it("lists on-demand text foundations and text-backed active profiles without writes", async () => {
   save({ ...pair, models: ["manual"], sessionToken: "session" });
   await config.editConfig((current) => ({ ...current, routePriority: ["coder", "direct"] }));
   const paths = [service.providersConfigStore.providersFile, join(root, "config.json")];
@@ -73,17 +73,48 @@ it("lists text foundations and both active profile types verbatim without writes
   respond = () =>
     Response.json(
       requests.length === 1
-        ? { modelSummaries: [{ modelId: "foundation" }, { modelId: "foundation" }] }
+        ? {
+            modelSummaries: [
+              { modelId: "foundation", inferenceTypesSupported: ["ON_DEMAND"] },
+              { modelId: "foundation" },
+              // Direct invocation is rejected; only its profiles are usable.
+              { modelId: "profile-only", inferenceTypesSupported: ["INFERENCE_PROFILE"] },
+            ],
+          }
         : {
             inferenceProfileSummaries: [
               {
                 inferenceProfileId: "us.system:0",
                 type: "SYSTEM_DEFINED",
                 status: "ACTIVE",
+                models: [
+                  { modelArn: "arn:aws:bedrock:us-east-1::foundation-model/profile-only" },
+                  { modelArn: "arn:aws:bedrock:us-west-2::foundation-model/profile-only" },
+                ],
+              },
+              {
+                inferenceProfileId: "application-id",
+                type: "APPLICATION",
+                status: "ACTIVE",
+                models: [{ modelArn: "arn:aws:bedrock:us-east-1::foundation-model/foundation" }],
+              },
+              // Not backed by a listed text foundation (embedding, unknown, or malformed).
+              {
+                inferenceProfileId: "embedding-profile",
+                status: "ACTIVE",
+                models: [{ modelArn: "arn:aws:bedrock:us-east-1::foundation-model/titan-embed" }],
+              },
+              { inferenceProfileId: "no-models", status: "ACTIVE" },
+              {
+                inferenceProfileId: "malformed",
+                status: "ACTIVE",
                 models: [{ modelArn: "wrong" }],
               },
-              { inferenceProfileId: "application-id", type: "APPLICATION", status: "ACTIVE" },
-              { inferenceProfileId: "inactive", status: "INACTIVE" },
+              {
+                inferenceProfileId: "inactive",
+                status: "INACTIVE",
+                models: [{ modelArn: "arn:aws:bedrock:us-east-1::foundation-model/foundation" }],
+              },
             ],
             ...(requests.length === 2 && { nextToken: "a +/=!*" }),
           }

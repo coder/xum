@@ -103,11 +103,25 @@ const Id = z
   .string()
   .min(1)
   .refine((id) => id.trim() === id);
-const Foundations = z.object({ modelSummaries: z.array(z.object({ modelId: Id })).default([]) });
+const Foundations = z.object({
+  modelSummaries: z
+    .array(z.object({ modelId: Id, inferenceTypesSupported: z.array(z.string()).optional() }))
+    .default([]),
+});
 const Profiles = z.object({
-  inferenceProfileSummaries: z.array(z.object({ inferenceProfileId: Id, status: Id })).default([]),
+  inferenceProfileSummaries: z
+    .array(
+      z.object({
+        inferenceProfileId: Id,
+        status: Id,
+        models: z.array(z.object({ modelArn: z.string() })).optional(),
+      })
+    )
+    .default([]),
   nextToken: Id.optional(),
 });
+// Foundation ARNs end in `foundation-model/<modelId>`; anything else is not a text foundation.
+const foundationModelId = (arn: string) => /(?:^|:)foundation-model\/(.+)$/.exec(arn)?.[1];
 const escapeQuery = (value: string) =>
   encodeURIComponent(value).replace(
     /[!'()*]/g,
@@ -138,6 +152,9 @@ export async function discoverBedrockModels(
       combined.throwIfAborted();
     };
     agent = new EnvHttpProxyAgent({ connect: { timeout: MODEL_DISCOVERY_LIMITS.timeoutMs } });
+    // Text foundations (including profile-only ones) decide which profiles are chat-capable.
+    const textFoundations = new Set<string>(),
+      profiles: Array<{ id: string; models: string[] }> = [];
     const ids = new Set<string>(),
       cursors = new Set<string>();
     let pages = 0,
@@ -204,13 +221,25 @@ export async function discoverBedrockModels(
           if (request.path === "/foundation-models") {
             const page = Foundations.parse(parsed);
             items += page.modelSummaries.length;
-            for (const model of page.modelSummaries) ids.add(model.modelId);
+            for (const model of page.modelSummaries) {
+              textFoundations.add(model.modelId);
+              // Profile-only foundations reject direct invocation; their profiles are listed below.
+              if (
+                !model.inferenceTypesSupported ||
+                model.inferenceTypesSupported.includes("ON_DEMAND")
+              )
+                ids.add(model.modelId);
+            }
           } else {
             assert(request.path === "/inference-profiles", "Unexpected Bedrock listing operation");
             const page = Profiles.parse(parsed);
             items += page.inferenceProfileSummaries.length;
             for (const profile of page.inferenceProfileSummaries)
-              if (profile.status === "ACTIVE") ids.add(profile.inferenceProfileId);
+              if (profile.status === "ACTIVE")
+                profiles.push({
+                  id: profile.inferenceProfileId,
+                  models: (profile.models ?? []).map((model) => model.modelArn),
+                });
           }
           if (items > MODEL_DISCOVERY_LIMITS.items) {
             reason = "limit-exceeded";
@@ -259,6 +288,17 @@ export async function discoverBedrockModels(
       }
       if (nextToken) cursors.add(nextToken);
     } while (nextToken);
+    // Profile listing has no modality filter: keep only profiles whose every backing
+    // model is a listed text foundation, so embedding/image profiles are not suggested.
+    for (const profile of profiles)
+      if (
+        profile.models.length > 0 &&
+        profile.models.every((arn) => {
+          const id = foundationModelId(arn);
+          return id != null && textFoundations.has(id);
+        })
+      )
+        ids.add(profile.id);
     await agent.destroy().catch(() => undefined);
     agent = undefined;
     current();
