@@ -30,6 +30,7 @@ export const EXPERIMENT_IDS = {
   TIMELINE: "timeline",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
+  AUTO_MODEL_ROUTING: "auto-model-routing",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -273,6 +274,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Timeline",
     description:
       "Record a durable birds-eye timeline per workspace: prompts, agent events, goals, heartbeats, sub-agents, and workflows",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: {
+    id: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+    name: "Auto model routing",
+    description:
+      "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
     enabledByDefault: false,
     showInSettings: true,
   },

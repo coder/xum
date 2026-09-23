@@ -56,6 +56,7 @@ export class SummarizeStrategy {
         goalId: streamContext.goalId,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
+        autoModelRouting: streamContext.autoModelRouting,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {

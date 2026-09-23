@@ -275,6 +275,33 @@ describe("createDisplayUsage", () => {
   });
 
   describe("tiered long-context pricing", () => {
+    test.each([
+      ["openai:gpt-6-sol", 2, 0.2, 10],
+      ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
+    ] as const)(
+      "applies %s pricing only above the 272K boundary",
+      (model, input, cached, output) => {
+        for (const tokens of [272000, 272001]) {
+          const longContext = tokens > 272000;
+          const result = createDisplayUsage(
+            {
+              inputTokens: tokens,
+              cachedInputTokens: 100000,
+              outputTokens: 1000,
+              totalTokens: tokens + 1000,
+            },
+            model
+          );
+          expect(result?.input.cost_usd).toBeCloseTo(
+            (((tokens - 100000) * input) / 1e6) * (longContext ? 2 : 1),
+            12
+          );
+          expect(result?.cached.cost_usd).toBeCloseTo(0.1 * cached * (longContext ? 2 : 1), 12);
+          expect(result?.output.cost_usd).toBeCloseTo(0.001 * output * (longContext ? 1.5 : 1), 12);
+        }
+      }
+    );
+
     test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 272000,

@@ -61,13 +61,26 @@ import {
   reasoningProviderOptionsFromMetadata,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
-import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  ThinkingLevelSchema,
+  coerceThinkingLevel,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
+import {
+  createAutoThinkingEscalationState,
+  markAutoThinkingEscalationExhausted,
+  proposeAutoThinkingEscalation,
+  rebaseAutoThinkingEscalation,
+  recordAutoThinkingEscalation,
+  type AutoThinkingEscalationState,
+} from "@/node/services/autoThinkingEscalation";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   coerceStreamErrorTypeForMessage,
@@ -338,6 +351,39 @@ type StreamRequestInput = StreamRequestOptions & {
   onToolExecutionStart?: (toolCallId: string) => void;
 };
 
+/**
+ * Auto's thinking claim on a routing record: stamped with the level the request runs at,
+ * or withdrawn (with its raises) once the user moved the slider this turn, because the
+ * record must not claim a level the rest of the turn did not run at.
+ */
+function withAutoThinkingClaim(
+  record: AutoModelRoutingRecord,
+  level: ThinkingLevel | undefined,
+  manual: boolean | undefined
+): AutoModelRoutingRecord {
+  if (record.thinkingLevel == null) return record;
+  if (manual) {
+    const { thinkingLevel: _level, escalations: _escalations, ...withoutClaim } = record;
+    return withoutClaim;
+  }
+  return level != null ? { ...record, thinkingLevel: level } : record;
+}
+
+/**
+ * Report what an Auto-routed stream now runs on to the session (see
+ * ActiveTurnThinkingOverride.onLiveRoutingChanged). Called after every mid-turn change to the
+ * stream's model, thinking level or routing record; a no-op for streams without a record.
+ */
+function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
+  const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+  if (autoModelRouting == null) return;
+  streamInfo.request.thinkingOverrideState?.onLiveRoutingChanged?.({
+    model: streamInfo.model,
+    thinkingLevel: coerceThinkingLevel(streamInfo.thinkingLevel),
+    autoModelRouting,
+  });
+}
+
 interface StepMessageTracker {
   workspaceId?: string;
   pendingPrefixSwap?: ContinuousPrefixSwap;
@@ -345,6 +391,8 @@ interface StepMessageTracker {
   prefixSwapInvalidated?: boolean;
   prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
+  /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
+  autoThinkingEscalation?: AutoThinkingEscalationState;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -2696,6 +2744,18 @@ export class StreamManager {
           }
           throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
         }
+        // Auto-set thinking raises itself when the turn looks stuck, through the same
+        // override the slider uses (so the swap check below sees it too); a slider move
+        // this turn hands the level to the user.
+        const escalationState = stepTracker?.autoThinkingEscalation;
+        const overrideState = request.thinkingOverrideState;
+        const escalation =
+          escalationState && overrideState && !overrideState.manual && overrideState.pending == null
+            ? proposeAutoThinkingEscalation(escalationState, stepMessages)
+            : undefined;
+        if (escalation && overrideState) {
+          overrideState.pending = escalation.to;
+        }
         // The staged prefix was prepared under the previous thinking options.
         // Keep full context if those options change before the swap is consumed.
         const pendingSwap = stepTracker?.pendingPrefixSwap;
@@ -2760,6 +2820,26 @@ export class StreamManager {
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
+        if (escalation && escalationState) {
+          // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
+          // only a level that actually changed is provenance, at the level it changed to (a
+          // sparse ladder can land above the requested step). A slider write that raced the
+          // step's awaits is the user's level, not Auto's.
+          const applied = overrideState?.applied;
+          if (
+            thinkingOverride !== undefined &&
+            applied != null &&
+            applied !== escalation.from &&
+            !overrideState?.manual
+          ) {
+            const effective =
+              applied === escalation.to ? escalation : { ...escalation, to: applied };
+            recordAutoThinkingEscalation(escalationState, effective);
+            log.info("Auto thinking escalated mid-turn", effective);
+          } else {
+            markAutoThinkingEscalationExhausted(escalationState);
+          }
+        }
         // Step 0: an override consumed here raced stream setup (written during
         // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
         // fold). Message preparation is thinking-level-dependent (Anthropic
@@ -2972,11 +3052,38 @@ export class StreamManager {
     // any step can run; the catch-up sync covers a holder that already applied
     // a level (e.g. re-attachment on retry paths).
     if (request.thinkingOverrideState) {
-      request.thinkingOverrideState.onApplied = (level) => {
+      const holder = request.thinkingOverrideState;
+      holder.onApplied = (level) => {
         streamInfo.thinkingLevel = level;
+        const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+        if (holder.manual && autoModelRouting != null) {
+          streamInfo.initialMetadata = {
+            ...streamInfo.initialMetadata,
+            autoModelRouting: withAutoThinkingClaim(autoModelRouting, undefined, true),
+          };
+        }
+        publishLiveRouting(streamInfo);
       };
-      if (request.thinkingOverrideState.applied) {
-        streamInfo.thinkingLevel = request.thinkingOverrideState.applied;
+      if (holder.applied) {
+        streamInfo.thinkingLevel = holder.applied;
+      }
+      // A thinking level Auto chose may raise itself mid-turn (see autoThinkingEscalation.ts);
+      // the raises land on the routing record the stream-end metadata spreads.
+      const routedThinkingLevel = initialMetadata?.autoModelRouting?.thinkingLevel;
+      if (routedThinkingLevel != null) {
+        stepTracker.autoThinkingEscalation = createAutoThinkingEscalationState(
+          routedThinkingLevel,
+          initialMetadata?.autoModelRouting?.escalations ?? [],
+          (escalations) => {
+            const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+            if (autoModelRouting == null) return;
+            streamInfo.initialMetadata = {
+              ...streamInfo.initialMetadata,
+              autoModelRouting: { ...autoModelRouting, escalations },
+            };
+            publishLiveRouting(streamInfo);
+          }
+        );
       }
     }
 
@@ -3293,6 +3400,9 @@ export class StreamManager {
       metadataModel: streamInfo.metadataModel,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
+      ...(streamInfo.initialMetadata?.autoModelRouting != null && {
+        autoModelRouting: streamInfo.initialMetadata.autoModelRouting,
+      }),
       historySequence,
       startTime: streamInfo.startTime,
       ...(streamStartAgentId && { agentId: streamStartAgentId }),
@@ -3843,13 +3953,31 @@ export class StreamManager {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
       },
+      // The routing record names the model that actually answered, not the refused tier model,
+      // and (when Auto set it) the thinking level the fallback preparation clamped to.
+      ...(streamInfo.initialMetadata?.autoModelRouting != null && {
+        autoModelRouting: withAutoThinkingClaim(
+          { ...streamInfo.initialMetadata.autoModelRouting, model: prepared.data.modelString },
+          coerceThinkingLevel(prepared.data.thinkingLevel),
+          overrideHolder?.manual
+        ),
+      }),
     };
+    // Escalation climbs from the level the stream runs at now: the fallback model's ladder
+    // may have clamped Auto's claim, and a raise proposed from the refused model's level
+    // would be a no-op here and retire escalation for the rest of the turn.
+    const escalationState = streamInfo.stepTracker.autoThinkingEscalation;
+    const claimedLevel = streamInfo.initialMetadata.autoModelRouting?.thinkingLevel;
+    if (escalationState && claimedLevel != null) {
+      rebaseAutoThinkingEscalation(escalationState, claimedLevel);
+    }
     // Release the refused model's transport resources now: the stream-exit
     // finally only cleans the final request's model, so without this the
     // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
+    publishLiveRouting(streamInfo);
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (
       consumedSwap &&

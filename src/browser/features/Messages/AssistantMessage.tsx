@@ -29,6 +29,7 @@ import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
 import { ModelDisplay } from "./ModelDisplay";
 import { ModelFallbackBadge } from "./ModelFallbackBadge";
+import { AutoModelRoutingBadge } from "./AutoModelRoutingBadge";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
 
 interface AssistantMessageProps {
@@ -228,6 +229,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
         {message.modelFallback && (
           <ModelFallbackBadge modelFallback={message.modelFallback} effectiveModel={modelName} />
         )}
+        {message.autoModelRouting && <AutoModelRoutingBadge record={message.autoModelRouting} />}
         {isCompacted && (
           <span className="text-plan-mode bg-plan-mode/10 inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
             {isIdleCompacted ? (

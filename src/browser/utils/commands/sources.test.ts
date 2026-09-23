@@ -1,4 +1,4 @@
-import { expect, test, mock, spyOn } from "bun:test";
+import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
@@ -110,6 +110,53 @@ interface ToastEventDetail {
 
 const getActions = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) =>
   mk(over).flatMap((source) => source());
+
+describe("Auto routing palette actions", () => {
+  const ids = [
+    CommandIds.toggleAutoRouting("model"),
+    CommandIds.toggleAutoRouting("thinkingLevel"),
+  ];
+
+  test("appear only while the experiment is on, for the workspace and the creation composer", () => {
+    const wired = {
+      getAutoRouting: () => false,
+      onSetAutoRouting: () => undefined,
+    };
+    const off = getActions({ ...wired, autoModelRoutingEnabled: false }).map((a) => a.id);
+    expect(off).not.toContain(ids[0]);
+    expect(off).not.toContain(ids[1]);
+
+    const on = getActions({ ...wired, autoModelRoutingEnabled: true }).map((a) => a.id);
+    expect(on).toContain(ids[0]);
+    expect(on).toContain(ids[1]);
+
+    const creation = getActions({
+      ...wired,
+      autoModelRoutingEnabled: true,
+      selectedWorkspace: null,
+      creationScopeId: "project:/repo/b",
+    }).map((a) => a.id);
+    expect(creation).toContain(ids[0]);
+    expect(creation).toContain(ids[1]);
+  });
+
+  test("each action flips its own dimension for the composer's scope", () => {
+    const onSetAutoRouting = mock(
+      (_scopeId: string, _dimension: "model" | "thinkingLevel", _active: boolean) => undefined
+    );
+    const actions = getActions({
+      autoModelRoutingEnabled: true,
+      getAutoRouting: (_scopeId, dimension) => dimension === "model",
+      onSetAutoRouting,
+    });
+    void actions.find((a) => a.id === ids[0])?.run();
+    void actions.find((a) => a.id === ids[1])?.run();
+    expect(onSetAutoRouting.mock.calls).toEqual([
+      ["w1", "model", false],
+      ["w1", "thinkingLevel", true],
+    ]);
+  });
+});
 
 const workspaceApi = (workspace: Record<string, unknown>) =>
   ({

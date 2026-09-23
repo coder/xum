@@ -38,6 +38,8 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(first).toEqual({ accepted: true });
       expect(second).toEqual({ accepted: true });
       expect(opts.activeTurnThinkingOverride?.pending).toBe("low");
+      // A slider write marks the turn as user-controlled, which disables Auto's escalation.
+      expect(opts.activeTurnThinkingOverride?.manual).toBe(true);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 

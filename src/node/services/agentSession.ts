@@ -14,7 +14,11 @@ import {
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import {
+  isProviderEligibleMessage,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
+import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
@@ -127,6 +131,7 @@ import {
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
+import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
   normalizePersistedAgentCandidate,
@@ -134,6 +139,13 @@ import {
 } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingDimensions,
+  type AutoModelRoutingRecord,
+  type AutoModelRoutingTier,
+} from "@/common/types/autoModelRouting";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -205,6 +217,7 @@ import {
   type StreamAbortReason,
   type StreamEndEvent,
   type StreamAbortEvent,
+  type StreamStartEvent,
   type StreamLifecycleSnapshot,
 } from "@/common/types/stream";
 import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoalService";
@@ -245,6 +258,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
 import {
   getExplicitGatewayPrefix,
+  modelSelectionEqualityKey,
   normalizeToCanonical,
   normalizeSelectedModel,
   isValidModelFormat,
@@ -363,6 +377,27 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+}
+
+/**
+ * Send options after auto-model-routing resolution. The record is session-internal
+ * (never sourced from IPC) and rides to the request builder as stream provenance.
+ */
+type ResolvedSendMessageOptions = SendMessageOptions & {
+  autoModelRoutingRecord?: AutoModelRoutingRecord;
+};
+
+/**
+ * A user row the chat model itself would replay. Context-budget-rejected prompts and workflow
+ * display rows stay in history for the UI but never reach a provider, so routing (evaluator
+ * context, attachment gating) must not see them either.
+ */
+function isProviderVisibleUserRow(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    isProviderEligibleMessage(message) &&
+    !isWorkflowDisplayOnlyMessage(message)
+  );
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -701,6 +736,8 @@ interface AgentSessionOptions {
   workspaceGoalService?: WorkspaceGoalService;
   /** Cost telemetry sink for headless side-channel calls (branch summaries). */
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
+  /** Difficulty classifier for composer Auto sends; absent means Auto falls back to the composer model. */
+  autoModelRouter?: Pick<AutoModelRouter, "classify">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /**
@@ -900,6 +937,8 @@ interface PreparationAttempt {
    * turn that had no registered start yet); prepared candidates never refresh it at startup.
    */
   admissionStopEpoch?: number;
+  /** Evaluator spend this turn owes its goal (deferEvaluatorGoalCharge); settled if it never streams. */
+  evaluatorGoalCostUsd?: number;
 }
 
 export class AgentSession {
@@ -917,6 +956,7 @@ export class AgentSession {
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
   private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
+  private readonly autoModelRouter?: Pick<AutoModelRouter, "classify">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
@@ -1145,6 +1185,13 @@ export class AgentSession {
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
 
+  /**
+   * Evaluator spend a delivered turn owes its goal, carried by the next non-compaction stream's
+   * accounting (deferEvaluatorGoalCharge). Settled by itself when a compaction aborts before its
+   * follow-up; discarded with the stream's own cost on a terminal error.
+   */
+  private pendingEvaluatorGoalCostUsd?: number;
+
   /** True once we see any model/tool output for the current stream (retry guard). */
   private activeStreamHadAnyDelta = false;
 
@@ -1200,7 +1247,20 @@ export class AgentSession {
     modelString: string;
     contextBudgetRetried?: boolean;
     requestAssemblySnapshot?: RequestAssemblySnapshot;
-    options?: SendMessageOptions;
+    /**
+     * The options the automatic recoveries (context-window rollover, compaction retry) replay
+     * through streamWithHistory; their routing record follows the stream's mid-turn changes
+     * like `autoModelRouting` below.
+     */
+    options?: ResolvedSendMessageOptions;
+    /**
+     * Auto routing decision of the streaming request. Starts as the session's pre-stream
+     * decision, is replaced by the prepared record on stream-start (request preparation
+     * may fall back to the composer's model when the tier model cannot be built), and then
+     * follows the stream's mid-turn changes (ActiveTurnThinkingOverride.onLiveRoutingChanged):
+     * live pricing, compaction thresholds and mid-stream follow-ups must follow each swap.
+     */
+    autoModelRouting?: AutoModelRoutingRecord;
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
@@ -1246,6 +1306,7 @@ export class AgentSession {
       backgroundProcessManager,
       workspaceGoalService,
       sessionUsageService,
+      autoModelRouter,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
@@ -1284,6 +1345,7 @@ export class AgentSession {
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
     this.sessionUsageService = sessionUsageService;
+    this.autoModelRouter = autoModelRouter;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
@@ -3429,6 +3491,7 @@ export class AgentSession {
       // (withdrawn send, pre-admission early return) also never runs; settle it before idle.
       if (attempt.outcome !== "delivered" && attempt.outcome !== "background") {
         this.recordQueueCutSuccessorPreStreamFailure(attempt);
+        await this.settleEvaluatorGoalCharge(attempt);
       }
       try {
         if (this.preparingQueuedInput?.attempt === attempt) {
@@ -3855,39 +3918,9 @@ export class AgentSession {
 
     // Defense-in-depth: reject PDFs for models we know don't support them.
     // (Frontend should also block this, but it's easy to bypass via IPC / older clients.)
-    if (effectiveFileParts && effectiveFileParts.length > 0) {
-      const pdfParts = effectiveFileParts.filter(
-        (part) => normalizeMediaType(part.mediaType) === PDF_MEDIA_TYPE
-      );
-
-      if (pdfParts.length > 0) {
-        const caps = getModelCapabilitiesResolved(
-          options.model,
-          this.aiService.getProvidersConfig()
-        );
-
-        if (caps && !caps.supportsPdfInput) {
-          return Err(
-            createUnknownSendMessageError(`Model ${options.model} does not support PDF input.`)
-          );
-        }
-
-        if (caps?.maxPdfSizeMb !== undefined) {
-          const maxBytes = caps.maxPdfSizeMb * 1024 * 1024;
-          for (const part of pdfParts) {
-            const bytes = estimateBase64DataUrlBytes(part.url);
-            if (bytes !== null && bytes > maxBytes) {
-              const actualMb = (bytes / (1024 * 1024)).toFixed(1);
-              const label = part.filename ?? "PDF";
-              return Err(
-                createUnknownSendMessageError(
-                  `${label} is ${actualMb}MB, but ${options.model} allows up to ${caps.maxPdfSizeMb}MB per PDF.`
-                )
-              );
-            }
-          }
-        }
-      }
+    const pdfIssue = this.findPdfAttachmentIssue(options.model, effectiveFileParts);
+    if (pdfIssue) {
+      return Err(createUnknownSendMessageError(pdfIssue));
     }
 
     // Validate the actual payload before truncate+replace, including non-PDF attachment shape.
@@ -4172,19 +4205,62 @@ export class AgentSession {
     // (task orchestration, compaction, auto-resume, etc.).
     let agentInitiated = internal?.agentInitiated === true;
 
-    let modelForStream = options.model;
-    let optionsForStream: SendMessageOptions = stripGoalInterventionPolicy({
+    let optionsForStream: ResolvedSendMessageOptions = stripGoalInterventionPolicy({
       ...options,
       ...(acpPromptId != null ? { acpPromptId } : {}),
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
+    // Strip before anything snapshots these options: retry rows, compaction follow-ups,
+    // and resumes must carry the concrete model and never re-classify (or re-bill).
+    const routingDimensions: AutoModelRoutingDimensions = {
+      model: optionsForStream.autoModelRouting === true,
+      thinkingLevel: optionsForStream.autoThinkingLevel === true,
+    };
+    delete optionsForStream.autoModelRouting;
+    delete optionsForStream.autoThinkingLevel;
+    const classifyUserTurn =
+      (routingDimensions.model || routingDimensions.thinkingLevel) &&
+      !agentInitiated &&
+      internal?.synthetic !== true;
+    if (classifyUserTurn && !isCompactionRequest) {
+      optionsForStream = await this.resolveAutoModelRouting(
+        trimmedMessage,
+        optionsForStream,
+        routingDimensions,
+        cancelSignal,
+        attempt
+      );
+    }
+    // A routed record reaches here freshly classified or carried by a compaction follow-up;
+    // either way the attachment gate sees the context this request actually runs in. The
+    // ungated decision survives for an on-send compaction follow-up, which runs after the
+    // boundary and gates itself on dispatch.
+    const routedOptions = optionsForStream;
+    if (!isCompactionRequest) {
+      optionsForStream = await this.gateRoutedModelAgainstAttachments(
+        optionsForStream,
+        effectiveFileParts
+      );
+    }
+    let modelForStream = optionsForStream.model;
 
     // RLM keep-recent floor: stamp compaction requests (manual /compact,
     // mid-stream forced, idle) with the durable tail-start sequence before the
     // row is persisted. No-op when RLM is off.
     const stampedMuxMetadata =
       isCompactionRequest && typedMuxMetadata?.type === "compaction-request"
-        ? await this.withKeepRecentTailStamp(typedMuxMetadata, optionsForStream)
+        ? await this.withKeepRecentTailStamp(
+            classifyUserTurn
+              ? await this.withAutoRoutedFollowUp(
+                  typedMuxMetadata,
+                  optionsForStream,
+                  routingDimensions,
+                  cancelSignal,
+                  attempt
+                )
+              : typedMuxMetadata,
+            optionsForStream
+          )
         : typedMuxMetadata;
 
     const userMessage = createMuxMessage(
@@ -4196,6 +4272,11 @@ export class AgentSession {
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
+        // Resumes of this turn re-attach the routing record from here (the whitelist above
+        // deliberately keeps it out of retrySendOptions).
+        ...(optionsForStream.autoModelRoutingRecord != null
+          ? { autoModelRouting: optionsForStream.autoModelRoutingRecord }
+          : {}),
         muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
@@ -4313,6 +4394,8 @@ export class AgentSession {
         goalKind,
         goalId: internal?.goalId,
         muxMetadata: typedMuxMetadata,
+        // Pre-gate decision: the follow-up re-gates against the post-compaction context.
+        autoModelRouting: routedOptions.autoModelRoutingRecord,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -4999,6 +5082,7 @@ export class AgentSession {
       attempt.outcome = "background";
       const backgroundAttempt: PreparationAttempt = { ...attempt, outcome: "preparing" };
       attempt.preparedRequest = undefined;
+      attempt.evaluatorGoalCostUsd = undefined;
       // Handoff callbacks may already have preempted back to idle. Transfer the edit
       // exclusion too, so only the child's settled startup can release queued work.
       attempt.editReservation = undefined;
@@ -5056,10 +5140,11 @@ export class AgentSession {
     };
 
     assert(options, "resumeStream requires options");
-    const { model } = options;
+    const resumeOptions = await this.applyAutoRoutedResume(options);
+    const { model } = resumeOptions;
     assert(typeof model === "string" && model.trim().length > 0, "resumeStream requires a model");
 
-    const normalizedOptions = this.normalizeGatewaySendOptions(options);
+    const normalizedOptions = this.normalizeGatewaySendOptions(resumeOptions);
     const modelForStream = normalizedOptions.model;
     const optionsForStream = normalizedOptions;
 
@@ -6817,6 +6902,54 @@ export class AgentSession {
     );
   }
 
+  /**
+   * A user-built compaction request (`/compact` plus a follow-up, or compact-and-retry after
+   * a context overflow) is never routed itself, but the follow-up it carries is the user's
+   * real prompt and would otherwise redispatch on the composer model without a badge.
+   * Classify it once here; the redispatch reuses the stored decision.
+   */
+  private async withAutoRoutedFollowUp(
+    metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
+    options: ResolvedSendMessageOptions,
+    dimensions: AutoModelRoutingDimensions,
+    signal: AbortSignal | undefined,
+    attempt: PreparationAttempt
+  ): Promise<Extract<MuxMessageMetadata, { type: "compaction-request" }>> {
+    const followUp = metadata.parsed.followUpContent;
+    if (followUp == null || followUp.autoModelRouting != null) return metadata;
+    // Classify the text the redispatch will actually send: review notes are formatted into
+    // the prompt there (prepareUserMessageForSend), so a review-only follow-up is a real
+    // prompt, not an empty one.
+    const prompt = prepareUserMessageForSend({
+      // Persisted follow-ups are untyped on disk; a missing text must not throw here.
+      text: followUp.text ?? "",
+      reviews: followUp.reviews,
+    }).finalText.trim();
+    // An attachment-only follow-up still goes through routing so its fallback record
+    // (and badge) survive the redispatch, exactly like an attachment-only send.
+    if (!prompt && !(followUp.fileParts?.length ?? 0)) return metadata;
+    const routed = await this.resolveAutoModelRouting(
+      prompt,
+      { ...options, model: followUp.model, thinkingLevel: followUp.thinkingLevel },
+      dimensions,
+      signal,
+      attempt
+    );
+    if (routed.autoModelRoutingRecord == null) return metadata;
+    return {
+      ...metadata,
+      parsed: {
+        ...metadata.parsed,
+        followUpContent: {
+          ...followUp,
+          model: routed.model,
+          ...(routed.thinkingLevel !== undefined ? { thinkingLevel: routed.thinkingLevel } : {}),
+          autoModelRouting: routed.autoModelRoutingRecord,
+        },
+      },
+    };
+  }
+
   /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
   private async withKeepRecentTailStamp(
     metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
@@ -6978,7 +7111,448 @@ export class AgentSession {
     }
   }
 
-  private normalizeGatewaySendOptions(options: SendMessageOptions): SendMessageOptions {
+  /**
+   * Composer Auto: classify the prompt's difficulty and swap in the chosen tier's
+   * model and/or thinking level, each only when the composer opted that dimension
+   * into Auto. Every failure keeps the composer's concrete choices, so the returned
+   * options are always streamable; the record explains what happened.
+   */
+  private async resolveAutoModelRouting(
+    prompt: string,
+    options: ResolvedSendMessageOptions,
+    dimensions: AutoModelRoutingDimensions,
+    signal: AbortSignal | undefined,
+    attempt: PreparationAttempt
+  ): Promise<ResolvedSendMessageOptions> {
+    const experimentEnabled =
+      typeof this.aiService.isExperimentEnabled === "function" &&
+      this.aiService.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+    if (!experimentEnabled) return options;
+
+    const fallback = (
+      record: Omit<AutoModelRoutingRecord, "requestedFallbackModel" | "model">
+    ) => ({
+      ...options,
+      autoModelRoutingRecord: {
+        requestedFallbackModel: options.model,
+        model: options.model,
+        ...record,
+      },
+    });
+    if (!this.autoModelRouter) {
+      return fallback({ status: "fallback", reason: "Evaluator unavailable in this session" });
+    }
+    // An attachment-only send gives the evaluator nothing to judge; skip the paid round-trip.
+    if (prompt.length === 0) {
+      return fallback({
+        status: "fallback",
+        reason: "Attachment-only send has no prompt text to classify",
+      });
+    }
+
+    const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
+      this.config.loadConfigOrDefault().autoModelRouting
+    );
+    // Only the opted-in dimensions can change the turn; without a mapped tier in one
+    // of them no answer matters, so skip the paid round-trip.
+    const routable = (tier: AutoModelRoutingTier) => ({
+      model: dimensions.model && tier.model != null,
+      thinkingLevel: dimensions.thinkingLevel && tier.thinkingLevel != null,
+    });
+    if (tiers.every((tier) => !routable(tier).model && !routable(tier).thinkingLevel)) {
+      return fallback({
+        status: "fallback",
+        reason: dimensions.model
+          ? "No difficulty tier has a model mapped"
+          : "No difficulty tier has a thinking level mapped",
+      });
+    }
+    // The evaluation itself is paid: a budgeted goal must not spend on an evaluator it
+    // cannot price, the same rule the tier model meets below.
+    const evaluatorPricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
+      this.workspaceId,
+      evaluationModel
+    );
+    if (evaluatorPricingGate && !evaluatorPricingGate.success) {
+      return fallback({
+        status: "fallback",
+        reason: `${evaluationModel} has no pricing data for the budgeted goal`,
+      });
+    }
+    const decision = await this.autoModelRouter.classify({
+      prompt,
+      recentUserMessages: await this.collectRecentUserPrompts(),
+      tiers,
+      evaluationModel,
+      signal,
+    });
+    if (!decision.success) {
+      return fallback({ status: "fallback", reason: decision.error });
+    }
+    // The evaluation is a paid request outside StreamManager; bill it to the workspace
+    // before any fallback below, since the tokens were spent either way.
+    const billed = await this.sessionUsageService?.recordHeadlessUsage(
+      this.workspaceId,
+      decision.data.evaluationModel,
+      decision.data.usage,
+      decision.data.providerMetadata,
+      { analyticsSource: "auto_model_routing" }
+    );
+    this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
+    const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+    const provenance = {
+      tierId: decision.data.tierId,
+      tierLabel: chosen?.label ?? decision.data.tierId,
+      ...(decision.data.confidence != null ? { confidence: decision.data.confidence } : {}),
+      ...(decision.data.probabilities != null
+        ? { probabilities: decision.data.probabilities }
+        : {}),
+    };
+    const applies = chosen ? routable(chosen) : { model: false, thinkingLevel: false };
+    if (!chosen || (!applies.model && !applies.thinkingLevel)) {
+      return fallback({ ...provenance, status: "unmapped-tier" });
+    }
+    // A dimension the composer kept concrete (or the tier left unmapped) stays as sent. The
+    // two dimensions stay independent from here on: every later model-only gate (pricing,
+    // attachments, request preparation) reverts the model and keeps the tier's thinking level.
+    const routedThinking: Pick<AutoModelRoutingRecord, "thinkingLevel"> =
+      applies.thinkingLevel && chosen.thinkingLevel != null
+        ? { thinkingLevel: chosen.thinkingLevel }
+        : {};
+    const thinkingLevel = routedThinking.thinkingLevel ?? options.thinkingLevel;
+    if (applies.model && chosen.model != null) {
+      // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
+      // context the turn finally runs in, which compaction can still change. Whether the tier
+      // model can be built at all (credentials, policy, catalog) is decided by the request
+      // preparation itself, which falls back to the composer's model when it cannot
+      // (TurnRequestBuilder). A budgeted goal must not spend on a model it cannot price.
+      const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
+        this.workspaceId,
+        chosen.model
+      );
+      if (pricingGate && !pricingGate.success) {
+        return {
+          ...options,
+          thinkingLevel,
+          autoModelRoutingRecord: {
+            ...provenance,
+            requestedFallbackModel: options.model,
+            model: options.model,
+            ...routedThinking,
+            status: "fallback",
+            reason: `${chosen.model} has no pricing data for the budgeted goal`,
+          },
+        };
+      }
+    }
+    const model = applies.model && chosen.model != null ? chosen.model : options.model;
+    return {
+      ...options,
+      model,
+      thinkingLevel,
+      autoModelRoutingRecord: {
+        ...provenance,
+        requestedFallbackModel: options.model,
+        model,
+        ...routedThinking,
+        status: "routed",
+      },
+    };
+  }
+
+  /**
+   * Revert a routed model to the composer's when an attachment the request carries (this
+   * turn's, or an earlier turn's still in the window) cannot be sent to it. Runs on the
+   * request that actually streams, never at classification time: an on-send compaction or a
+   * /compact follow-up defers the turn behind a new boundary, and attachments the summary
+   * folds away must not cost the tier model. Only the model reverts; the tier's thinking
+   * level does not depend on attachments.
+   */
+  private async gateRoutedModelAgainstAttachments(
+    options: ResolvedSendMessageOptions,
+    fileParts: FilePart[] | undefined
+  ): Promise<ResolvedSendMessageOptions> {
+    const record = options.autoModelRoutingRecord;
+    if (record?.status !== "routed" || record.model === record.requestedFallbackModel) {
+      return options;
+    }
+    const contextParts = [...(fileParts ?? []), ...(await this.collectContextFileParts())];
+    const attachmentIssue =
+      this.findImageAttachmentIssue(record.model, contextParts) ??
+      this.findPdfAttachmentIssue(record.model, contextParts);
+    if (attachmentIssue == null) return options;
+    return {
+      ...options,
+      model: record.requestedFallbackModel,
+      autoModelRoutingRecord: {
+        ...record,
+        model: record.requestedFallbackModel,
+        status: "fallback",
+        reason: attachmentIssue,
+      },
+    };
+  }
+
+  /**
+   * A budgeted goal caps every dollar the turn spends, and goal cost otherwise only advances
+   * from stream usage, so the evaluator's priced spend is charged with the turn it routed, in
+   * that turn's own stream accounting (recordGoalAccountingFromUsage). Charged by itself it
+   * could tip the goal into budget_limited before the response starts, and a user-origin
+   * stream on a non-active goal is not charged at all, so the far larger response cost would
+   * escape the cap. The charge rides the preparation attempt until its stream is delivered
+   * (adoptEvaluatorGoalCharge); an attempt that never streams settles it by itself
+   * (settleEvaluatorGoalCharge), as does a delivered stream that ends in a terminal error, so
+   * nothing owed leaks into a later, unrelated turn.
+   * Compaction streams never charge the goal and leave it for the turn that follows their
+   * boundary (an on-send compaction or a /compact follow-up).
+   */
+  private deferEvaluatorGoalCharge(attempt: PreparationAttempt, costUsd: number | undefined): void {
+    if (!this.workspaceGoalService || costUsd == null || costUsd <= 0) return;
+    attempt.evaluatorGoalCostUsd = (attempt.evaluatorGoalCostUsd ?? 0) + costUsd;
+  }
+
+  /** The delivered stream's accounting now owns the attempt's evaluator charge. */
+  private adoptEvaluatorGoalCharge(attempt: PreparationAttempt): void {
+    if (attempt.evaluatorGoalCostUsd == null) return;
+    this.pendingEvaluatorGoalCostUsd =
+      (this.pendingEvaluatorGoalCostUsd ?? 0) + attempt.evaluatorGoalCostUsd;
+    attempt.evaluatorGoalCostUsd = undefined;
+  }
+
+  /**
+   * No stream follows this attempt, so its evaluator spend is charged as a zero-turn
+   * user-origin stream: the cap sees it without a goal turn being consumed.
+   */
+  private async settleEvaluatorGoalCharge(attempt: PreparationAttempt): Promise<void> {
+    const costUsd = attempt.evaluatorGoalCostUsd;
+    attempt.evaluatorGoalCostUsd = undefined;
+    await this.chargeEvaluatorSpendToGoal(costUsd);
+  }
+
+  /**
+   * A compaction that ends without handing off to its follow-up (the user stopped it) owes
+   * the goal the spend it was carrying for that follow-up; charge it now rather than let the
+   * next unrelated turn, possibly under a replacement goal, pick it up.
+   */
+  private async settlePendingEvaluatorGoalCharge(): Promise<void> {
+    const costUsd = this.pendingEvaluatorGoalCostUsd;
+    this.pendingEvaluatorGoalCostUsd = undefined;
+    await this.chargeEvaluatorSpendToGoal(costUsd);
+  }
+
+  private async chargeEvaluatorSpendToGoal(costUsd: number | undefined): Promise<void> {
+    if (!this.workspaceGoalService || costUsd == null) return;
+    try {
+      await this.workspaceGoalService.recordStreamAccounting({
+        workspaceId: this.workspaceId,
+        costUsd,
+        streamOriginKind: "user",
+      });
+    } catch (error) {
+      log.warn("Failed to charge evaluator usage to the goal", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Adopt the routing record the prepared request actually streams with. Request preparation
+   * owns the last fallback (a tier model the factory cannot build reverts to the composer's,
+   * see TurnRequestBuilder), which the session's pre-stream decision cannot know about. Live
+   * usage pricing, goal accounting, compaction thresholds and mid-stream follow-ups read this
+   * context, so a swapped model must land here before the first usage delta.
+   */
+  private adoptPreparedRouting(payload: StreamStartEvent): void {
+    const context = this.activeStreamContext;
+    const record = payload.autoModelRouting;
+    if (context?.autoModelRouting == null || record == null) return;
+    if (record.model !== context.autoModelRouting.model) {
+      context.modelString = record.model;
+    }
+    context.autoModelRouting = record;
+  }
+
+  /**
+   * Error text when an image attachment cannot be sent to `model`, else null. Routing only:
+   * the composer picked its model with the images in view, a tier model did not.
+   */
+  private findImageAttachmentIssue(model: string, fileParts: FilePart[]): string | null {
+    if (!fileParts.some((part) => normalizeMediaType(part.mediaType).startsWith("image/"))) {
+      return null;
+    }
+    const caps = getModelCapabilitiesResolved(model, this.aiService.getProvidersConfig());
+    return caps && !caps.supportsVision ? `Model ${model} does not support image input.` : null;
+  }
+
+  /** Error text when a PDF attachment cannot be sent to `model`, else null. */
+  private findPdfAttachmentIssue(model: string, fileParts: FilePart[] | undefined): string | null {
+    const pdfParts = (fileParts ?? []).filter(
+      (part) => normalizeMediaType(part.mediaType) === PDF_MEDIA_TYPE
+    );
+    if (pdfParts.length === 0) return null;
+    const caps = getModelCapabilitiesResolved(model, this.aiService.getProvidersConfig());
+    if (caps && !caps.supportsPdfInput) {
+      return `Model ${model} does not support PDF input.`;
+    }
+    if (caps?.maxPdfSizeMb !== undefined) {
+      const maxBytes = caps.maxPdfSizeMb * 1024 * 1024;
+      for (const part of pdfParts) {
+        const bytes = estimateBase64DataUrlBytes(part.url);
+        if (bytes !== null && bytes > maxBytes) {
+          const actualMb = (bytes / (1024 * 1024)).toFixed(1);
+          const label = part.filename ?? "PDF";
+          return `${label} is ${actualMb}MB, but ${model} allows up to ${caps.maxPdfSizeMb}MB per PDF.`;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Attachments of earlier user turns the provider request will actually carry; a read
+   * failure reads as none. A file on a display-only row never reaches the model, so it
+   * must not cost the tier model either.
+   */
+  private async collectContextFileParts(): Promise<FilePart[]> {
+    return (await this.loadActiveRoutingRows()).flatMap((message) =>
+      isProviderVisibleUserRow(message)
+        ? message.parts
+            .filter((part): part is MuxFilePart => part.type === "file")
+            .map((part) => ({ url: part.url, mediaType: part.mediaType, filename: part.filename }))
+        : []
+    );
+  }
+
+  /**
+   * The active context for routing decisions; a read failure reads as empty. Scoped to the
+   * latest durable boundary, the same privacy floor provider requests use, so a /clear or
+   * compaction also hides earlier prompts (and attachments) from routing.
+   */
+  private async loadActiveRoutingRows(): Promise<MuxMessage[]> {
+    const history = await this.historyService
+      .getHistoryFromLatestBoundary(this.workspaceId)
+      .catch(() => null);
+    return history?.success ? history.data : [];
+  }
+
+  /**
+   * Prior user prompts (oldest first) so the classifier sees conversational context. Only
+   * rows the chat model itself would replay reach the evaluator, and only the user's own
+   * words: synthetic rows are the app's, not a prompt to judge.
+   */
+  private async collectRecentUserPrompts(): Promise<string[]> {
+    return (
+      (await this.loadActiveRoutingRows())
+        .filter(
+          (message) => isProviderVisibleUserRow(message) && message.metadata?.synthetic !== true
+        )
+        // Bounded tail of the user's prompts, counted after filtering: the classifier only
+        // needs conversational context, but a prompt behind many report rows still counts.
+        .slice(-20)
+        .map((message) =>
+          message.parts
+            .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+            .map((part) => part.text)
+            .join("\n")
+            .trim()
+        )
+        .filter((text) => text.length > 0)
+    );
+  }
+
+  /**
+   * A manual resume sends the composer's current options, but a dimension still on Auto
+   * only names the routing fallback: continue on what this turn actually ran with (the
+   * retry snapshot). A concrete dimension keeps the caller's choice. The badge names the
+   * routed model, so it survives only a resume that still runs on that model (startup
+   * retries, or a caller picking it by hand).
+   */
+  private async applyAutoRoutedResume(
+    options: SendMessageOptions
+  ): Promise<ResolvedSendMessageOptions> {
+    const { autoModelRouting, autoThinkingLevel, ...resumeOptions } = options;
+    // The same row a resume retries, searched across the whole active window: completed report
+    // cards and other non-retry rows are skipped, however many follow the interrupted turn.
+    const rows = await this.loadActiveRoutingRows();
+    const lastUserRow = this.findLastRetryUserMessage(rows);
+    // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
+    const parsedRecord = AutoModelRoutingRecordSchema.safeParse(
+      lastUserRow?.metadata?.autoModelRouting
+    );
+    if (!parsedRecord.success) return resumeOptions;
+    const retry = lastUserRow?.metadata?.retrySendOptions;
+    // The user row only knows the pre-stream decision. What the turn actually ran on is on the
+    // assistant row it left behind: a refusal fallback corrected the model there, and the
+    // raises of an Auto-set thinking level accumulated there. Under Auto the resume continues
+    // on that (the fallback model rather than the one that refused, the raised level with its
+    // raises), so the badge and the per-turn cap describe the run.
+    const interruptedRow = lastUserRow
+      ? rows.slice(rows.indexOf(lastUserRow) + 1).findLast((row) => row.role === "assistant")
+      : undefined;
+    const interruptedRecord = AutoModelRoutingRecordSchema.safeParse(
+      interruptedRow?.metadata?.autoModelRouting
+    );
+    const record = interruptedRecord.success ? interruptedRecord.data : parsedRecord.data;
+    const model =
+      autoModelRouting === true
+        ? interruptedRecord.success
+          ? record.model
+          : typeof retry?.model === "string"
+            ? retry.model
+            : record.model
+        : resumeOptions.model;
+    const thinkingLevel =
+      autoThinkingLevel === true
+        ? (record.escalations?.at(-1)?.to ??
+          coerceThinkingLevel(retry?.thinkingLevel) ??
+          record.thinkingLevel ??
+          resumeOptions.thinkingLevel)
+        : resumeOptions.thinkingLevel;
+    // The record survives a resume that still runs on the routed model (route-aware: a
+    // Coder-gateway tier model and its direct twin are different runs) while a dimension is
+    // still on Auto. With both dimensions concrete it survives only when the picks match what
+    // ran (startup retries): a thinking-only routing resumed at a hand-picked level routed
+    // nothing, and the badge must not claim its tier. A different hand-picked model under
+    // thinking Auto still runs at Auto's level (with its raises), so a record that claims one
+    // survives as a thinking-only routing on the picked model: the escalation state seeds
+    // from it and the badge keeps the tier, while nothing about the model is Auto's any more.
+    const modelMatches =
+      modelSelectionEqualityKey(model) === modelSelectionEqualityKey(record.model);
+    const keepRecord = modelMatches
+      ? autoModelRouting === true ||
+        autoThinkingLevel === true ||
+        record.thinkingLevel == null ||
+        thinkingLevel === record.thinkingLevel
+      : autoThinkingLevel === true && record.thinkingLevel != null;
+    // The record's thinkingLevel (and the raises that followed it) means "Auto set it"; a
+    // concrete pick on resume replaces it.
+    const {
+      thinkingLevel: _routedThinkingLevel,
+      escalations: _raises,
+      ...recordWithoutThinking
+    } = record;
+    const { reason: _modelFallbackReason, ...recordWithoutModelProvenance } = record;
+    const resumedRecord =
+      autoThinkingLevel !== true
+        ? recordWithoutThinking
+        : modelMatches
+          ? record
+          : {
+              ...recordWithoutModelProvenance,
+              requestedFallbackModel: model,
+              model,
+              status: "routed" as const,
+            };
+    return {
+      ...resumeOptions,
+      model,
+      thinkingLevel,
+      ...(keepRecord ? { autoModelRoutingRecord: resumedRecord } : {}),
+    };
+  }
+
+  private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
       // Preserve explicit gateway prefixes as user intent; otherwise keep persisted IDs canonical.
@@ -7364,7 +7938,7 @@ export class AgentSession {
   private async streamWithHistory(
     turn: TurnId,
     modelString: string,
-    options?: SendMessageOptions,
+    options?: ResolvedSendMessageOptions,
     openaiTruncationModeOverride?: "auto" | "disabled",
     disablePostCompactionAttachments?: boolean,
     agentInitiated?: boolean,
@@ -7438,18 +8012,42 @@ export class AgentSession {
       this.activeStreamHadAnyDelta = false;
       this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
-      this.activeStreamContext = {
+      const streamContext: NonNullable<typeof this.activeStreamContext> = {
         admissionCapture,
         modelString,
         contextBudgetRetried,
         requestAssemblySnapshot,
         options,
+        ...(options?.autoModelRoutingRecord != null
+          ? { autoModelRouting: options.autoModelRoutingRecord }
+          : {}),
         agentInitiated,
         openaiTruncationModeOverride,
         ...(goalKind != null ? { goalKind } : {}),
         ...(goalId != null ? { goalId } : {}),
         providersConfig,
       };
+      this.activeStreamContext = streamContext;
+      if (activeTurnThinkingOverride != null) {
+        // Mid-stream compaction follow-ups are built from this context after the stream is
+        // stopped, and the automatic recoveries (context-window rollover, compaction retry)
+        // replay its options through streamWithHistory: what the Auto-routed stream runs on (a
+        // raise, a slider move, a refusal fallback) must land on both, or the resumed turn
+        // drops back to the tier's model and level and re-arms the pre-change provenance.
+        activeTurnThinkingOverride.onLiveRoutingChanged = (live) => {
+          if (this.activeStreamContext !== streamContext) return;
+          streamContext.modelString = live.model;
+          streamContext.autoModelRouting = live.autoModelRouting;
+          if (streamContext.options != null) {
+            streamContext.options = {
+              ...streamContext.options,
+              model: live.model,
+              thinkingLevel: live.thinkingLevel ?? streamContext.options.thinkingLevel,
+              autoModelRoutingRecord: live.autoModelRouting,
+            };
+          }
+        };
+      }
       this.activeStreamUserMessageId = undefined;
 
       const commitResult = await this.historyService.commitPartial(this.workspaceId);
@@ -7871,6 +8469,7 @@ export class AgentSession {
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
+        autoModelRouting: options?.autoModelRoutingRecord,
         muxMetadata: contextBudgetFlushTurn
           ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
           : streamMuxMetadata,
@@ -7986,6 +8585,7 @@ export class AgentSession {
 
       if (preparation) {
         preparation.outcome = "delivered";
+        this.adoptEvaluatorGoalCharge(preparation);
         // An already-resolved handle can launch recovery synchronously. Release the
         // valid edit's history exclusion first; canceled startup keeps it through its callback.
         if (
@@ -8470,7 +9070,9 @@ export class AgentSession {
     // whether this stream may charge a non-active goal — otherwise the Goal UI
     // shows growing maintenance cost mid-stream that snaps back at stream end.
     const streamOriginKind = getGoalStreamOriginKind(input);
-    const costUsd = getTotalCost(displayUsage) ?? 0;
+    const evaluatorCostUsd =
+      input.isCompaction === true ? 0 : (this.pendingEvaluatorGoalCostUsd ?? 0);
+    const costUsd = (getTotalCost(displayUsage) ?? 0) + evaluatorCostUsd;
     try {
       await this.workspaceGoalService.previewStreamAccounting({
         workspaceId: this.workspaceId,
@@ -8537,7 +9139,13 @@ export class AgentSession {
       input.metadataModel
     );
     const streamOriginKind = getGoalStreamOriginKind(input);
-    const costUsd = getTotalCost(displayUsage) ?? 0;
+    // The turn's accounting carries the evaluator spend that routed it (deferEvaluatorGoalCharge).
+    let evaluatorCostUsd = 0;
+    if (input.isCompaction !== true && this.pendingEvaluatorGoalCostUsd != null) {
+      evaluatorCostUsd = this.pendingEvaluatorGoalCostUsd;
+      this.pendingEvaluatorGoalCostUsd = undefined;
+    }
+    const costUsd = (getTotalCost(displayUsage) ?? 0) + evaluatorCostUsd;
     try {
       await this.workspaceGoalService.recordStreamAccounting({
         workspaceId: this.workspaceId,
@@ -8699,7 +9307,13 @@ export class AgentSession {
     const streamErrorMessage = createStreamErrorMessage(data);
     this.setTerminalStreamLifecycle("failed");
     this.terminalStreamError = streamErrorMessage;
+    // The failed stream's cost is discarded below, but the evaluator that routed it was
+    // billed: charge that spend by itself (captured before the await, so a superseding turn's
+    // charge is not swept up) rather than let it land on whichever unrelated turn streams next.
+    const evaluatorCostUsd = this.pendingEvaluatorGoalCostUsd;
+    this.pendingEvaluatorGoalCostUsd = undefined;
     await this.restoreGoalAccountingSnapshot();
+    await this.chargeEvaluatorSpendToGoal(evaluatorCostUsd);
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     this.activeCompactionRequest = undefined;
@@ -8824,6 +9438,16 @@ export class AgentSession {
           agentInitiated: this.activeStreamContext?.agentInitiated,
           isCompaction: hadCompactionRequest,
         });
+        if (
+          !this.coordinator.isCurrentTurn(turn) ||
+          !this.coordinator.isCurrentOperation(operation)
+        )
+          return;
+      }
+      // An aborted compaction never reaches its follow-up (the queue is cleared below), so the
+      // evaluator spend it carried for that follow-up cannot ride the follow-up's accounting.
+      if (hadCompactionRequest && this.pendingEvaluatorGoalCostUsd != null) {
+        await this.settlePendingEvaluatorGoalCharge();
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -9192,6 +9816,7 @@ export class AgentSession {
         return;
       }
       if (payload.type === "stream-start" && this.coordinator.streamStarted(payload)) {
+        this.adoptPreparedRouting(payload);
         this.emitChatEvent(payload);
       }
     });
@@ -9542,6 +10167,7 @@ export class AgentSession {
       return { accepted: false };
     }
     holder.pending = level;
+    holder.manual = true;
     return { accepted: true };
   }
 
@@ -10747,16 +11373,30 @@ export class AgentSession {
         workspaceId: this.workspaceId,
       });
     }
+    const persistedRoutingRecord =
+      followUp.autoModelRouting != null
+        ? AutoModelRoutingRecordSchema.safeParse(followUp.autoModelRouting)
+        : undefined;
+    if (persistedRoutingRecord != null && !persistedRoutingRecord.success) {
+      log.warn("Ignoring malformed persisted autoModelRouting record on compaction follow-up", {
+        workspaceId: this.workspaceId,
+      });
+    }
 
     // Build options for the follow-up message from the preserved send settings captured
     // when the compaction handoff was staged. Avoid forwarding internal-only recovery flags.
-    const options: SendMessageOptions & {
+    const options: ResolvedSendMessageOptions & {
       fileParts?: FilePart[];
       muxMetadata?: MuxMessageMetadata;
     } = {
       model: effectiveModel,
       agentId: effectiveAgentId,
       thinkingLevel: followUp.thinkingLevel,
+      // Restores the Auto badge and the routed-model resume path without reclassifying. Same
+      // raw JSON boundary as toolPolicy above: a malformed record is dropped, not forwarded.
+      ...(persistedRoutingRecord?.success
+        ? { autoModelRoutingRecord: persistedRoutingRecord.data }
+        : {}),
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,

@@ -19,7 +19,7 @@ import {
   THINKING_LEVEL_OFF,
   anthropicRejectsDisabledThinking,
   anthropicSupportsNativeXhigh,
-  isGrok46Model,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
@@ -90,7 +90,7 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
- * - xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
+ * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
  * - xai:grok-4.5 → ["low", "medium", "high"] (reasoning cannot be disabled)
  * - zai:glm-5.3-flash → ["low", "high", "max"] (reasoning cannot be disabled)
  * - default → ["off", "low", "medium", "high"] (standard 4 levels; xhigh is opt-in per model)
@@ -133,9 +133,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // proxies encode (e.g. `mux-gateway:openai/gpt-5.5-pro` -> `gpt-5.5-pro`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
-  // Mythos-class models (Fable/Mythos) cannot disable thinking — the API rejects
-  // `thinking: { type: "disabled" }` and always thinks (adaptive by default) — so
-  // "off" is not offered and requests for it clamp up to "low".
+  // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
+  // API rejects `thinking: { type: "disabled" }` and always thinks (adaptive by
+  // default) — so "off" is not offered and requests for it clamp up to "low".
   if (anthropicRejectsDisabledThinking(modelString)) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
@@ -172,8 +172,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "medium", "high", "xhigh", "max"];
   }
 
-  // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
-  // the native "max" reasoning effort introduced at GA.
+  // GPT-5.6 and GPT-6 Sol/Luna support both disabled reasoning and native max.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
@@ -216,9 +215,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "high"];
   }
 
-  // Frontier Grok models always reason. Grok 4.6 adds native xhigh effort;
+  // Frontier Grok models always reason. Grok 4.6/4.7 support native xhigh effort;
   // Grok 4.5 supports configurable low/medium/high.
-  if (isGrok46Model(withoutProviderNamespace)) {
+  if (grokSupportsNativeXhigh(withoutProviderNamespace)) {
     return ["low", "medium", "high", "xhigh"];
   }
   if (isGrokFrontierModel(withoutProviderNamespace)) {

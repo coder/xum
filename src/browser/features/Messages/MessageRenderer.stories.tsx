@@ -1183,3 +1183,109 @@ export const LargeDiff: AppStory = {
     />
   ),
 };
+
+export const AutoModelRoutingBadges: AppStory = {
+  parameters: { pixel: { matrix: PIXEL_DUAL_THEME } },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        const withRouting = (
+          message: ChatMuxMessage,
+          autoModelRouting: NonNullable<ChatMuxMessage["metadata"]>["autoModelRouting"]
+        ): ChatMuxMessage => ({
+          ...message,
+          metadata: { ...message.metadata, autoModelRouting },
+        });
+        const messages: ChatMuxMessage[] = [
+          createUserMessage("msg-1", "Rename the helper in utils.ts", {
+            historySequence: 1,
+            timestamp: STABLE_TIMESTAMP - 60000,
+          }),
+          withRouting(
+            createAssistantMessage("msg-2", "Renamed it and updated the two call sites.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 55000,
+              model: "openai:gpt-5.5-mini",
+            }),
+            {
+              requestedFallbackModel: "anthropic:claude-opus-4-6",
+              tierId: "easy",
+              tierLabel: "Easy",
+              confidence: 0.91,
+              probabilities: { easy: 0.91, medium: 0.07, hard: 0.02, extreme: 0 },
+              model: "openai:gpt-5.5-mini",
+              status: "routed",
+            }
+          ),
+          createUserMessage("msg-3", "Now redesign the scheduler around a work-stealing queue", {
+            historySequence: 3,
+            timestamp: STABLE_TIMESTAMP - 30000,
+          }),
+          withRouting(
+            createAssistantMessage("msg-4", "Here is the design and a migration plan.", {
+              historySequence: 4,
+              timestamp: STABLE_TIMESTAMP - 25000,
+              model: "anthropic:claude-opus-4-6",
+            }),
+            {
+              requestedFallbackModel: "anthropic:claude-opus-4-6",
+              tierId: "extreme",
+              // Label at the schema cap: the badge truncates it, the tooltip keeps it whole.
+              tierLabel: "Architecture and cross-cutting w",
+              confidence: 0.64,
+              probabilities: { easy: 0.01, medium: 0.05, hard: 0.3, extreme: 0.64 },
+              model: "anthropic:claude-opus-4-6",
+              status: "unmapped-tier",
+            }
+          ),
+          createUserMessage("msg-5", "Also fix the flaky test", {
+            historySequence: 5,
+            timestamp: STABLE_TIMESTAMP - 10000,
+          }),
+          withRouting(
+            createAssistantMessage("msg-6", "The flake came from an unawaited cleanup.", {
+              historySequence: 6,
+              timestamp: STABLE_TIMESTAMP - 5000,
+              model: "anthropic:claude-opus-4-6",
+            }),
+            {
+              requestedFallbackModel: "anthropic:claude-opus-4-6",
+              model: "anthropic:claude-opus-4-6",
+              status: "fallback",
+              reason: "Evaluation model returned HTTP 429",
+            }
+          ),
+          createUserMessage("msg-7", "Why does the retry loop double-count?", {
+            historySequence: 7,
+            timestamp: STABLE_TIMESTAMP - 4000,
+          }),
+          // Thinking-only routing: the composer model stays, Auto set the effort.
+          withRouting(
+            createAssistantMessage("msg-8", "The counter increments before the guard.", {
+              historySequence: 8,
+              timestamp: STABLE_TIMESTAMP - 2000,
+              model: "anthropic:claude-opus-4-6",
+            }),
+            {
+              requestedFallbackModel: "anthropic:claude-opus-4-6",
+              tierId: "hard",
+              tierLabel: "Hard",
+              model: "anthropic:claude-opus-4-6",
+              thinkingLevel: "high",
+              status: "routed",
+            }
+          ),
+        ];
+        return setupSimpleChatStory({ workspaceId: "ws-auto-routing-badges", messages });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitFor(() => {
+      const badges = storyRoot.querySelectorAll("[data-auto-model-routing-badge]");
+      if (badges.length !== 4) throw new Error(`Expected 4 routing badges, saw ${badges.length}`);
+    });
+  },
+};

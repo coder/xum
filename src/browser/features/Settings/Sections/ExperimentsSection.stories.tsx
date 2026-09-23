@@ -1,3 +1,4 @@
+import type { ComponentType } from "react";
 import { expect, waitFor, within } from "@storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -126,5 +127,78 @@ export const HeartbeatSettingsEnabled: Story = {
     await waitFor(() =>
       expect(heartbeatPrompt).toHaveValue("Review pending work before continuing.")
     );
+  },
+};
+
+export const AutoModelRoutingEnabled: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+          providersConfig: {
+            anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          },
+        })
+      }
+    >
+      <ExperimentsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // The nested panel renders the evaluation model field, the default tier rows, and the
+    // preview control.
+    await canvas.findByLabelText("Evaluation model");
+    await canvas.findByLabelText("Tier 4 description");
+    await canvas.findByRole("button", { name: "Add tier" });
+  },
+};
+
+// Pixel's named phone viewport width. The test-runner ignores viewport globals and plays at
+// desktop size, so the decorator forces this width; the clamp keeps the narrower local
+// `mobile1` viewport from clipping the frame.
+const PHONE_VIEWPORT_WIDTH = 390;
+
+function PhoneWidthDecorator(Story: ComponentType) {
+  return (
+    <div
+      data-phone-frame
+      style={{ width: `min(100vw, ${PHONE_VIEWPORT_WIDTH}px)`, overflow: "hidden" }}
+    >
+      <Story />
+    </div>
+  );
+}
+
+export const AutoModelRoutingEnabledPhone: Story = {
+  ...AutoModelRoutingEnabled,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  decorators: [PhoneWidthDecorator],
+  play: async ({ canvasElement, parameters, globals }) => {
+    await expect(parameters).toMatchObject({ pixel: { matrix: { viewports: ["phone"] } } });
+    await expect(globals).toMatchObject({ viewport: { value: "mobile1" } });
+
+    const canvas = within(canvasElement);
+    await canvas.findByLabelText("Tier 4 description");
+    await canvas.findByRole("button", { name: "Add tier" });
+
+    const frame = canvasElement.querySelector("[data-phone-frame]");
+    const section = canvasElement.querySelector("[data-auto-model-routing-config]");
+    if (!(frame instanceof HTMLElement) || !(section instanceof HTMLElement)) {
+      throw new Error("Phone frame or routing section did not render");
+    }
+    const frameRight = frame.getBoundingClientRect().right;
+    // Nothing in the routing panel may extend past the phone frame: inputs, selectors, and
+    // the per-tier controls must all fit inside the narrow column.
+    await waitFor(async () => {
+      await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+      for (const element of section.querySelectorAll<HTMLElement>("input, button, textarea")) {
+        await expect(element.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
+      }
+    });
   },
 };

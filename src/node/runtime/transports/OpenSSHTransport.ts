@@ -135,7 +135,6 @@ export class OpenSSHTransport implements SSHTransport {
       cwd: process.cwd(),
       cols: params.cols,
       rows: params.rows,
-      preferElectronBuild: false,
     });
   }
 

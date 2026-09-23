@@ -160,6 +160,7 @@ import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntr
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 
 // Experiments
 export const experiments = {
@@ -2620,6 +2621,7 @@ export const config = {
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
       modelFallbacks: ModelFallbacksSchema.optional(),
+      autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
@@ -2703,6 +2705,52 @@ export const config = {
       modelFallbacks: ModelFallbacksSchema,
     }),
     output: z.void(),
+  },
+  updateAutoModelRouting: {
+    input: z.object({
+      // Full replacement. This schema enforces tier shape and count; the backend only
+      // dedupes ids before persisting.
+      autoModelRouting: AutoModelRoutingConfigSchema,
+    }),
+    output: z.void(),
+  },
+  getAutoModelRoutingEvaluationStatus: {
+    // Omit to check the saved evaluation model; pass one to check an unsaved edit.
+    input: z.object({ evaluationModel: z.string().optional() }).optional(),
+    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    output: z.object({
+      evaluationModel: z.string(),
+      available: z.boolean(),
+      reason: z.string().optional(),
+    }),
+  },
+  previewAutoModelRouting: {
+    input: z.object({
+      prompt: z.string().min(1),
+      /**
+       * The preview is a paid evaluator request outside any turn. Usage ledgers are
+       * per-workspace, so the panel names the workspace it bills (the one last selected) and
+       * the backend refuses to spend without one it knows.
+       */
+      workspaceId: z.string().min(1),
+      /**
+       * The tiers and evaluator the panel shows. The panel saves edits optimistically, so a
+       * preview must classify against what the user sees, not the last persisted config.
+       */
+      config: AutoModelRoutingConfigSchema.optional(),
+    }),
+    output: ResultSchema(
+      z.object({
+        tierId: z.string(),
+        tierLabel: z.string(),
+        confidence: z.number().optional(),
+        probabilities: z.record(z.string(), z.number()).optional(),
+        evaluationModel: z.string(),
+        model: z.string().optional(),
+        thinkingLevel: ThinkingLevelSchema.optional(),
+      }),
+      z.string()
+    ),
   },
   updateCoderPrefs: {
     input: z

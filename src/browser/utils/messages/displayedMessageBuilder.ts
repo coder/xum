@@ -524,6 +524,7 @@ function appendAssistantTextRow(
       message.metadata?.routedThroughGateway
     ),
     modelFallback: message.metadata?.modelFallback,
+    autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
     agentId: message.metadata?.agentId ?? message.metadata?.mode,
     timestamp: part.timestamp ?? options.baseTimestamp,

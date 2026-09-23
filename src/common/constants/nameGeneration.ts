@@ -12,7 +12,7 @@ import { getKnownModel } from "@/common/constants/knownModels";
  */
 export const NAME_GEN_PREFERRED_MODELS = [
   getKnownModel("HAIKU").id,
-  getKnownModel("GPT_56_LUNA").id,
+  getKnownModel("GPT_6_LUNA").id,
 ];
 
 /**

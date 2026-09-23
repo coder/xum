@@ -19,6 +19,7 @@ import type {
   AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
+import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
 
@@ -230,6 +231,11 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * AgentSession.inheritOpenWorkspaceTurnMetadata).
    */
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Auto routing decision made for the diverted send. The redispatched turn
+   * persists it instead of classifying (and billing) again.
+   */
+  autoModelRouting?: AutoModelRoutingRecord;
 }
 
 /**
@@ -1022,6 +1028,8 @@ export interface MuxMetadata {
    * order. Refused-attempt token usage is attributed via toolModelUsages.
    */
   modelFallback?: ModelFallbackRecord;
+  /** Present when the composer's Auto entry classified this turn's difficulty. */
+  autoModelRouting?: AutoModelRoutingRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
@@ -1309,6 +1317,8 @@ export type DisplayedMessage =
       routeProvider?: string;
       /** Present when a fallback model answered after the requested model refused. */
       modelFallback?: ModelFallbackRecord;
+      /** Present when the composer's Auto entry routed this turn by difficulty. */
+      autoModelRouting?: AutoModelRoutingRecord;
       agentId?: string; // Agent id active when this message was sent (assistant messages only)
       /** @deprecated Legacy base mode derived from agent definition. */
       mode?: AgentMode;

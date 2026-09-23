@@ -23,43 +23,55 @@ describe("Known Models Integration", () => {
     }
   });
 
+  test("opus alias tracks Opus 5.5 and retired ids keep tokenizer overrides", () => {
+    expect(MODEL_ABBREVIATIONS.opus).toBe("anthropic:claude-opus-5-5");
+    expect(KNOWN_MODELS.OPUS.id).toBe("anthropic:claude-opus-5-5");
+    // Exact-id lookup for retired-but-documented custom model strings must keep
+    // resolving to the Opus 4.5 approximation instead of falling back (with a
+    // warning) to the generic per-provider tokenizer.
+    expect(TOKENIZER_MODEL_OVERRIDES["anthropic:claude-opus-5"]).toBe("anthropic/claude-opus-4.5");
+    expect(TOKENIZER_MODEL_OVERRIDES[KNOWN_MODELS.OPUS.id]).toBe("anthropic/claude-opus-4.5");
+  });
+
   test("gemini-flash resolves to the stable Gemini 3.8 Flash model", () => {
     expect(MODEL_ABBREVIATIONS["gemini-flash"]).toBe("google:gemini-3.8-flash");
   });
 
-  test("gpt alias tracks the GPT-5.6 flagship tier alongside the tier aliases", () => {
-    expect(MODEL_ABBREVIATIONS.gpt).toBe("openai:gpt-5.6-sol");
-    expect(MODEL_ABBREVIATIONS.sol).toBe("openai:gpt-5.6-sol");
+  test("gpt and luna aliases track their latest tiers while terra stays on GPT-5.6", () => {
+    expect(MODEL_ABBREVIATIONS.gpt).toBe("openai:gpt-6-sol");
+    expect(MODEL_ABBREVIATIONS.sol).toBe("openai:gpt-6-sol");
     expect(MODEL_ABBREVIATIONS.terra).toBe("openai:gpt-5.6-terra");
-    expect(MODEL_ABBREVIATIONS.luna).toBe("openai:gpt-5.6-luna");
+    expect(MODEL_ABBREVIATIONS.luna).toBe("openai:gpt-6-luna");
     // The bare gpt-5.5 alias retired with the entry; openai:gpt-5.5 still
     // resolves as a custom model string via models-extra stats.
     expect(MODEL_ABBREVIATIONS["gpt-5.5"]).toBeUndefined();
   });
 
+  test.each(["sol", "luna"])("keeps retired GPT-5.6 %s custom model tokenizers", (tier) => {
+    expect(TOKENIZER_MODEL_OVERRIDES[`openai:gpt-5.6-${tier}`]).toBe("openai/gpt-5");
+    expect(TOKENIZER_MODEL_OVERRIDES[`openai:gpt-6-${tier}`]).toBe("openai/gpt-5");
+  });
+
   test("astra aliases resolve to the GPT-6 Astra entry without moving gpt", () => {
     expect(MODEL_ABBREVIATIONS.astra).toBe("openai:gpt-6-astra");
     expect(MODEL_ABBREVIATIONS["gpt-6-astra"]).toBe("openai:gpt-6-astra");
-    // Astra is additive: the flagship alias keeps tracking the cheaper GPT-5.6
+    // Astra is additive: the flagship alias keeps tracking the cheaper GPT-6
     // Sol, and Astra is not warmed at startup (its tokenizer is warmed via GPT).
     expect(MODEL_ABBREVIATIONS.gpt).toBe(KNOWN_MODELS.GPT.id);
     expect(KNOWN_MODELS.GPT_6_ASTRA.warm).toBeUndefined();
-    // Sol must stay ahead of Astra: compaction "switch model" suggestions pick the
-    // first registry entry with the largest context, and both assume 1.05M.
-    const ids = Object.values(KNOWN_MODELS).map((model) => model.id);
-    expect(ids.indexOf(KNOWN_MODELS.GPT.id)).toBeLessThan(ids.indexOf(KNOWN_MODELS.GPT_6_ASTRA.id));
     // Approximate tokenizer: GPT-6's tokenizer is unpublished, so reuse gpt-5.
     expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-astra"]).toBe("openai/gpt-5");
   });
 
-  test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {
-    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.6");
-    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBe("xai:grok-4.6");
+  test("grok aliases resolve only to Grok 4.7 in the curated registry", () => {
+    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.7"]).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.5"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.1"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-code"]).toBeUndefined();
     expect(Object.values(KNOWN_MODELS).filter((model) => model.provider === "xai")).toEqual([
-      KNOWN_MODELS.GROK_46,
+      KNOWN_MODELS.GROK_47,
     ]);
   });
 

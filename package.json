@@ -1,6 +1,6 @@
 {
   "name": "@coder/xum",
-  "version": "0.29.0",
+  "version": "0.30.0",
   "desktopName": "xum.desktop",
   "description": "xum - coding agent multiplexer",
   "author": "Coder",
@@ -44,20 +44,20 @@
     "docs:watch": "make docs-watch",
     "storybook": "make storybook",
     "storybook:build": "make storybook-build",
-    "test:storybook": "make test-storybook",
-    "postinstall": "sh scripts/postinstall.sh"
+    "test:storybook": "make test-storybook"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.25.0",
-    "@ai-sdk/amazon-bedrock": "^5.0.15",
-    "@ai-sdk/anthropic": "^4.0.11",
-    "@ai-sdk/deepseek": "^3.0.7",
-    "@ai-sdk/google": "^4.0.11",
-    "@ai-sdk/moonshotai": "^3.0.15",
-    "@ai-sdk/openai": "^4.0.43",
-    "@ai-sdk/openai-compatible": "^3.0.7",
+    "@ai-sdk/amazon-bedrock": "^5.0.88",
+    "@ai-sdk/anthropic": "^4.0.58",
+    "@ai-sdk/deepseek": "^3.0.49",
+    "@ai-sdk/google": "^4.0.76",
+    "@ai-sdk/moonshotai": "^3.0.54",
+    "@ai-sdk/openai": "^4.0.71",
+    "@ai-sdk/openai-compatible": "^3.0.53",
+    "@ai-sdk/typesafe-ai": "^3.0.4",
     "@ai-sdk/xai": "^4.0.37",
-    "@ai-sdk/zai": "^3.0.2",
+    "@ai-sdk/zai": "^3.0.15",
     "@aws-sdk/credential-providers": "^3.940.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
@@ -94,7 +94,7 @@
     "@vercel/ai-sdk-openai-websocket-fetch": "^1.0.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
-    "ai": "7.0.19",
+    "ai": "7.0.107",
     "ai-tokenizer": "^1.0.6",
     "ajv": "^8.20.0",
     "chalk": "^5.6.2",
@@ -160,7 +160,6 @@
     "@babel/preset-react": "^7.28.5",
     "@babel/preset-typescript": "^7.28.5",
     "@coder/pixel-storybook": "0.3.0",
-    "@electron/rebuild": "^4.0.4",
     "@eslint/js": "^9.36.0",
     "@playwright/test": "^1.56.0",
     "@storybook/addon-docs": "^10.0.0",
@@ -180,6 +179,7 @@
     "@types/katex": "^0.16.7",
     "@types/markdown-it": "^14.1.2",
     "@types/minimist": "^1.2.5",
+    "@types/node": "^24.9.0",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@types/ssh2": "^1.15.0",
@@ -239,8 +239,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^40.9.3",
-    "node-pty": "1.1.0-beta39"
+    "electron": "^40.9.3"
   },
   "files": [
     "dist/**/*.js",
@@ -255,7 +254,6 @@
     "dist/**/*.png",
     "dist/assets/**/*",
     "patches/**/*",
-    "scripts/postinstall.sh",
     "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
@@ -286,7 +284,7 @@
     "asarUnpack": [
       "dist/**/*.wasm",
       "dist/**/*.map",
-      "**/node_modules/node-pty/build/**/*",
+      "**/node_modules/@lydell/**/*",
       "**/node_modules/@duckdb/**/*.node",
       "**/node_modules/sharp/**/*",
       "**/node_modules/@img/**/*"
@@ -335,7 +333,6 @@
     "esbuild",
     "geckodriver",
     "lzma-native",
-    "node-pty",
     "sharp",
     "ssh2",
     "unrs-resolver"

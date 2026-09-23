@@ -44,9 +44,10 @@ describe("getThinkingDisplayLabel", () => {
     expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra-mini")).toBe("XHIGH");
   });
 
-  test("returns XHIGH for xhigh on Grok 4.6 (native effort), MAX on Grok 4.5", () => {
+  test("returns XHIGH for xhigh on Grok 4.6/4.7 (native effort), MAX on Grok 4.5", () => {
+    expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.7")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:xai/grok-4.7")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.6")).toBe("XHIGH");
-    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:xai/grok-4.6")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.5")).toBe("MAX");
   });
 

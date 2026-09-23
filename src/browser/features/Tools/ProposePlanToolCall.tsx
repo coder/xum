@@ -621,6 +621,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentId: args.targetAgentId,
         model: settings.resolvedModel,
         thinkingLevel: settings.resolvedThinking,
+        // The target agent's model and thinking level are explicit; classifying
+        // "Implement the plan" would reroute them based on a prompt that says nothing
+        // about the plan's difficulty.
+        autoModelRouting: false,
+        autoThinkingLevel: false,
       },
     });
   };

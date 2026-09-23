@@ -6,6 +6,7 @@ import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogConte
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
+import type { AutoRoutingDimension } from "@/browser/hooks/useSendMessageOptions";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -113,6 +114,11 @@ export interface BuildSourcesParams {
   onToggleReasoningMode: (workspaceId: string) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
+  autoModelRoutingEnabled?: boolean;
+  /** Composer Auto flag for one dimension, keyed by workspace or creation scope. */
+  getAutoRouting?: (scopeId: string, dimension: AutoRoutingDimension) => boolean;
+  onSetAutoRouting?: (scopeId: string, dimension: AutoRoutingDimension, active: boolean) => void;
   /** Effective model currently displayed by the workspace or creation composer. */
   getEffectiveComposerModel: (scopeId: string) => string;
   /** Providers config for route-aware provider-option availability. */
@@ -1335,6 +1341,39 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             run: p.onToggleFastMode,
           }
         : null;
+    // The picker rows are the only pointer path to Auto; the model-cycle and thinking-step
+    // shortcuts pick concrete values and so can only leave it.
+    const getAutoRouting = p.getAutoRouting;
+    const onSetAutoRouting = p.onSetAutoRouting;
+    const autoRoutingActions: CommandAction[] =
+      p.autoModelRoutingEnabled === true &&
+      providerOptionScopeId != null &&
+      getAutoRouting != null &&
+      onSetAutoRouting != null
+        ? (
+            [
+              { dimension: "model", title: "Toggle Auto Model Routing", what: "the model" },
+              {
+                dimension: "thinkingLevel",
+                title: "Toggle Auto Thinking Effort",
+                what: "the thinking effort",
+              },
+            ] as const
+          ).map(({ dimension, title, what }) => {
+            const active = getAutoRouting(providerOptionScopeId, dimension);
+            return {
+              id: CommandIds.toggleAutoRouting(dimension),
+              title,
+              subtitle: active
+                ? `Current: Auto (the evaluation model picks ${what} for each prompt)`
+                : "Current: manual",
+              section: section.mode,
+              run: () => {
+                onSetAutoRouting(providerOptionScopeId, dimension, !active);
+              },
+            };
+          })
+        : [];
 
     if (selectedWorkspace) {
       const { workspaceId } = selectedWorkspace;
@@ -1418,6 +1457,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       });
 
+      list.push(...autoRoutingActions);
       if (fastModeAction) {
         list.push(fastModeAction);
       }
@@ -1453,9 +1493,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         });
       }
-    } else if (fastModeAction) {
-      // Creation composers use their project-scoped model preference before a workspace exists.
-      list.push(fastModeAction);
+    } else {
+      // Creation composers use their project-scoped preferences before a workspace exists.
+      list.push(...autoRoutingActions);
+      if (fastModeAction) list.push(fastModeAction);
     }
 
     return list;
@@ -1717,7 +1758,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.settingsOpenSection("providers-coder-login"),
         title: "Settings: Login with Coder",
-        subtitle: "Connect to a Coder deployment (AI Bridge)",
+        subtitle: "Connect to a Coder deployment (AI Gateway)",
         section: section.settings,
         keywords: ["coder", "login", "oauth", "aibridge", "deployment", "connect"],
         // Hidden when a custom OpenAI-compatible provider shadows the "coder"

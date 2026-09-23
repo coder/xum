@@ -17,6 +17,7 @@ describe("formatCompactModelDisplayName", () => {
 
   test("falls back to the full display name when no shorter label is clearer", () => {
     expect(formatCompactModelDisplayName("claude-opus-5")).toBe("Opus 5");
+    expect(formatCompactModelDisplayName("claude-opus-5-5")).toBe("Opus 5.5");
     expect(formatCompactModelDisplayName("gpt-5.3-codex-spark")).toBe("Spark 5.3");
   });
 });

@@ -2144,6 +2144,7 @@ export class StreamingMessageAggregator {
         existingMessage.metadata.model = data.model;
         existingMessage.metadata.routedThroughGateway = data.routedThroughGateway;
         existingMessage.metadata.routeProvider = routeProvider;
+        existingMessage.metadata.autoModelRouting = data.autoModelRouting;
         if (data.agentId != null) {
           existingMessage.metadata.agentId = data.agentId;
         }
@@ -2165,6 +2166,7 @@ export class StreamingMessageAggregator {
       model: data.model,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
+      autoModelRouting: data.autoModelRouting,
       agentId: data.agentId,
       mode: data.mode,
       thinkingLevel: data.thinkingLevel,

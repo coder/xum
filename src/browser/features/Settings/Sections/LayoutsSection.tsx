@@ -160,7 +160,9 @@ interface PersistedWorkspaceSelection {
   workspaceId: string;
 }
 
-function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorkspaceSelection {
+export function isPersistedWorkspaceSelection(
+  value: unknown
+): value is PersistedWorkspaceSelection {
   if (!value || typeof value !== "object") {
     return false;
   }
@@ -169,7 +171,7 @@ function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorksp
   return typeof candidate.workspaceId === "string";
 }
 
-function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
+export function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
   return `${projectName}/${namedWorkspacePath.split("/").pop() ?? namedWorkspacePath}`;
 }
 

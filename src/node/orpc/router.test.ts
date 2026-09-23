@@ -4,11 +4,112 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { Ok } from "@/common/types/result";
+import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 
 import type { ORPCContext } from "./context";
 import { inFlightProcedureCount } from "./inFlightProcedures";
 import { router } from "./router";
+
+describe("config.previewAutoModelRouting", () => {
+  const PREVIEW_TIERS = {
+    tiers: [
+      { id: "easy", label: "Easy", description: "Trivial" },
+      { id: "hard", label: "Hard", description: "Complex", model: "openai:gpt-5.5" },
+    ],
+  };
+  const EVALUATOR_USAGE = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+
+  function createPreviewClient(verdict: AutoModelRoutingDecision) {
+    const classifyEffect = mock((_input: unknown) => Effect.succeed(Ok(verdict)));
+    const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
+    const context = {
+      config: {
+        loadConfigOrDefault: () => ({}),
+        // Only ws-live is registered; a stale persisted selection resolves to nothing.
+        findWorkspace: (workspaceId: string) =>
+          workspaceId === "ws-live" ? { workspacePath: "/repo/ws", projectPath: "/repo" } : null,
+      },
+      initStateManager: { waitForInit: mock(async () => undefined) },
+      sessionUsageService: { recordHeadlessUsage },
+      "effect/context": Context.make(AutoModelRouterTag, {
+        classifyEffect,
+      } as unknown as AutoModelRouter),
+    } as unknown as ORPCContext;
+    return {
+      client: createRouterClient(router(), { context }),
+      classifyEffect,
+      recordHeadlessUsage,
+    };
+  }
+
+  test("bills the evaluator's usage to the named workspace like the send path", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient({
+      tierId: "hard",
+      confidence: 0.8,
+      evaluationModel: "typesafe:jev-latest",
+      usage: EVALUATOR_USAGE,
+      providerMetadata: { typesafe: { requestId: "req-1" } },
+    });
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result).toEqual(
+      Ok({
+        tierId: "hard",
+        tierLabel: "Hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        model: "openai:gpt-5.5",
+      })
+    );
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]).toEqual([
+      "ws-live",
+      "typesafe:jev-latest",
+      EVALUATOR_USAGE,
+      { typesafe: { requestId: "req-1" } },
+      { analyticsSource: "auto_model_routing_preview" },
+    ]);
+  });
+
+  test("a verdict naming a tier the panel no longer has still bills its usage", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient({
+      tierId: "extreme",
+      evaluationModel: "typesafe:jev-latest",
+      usage: EVALUATOR_USAGE,
+    });
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(true);
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+  });
+
+  test("refuses a workspace it does not know before calling the evaluator", async () => {
+    const { client, classifyEffect, recordHeadlessUsage } = createPreviewClient({
+      tierId: "hard",
+      evaluationModel: "typesafe:jev-latest",
+      usage: EVALUATOR_USAGE,
+    });
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-removed",
+      config: PREVIEW_TIERS,
+    });
+    expect(result.success).toBe(false);
+    expect(classifyEffect).not.toHaveBeenCalled();
+    expect(recordHeadlessUsage).not.toHaveBeenCalled();
+  });
+});
 
 describe("router agent skill routes", () => {
   test("subproject workspaces inherit parent skills with nearest precedence", async () => {

@@ -412,7 +412,7 @@ function pluginToolCalls(options: { nested?: boolean }): MuxToolPart[] {
     state: "output-available",
     input: { task: "Run the UAT round on the pushed SHA", organization_id: "703f72a1" },
     output: text("Created chat 6b1c… (running)."),
-    mcpServer: coderSnapshot(CODER_A_KEY, "2.0.0"),
+    mcpServer: coderSnapshot(CODER_A_KEY, "v2.37.2-devel+a970c6c92e"),
   };
   const listTemplates: MuxToolPart = {
     type: "dynamic-tool",
@@ -538,7 +538,10 @@ export const PluginServerDetails: AppStory = {
     });
     // The popover keeps the exact configured connection the label dropped.
     await expect(dialog).toHaveTextContent(CODER_A_KEY);
-    await expect(dialog).toHaveTextContent("v2.0.0");
+    // Match the whole version label so a duplicate prefix cannot pass.
+    await expect(
+      within(dialog).getByText("v2.37.2-devel+a970c6c92e", { exact: true })
+    ).toBeVisible();
     await expect(dialog).toHaveTextContent("stdio");
     await expect(create.card).not.toHaveTextContent("Arguments");
     await userEvent.keyboard("{Escape}");

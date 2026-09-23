@@ -9,6 +9,7 @@ import { StreamErrorTypeSchema } from "./errors";
 import {
   FilePartSchema,
   ModelFallbackRecordSchema,
+  AutoModelRoutingRecordSchema,
   MuxMessageSchema,
   MuxReasoningPartSchema,
   MuxTextPartSchema,
@@ -188,6 +189,9 @@ export const StreamStartEventSchema = z.object({
     }),
   routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
+  autoModelRouting: AutoModelRoutingRecordSchema.optional().meta({
+    description: "Auto-model-routing provenance, present when the turn was routed by difficulty",
+  }),
   historySequence: z.number().meta({
     description: "Backend assigns global message ordering",
   }),
@@ -275,6 +279,8 @@ export const StreamEndEventSchema = z.object({
       routeProvider: z.string().optional(),
       // Present when a fallback model answered after the requested model refused.
       modelFallback: ModelFallbackRecordSchema.optional(),
+      // Present when the composer's Auto entry routed this turn.
+      autoModelRouting: AutoModelRoutingRecordSchema.optional(),
       // Total usage across all steps (for cost calculation)
       usage: LanguageModelV2UsageSchema.optional(),
       // Last step's usage only (for context window display - inputTokens = current context size)
@@ -945,6 +951,19 @@ export const SendMessageOptionsSchema = z.object({
    */
   skipAiSettingsPersistence: z.boolean().optional(),
   experiments: ExperimentsSchema.optional(),
+  /**
+   * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
+   * difficulty and run on the matching tier's model. `model` stays the concrete
+   * composer model and doubles as the fallback; the backend strips this flag from the
+   * resolved options so retries and resumes never re-classify.
+   */
+  autoModelRouting: z.boolean().optional(),
+  /**
+   * Composer thinking level set to "Auto": the same classification picks the tier's
+   * thinking level. Independent of `autoModelRouting`; `thinkingLevel` stays the
+   * composer's concrete level and doubles as the fallback.
+   */
+  autoThinkingLevel: z.boolean().optional(),
   /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when

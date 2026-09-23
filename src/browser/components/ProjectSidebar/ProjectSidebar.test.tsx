@@ -171,6 +171,7 @@ let archivePopoverShowErrorMock = mock(
 );
 
 let interruptibleWorkspaceIds = new Set<string>();
+let monitoredWorkspaceIds = new Set<string>();
 let workspaceStoreSubscriptions = new Map<string, () => void>();
 let activeWorkflowRunIdsByWorkspaceId = new Map<string, string[]>();
 
@@ -183,6 +184,7 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
     userProjects: new Map([[projectPath, { workspaces: [] }]]),
   });
   interruptibleWorkspaceIds = new Set();
+  monitoredWorkspaceIds = new Set();
   workspaceStoreSubscriptions = new Map();
   activeWorkflowRunIdsByWorkspaceId = new Map();
   installProjectSidebarTestDoubles();
@@ -589,6 +591,7 @@ function installProjectSidebarTestDoubles() {
         getWorkspaceMetadata: () => undefined,
         getWorkspaceSidebarState: (workspaceId: string) => ({
           canInterrupt: interruptibleWorkspaceIds.has(workspaceId),
+          activeBashMonitorCount: monitoredWorkspaceIds.has(workspaceId) ? 1 : 0,
           isStarting: false,
           awaitingUserQuestion: false,
           lastAbortReason: null,
@@ -1558,6 +1561,40 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     expect(view.queryByText("Multi-Project")).toBeNull();
     expect(view.queryByTestId(agentItemTestId("parent"))).toBeNull();
     expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+  });
+
+  test("shows a reported child only while its background Bash monitor is armed", () => {
+    const parentWorkspace = createWorkspace("parent");
+    const childWorkspace = {
+      ...createWorkspace("child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      taskExecutionStatus: "completed" as const,
+    };
+    // The stream hint stays true throughout, as it can during final-turn teardown.
+    // Arming/retiring a monitor must still trigger a render when isWorking is unchanged.
+    interruptibleWorkspaceIds.add("child");
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childWorkspace]]])
+        }
+        workspaceRecency={{}}
+      />
+    );
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    act(() => {
+      monitoredWorkspaceIds.add("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.getByTestId(agentItemTestId("child"))).toBeTruthy();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("1");
+    act(() => {
+      monitoredWorkspaceIds.delete("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("0");
   });
 
   test("keeps inactive persistent children out of the left sidebar", () => {

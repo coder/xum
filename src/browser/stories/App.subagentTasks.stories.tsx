@@ -1,4 +1,8 @@
 import type { ComponentType } from "react";
+import { expect, waitFor } from "@storybook/test";
+import { createMockORPCClient } from "./mocks/orpc";
+import { groupWorkspacesByProject } from "./mocks/workspaces";
+import { expandLeftSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
 
 import { getSubAgentTasksExpandedKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -76,6 +80,70 @@ function PhoneDecorator(Story: ComponentType) {
 export default {
   ...appMeta,
   title: "App/PersistentSubagents",
+};
+
+function setupMonitoredSubagentStory() {
+  const parent = createWorkspace({
+    id: PARENT_WORKSPACE_ID,
+    name: "waiting-for-verification",
+    projectName: PROJECT_NAME,
+    projectPath: PROJECT_PATH,
+  });
+  const child = {
+    ...createWorkspace({
+      id: "subagent-monitored",
+      name: "verification-watcher",
+      title: "Verification watcher",
+      projectName: PROJECT_NAME,
+      projectPath: PROJECT_PATH,
+      parentWorkspaceId: parent.id,
+      taskStatus: "reported",
+    }),
+    taskExecutionStatus: "completed" as const,
+  };
+  expandLeftSidebar();
+  collapseRightSidebar();
+  expandProjects([PROJECT_PATH]);
+  selectWorkspace(parent);
+  return createMockORPCClient({
+    projects: groupWorkspacesByProject([parent, child]),
+    workspaces: [parent, child],
+    workspaceActivitySnapshots: {
+      [child.id]: {
+        recency: STABLE_TIMESTAMP,
+        streaming: false,
+        lastModel: null,
+        lastThinkingLevel: null,
+        activeBashMonitorCount: 1,
+      },
+    },
+  });
+}
+
+export const BackgroundMonitor: AppStory = {
+  render: () => <AppWithMocks setup={setupMonitoredSubagentStory} />,
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } },
+  },
+  play: async ({ canvasElement }) => {
+    await waitFor(async () => {
+      const row = canvasElement.querySelector(
+        '[data-workspace-id="subagent-monitored"][role="button"]'
+      );
+      await expect(row).toBeVisible();
+    });
+  },
+};
+
+export const BackgroundMonitorPhone: AppStory = {
+  ...BackgroundMonitor,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  decorators: [PhoneDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
 };
 
 export const Expanded: AppStory = {

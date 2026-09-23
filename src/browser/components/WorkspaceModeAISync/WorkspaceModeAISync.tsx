@@ -13,7 +13,11 @@ import {
   AGENT_AI_DEFAULTS_KEY,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  leaveAutoRoutingForAgentSwitch,
+  setWorkspaceModelWithOrigin,
+  setWorkspaceThinkingLevelWithOrigin,
+} from "@/browser/utils/modelChange";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -83,6 +87,9 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    if (isExplicitAgentSwitch) {
+      leaveAutoRoutingForAgentSwitch(workspaceId);
+    }
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(
         workspaceId,
@@ -92,7 +99,11 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      setWorkspaceThinkingLevelWithOrigin(
+        workspaceId,
+        resolvedThinking,
+        isExplicitAgentSwitch ? "agent" : "sync"
+      );
     }
 
     if (existingReasoning !== resolvedReasoningMode) {

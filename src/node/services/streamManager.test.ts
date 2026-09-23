@@ -33,9 +33,17 @@ import {
 } from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
+  LiveTurnRouting,
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "./thinkingOverride";
+import {
+  createAutoThinkingEscalationState,
+  markAutoThinkingEscalationExhausted,
+  type AutoThinkingEscalationState,
+} from "./autoThinkingEscalation";
+import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import * as aiSdk from "ai";
 import {
@@ -4804,6 +4812,7 @@ describe("StreamManager - empty stream completions", () => {
       metadata?: {
         model?: string;
         modelFallback?: { requestedModel: string; refusedModels: string[] };
+        autoModelRouting?: { tierId?: string; model: string; thinkingLevel?: string };
         toolModelUsages?: Array<{
           toolName: string;
           model: string;
@@ -4891,7 +4900,18 @@ describe("StreamManager - empty stream completions", () => {
       model: KNOWN_MODELS.SONNET.id,
       metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
+      initialMetadata: {
+        agentId: "plan",
+        // An Auto-routed turn: the record must follow the swap to the model that answered
+        // and to the thinking level the fallback preparation clamped the tier's level to.
+        autoModelRouting: {
+          status: "routed",
+          tierId: "hard",
+          model: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "high",
+          requestedFallbackModel: "anthropic:claude-3-5-haiku-latest",
+        },
+      },
       runtime,
       request: { model: refusedLanguageModel, messages: [], providerOptions: undefined },
       modelFallback: {
@@ -4917,6 +4937,11 @@ describe("StreamManager - empty stream completions", () => {
     expect(metadata?.modelFallback).toEqual({
       requestedModel: KNOWN_MODELS.SONNET.id,
       refusedModels: [KNOWN_MODELS.SONNET.id],
+    });
+    expect(metadata?.autoModelRouting).toMatchObject({
+      tierId: "hard",
+      model: fallbackModel,
+      thinkingLevel: "off",
     });
     // Pin the IPC passthrough: the oRPC schema strips unknown metadata keys, so
     // modelFallback must survive StreamEndEventSchema or the live transcript
@@ -7706,7 +7731,8 @@ describe("StreamManager - mid-turn thinking override", () => {
   type BuildStreamRequestConfig = (input: Record<string, unknown>) => OverrideRequestForTests;
   type CreateStreamResult = (
     request: OverrideRequestForTests,
-    abortController: AbortController
+    abortController: AbortController,
+    stepTracker?: { autoThinkingEscalation?: AutoThinkingEscalationState }
   ) => unknown;
   type CapturedPrepareStep = (options: {
     messages: ModelMessage[];
@@ -7740,8 +7766,8 @@ describe("StreamManager - mid-turn thinking override", () => {
     }
     return {
       buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
-      createStreamResult: (request, abortController) =>
-        createStreamResultMethod.call(streamManager, request, abortController),
+      createStreamResult: (request, abortController, stepTracker) =>
+        createStreamResultMethod.call(streamManager, request, abortController, stepTracker),
     };
   }
 
@@ -7853,6 +7879,292 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
+  // Auto-set thinking escalation (autoThinkingEscalation.ts) rides the same override.
+  function stuckTranscript(): ModelMessage[] {
+    const failing = (index: number): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: `call-${index}`, toolName: "bash", input: { c: index } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "bash",
+            output: { type: "json", value: { success: false, error: "boom" } },
+          },
+        ],
+      },
+    ];
+    return [{ role: "user", content: "fix it" }, ...failing(0), ...failing(1), ...failing(2)];
+  }
+
+  test("a stuck Auto-set thinking level escalates through the rebuild and records provenance", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    const rebuild = mock((level: string) => ({
+      effectiveLevel: level as ThinkingLevel,
+      providerOptions: { anthropic: { effort: level } },
+    }));
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const transcript = stuckTranscript();
+    const step = await prepareStep({ messages: transcript, stepNumber: 3 });
+    expect(step?.providerOptions).toEqual({ anthropic: { effort: "medium" } });
+    expect(state.applied).toBe("medium");
+    expect(persisted.at(-1)).toMatchObject([{ step: 4, from: "low", to: "medium" }]);
+    // The judged steps do not fire again, and the user never touched the slider.
+    expect(await prepareStep({ messages: transcript, stepNumber: 4 })).toBeUndefined();
+    expect(state.manual).toBeUndefined();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  test("a slider move this turn disables Auto's escalation", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = { manual: true, applied: "off" };
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    const rebuild = mock(() => null);
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    expect(await prepareStep({ messages: stuckTranscript(), stepNumber: 3 })).toBeUndefined();
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(persisted).toEqual([]);
+  });
+
+  test("a raise a sparse ladder clamps upward is recorded at the level that applied", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("low", [], (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    // The model offers only low and high: the requested medium lands on high.
+    const rebuild = mock((level: string) => ({
+      effectiveLevel: (level === "medium" ? "high" : level) as ThinkingLevel,
+      providerOptions: { google: { thinkingLevel: level === "medium" ? "high" : level } },
+    }));
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const step = await prepareStep({ messages: stuckTranscript(), stepNumber: 3 });
+    expect(step?.providerOptions).toEqual({ google: { thinkingLevel: "high" } });
+    expect(state.applied).toBe("high");
+    // Provenance names the level the turn now runs at, and the ladder continues from it.
+    expect(persisted.at(-1)).toMatchObject([{ step: 4, from: "low", to: "high" }]);
+    expect(stepTracker.autoThinkingEscalation.level).toBe("high");
+    expect(stepTracker.autoThinkingEscalation.exhausted).toBe(false);
+  });
+
+  test("a raise the model ceiling clamps away is not provenance and ends further attempts", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { createStreamResult } = getRequestHelpers(streamManager);
+    const streamTextSpy = setupStreamTextSpy();
+
+    const state: ActiveTurnThinkingOverride = {};
+    const persisted: AutoModelRoutingEscalation[][] = [];
+    const stepTracker = {
+      autoThinkingEscalation: createAutoThinkingEscalationState("high", [], (escalations) =>
+        persisted.push(escalations)
+      ),
+    };
+    // The model tops out at high: the rebuild reports the clamped level as a no-op.
+    const rebuild = mock(() => null);
+    const request: OverrideRequestForTests = {
+      model,
+      messages,
+      system: "system",
+      providerOptions: {},
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel:
+        rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+    };
+    createStreamResult(request, new AbortController(), stepTracker);
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const transcript = stuckTranscript();
+    expect(await prepareStep({ messages: transcript, stepNumber: 3 })).toBeUndefined();
+    expect(persisted).toEqual([]);
+    expect(stepTracker.autoThinkingEscalation.exhausted).toBe(true);
+    // Three more failures would qualify again; the exhausted state stops the retry.
+    const longer = [...transcript, ...stuckTranscript().slice(1)];
+    expect(await prepareStep({ messages: longer, stepNumber: 6 })).toBeUndefined();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  test("startStream arms escalation only for an Auto-set thinking level, lands raises on the stream-end record, and reports live routing to the session", async () => {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/auto-escalation-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+    const raise: AutoModelRoutingEscalation = {
+      step: 4,
+      from: "low",
+      to: "medium",
+      reason: "3 consecutive steps with only failing tool calls",
+    };
+    const armed: Record<string, boolean> = {};
+    const sessionSaw: Record<string, LiveTurnRouting[]> = {};
+    let active: { workspaceId: string; holder: ActiveTurnThinkingOverride } | undefined;
+    // The mocked stream stands in for prepareStep: it reports whether escalation was armed
+    // for this stream, fires the provenance sink the way a recorded raise would, and then
+    // applies a slider move through the holder when the case asks for one.
+    Reflect.set(streamManager, "createStreamResult", () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          if (!active) throw new Error("Expected an active case");
+          const tracker = (
+            workspaceStreams.get(active.workspaceId) as {
+              stepTracker: { autoThinkingEscalation?: AutoThinkingEscalationState };
+            }
+          ).stepTracker;
+          armed[active.workspaceId] = tracker.autoThinkingEscalation != null;
+          tracker.autoThinkingEscalation?.onEscalated([raise]);
+          if (active.holder.manual) active.holder.onApplied?.("max");
+          yield { type: "text-delta", text: "done" };
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      )
+    );
+    const streamEnds: Array<{
+      metadata?: {
+        thinkingLevel?: string;
+        autoModelRouting?: { escalations?: unknown; thinkingLevel?: string; tierId?: string };
+      };
+    }> = [];
+    onTurnEngineEvent(streamManager, "stream-end", (data) =>
+      streamEnds.push(data as (typeof streamEnds)[number])
+    );
+    const routed = {
+      status: "routed" as const,
+      tierId: "hard",
+      model: "openai:gpt-4.1-mini",
+      requestedFallbackModel: "openai:gpt-4.1-mini",
+    };
+    const thinkingRouted = { ...routed, thinkingLevel: "low" as const };
+    const cases: Array<{
+      workspaceId: string;
+      autoModelRouting: typeof routed | typeof thinkingRouted;
+      holder: ActiveTurnThinkingOverride;
+    }> = [
+      { workspaceId: "auto-escalation-thinking", autoModelRouting: thinkingRouted, holder: {} },
+      { workspaceId: "auto-escalation-model-only", autoModelRouting: routed, holder: {} },
+      // The user moved the slider after the raise: Auto's claim (level and raises) is withdrawn.
+      {
+        workspaceId: "auto-escalation-manual",
+        autoModelRouting: thinkingRouted,
+        holder: { manual: true },
+      },
+    ];
+    for (const testCase of cases) {
+      active = testCase;
+      sessionSaw[testCase.workspaceId] = [];
+      testCase.holder.onLiveRoutingChanged = (live) => sessionSaw[testCase.workspaceId]?.push(live);
+      const messageId = `${testCase.workspaceId}-msg`;
+      await appendPartialAssistantForTests(testCase.workspaceId, messageId, 1);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId: testCase.workspaceId,
+          messageId,
+          model: createTestLanguageModel(),
+          tools: {},
+          thinkingOverrideState: testCase.holder,
+          initialMetadata: { autoModelRouting: testCase.autoModelRouting },
+        })
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Expected stream to start");
+      await result.data.completion;
+    }
+
+    expect(armed).toEqual({
+      "auto-escalation-thinking": true,
+      "auto-escalation-model-only": false,
+      "auto-escalation-manual": true,
+    });
+    expect(streamEnds).toHaveLength(3);
+    expect(streamEnds[0]?.metadata?.autoModelRouting).toMatchObject({
+      thinkingLevel: "low",
+      escalations: [raise],
+    });
+    expect(streamEnds[1]?.metadata?.autoModelRouting?.escalations).toBeUndefined();
+    const manual = streamEnds[2]?.metadata;
+    expect(manual?.thinkingLevel).toBe("max");
+    expect(manual?.autoModelRouting?.tierId).toBe("hard");
+    expect(manual?.autoModelRouting?.thinkingLevel).toBeUndefined();
+    expect(manual?.autoModelRouting?.escalations).toBeUndefined();
+    // The session's live-routing sink saw the same record each change landed on.
+    expect(sessionSaw["auto-escalation-thinking"]?.at(-1)?.autoModelRouting).toMatchObject({
+      thinkingLevel: "low",
+      escalations: [raise],
+    });
+    expect(sessionSaw["auto-escalation-model-only"]).toEqual([]);
+    const manualLive = sessionSaw["auto-escalation-manual"]?.at(-1);
+    expect(manualLive?.thinkingLevel).toBe("max");
+    expect(manualLive?.autoModelRouting).not.toHaveProperty("thinkingLevel");
+    expect(manualLive?.autoModelRouting).not.toHaveProperty("escalations");
+  });
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {
     const streamManager = new StreamManager(historyService);
     const { buildRequestConfig, createStreamResult } = getRequestHelpers(streamManager);
@@ -7941,9 +8253,27 @@ describe("StreamManager - mid-turn thinking override", () => {
 
     // Pending override that never got a next step on the refusing stream: the
     // fallback hop must not silently revert it.
-    const holder: ActiveTurnThinkingOverride = { pending: "high" };
+    const sessionSaw: LiveTurnRouting[] = [];
+    const holder: ActiveTurnThinkingOverride = {
+      pending: "high",
+      onLiveRoutingChanged: (live) => sessionSaw.push(live),
+    };
+    // Auto set "low"; the escalation ladder was seeded from it when the refused stream started
+    // and the refused model's ceiling already retired it.
+    const escalationState = createAutoThinkingEscalationState("low", [], () => undefined);
+    markAutoThinkingEscalationExhausted(escalationState);
     const startTime = Date.now() - 250;
     const streamInfo = createStreamInfoForTests({
+      stepTracker: { autoThinkingEscalation: escalationState },
+      initialMetadata: {
+        autoModelRouting: {
+          status: "routed",
+          tierId: "hard",
+          model: KNOWN_MODELS.SONNET.id,
+          requestedFallbackModel: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "low",
+        },
+      },
       streamResult: createStreamResultForTests(
         (async function* () {
           await Promise.resolve();
@@ -7985,5 +8315,22 @@ describe("StreamManager - mid-turn thinking override", () => {
     const nextRequest = capturedNextRequests[0];
     expect(nextRequest?.thinkingOverrideState).toBe(holder);
     expect(nextRequest?.rebuildProviderOptionsForThinkingLevel).toBe(fallbackRebuild);
+    // The session learns what the stream runs on now: the fallback model and the level the
+    // fallback preparation clamped Auto's claim to.
+    expect(sessionSaw.at(-1)).toEqual({
+      model: fallbackModel,
+      thinkingLevel: "high",
+      autoModelRouting: {
+        status: "routed",
+        tierId: "hard",
+        model: fallbackModel,
+        requestedFallbackModel: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "high",
+      },
+    });
+    // The next raise climbs from the level the fallback runs at, not the refused model's, and
+    // the refused model's ceiling no longer retires it.
+    expect(escalationState.level).toBe("high");
+    expect(escalationState.exhausted).toBe(false);
   });
 });

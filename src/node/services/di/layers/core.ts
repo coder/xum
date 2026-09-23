@@ -20,6 +20,7 @@ import {
   createAgentPluginsMcpProvider,
 } from "@/node/services/agentPlugins/mcpConfig";
 import { AIService } from "@/node/services/aiService";
+import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
@@ -27,6 +28,7 @@ import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiber
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AI,
+  AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
@@ -183,6 +185,19 @@ export const ProviderLive = Layer.effect(
       yield* ProvidersConfigStoreTag,
       yield* FileLeaseManagerTag
     );
+  })
+);
+
+// Auto model routing (auto-model-routing experiment): prompts are third-party egress,
+// so the evaluation model is gated by the same provider policy as chat models.
+export const AutoModelRouterLive = Layer.effect(
+  AutoModelRouterTag,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    return new AutoModelRouter({
+      providersConfigStore: yield* ProvidersConfigStoreTag,
+      policyService: opts.policyService,
+    });
   })
 );
 
@@ -474,7 +489,8 @@ export const WorkspaceLive = Layer.effect(
       yield* ProvidersConfigStoreTag,
       yield* DesktopInputCoordinatorTag,
       yield* EffectRunnerTag,
-      yield* AppFiberScopeTag
+      yield* AppFiberScopeTag,
+      yield* AutoModelRouterTag
     );
   })
 );
@@ -695,6 +711,7 @@ const S1 = Layer.mergeAll(
   HistoryLive,
   InitStateManagerLive,
   ProviderLive,
+  AutoModelRouterLive,
   BackgroundProcessManagerLive,
   ExtensionMetadataLive,
   MemoryLive,
@@ -732,6 +749,7 @@ export function coreServicesFromContext(context: Context.Context<CoreTags>): Cor
     historyService: Context.get(context, History),
     initStateManager: Context.get(context, InitStateManagerTag),
     providerService: Context.get(context, Provider),
+    autoModelRouter: Context.get(context, AutoModelRouterTag),
     backgroundProcessManager: Context.get(context, BackgroundProcessManagerTag),
     sessionUsageService: Context.get(context, SessionUsage),
     workspaceGoalService: Context.get(context, WorkspaceGoal),

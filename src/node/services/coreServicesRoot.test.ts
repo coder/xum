@@ -17,6 +17,7 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { CoreLive, CoreOptionsTag } from "@/node/services/di/layers/core";
 import {
   AI,
+  AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
@@ -59,6 +60,7 @@ const CORE_FIELD_TAGS: Record<keyof CoreServices, Context.Key<CoreTags, unknown>
   historyService: History,
   initStateManager: InitStateManagerTag,
   providerService: Provider,
+  autoModelRouter: AutoModelRouterTag,
   backgroundProcessManager: BackgroundProcessManagerTag,
   sessionUsageService: SessionUsage,
   workspaceGoalService: WorkspaceGoal,

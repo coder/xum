@@ -22,6 +22,7 @@ import type {
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
 import type { AIService } from "@/node/services/aiService";
+import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { BackupService } from "@/node/services/backup/backupService";
@@ -132,6 +133,9 @@ export class IdleDispatcherTag extends Context.Service<IdleDispatcherTag, IdleDi
   "xum/IdleDispatcher"
 ) {}
 export class AI extends Context.Service<AI, AIService>()("xum/AI") {}
+export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, AutoModelRouter>()(
+  "xum/AutoModelRouter"
+) {}
 export class StreamManagerTag extends Context.Service<StreamManagerTag, StreamManager>()(
   "xum/StreamManager"
 ) {}
@@ -316,6 +320,7 @@ export type CoreTags =
   | History
   | InitStateManagerTag
   | Provider
+  | AutoModelRouterTag
   | BackgroundProcessManagerTag
   | SessionUsage
   | WorkspaceGoal

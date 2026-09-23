@@ -15,6 +15,7 @@ import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
+import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
@@ -113,6 +114,9 @@ export interface ProjectsConfig {
    * model refuses, the turn retries or continues on the next chain model.
    */
   modelFallbacks?: ModelFallbacks;
+
+  /** Difficulty tiers for the auto-model-routing experiment; always normalized on load. */
+  autoModelRouting?: AutoModelRoutingConfig;
 
   /**
    * Default model used for new workspaces (shared via ~/.xum/config.json).

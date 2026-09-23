@@ -3,6 +3,7 @@ import { MCPToolCallDisplaySchema } from "./mcp";
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
 import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
@@ -134,6 +135,32 @@ export const ModelFallbackRecordSchema = z.object({
   refusedModels: z.array(z.string()),
 });
 
+// One mid-turn thinking raise applied because the turn looked stuck (auto-model-routing).
+export const AutoModelRoutingEscalationSchema = z.object({
+  // 1-based index of the first step that ran at the raised level.
+  step: z.number().int().positive(),
+  from: ThinkingLevelSchema,
+  to: ThinkingLevelSchema,
+  reason: z.string(),
+});
+
+// Auto-model-routing provenance (which tier the evaluator chose, which model and thinking level ran).
+// Both models are re-read from history to build requests (a resume continues on the routed
+// model, request preparation reverts to the fallback), so a damaged value must fail parsing
+// and drop the record rather than reach pricing or the provider.
+export const AutoModelRoutingRecordSchema = z.object({
+  requestedFallbackModel: z.string().refine(isValidModelFormat),
+  tierId: z.string().optional(),
+  tierLabel: z.string().optional(),
+  confidence: z.number().optional(),
+  probabilities: z.record(z.string(), z.number()).optional(),
+  model: z.string().refine(isValidModelFormat),
+  thinkingLevel: ThinkingLevelSchema.optional(),
+  escalations: z.array(AutoModelRoutingEscalationSchema).optional(),
+  status: z.enum(["routed", "unmapped-tier", "fallback"]),
+  reason: z.string().optional(),
+});
+
 const TranscriptAnchorSchema = z.object({
   messageId: z.string(),
   historySequence: z.number(),
@@ -180,6 +207,7 @@ export const MuxMessageSchema = z.object({
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"
       // instead of failing whole-chat loading at the oRPC output boundary.
       modelFallback: ModelFallbackRecordSchema.optional().catch(undefined),
+      autoModelRouting: AutoModelRoutingRecordSchema.optional().catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),

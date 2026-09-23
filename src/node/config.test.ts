@@ -2073,7 +2073,9 @@ describe("Config", () => {
   describe("default model fallbacks seeding", () => {
     const FABLE = KNOWN_MODELS.FABLE.id;
     const LEGACY_FABLE = "anthropic:claude-fable-5";
-    const OPUS = KNOWN_MODELS.OPUS.id;
+    // The shipped chain target is pinned to Opus 5, not the moving
+    // KNOWN_MODELS.OPUS alias (see DEFAULT_MODEL_FALLBACKS).
+    const OPUS = "anthropic:claude-opus-5";
     const configFilePath = () => path.join(tempDir, "config.json");
 
     it("seeds the default chain once on first load and persists the migration flag", async () => {

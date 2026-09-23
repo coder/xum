@@ -354,6 +354,34 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchedOptions?.strictAgentResolution).toBe(true);
   });
 
+  test("dispatchPendingFollowUp restores the Auto routing record on the redispatched turn", async () => {
+    let dispatchedOptions: (SendOptions & { autoModelRoutingRecord?: unknown }) | undefined;
+    const record = {
+      status: "routed" as const,
+      tierId: "hard",
+      model: "openai:gpt-5.5",
+      requestedFallbackModel: "openai:gpt-4o",
+    };
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-auto-routing", {
+        text: "refactor the scheduler",
+        model: "openai:gpt-5.5",
+        agentId: "exec",
+        autoModelRouting: record,
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatchedOptions?.model).toBe("openai:gpt-5.5");
+    expect(dispatchedOptions?.autoModelRoutingRecord).toEqual(record);
+    expect(dispatchedOptions?.autoModelRouting).toBeUndefined();
+  });
+
   test("dispatchPendingFollowUp leaves the follow-up pending when the workspace is archived on disk", async () => {
     const archivedConfig = {
       ...createConfig(),

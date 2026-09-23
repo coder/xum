@@ -12,6 +12,7 @@ import {
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 export function buildAutoCompactionFollowUp(params: {
   messageText: string;
@@ -23,10 +24,14 @@ export function buildAutoCompactionFollowUp(params: {
   goalId?: string;
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  autoModelRouting?: AutoModelRoutingRecord;
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
-    model: params.modelForStream,
+    // A routing record names the model its turn should run on. The live send may have gated
+    // it back to the composer model over attachments this compaction folds away; the
+    // follow-up carries the decision and re-gates against the post-boundary context.
+    model: params.autoModelRouting?.model ?? params.modelForStream,
     agentId: params.options.agentId,
     ...pickPreservedSendOptions(params.options),
   };
@@ -53,6 +58,10 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.workspaceTurnMetadata) {
     followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
+  }
+
+  if (params.autoModelRouting) {
+    followUp.autoModelRouting = params.autoModelRouting;
   }
 
   return followUp;

@@ -64,6 +64,7 @@ import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
+  getAutoThinkingLevelKey,
   getModelKey,
   getNotifyOnResponseKey,
   getProjectScopeId,
@@ -115,6 +116,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { getAutoRoutingKey } from "@/browser/hooks/useSendMessageOptions";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -234,6 +236,7 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -571,6 +574,8 @@ function AppInner() {
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
+      // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
+      updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<
@@ -966,6 +971,13 @@ function AppInner() {
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
+    autoModelRoutingEnabled,
+    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // in the picker rows the way a row click does.
+    getAutoRouting: (scopeId, dimension) =>
+      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    onSetAutoRouting: (scopeId, dimension, active) =>
+      updatePersistedState(getAutoRoutingKey(scopeId, dimension), active),
     getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, Zap } from "lucide-react";
+import { Check, ChevronDown, Route, Zap } from "lucide-react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
@@ -75,6 +75,12 @@ interface ThinkingSelectorControlProps {
   variant?: "composer" | "box";
   /** Optional "Inherit" row above the levels (settings defaults). */
   inheritOption?: ThinkingInheritOption;
+  /**
+   * Auto-model-routing experiment: when provided, an "Auto" row is pinned above the
+   * levels. While active the trigger reads "Auto" and no level is marked selected;
+   * picking a level still calls onThinkingLevelChange only (the owner turns Auto off).
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
 }
 
 /**
@@ -94,6 +100,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
   const variant = props.variant ?? "composer";
   const inheritSelected = props.inheritOption?.selected === true;
+  const autoActive = props.autoRouting?.active === true;
 
   const modelCapabilitiesDeferred = props.modelCapabilitiesDeferred ?? false;
   const reasoningModeInherited = props.reasoningModeInherited === true;
@@ -146,7 +153,11 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
   const fastModeActive =
     fastModeProvider != null && providersConfig?.[fastModeProvider]?.serviceTier === "priority";
   const hasMenu =
-    allowed.length > 1 || proModeAvailable || fastModeAvailable || props.inheritOption != null;
+    allowed.length > 1 ||
+    proModeAvailable ||
+    fastModeAvailable ||
+    props.inheritOption != null ||
+    props.autoRouting != null;
 
   // The menu is rendered inline for happy-dom coverage, so a document listener is the
   // deterministic way to dismiss it when the user clicks elsewhere.
@@ -218,13 +229,16 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
-        aria-label={`Thinking: ${effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${fastModeActive ? ", fast mode" : ""}`}
+        aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${fastModeActive ? ", fast mode" : ""}`}
         onClick={() => setIsOpen((previous) => !previous)}
       >
+        {autoActive && <Route aria-hidden className="h-3 w-3 shrink-0 opacity-70" />}
         <span data-thinking-label className="min-w-[3ch] text-center">
-          {modelCapabilitiesDeferred
-            ? THINKING_OPTION_LABELS[effectiveThinkingLevel]
-            : getThinkingDisplayLabel(effectiveThinkingLevel, capabilityModel)}
+          {autoActive
+            ? "Auto"
+            : modelCapabilitiesDeferred
+              ? THINKING_OPTION_LABELS[effectiveThinkingLevel]
+              : getThinkingDisplayLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
         {proModeActive && (
           <span
@@ -264,9 +278,11 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         onClick={() => setIsOpen((previous) => !previous)}
       >
         <span data-thinking-label className="min-w-0 flex-1 truncate text-left">
-          {inheritSelected && props.inheritOption
-            ? props.inheritOption.label
-            : getThinkingMenuLabel(effectiveThinkingLevel, capabilityModel)}
+          {autoActive
+            ? "Auto"
+            : inheritSelected && props.inheritOption
+              ? props.inheritOption.label
+              : getThinkingMenuLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
         {(proModeActive || props.reasoningModeInherited === false) && (
           <span
@@ -346,6 +362,28 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             Reasoning effort
           </div>
           <div className="py-1" role="listbox" aria-label="Reasoning effort">
+            {props.autoRouting && (
+              <button
+                type="button"
+                role="option"
+                aria-label="Auto"
+                aria-selected={autoActive}
+                data-auto-routing-option
+                className={composerPickerOptionClass(
+                  { isHighlighted: false, isSelected: autoActive },
+                  "w-full py-1.5 text-left"
+                )}
+                onClick={props.autoRouting.onSelect}
+              >
+                <Route
+                  aria-hidden
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                />
+                <span className="text-foreground min-w-0 flex-1">Auto</span>
+                <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
+                {autoActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+              </button>
+            )}
             {props.inheritOption && (
               <button
                 type="button"
@@ -363,7 +401,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               </button>
             )}
             {allowed.map((level) => {
-              const selected = !inheritSelected && level === effectiveThinkingLevel;
+              const selected = !inheritSelected && !autoActive && level === effectiveThinkingLevel;
               const label = getThinkingMenuLabel(level, capabilityModel);
               return (
                 <button
@@ -441,6 +479,11 @@ interface ThinkingSelectorProps {
   allowProMode?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
   allowFastMode?: boolean;
+  /**
+   * Auto-model-routing experiment: the composer's Auto thinking-level flag. The Auto
+   * row turns it on; ThinkingContext.setThinkingLevel turns it off on a concrete pick.
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
 }
 
 /** Chat-composer picker: the shared control wired to the workspace ThinkingContext. */
@@ -457,6 +500,7 @@ export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
       onReasoningModeChange={setReasoningMode}
       allowProMode={props.allowProMode}
       allowFastMode={props.allowFastMode}
+      autoRouting={props.autoRouting}
     />
   );
 };

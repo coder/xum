@@ -27,7 +27,8 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   getOpenAIReasoningEffort,
-  isGrok46Model,
+  isGpt6SolOrLunaModel,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
@@ -50,7 +51,10 @@ import {
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
-import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import {
+  bedrockOpenAIModelId,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
 import {
   customProviderWireOrigin,
   isCustomProviderConfig,
@@ -403,13 +407,14 @@ export function buildProviderOptions(
       const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
       // Opus 4.6+ / Sonnet 4.6 / Sonnet 5: adaptive thinking when on, disabled when off
       // Opus 4.5: enabled thinking with budgetTokens ceiling (only when not "off")
-      // Mythos-class (Fable/Mythos) rejects `{ type: "disabled" }`. The thinking policy
+      // Mythos-class (Fable/Mythos) and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy
       // excludes "off" for them and AIService clamps the effective level via
       // resolveEffectiveThinkingLevel, so "off" should not reach here — but if a stray
       // path does, omit `thinking` (API defaults to adaptive) rather than hard-erroring.
       //
       // Opus 5 rejects disabled thinking above high effort. "off" maps to low,
-      // so this branch cannot produce that invalid combination.
+      // so this branch cannot produce that invalid combination. (Opus 5.5 rejects
+      // it at every effort and takes the Mythos-class omit path above.)
       //
       // Native-xhigh models require `thinking.display: "summarized"` to return
       // thinking content on adaptive requests; non-native adaptive models
@@ -469,15 +474,12 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: native-max models (the GPT-5.6 family and GPT-6 Astra, see
+    // Model-aware: native-max models (the GPT-5.6 and GPT-6 families, see
     // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
     // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
-    // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
-    // and Chat Completions, so both wire formats now preserve the selected level.
-    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium;
-    // Astra rejects "none", so its "off" clamps to "low".
-    const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // native effort. GPT-5.6 and GPT-6 Sol/Luna "off" must be explicit "none"
+    // because omission defaults to medium; Astra instead clamps "off" to "low".
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.
@@ -494,6 +496,13 @@ export function buildProviderOptions(
     const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
     const store = muxProviderOptions?.openai?.store;
     const isResponses = wireFormat === "responses";
+    // Sol/Luna only support Chat Completions function calls at effort none.
+    // Xum turns are tool-driven, so keep tools working on this opt-in route;
+    // Responses (the default) preserves the selected reasoning effort.
+    const reasoningEffort =
+      !isResponses && isGpt6SolOrLunaModel(capabilityModel)
+        ? "none"
+        : getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&
@@ -511,13 +520,22 @@ export function buildProviderOptions(
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
     // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
     // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
-    // would drop reasoning.effort. Force the classification; Mantle rejects
-    // every reasoning.summary value except "auto" with HTTP 400.
+    // would drop the ENTIRE reasoning object (effort, summary, and pro mode).
+    // Force the classification; Mantle rejects every reasoning.summary value
+    // except "auto" with HTTP 400. Mantle is reachable through two Coder
+    // instance types: bedrock (whose OpenAI-namespaced IDs already select the
+    // Responses wire) and openai (Mantle speaks OpenAI Responses natively).
+    // Key on the wire model ID's namespace, not the instance type alone, so
+    // the real OpenAI upstream on an openai-typed instance keeps the SDK's
+    // own detection and "detailed" summaries.
+    const coderWire =
+      routeProvider === "coder" && modelString.startsWith("coder:")
+        ? resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
+        : null;
     const bedrockOpenAIWire =
-      routeProvider === "coder" &&
-      modelString.startsWith("coder:") &&
-      resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
-        ?.providerType === "bedrock";
+      coderWire != null &&
+      (coderWire.providerType === "bedrock" || coderWire.providerType === "openai") &&
+      bedrockOpenAIModelId(coderWire.modelId) != null;
 
     log.debug("buildProviderOptions: OpenAI config", {
       reasoningEffort,
@@ -715,8 +733,8 @@ export function buildProviderOptions(
       ...overrides
     } = muxProviderOptions?.xai ?? {};
     const isGrokFrontier = isGrokFrontierModel(capabilityModel);
-    // Grok 4.6 supports native xhigh effort; Grok 4.5 tops out at high.
-    const topEffort = isGrok46Model(capabilityModel) ? "xhigh" : "high";
+    // Grok 4.6/4.7 support native xhigh effort; Grok 4.5 tops out at high.
+    const topEffort = grokSupportsNativeXhigh(capabilityModel) ? "xhigh" : "high";
     const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrokFrontier
       ? effectiveThinking === "xhigh" || effectiveThinking === "max"
         ? topEffort

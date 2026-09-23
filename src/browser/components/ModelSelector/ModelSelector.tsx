@@ -14,7 +14,7 @@ import React, {
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { ChevronDown, Eye, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, ShieldCheck, Star } from "lucide-react";
 
 import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
@@ -63,6 +63,14 @@ interface ModelSelectorProps {
   variant?: "default" | "box";
   className?: string;
   tooltipExtraContent?: React.ReactNode;
+  /**
+   * Auto-model-routing experiment: when provided, an "Auto" row is pinned above the
+   * model list. While active the trigger reads "Auto" and no concrete model is marked
+   * selected; picking a concrete model still calls onChange (the owner turns Auto off).
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
+  /** Accessible name for the trigger when no visible label identifies the picker. */
+  triggerAriaLabel?: string;
 }
 
 export interface ModelSelectorRef {
@@ -87,6 +95,8 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       variant = "default",
       className,
       tooltipExtraContent,
+      autoRouting,
+      triggerAriaLabel,
     },
     ref
   ) => {
@@ -152,14 +162,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setInputValue(""); // Clear input to show all models
       setShowAllModels(false);
 
-      // Start with current value highlighted
+      // Start with current value highlighted (the Auto row while Auto is active, so
+      // Enter keeps the routing choice instead of committing the fallback model).
       const currentIndex = models.indexOf(value);
-      setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      setHighlightedIndex(autoRouting?.active === true ? -1 : currentIndex >= 0 ? currentIndex : 0);
 
       // Focus input after dropdown renders.
       const timer = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(timer);
-    }, [isOpen, models, value]);
+    }, [isOpen, models, value, autoRouting?.active]);
 
     // Build model list: visible models + (if showAllModels) hidden models
     const baseModels = showAllModels ? [...models, ...hiddenModels] : models;
@@ -184,18 +195,33 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       }
     }
 
+    // The pinned Auto row lives at index -1 so ArrowUp from the first model reaches it.
+    const autoRowIndex = autoRouting ? -1 : 0;
+    const autoRowHighlighted = autoRouting != null && highlightedIndex === -1;
+
     // If the list shrinks (e.g., a model is hidden), keep the highlight in-bounds.
     useEffect(() => {
+      if (highlightedIndex < autoRowIndex) {
+        setHighlightedIndex(autoRowIndex);
+        return;
+      }
       if (filteredModels.length === 0) {
-        setHighlightedIndex(0);
+        if (highlightedIndex > 0) setHighlightedIndex(0);
         return;
       }
       if (highlightedIndex >= filteredModels.length) {
         setHighlightedIndex(filteredModels.length - 1);
       }
-    }, [filteredModels.length, highlightedIndex]);
+    }, [autoRowIndex, filteredModels.length, highlightedIndex]);
+
+    const canSave = autoRowHighlighted || filteredModels.length > 0;
 
     const handleSave = () => {
+      if (autoRowHighlighted) {
+        autoRouting.onSelect();
+        handleCancel();
+        return;
+      }
       // No matches - do nothing, let user keep typing or cancel
       if (filteredModels.length === 0) {
         return;
@@ -220,7 +246,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       if (e.key === "Enter") {
         e.preventDefault();
         // Only call onComplete if save succeeded (had matches)
-        if (filteredModels.length > 0) {
+        if (canSave) {
           handleSave();
           onComplete?.();
         }
@@ -245,7 +271,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setHighlightedIndex((prev) => Math.max(prev - 1, 0));
+        setHighlightedIndex((prev) => Math.max(prev - 1, autoRowIndex));
         return;
       }
     };
@@ -308,15 +334,19 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       : cn("bg-transparent rounded-sm text-[11px]", className ?? "w-32");
 
     const hasValue = value.trim().length > 0;
+    const autoActive = autoRouting?.active === true;
+    // While Auto is active the concrete value is only the fallback, not the selection.
+    const isModelSelected = (model: string) => value === model && !autoActive;
     const explicitGateway = hasValue ? getExplicitGatewayPrefix(value) : undefined;
     const canonicalValue = hasValue ? normalizeToCanonical(value) : "";
-    const selectedProvider = hasValue ? getModelProvider(canonicalValue) : "";
-    const displayValue = hasValue
-      ? formatModelStringForDisplay(canonicalValue)
-      : (emptyLabel ?? "");
-    const compactDisplayValue = hasValue
-      ? formatCompactModelStringForDisplay(canonicalValue)
-      : displayValue;
+    const selectedProvider = hasValue && !autoActive ? getModelProvider(canonicalValue) : "";
+    const displayValue = autoActive
+      ? "Auto"
+      : hasValue
+        ? formatModelStringForDisplay(canonicalValue)
+        : (emptyLabel ?? "");
+    const compactDisplayValue =
+      hasValue && !autoActive ? formatCompactModelStringForDisplay(canonicalValue) : displayValue;
 
     // Explicit gateway selections short-circuit route resolution: the user
     // intentionally pinned a gateway, so display that gateway directly instead
@@ -341,11 +371,13 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               )}
               role="combobox"
               aria-expanded={isOpen}
+              aria-label={triggerAriaLabel}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}
             >
               <span className="flex min-w-0 items-center gap-1.5">
+                {autoActive && <Route aria-hidden="true" className="h-3 w-3 shrink-0 opacity-70" />}
                 {selectedProvider && (
                   <ProviderIcon
                     provider={selectedProvider}
@@ -383,7 +415,11 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
             align={tooltipExtraContent ? "start" : "center"}
             className={cn(tooltipExtraContent && "max-w-80 whitespace-normal")}
           >
-            {explicitGateway ? value.trim() : canonicalValue}
+            {autoActive
+              ? `Auto: routes each prompt by difficulty (falls back to ${canonicalValue})`
+              : explicitGateway
+                ? value.trim()
+                : canonicalValue}
             {routedViaDisplayName ? (
               <>
                 <br />
@@ -423,6 +459,40 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               {error && <div className="text-danger-soft mt-1 text-[10px]">{error}</div>}
             </div>
 
+            {autoRouting && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={autoActive}
+                data-auto-routing-option
+                data-highlighted={autoRowHighlighted}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setHighlightedIndex(-1)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  autoRouting.onSelect();
+                  handleCancel();
+                }}
+                className={cn(
+                  composerPickerOptionClass(
+                    { isHighlighted: autoRowHighlighted, isSelected: autoActive },
+                    "py-1"
+                  ),
+                  "border-border-light w-full shrink-0 border-b text-left"
+                )}
+              >
+                <Route
+                  aria-hidden="true"
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                />
+                <span className="flex min-w-0 flex-1 items-baseline gap-1">
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent")}>Auto</span>
+                  <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
+                </span>
+              </button>
+            )}
+
             {/* Scrollable list */}
             <div ref={listRef} className="max-h-[280px] min-h-0 overflow-y-auto py-1">
               {filteredModels.length === 0 ? (
@@ -442,24 +512,29 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       className={composerPickerOptionClass(
                         {
                           isHighlighted: index === highlightedIndex,
-                          isSelected: value === model,
+                          isSelected: isModelSelected(model),
                         },
                         "py-1",
                         hiddenSet.has(model) && "opacity-50"
                       )}
                       onClick={() => handleSelectModel(model)}
                       role="option"
-                      aria-selected={value === model}
+                      aria-selected={isModelSelected(model)}
                     >
                       <ProviderIcon
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          value === model ? "text-accent" : "text-muted"
+                          isModelSelected(model) ? "text-accent" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                        <span className={cn("min-w-0 truncate", value === model && "text-accent")}>
+                        <span
+                          className={cn(
+                            "min-w-0 truncate",
+                            isModelSelected(model) && "text-accent"
+                          )}
+                        >
                           {formatModelDisplayName(modelName)}
                         </span>
                         {showProviderLabel && (

@@ -330,6 +330,7 @@ import type {
   GoalContinuationRuntimeState,
   WorkspaceGoalService,
 } from "@/node/services/workspaceGoalService";
+import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import type {
   BackgroundProcess,
@@ -2445,7 +2446,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
     private readonly effectRunner: EffectRunner = defaultEffectRunner,
-    private readonly appFiberScope?: Scope.Scope
+    private readonly appFiberScope?: Scope.Scope,
+    // Test doubles construct WorkspaceService directly; the core graph provides the
+    // shared router (AutoModelRouterLive).
+    private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
+      providersConfigStore,
+      policyService,
+    })
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -4734,6 +4741,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       backgroundProcessManager: this.backgroundProcessManager,
       // Branch-summary side-channel spend recording (edit-resend path).
       sessionUsageService: this.sessionUsageService,
+      autoModelRouter: this.autoModelRouter,
       sanitizeCliWorkspaceRegistration: (args) =>
         this.sanitizeCliRegisteredWorkspace(
           args.workspaceId,

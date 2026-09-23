@@ -79,6 +79,8 @@ import {
 } from "@/node/services/workspaceOperations";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
+import { AutoModelRouterTag } from "@/node/services/di/tags";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
@@ -341,6 +343,76 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () =>
               context.config.updateModelFallbacks(input.modelFallbacks)
             );
+          })
+        ),
+
+      updateAutoModelRouting: t
+        .input(schemas.config.updateAutoModelRouting.input)
+        .output(schemas.config.updateAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAutoModelRouting(input.autoModelRouting)
+            );
+          })
+        ),
+
+      getAutoModelRoutingEvaluationStatus: t
+        .input(schemas.config.getAutoModelRoutingEvaluationStatus.input)
+        .output(schemas.config.getAutoModelRoutingEvaluationStatus.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            const router = yield* AutoModelRouterTag;
+            return router.getEvaluationStatus(
+              // Unsaved Settings edits preview their own evaluator; otherwise the saved one.
+              input?.evaluationModel ??
+                normalizeAutoModelRoutingConfig(
+                  context.config.loadConfigOrDefault().autoModelRouting
+                ).evaluationModel
+            );
+          })
+        ),
+
+      previewAutoModelRouting: t
+        .input(schemas.config.previewAutoModelRouting.input)
+        .output(schemas.config.previewAutoModelRouting.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            // Refuse before spending: the evaluator is billed to this workspace's ledger, and a
+            // stale selection (a workspace removed since) has nowhere to record it.
+            if (context.config.findWorkspace(input.workspaceId) == null) {
+              return Err(
+                "Preview usage is recorded under a workspace; open a workspace and try again."
+              );
+            }
+            const router = yield* AutoModelRouterTag;
+            const { tiers, evaluationModel } = normalizeAutoModelRoutingConfig(
+              input.config ?? context.config.loadConfigOrDefault().autoModelRouting
+            );
+            const decision = yield* router.classifyEffect({
+              prompt: input.prompt,
+              tiers,
+              evaluationModel,
+            });
+            if (!decision.success) return decision;
+            // Billed like the send path's evaluation (AgentSession), and before the tier is
+            // mapped: an unmapped verdict cost the same tokens.
+            yield* atomicPromise(() =>
+              context.sessionUsageService.recordHeadlessUsage(
+                input.workspaceId,
+                decision.data.evaluationModel,
+                decision.data.usage,
+                decision.data.providerMetadata,
+                { analyticsSource: "auto_model_routing_preview" }
+              )
+            );
+            const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
+            return Ok({
+              ...decision.data,
+              tierLabel: chosen?.label ?? decision.data.tierId,
+              ...(chosen?.model != null ? { model: chosen.model } : {}),
+              ...(chosen?.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+            });
           })
         ),
 
