@@ -535,5 +535,9 @@ export const NarrowReadItemLongRole: Story = {
     await assertCardFitsNarrowContainer(canvasElement, EXCERPT_SELECTOR);
     const role = excerptRoleLabel(canvasElement, LONG_LABEL);
     await expect(role.scrollWidth).toBeGreaterThan(role.clientWidth);
+    // The item ID next to the chip keeps a visible sliver instead of collapsing to zero.
+    const id = role.parentElement?.nextElementSibling;
+    if (!(id instanceof HTMLElement)) throw new Error("Excerpt item ID not found");
+    await expect(id.getBoundingClientRect().width).toBeGreaterThan(0);
   },
 };
