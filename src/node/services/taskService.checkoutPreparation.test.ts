@@ -3,7 +3,8 @@ import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 import * as path from "path";
 
-import { SecretsStore, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type { ProjectsConfig } from "@/common/types/project";
+import { SecretsStore, type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Ok } from "@/common/types/result";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
@@ -30,6 +31,7 @@ import {
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -441,4 +443,131 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
     expect(await validateTaskCheckoutPreparation(config, taskId)).toMatchObject({ kind: "ready" });
     expect(sends).toEqual([taskId]);
   }, 30_000);
+
+  // editConfig logs and swallows a failed save (saveConfigEffect), so a publish that returned
+  // proves nothing reached disk: reporting the task created would checkpoint an id whose launch
+  // cannot find its row and leak the prepared checkout.
+  test.each([
+    ["reserved", "prepunsaved01"],
+    ["unqueued", "prepunsaved02"],
+    ["queued", "prepunsaved03"],
+  ] as const)(
+    "a %s publication whose config save was swallowed is refused: no row, the fork retained and named, nothing sent, no owned attempt left open, the registration lock free",
+    async (mode, taskId) => {
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, sends } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      if (mode === "queued") {
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      const forkPath = forkPathFor(config.srcDir, taskId);
+      // Drop every save that would register the task, as a swallowed write failure leaves disk.
+      const facade = config as unknown as { saveConfig: (next: ProjectsConfig) => Promise<void> };
+      const realSave = facade.saveConfig.bind(config);
+      const save = spyOn(facade, "saveConfig").mockImplementation((next) =>
+        [...next.projects.values()].some((project) =>
+          project.workspaces.some((row) => row.id === taskId)
+        )
+          ? Promise.resolve()
+          : realSave(next)
+      );
+      restores.push(() => save.mockRestore());
+
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([createArgs("Unsaved")])
+          : await taskService.create(createArgs("Unsaved"));
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain("did not persist");
+      expect(created.error).toContain(forkPath);
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+      expect(await pathExists(path.join(forkPath, ".git"))).toBe(true);
+      await settle();
+      expect(sends).toEqual([]);
+      const internals = taskService as unknown as {
+        ownedAttemptByTaskId: Map<string, unknown>;
+        attemptSettlementByTaskId: Map<string, { phase: string }>;
+        workspaceStopRecords: Map<string, unknown>;
+        admittedSendsByTaskId: Map<string, Set<unknown>>;
+      };
+      // A queued row is never admitted here, so nothing was owned; otherwise the owned attempt
+      // is settled, not left for a Stop or reawaken to meet without settlement evidence.
+      if (mode === "queued") expect(internals.ownedAttemptByTaskId.has(taskId)).toBe(false);
+      else expect(internals.attemptSettlementByTaskId.get(taskId)?.phase).toBe("settled");
+      expect(internals.workspaceStopRecords.has(taskId)).toBe(false);
+      expect(internals.admittedSendsByTaskId.get(taskId)?.size ?? 0).toBe(0);
+      const release = await acquireCrossProcessLock({
+        lockPath: path.join(config.rootDir, "workspace-registration.lock"),
+        acquireTimeoutMs: 100,
+        staleMs: 60_000,
+        timeoutMessage: "registration lock held",
+      });
+      await release();
+    },
+    30_000
+  );
+
+  // An unreadable registry proves nothing either way: the write may well have landed, and a
+  // reported failure would then leave a durable (possibly launchable) row the caller cannot
+  // fence and may duplicate on retry. Only a READABLE registry lacking the proof refuses.
+  test.each([
+    ["reserved", "prepunread01"],
+    ["unqueued", "prepunread02"],
+    ["queued", "prepunread03"],
+  ] as const)(
+    "a %s publication whose verification read fails transiently keeps its success: the persisted row stays the task",
+    async (mode, taskId) => {
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      if (mode === "queued") {
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      // Armed the moment `publish` returns: the next strict read is the verification's.
+      let armed = false;
+      let verificationReadFailed = false;
+      const realLoad = config.loadConfigOrDefault.bind(config);
+      const load = spyOn(config, "loadConfigOrDefault").mockImplementation(((
+        options?: Parameters<Config["loadConfigOrDefault"]>[0]
+      ) => {
+        if (armed && options?.throwOnError === true) {
+          armed = false;
+          verificationReadFailed = true;
+          throw new Error("transient config read failure");
+        }
+        return realLoad(options);
+      }) as Config["loadConfigOrDefault"]);
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        (materialize, publish) =>
+          realPrepare(materialize, async (proofs) => {
+            const value = await publish(proofs);
+            armed = true;
+            return value;
+          })
+      );
+      restores.push(
+        () => load.mockRestore(),
+        () => prepare.mockRestore()
+      );
+
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([createArgs("Unread")])
+          : await taskService.create(createArgs("Unread"));
+      expect(verificationReadFailed).toBe(true);
+      expect(created.success).toBe(true);
+      const row = findWorkspaceInConfig(config, taskId);
+      expect(row).toMatchObject({
+        taskCheckoutPreparation: { v: 1, path: forkPathFor(config.srcDir, taskId) },
+      });
+      if (mode === "queued") expect(row?.taskStatus).toBe("queued");
+    },
+    30_000
+  );
 });

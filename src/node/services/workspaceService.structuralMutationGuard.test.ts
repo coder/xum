@@ -510,6 +510,53 @@ describe("WorkspaceService structural mutation guard", () => {
       await expectIntact(root);
     });
 
+    // Malformed config: Config.removeWorkspace drops EVERY row with the id and removal deletes
+    // the id's session directory, so classifying by the first row would take the protected task
+    // row sharing the id down with an ordinary one (an off-host first row even skipped the scan).
+    const rowsWithId = (id: string) =>
+      [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
+        project.workspaces.filter((candidate) => candidate.id === id)
+      );
+    async function expectDuplicatesIntact(entries: Workspace[]): Promise<void> {
+      expect(rowsWithId(entries[0].id!).map((entry) => entry.path)).toEqual(
+        entries.map((entry) => entry.path)
+      );
+      for (const entry of entries)
+        expect(await exists(path.join(entry.path, "WORK.md"))).toBe(true);
+      expect(await exists(path.join(sessionDir(entries[0].id!), "chat.jsonl"))).toBe(true);
+    }
+
+    test("an ordinary row sharing its id with a protected task row refuses remove, rename and a destructive archive, leaving every row, checkout and the session", async () => {
+      const ordinary = row("dup-root", ROOT_ID);
+      const task = taskRow("agent_dup", ROOT_ID, { parentWorkspaceId: "root-ws-other" });
+      await seed([row("other", "root-ws-other"), ordinary, task], {
+        worktreeArchiveBehavior: "delete",
+      });
+
+      expectRefused(await service.remove(ROOT_ID, true), "share this id");
+      expectRefused(await service.rename(ROOT_ID, "dup-renamed"), "share this id");
+      expectRefused(await service.archive(ROOT_ID), "share this id");
+      await expectDuplicatesIntact([ordinary, task]);
+      expect(rowsWithId(ROOT_ID).map((entry) => entry.archivedAt)).toEqual([undefined, undefined]);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+      expect(removeManagedGitWorktreeSpy).not.toHaveBeenCalled();
+    });
+
+    test("an off-host first row sharing its id with a protected task row refuses removal and rename", async () => {
+      const offHost = row("dup-remote", ROOT_ID, {
+        runtimeConfig: { type: "ssh", host: "box.invalid", srcBaseDir },
+      });
+      const task = taskRow("agent_dup", ROOT_ID, { parentWorkspaceId: "root-ws-other" });
+      await seed([row("other", "root-ws-other"), offHost, task]);
+
+      expectRefused(await service.remove(ROOT_ID, true), "share this id");
+      expectRefused(await service.rename(ROOT_ID, "dup-renamed"), "share this id");
+      await expectDuplicatesIntact([offHost, task]);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
     test("an alias-free root keeps its ordinary behavior: remove deletes, rename moves, archive-delete deletes", async () => {
       const root = row("root", ROOT_ID);
       const other = row("other", "root-ws-other");
@@ -759,6 +806,32 @@ describe("WorkspaceService structural mutation guard", () => {
       expectRefused(await removal, `"${TASK_ID}"`);
       await expectIntact(root);
       expect(persistedRow(TASK_ID)).toBeDefined();
+      expect(physical.deleted).toEqual([]);
+    });
+
+    test("a task row sharing the root's id published under the lock makes the removal ambiguous: refused under the lock", async () => {
+      const root = row("root", ROOT_ID);
+      await seed([root]);
+      const releasePublication = await acquireRegistrationLock(5_000);
+      const removal = service.remove(ROOT_ID, true);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Disjoint checkout: only the id ties it to the root, so no alias scan would refuse.
+      const task = taskRow("agent_dup", ROOT_ID);
+      await fsPromises.mkdir(task.path, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(task);
+        return cfg;
+      });
+      await releasePublication();
+
+      expectRefused(await removal, "share this id");
+      await expectIntact(root);
+      expect(
+        config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)!
+          .workspaces.filter((entry) => entry.id === ROOT_ID)
+      ).toHaveLength(2);
       expect(physical.deleted).toEqual([]);
     });
 
