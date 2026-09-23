@@ -105,7 +105,7 @@ export async function listWorkspaceMcpPrompts(
   // resolution reads through an SSH/Docker parent (minutes per remote op),
   // and discovery holds its archive admission for the duration.
   const overridesReadStartedAt = Date.now();
-  const { overrides, authoritative } =
+  const { overrides, authoritative, preparation } =
     await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
       timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
       ...(signal !== undefined ? { signal } : {}),
@@ -127,6 +127,8 @@ export async function listWorkspaceMcpPrompts(
       trusted: isWorkspaceProjectTrusted(context.config, metadata),
       overrides,
       overridesAuthoritative: authoritative,
+      // The checkout-preparation authorization the read validated; the manager re-checks it.
+      preparation,
       // Like the send path: a non-authoritative read that exhausted its
       // budget must not be followed by a second full-length attempt inside
       // the manager while discovery holds its archive admission.

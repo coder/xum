@@ -57,6 +57,27 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
+/**
+ * Well-formed preparation proof of a dedicated host-local task checkout (see
+ * `taskCheckoutPreparation.ts` for producers/validators). Numeric filesystem identifiers are
+ * BigInt decimal strings (inode/device numbers can exceed 2^53).
+ */
+export const TaskCheckoutPreparationSchema = z.object({
+  v: z.literal(1),
+  materializationId: z.string().regex(/^mat_[0-9a-f]{16}$/),
+  authorizationRevision: z.string().regex(/^rev_[0-9a-f]{16}$/),
+  runtimeConfigJson: z.string(),
+  path: z.string().min(1),
+  realpath: z.string().min(1),
+  root: z.object({ dev: z.string().regex(/^\d+$/), ino: z.string().regex(/^\d+$/) }),
+  gitdir: z.object({
+    pointer: z.string().min(1),
+    dev: z.string().regex(/^\d+$/),
+    ino: z.string().regex(/^\d+$/),
+  }),
+});
+export type TaskCheckoutPreparation = z.infer<typeof TaskCheckoutPreparationSchema>;
+
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -269,6 +290,17 @@ export const WorkspaceConfigSchema = z.object({
   taskAttemptUnproven: z.literal(true).optional().meta({
     description:
       "Set when the attempt's lineage cannot be proven settled (startup re-drive, stale-starting relaunch, pre-upgrade entry, or reawakened from such an attempt). Inherited by every successor; cleared only by a new reservation.",
+  }),
+  // Preparation proof of a DEDICATED host-local task checkout (see taskCheckoutPreparation.ts).
+  // Written once, with the row's first publication, by the producers that forked and sanitized
+  // the checkout; never rotated by admissions and never rebound. Consumers authorize execution
+  // and MCP activation only against a physically validated proof. Kept as `unknown` at the schema
+  // level so a malformed or newer-version value is RETAINED on disk (and classified `unsupported`
+  // → refused) instead of being stripped or failing the whole config; the well-formed shape is
+  // `TaskCheckoutPreparationSchema`.
+  taskCheckoutPreparation: z.unknown().optional().meta({
+    description:
+      "Immutable preparation proof of a dedicated host-local agent-task checkout (materialization identity, authorization revision, canonical runtime, path/realpath, root and git-admin dev/ino, .git pointer). Absent on shared/off-host/root rows and on rows published before preparation existed.",
   }),
   taskAttemptRetiredBy: z
     .object({

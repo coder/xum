@@ -87,6 +87,10 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
+import {
+  taskCheckoutAuthorizationEqual,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -473,7 +477,10 @@ function authorizationStateEqual(
     // serve must not hand out tools on the strength of the same value.
     (a.overridesAuthoritative !== false) === (b.overridesAuthoritative !== false) &&
     workspaceOverridesEqual(a.overrides, b.overrides) &&
-    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null)
+    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null) &&
+    // The checkout-preparation authorization is part of the enablement: a serve captured under
+    // another authorization (or none) is a different authorization state.
+    taskCheckoutAuthorizationEqual(a.preparation, b.preparation)
   );
 }
 
@@ -1263,7 +1270,23 @@ export interface MCPWorkspaceRequestOptions {
   overridesReadDeadlineAt?: number;
   projectSecrets?: Record<string, string>;
   agentPlugins?: AgentPluginsMcpContext | null;
+  /**
+   * The checkout-preparation authorization the caller's deep override read captured
+   * (WorkspaceMcpOverridesService.getOverridesForWorkspace). With the registry check wired
+   * (pluginInvalidation.isPreparationAuthorizationCurrent) the manager re-derives it
+   * synchronously from the fresh registry at every point that hands out enablement and fails
+   * closed on any difference. Nothing captured is not an allow: only a fresh exemption (an
+   * ordinary root, an off-host row) then passes.
+   */
+  preparation?: TaskCheckoutAuthorization;
 }
+
+/**
+ * What a server launch is authorized against: the workspace and the checkout-preparation
+ * authorization CAPTURED by the serve/start chain that launches it (never a later recording),
+ * threaded through startServers down to the launch callback boundary.
+ */
+type MCPPreparationRequest = Pick<MCPWorkspaceRequestOptions, "workspaceId" | "preparation">;
 
 export type MCPWorkspaceSecretsResolver = (
   workspaceId: string,
@@ -1418,6 +1441,17 @@ export interface MCPServerManagerOptions {
       signal?: AbortSignal;
       timeoutMs?: number;
     }) => Promise<() => Promise<void>>;
+    /**
+     * SYNCHRONOUS fresh re-check of a workspace's checkout-preparation authorization against the
+     * registry (taskCheckoutAuthorization.isTaskCheckoutAuthorizationCurrent: a throwing config
+     * read; never the manager's own caches, never checkout locks or filesystem, so it is safe
+     * under the override writer's fence). `false` fails the serve closed. With `captured`
+     * undefined only a fresh exemption (root / off-host row without a proof) is current.
+     */
+    isPreparationAuthorizationCurrent?: (
+      workspaceId: string,
+      captured: TaskCheckoutAuthorization | undefined
+    ) => boolean;
   };
 }
 
@@ -2796,7 +2830,68 @@ export class MCPServerManager {
     // finish must not be failed closed as if a publication had revoked it. A
     // publication or trust change records different overrides/trust and is
     // still detected.
-    return recorded !== undefined && authorizationStateEqual(recorded, derivedFrom);
+    return (
+      recorded !== undefined &&
+      authorizationStateEqual(recorded, derivedFrom) &&
+      // And the fresh registry must still derive the captured checkout-preparation authority:
+      // the caller's read validated it once; every hand-out re-checks it (config only).
+      this.isPreparationAuthorityCurrent(derivedFrom)
+    );
+  }
+
+  /**
+   * Whether the checkout-preparation authority `options` were captured under is still exactly
+   * what the fresh registry derives. Synchronous and config-only (the wired reader), so it can
+   * run at every post-await hand-out point and under the override writer's fence. Without a
+   * wired reader (tests, embedded managers) there is no authority to check; with one, a request
+   * that captured nothing cannot be vouched for and fails closed — never a permissive default.
+   */
+  private isPreparationAuthorityCurrent(options: MCPPreparationRequest): boolean {
+    const isCurrent = this.pluginInvalidation?.isPreparationAuthorizationCurrent;
+    if (isCurrent === undefined) return true;
+    try {
+      const current = isCurrent(options.workspaceId, options.preparation);
+      if (!current) {
+        log.debug("[MCP] Checkout-preparation authorization is not current; failing closed", {
+          workspaceId: options.workspaceId,
+          captured: options.preparation?.kind,
+        });
+      }
+      return current;
+    } catch (error) {
+      log.debug("[MCP] Checkout-preparation authorization could not be re-read; failing closed", {
+        workspaceId: options.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * The last synchronous point before a launch callback runs (a stdio exec, a remote connection
+   * initiation): every await of the start chain — the startup semaphore, negotiation retries,
+   * the writer's lock, the fenced epoch read and plugin admission — is behind us, so a proof or
+   * ancestry change that landed during any of them is caught HERE, before a
+   * repository-configured command executes (a postflight can close a process, not undo its
+   * execution). Config only, so it is safe under the writer's lock.
+   */
+  private assertPreparationCurrentAtLaunch(
+    name: string,
+    request: MCPPreparationRequest | undefined
+  ): void {
+    if (request === undefined) {
+      // A launch outside any workspace request (direct starts in tests) has no row to derive
+      // from; with the registry check wired nothing vouches for it — fail closed.
+      if (this.pluginInvalidation?.isPreparationAuthorizationCurrent !== undefined) {
+        throw new Error(`MCP server '${name}' cannot launch outside a workspace request`);
+      }
+      return;
+    }
+    if (!this.isPreparationAuthorityCurrent(request)) {
+      throw new Error(
+        `Workspace ${request.workspaceId} checkout preparation changed while MCP server '${name}' was about to launch; retry`
+      );
+    }
   }
 
   private failClosedResult(): MCPToolsForWorkspaceResult {
@@ -2924,6 +3019,12 @@ export class MCPServerManager {
     // get the reader's default budget, not one that expired with this send.
     if (options.overridesReadDeadlineAt !== undefined) {
       options = { ...options, overridesReadDeadlineAt: undefined };
+    }
+    // Checkout-preparation authority AFTER the disk re-read's await and before anything is
+    // recorded or started: an authority change landing during that await must fail this serve
+    // closed (nothing enabled, nothing started), exactly like an unverifiable override document.
+    if (!this.isPreparationAuthorityCurrent(options)) {
+      overridesUnavailable = true;
     }
     const {
       workspaceId,
@@ -3068,7 +3169,7 @@ export class MCPServerManager {
         }
 
         try {
-          await this.assertOverridesEpochUnmovedBeforeStart();
+          await this.assertOverridesEpochUnmovedBeforeStart(options, serversToRetry);
           const {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
@@ -3081,7 +3182,7 @@ export class MCPServerManager {
             workspacePath,
             projectSecrets,
             () => this.markActivity(workspaceId),
-            workspaceId
+            options
           );
 
           // Config changes can replace the workspace cache entry while this retry is still
@@ -3286,7 +3387,7 @@ export class MCPServerManager {
           }
         }
 
-        await this.assertOverridesEpochUnmovedBeforeStart();
+        await this.assertOverridesEpochUnmovedBeforeStart(options, serversToRestart);
         const {
           instances: restartedInstances,
           failedServerNames: failedNames,
@@ -3299,7 +3400,7 @@ export class MCPServerManager {
           workspacePath,
           projectSecrets,
           () => this.markActivity(workspaceId),
-          workspaceId
+          options
         );
 
         // Drop restarted instances whose plugin tree was swapped mid-startup;
@@ -3534,7 +3635,7 @@ export class MCPServerManager {
       if (retained) retained.lastActivity = Date.now();
       else await this.stopServers(workspaceId, { retainRestartOptions: true });
 
-      await this.assertOverridesEpochUnmovedBeforeStart();
+      await this.assertOverridesEpochUnmovedBeforeStart(options, serversToStart);
       const {
         instances,
         failedServerNames: startedFailedNames,
@@ -3547,7 +3648,7 @@ export class MCPServerManager {
         workspacePath,
         projectSecrets,
         () => this.markActivity(workspaceId),
-        workspaceId
+        options
       );
       // Still-waiting servers were not attempted this time but are still down.
       const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
@@ -5347,6 +5448,11 @@ export class MCPServerManager {
             if (this.overridesInvalidationGenerations.has(workspaceId)) {
               throw revoked(`server '${serverName}'`);
             }
+            // Fresh registry re-derivation of the checkout-preparation authority the served
+            // tools were handed out under (config only; inside the same synchronous decision).
+            if (!this.isPreparationAuthorityCurrent(recorded)) {
+              throw revoked(`server '${serverName}'`);
+            }
             const entry = this.workspaceServers.get(workspaceId);
             if (entry === undefined) {
               throw revoked(`server '${serverName}'`);
@@ -5543,7 +5649,20 @@ export class MCPServerManager {
    * revocation. The bracket's postflight alone would only close the server
    * after it had started. The next serve's preflight re-derives from disk.
    */
-  private async assertOverridesEpochUnmovedBeforeStart(): Promise<void> {
+  private async assertOverridesEpochUnmovedBeforeStart(
+    options: MCPPreparationRequest,
+    /** The servers about to start; an empty batch (a serve already failing closed) starts nothing. */
+    servers: MCPServerMap
+  ): Promise<void> {
+    // Batch-level refusal: the captured checkout-preparation authorization must still be what the
+    // fresh registry derives before any start is attempted. The per-launch boundary check
+    // (assertPreparationCurrentAtLaunch, after the start chain's final await) is the authority;
+    // this only spares the batch the startup work.
+    if (Object.keys(servers).length > 0 && !this.isPreparationAuthorityCurrent(options)) {
+      throw new Error(
+        `Workspace ${options.workspaceId} checkout preparation changed while MCP servers were about to start; retry`
+      );
+    }
     const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
     if (readOverridesEpoch === undefined || !this.pluginInvalidationTokenSeen) {
       return;
@@ -5566,7 +5685,8 @@ export class MCPServerManager {
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
-    workspaceId?: string
+    /** The serve/start chain's own captured authorization (see MCPPreparationRequest). */
+    request: MCPPreparationRequest
   ): Promise<{
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
@@ -5595,7 +5715,7 @@ export class MCPServerManager {
             workspacePath,
             projectSecrets,
             onActivity,
-            workspaceId
+            request
           );
         } catch (error) {
           const message = getErrorMessage(error);
@@ -5631,7 +5751,7 @@ export class MCPServerManager {
     workspacePath: string,
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
-    workspaceId?: string
+    request: MCPPreparationRequest
   ): Promise<MCPServerInstance | null> {
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const abortController = new AbortController();
@@ -5654,7 +5774,7 @@ export class MCPServerManager {
       onActivity,
       abortController.signal,
       registerAbortCleanup,
-      workspaceId
+      request
     ).then(
       (instance) => (didTimeout ? keepPendingAfterTimeout() : instance),
       (error) => {
@@ -5743,11 +5863,12 @@ export class MCPServerManager {
     onActivity: () => void,
     signal: AbortSignal,
     onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
-    workspaceId?: string
+    request?: MCPPreparationRequest
   ): Promise<MCPServerInstance | null> {
     if (signal.aborted) {
       return null;
     }
+    const workspaceId = request?.workspaceId;
 
     if (info.transport === "stdio") {
       // Scope verdicts by workspace identity (each workspace binds exactly
@@ -5788,7 +5909,7 @@ export class MCPServerManager {
             signal,
             onAbortCleanup,
             prior,
-            workspaceId
+            request
           );
           if (started === null) {
             return null;
@@ -5832,7 +5953,7 @@ export class MCPServerManager {
       onActivity,
       signal,
       onAbortCleanup,
-      workspaceId
+      request
     );
   }
 
@@ -5855,8 +5976,15 @@ export class MCPServerManager {
     /** `launchSignal` aborts with the startup signal AND at an `abortAfterMs` deadline. */
     launch: (launchSignal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
-    options?: {
-      workspaceId?: string;
+    options: {
+      /**
+       * The serve/start chain's CAPTURED checkout-preparation authorization: re-derived
+       * synchronously right before `launch` runs (assertPreparationCurrentAtLaunch), after the
+       * final fence await — on every path, including untracked servers and negotiation retries.
+       * Absent only for a start outside any workspace request, which fails closed once the
+       * registry check is wired.
+       */
+      request: MCPPreparationRequest | undefined;
       /**
        * Release the lock once `launch` has settled OR this many ms have
        * passed, whichever comes first. Remote (HTTP/SSE) connections: the
@@ -5889,8 +6017,11 @@ export class MCPServerManager {
       !trackOverrides &&
       plugin?.componentPolicy === undefined &&
       plugin?.sourceScope !== "global"
-    )
+    ) {
+      // Untracked plain launch: still synchronous from this check to the exec.
+      this.assertPreparationCurrentAtLaunch(name, options.request);
       return launch(signal);
+    }
     // ONE deadline for acquisition and the fenced reads (see getPrompt).
     const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
     const release = trackOverrides
@@ -5933,14 +6064,16 @@ export class MCPServerManager {
       // The same consent decision gates calls and launches, but startup holds
       // it through actual exec/connection initiation, not only the callback.
       releaseAdmission = await this.acquirePluginAdmissionFence(name, info, {
-        workspaceId: options?.workspaceId,
+        workspaceId: options.request?.workspaceId,
         signal,
         timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
       });
       if (signal.aborted) throw new Error("MCP server startup was aborted");
       if (Date.now() >= fenceDeadlineAt)
         throw new Error("MCP server startup admission timed out; retry");
-      if (options?.abortAfterMs !== undefined) {
+      // Final fence await is behind us; nothing may await between here and `launch`.
+      this.assertPreparationCurrentAtLaunch(name, options.request);
+      if (options.abortAfterMs !== undefined) {
         const { ms, serverName } = options.abortAfterMs;
         const launchAbort = new AbortController();
         const forwardAbort = () => launchAbort.abort();
@@ -5967,7 +6100,7 @@ export class MCPServerManager {
         return await pending;
       }
       pending = launch(signal);
-      if (options?.releaseAfterMs === undefined) {
+      if (options.releaseAfterMs === undefined) {
         return await pending;
       }
       await raceWithAbortAndTimeout(
@@ -6003,7 +6136,7 @@ export class MCPServerManager {
     signal: AbortSignal,
     onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
     prior: PriorDiscovery | undefined,
-    workspaceId?: string
+    request: MCPPreparationRequest | undefined
   ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
     {
       log.debug("[MCP] Spawning stdio server", { name });
@@ -6024,7 +6157,7 @@ export class MCPServerManager {
         // held for the whole startup deadline, and the launch must not be
         // released to send its command after a revocation: abort it instead
         // (see launchUnderOverrideFence).
-        { workspaceId, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        { request, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
       );
 
       const cleanupSpawnedExecStream = async () => {
@@ -6258,8 +6391,8 @@ export class MCPServerManager {
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
     signal: AbortSignal,
-    onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
-    workspaceId?: string
+    onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
+    request: MCPPreparationRequest | undefined
   ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
     const design = info.managed === "claude-design" ? this.configService.claudeDesign : undefined;
@@ -6324,7 +6457,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { request, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     const trySse = () =>
@@ -6341,7 +6474,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { request, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;

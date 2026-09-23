@@ -5870,7 +5870,24 @@ describe("WorkspaceService activity list scoping", () => {
         sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        // A registered ordinary root: the structural guard refuses unregistered ids.
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              "/tmp/proj",
+              {
+                workspaces: [
+                  {
+                    path: `/tmp/proj/${workspaceId}`,
+                    id: workspaceId,
+                    name: workspaceId,
+                    runtimeConfig: { type: "local" as const },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
         // The discard verifies deregistration against the persisted superset
         // (and the findWorkspace mock above) before deleting.
         readPersistedWorkspaceIdSuperset: mock(() => new Set<string>()),
@@ -11591,7 +11608,29 @@ describe("WorkspaceService rename lock", () => {
       projectPath: "/tmp/project",
       workspacePath: "/srv/project/old-name",
     }));
-    config.loadConfigOrDefault = mock(() => ({ projects: new Map() }));
+    // A registered off-host root: the structural guard needs no alias scan and no lock here,
+    // so the overrides lock below is the first lock the rename takes.
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              {
+                path: "/srv/project/old-name",
+                id: workspaceId,
+                name: "old-name",
+                runtimeConfig: {
+                  type: "ssh" as const,
+                  host: "example.invalid",
+                  srcBaseDir: "/srv",
+                },
+              },
+            ],
+          },
+        ],
+      ]),
+    }));
     const acquireWorkspaceLock = mock((_workspaceId: string) =>
       Promise.reject(new Error("Another Mux process is currently updating workspace MCP settings"))
     );
@@ -15935,7 +15974,27 @@ describe("WorkspaceService remove lifecycle coordination", () => {
     const workspaceId = "parent-remove-lifecycle";
     const workspaceService = createWorkspaceServiceForTest({
       config: {
+        // A registered ordinary root: the structural guard scans for task aliases under the
+        // registration lock (rootDir) and, finding none, lets the descendant check decide.
+        rootDir: path.join(tmpdir(), "mux-remove-lifecycle", `root-${crypto.randomUUID()}`),
         findWorkspace: mock(() => null),
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              "/tmp/proj",
+              {
+                workspaces: [
+                  {
+                    path: `/tmp/proj/${workspaceId}`,
+                    id: workspaceId,
+                    name: workspaceId,
+                    runtimeConfig: { type: "local" as const },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       },
     });
     let insideLifecycleLock = false;
@@ -16261,38 +16320,22 @@ describe("WorkspaceService remove timing rollup", () => {
     await cleanupHistory();
   });
 
-  test("waits for stream-abort before rolling up session timing", async () => {
+  // The child→parent timing rollup rides on a committed child removal (after the stream
+  // stop's abort has been recorded). A sub-agent removal is refused by the structural guard
+  // before the stream is even stopped, so neither the stop nor the rollup may run and the
+  // child's live stream and session survive.
+  test("a sub-agent removal refuses before stopping its stream or rolling up session timing", async () => {
     const workspaceId = "child-ws";
     const parentWorkspaceId = "parent-ws";
 
     const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-"));
-    const stopEntered = Promise.withResolvers<void>();
-    const stopRelease = Promise.withResolvers<void>();
     try {
       const sessionRoot = path.join(tempRoot, "sessions");
       await fsPromises.mkdir(path.join(sessionRoot, workspaceId), { recursive: true });
 
-      let abortEmitted = false;
-      let rollUpSawAbort = false;
-
       class FakeAIService extends EventEmitter {
         isStreaming = mock(() => true);
-
-        stopStream = mock(async () => {
-          stopEntered.resolve();
-          await stopRelease.promise;
-          abortEmitted = true;
-          this.emit("stream-abort", {
-            type: "stream-abort",
-            workspaceId,
-            messageId: "msg",
-            abortReason: "system",
-            metadata: { duration: 123 },
-            abandonPartial: true,
-          });
-          return { success: true as const, data: undefined };
-        });
-
+        stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
         getWorkspaceMetadata = mock(() =>
           Promise.resolve({
             success: true as const,
@@ -16313,16 +16356,33 @@ describe("WorkspaceService remove timing rollup", () => {
         srcDir: "/tmp/src",
         sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
-        findWorkspace: mock(() => null),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj" })),
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              "/tmp/proj",
+              {
+                workspaces: [
+                  { path: "/tmp/proj", id: parentWorkspaceId, name: "parent" },
+                  {
+                    path: "/tmp/proj",
+                    id: workspaceId,
+                    name: "child",
+                    runtimeConfig: { type: "local" as const },
+                    parentWorkspaceId,
+                    taskIsolation: "none" as const,
+                    taskStatus: "running" as const,
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       };
 
       const timingService: Partial<SessionTimingService> = {
         waitForIdle: mock(() => Promise.resolve()),
-        rollUpTimingIntoParent: mock(() => {
-          rollUpSawAbort = abortEmitted;
-          return Promise.resolve({ didRollUp: true });
-        }),
+        rollUpTimingIntoParent: mock(() => Promise.resolve({ didRollUp: true })),
       };
 
       const workspaceService = new WorkspaceService(
@@ -16340,26 +16400,25 @@ describe("WorkspaceService remove timing rollup", () => {
         timingService as SessionTimingService
       );
 
-      const removing = workspaceService.remove(workspaceId, true);
-      await stopEntered.promise;
+      const removeResult = await workspaceService.remove(workspaceId, true);
+      expect(removeResult.success).toBe(false);
+      if (!removeResult.success) expect(removeResult.error).toContain("sub-agent task");
+      expect((aiService as unknown as FakeAIService).stopStream).not.toHaveBeenCalled();
       expect(timingService.rollUpTimingIntoParent).not.toHaveBeenCalled();
-      stopRelease.resolve();
-      const removeResult = await removing;
-      expect(removeResult.success).toBe(true);
-      expect(mockInitStateManager.clearInMemoryState).toHaveBeenCalledWith(workspaceId);
-      expect(rollUpSawAbort).toBe(true);
+      expect(mockConfig.removeWorkspace).not.toHaveBeenCalled();
+      expect(existsSync(path.join(sessionRoot, workspaceId))).toBe(true);
     } finally {
-      stopRelease.resolve();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
     }
   });
 });
 
 describe("WorkspaceService remove sub-agent handover ordering", () => {
-  // A sub-agent's final shared-memory handover + removal tombstone are sealed
-  // under the removal locks BEFORE the checkout is deleted: a handover the
-  // owner store cannot take aborts with the checkout intact, and a refused
-  // checkout deletion rolls the tombstone back.
+  // A sub-agent's removal is refused by the structural guard BEFORE its final
+  // shared-memory handover, removal tombstone, checkout deletion and session
+  // teardown (workspaceStructuralMutationGuard.ts): a cooperating backend may
+  // still be operating in that checkout, so nothing of the removal sequence may
+  // start — forced or not — and the child stays fully usable.
   const projectPath = "/tmp/proj-handover";
   const workspaceId = "child-handover";
   const ownerId = "owner-handover";
@@ -16436,46 +16495,7 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
     } as unknown as AIService;
   }
 
-  test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: workspacePath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(),
-        aiService: buildAiService(),
-      });
-      let adoptions = 0;
-      workspaceService.setSharedWorkspaceMemoryStore({
-        adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
-          adoptions++;
-          // The unlocked pre-pass succeeds; the late note appears for the
-          // locked pass, which cannot place it.
-          return options?.locksHeld
-            ? Promise.reject(new Error("1 legacy note could not be folded"))
-            : Promise.resolve();
-        },
-      });
-      const result = await workspaceService.remove(workspaceId);
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toContain("could not be folded");
-      expect(adoptions).toBe(2);
-      expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
-      // force accepts the loss and completes the removal.
-      expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
-
-  test("a teardown step failing after the seal rolls the tombstone back and releases the gate", async () => {
+  test("a sub-agent removal refuses before the handover, the seal and the checkout deletion", async () => {
     const deleteWorkspace = mock(() =>
       Promise.resolve({ success: true as const, deletedPath: workspacePath })
     );
@@ -16488,24 +16508,20 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
         config,
         aiService: buildAiService(),
       });
+      let adoptions = 0;
       workspaceService.setSharedWorkspaceMemoryStore({
-        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+        adoptLegacyPrivateStoreForRemoval: () => {
+          adoptions++;
+          return Promise.resolve();
+        },
       });
-      // The consolidation drain runs once before the seal and again after the
-      // checkout deletion; the second call stands in for any teardown step
-      // that rejects once the child is durably tombstoned.
       const calls: string[] = [];
-      let cancels = 0;
-      let failSecondCancel = true;
       workspaceService.setMemoryConsolidationService({
         triggerInBackground: () => undefined,
         triggerHarvestThenSweepInBackground: () => undefined,
         cancelInFlightConsolidation: () => {
           calls.push("cancel");
-          cancels++;
-          return cancels === 2 && failSecondCancel
-            ? Promise.reject(new Error("sandbox teardown failed"))
-            : Promise.resolve();
+          return Promise.resolve();
         },
         releaseRemovalCancellation: () => {
           calls.push("release");
@@ -16515,18 +16531,20 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
           return Promise.resolve();
         },
       });
-      const failed = await workspaceService.remove(workspaceId);
-      expect(failed.success).toBe(false);
-      if (!failed.success) expect(failed.error).toContain("sandbox teardown failed");
-      // Still registered: the sealed marker is gone, the gate lifted, and
-      // nothing was finalized.
+      for (const force of [false, true]) {
+        const result = await workspaceService.remove(workspaceId, force);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("sub-agent task");
+      }
+      // Nothing of the removal sequence ran: no handover, no producer drain, no
+      // deletion, no deregistration, no tombstone; the session directory is intact.
+      expect(adoptions).toBe(0);
+      expect(calls).toEqual([]);
+      expect(deleteWorkspace).not.toHaveBeenCalled();
       expect(config.removeWorkspace).not.toHaveBeenCalled();
       expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
       expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
-      expect(calls).toContain("release");
-      expect(calls).not.toContain("finalize");
-      // The child's memory works again: its shared-store write is not
-      // refused by a stale tombstone.
+      // The child's memory keeps working: no stale tombstone refuses its shared-store write.
       const memoryService = new MemoryService(
         {
           rootDir,
@@ -16539,60 +16557,11 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       );
       const created = await memoryService.create(
         { runtime: null, checkoutCwd: "", workspaceId, projectPath: "" },
-        "/memories/workspace/after-abort.md",
+        "/memories/workspace/after-refusal.md",
         "still usable",
         "agent"
       );
       expect(created.success).toBe(true);
-      // A retried removal completes: cancelled, tombstoned, finalized, not released.
-      failSecondCancel = false;
-      calls.length = 0;
-      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
-      expect(calls).toContain("finalize");
-      expect(calls).not.toContain("release");
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
-
-  test("a refused checkout deletion rolls the sealed tombstone back", async () => {
-    let refuse = true;
-    const deleteWorkspace = mock(() =>
-      Promise.resolve(
-        refuse
-          ? { success: false as const, error: "Workspace has uncommitted changes" }
-          : { success: true as const, deletedPath: workspacePath }
-      )
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(),
-        aiService: buildAiService(),
-      });
-      let sealedTombstone = false;
-      workspaceService.setSharedWorkspaceMemoryStore({
-        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
-      });
-      deleteWorkspace.mockImplementation(async () => {
-        // Runtime deletion runs with the tombstone already sealed.
-        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
-        return refuse
-          ? { success: false as const, error: "Workspace has uncommitted changes" }
-          : { success: true as const, deletedPath: workspacePath };
-      });
-      const refused = await workspaceService.remove(workspaceId);
-      expect(refused.success).toBe(false);
-      if (!refused.success) expect(refused.error).toContain("uncommitted changes");
-      expect(sealedTombstone).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
-      refuse = false;
-      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -16626,6 +16595,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
                   name: "agent_explore_child",
                   path: sharedPath,
                   runtimeConfig,
+                  parentWorkspaceId: "parent-ws-id",
                   taskIsolation,
                 },
               ],
@@ -16655,48 +16625,34 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     return new FakeAIService() as unknown as AIService;
   }
 
-  test("does not delete the shared parent checkout for isolation: none tasks", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig("none"),
-        aiService: buildAiService(),
-      });
+  // Removing the CHILD itself: refused for every isolation (structural guard); nothing is
+  // deleted or deregistered, so the shared parent checkout can never be deleted on its behalf.
+  test.each(["none", "fork"] as const)(
+    "refuses to remove a task workspace (isolation: %s) and deregisters nothing",
+    async (taskIsolation) => {
+      const deleteWorkspace = mock(() =>
+        Promise.resolve({ success: true as const, deletedPath: sharedPath })
+      );
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        deleteWorkspace,
+      } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+      try {
+        const config = buildConfig(taskIsolation);
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          aiService: buildAiService(),
+        });
 
-      const result = await workspaceService.remove(workspaceId, true);
-      expect(result.success).toBe(true);
-      // The parent's checkout must never be physically deleted on behalf of a shared task.
-      expect(deleteWorkspace).not.toHaveBeenCalled();
-    } finally {
-      createRuntimeSpy.mockRestore();
+        const result = await workspaceService.remove(workspaceId, true);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("sub-agent task");
+        expect(deleteWorkspace).not.toHaveBeenCalled();
+        expect(config.removeWorkspace).not.toHaveBeenCalled();
+      } finally {
+        createRuntimeSpy.mockRestore();
+      }
     }
-  });
-
-  test("deletes the workspace for normal (forked) tasks", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(undefined),
-        aiService: buildAiService(),
-      });
-
-      const result = await workspaceService.remove(workspaceId, true);
-      expect(result.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
+  );
 
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   function buildParentConfig(childTaskStatus: string): Partial<Config> {
@@ -16755,71 +16711,35 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     return new FakeAIService() as unknown as AIService;
   }
 
-  test("does not delete a parent checkout shared by an active isolation: none child", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("running"),
-        aiService: buildParentAiService(),
-      });
+  // The parent's checkout IS the shared child's footprint: its removal refuses whatever the
+  // child's status says — terminal status or a queued launch cannot prove a cooperating
+  // backend has finished with that directory (structural guard).
+  test.each(["running", "queued", "reported"])(
+    "refuses to remove a parent whose checkout a %s shared child points at",
+    async (childTaskStatus) => {
+      const deleteWorkspace = mock(() =>
+        Promise.resolve({ success: true as const, deletedPath: sharedPath })
+      );
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        deleteWorkspace,
+      } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+      try {
+        const config = buildParentConfig(childTaskStatus);
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          aiService: buildParentAiService(),
+        });
 
-      const result = await workspaceService.remove("parent-ws-id", true);
-      expect(result.success).toBe(true);
-      // The running shared child still uses this checkout as its cwd.
-      expect(deleteWorkspace).not.toHaveBeenCalled();
-    } finally {
-      createRuntimeSpy.mockRestore();
+        const result = await workspaceService.remove("parent-ws-id", true);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain(`"${workspaceId}"`);
+        expect(deleteWorkspace).not.toHaveBeenCalled();
+        expect(config.removeWorkspace).not.toHaveBeenCalled();
+      } finally {
+        createRuntimeSpy.mockRestore();
+      }
     }
-  });
-
-  test("deletes a parent checkout when its shared child is only queued (fails fast at dequeue like forked tasks)", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("queued"),
-        aiService: buildParentAiService(),
-      });
-
-      const result = await workspaceService.remove("parent-ws-id", true);
-      expect(result.success).toBe(true);
-      // Queued children require the parent config entry to launch regardless of isolation, so
-      // they fail fast at dequeue either way — preserving the checkout would only leak it.
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
-
-  test("deletes a parent checkout when its shared child already reported", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("reported"),
-        aiService: buildParentAiService(),
-      });
-
-      const result = await workspaceService.remove("parent-ws-id", true);
-      expect(result.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
+  );
 });
 
 describe("WorkspaceService remove shared memory owner pinning", () => {
@@ -16834,7 +16754,11 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     memoryOwnerWorkspaceId?: string;
   }
 
-  /** owner → mid → grand: removing `mid` must keep `grand` on the owner's notebook. */
+  /**
+   * owner → mid → grand: `mid` is a sub-agent task row, so its removal is refused by the
+   * structural guard before the descendant memory-owner pin, the deletion and the
+   * deregistration — `grand` keeps its parent link and needs no pin.
+   */
   function buildTopology(): { projects: Map<string, { trusted: boolean; workspaces: Entry[] }> } {
     return {
       projects: new Map([
@@ -16902,7 +16826,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     return new FakeAIService() as unknown as AIService;
   }
 
-  test("pins surviving descendants to the root owner before tearing the middle node down", async () => {
+  test("refuses to remove the middle task node before pinning descendants or tearing it down", async () => {
     const deleteWorkspace = mock(() =>
       Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
     );
@@ -16915,124 +16839,24 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
         config,
         aiService: buildAiService(),
       });
-      const result = await workspaceService.remove("ws-mid");
-      expect(result.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-      const grand = topology.projects
-        .get(projectPath)!
-        .workspaces.find((ws) => ws.id === "ws-grand");
-      expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
-      // Once ws-mid is gone the pin keeps ws-grand on the root's notebook.
-      topology.projects.get(projectPath)!.workspaces = topology.projects
-        .get(projectPath)!
-        .workspaces.filter((ws) => ws.id !== "ws-mid");
-      expect(resolveWorkspaceMemoryOwnerId(topology as never, "ws-grand")).toBe("ws-owner");
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
-
-  test("aborts a non-forced removal (workspace intact) when the descendant pin does not persist", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    const { config } = buildConfig({ persistPins: false });
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
-      const refused = await workspaceService.remove("ws-mid");
-      expect(refused.success).toBe(false);
-      if (!refused.success) expect(refused.error).toContain("retry the removal");
-      // Nothing destructive ran: no checkout deletion, no deregistration.
-      expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(config.removeWorkspace).not.toHaveBeenCalled();
-
-      // Forced removal accepts the loss and proceeds.
-      const forced = await workspaceService.remove("ws-mid", true);
-      expect(forced.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-    } finally {
-      createRuntimeSpy.mockRestore();
-    }
-  });
-
-  test("aborts a non-forced removal when the owner cannot be resolved from a readable config", async () => {
-    // An unreadable config.json: the lenient read yields an empty topology
-    // (this workspace would look like its own owner — no pins, no handover),
-    // the strict one throws. The removal must decide from the strict read.
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    const { config } = buildConfig({ persistPins: true });
-    const loadConfigOrDefault = mock((options?: { throwOnError?: boolean }) => {
-      if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
-      return { projects: new Map() };
-    });
-    (config as { loadConfigOrDefault: unknown }).loadConfigOrDefault = loadConfigOrDefault;
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
-      const refused = await workspaceService.remove("ws-mid");
-      expect(refused.success).toBe(false);
-      if (!refused.success) {
-        expect(refused.error).toContain("config.json unreadable");
-        expect(refused.error).toContain("retry the removal");
+      for (const force of [false, true]) {
+        const result = await workspaceService.remove("ws-mid", force);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("sub-agent task");
       }
       expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(config.removeWorkspace).not.toHaveBeenCalled();
       expect(config.editConfig).not.toHaveBeenCalled();
-
-      // Forced removal accepts the loss and proceeds.
-      const forced = await workspaceService.remove("ws-mid", true);
-      expect(forced.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      // The topology is untouched: grand still hangs off mid and carries no owner pin.
+      const grand = topology.projects.get(projectPath)?.workspaces.find((w) => w.id === "ws-grand");
+      expect(grand).toMatchObject({ parentWorkspaceId: "ws-mid" });
+      expect(grand?.memoryOwnerWorkspaceId).toBeUndefined();
+      expect(resolveWorkspaceMemoryOwnerId(topology as unknown as ProjectsConfig, "ws-grand")).toBe(
+        "ws-owner"
+      );
     } finally {
       createRuntimeSpy.mockRestore();
     }
-  });
-
-  test("pins surviving descendants even when the removed node's metadata cannot be built", async () => {
-    // The phantom-cleanup path: no metadata, yet the config entry is removed
-    // all the same — the pin is a config-only edit and must still land, or a
-    // surviving child silently falls back to a private notebook.
-    class PhantomAiService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({ success: false as const, error: "metadata unavailable" })
-      );
-    }
-    const { config, topology } = buildConfig({ persistPins: true });
-    const workspaceService = createWorkspaceServiceForTest({
-      config,
-      aiService: new PhantomAiService() as unknown as AIService,
-    });
-    const result = await workspaceService.remove("ws-mid");
-    expect(result.success).toBe(true);
-    expect(config.removeWorkspace).toHaveBeenCalledTimes(1);
-    const grand = topology.projects.get(projectPath)!.workspaces.find((ws) => ws.id === "ws-grand");
-    expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
-
-    // ...and a pin that does not persist still aborts the non-forced removal
-    // on that path, before the config entry is dropped.
-    const unpersisted = buildConfig({ persistPins: false });
-    const refusing = createWorkspaceServiceForTest({
-      config: unpersisted.config,
-      aiService: new PhantomAiService() as unknown as AIService,
-    });
-    const refused = await refusing.remove("ws-mid");
-    expect(refused.success).toBe(false);
-    expect(unpersisted.config.removeWorkspace).not.toHaveBeenCalled();
   });
 });
 
@@ -17069,7 +16893,25 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       sessionsDir: path.join(tempRoot, "sessions"),
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      // A registered ordinary root (the structural guard refuses unregistered ids); its
+      // metadata still fails to build below, exercising the metadata-less teardown path.
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            "/tmp/src/project",
+            {
+              workspaces: [
+                {
+                  path: "/tmp/src/project/ws-remove-desktop",
+                  id: workspaceId,
+                  name: workspaceId,
+                  runtimeConfig: { type: "local" as const },
+                },
+              ],
+            },
+          ],
+        ]),
+      })),
       // The descendant pin pass edits whatever topology a test installed.
       editConfig: mock((edit: (cfg: unknown) => unknown) => {
         edit(mockConfig.loadConfigOrDefault!());
@@ -17161,9 +17003,9 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const aborted = await workspaceService.remove(workspaceId);
     expect(aborted.success).toBe(false);
     expect(calls).toEqual(["release"]);
-    // Aborted inside the locked handover (a late legacy note the owner store
-    // cannot take), i.e. after the drain but BEFORE the tombstone: the session
-    // directory survives, so the gate is lifted too.
+    // Registered as a sub-agent instead: the structural guard refuses before the drain
+    // even starts, so no gate is armed (nothing to release) and the session directory
+    // survives untouched.
     descendants = false;
     calls.length = 0;
     const sessionDir = path.join(tempRoot, "sessions", workspaceId);
@@ -17190,13 +17032,11 @@ describe("WorkspaceService remove desktop session cleanup", () => {
         Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
     });
     try {
-      const lockedAbort = await workspaceService.remove(workspaceId);
-      expect(lockedAbort.success).toBe(false);
-      if (!lockedAbort.success) expect(lockedAbort.error).toContain("tombstone could be published");
+      const refused = await workspaceService.remove(workspaceId);
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("sub-agent task");
       expect(existsSync(sessionDir)).toBe(true);
-      expect(calls).toContain("cancel");
-      expect(calls).toContain("release");
-      expect(calls).not.toContain("finalize");
+      expect(calls).toEqual([]);
     } finally {
       config.loadConfigOrDefault = previousLoad;
       workspaceService.setSharedWorkspaceMemoryStore({
@@ -19352,6 +19192,8 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
       }),
       editConfig: editConfigSpy,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([workspaceMetadata])),
+      // The structural guard reads the row to see whether a snapshot restore would run.
+      loadConfigOrDefault: mock(() => configState),
     };
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
@@ -19505,6 +19347,9 @@ describe("WorkspaceService archive snapshots", () => {
     });
 
     const mockConfig: MockWorkspaceConfig = {
+      // Structural guard: a destructive archive/restore of this root takes the cross-process
+      // registration lock under rootDir (unique per service so runs never share a lock file).
+      rootDir: path.join(tmpdir(), "mux-archive-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
@@ -19873,6 +19718,9 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
     };
 
     const mockConfig: MockWorkspaceConfig = {
+      // Structural guard: a destructive archive/restore of this root takes the cross-process
+      // registration lock under rootDir (unique per service so runs never share a lock file).
+      rootDir: path.join(tmpdir(), "mux-archive-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
@@ -20156,6 +20004,9 @@ describe("WorkspaceService unarchive snapshot restore", () => {
     };
 
     const mockConfig: MockWorkspaceConfig = {
+      // Structural guard: a destructive archive/restore of this root takes the cross-process
+      // registration lock under rootDir (unique per service so runs never share a lock file).
+      rootDir: path.join(tmpdir(), "mux-archive-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
@@ -20306,10 +20157,32 @@ describe("WorkspaceService deleteWorktree", () => {
     };
 
     const mockConfig: MockWorkspaceConfig = {
+      // Structural guard: the worktree deletion of this root scans the config rows and holds
+      // the cross-process registration lock under rootDir across the deletion.
+      rootDir: path.join(tempSrcBaseDir, "root"),
       srcDir: tempSrcBaseDir,
       sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       getAllWorkspaceMetadata: mock(async () => [await getCurrentMetadata()]),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              workspaces: [
+                {
+                  path: managedPath,
+                  id: workspaceId,
+                  name: workspaceName,
+                  runtimeConfig,
+                  archivedAt: options?.archivedAt,
+                  taskIsolation: options?.taskIsolation,
+                },
+              ],
+            },
+          ],
+        ]),
+      })),
     };
 
     const aiService = {
@@ -20751,7 +20624,7 @@ describe("WorkspaceService init cancellation", () => {
     await cleanupHistory();
   });
 
-  test("scratch workspace deletion preserves shared workdirs until the last reference", async () => {
+  test("a scratch workdir shared with a scratch task is never deleted: both removals refuse", async () => {
     const {
       config,
       historyService: scratchHistoryService,
@@ -20805,15 +20678,19 @@ describe("WorkspaceService init cancellation", () => {
       });
 
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
-      expect(await workspaceService.remove(parentId, true)).toEqual(Ok(undefined));
+      // The scratch root's workdir is the shared child's footprint (structural guard): the
+      // root refuses naming the child, and the task row itself refuses outright.
+      const parentRemoval = await workspaceService.remove(parentId, true);
+      expect(parentRemoval.success).toBe(false);
+      if (!parentRemoval.success) expect(parentRemoval.error).toContain(`"${childId}"`);
+      const childRemoval = await workspaceService.remove(childId, true);
+      expect(childRemoval.success).toBe(false);
+      if (!childRemoval.success) expect(childRemoval.error).toContain("sub-agent task");
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
-      expect(await workspaceService.remove(childId, true)).toEqual(Ok(undefined));
-      expect(
-        await fsPromises
-          .stat(scratchPath)
-          .then(() => true)
-          .catch(() => false)
-      ).toBe(false);
+      const scratchRows = config
+        .loadConfigOrDefault()
+        .projects.get(SCRATCH_PROJECT_CONFIG_KEY)?.workspaces;
+      expect(scratchRows?.map((w) => w.id).sort()).toEqual([parentId, childId].sort());
     } finally {
       await cleanup();
     }
@@ -21510,6 +21387,25 @@ describe("WorkspaceService init cancellation", () => {
         sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
+        // A registered ordinary root (the structural guard refuses unregistered ids); its
+        // metadata still fails to build, exercising the metadata-less teardown path.
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              "/tmp/proj",
+              {
+                workspaces: [
+                  {
+                    path: `/tmp/proj/${workspaceId}`,
+                    id: workspaceId,
+                    name: workspaceId,
+                    runtimeConfig: { type: "local" as const },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,
@@ -21587,10 +21483,29 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as AIService;
 
       const mockConfig: MockWorkspaceConfig = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         sessionsDir: tempRoot,
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
+        // A registered ordinary root: the structural guard refuses unregistered ids.
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              projectPath,
+              {
+                workspaces: [
+                  {
+                    path: `${projectPath}/ws`,
+                    id: workspaceId,
+                    name: "ws",
+                    runtimeConfig: { type: "worktree" as const, srcBaseDir: "/tmp/src" },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,
@@ -21667,7 +21582,24 @@ describe("WorkspaceService init cancellation", () => {
         sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        // A registered ordinary root: the structural guard refuses unregistered ids.
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              projectPath,
+              {
+                workspaces: [
+                  {
+                    path: "/tmp/proj/ws",
+                    id: workspaceId,
+                    name: "ws",
+                    runtimeConfig: { type: "local" as const },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,
@@ -21752,7 +21684,24 @@ describe("WorkspaceService init cancellation", () => {
         sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        // A registered ordinary root: the structural guard refuses unregistered ids.
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              projectPath,
+              {
+                workspaces: [
+                  {
+                    path: "/tmp/proj/ws",
+                    id: workspaceId,
+                    name: "ws",
+                    runtimeConfig: { type: "local" as const },
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,
@@ -24390,97 +24339,16 @@ describe("WorkspaceService.getLastUserPrompt", () => {
 });
 
 describe("WorkspaceService.remove usage-rollup ordering", () => {
-  test("usage recorded while draining background producers reaches the parent rollup", async () => {
-    // Codex round 13: the child's usage snapshot was read BEFORE the
-    // cancel-and-drain calls for the pending branch summary and in-flight
-    // /refine pass. A draining producer records headless usage as it
-    // settles, so that spend landed after the snapshot and was permanently
-    // lost from parent accounting (the child is deleted with no second
-    // rollup). Drains must complete before the snapshot is read.
+  // The one-shot child→parent usage/timing rollups ride on a committed child removal.
+  // Sub-agent removals are refused by the structural guard before the producer drains, so
+  // no rollup (and no drain) may run: the child's spend stays where it is, retryable.
+  test("a sub-agent removal refuses before draining producers or rolling usage into the parent", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-"));
     const parentId = "rollup-parent-ws";
     const childId = "rollup-child-ws";
-    try {
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectDir, {
-          trusted: true,
-          workspaces: [
-            { path: projectDir, id: parentId, name: parentId },
-            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
-          ],
-        });
-        return cfg;
-      });
-
-      // Fake usage ledger: the draining refine pass records the child's
-      // spend only when cancelInFlightRefinePass runs (modelling a settle-
-      // time recordHeadlessUsage write).
-      const usageByWorkspace = new Map<string, Record<string, unknown>>();
-      const rollupCalls: Array<{ parent: string; child: string; byModel: object }> = [];
-      const sessionUsageService = {
-        getSessionUsage: (workspaceId: string) =>
-          Promise.resolve({ byModel: usageByWorkspace.get(workspaceId) ?? {} }),
-        rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
-          rollupCalls.push({ parent, child, byModel });
-          return Promise.resolve({ didRollUp: true });
-        },
-      } as unknown as SessionUsageService;
-      const cancelInFlightRefinePass = mock((workspaceId: string) => {
-        // The drained pass settles and records its spend against the child.
-        usageByWorkspace.set(workspaceId, {
-          "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
-        });
-        return Promise.resolve();
-      });
-
-      const service = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        sessionUsageService,
-        aiService: createMockAIService({
-          getWorkspaceMetadata: (async (workspaceId: string) => {
-            const metadata = (await config.getAllWorkspaceMetadata()).find(
-              (m) => m.id === workspaceId
-            );
-            return metadata ? Ok(metadata) : Err("workspace not found");
-          }) as AIService["getWorkspaceMetadata"],
-        }),
-      });
-      service.setRefinePassCanceller({ cancelInFlightRefinePass });
-
-      const result = await service.remove(childId);
-      expect(result.success).toBe(true);
-      expect(cancelInFlightRefinePass).toHaveBeenCalled();
-
-      // The drain-recorded spend made it into the parent rollup snapshot.
-      expect(rollupCalls).toHaveLength(1);
-      expect(rollupCalls[0].parent).toBe(parentId);
-      expect(rollupCalls[0].child).toBe(childId);
-      expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
-    } finally {
-      await fsPromises.rm(projectDir, { recursive: true, force: true });
-      await cleanup();
-    }
-  });
-
-  test("a failed non-forced deletion defers the one-shot rollups until removal commits", async () => {
-    // rollUpUsageIntoParent / rollUpTimingIntoParent record the child in the
-    // one-shot rolledUpFrom guard. Rolling up BEFORE runtime deletion meant a
-    // force=false deletion failure left the child usable, and the eventual
-    // successful removal skipped the rollup — permanently losing the child's
-    // post-failure spend from parent accounting. Rollups must run only after
-    // deletion can no longer fail, so a failed attempt rolls up nothing and
-    // the retry captures the child's full (including post-failure) usage.
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-retry-"));
-    const parentId = "rollup-retry-parent-ws";
-    const childId = "rollup-retry-child-ws";
-    let deletionFails = true;
     const deleteWorkspaceMock = mock(() =>
-      deletionFails
-        ? Promise.resolve({ success: false as const, error: "worktree has uncommitted changes" })
-        : Promise.resolve({ success: true as const, deletedPath: projectDir })
+      Promise.resolve({ success: true as const, deletedPath: projectDir })
     );
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace: deleteWorkspaceMock,
@@ -24497,14 +24365,14 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         return cfg;
       });
 
-      const childUsage: Record<string, unknown> = {
-        "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
-      };
-      const usageRollups: Array<{ parent: string; child: string; byModel: object }> = [];
+      const usageRollups: Array<{ parent: string; child: string }> = [];
       const sessionUsageService = {
-        getSessionUsage: () => Promise.resolve({ byModel: { ...childUsage } }),
-        rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
-          usageRollups.push({ parent, child, byModel });
+        getSessionUsage: () =>
+          Promise.resolve({
+            byModel: { "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } } },
+          }),
+        rollUpUsageIntoParent: (parent: string, child: string) => {
+          usageRollups.push({ parent, child });
           return Promise.resolve({ didRollUp: true });
         },
       } as unknown as SessionUsageService;
@@ -24516,6 +24384,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
           return Promise.resolve();
         },
       } as unknown as SessionTimingService;
+      const cancelInFlightRefinePass = mock((_workspaceId: string) => Promise.resolve());
 
       const service = createWorkspaceServiceForTest({
         config,
@@ -24531,31 +24400,23 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
           }) as AIService["getWorkspaceMetadata"],
         }),
       });
+      service.setRefinePassCanceller({ cancelInFlightRefinePass });
 
-      // Non-forced removal fails at runtime deletion: the child stays usable,
-      // so neither one-shot rollup may have been consumed.
-      const failedAttempt = await service.remove(childId);
-      expect(failedAttempt.success).toBe(false);
-      expect(deleteWorkspaceMock).toHaveBeenCalledTimes(1);
-      expect(usageRollups).toHaveLength(0);
-      expect(timingRollups).toHaveLength(0);
-
-      // The still-usable child accrues more spend before the retry.
-      childUsage["openai:gpt-5.2"] = { input: { tokens: 7, cost_usd: 0.002 } };
-
-      deletionFails = false;
-      const retry = await service.remove(childId);
-      expect(retry.success).toBe(true);
-
-      // The retry rolls up exactly once, with the full post-failure snapshot.
-      expect(timingRollups).toEqual([childId]);
-      expect(usageRollups).toHaveLength(1);
-      expect(usageRollups[0].parent).toBe(parentId);
-      expect(usageRollups[0].child).toBe(childId);
-      expect(Object.keys(usageRollups[0].byModel)).toEqual([
-        "anthropic:claude-sonnet-4-5",
-        "openai:gpt-5.2",
-      ]);
+      for (const force of [false, true]) {
+        const result = await service.remove(childId, force);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("sub-agent task");
+      }
+      expect(cancelInFlightRefinePass).not.toHaveBeenCalled();
+      expect(deleteWorkspaceMock).not.toHaveBeenCalled();
+      expect(usageRollups).toEqual([]);
+      expect(timingRollups).toEqual([]);
+      // Still registered under its parent, so a later (authorized) rollup has its source.
+      const child = config
+        .loadConfigOrDefault()
+        .projects.get(projectDir)
+        ?.workspaces.find((w) => w.id === childId);
+      expect(child).toMatchObject({ parentWorkspaceId: parentId });
     } finally {
       createRuntimeSpy.mockRestore();
       await fsPromises.rm(projectDir, { recursive: true, force: true });
@@ -24819,6 +24680,11 @@ describe("WorkspaceService disposal ownership", () => {
         })
       );
       service.registerSession(workspaceId, h.session);
+      // A registered ordinary root: the structural guard refuses unregistered ids.
+      const leasedProjectPath = path.join(h.config.rootDir, "repo");
+      await saveWorkspaces(h.config, leasedProjectPath, [
+        projectWorkspace(leasedProjectPath, "leased", workspaceId),
+      ]);
       await h.historyService.appendToHistory(
         workspaceId,
         createMuxMessage("user", "user", "remove after callback")
@@ -24846,8 +24712,16 @@ describe("WorkspaceService disposal ownership", () => {
           removed.resolve(await service.remove(workspaceId, true));
         });
         lease[Symbol.dispose]();
-        if (external) expect((await external).success).toBe(true);
-        expect((await removed.promise).success).toBe(true);
+        if (external) {
+          expect((await external).success).toBe(true);
+          // The deferred removal runs after the external one deregistered the row: with no
+          // registered row left, the structural guard refuses instead of a phantom cleanup.
+          const repeat = await removed.promise;
+          expect(repeat.success).toBe(false);
+          if (!repeat.success) expect(repeat.error).toContain("not registered");
+        } else {
+          expect((await removed.promise).success).toBe(true);
+        }
         expect(existsSync(sessionDir)).toBe(false);
       } finally {
         lease[Symbol.dispose]();

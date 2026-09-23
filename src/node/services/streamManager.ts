@@ -1,4 +1,5 @@
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import type { TaskCheckoutAuthorization } from "@/node/services/taskCheckoutAuthorization";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -345,6 +346,12 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
    * no start can slip between the cascade's capture and the request.
    */
   stopFence?: () => boolean;
+  /**
+   * The checkout-preparation authorization the request builder captured for this workspace
+   * (taskCheckoutAuthorization). AIService re-checks it strictly against the fresh registry right
+   * before handing the options to the engine; the engine itself does not consult it.
+   */
+  preparationAuthorization?: TaskCheckoutAuthorization;
 }
 
 type StreamRequestInput = StreamRequestOptions & {

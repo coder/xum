@@ -16,6 +16,16 @@ import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdat
 import { EventEmitter } from "events";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
+  classifyStructuralMutationTarget,
+  deriveHostLocalCheckoutPath,
+  findProtectedFootprintOverlap,
+  structuralRefusalForOverlap,
+  structuralRefusalForTask,
+  structuralRefusalForUnreadableConfig,
+  structuralRefusalForUnregistered,
+  type StructuralMutation,
+} from "@/node/services/workspaceStructuralMutationGuard";
+import {
   clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
   type AgentWorkflowRunReference,
@@ -35,7 +45,7 @@ import {
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
+import { DEFAULT_RUNTIME_CONFIG, STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
@@ -247,6 +257,16 @@ import {
   isWorkflowRunEmittingToolName,
 } from "@/common/utils/workflowRunMessages";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  bindTaskCheckoutIdentity,
+  buildTaskCheckoutPreparation,
+  claimTaskCheckoutIdentity,
+  isWorktreeSemanticsRuntime,
+  revalidateTaskCheckoutIdentity,
+  type BoundTaskCheckoutIdentity,
+  type CapturedTaskCheckoutIdentity,
+  type TaskCheckoutPreparation,
+} from "@/node/services/taskCheckoutPreparation";
 import type {
   PendingMaterialization,
   Runtime,
@@ -368,6 +388,7 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import type { TaskCheckoutAuthorization } from "@/node/services/taskCheckoutAuthorization";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2978,6 +2999,89 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
+   * Structural-mutation guard shared by remove, rename, archive (delete/snapshot
+   * policies), unarchive (snapshot restore) and deleteWorktree; the policy and the
+   * alias scan live in workspaceStructuralMutationGuard.ts. Decision order:
+   *   1. strict config read — an unreadable config cannot prove "no task", so it refuses;
+   *   2. a protected task row refuses outright, before any lock or effect;
+   *   3. an UNREGISTERED target refuses too: absent metadata or a cached record cannot
+   *      prove it lies outside a protected footprint (the former phantom session-only
+   *      cleanup of remove is gone with it); an off-host root proceeds unlocked;
+   *   4. a host-local ordinary root takes the registration lock (BEFORE any checkout /
+   *      overrides lock — the lock order registerSanitizedTaskCheckout documents),
+   *      re-reads the config under it and scans every protected task row for aliases of
+   *      the root's footprint. The lock is handed back so the caller holds it across its
+   *      physical effect AND config write: task publications take the same lock, so a
+   *      shared child cannot be published against a checkout mid-deletion, and a scan
+   *      that saw no alias stays true until the caller releases. A precheck alone would
+   *      not be: "no alias now" is not permission to mutate later.
+   * Never call while holding a checkout/overrides lock (would invert the order).
+   * Returns Err with the refusal, or Ok with the release to run once the effect and
+   * its config write settled (a no-op when no exclusion was needed).
+   */
+  private async guardStructuralMutation(
+    mutation: StructuralMutation,
+    workspaceId: string,
+    options?: { extraTargetPaths?: (row: Workspace) => string[] }
+  ): Promise<Result<() => Promise<void>>> {
+    const noRelease = () => Promise.resolve();
+    let preliminary: ReturnType<typeof classifyStructuralMutationTarget>;
+    try {
+      preliminary = classifyStructuralMutationTarget(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        workspaceId
+      );
+    } catch (error) {
+      return Err(structuralRefusalForUnreadableConfig(mutation, workspaceId, error));
+    }
+    if (preliminary.kind === "protected-task") {
+      return Err(structuralRefusalForTask(mutation, workspaceId));
+    }
+    if (preliminary.kind === "unregistered") {
+      return Err(structuralRefusalForUnregistered(mutation, workspaceId));
+    }
+    if (preliminary.kind === "off-host-root") {
+      return Ok(noRelease);
+    }
+    let release: () => Promise<void>;
+    try {
+      release = await this.acquireRegistrationSanitizeLock();
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    try {
+      // Fresh under the lock: the read above only decided whether exclusion is needed.
+      const locked = this.config.loadConfigOrDefault({ throwOnError: true });
+      const target = classifyStructuralMutationTarget(locked, workspaceId);
+      if (target.kind === "protected-task") {
+        await release();
+        return Err(structuralRefusalForTask(mutation, workspaceId));
+      }
+      if (target.kind === "unregistered") {
+        await release();
+        return Err(structuralRefusalForUnregistered(mutation, workspaceId));
+      }
+      if (target.kind === "off-host-root") {
+        await release();
+        return Ok(noRelease);
+      }
+      const overlap = await findProtectedFootprintOverlap(locked, {
+        row: target.row,
+        bucketProjectPath: target.bucketProjectPath,
+        extraPaths: options?.extraTargetPaths?.(target.row),
+      });
+      if (overlap.kind !== "none") {
+        await release();
+        return Err(structuralRefusalForOverlap(mutation, workspaceId, overlap));
+      }
+      return Ok(release);
+    } catch (error) {
+      await release();
+      return Err(structuralRefusalForUnreadableConfig(mutation, workspaceId, error));
+    }
+  }
+
+  /**
    * Task orchestration entry point: task worktrees are REGISTERED before their
    * checkout exists (queued/reserved launches persist the entry with a future
    * path), so creation-time sanitization cannot cover them and an uninstall's
@@ -3175,6 +3279,145 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(unsanitizableOverridesMessage(target.workspacePath, error));
       }
       return Ok(await publish());
+    } finally {
+      await releaseRegistrationLock();
+    }
+  }
+
+  /**
+   * The task producers' ONE registration-lock hold: `materialize` (the forks of every fresh
+   * DEDICATED host-local checkout of the batch — nothing registered yet), then per checkout,
+   * under the checkout locks the prune holds: a strict live sibling scan — a live alias of a
+   * fresh dedicated fork is anomalous, so `found` REFUSES (a skipped prune is not a proof that
+   * the directory is sanitized) and an unreadable registry refuses too; the pre-prune identity
+   * CLAIM (stats + nonce); the strict prune; `bindTaskCheckoutIdentity` inside the SAME held
+   * locks, so the identity bound is exactly the directory that was claimed and pruned. Every
+   * identity is revalidated (read-only) immediately before `publish` (the config write that
+   * registers the batch's rows), which runs after the per-target checkout locks are released,
+   * still under the registration lock — the same shape as the single-target helper above, not
+   * a checkout-locked transaction.
+   *
+   * The forks run INSIDE the hold on purpose: a structural mutator (remove/rename/archive of an
+   * alias-free root or a backing repository) scans task rows and applies its effect under this
+   * same lock, so a fork that ran before acquiring it could write into a repository being torn
+   * down and then publish a row the scan never saw. One owner per hold; nothing here re-enters
+   * the registration lock (runtime forks do not go through WorkspaceService.create, and the
+   * config write inside `publish` takes the separate project-registration file lock as always).
+   * Batches with no dedicated checkout (shared / off-host rows) publish under the same hold so a
+   * mutator's scan sees every task row or none.
+   *
+   * `Err` means nothing was published (a throwing `materialize` is reported the same way: its
+   * message, verbatim); the caller retains the fresh directories (their names are unique to
+   * their task ids and a fork refuses an existing path, so no later creation reuses or removes
+   * them; a claimed one refuses adoption through its nonce) and reports their paths. A
+   * throwing `publish` propagates. A `local` runtime fork shares the project directory and is
+   * a shared task by construction: never a target here.
+   */
+  async prepareTaskCheckouts<T>(
+    materialize: () => Promise<
+      ReadonlyArray<{
+        workspacePath: string;
+        runtimeConfig: RuntimeConfig;
+        materializationId: string;
+      }>
+    >,
+    publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>
+  ): Promise<Result<T, string>> {
+    let releaseRegistrationLock: () => Promise<void>;
+    try {
+      releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    try {
+      let targets: Awaited<ReturnType<typeof materialize>>;
+      try {
+        targets = await materialize();
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+      for (const target of targets) {
+        assert(target.workspacePath.length > 0, "prepareTaskCheckouts: path is required");
+        assert(
+          isWorktreeSemanticsRuntime(target.runtimeConfig),
+          "prepareTaskCheckouts: dedicated host-local (worktree) checkouts only"
+        );
+      }
+      const proofs: TaskCheckoutPreparation[] = [];
+      for (const target of targets) {
+        // Identity claimed (stats + nonce) BEFORE the prune inside `claimUnderLock` — the
+        // MUTATING hook the prune joins before its locks release, not the read-only verdict a
+        // deadline may leave detached — under the held checkout locks; bound AFTER it inside
+        // `afterPruneUnderLock` (same locks, read-only) only if the directory is still that
+        // identity and still carries the claim: what the proof binds is exactly the directory
+        // that was claimed and pruned (see claimTaskCheckoutIdentity).
+        let claimed: CapturedTaskCheckoutIdentity | undefined;
+        let bound: BoundTaskCheckoutIdentity | Error | undefined;
+        const claim = async () => {
+          const identity = await claimTaskCheckoutIdentity(target, target.materializationId);
+          if (identity instanceof Error) throw identity;
+          claimed = identity;
+        };
+        const bind = async () => {
+          assert(claimed !== undefined, "prepareTaskCheckouts: bind before claim");
+          bound = await bindTaskCheckoutIdentity(target, target.materializationId, claimed);
+          if (bound instanceof Error) throw bound;
+        };
+        try {
+          if (this.workspaceMcpOverridesService) {
+            await this.workspaceMcpOverridesService.prunePluginOverrideKeysForUnregisteredCheckout(
+              target,
+              "plugin:",
+              {
+                shouldPrune: async () => {
+                  const siblings = await this.findLiveSiblingForCheckout(
+                    target.workspacePath,
+                    undefined,
+                    undefined,
+                    /* ownConfigStrict */ true
+                  );
+                  if (siblings === "found") {
+                    throw new Error(
+                      "a live workspace already resolves to this fresh checkout (alias); refusing to prepare it"
+                    );
+                  }
+                  if (siblings !== "none") throw new Error(siblings.error);
+                  return true;
+                },
+                claimUnderLock: claim,
+                afterPruneUnderLock: bind,
+              }
+            );
+          } else {
+            // No override store in this host composition: nothing can be pruned or activated
+            // through overrides, but the identity is still bound so the row is provable.
+            await claim();
+            await bind();
+          }
+        } catch (error) {
+          return Err(unsanitizableOverridesMessage(target.workspacePath, error));
+        }
+        if (bound === undefined || bound instanceof Error) {
+          return Err(
+            unsanitizableOverridesMessage(
+              target.workspacePath,
+              bound ?? new Error("preparation identity was not bound")
+            )
+          );
+        }
+        proofs.push(buildTaskCheckoutPreparation(bound, target.runtimeConfig));
+      }
+      // Read-only revalidation right before publication: the checkout locks are released, so a
+      // directory replaced meanwhile (only a non-cooperating writer can) must not be published.
+      for (const proof of proofs) {
+        const check = await revalidateTaskCheckoutIdentity(proof);
+        if (!check.ok) {
+          return Err(
+            `${proof.path} changed after sanitization (${check.state.kind}); nothing was published`
+          );
+        }
+      }
+      return Ok(await publish(proofs));
     } finally {
       await releaseRegistrationLock();
     }
@@ -6392,6 +6635,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // it back so the intact workspace stays usable.
     let sealedForRemoval = false;
 
+    // Structural guard (see guardStructuralMutation): decided before the init abort and
+    // the admission holds below, so a refused removal has no effect at all — the task
+    // row, its checkout and its session stay exactly as they were. For an ordinary
+    // root the returned release keeps the registration lock held across the checkout
+    // deletion and deregistration below; it is released in the finally, after the
+    // overrides lock (reverse acquisition order).
+    const structuralGuard = await this.guardStructuralMutation("remove", workspaceId);
+    if (!structuralGuard.success) {
+      this.removingWorkspaces.delete(workspaceId);
+      return Err(structuralGuard.error);
+    }
+    const releaseRegistrationLock = structuralGuard.data;
+
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
     const initAbortController = this.initAbortControllers.get(workspaceId);
@@ -7235,6 +7491,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           });
         }
       }
+      try {
+        await releaseRegistrationLock();
+      } catch (error) {
+        // The lease ages out for other holders; the removal's outcome is already decided.
+        log.debug("Failed to release the registration lock after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
       for (const hold of admissionHolds) {
         hold[Symbol.dispose]();
       }
@@ -7975,6 +8240,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     let releaseOverridesLock: (() => Promise<void>) | undefined;
+    let releaseRegistrationLock: (() => Promise<void>) | undefined;
     try {
       if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
@@ -8016,6 +8282,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const { projectPath: configProjectPath } = workspace;
       const configSnapshot = this.config.loadConfigOrDefault();
+
+      // Structural guard (see guardStructuralMutation), BEFORE the overrides lock below
+      // (lock order: registration → checkout/overrides). The destination paths join the
+      // scanned footprint: moving a root onto a task's alias is as destructive as moving
+      // the task itself. Released right after the config rewrite, with the overrides lock.
+      const structuralGuard = await this.guardStructuralMutation("rename", workspaceId, {
+        extraTargetPaths: (row) =>
+          (row.projects && row.projects.length > 1
+            ? row.projects.map((project) => project.projectPath)
+            : [configProjectPath]
+          ).map((targetProjectPath) =>
+            deriveHostLocalCheckoutPath(row.runtimeConfig, targetProjectPath, newName)
+          ),
+      });
+      if (!structuralGuard.success) {
+        return Err(structuralGuard.error);
+      }
+      releaseRegistrationLock = structuralGuard.data;
 
       // Hold THIS workspace's MCP-overrides lock across the checkout move AND
       // the config rewrite below, for every runtime. Every writer of the
@@ -8270,6 +8554,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           error: getErrorMessage(error),
         });
       });
+      // Same for task registrants: the move and its config write are durable.
+      const releaseRegistrationNow = releaseRegistrationLock;
+      releaseRegistrationLock = undefined;
+      await releaseRegistrationNow?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after rename", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
 
       // Rename plan file if it exists (uses workspace name, not ID)
       await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
@@ -8300,6 +8593,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // a release failure skip clearing the renaming flag below.
       await releaseOverridesLock?.().catch((error: unknown) => {
         log.warn("Failed to release MCP-overrides lock after rename", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+      await releaseRegistrationLock?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after rename", {
           workspaceId,
           error: getErrorMessage(error),
         });
@@ -9571,6 +9870,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
+    let releaseRegistrationLock: (() => Promise<void>) | undefined;
 
     try {
       // Fail-closed live-activity gate for model-facing callers. This check and the
@@ -9669,6 +9969,41 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
+      // Prefer the caller's pinned behavior: model-facing callers make interruption and
+      // eligibility decisions against one read, and the sink honoring that same read keeps the
+      // whole operation coherent under concurrent settings flips.
+      const worktreeArchiveBehavior =
+        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
+      // Structural guard (see guardStructuralMutation) for the archive policies that end in a
+      // checkout deletion — mirrors exactly what the afterArchive worktree hook would delete
+      // (managed worktree, not an isolation:none child, snapshot skips multi-project). A
+      // keep-only archive touches no footprint and stays available for every workspace; a
+      // requested destructive archive is refused, never silently downgraded to keep. Decided
+      // before the init cancellation below so a refusal has no effect at all; for an ordinary
+      // root the lock is held through the afterArchive hook that performs the deletion.
+      const archivingRow = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        workspaceId
+      )?.workspace;
+      // The hook sees metadata, whose runtimeConfig defaults to DEFAULT_RUNTIME_CONFIG (a managed
+      // worktree) for a legacy row without one: decide on that same effective runtime, or such a
+      // row's checkout would be deleted without the guard.
+      const archiveDeletesCheckout =
+        worktreeArchiveBehavior !== "keep" &&
+        archivingRow !== undefined &&
+        isWorktreeRuntime(archivingRow.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG) &&
+        archivingRow.taskIsolation !== "none" &&
+        !(worktreeArchiveBehavior === "snapshot" && (archivingRow.projects?.length ?? 0) > 1);
+      if (archiveDeletesCheckout) {
+        const structuralGuard = await this.guardStructuralMutation(
+          worktreeArchiveBehavior === "snapshot" ? "archive-snapshot" : "archive-delete",
+          workspaceId
+        );
+        if (!structuralGuard.success) {
+          return Err(structuralGuard.error);
+        }
+        releaseRegistrationLock = structuralGuard.data;
+      }
       const initState = this.initStateManager.getInitState(workspaceId);
       if (initState?.status === "running") {
         // Archiving should not leave post-create setup running in the background.
@@ -9717,11 +10052,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const { projectPath, workspacePath } = workspace;
-      // Prefer the caller's pinned behavior: model-facing callers make interruption and
-      // eligibility decisions against one read, and the sink honoring that same read keeps the
-      // whole operation coherent under concurrent settings flips.
-      const worktreeArchiveBehavior =
-        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
       const forbidDeleteCheckNeeded =
         options?.forbidWorktreeCheckoutDeletion === true && worktreeArchiveBehavior === "delete";
       const snapshotBehaviorEnabled =
@@ -9987,6 +10317,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           await this.emitCurrentWorkspaceMetadata(workspaceId);
         }
       }
+      // The checkout deletion (if any) is behind us: let task registrants proceed.
+      const releaseRegistrationNow = releaseRegistrationLock;
+      releaseRegistrationLock = undefined;
+      await releaseRegistrationNow?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after archive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
 
       // Dream trigger (PRD #3534): final consolidation pass — last chance to
       // promote durable workspace-scope lessons to the narrowest available scope
@@ -10012,6 +10351,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
     } finally {
+      // Still held only when the archive exited before its afterArchive hook ran.
+      await releaseRegistrationLock?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after archive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
       admissionHold?.[Symbol.dispose]();
       this.archivingWorkspaces.delete(workspaceId);
     }
@@ -10040,12 +10386,38 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
+    let releaseRegistrationLock: (() => Promise<void>) | undefined;
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
         return Err("Workspace not found");
       }
       const { projectPath, workspacePath } = workspace;
+
+      // Structural guard (see guardStructuralMutation): an unarchive that would REMATERIALIZE
+      // the checkout from its archive snapshot (restoreSnapshotAfterUnarchive below) is a
+      // structural mutation of the footprint; a snapshot-less unarchive only flips the
+      // archived flag and stays available for every workspace (task ancestry unarchive on
+      // send relies on that). Decided before unarchivedAt is written; for an ordinary root
+      // the lock is held through the restoration.
+      const unarchivingRow = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        workspaceId
+      )?.workspace;
+      if (
+        this.worktreeArchiveSnapshotService != null &&
+        unarchivingRow?.worktreeArchiveSnapshot != null &&
+        isWorkspaceArchived(unarchivingRow.archivedAt, unarchivingRow.unarchivedAt)
+      ) {
+        const structuralGuard = await this.guardStructuralMutation(
+          "unarchive-restore",
+          workspaceId
+        );
+        if (!structuralGuard.success) {
+          return Err(structuralGuard.error);
+        }
+        releaseRegistrationLock = structuralGuard.data;
+      }
 
       let didUnarchive = false;
       let previousUnarchivedAt: string | undefined;
@@ -10143,6 +10515,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           return Err(restoreResult.error);
         }
       }
+      // The restoration (if any) is durable: let task registrants proceed before the
+      // lifecycle hooks, which can be slow (e.g. starting a remote workspace).
+      const releaseRegistrationNow = releaseRegistrationLock;
+      releaseRegistrationLock = undefined;
+      await releaseRegistrationNow?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after unarchive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
 
       // Restoration succeeded, so the unarchive is final from here: monitor attention held while
       // archived (see dispatchBashMonitorWake) wakes after lifecycle startup below, and still
@@ -10189,6 +10571,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
+    } finally {
+      // Still held only when the unarchive exited before or during the restoration.
+      await releaseRegistrationLock?.().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock after unarchive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
     }
   }
 
@@ -10212,8 +10602,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err("Deleting a managed worktree is only supported for worktree runtimes");
       }
 
-      const managedPath = workspaceMetadata.namedWorkspacePath;
-      await removeManagedGitWorktree(workspaceMetadata.projectPath, managedPath);
+      // Structural guard (see guardStructuralMutation): held across the deletion below.
+      const structuralGuard = await this.guardStructuralMutation("delete-worktree", workspaceId);
+      if (!structuralGuard.success) {
+        return Err(structuralGuard.error);
+      }
+      const releaseRegistrationLock = structuralGuard.data;
+      try {
+        const managedPath = workspaceMetadata.namedWorkspacePath;
+        await removeManagedGitWorktree(workspaceMetadata.projectPath, managedPath);
+      } finally {
+        await releaseRegistrationLock().catch((error: unknown) => {
+          log.warn("Failed to release the registration lock after deleting a worktree", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+      }
       await this.emitCurrentWorkspaceMetadata(workspaceId);
       return Ok(undefined);
     } catch (error) {
@@ -11883,6 +12288,48 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     });
   }
 
+  /**
+   * Manual rescue of an interrupted/reported task before a send or resume. The preflight's
+   * captured authority rides along when there is one; otherwise the rescue is called exactly as
+   * before (no options) and runs its own preflight.
+   */
+  private rescueInterruptedTask(
+    workspaceId: string,
+    preparation: TaskCheckoutAuthorization | undefined
+  ): Promise<boolean> {
+    const integration = this.agentTaskIntegration;
+    if (integration == null) return Promise.resolve(false);
+    return preparation != null
+      ? integration.markInterruptedTaskRunning(workspaceId, { preparation })
+      : integration.markInterruptedTaskRunning(workspaceId);
+  }
+
+  /**
+   * Checkout-preparation preflight for a stream-starting entry point (sendMessage/resumeStream):
+   * runs the task integration's async, bounded validation for an agent-task workspace (a row with
+   * a parent) that will mint its own obligation here. Resolves `undefined` when nothing has to be
+   * captured — no integration, a root, or a caller-minted token (already admitted under its own
+   * authority). A refusal is the sender's error; nothing downstream runs.
+   */
+  private async preflightTaskPreparationForSend(
+    workspaceId: string,
+    callerToken: TurnAdmissionToken | undefined
+  ): Promise<Result<TaskCheckoutAuthorization | undefined, SendMessageError>> {
+    const integration = this.agentTaskIntegration;
+    if (integration == null || callerToken != null) return Ok(undefined);
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (entry?.parentWorkspaceId == null) return Ok(undefined);
+    const preflight = await integration.preflightTaskWorkspacePreparation(workspaceId);
+    if (!preflight.success) {
+      log.debug("send refused by the checkout-preparation preflight", {
+        workspaceId,
+        message: preflight.error,
+      });
+      return Err({ type: "unknown", raw: preflight.error });
+    }
+    return Ok(preflight.data);
+  }
+
   async sendMessage(
     workspaceId: string,
     message: string,
@@ -11921,11 +12368,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
     };
     let taskTurnAdmissionComposed = false;
+    // The checkout-preparation authority the async preflight below captured for an agent-task
+    // workspace; the fence (and the manual rescue) re-check it against the fresh registry.
+    let taskPreparation: TaskCheckoutAuthorization | undefined;
     const admitTaskTurn = (): Result<void, SendMessageError> => {
       if (taskTurnAdmissionComposed) return Ok(undefined);
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(taskPreparation != null ? { preparation: taskPreparation } : {}),
         });
         if (admission == null || admission.kind === "not-a-task") return Ok(undefined);
         if (admission.kind === "refused") {
@@ -11950,6 +12401,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Ok(undefined);
     };
     try {
+      // Checkout-preparation preflight (async, bounded) for a send that will mint its own
+      // obligation into an agent-task workspace: BEFORE the synchronous entry checks below, so
+      // those stay in one synchronous block with the preflight counter they pair with. A
+      // caller-minted token was admitted under its own authority; roots never preflight.
+      const preflight = await this.preflightTaskPreparationForSend(workspaceId, taskTurnAdmission);
+      if (!preflight.success) return preflight;
+      taskPreparation = preflight.data;
+
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
         log.debug("sendMessage blocked: workspace is being renamed", { workspaceId });
@@ -12484,8 +12943,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+        resumedInterruptedTask = await this.rescueInterruptedTask(workspaceId, taskPreparation);
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under) and before the session's own admission awaits.
@@ -12825,9 +13283,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           Promise.resolve(undefined)
         );
       }
+      // Checkout-preparation preflight (see sendMessage): captured before the rescue so both
+      // the rescue's CAS and the fence below re-check the same authority.
+      const preflight = await this.preflightTaskPreparationForSend(
+        workspaceId,
+        internal?.turnAdmission
+      );
+      if (!preflight.success) return preflight;
+      const taskPreparation = preflight.data;
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-      resumedInterruptedTask =
-        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+      resumedInterruptedTask = await this.rescueInterruptedTask(workspaceId, taskPreparation);
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
       // carries the same obligation, bound after the rescue above. Disposed as no-work when the
@@ -12836,6 +13301,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(taskPreparation != null ? { preparation: taskPreparation } : {}),
         });
         if (admission?.kind === "refused") {
           return Err({ type: "unknown", raw: admission.message });

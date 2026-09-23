@@ -16,6 +16,7 @@ import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { TurnId } from "@/node/services/turnCoordinator";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type { TaskCheckoutPreparation } from "@/common/schemas/project";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
@@ -33,6 +34,7 @@ import type {
 } from "@/node/services/terminalAttentionStore";
 import assert from "@/common/utils/assert";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type { TaskCheckoutAuthorization } from "@/node/services/taskCheckoutAuthorization";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
 import type { z } from "zod";
 import strictAssert from "node:assert/strict";
@@ -670,6 +672,23 @@ export interface WorkspaceProvisioningHost {
     target: { workspacePath: string; runtimeConfig: RuntimeConfig },
     publish: () => Promise<T>
   ): Promise<Result<T, string>>;
+  /**
+   * One registration-lock hold for a batch of task rows: `materialize` (the forks of the batch's
+   * fresh DEDICATED host-local checkouts; may return none for shared / off-host batches), then
+   * per checkout the strict prune + identity bound under the checkout locks, then `publish` with
+   * their proofs. `Err` means nothing was published and any forked directories were retained;
+   * see WorkspaceService.prepareTaskCheckouts.
+   */
+  prepareTaskCheckouts<T>(
+    materialize: () => Promise<
+      ReadonlyArray<{
+        workspacePath: string;
+        runtimeConfig: RuntimeConfig;
+        materializationId: string;
+      }>
+    >,
+    publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>
+  ): Promise<Result<T, string>>;
   discardExtensionMetadataEntry(workspaceId: string): Promise<void>;
   registerExternalBackgroundInit(
     workspaceId: string,
@@ -719,7 +738,25 @@ export interface AgentTaskIntegration {
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
-  markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
+  /**
+   * Manual rescue of an interrupted/reported task before a send or resume. `preparation` is the
+   * checkout-preparation authority the caller's preflight captured; without it the rescue runs
+   * its own preflight. Either way the rotation CAS re-checks that authority against the fresh row.
+   */
+  markInterruptedTaskRunning(
+    workspaceId: string,
+    options?: { preparation?: TaskCheckoutAuthorization }
+  ): Promise<boolean>;
+  /**
+   * Async, bounded checkout-preparation preflight for a workspace (see
+   * taskCheckoutAuthorization.captureTaskCheckoutAuthorization): roots and off-host rows resolve to
+   * an exempt authorization; a host-local task row resolves to its validated authority or refuses
+   * with an inspectable message. Every stream-starting entry point runs this BEFORE the
+   * synchronous fence and hands the captured authority to it.
+   */
+  preflightTaskWorkspacePreparation(
+    workspaceId: string
+  ): Promise<Result<TaskCheckoutAuthorization, string>>;
   /**
    * Synchronous admission fence for a send into a workspace, evaluated at the session handoff
    * (right before the queue insertion or the session's own admission awaits). Non-task workspaces
@@ -736,6 +773,12 @@ export interface AgentTaskIntegration {
        * another writer between its own admission and this handoff.
        */
       expectedAttemptId?: string;
+      /**
+       * The checkout-preparation authority the caller's async preflight captured. Mandatory for
+       * host-local task rows: the fence re-derives the authority from the fresh registry and
+       * refuses when it differs (or when none was captured). Roots and off-host rows ignore it.
+       */
+      preparation?: TaskCheckoutAuthorization;
     }
   ): TaskTurnAdmission;
   restoreInterruptedTaskAfterResumeFailure(

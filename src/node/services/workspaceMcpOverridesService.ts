@@ -12,6 +12,10 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config, ProjectsConfig } from "@/node/config";
+import {
+  captureTaskCheckoutAuthorization,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -1070,6 +1074,20 @@ function groupMetadataById(
   return grouped;
 }
 
+/**
+ * Result of getOverridesForWorkspace. `preparation` is the checkout-preparation authority the
+ * read validated (threaded by callers into MCPWorkspaceRequestOptions so the manager can re-check
+ * it against the fresh registry); `preparationRefusal` replaces it when the gate refused, in
+ * which case the read is never authoritative and carries no overrides.
+ */
+export interface WorkspaceMcpOverridesRead {
+  overrides: WorkspaceMCPOverrides;
+  revision: string;
+  authoritative: boolean;
+  preparation?: TaskCheckoutAuthorization;
+  preparationRefusal?: { message: string };
+}
+
 export class WorkspaceMcpOverridesService {
   /**
    * Root holding the cross-process coordination state (override epoch file,
@@ -1598,9 +1616,29 @@ export class WorkspaceMcpOverridesService {
       timeoutMs?: number;
       signal?: AbortSignal;
     }
-  ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string; authoritative: boolean }> {
-    const snapshot = new ConfigSnapshot(this.config);
+  ): Promise<WorkspaceMcpOverridesRead> {
     const mode = options?.mode ?? "lenient";
+    // Checkout-preparation authority — the deepest MCP gate. Every consumer that can activate
+    // MCP for a workspace (turn builder, prompt discovery, the manager's disk re-read, prompt
+    // materialization, served-tool dispatch) reads through here, so a host-local task row whose
+    // authority cannot be validated (bounded, async) yields a NON-authoritative read with no
+    // overrides — the manager then fails its serve closed — and never the document's own
+    // enablement. Roots and off-host rows resolve to an exempt authority the caller threads on.
+    const preparation = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+    if (!preparation.success) {
+      if (mode === "strict") throw new Error(preparation.error);
+      log.info("[MCP] Workspace MCP overrides withheld: checkout preparation refused", {
+        workspaceId,
+        message: preparation.error,
+      });
+      return {
+        overrides: {},
+        revision: computeOverridesRevision({}),
+        authoritative: false,
+        preparationRefusal: { message: preparation.error },
+      };
+    }
+    const snapshot = new ConfigSnapshot(this.config);
     const resolution = (async () =>
       this.resolveOverridesFor(
         await this.getWorkspaceMetadata(workspaceId, snapshot),
@@ -1633,7 +1671,12 @@ export class WorkspaceMcpOverridesService {
           throw new Error(reason);
         }
         log.warn(`[MCP] ${reason}; serving no overrides (non-authoritative)`, { workspaceId });
-        return { overrides: {}, revision: computeOverridesRevision({}), authoritative: false };
+        return {
+          overrides: {},
+          revision: computeOverridesRevision({}),
+          authoritative: false,
+          preparation: preparation.data,
+        };
       }
       resolved = raced.value;
     }
@@ -1641,6 +1684,7 @@ export class WorkspaceMcpOverridesService {
       overrides: resolved.overrides,
       revision: computeOverridesRevision(resolved.overrides),
       authoritative: resolved.authoritative,
+      preparation: preparation.data,
     };
   }
 
@@ -4321,6 +4365,31 @@ export class WorkspaceMcpOverridesService {
        * by the prune's own budget.
        */
       shouldPrune?: () => Promise<boolean>;
+      /**
+       * Runs INSIDE the same held checkout and global override locks AFTER a
+       * `true` verdict and BEFORE the prune: the task-checkout preparation
+       * producer CLAIMS the fresh checkout here (a durable nonce write into its
+       * git admin dir). MUTATING, unlike the verdict — so a deadline that fires
+       * while it is in flight does not detach it: the claim is joined (landed or
+       * failed) before the locks release, exactly like an abandoned prune
+       * rewrite. A late nonce write after the release could otherwise stamp a
+       * directory a successor owns by then. Bounded by the prune's own budget;
+       * a deadline here fails the operation before any prune is launched.
+       */
+      claimUnderLock?: () => Promise<void>;
+      /**
+       * Runs INSIDE the same held checkout and global override locks AFTER the
+       * prune's writes settled (also when `shouldPrune` allowed the prune and
+       * nothing needed rewriting): the task-checkout preparation producer binds
+       * the physical identity of the sanitized directory here, so what it binds
+       * is exactly what was pruned, with no window in which an alias writer could
+       * replace or re-consent the checkout. Read-only (stats and a bounded read
+       * of the nonce; the nonce was written by `claimUnderLock`), so a deadline
+       * may leave it detached like the verdict; bounded by the prune's own
+       * budget. Not invoked when `shouldPrune` returned `false` (nothing was
+       * sanitized, nothing to bind).
+       */
+      afterPruneUnderLock?: () => Promise<void>;
     }
   ): Promise<void> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
@@ -4344,11 +4413,11 @@ export class WorkspaceMcpOverridesService {
           if (unresolvable !== undefined) {
             throw unresolvable.error;
           }
-          // ONE budget for the verdict and the prune (the prune sweep's shape): a
-          // slow registry walk under the locks must not leave a full prune budget
-          // behind it, and an expired verdict must not launch a mutating prune
-          // at all — the only detached work a deadline can leave here is the
-          // read-only verdict itself.
+          // ONE budget for the verdict, the claim and the prune (the prune sweep's
+          // shape): a slow registry walk under the locks must not leave a full
+          // prune budget behind it, and an expired verdict must not launch a
+          // mutating claim or prune at all — the only detached work a deadline
+          // can leave here is the read-only verdict (and the read-only bind).
           const budget = createPublicationBudget();
           if (options?.shouldPrune !== undefined) {
             const prune = await withDeadline(
@@ -4357,6 +4426,27 @@ export class WorkspaceMcpOverridesService {
               `verifying the siblings of ${label} exceeded the plugin-prune budget`
             );
             if (!prune) return;
+          }
+          if (options?.claimUnderLock !== undefined) {
+            if (budget.exhausted()) {
+              throw new Error(`claiming ${label} exceeded the plugin-prune budget`);
+            }
+            const claim = options.claimUnderLock();
+            try {
+              await withDeadline(
+                claim,
+                budget.remaining(),
+                `claiming ${label} exceeded the plugin-prune budget`
+              );
+            } finally {
+              // Write-join: a claim the deadline abandoned must land (or fail) before
+              // the locks release (see the option's contract). Its own failure, if
+              // any, is the error already propagating from the await above.
+              await claim.then(
+                () => undefined,
+                () => undefined
+              );
+            }
           }
           if (budget.exhausted()) {
             throw new Error(`pruning ${label} exceeded the plugin-prune budget`);
@@ -4393,6 +4483,16 @@ export class WorkspaceMcpOverridesService {
             // locks release: a late write could otherwise overwrite a save made
             // by the registration that follows.
             await snapshot.settleSideEffects();
+          }
+          if (options?.afterPruneUnderLock !== undefined) {
+            if (budget.exhausted()) {
+              throw new Error(`binding ${label} exceeded the plugin-prune budget`);
+            }
+            await withDeadline(
+              options.afterPruneUnderLock(),
+              budget.remaining(),
+              `binding ${label} exceeded the plugin-prune budget`
+            );
           }
         }),
       WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS

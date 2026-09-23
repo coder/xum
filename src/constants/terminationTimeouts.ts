@@ -24,6 +24,22 @@ export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
 
 /**
+ * Bounds the physical half of task checkout preparation validation. A healthy host-local checkout
+ * answers its few stats and small reads in milliseconds, but one on a stalled FUSE/NFS mount can
+ * block them forever, and the send/resume/startup gates pass no abort signal. On expiry the
+ * validation fails closed (the task refuses to run as unreadable).
+ */
+export const TASK_CHECKOUT_VALIDATION_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * Bounds a structural mutation's protected-footprint scan (Git-backing probes and realpaths of
+ * every protected task row), which runs while holding the workspace registration lock. A stalled
+ * FUSE/NFS mount under any row would otherwise hang the mutation and every task publication
+ * behind that lock. On expiry the mutation is refused (the overlap is unknown).
+ */
+export const STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS = 20 * 1000;
+
+/**
  * Bounds backup Git calls that can hang on a blackholed remote, while leaving room for a
  * slow initial clone.
  */

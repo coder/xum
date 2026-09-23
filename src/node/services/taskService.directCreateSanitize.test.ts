@@ -16,6 +16,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { TaskService } from "@/node/services/taskService";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   createAIServiceMocks,
   createTestProject,
@@ -396,6 +397,125 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     ).toEqual(consented);
   }, 30_000);
 
+  test.each(["isolation-none", "project-dir-local"] as const)(
+    "a capacity-queued shared task (%s) publishes its protected row under the registration lock, like the unqueued shared path",
+    async (shape) => {
+      const [runningId, queuedId] =
+        shape === "isolation-none" ? ["sharedrun1", "sharedque1"] : ["localrun01", "localque01"];
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, parentPath } = await createRealStack(projectPath);
+      if (shape === "project-dir-local") {
+        // A project-dir parent: its local-runtime tasks share the project directory.
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            {
+              path: projectPath,
+              id: rootId,
+              name: "repo",
+              createdAt: new Date().toISOString(),
+              runtimeConfig: { type: "local" },
+            },
+          ],
+          testTaskSettings(1)
+        );
+      } else {
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+      }
+      const sharedPath = shape === "project-dir-local" ? projectPath : parentPath;
+      const isolation = shape === "isolation-none" ? ("none" as const) : undefined;
+      stubStableIds(config, [runningId, queuedId]);
+      // The one parallel slot is taken by a running shared task.
+      expect(await taskService.create({ ...createArgs("Running"), isolation })).toMatchObject({
+        success: true,
+        data: { taskId: runningId, status: "running" },
+      });
+      // A structural mutator in another backend scans task rows and renames under this lock, so
+      // the queued row must land while the lock is held (seen by that scan or after it), never
+      // in the middle of the mutation.
+      const lockPath = path.join(config.rootDir, "workspace-registration.lock");
+      const probeRegistrationLock = async (): Promise<"held" | "free"> => {
+        try {
+          const release = await acquireCrossProcessLock({
+            lockPath,
+            acquireTimeoutMs: 100,
+            staleMs: 60_000,
+            timeoutMessage: "registration lock held",
+          });
+          await release();
+          return "free";
+        } catch (error) {
+          expect(String(error)).toContain("registration lock held");
+          return "held";
+        }
+      };
+      const realEdit = config.editConfig.bind(config);
+      const publications: Array<"held" | "free"> = [];
+      const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+        const lock = await probeRegistrationLock();
+        await realEdit((cfg) => {
+          const before = findWorkspaceEntry(cfg, queuedId) != null;
+          const next = fn(cfg);
+          if (!before && findWorkspaceEntry(next, queuedId) != null) publications.push(lock);
+          return next;
+        }, options);
+      });
+      restores.push(() => edit.mockRestore());
+
+      const queued = await taskService.create({ ...createArgs("Queued"), isolation });
+      expect(queued).toMatchObject({ success: true, data: { taskId: queuedId, status: "queued" } });
+      expect(publications).toEqual(["held"]);
+      const row = findWorkspaceInConfig(config, queuedId);
+      expect(row).toMatchObject({ path: sharedPath, taskStatus: "queued" });
+      expect(row?.taskIsolation).toBe(isolation);
+    },
+    30_000
+  );
+
+  test.each(["queued", "unqueued", "reserved"] as const)(
+    "a structural rename that wins the registration lock before the %s isolation: none publication refuses the creation instead of publishing stale ancestry",
+    async (mode) => {
+      const taskId =
+        mode === "queued" ? "stalequeue1" : mode === "unqueued" ? "staledirect" : "stalereserv";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, parentPath } =
+        await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      if (mode === "queued") {
+        // The one slot is taken by unrelated work (nothing aliasing the parent), so the rename
+        // below is a mutation the guard permits.
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      // The mutator wins the lock first: the parent is renamed after the creator captured its
+      // path and before the creator's locked publication.
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      let renamed: Awaited<ReturnType<WorkspaceService["rename"]>> | undefined;
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        async (materialize, publish) => {
+          renamed ??= await workspaceService.rename(rootId, "parent-renamed");
+          return realPrepare(materialize, publish);
+        }
+      );
+      restores.push(() => prepare.mockRestore());
+
+      // "reserved" is the batch path (createMany), which commits its rows in one locked write.
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([{ ...createArgs("Stale"), isolation: "none" }])
+          : await taskService.create({ ...createArgs("Stale"), isolation: "none" });
+      expect(renamed).toMatchObject({ success: true });
+      expect(findWorkspaceInConfig(config, rootId)?.path).not.toBe(parentPath);
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain("parent workspace changed");
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    },
+    30_000
+  );
+
   test("a project-dir (local runtime) parent shares its directory with the task: the live sibling is found and its consent is preserved", async () => {
     const taskId = "directlocal01";
     const projectPath = await createRepoWithTrackedEnable();
@@ -442,12 +562,12 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
   }, 30_000);
 
   test.each(["before-the-scan", "after-the-prune"] as const)(
-    "an older-style in-place registration of the same physical checkout through a symlinked spelling (%s) keeps its consent: the alias is recognized, and consent saved after the prune is never pruned again",
+    "an older-style in-place registration of the same physical checkout through a symlinked spelling (%s): a live alias of the fresh fork refuses the creation with its consent intact; consent saved after the prune survives publication",
     async (when) => {
       const taskId = when === "before-the-scan" ? "directalias01" : "directalias02";
       const aliasId = "cli-alias-registration";
       const projectPath = await createRepoWithTrackedEnable();
-      const { config, taskService, overridesService } = await createRealStack(projectPath);
+      const { config, taskService, overridesService, sends } = await createRealStack(projectPath);
       stubStableIds(config, [taskId]);
       // A second spelling of the worktree directory tree: `<root>/src-alias` -> `<root>/src`.
       const srcAlias = path.join(rootDir, "src-alias");
@@ -459,8 +579,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       // checkout in place through the alias spelling — the shape `xum run` leaves behind — and
       // then saves plugin consent for it through the ordinary save path. A save replaces the
       // document's enable list: registered before the scan, the alias re-consents to the tracked
-      // key as well, so its survival proves the creation SKIPPED the prune (live sibling); saved
-      // after the prune, the consent alone must survive publication.
+      // key as well; saved after the prune, the consent alone must survive publication.
       const aliasEnables = when === "before-the-scan" ? [STALE_PLUGIN_KEY, consented] : [consented];
       const otherConfig = new Config(config.rootDir);
       const otherOverrides = new WorkspaceMcpOverridesService(otherConfig);
@@ -508,28 +627,41 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       }
 
       const created = await taskService.create(createArgs("Alias"));
-      expect(created).toMatchObject({ success: true, data: { taskId } });
-      expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
-        path: forkPath,
-        taskStatus: "running",
-      });
       const document = JSON.parse(
         await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")
       ) as { enabledServers?: string[] };
-      // The alias registration's consent is intact either way: a live sibling at scan time
-      // means no prune at all (the tracked key it re-consented to survives); a sibling arriving
-      // after the prune is never pruned again.
-      expect(document.enabledServers).toEqual(aliasEnables);
+      if (when === "before-the-scan") {
+        // A live workspace already resolving to a FRESH dedicated fork is anomalous: a skipped
+        // prune would prove nothing about the directory, so the preparation refuses. Nothing is
+        // published or sent, the alias's document (tracked key included) is untouched, and the
+        // fork is retained unregistered and named.
+        expect(created.success).toBe(false);
+        if (created.success) throw new Error("unreachable");
+        expect(created.error).toContain("alias");
+        expect(created.error).toContain(`created at ${forkPath} but not registered`);
+        expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+        expect(sends).toEqual([]);
+        expect(document.enabledServers).toEqual(aliasEnables);
+      } else {
+        expect(created).toMatchObject({ success: true, data: { taskId } });
+        expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+          path: forkPath,
+          taskStatus: "running",
+          taskCheckoutPreparation: { v: 1, path: forkPath },
+        });
+        // A sibling arriving after the prune is never pruned again: its consent survives.
+        expect(document.enabledServers).toEqual(aliasEnables);
+      }
       // Both registrations read the same document.
       const viaAlias = await otherOverrides.getOverridesForWorkspace(aliasId, { timeoutMs: 5_000 });
       expect(viaAlias.overrides.enabledServers).toEqual(document.enabledServers);
-      // The alias row was never touched by the task's publication.
+      // The alias row was never touched by the creation.
       expect(findWorkspaceInConfig(config, aliasId)).toMatchObject({ path: aliasPath });
     },
     30_000
   );
 
-  test("an alias registration that lands after the sibling scan but before the checkout lock is acquired keeps its consent: the creator re-checks siblings under the path lock", async () => {
+  test("an alias registration that lands after the sibling scan but before the checkout lock is acquired is seen under the path lock: the creation refuses and the alias's consent is neither pruned nor published against", async () => {
     // The plan's scan-under-relevant-locks gate. A registration-lock snapshot alone provides
     // no exclusion against an older-CLI-style in-place registration (which never takes that
     // lock): it can register the same physical checkout through a symlinked spelling and save
@@ -539,7 +671,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     const taskId = "directalias03";
     const aliasId = "cli-alias-late";
     const projectPath = await createRepoWithTrackedEnable();
-    const { config, taskService, overridesService } = await createRealStack(projectPath);
+    const { config, taskService, overridesService, sends } = await createRealStack(projectPath);
     stubStableIds(config, [taskId]);
     const srcAlias = path.join(rootDir, "src-alias");
     await fsPromises.symlink(config.srcDir, srcAlias);
@@ -582,13 +714,18 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     let savedAt: number | undefined;
 
     const created = await taskService.create(createArgs("Late alias"));
-    expect(created).toMatchObject({ success: true, data: { taskId } });
     expect(interleaved).toBe(true);
+    // Seen under the path lock: the live alias refuses the preparation of a fresh fork. Nothing
+    // is published, and the newly saved legitimate consent was never rewritten.
+    expect(created.success).toBe(false);
+    if (created.success) throw new Error("unreachable");
+    expect(created.error).toContain("alias");
+    expect(created.error).toContain(`created at ${forkPath} but not registered`);
+    expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    expect(sends).toEqual([]);
     const document = JSON.parse(
       await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")
     ) as { enabledServers?: string[] };
-    // Newly saved legitimate consent must never be revoked by the creation's prune — the prune
-    // was skipped outright: the document was not rewritten after the alias's save.
     expect(document.enabledServers).toEqual([consented]);
     expect(savedAt).toBeDefined();
     expect((await fsPromises.stat(path.join(forkPath, OVERRIDES_RELATIVE_PATH))).mtimeMs).toBe(
@@ -596,7 +733,6 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     );
     const viaAlias = await otherOverrides.getOverridesForWorkspace(aliasId, { timeoutMs: 5_000 });
     expect(viaAlias.overrides.enabledServers).toEqual([consented]);
-    expect(findWorkspaceInConfig(config, taskId)).toMatchObject({ path: forkPath });
     expect(findWorkspaceInConfig(config, aliasId)).toMatchObject({ path: aliasPath });
   }, 30_000);
 

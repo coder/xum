@@ -98,11 +98,19 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
+  isProjectDirLocalRuntime,
+  isWorktreeSemanticsRuntime,
+  newMaterializationId,
+  sharedTaskRowPublicationRefusal,
+  type TaskCheckoutPreparation,
+} from "@/node/services/taskCheckoutPreparation";
+import { isProtectedTaskRow } from "@/node/services/workspaceStructuralMutationGuard";
+import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
-import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
+import { createRuntime, runBackgroundInit } from "@/node/runtime/runtimeFactory";
 import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
@@ -110,6 +118,14 @@ import {
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
+import {
+  captureTaskCheckoutAuthorization,
+  isTaskCheckoutAuthorizationCurrent,
+  isTaskCheckoutDomainRow,
+  snapshotConfigReader,
+  taskCheckoutStaleMessage,
+  type TaskCheckoutAuthorization,
+} from "@/node/services/taskCheckoutAuthorization";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -135,11 +151,13 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
+  getSrcBaseDir,
   isLocalProjectRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
 } from "@/common/types/runtime";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 import type {
   ProjectRef,
   WorkspaceMetadata,
@@ -509,6 +527,11 @@ interface AdmittedSend {
   readonly attemptId: string;
   /** Set for sends admitted while this process owns the attempt (receipt authority, later change). */
   readonly attempt?: OwnedTaskAttempt;
+  /**
+   * The checkout-preparation authorization the send was admitted under (host-local task rows
+   * only). A pending/enqueued token reads stale once the fresh registry no longer derives it.
+   */
+  readonly preparation?: TaskCheckoutAuthorization;
   state: "pending" | "enqueued" | "admitted" | "discharged";
   /** The admitted turn generation; rebound to its successor on supersession. */
   turnId?: symbol;
@@ -558,6 +581,8 @@ interface TaskLaunchPlan {
   parentRuntimeConfig: RuntimeConfig;
   configProjectPath: string;
   workspaceKind?: "scratch";
+  /** Set by the reservation's prepare stage for dedicated host-local checkouts (in-process only). */
+  prepared?: PreparedReservedCheckout;
   taskModelString: string;
   canonicalModel: string;
   effectiveThinkingLevel?: ThinkingLevel;
@@ -698,6 +723,20 @@ interface MaterializedTaskLaunch {
   runtimeForTaskWorkspace: Runtime;
   inheritedProjects: WorkspaceMetadata["projects"];
   sourceRuntimeConfigUpdate?: RuntimeConfig;
+}
+
+/**
+ * A dedicated host-local reserved checkout forked and sanitized BEFORE its reservation is
+ * published (see prepareDedicatedReservedCheckouts): the commit writes its path, runtime, trunk,
+ * base SHAs and preparation proof in the row's first write, and the launch consumes the row
+ * instead of materializing.
+ */
+interface PreparedReservedCheckout {
+  materialized: MaterializedTaskLaunch;
+  taskBaseCommitShaByProjectPath: Record<string, string>;
+  materializationId: string;
+  /** Bound by WorkspaceService.prepareTaskCheckouts under the checkout locks; set before publication. */
+  proof?: TaskCheckoutPreparation;
 }
 
 export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
@@ -2757,13 +2796,15 @@ export class TaskService implements AgentTaskIntegration {
   private createAdmittedSend(
     taskId: string,
     attemptId: string,
-    attempt: OwnedTaskAttempt | undefined
+    attempt: OwnedTaskAttempt | undefined,
+    preparation: TaskCheckoutAuthorization | undefined
   ): AdmittedSend {
     assertTaskAttemptId(attemptId, "createAdmittedSend");
     const send: AdmittedSend = {
       taskId,
       attemptId,
       ...(attempt != null ? { attempt } : {}),
+      ...(preparation != null ? { preparation } : {}),
       state: "pending",
       capturedBy: new Set(),
       token: {
@@ -2775,6 +2816,14 @@ export class TaskService implements AgentTaskIntegration {
           if (send.state === "discharged") return true;
           if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
           if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
+            return true;
+          }
+          // The checkout-preparation authorization the send was admitted under must still be
+          // what the fresh registry derives (strict, config only); unreadable registry = stale.
+          if (
+            send.preparation != null &&
+            !isTaskCheckoutAuthorizationCurrent(this.config, taskId, send.preparation).current
+          ) {
             return true;
           }
           // A send still in its preflight while the attempt's last stream is undecided, or was
@@ -2864,15 +2913,18 @@ export class TaskService implements AgentTaskIntegration {
    */
   admitTaskWorkspaceTurn(
     workspaceId: string,
-    options: { acceptanceOrigin: TurnAcceptanceOrigin; expectedAttemptId?: string }
+    options: {
+      acceptanceOrigin: TurnAcceptanceOrigin;
+      expectedAttemptId?: string;
+      preparation?: TaskCheckoutAuthorization;
+    }
   ): TaskTurnAdmission {
     assert(workspaceId.length > 0, "admitTaskWorkspaceTurn: workspaceId must be non-empty");
     let entry: WorkspaceConfigEntry | undefined;
+    let config: ProjectsConfig;
     try {
-      entry = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        workspaceId
-      )?.workspace;
+      config = this.config.loadConfigOrDefault({ throwOnError: true });
+      entry = findWorkspaceEntry(config, workspaceId)?.workspace;
     } catch (error: unknown) {
       // A task-workspace send must not proceed on an unreadable registry (fail closed); an
       // ordinary workspace is unaffected because it never reaches the session with a token.
@@ -2882,6 +2934,24 @@ export class TaskService implements AgentTaskIntegration {
       return { kind: "not-a-task" };
     }
     if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
+    // Checkout-preparation authority, before every other gate (including the pre-identity
+    // bypass below): a host-local task row is executable only under the authority the caller's
+    // async preflight captured, re-derived here strictly from the fresh registry. Off-host rows
+    // are excluded; a caller that captured nothing for a domain row is refused (fail closed).
+    const preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+      workspaceId,
+      entry,
+      config,
+      options.preparation
+    );
+    if (preparationRefusal != null) {
+      log.info("[task-attempt] send refused: checkout preparation authority", {
+        workspaceId,
+        acceptanceOrigin: options.acceptanceOrigin,
+        message: preparationRefusal,
+      });
+      return { kind: "refused", message: preparationRefusal };
+    }
     // The claim is monotonic and stronger than the id: a retired task refuses even when its id
     // is missing or malformed (fail closed on partial state), so check it before the id.
     if (entry.taskAttemptRetiredBy != null) {
@@ -2920,9 +2990,51 @@ export class TaskService implements AgentTaskIntegration {
     const send = this.createAdmittedSend(
       workspaceId,
       attemptId,
-      owned?.attemptId === attemptId ? owned : undefined
+      owned?.attemptId === attemptId ? owned : undefined,
+      isTaskCheckoutDomainRow(entry) ? options.preparation : undefined
     );
     return { kind: "admitted", token: send.token };
+  }
+
+  /**
+   * Async, bounded checkout-preparation preflight (AgentTaskIntegration): the authority every
+   * admission of this workspace must bind. Never throws; a refusal carries the inspectable
+   * message the caller returns to the sender.
+   */
+  async preflightTaskWorkspacePreparation(
+    workspaceId: string
+  ): Promise<Result<TaskCheckoutAuthorization, string>> {
+    assert(workspaceId.length > 0, "preflightTaskWorkspacePreparation: workspaceId");
+    const captured = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+    if (!captured.success) {
+      log.info("[task-prep] preflight refused", { workspaceId, message: captured.error });
+    }
+    return captured;
+  }
+
+  /**
+   * The fence's synchronous checkout-preparation check for a task row `entry` read from `config`:
+   * `undefined` when the captured authorization is exactly what the snapshot derives (or, for an
+   * off-host row with nothing captured, when the snapshot still proves its exemption); otherwise
+   * the refusal message. A host-local task row with nothing captured is refused: the physical
+   * validation belongs to the async preflight and cannot be replayed here. Config only — no
+   * filesystem, no locks (see isTaskCheckoutAuthorizationCurrent).
+   */
+  private checkTaskCheckoutAuthorityAtFence(
+    workspaceId: string,
+    entry: WorkspaceConfigEntry,
+    config: ProjectsConfig,
+    captured: TaskCheckoutAuthorization | undefined
+  ): string | undefined {
+    if (captured == null && isTaskCheckoutDomainRow(entry)) {
+      return `Task workspace ${workspaceId} cannot run: this send was not preflighted against its checkout preparation (PREP_PREFLIGHT_REQUIRED).`;
+    }
+    const check = isTaskCheckoutAuthorizationCurrent(
+      snapshotConfigReader(config),
+      workspaceId,
+      captured
+    );
+    return check.current ? undefined : taskCheckoutStaleMessage(workspaceId, check.reason);
   }
 
   /**
@@ -3018,18 +3130,36 @@ export class TaskService implements AgentTaskIntegration {
   private async rotateAttemptForStartupRedrive(
     taskId: string,
     snapshot: Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus">
-  ): Promise<string | undefined> {
+  ): Promise<{ attemptId: string; preparation: TaskCheckoutAuthorization } | undefined> {
+    // Checkout-preparation authority first (async, bounded): a row this process cannot authorize
+    // is never re-driven — no rotation, no send; it stays inspectable with its old attempt.
+    const preflight = await this.preflightTaskWorkspacePreparation(taskId);
+    if (!preflight.success) {
+      log.info("[startup] task skipped: checkout preparation refused", {
+        taskId,
+        message: preflight.error,
+      });
+      return undefined;
+    }
+    const preparation = preflight.data;
     const attemptId = newTaskAttemptId();
     let committed = false;
     let moved = false;
     try {
       await this.editWorkspaceEntry(
         taskId,
-        (ws) => {
+        (ws, freshConfig) => {
           if (ws.taskAttemptRetiredBy != null) return;
           if (
             ws.taskAttemptId !== snapshot.taskAttemptId ||
             ws.taskStatus !== snapshot.taskStatus
+          ) {
+            moved = true;
+            return;
+          }
+          // Strict re-derivation against the fresh row inside the CAS (config only).
+          if (
+            this.checkTaskCheckoutAuthorityAtFence(taskId, ws, freshConfig, preparation) != null
           ) {
             moved = true;
             return;
@@ -3056,7 +3186,7 @@ export class TaskService implements AgentTaskIntegration {
       return undefined;
     }
     this.publishAttemptRotation(taskId, attemptId);
-    return attemptId;
+    return { attemptId, preparation };
   }
 
   /**
@@ -3069,11 +3199,12 @@ export class TaskService implements AgentTaskIntegration {
    */
   private async dispatchFencedStartupCompactionFollowUp(
     taskId: string,
-    attemptId: string
+    rotated: { attemptId: string; preparation: TaskCheckoutAuthorization }
   ): Promise<Result<boolean>> {
     const admission = this.admitTaskWorkspaceTurn(taskId, {
       acceptanceOrigin: "automatic",
-      expectedAttemptId: attemptId,
+      expectedAttemptId: rotated.attemptId,
+      preparation: rotated.preparation,
     });
     if (admission.kind !== "admitted") {
       return Err(
@@ -4165,15 +4296,12 @@ export class TaskService implements AgentTaskIntegration {
       // the first send below; the sends are then fenced against the fresh id at the handoff.
       // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
       // admitted or stopped by another writer and must not be re-driven.
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
+      const rotated = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotated == null) {
         failedAwaitingReportCount += 1;
         continue;
       }
-      const followUp = await this.dispatchFencedStartupCompactionFollowUp(
-        task.id,
-        rotatedAttemptId
-      );
+      const followUp = await this.dispatchFencedStartupCompactionFollowUp(task.id, rotated);
       if (!followUp.success) failedAwaitingReportCount += 1;
       else if (followUp.data) resumedAwaitingReportCount += 1;
       if (!followUp.success || followUp.data) continue;
@@ -4183,7 +4311,8 @@ export class TaskService implements AgentTaskIntegration {
       // refuses the send at the gates instead of the handoff adopting the successor.
       const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
         acceptanceOrigin: "automatic",
-        expectedAttemptId: rotatedAttemptId,
+        expectedAttemptId: rotated.attemptId,
+        preparation: rotated.preparation,
       });
       if (completionAdmission.kind !== "admitted") {
         failedAwaitingReportCount += 1;
@@ -4191,7 +4320,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
-        fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
+        fence: { turnAdmission: completionAdmission.token, attemptId: rotated.attemptId },
       });
       if (!resumed) {
         failedAwaitingReportCount += 1;
@@ -4229,18 +4358,19 @@ export class TaskService implements AgentTaskIntegration {
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
       // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
+      const rotated = await this.rotateAttemptForStartupRedrive(task.id, task);
+      if (rotated == null) {
         failedRunningCount += 1;
         continue;
       }
+      const rotatedAttemptId = rotated.attemptId;
 
       // Restore compaction intent before new guidance/nudges make its tail stale.
       // Guidance then queues behind that continuation without losing either payload.
       const followUp =
         alreadyStreaming || queueOnly
           ? Ok(false)
-          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotatedAttemptId);
+          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotated);
       if (!followUp.success) failedRunningCount += 1;
       else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
       if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
@@ -4252,6 +4382,7 @@ export class TaskService implements AgentTaskIntegration {
         const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
           acceptanceOrigin: "automatic",
           expectedAttemptId: rotatedAttemptId,
+          preparation: rotated.preparation,
         });
         return admission.kind === "admitted" ? admission.token : undefined;
       };
@@ -4583,7 +4714,7 @@ export class TaskService implements AgentTaskIntegration {
 
   private async editActiveWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (workspace: WorkspaceConfigEntry, config: ProjectsConfig) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean> {
     // Admission protects only persistence. Never hold the desktop gate across nested sends.
@@ -4591,7 +4722,7 @@ export class TaskService implements AgentTaskIntegration {
       this.editWorkspaceEntry(
         workspaceId,
         (workspace, config) => {
-          updater(workspace);
+          updater(workspace, config);
           this.desktopInputCoordinator.assertAdmission(config, workspaceId);
         },
         options
@@ -5193,44 +5324,110 @@ export class TaskService implements AgentTaskIntegration {
     progress.enter("desktop-gate");
     let canceledInsideCommit = false;
     const commit = async (): Promise<Result<TaskCreateResult[], string> | null> => {
-      // Checkpoint entry is the LAST cancellation point: an abort observed here leaves nothing
-      // durable. Once a callback is entered it is owned to completion (the runner checks the
-      // signal itself before its store write).
-      progress.enter("checkpoint");
-      if (signal?.aborted) return interrupted();
-      // Ownership BEFORE exposure: every id a checkpoint callback may durably record is owned by
-      // this process from here, whatever happens to the callbacks or the commit. The identity is
-      // kept through a successful commit (the launch reuses it) and, when the pre-launch path
-      // fails, settled once nothing can launch — a checkpointed id must never read back to the
-      // runner as "no attempt owned by this process".
-      // The reservation is the FIRST admission of a brand-new task by construction, so its
-      // lineage is proven: the attempt id minted here is persisted by the commit below in the same
-      // write that creates the entry, and the launch reuses it.
-      const ownedAttempts = new Map(
-        plans.map((plan) => {
-          plan.attemptId = newTaskAttemptId();
-          return [
-            plan.taskId,
-            this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
-              attemptId: plan.attemptId,
-              receiptEligible: true,
-              ...(signal != null ? { abortSignal: signal } : {}),
-            }),
-          ];
-        })
-      );
+      const preparedPlans = () => plans.filter((plan) => plan.prepared != null);
+      const retainedPreparedNotice = () =>
+        preparedPlans().length === 0
+          ? ""
+          : ` Prepared checkout(s) retained, not registered: ${preparedPlans()
+              .map((plan) => plan.prepared!.materialized.workspacePath)
+              .join(", ")}`;
+      // A refusal decided before anything was owned or published (abort, fork failure): the
+      // commit's own result, returned instead of thrown so nothing is settled or fenced.
+      let refusedBeforeOwnership: Result<TaskCreateResult[], string> | undefined;
+      let ownedAttempts = new Map<string, OwnedTaskAttempt>();
       try {
-        for (const [index, result] of results.entries()) {
-          // Workflow callers durably checkpoint returned task IDs before task records are
-          // persisted. If config persistence fails afterward, replay sees a started step whose
-          // task is not found and restarts it instead of duplicating an already-launched child
-          // after a crash.
-          await options.onTaskReserved?.(index, result);
+        // ONE registration-lock hold (WorkspaceService.prepareTaskCheckouts) spans the forks of
+        // every DEDICATED host-local checkout, their strict sanitization (sibling scan + prune +
+        // identity claimed/bound under the checkout locks), the checkpoint callbacks and the
+        // config commit: a structural mutator scanning task rows under the same lock sees either
+        // no fork and no row, or the published row — never a fork it could tear down. A refused
+        // preparation publishes nothing and retains the forked directories (named in the error;
+        // never adopted by a later reservation).
+        const published = await this.workspaceService.prepareTaskCheckouts(
+          async () => {
+            progress.enter("prepare");
+            if (signal?.aborted) {
+              refusedBeforeOwnership = interrupted();
+              throw new Error(progress.interruptedError());
+            }
+            const prepared = await this.prepareDedicatedReservedCheckouts(plans, signal);
+            if (!prepared.success) {
+              refusedBeforeOwnership = prepared.error.startsWith(
+                TASK_RESERVATION_INTERRUPTED_PREFIX
+              )
+                ? Err(prepared.error)
+                : Err(`Task preparation failed: ${prepared.error}`);
+              throw new Error(prepared.error);
+            }
+            // Checkpoint entry is the LAST cancellation point: an abort observed here leaves
+            // nothing durable. Once a callback is entered it is owned to completion (the runner
+            // checks the signal itself before its store write).
+            progress.enter("checkpoint");
+            if (signal?.aborted) {
+              refusedBeforeOwnership = Err(
+                `${progress.interruptedError()}${retainedPreparedNotice()}`
+              );
+              throw new Error(progress.interruptedError());
+            }
+            // Ownership BEFORE exposure: every id a checkpoint callback may durably record is
+            // owned by this process from here, whatever happens to the callbacks or the commit.
+            // The identity is kept through a successful commit (the launch reuses it) and, when
+            // the pre-launch path fails, settled once nothing can launch — a checkpointed id must
+            // never read back to the runner as "no attempt owned by this process".
+            // The reservation is the FIRST admission of a brand-new task by construction, so its
+            // lineage is proven: the attempt id minted here is persisted by the commit below in
+            // the same write that creates the entry, and the launch reuses it.
+            ownedAttempts = new Map(
+              plans.map((plan) => {
+                plan.attemptId = newTaskAttemptId();
+                return [
+                  plan.taskId,
+                  this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
+                    attemptId: plan.attemptId,
+                    receiptEligible: true,
+                    ...(signal != null ? { abortSignal: signal } : {}),
+                  }),
+                ];
+              })
+            );
+            // Multi-project forks: this is the PRIMARY checkout only, so the one proof binds it
+            // alone (the proof schema holds one checkout identity). The secondary checkouts carry
+            // no consent state preparation could protect: multi-project workspaces load no agent
+            // plugins and read overrides from the runtime's container path, not from any project
+            // checkout. They are in the structural guard's footprint, so cooperating mutations
+            // are refused. Binding their identities needs a proof schema extension (a tracked
+            // follow-up).
+            return preparedPlans().map((plan) => ({
+              workspacePath: plan.prepared!.materialized.workspacePath,
+              runtimeConfig: plan.prepared!.materialized.forkedRuntimeConfig,
+              materializationId: plan.prepared!.materializationId,
+            }));
+          },
+          async (proofs) => {
+            const targets = preparedPlans();
+            assert(proofs.length === targets.length, "one proof per prepared checkout");
+            for (const [index, plan] of targets.entries()) {
+              plan.prepared!.proof = proofs[index];
+            }
+            for (const [index, result] of results.entries()) {
+              // Workflow callers durably checkpoint returned task IDs before task records are
+              // persisted. If config persistence fails afterward, replay sees a started step
+              // whose task is not found and restarts it instead of duplicating an
+              // already-launched child after a crash.
+              await options.onTaskReserved?.(index, result);
+            }
+            progress.enter("config-commit");
+            await this.commitReservations(plans, signal, () => {
+              canceledInsideCommit = true;
+            });
+          }
+        );
+        if (refusedBeforeOwnership != null) return refusedBeforeOwnership;
+        if (!published.success) {
+          // The registration lock itself (nothing owned yet) or a refused sanitization (owned).
+          if (ownedAttempts.size === 0) return Err(published.error);
+          throw new Error(`${published.error}${retainedPreparedNotice()}`);
         }
-        progress.enter("config-commit");
-        await this.commitReservations(plans, signal, () => {
-          canceledInsideCommit = true;
-        });
       } catch (error: unknown) {
         await this.settleFailedReservations(plans, ownedAttempts, signal, error);
         throw error;
@@ -5327,10 +5524,19 @@ export class TaskService implements AgentTaskIntegration {
           projectPath: plan.parentMeta.projectPath,
           name: plan.parentMeta.name,
         });
+        // A prepared (dedicated host-local) checkout publishes the materialized truth and its
+        // proof in this first write; lazy plans publish the name-derived path as before.
+        const prepared = plan.prepared;
+        assert(
+          prepared == null || prepared.proof != null,
+          "Task.createMany: prepared checkout published without its proof"
+        );
         const workspacePath =
+          prepared?.materialized.workspacePath ??
           plan.sharedWorkspacePath ??
           runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
         const trunkBranch =
+          prepared?.materialized.trunkBranch ??
           coerceNonEmptyString(plan.preferredTrunkBranch) ??
           coerceNonEmptyString(plan.parentMeta.name);
         if (!trunkBranch) {
@@ -5348,7 +5554,7 @@ export class TaskService implements AgentTaskIntegration {
           name: plan.workspaceName,
           title: plan.title,
           createdAt: plan.createdAt,
-          runtimeConfig: plan.taskRuntimeConfig,
+          runtimeConfig: prepared?.materialized.forkedRuntimeConfig ?? plan.taskRuntimeConfig,
           aiSettings:
             plan.effectiveThinkingLevel !== undefined
               ? {
@@ -5367,8 +5573,16 @@ export class TaskService implements AgentTaskIntegration {
           taskStatus: canceledInsideCommit ? "interrupted" : plan.status,
           taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
           taskAttemptId: plan.attemptId,
+          taskCheckoutPreparation: prepared?.proof,
           taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
           taskTrunkBranch: trunkBranch,
+          ...(prepared != null
+            ? {
+                taskBaseCommitSha:
+                  prepared.taskBaseCommitShaByProjectPath[plan.parentMeta.projectPath] ?? undefined,
+                taskBaseCommitShaByProjectPath: prepared.taskBaseCommitShaByProjectPath,
+              }
+            : {}),
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskOnRefusal: plan.onRefusal,
@@ -5376,9 +5590,17 @@ export class TaskService implements AgentTaskIntegration {
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
-          projects: plan.parentMeta.projects,
+          projects: prepared?.materialized.inheritedProjects ?? plan.parentMeta.projects,
         });
         this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
+      }
+      // Shared plans (isolation: "none", project-dir local) resolved their parent before the
+      // registration lock was taken: a structural rename that won the lock first has moved it
+      // since. Re-derive each shared row in this locked write and refuse the batch (nothing is
+      // written) instead of persisting ancestry that is already broken.
+      for (const plan of plans) {
+        const stale = sharedTaskRowPublicationRefusal(config, plan.taskId);
+        if (stale != null) throw new Error(`Task.createMany: ${stale}`);
       }
       return config;
     });
@@ -5559,20 +5781,43 @@ export class TaskService implements AgentTaskIntegration {
     sourceRuntime: Runtime,
     workspace: WorkspaceConfigEntry
   ): Promise<MaterializedTaskLaunch | null> {
-    const workspacePath =
-      coerceNonEmptyString(workspace.path) ??
-      sourceRuntime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
+    const forkedRuntimeConfig = workspace.runtimeConfig ?? plan.taskRuntimeConfig;
+    // LocalRuntime executes in the PROJECT directory whatever the row's persisted path says
+    // (LocalRuntime.getWorkspacePath ignores it) — the same directory the preparation gate
+    // derived the row's shared context for. Every other runtime runs at the persisted path.
+    const workspacePath = isProjectDirLocalRuntime(forkedRuntimeConfig)
+      ? sourceRuntime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName)
+      : (coerceNonEmptyString(workspace.path) ??
+        sourceRuntime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName));
     if (!(await runtimePathExists(sourceRuntime, workspacePath))) {
       return null;
     }
 
-    const forkedRuntimeConfig = workspace.runtimeConfig ?? plan.taskRuntimeConfig;
-    const runtimeForTaskWorkspace = createRuntimeForWorkspace({
-      runtimeConfig: forkedRuntimeConfig,
-      projectPath: plan.parentMeta.projectPath,
-      name: plan.workspaceName,
-      namedWorkspacePath: workspacePath,
-    });
+    const inheritedProjects = workspace.projects ?? plan.parentMeta.projects;
+    // The prepared checkout of a multi-project row is the fork's shared container: rebuild the
+    // same MultiProjectRuntime the fork built (see orchestrateFork), so its init hook and env
+    // resolver span every project. A dedicated row is prepared at creation and never forked at
+    // launch, so this reuse is the only launch path that builds its runtime.
+    const runtimeForTaskWorkspace =
+      inheritedProjects != null && inheritedProjects.length > 1
+        ? new MultiProjectRuntime(
+            new ContainerManager(getSrcBaseDir(forkedRuntimeConfig) ?? this.config.srcDir),
+            inheritedProjects.map((project) => ({
+              projectPath: project.projectPath,
+              projectName: project.projectName,
+              runtime: createRuntime(forkedRuntimeConfig, {
+                projectPath: project.projectPath,
+                workspaceName: plan.workspaceName,
+              }),
+            })),
+            plan.workspaceName
+          )
+        : createRuntimeForWorkspace({
+            runtimeConfig: forkedRuntimeConfig,
+            projectPath: plan.parentMeta.projectPath,
+            name: plan.workspaceName,
+            namedWorkspacePath: workspacePath,
+          });
     const trunkBranch =
       coerceNonEmptyString(workspace.taskTrunkBranch) ??
       coerceNonEmptyString(plan.preferredTrunkBranch) ??
@@ -5584,7 +5829,7 @@ export class TaskService implements AgentTaskIntegration {
       trunkBranch,
       forkedRuntimeConfig,
       runtimeForTaskWorkspace,
-      inheritedProjects: workspace.projects ?? plan.parentMeta.projects,
+      inheritedProjects,
     };
   }
 
@@ -5611,7 +5856,8 @@ export class TaskService implements AgentTaskIntegration {
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
-    initLogger: InitLogger
+    initLogger: InitLogger,
+    options: { allowFork: boolean }
   ): Promise<MaterializedTaskLaunch | null> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
     if (entry?.workspace.taskStatus !== "starting") {
@@ -5630,6 +5876,14 @@ export class TaskService implements AgentTaskIntegration {
       });
       return existing;
     }
+    if (!options.allowFork) {
+      // Host-local rows: the preparation gate just derived `ready` against this very path, so
+      // its disappearance is a race with an outside writer — refuse rather than fork a checkout
+      // the row's proof (or shared ancestry) does not cover.
+      throw new Error(
+        `Task checkout ${coerceNonEmptyString(entry.workspace.path) ?? plan.workspaceName} is no longer present; a prepared checkout is never forked again. The task record is retained for inspection; start a fresh task.`
+      );
+    }
 
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
@@ -5637,43 +5891,143 @@ export class TaskService implements AgentTaskIntegration {
       if (entryBeforeFork?.workspace.taskStatus !== "starting") {
         return null;
       }
-
-      const forkResult = await orchestrateFork({
-        sourceRuntime,
-        projectPath: plan.parentMeta.projectPath,
-        sourceWorkspaceName: plan.parentMeta.name,
-        newWorkspaceName: plan.workspaceName,
-        initLogger,
-        config: this.config,
-        sourceWorkspaceId: plan.parentWorkspaceId,
-        sourceRuntimeConfig: plan.parentRuntimeConfig,
-        parentMetadata: plan.parentMeta,
-        allowCreateFallback: true,
-        ...(plan.preferredTrunkBranch != null
-          ? { preferredTrunkBranch: plan.preferredTrunkBranch }
-          : {}),
-        trusted:
-          this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
-        multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-          EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-        ),
-      });
-
-      if (!forkResult.success) {
-        throw new Error(`Task fork failed: ${forkResult.error}`);
-      }
-
-      return {
-        workspacePath: forkResult.data.workspacePath,
-        trunkBranch: forkResult.data.trunkBranch,
-        forkedRuntimeConfig: forkResult.data.forkedRuntimeConfig,
-        runtimeForTaskWorkspace: forkResult.data.targetRuntime,
-        inheritedProjects: forkResult.data.projects,
-        ...(forkResult.data.sourceRuntimeConfigUpdate != null
-          ? { sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate }
-          : {}),
-      };
+      return await this.forkReservedTaskWorkspace(plan, sourceRuntime, initLogger);
     });
+  }
+
+  /**
+   * Fork a fresh checkout for a reserved task (no row checks, no reuse of an existing path: the
+   * fork refuses an existing directory). Used by lazy materialization (off-host, shared fallback)
+   * and by the pre-publication prepare stage of dedicated host-local reservations.
+   */
+  private async forkReservedTaskWorkspace(
+    plan: TaskLaunchPlan,
+    sourceRuntime: Runtime,
+    initLogger: InitLogger
+  ): Promise<MaterializedTaskLaunch> {
+    const forkResult = await orchestrateFork({
+      sourceRuntime,
+      projectPath: plan.parentMeta.projectPath,
+      sourceWorkspaceName: plan.parentMeta.name,
+      newWorkspaceName: plan.workspaceName,
+      initLogger,
+      config: this.config,
+      sourceWorkspaceId: plan.parentWorkspaceId,
+      sourceRuntimeConfig: plan.parentRuntimeConfig,
+      parentMetadata: plan.parentMeta,
+      allowCreateFallback: true,
+      ...(plan.preferredTrunkBranch != null
+        ? { preferredTrunkBranch: plan.preferredTrunkBranch }
+        : {}),
+      trusted:
+        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
+        EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+      ),
+    });
+
+    if (!forkResult.success) {
+      throw new Error(`Task fork failed: ${forkResult.error}`);
+    }
+
+    return {
+      workspacePath: forkResult.data.workspacePath,
+      trunkBranch: forkResult.data.trunkBranch,
+      forkedRuntimeConfig: forkResult.data.forkedRuntimeConfig,
+      runtimeForTaskWorkspace: forkResult.data.targetRuntime,
+      inheritedProjects: forkResult.data.projects,
+      ...(forkResult.data.sourceRuntimeConfigUpdate != null
+        ? { sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate }
+        : {}),
+    };
+  }
+
+  /**
+   * Prepare stage of a reservation batch: fork every DEDICATED host-local checkout (worktree
+   * runtime, not sharing the parent's checkout) before anything durable exists. A fork failure
+   * or an abort stops the batch: nothing is published, and every directory forked so far is
+   * RETAINED and named — its name is unique to its task id and a fork refuses an existing path,
+   * so no later reservation adopts it. Off-host and shared plans are untouched (lazy path).
+   */
+  private async prepareDedicatedReservedCheckouts(
+    plans: ReadonlyArray<TaskLaunchPlan & { sharedWorkspacePath?: string }>,
+    signal: AbortSignal | undefined
+  ): Promise<Result<void, string>> {
+    const retained: string[] = [];
+    const retainedNotice = () =>
+      retained.length === 0
+        ? ""
+        : ` Prepared checkout(s) retained, not registered: ${retained.join(", ")}`;
+    const silentLogger: InitLogger = {
+      logStep: () => undefined,
+      logStdout: () => undefined,
+      logStderr: () => undefined,
+      logComplete: () => undefined,
+      enterHookPhase: () => undefined,
+    };
+    for (const plan of plans) {
+      // Worktree semantics (a legacy `local` + srcBaseDir parent forks a worktree too).
+      if (plan.sharedWorkspacePath != null || !isWorktreeSemanticsRuntime(plan.taskRuntimeConfig)) {
+        continue;
+      }
+      if (signal?.aborted) {
+        return Err(
+          `${TASK_RESERVATION_INTERRUPTED_PREFIX}: reservation canceled.${retainedNotice()}`
+        );
+      }
+      // Same source runtime the launch would build: forks FROM the parent's REAL checkout when the
+      // parent is itself an isolation: "none" task (see startReservedAgentTask).
+      const parentEntry = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        plan.parentWorkspaceId
+      );
+      const sourceRuntime = createRuntimeForWorkspace({
+        runtimeConfig: plan.taskRuntimeConfig,
+        projectPath: plan.parentMeta.projectPath,
+        name: plan.parentMeta.name,
+        namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
+      });
+      let materialized: MaterializedTaskLaunch;
+      try {
+        materialized = await this.runProjectForkExclusive(
+          stripTrailingSlashes(plan.parentMeta.projectPath),
+          () => this.forkReservedTaskWorkspace(plan, sourceRuntime, silentLogger)
+        );
+      } catch (error: unknown) {
+        return Err(`${getErrorMessage(error)}${retainedNotice()}`);
+      }
+      retained.push(materialized.workspacePath);
+      if (materialized.sourceRuntimeConfigUpdate) {
+        // The fork learned the parent's real runtime config (what the lazy launch persisted
+        // after ITS fork); the launch reuses this prepared checkout, so persist it here.
+        await this.config.updateWorkspaceMetadata(plan.parentWorkspaceId, {
+          runtimeConfig: materialized.sourceRuntimeConfigUpdate,
+        });
+        await this.emitWorkspaceMetadata(plan.parentWorkspaceId);
+      }
+      this.configureMultiProjectRuntimeEnvResolver(materialized.runtimeForTaskWorkspace);
+      let taskBaseCommitShaByProjectPath: Record<string, string>;
+      try {
+        taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
+          workspaceId: plan.taskId,
+          workspaceName: plan.workspaceName,
+          workspacePath: materialized.workspacePath,
+          runtimeConfig: materialized.forkedRuntimeConfig,
+          projectPath: plan.parentMeta.projectPath,
+          projectName: plan.parentMeta.projectName,
+          projects: materialized.inheritedProjects,
+          runtime: materialized.runtimeForTaskWorkspace,
+        });
+      } catch (error: unknown) {
+        return Err(`${getErrorMessage(error)}${retainedNotice()}`);
+      }
+      plan.prepared = {
+        materialized,
+        taskBaseCommitShaByProjectPath,
+        materializationId: newMaterializationId(),
+      };
+    }
+    return Ok(undefined);
   }
 
   private scheduleReservedTaskLaunch(plan: TaskLaunchPlan): void {
@@ -5831,9 +6185,25 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // isolation: "none" tasks were queued pointing at the parent's checkout. When that checkout
-    // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
-    // back to forking a real workspace and the shared flag must be cleared below.
+    // Preparation gate (producer side). A host-local task row runs ONLY in the checkout its
+    // reservation prepared: a dedicated row must carry a physically valid proof (its checkout was
+    // forked, sanitized and bound before the row was published), a shared (isolation "none" /
+    // local-runtime) row must derive its live same-directory ancestry. Nothing host-local is
+    // forked here any more — a lazily forked worktree would carry no proof — and a shared row
+    // never becomes a dedicated one: when the parent's checkout is gone the launch refuses instead
+    // of forking a fallback worktree, so the shared discriminator survives publication and launch.
+    // Everything else (legacy rows published before preparation existed, a proof whose directory
+    // is missing or replaced, an unreadable registry) is an inspectable refusal: the row and its
+    // files are retained untouched and recovery is an ordinary fresh task. Off-host rows are
+    // outside the protocol (exempt) and keep today's lazy materialization. The captured
+    // authorization is what the send below is admitted under (the fence re-derives it).
+    const preflight = await this.preflightTaskWorkspacePreparation(plan.taskId);
+    if (!preflight.success) throw new Error(preflight.error);
+    const preparation = preflight.data;
+    assert(
+      preparation.kind === "authority" || preparation.exemption === "offhost",
+      "startReservedAgentTask: a task row cannot be an exempt root"
+    );
     const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
     const persistedSharedPath = taskWasShared
       ? coerceNonEmptyString(entryAtStart.workspace.path)
@@ -5855,7 +6225,11 @@ export class TaskService implements AgentTaskIntegration {
 
     let materialized: MaterializedTaskLaunch | null;
     try {
-      materialized = await this.materializeReservedTaskWorkspace(plan, runtime, initLogger);
+      materialized = await this.materializeReservedTaskWorkspace(plan, runtime, initLogger, {
+        // Only off-host rows may still fork here; a prepared/shared host-local row reuses its
+        // published checkout or refuses (see the preparation gate above).
+        allowFork: preparation.kind === "exempt",
+      });
     } catch (error: unknown) {
       initLogger.logComplete(-1);
       throw error;
@@ -5865,15 +6239,43 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // Reuse of the persisted shared path means the task still runs in the parent's checkout;
-    // any other materialized path means the fork fallback created a real (deletable) workspace.
-    const sharesParentCheckout =
-      taskWasShared && materialized.workspacePath === persistedSharedPath;
+    // A shared row runs in the parent's checkout: its published path was reused (a host-local
+    // row never forks here), so the shared flag stays and removal never deletes those files.
+    const sharesParentCheckout = taskWasShared;
+    assert(
+      !taskWasShared ||
+        isProjectDirLocalRuntime(materialized.forkedRuntimeConfig) || // executes in the project dir
+        materialized.workspacePath === persistedSharedPath,
+      "startReservedAgentTask: a shared task must reuse its published checkout"
+    );
+    // Launch failures past this point: a PREPARED host-local checkout (dedicated proof or shared
+    // context) and its session are RETAINED — it is a published row's directory, deleting it
+    // would destroy an inspectable checkout and reopen the delete-then-re-fork window the
+    // preparation protocol closes. Only an off-host materialization (no proof) is reclaimed.
+    const runtimeForCleanup = materialized.runtimeForTaskWorkspace;
+    const cleanupAfterLaunchFailure = async (): Promise<void> => {
+      if (preparation.kind === "authority") {
+        log.info("Task launch failed after preparation: checkout and session retained", {
+          taskId: plan.taskId,
+          workspacePath: materialized.workspacePath,
+        });
+        return;
+      }
+      await this.cleanupMaterializedTaskWorkspace(
+        runtimeForCleanup,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        plan.taskId,
+        { preservePhysicalWorkspace: false }
+      );
+    };
     const cancelMaterializedLaunch = () =>
-      this.cancelReservedLaunch(plan, initLogger, {
-        runtime: materialized.runtimeForTaskWorkspace,
-        preservePhysicalWorkspace: sharesParentCheckout,
-      });
+      preparation.kind === "authority"
+        ? this.cancelReservedLaunch(plan, initLogger)
+        : this.cancelReservedLaunch(plan, initLogger, {
+            runtime: runtimeForCleanup,
+            preservePhysicalWorkspace: false,
+          });
     if (plan.abortSignal?.aborted) {
       await cancelMaterializedLaunch();
       return;
@@ -5885,13 +6287,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
-      await this.cleanupMaterializedTaskWorkspace(
-        materialized.runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await cleanupAfterLaunchFailure();
       return;
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
@@ -5939,11 +6335,6 @@ export class TaskService implements AgentTaskIntegration {
         ws.taskBaseCommitSha = taskBaseCommitSha ?? undefined;
         ws.taskBaseCommitShaByProjectPath = taskBaseCommitShaByProjectPath;
         ws.projects = inheritedProjects;
-        // The shared parent checkout was gone, so this task had to fork a real workspace.
-        // Clear the shared flag so removal cleans up the new worktree.
-        if (taskWasShared && !sharesParentCheckout) {
-          ws.taskIsolation = undefined;
-        }
       },
       { allowMissing: true }
     );
@@ -5956,13 +6347,7 @@ export class TaskService implements AgentTaskIntegration {
     const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await cleanupAfterLaunchFailure();
       return;
     }
     if (
@@ -5973,33 +6358,10 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    if (!sharesParentCheckout) {
-      // SECURITY: task worktrees materialize AFTER their workspace entry is
-      // registered, so creation-time plugin-override sanitization never saw
-      // this checkout — a tracked stale `plugin:` enable would re-activate a
-      // same-name reinstall's default-disabled MCP server on the first send.
-      // Same contract as the host's create/fork paths: sanitize or fail.
-      const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
-        plan.taskId,
-        workspacePath,
-        forkedRuntimeConfig
-      );
-      if (sanitizeError !== undefined) {
-        initLogger.logComplete(-1);
-        // Reclaim the just-materialized worktree/session before failing the
-        // launch: the throw reaches scheduleReservedTaskLaunch, which only
-        // marks the task interrupted — without this cleanup the physical
-        // checkout would accumulate and collide with later same-name forks.
-        await this.cleanupMaterializedTaskWorkspace(
-          runtimeForTaskWorkspace,
-          plan.parentMeta.projectPath,
-          plan.workspaceName,
-          plan.taskId,
-          { preservePhysicalWorkspace: false }
-        );
-        throw new Error(sanitizeError);
-      }
-    }
+    // No launch-time plugin-override sanitization: a dedicated host-local checkout was pruned
+    // (and its identity bound) BEFORE its row was published, and consent granted to it since is
+    // the user's — never re-pruned automatically. Shared rows run in the parent's live context;
+    // off-host runtimes spawn no plugin servers.
 
     if (sharesParentCheckout) {
       // The parent's checkout is already initialized and live; re-running init would redundantly
@@ -6059,19 +6421,14 @@ export class TaskService implements AgentTaskIntegration {
     const admission = this.admitTaskWorkspaceTurn(plan.taskId, {
       acceptanceOrigin: "automatic",
       expectedAttemptId: plan.attemptId,
+      preparation,
     });
     if (admission.kind !== "admitted") {
       const message =
         admission.kind === "refused"
           ? admission.message
           : "Task launch refused: the task record is no longer an agent task";
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await cleanupAfterLaunchFailure();
       throw new Error(message);
     }
     plan.sendAdmitted = true;
@@ -6099,13 +6456,7 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await cleanupAfterLaunchFailure();
       throw new Error(message);
     }
 
@@ -6447,17 +6798,23 @@ export class TaskService implements AgentTaskIntegration {
       thinkingLevel: effectiveThinkingLevel,
     });
 
-    if (shouldQueue) {
+    // A DEDICATED host-local (worktree) task is prepared eagerly even when capacity queues it:
+    // its checkout is forked, sanitized and bound before the row's first write (below, with
+    // `queueOnly`), because a published dedicated row without a prepared checkout is refused at
+    // launch (see startReservedAgentTask). Init and the send stay lazy (the queue drain runs them
+    // when a slot frees). Shared and off-host tasks keep the persist-only queue below.
+    const queueOnly =
+      shouldQueue && !useSharedWorkspace && isWorktreeSemanticsRuntime(taskRuntimeConfig);
+    if (shouldQueue && !queueOnly) {
       const trunkBranch = parentBranchName;
       if (!trunkBranch) {
         return Err("Task.create: parent workspace name missing (cannot queue task)");
       }
 
-      // NOTE: Queued tasks are persisted immediately, but their workspace is created later
-      // when a parallel slot is available. This ensures queued tasks don't create worktrees
-      // or run init hooks until they actually start.
-      // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
-      // dequeue path sees the directory already exists and skips fork + init.
+      // NOTE: Queued shared/off-host tasks are persisted immediately, but their workspace is
+      // created later when a parallel slot is available (off-host), or is the parent's checkout
+      // (isolation: "none"), so the dequeue path sees the directory already exists and skips
+      // fork + init.
       const workspacePath = useSharedWorkspace
         ? parentWorkspacePath
         : runtime.getWorkspacePath(parentMeta.projectPath, workspaceName);
@@ -6470,52 +6827,67 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath,
       });
 
+      const queuedRow: WorkspaceConfigEntry = {
+        kind: parentIsScratch ? "scratch" : undefined,
+        path: workspacePath,
+        id: taskId,
+        name: workspaceName,
+        title: args.title,
+        createdAt,
+        runtimeConfig: taskRuntimeConfig,
+        aiSettings: {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+        },
+        parentWorkspaceId,
+        agentId,
+        agentType,
+        workflowTask: args.workflowTask,
+        bestOf: normalizedBestOf,
+        taskStatus: "queued",
+        // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
+        taskAttemptId: newTaskAttemptId(),
+        taskPrompt: prompt,
+        taskTrunkBranch: trunkBranch,
+        taskModelString,
+        taskThinkingLevel: effectiveThinkingLevel,
+        taskOnRefusal: args.onRefusal,
+        taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
+        taskIsolation: useSharedWorkspace ? "none" : undefined,
+        taskAttentionPolicy: args.attentionPolicy,
+        taskDesktopOwnerWorkspaceId,
+        projects: parentMeta.projects,
+      };
+      const publishQueuedRow = () =>
+        this.config.editConfig((config) => {
+          let projectConfig = config.projects.get(configProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(configProjectPath, projectConfig);
+          }
+          projectConfig.workspaces.push(queuedRow);
+          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          if (stale != null) throw new Error(`Task.create: ${stale}`);
+          this.desktopInputCoordinator.assertAdmission(config, taskId);
+          return config;
+        });
       try {
         await reserveDesktop(async () => {
-          await this.config.editConfig((config) => {
-            let projectConfig = config.projects.get(configProjectPath);
-            if (!projectConfig) {
-              projectConfig = { workspaces: [] };
-              config.projects.set(configProjectPath, projectConfig);
-            }
-
-            projectConfig.workspaces.push({
-              kind: parentIsScratch ? "scratch" : undefined,
-              path: workspacePath,
-              id: taskId,
-              name: workspaceName,
-              title: args.title,
-              createdAt,
-              runtimeConfig: taskRuntimeConfig,
-              aiSettings: {
-                model: canonicalModel,
-                thinkingLevel: effectiveThinkingLevel,
-                ...(effectiveReasoningMode != null
-                  ? { reasoningMode: effectiveReasoningMode }
-                  : {}),
-              },
-              parentWorkspaceId,
-              agentId,
-              agentType,
-              workflowTask: args.workflowTask,
-              bestOf: normalizedBestOf,
-              taskStatus: "queued",
-              // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
-              taskAttemptId: newTaskAttemptId(),
-              taskPrompt: prompt,
-              taskTrunkBranch: trunkBranch,
-              taskModelString,
-              taskThinkingLevel: effectiveThinkingLevel,
-              taskOnRefusal: args.onRefusal,
-              taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
-              taskIsolation: useSharedWorkspace ? "none" : undefined,
-              taskAttentionPolicy: args.attentionPolicy,
-              taskDesktopOwnerWorkspaceId,
-              projects: parentMeta.projects,
-            });
-            this.desktopInputCoordinator.assertAdmission(config, taskId);
-            return config;
-          });
+          if (!isProtectedTaskRow(queuedRow)) {
+            await publishQueuedRow();
+            return;
+          }
+          // A host-local (shared) task row is protected: structural mutators scan task rows and
+          // rename/remove under the registration lock. Published outside that lock, the row could
+          // land between another backend's scan and its rename, leaving it pointing at the old
+          // path (PREP_SHARED_BROKEN). Publish it under the same empty-target lock hold as the
+          // unqueued shared path (no checkout, no prune): the scan sees every task row or none.
+          const registration = await this.workspaceService.prepareTaskCheckouts(
+            () => Promise.resolve([]),
+            publishQueuedRow
+          );
+          if (!registration.success) throw new Error(registration.error);
         });
       } catch (error) {
         return Err(getErrorMessage(error));
@@ -6763,119 +7135,152 @@ export class TaskService implements AgentTaskIntegration {
     const materialize = async () => {
       const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
 
-      let workspacePath: string;
-      let trunkBranch: string;
-      let forkedRuntimeConfig: RuntimeConfig;
-      let runtimeForTaskWorkspace: Runtime;
-      let forkedFromSource: boolean;
-      let inheritedProjects: ProjectRef[] | undefined;
+      // Everything the row's first write needs, filled by `materializeCheckout` (the shared
+      // parent checkout, or the fork). One object, so the closures below see a materialized
+      // checkout or none — never a half-filled set of variables.
+      let checkout:
+        | {
+            workspacePath: string;
+            trunkBranch: string;
+            forkedRuntimeConfig: RuntimeConfig;
+            runtimeForTaskWorkspace: Runtime;
+            inheritedProjects: ProjectRef[] | undefined;
+            taskBaseCommitShaByProjectPath: Record<string, string>;
+          }
+        | undefined;
+      const materializeCheckout = async (): Promise<Result<void, string>> => {
+        let workspacePath: string;
+        let trunkBranch: string;
+        let forkedRuntimeConfig: RuntimeConfig;
+        let runtimeForTaskWorkspace: Runtime;
+        let forkedFromSource: boolean;
+        let inheritedProjects: ProjectRef[] | undefined;
 
-      if (useSharedWorkspace) {
-        // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
-        // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
-        // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
-        //
-        // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
-        // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
-        // shared parent checkout. workspaceService.remove additionally skips physical deletion for
-        // tasks persisted with taskIsolation === "none".
-        workspacePath = parentWorkspacePath;
-        trunkBranch = parentBranchName ?? "main";
-        forkedRuntimeConfig = parentRuntimeConfig;
-        forkedFromSource = false;
-        inheritedProjects = parentMeta.projects;
-        // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
-        // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
-        // resolution and ensureReady land in the shared parent checkout instead of a name-derived
-        // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
-        runtimeForTaskWorkspace = createRuntimeForWorkspace({
-          runtimeConfig: parentRuntimeConfig,
-          projectPath: parentMeta.projectPath,
-          name: workspaceName,
-          namedWorkspacePath: parentWorkspacePath,
-        });
-        initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
-        initLogger.logComplete(0);
-      } else {
-        // Note: Local project-dir runtimes share the same directory (unsafe by design).
-        // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
-        const forkResult = await orchestrateFork({
-          sourceRuntime: runtime,
-          projectPath: parentMeta.projectPath,
-          sourceWorkspaceName: parentMeta.name,
-          newWorkspaceName: workspaceName,
-          initLogger,
-          config: this.config,
-          sourceWorkspaceId: parentWorkspaceId,
-          sourceRuntimeConfig: parentRuntimeConfig,
-          parentMetadata: parentMeta,
-          allowCreateFallback: true,
-          // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-          // synthetic name never names a real branch, so supply the actual checked-out branch.
-          // Gated to shared parents to keep the existing branch-discovery fallback otherwise.
-          ...(parentIsSharedTask && parentBranchName != null
-            ? { preferredTrunkBranch: parentBranchName }
-            : {}),
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
-          multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-          ),
-        });
-
-        if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
-          await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
-            runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
+        if (useSharedWorkspace) {
+          // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
+          // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
+          // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
+          //
+          // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
+          // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
+          // shared parent checkout. workspaceService.remove additionally skips physical deletion for
+          // tasks persisted with taskIsolation === "none".
+          workspacePath = parentWorkspacePath;
+          trunkBranch = parentBranchName ?? "main";
+          forkedRuntimeConfig = parentRuntimeConfig;
+          forkedFromSource = false;
+          inheritedProjects = parentMeta.projects;
+          // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
+          // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
+          // resolution and ensureReady land in the shared parent checkout instead of a name-derived
+          // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
+          runtimeForTaskWorkspace = createRuntimeForWorkspace({
+            runtimeConfig: parentRuntimeConfig,
+            projectPath: parentMeta.projectPath,
+            name: workspaceName,
+            namedWorkspacePath: parentWorkspacePath,
           });
-          // Ensure UI gets the updated runtimeConfig for the parent workspace.
-          await this.emitWorkspaceMetadata(parentWorkspaceId);
+          initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
+          initLogger.logComplete(0);
+        } else {
+          // Note: Local project-dir runtimes share the same directory (unsafe by design).
+          // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
+          const forkResult = await orchestrateFork({
+            sourceRuntime: runtime,
+            projectPath: parentMeta.projectPath,
+            sourceWorkspaceName: parentMeta.name,
+            newWorkspaceName: workspaceName,
+            initLogger,
+            config: this.config,
+            sourceWorkspaceId: parentWorkspaceId,
+            sourceRuntimeConfig: parentRuntimeConfig,
+            parentMetadata: parentMeta,
+            allowCreateFallback: true,
+            // Create-fallback base when the fork cannot detect a source branch — a shared parent's
+            // synthetic name never names a real branch, so supply the actual checked-out branch.
+            // Gated to shared parents to keep the existing branch-discovery fallback otherwise.
+            ...(parentIsSharedTask && parentBranchName != null
+              ? { preferredTrunkBranch: parentBranchName }
+              : {}),
+            trusted:
+              this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
+            multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
+              EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+            ),
+          });
+
+          if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
+            await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
+              runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
+            });
+            // Ensure UI gets the updated runtimeConfig for the parent workspace.
+            await this.emitWorkspaceMetadata(parentWorkspaceId);
+          }
+
+          if (!forkResult.success) {
+            initLogger.logComplete(-1);
+            return Err(`Task fork failed: ${forkResult.error}`);
+          }
+
+          workspacePath = forkResult.data.workspacePath;
+          trunkBranch = forkResult.data.trunkBranch;
+          forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
+          runtimeForTaskWorkspace = forkResult.data.targetRuntime;
+          forkedFromSource = forkResult.data.forkedFromSource;
+          inheritedProjects = forkResult.data.projects;
         }
 
-        if (!forkResult.success) {
-          initLogger.logComplete(-1);
-          return Err(`Task fork failed: ${forkResult.error}`);
-        }
+        materializedCheckout = {
+          initLogger,
+          runtime: runtimeForTaskWorkspace,
+          workspacePath,
+          runtimeConfig: forkedRuntimeConfig,
+        };
 
-        workspacePath = forkResult.data.workspacePath;
-        trunkBranch = forkResult.data.trunkBranch;
-        forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
-        runtimeForTaskWorkspace = forkResult.data.targetRuntime;
-        forkedFromSource = forkResult.data.forkedFromSource;
-        inheritedProjects = forkResult.data.projects;
-      }
+        // Multi-project forks need per-project secrets for each runtime's init hook.
+        this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
 
-      materializedCheckout = {
-        initLogger,
-        runtime: runtimeForTaskWorkspace,
-        workspacePath,
-        runtimeConfig: forkedRuntimeConfig,
+        const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
+          workspaceId: taskId,
+          workspaceName,
+          workspacePath,
+          runtimeConfig: forkedRuntimeConfig,
+          projectPath: parentMeta.projectPath,
+          projectName: parentMeta.projectName,
+          projects: inheritedProjects,
+          runtime: runtimeForTaskWorkspace,
+        });
+
+        taskQueueDebug("TaskService.create started (workspace created)", {
+          taskId,
+          workspaceName,
+          workspacePath,
+          trunkBranch,
+          forkSuccess: forkedFromSource,
+        });
+        checkout = {
+          workspacePath,
+          trunkBranch,
+          forkedRuntimeConfig,
+          runtimeForTaskWorkspace,
+          inheritedProjects,
+          taskBaseCommitShaByProjectPath,
+        };
+        return Ok(undefined);
       };
 
-      // Multi-project forks need per-project secrets for each runtime's init hook.
-      this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
-
-      const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
-        workspaceId: taskId,
-        workspaceName,
-        workspacePath,
-        runtimeConfig: forkedRuntimeConfig,
-        projectPath: parentMeta.projectPath,
-        projectName: parentMeta.projectName,
-        projects: inheritedProjects,
-        runtime: runtimeForTaskWorkspace,
-      });
-      const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
-
-      taskQueueDebug("TaskService.create started (workspace created)", {
-        taskId,
-        workspaceName,
-        workspacePath,
-        trunkBranch,
-        forkSuccess: forkedFromSource,
-      });
-
-      // Persist workspace entry before starting work so it's durable across crashes.
-      const publish = async (): Promise<void> => {
+      // Persist workspace entry before starting work so it's durable across crashes. A dedicated
+      // host-local fork publishes its preparation proof in this same first write.
+      const publish = async (proof?: TaskCheckoutPreparation): Promise<void> => {
+        assert(checkout != null, "Task.create: publish before the checkout materialized");
+        const {
+          workspacePath,
+          trunkBranch,
+          forkedRuntimeConfig,
+          inheritedProjects,
+          taskBaseCommitShaByProjectPath,
+        } = checkout;
+        const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
         await this.config.editConfig((config) => {
           let projectConfig = config.projects.get(configProjectPath);
           if (!projectConfig) {
@@ -6901,10 +7306,14 @@ export class TaskService implements AgentTaskIntegration {
             agentType,
             workflowTask: args.workflowTask,
             bestOf: normalizedBestOf,
-            taskStatus: "running",
+            taskStatus: queueOnly ? "queued" : "running",
             // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id
             // the send below is fenced against (WorkspaceService binds the obligation at handoff).
-            taskAttemptId: attemptId,
+            // A prepared-but-queued row is never admitted here: the queue drain's launch CAS
+            // rotates its id and takes ownership, exactly like the persist-only queue.
+            taskAttemptId: queueOnly ? newTaskAttemptId() : attemptId,
+            taskCheckoutPreparation: proof,
+            taskPrompt: queueOnly ? prompt : undefined,
             taskTrunkBranch: trunkBranch,
             taskBaseCommitSha: taskBaseCommitSha ?? undefined,
             taskBaseCommitShaByProjectPath,
@@ -6917,11 +7326,14 @@ export class TaskService implements AgentTaskIntegration {
             taskDesktopOwnerWorkspaceId,
             projects: inheritedProjects,
           });
+          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          if (stale != null) throw new Error(`Task.create: ${stale}`);
           this.desktopInputCoordinator.assertAdmission(config, taskId);
           // Past the last pre-write refusal: from here the save may land whatever is thrown next.
           configWriteAttempted = true;
           return config;
         });
+        if (queueOnly) return;
         // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
         // this workspace, whoever issues it, is admitted under an attempt this process owns.
         launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
@@ -6929,40 +7341,96 @@ export class TaskService implements AgentTaskIntegration {
           receiptEligible: true,
         });
       };
+      // Nothing published, the fresh directory retained on purpose (see prepareTaskCheckouts):
+      // the refusal may stem from an indeterminate checkout identity or an unreadable registry,
+      // i.e. exactly the cases in which this path cannot prove no sibling registration resolves
+      // to the same files. Unregistered, it is unreachable for every send/rescue/activation
+      // path; its name is unique to this task id, so no later creation reuses it (the fork
+      // refuses an existing directory). Removing it is the user's call.
+      const retainedRefusal = (error: string): Result<never, string> => {
+        assert(checkout != null, "Task.create: retained refusal before the checkout materialized");
+        unregisteredCheckoutRetained = true;
+        return Err(`${error} ${retainedCheckoutNotice(checkout.workspacePath)}`);
+      };
       if (useSharedWorkspace) {
+        const shared = await materializeCheckout();
+        if (!shared.success) return shared;
         // The parent's checkout: its consent context is alive and was sanitized at its own
-        // registration; nothing to prune, nothing to fence.
-        await publish();
-      } else {
-        // SECURITY: this checkout materialized outside the host's create/fork paths, so
-        // registration-time plugin-override sanitization never saw it — a tracked stale
-        // `plugin:` enable would re-activate a same-name reinstall's default-disabled MCP server
-        // on the send below. Sanitized BEFORE the record is published (not merely before it is
-        // announced): a published record is discoverable and admittable by every ordinary
-        // reader — a user send, another backend's startup re-drive, an older build — while the
-        // stale enable is still in place, and a refused sanitization would otherwise leave that
-        // record behind as an interrupted task whose manual rescue activates the enable.
-        const registration = await this.workspaceService.registerSanitizedTaskCheckout(
-          { workspacePath, runtimeConfig: forkedRuntimeConfig },
-          publish
+        // registration; nothing to prune, nothing to fence. The row keeps its shared
+        // discriminator; its authority derives from the live parent on every admission. It is
+        // still published under the producers' registration-lock hold (no checkout, no prune),
+        // so a structural mutator's task-row scan sees every task row or none.
+        const registration = await this.workspaceService.prepareTaskCheckouts(
+          () => Promise.resolve([]),
+          () => publish()
         );
+        if (!registration.success) return Err(registration.error);
+      } else if (isWorktreeSemanticsRuntime(taskRuntimeConfig)) {
+        // SECURITY: a dedicated host-local (worktree) fork materializes outside the host's
+        // create/fork paths, so registration-time plugin-override sanitization never saw it — a
+        // tracked stale `plugin:` enable would re-activate a same-name reinstall's
+        // default-disabled MCP server on the send below. It is PREPARED before the record is
+        // published (not merely before it is announced): a published record is discoverable and
+        // admittable by every ordinary reader — a user send, another backend's startup
+        // re-drive, an older build — while the stale enable is still in place, and a refused
+        // sanitization would otherwise leave that record behind as an interrupted task whose
+        // manual rescue activates the enable. Its identity is claimed and bound under the
+        // prune's locks and the proof is published in the row's first write, so every later
+        // admission can verify it runs in this sanitized directory. The fork itself runs INSIDE
+        // the registration-lock hold: a structural mutator scanning task rows under that lock
+        // sees no fork and no row, or the published row — never a fork it could tear down.
+        let forkRefusal: Result<never, string> | undefined;
+        const registration = await this.workspaceService.prepareTaskCheckouts(
+          async () => {
+            const forked = await materializeCheckout();
+            if (!forked.success) {
+              forkRefusal = forked;
+              throw new Error(forked.error);
+            }
+            assert(checkout != null, "Task.create: fork materialized no checkout");
+            // A fork keeps the parent's runtime config type (see applyForkRuntimeUpdates).
+            assert(
+              isWorktreeSemanticsRuntime(checkout.forkedRuntimeConfig),
+              "Task.create: a worktree parent forked a non-worktree checkout"
+            );
+            return [
+              {
+                workspacePath: checkout.workspacePath,
+                runtimeConfig: checkout.forkedRuntimeConfig,
+                materializationId: newMaterializationId(),
+              },
+            ];
+          },
+          async (proofs) => {
+            assert(proofs.length === 1, "Task.create: one proof for one prepared checkout");
+            await publish(proofs[0]);
+          }
+        );
+        if (forkRefusal != null) return forkRefusal;
         if (!registration.success) {
-          // Nothing published. The fresh worktree is NOT deleted: the refusal may stem from an
-          // indeterminate checkout identity or an unreadable registry, i.e. exactly the cases in
-          // which this path cannot prove no sibling registration resolves to the same files.
-          // Unregistered, it is unreachable for every send/rescue/activation path; its name is
-          // unique to this task id, so no later creation reuses it (the fork refuses an
-          // existing directory). Removing it is the user's call.
-          unregisteredCheckoutRetained = true;
-          return Err(`${registration.error} ${retainedCheckoutNotice(workspacePath)}`);
+          // The lock itself (nothing forked) or a refused preparation (the fork retained).
+          return checkout == null ? Err(registration.error) : retainedRefusal(registration.error);
         }
+      } else {
+        // A local-runtime fork shares the project directory (shared by construction) and an
+        // off-host fork is outside the protocol: both register without a proof as before, the
+        // host-local one sanitized under the registration lock (see registerSanitizedTaskCheckout).
+        const forked = await materializeCheckout();
+        if (!forked.success) return forked;
+        assert(checkout != null, "Task.create: fork materialized no checkout");
+        const registration = await this.workspaceService.registerSanitizedTaskCheckout(
+          { workspacePath: checkout.workspacePath, runtimeConfig: checkout.forkedRuntimeConfig },
+          () => publish()
+        );
+        if (!registration.success) return retainedRefusal(registration.error);
       }
 
+      assert(checkout != null, "Task.create: published without a checkout");
       return Ok({
         initLogger,
-        workspacePath,
-        trunkBranch,
-        runtimeForTaskWorkspace,
+        workspacePath: checkout.workspacePath,
+        trunkBranch: checkout.trunkBranch,
+        runtimeForTaskWorkspace: checkout.runtimeForTaskWorkspace,
       });
     };
     const materialized = await reserveDesktop(materialize).catch((error: unknown) =>
@@ -7002,6 +7470,28 @@ export class TaskService implements AgentTaskIntegration {
 
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
+
+    if (queueOnly) {
+      // Prepared and published as queued: the drain forks nothing (the checkout exists), runs the
+      // init hook and sends when a slot frees. The launch failure handling above no longer applies
+      // (nothing was admitted here), so this is the last step of the creation.
+      initLogger.logStep("Checkout prepared; queued until a parallel slot frees");
+      initLogger.logComplete(0);
+      taskQueueDebug("TaskService.create prepared and queued", {
+        taskId,
+        workspaceName,
+        workspacePath,
+      });
+      void this.maybeStartQueuedTasks();
+      return Ok({
+        taskId,
+        kind: "agent",
+        status: "queued",
+        modelString: taskModelString,
+        thinkingLevel: effectiveThinkingLevel,
+        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
+      });
+    }
 
     // Kick init (best-effort, async). Shared-workspace (isolation: "none") tasks reuse the parent's
     // already-initialized checkout, so re-running init would redundantly (and possibly disruptively)
@@ -7046,10 +7536,17 @@ export class TaskService implements AgentTaskIntegration {
     // then metadata emitted), so another writer may have re-admitted it under its own attempt
     // since — a launch decided for A never dispatches its prompt under B (refused, and the
     // failure path below leaves B's row alone).
-    const admission = this.admitTaskWorkspaceTurn(taskId, {
-      acceptanceOrigin: "automatic",
-      expectedAttemptId: attemptId,
-    });
+    // Preflighted against the row just published: the dedicated fork's proof (or the shared
+    // row's live parent, or an off-host exemption) is the authority the send is admitted under —
+    // the fence re-derives it, so a row replaced between here and the send refuses (PREP_STALE).
+    const preflight = await this.preflightTaskWorkspacePreparation(taskId);
+    const admission = preflight.success
+      ? this.admitTaskWorkspaceTurn(taskId, {
+          acceptanceOrigin: "automatic",
+          expectedAttemptId: attemptId,
+          preparation: preflight.data,
+        })
+      : ({ kind: "refused", message: preflight.error } as const);
     const sendResult =
       admission.kind !== "admitted"
         ? Err(
@@ -7212,10 +7709,18 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // Checkout-preparation authority (async, bounded, outside the mutex like the lineage): a
+    // child this process cannot authorize is refused before any attempt rotates.
+    const preparationPreflight = await this.preflightTaskWorkspacePreparation(taskId);
+    if (!preparationPreflight.success) {
+      return Err({ code: "send_failed" as const, message: preparationPreflight.error });
+    }
+    const preparation = preparationPreflight.data;
     const lineage = await this.evaluateAttemptLineage(taskId, refreshedEntry.workspace);
     const reactivationAttemptId = newTaskAttemptId();
     let committedProven = false;
     let published = false;
+    let preparationRefusal: string | undefined;
     {
       // Critical section (see markInterruptedTaskRunning): the identity CAS, the row check and
       // the ownership install run under the global mutex every cascade's Phase A holds, so no
@@ -7232,8 +7737,16 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editWorkspaceEntry(
         taskId,
-        (ws) => {
+        (ws, freshConfig) => {
           if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) return;
+          // Strict re-derivation against the fresh row inside the CAS (config only).
+          preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+            taskId,
+            ws,
+            freshConfig,
+            preparation
+          );
+          if (preparationRefusal != null) return;
           ws.taskAttemptId = reactivationAttemptId;
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
@@ -7243,6 +7756,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       if (!published) {
         // Nothing was published: the previous attempt (owned or not) stays exactly as it was.
+        if (preparationRefusal != null) {
+          return Err({ code: "send_failed" as const, message: preparationRefusal });
+        }
         const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
         return Err({
           code: "send_failed" as const,
@@ -13686,9 +14202,28 @@ export class TaskService implements AgentTaskIntegration {
         // reservation already owns it; eligibility is read from the fresh row (another process's
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
+        // Checkout-preparation authority before the launch CAS: a queued row this process cannot
+        // authorize (a legacy row written before preparation existed, a proof that no longer
+        // validates) is never flipped to `starting`; it fails inspectably instead, exactly as the
+        // launch itself would refuse it. Async and bounded, outside the CAS.
+        const preparationPreflight = await this.preflightTaskWorkspacePreparation(taskId);
+        if (!preparationPreflight.success) {
+          await this.markTaskLaunchFailed(taskId, preparationPreflight.error);
+          continue;
+        }
+        const preparation = preparationPreflight.data;
+        let preparationRefusal: string | undefined;
         try {
-          await this.editActiveWorkspaceEntry(taskId, (workspace) => {
+          await this.editActiveWorkspaceEntry(taskId, (workspace, freshConfig) => {
             if (workspace.taskStatus !== "queued" || workspace.taskAttemptRetiredBy != null) return;
+            // Strict re-derivation against the fresh row inside the CAS (config only).
+            preparationRefusal = this.checkTaskCheckoutAuthorityAtFence(
+              taskId,
+              workspace,
+              freshConfig,
+              preparation
+            );
+            if (preparationRefusal != null) return;
             const owned = this.ownedAttemptByTaskId.get(taskId);
             const attemptId =
               owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
@@ -13700,6 +14235,10 @@ export class TaskService implements AgentTaskIntegration {
           });
         } catch (error) {
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
+          continue;
+        }
+        if (preparationRefusal != null) {
+          await this.markTaskLaunchFailed(taskId, preparationRefusal);
           continue;
         }
         if (launch == null) {
@@ -13863,7 +14402,10 @@ export class TaskService implements AgentTaskIntegration {
    * status: manual follow-ups must not turn a historical report back into an active task.
    * Returns true only when taskStatus changed to running (and needs restoring on send failure).
    */
-  async markInterruptedTaskRunning(workspaceId: string): Promise<boolean> {
+  async markInterruptedTaskRunning(
+    workspaceId: string,
+    options?: { preparation?: TaskCheckoutAuthorization }
+  ): Promise<boolean> {
     assert(workspaceId.length > 0, "markInterruptedTaskRunning: workspaceId must be non-empty");
     // Stop-cascade barrier: a resume must not resurrect a task whose stop is still settling.
     if (this.isWorkspaceStopInProgress(workspaceId)) {
@@ -13922,6 +14464,21 @@ export class TaskService implements AgentTaskIntegration {
     // user's Stop came after this resume began, so the resume must not resurrect the task (a
     // recovery initiated after that Stop is a new decision and proceeds normally).
     const stopEpochAtStart = this.getWorkspaceStopEpoch(workspaceId);
+    // Checkout-preparation authority: the caller's preflight, or this rescue's own (async,
+    // bounded, outside the mutex like the lineage). A row that cannot be authorized never
+    // rotates — the send behind it is refused at the fence anyway, and the row stays inspectable.
+    let preparation = options?.preparation;
+    if (preparation == null && isTaskCheckoutDomainRow(entryAtStart.workspace)) {
+      const preflight = await this.preflightTaskWorkspacePreparation(workspaceId);
+      if (!preflight.success) {
+        log.info("markInterruptedTaskRunning refused: checkout preparation", {
+          workspaceId,
+          message: preflight.error,
+        });
+        return false;
+      }
+      preparation = preflight.data;
+    }
     // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
     // mutex below: it must never hold up task creation or a cascade's Phase A.
     const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
@@ -13956,7 +14513,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editActiveWorkspaceEntry(
         workspaceId,
-        (ws) => {
+        (ws, freshConfig) => {
           // Only descendant task workspaces have task lifecycle status.
           if (!ws.parentWorkspaceId || this.isWorkspaceStopInProgress(workspaceId)) {
             return;
@@ -13970,6 +14527,14 @@ export class TaskService implements AgentTaskIntegration {
             return;
           }
           if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) {
+            return;
+          }
+          // The authority captured before the CAS must still be exactly what the fresh row (and
+          // its live ancestry) derives; otherwise nothing rotates (config only, no filesystem).
+          if (
+            this.checkTaskCheckoutAuthorityAtFence(workspaceId, ws, freshConfig, preparation) !=
+            null
+          ) {
             return;
           }
 
