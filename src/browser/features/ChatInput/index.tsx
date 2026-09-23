@@ -1136,21 +1136,36 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // and their restores arrive before React re-renders, so a render-time snapshot (getDraft(),
   // reviewData) would let the second append overwrite the first.
   const attachedReviews = variant === "workspace" ? props.attachedReviews : undefined;
+  const onAttachReviews = variant === "workspace" ? props.onAttachReviews : undefined;
   const appendDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
       setInput((previous) => previous + (previous.trim() ? "\n\n" : "") + pending.content);
       const restoredAttachments = attachmentsFromPending(pending, attachmentKeyPrefix);
       setAttachments((previous) => [...previous, ...restoredAttachments]);
-      if (pending.reviews.length > 0) {
-        // With no draft override yet, the panel's attached notes are the effective list; the
-        // merged result becomes the override so nothing already attached is hidden or dropped.
-        setDraftReviews((previous) => [
-          ...(previous ?? (attachedReviews ?? []).map((review) => review.data)),
-          ...pending.reviews,
-        ]);
+      if (pending.reviews.length === 0) return;
+      if (!reviewOverrideActive && onAttachReviews) {
+        // The usual case: attach the notes in the workspace's review store, which persists them
+        // now, so they survive the composer remounting after the store acknowledges this
+        // restoration (the backend then drops its copy). A later send checks them off.
+        onAttachReviews(pending.reviews);
+        return;
       }
+      // A draft override (a Stop or queued-message edit restore) hides the store's notes: add
+      // these to it. With no override yet, the panel's attached notes are the effective list; the
+      // merged result becomes the override so nothing already attached is hidden or dropped.
+      setDraftReviews((previous) => [
+        ...(previous ?? (attachedReviews ?? []).map((review) => review.data)),
+        ...pending.reviews,
+      ]);
     },
-    [attachedReviews, setAttachments, setDraftReviews, setInput]
+    [
+      attachedReviews,
+      onAttachReviews,
+      reviewOverrideActive,
+      setAttachments,
+      setDraftReviews,
+      setInput,
+    ]
   );
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.

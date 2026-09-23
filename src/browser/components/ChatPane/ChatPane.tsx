@@ -2113,6 +2113,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onCheckReviews={props.onCheckReviews}
         onDeleteReview={reviews.removeReview}
         onUpdateReviewNote={reviews.updateReviewNote}
+        onAttachReviews={(restored) => {
+          for (const data of restored) reviews.addReview(data);
+        }}
       />
     </>
   );

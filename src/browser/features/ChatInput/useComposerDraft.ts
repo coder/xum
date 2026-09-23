@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type SetStateAction } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   subscribePersistedStateWrites,
   updatePersistedState,
@@ -8,7 +8,6 @@ import {
   getDraftScopeId,
   getInputAttachmentsKey,
   getInputKey,
-  getInputReviewsKey,
   getPendingScopeId,
 } from "@/common/constants/storage";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
@@ -97,52 +96,43 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
       }
     });
   }, [attachmentsKey]);
-  // The review-note override is draft state like the text: a restored unsent message's reviews
-  // must survive the composer remounting (switching workspaces away and back), because the
-  // restoration is acknowledged — and the backend copy dropped — as soon as it is applied. The
-  // persisted setter writes storage synchronously, so the override is remount-safe before that
-  // acknowledgement. null (key absent) = no override; [] = the user cleared the restored notes.
-  const [storedDraftReviews, setStoredDraftReviews] = usePersistedState<
-    ReviewNoteDataForDisplay[] | null
-  >(getInputReviewsKey(scopeId), null, { listener: true });
+  const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
+  const draftReviewIdsRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
+  const nextDraftReviewIdRef = useRef(0);
   const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
     typeof value === "object" && value !== null;
-  // Self-heal a malformed stored value instead of bricking the composer: a non-array reads as no
-  // override and non-object items are dropped. A valid value keeps its reference.
-  const asDraftReviews = (value: unknown): ReviewNoteDataForDisplay[] | null => {
-    if (!Array.isArray(value)) return null;
-    return value.every(isDraftReviewData) ? value : value.filter(isDraftReviewData);
+  const idForReview = (review: ReviewNoteDataForDisplay) => {
+    const existingId = draftReviewIdsRef.current.get(review);
+    if (existingId) return existingId;
+    const newId = "draft-review-" + nextDraftReviewIdRef.current++;
+    draftReviewIdsRef.current.set(review, newId);
+    return newId;
   };
-  const draftReviews = asDraftReviews(storedDraftReviews);
-  const setDraftReviews = (value: SetStateAction<ReviewNoteDataForDisplay[] | null>) =>
-    setStoredDraftReviews((previous) =>
-      value instanceof Function ? value(asDraftReviews(previous)) : value
-    );
-  // Each write re-parses the stored notes, so object identity does not survive it: a draft
-  // note's id is its position.
-  const idForIndex = (index: number) => "draft-review-" + index;
   const mutateDraftReview = (reviewId: string, userNote?: string) =>
     setDraftReviews((previous) => {
       if (previous === null) return previous;
-      const index = previous.findIndex((_, itemIndex) => idForIndex(itemIndex) === reviewId);
+      const index = previous.findIndex(
+        (review) => isDraftReviewData(review) && idForReview(review) === reviewId
+      );
       if (index === -1) return previous;
       if (userNote === undefined) return previous.filter((_, itemIndex) => itemIndex !== index);
       const review = previous[index];
       if (!review || review.userNote === userNote) return previous;
       const next = [...previous];
       next[index] = { ...review, userNote };
+      draftReviewIdsRef.current.set(next[index], reviewId);
       return next;
     });
   const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = draftReviews ?? [];
+  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
   const reviews = reviewOverrideActive
     ? draftReviewItems
     : attachedReviews.map((review) => review.data);
   const reviewData = reviews.length > 0 ? reviews : undefined;
   const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map(({ id }) => id);
   const reviewPanelItems = reviewOverrideActive
-    ? draftReviewItems.map((data, index) => ({
-        id: idForIndex(index),
+    ? draftReviewItems.map((data) => ({
+        id: idForReview(data),
         data,
         status: "attached" as const,
         createdAt: 0,

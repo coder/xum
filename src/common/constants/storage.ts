@@ -296,16 +296,6 @@ export function getInputAttachmentsKey(scopeId: string): string {
 }
 
 /**
- * Get the localStorage key for the composer's draft review-note override for a scope: the
- * notes restored into the draft (unsent input, queued-message edits), which replace the
- * code-review panel's attached notes until sent or cleared. Absent = no override.
- * Format: "inputReviews:{scopeId}"
- */
-export function getInputReviewsKey(scopeId: string): string {
-  return `inputReviews:${scopeId}`;
-}
-
-/**
  * Get the localStorage key for pending initial send errors after workspace creation.
  * Stored so the workspace view can surface a toast after navigation.
  * Format: "pendingSendError:{workspaceId}"
@@ -892,7 +882,6 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getAutoExpandPrefsKey,
   getWorkspaceNameStateKey,
   getInputAttachmentsKey,
-  getInputReviewsKey,
   getAgentIdKey,
   getPinnedAgentIdKey,
   getThinkingLevelKey,
