@@ -41,6 +41,7 @@ function buildState(workspaceId: string, input: SeedInput): WorkspaceState {
     name: workspaceId,
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: input.canInterrupt ?? false,
     isCompacting: false,
     isStreamStarting: input.isStarting ?? false,

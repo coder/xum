@@ -705,19 +705,27 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
-  /**
-   * How the composer takes the text. `replace` (default; a user Stop restores what the user had
-   * queued) overwrites the draft. `append` keeps the current draft and adds the text after it —
-   * used when a queued message was refused at dispatch and is handed back as unsent input.
-   */
-  mode: z.enum(["replace", "append"]).optional(),
-  /**
-   * Set when the backend retains this restoration until a renderer acknowledges applying it
-   * (workspace.acknowledgeInputRestore): it is re-sent on every onChat replay, because the
-   * renderer only subscribes to the workspace it shows and would otherwise never receive input
-   * handed back while another workspace is open. Same id on every delivery, so renderers dedupe.
-   */
-  restoreId: z.string().optional(),
+});
+
+/**
+ * The session's held inputs (see AgentSession.heldInputs): manual queued messages refused at
+ * dispatch because the task reported before they ran. Full list, oldest first; sent on every
+ * change and replayed on subscription while non-empty. The session keeps each full send and
+ * re-sends or discards it only on explicit request (workspace.sendHeldInput/discardHeldInput),
+ * so this carries display data only.
+ */
+export const HeldInputsChangedEventSchema = z.object({
+  type: z.literal("held-inputs-changed"),
+  workspaceId: z.string(),
+  heldInputs: z.array(
+    z.object({
+      id: z.string(),
+      /** The user's authored text (or slash command); empty for attachment/review-only input. */
+      displayText: z.string(),
+      attachmentCount: z.number().int().nonnegative(),
+      reviewCount: z.number().int().nonnegative(),
+    })
+  ),
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
@@ -763,6 +771,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
+  HeldInputsChangedEventSchema,
   // Auto-compaction status events
   AutoCompactionTriggeredEventSchema,
   AutoCompactionCompletedEventSchema,
@@ -1031,9 +1040,9 @@ export const SendMessageOptionsSchema = z.object({
   /**
    * The user's authored text when the message text is not it: the composer formats attached
    * review notes into the provider-facing message (prepareUserMessageForSend) and also carries
-   * them as structured reviews. A queued message handed back to the composer unsent restores
-   * this text next to the reviews, so a retry does not send every review twice. Transient: the
-   * queue keeps it per add and never forwards it.
+   * them as structured reviews. Queue restores and held-input previews show this text next to
+   * the reviews, so a retry does not send every review twice. Transient: the queue keeps it per
+   * add and never forwards it to the turn.
    */
   authoredText: z.string().optional(),
 });

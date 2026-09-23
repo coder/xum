@@ -41,7 +41,8 @@ import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
  * WorkspaceService + AgentSession + MessageQueue + TaskService, only the AI stream mocked. A
  * follow-up queued while the child's turn streams must never start under an attempt that turn
  * completed: held while the decision is pending, dispatched under the same attempt when the turn
- * was not the report, refused and handed back as unsent input otherwise.
+ * was not the report, refused otherwise — a refused manual follow-up stays with the session as
+ * held input (AgentSession.heldInputs) until the user re-sends or discards it.
  */
 const rootId = "root-hold";
 const model = "openai:gpt-5.2";
@@ -286,11 +287,14 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         >["streamEnd"],
       });
     };
+    /** Stop restores only: a refused follow-up is held by the session, never restored. */
     const restoreEvents = () =>
       sessionHarness.events.filter(
         (event): event is Extract<typeof event, { type: "restore-to-input" }> =>
           event.type === "restore-to-input"
       );
+    const heldInputs = () => sessionHarness.session.getHeldInputs();
+    const heldTexts = () => heldInputs().map((held) => held.send.displayText);
     const cleanup = async () => {
       for (const completion of completions) {
         completion.resolve({ status: "aborted", abortReason: "user" });
@@ -310,12 +314,14 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       endStream,
       completeStream,
       restoreEvents,
+      heldInputs,
+      heldTexts,
       cleanup,
     };
   }
 
   test.each(["drain before the decision", "drain after the decision"] as const)(
-    "a manual follow-up queued during the report turn never runs under the completed attempt (%s): it is held, then refused and handed back as unsent input",
+    "a manual follow-up queued during the report turn never runs under the completed attempt (%s): it is held, then refused and kept by the session as held input",
     async (ordering) => {
       const childId = ordering.startsWith("drain before") ? "holdreport001" : "holdreport002";
       const stack = await createStack(childId);
@@ -362,14 +368,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         // The follow-up's obligation was discharged exactly once and the decision pruned.
         expect(outstanding(svc, childId)).toHaveLength(0);
         expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
-        // The text is back with the user — appended, never replacing what they typed since.
-        const restored = stack.restoreEvents();
-        expect(restored).toHaveLength(1);
-        expect(restored[0]).toMatchObject({
-          workspaceId: childId,
-          text: "follow-up text",
-          mode: "append",
-        });
+        // The follow-up is held by the session (nothing is pushed into the composer).
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.restoreEvents()).toHaveLength(0);
         // A later manual send is a new admission that mints a fresh attempt (released shape).
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(false);
         expect(entryOf(config, childId)?.taskAttemptId).not.toBe(attemptA);
@@ -430,52 +431,141 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
-  test("the refused follow-up's unsent input is retained until the renderer acknowledges it: every onChat replay re-sends it under one restore id", async () => {
-    // The renderer subscribes to onChat only for the workspace it shows, so a refusal that lands
-    // while the user looks at another workspace reaches it only through a later replay.
-    const childId = "holdretain001";
+  test("refused manual follow-ups are held with their full sends, in order: never dispatched automatically (drains, force-send, a later manual turn), untouched by Stop and clearQueue, replayed on subscription; Send re-sends one under a fresh attempt and removes it only once accepted; Discard removes", async () => {
+    const childId = "holdinput001";
     const stack = await createStack(childId);
-    const { config, taskService, workspaceService, sessionHarness, sendOptions } = stack;
-    const replayedRestores = async () => {
-      const events: Array<{ type?: string; restoreId?: string; text?: string }> = [];
-      await sessionHarness.session.replayHistory(({ message }) => {
-        if ("type" in message && message.type === "restore-to-input") events.push(message);
+    const { config, taskService, workspaceService, sessionHarness, completions } = stack;
+    const { streamStarts, sendOptions } = stack;
+    const session = sessionHarness.session;
+    const review = {
+      filePath: "src/a.ts",
+      lineRange: "1-2",
+      selectedCode: "const a = 1;",
+      userNote: "rename a",
+    };
+    const reviewedSend = {
+      ...sendOptions,
+      fileParts: [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }],
+      muxMetadata: { type: "normal" as const, reviews: [review] },
+      authoredText: "second authored",
+    };
+    const replayedHeldLists = async () => {
+      const lists: string[][] = [];
+      await session.replayHistory(({ message }) => {
+        if ("type" in message && message.type === "held-inputs-changed") {
+          lists.push(message.heldInputs.map((held) => held.displayText));
+        }
       });
-      return events;
+      return lists;
     };
     try {
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
       expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
         Ok(undefined)
       );
-      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+      // Two follow-ups queued during the report turn (task-attempt entries never batch).
+      expect(await workspaceService.sendMessage(childId, "first follow-up", sendOptions)).toEqual(
         Ok(undefined)
       );
-      const event = stack.endStream(0, { report: "done" }, false);
+      expect(
+        await workspaceService.sendMessage(childId, "<review>a</review>\nsecond", reviewedSend)
+      ).toEqual(Ok(undefined));
+      stack.endStream(0, { report: "done" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
-      stack.completeStream(0, event);
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
-      const [live] = stack.restoreEvents();
-      expect(live).toMatchObject({ text: "follow-up text", mode: "append" });
-      const restoreId = live?.restoreId;
-      expect(typeof restoreId).toBe("string");
-      // Unacknowledged: each new subscription (switching back, reconnect) receives it again,
-      // under the same id so the renderer can tell a re-delivery from a new restoration.
+      await yieldMacrotasks(5);
+      expect(completions).toHaveLength(1);
+
+      // Held in order, each with its full original send (review metadata and files included).
+      expect(stack.heldTexts()).toEqual(["first follow-up", "second authored"]);
+      const [first, second] = stack.heldInputs();
+      expect(first.send).toMatchObject({ message: "first follow-up", attachmentCount: 0 });
+      expect(first.send.options).toMatchObject(sendOptions);
+      expect(second.send).toMatchObject({
+        message: "<review>a</review>\nsecond",
+        attachmentCount: 1,
+        reviewCount: 1,
+      });
+      expect(second.send.options).toMatchObject({
+        ...sendOptions,
+        fileParts: reviewedSend.fileParts,
+        muxMetadata: { reviews: [review] },
+        authoredText: "second authored",
+      });
+      // Held inputs are not dispatchable work.
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      // Every subscription receives the current list (switching back, reload).
       for (let replay = 0; replay < 2; replay++) {
-        expect(await replayedRestores()).toMatchObject([
-          { restoreId, text: "follow-up text", mode: "append" },
-        ]);
+        expect(await replayedHeldLists()).toEqual([["first follow-up", "second authored"]]);
       }
-      expect(workspaceService.acknowledgeInputRestore(childId, restoreId!)).toEqual(Ok(undefined));
-      expect(await replayedRestores()).toEqual([]);
-      // Acknowledging again (a renderer re-acking a re-delivery it already applied) is harmless.
-      expect(workspaceService.acknowledgeInputRestore(childId, restoreId!)).toEqual(Ok(undefined));
+
+      // No drain trigger or force-send dispatches them.
+      session.drainQueuedMessagesIfIdle();
+      expect(session.sendNextUserQueuedMessage()).toBe(false);
+      session.sendQueuedMessages("terminal");
+      await yieldMacrotasks(3);
+      expect(completions).toHaveLength(1);
+
+      // Stop and clearQueue leave them alone.
+      expect(await workspaceService.interruptStream(childId)).toEqual(Ok(undefined));
+      expect(workspaceService.clearQueue(childId)).toEqual(Ok(undefined));
+      expect(stack.heldTexts()).toEqual(["first follow-up", "second authored"]);
+
+      // A Send whose send is not accepted keeps the held input and surfaces the error.
+      const refusal = { type: "unknown" as const, raw: "send refused for the test" };
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValueOnce(Err(refusal));
+      expect(await workspaceService.sendHeldInput(childId, second.id)).toEqual(Err(refusal));
+      sendSpy.mockRestore();
+      expect(stack.heldTexts()).toEqual(["first follow-up", "second authored"]);
+      expect(completions).toHaveLength(1);
+
+      // Send: a new manual send of the exact held payload, admitted under a FRESH attempt (A was
+      // released by its report); a concurrent second Send of the same held input is refused
+      // instead of sending it twice.
+      const sending = workspaceService.sendHeldInput(childId, second.id);
+      expect(await workspaceService.sendHeldInput(childId, second.id)).toEqual(
+        Err({ type: "unknown", raw: "This unsent message is already being sent." })
+      );
+      expect(await sending).toEqual(Ok(undefined));
+      expect(completions).toHaveLength(2);
+      expect(streamStarts[1].row).not.toBe(attemptA);
+      expect(stack.heldTexts()).toEqual(["first follow-up"]);
+      expect(await replayedHeldLists()).toEqual([["first follow-up"]]);
+      // Each review reaches the provider once: the sent row is exactly the original message.
+      const history = await fixture.historyService.getLastMessages(childId, 1);
+      const sentRow = history.success ? history.data[0] : undefined;
+      expect(sentRow?.role).toBe("user");
+      const sentText = sentRow?.parts
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("");
+      expect(sentText).toBe("<review>a</review>\nsecond");
+      // A second Send of the removed input reports it gone.
+      expect(await workspaceService.sendHeldInput(childId, second.id)).toEqual(
+        Err({ type: "unknown", raw: "This unsent message is no longer held." })
+      );
+
+      // When that later manual turn ends, the remaining held input still does not run.
+      stack.endStream(1, { report: "done again" }, true);
+      await until(() => !session.isBusy(), "second turn settled");
+      await yieldMacrotasks(10);
+      expect(completions).toHaveLength(2);
+      expect(stack.heldTexts()).toEqual(["first follow-up"]);
+
+      // Discard removes it (and publishes the empty list).
+      expect(workspaceService.discardHeldInput(childId, first.id)).toEqual(Ok(undefined));
+      expect(stack.heldInputs()).toHaveLength(0);
+      expect(await replayedHeldLists()).toEqual([]);
+      const heldEvents = sessionHarness.events.filter(
+        (event) => event.type === "held-inputs-changed"
+      );
+      expect(heldEvents.at(-1)).toMatchObject({ heldInputs: [] });
     } finally {
       await stack.cleanup();
     }
   }, 20_000);
 
-  test("an attachment-only manual follow-up refused after the report is handed back with its file parts (empty text is not a drop)", async () => {
+  test("an attachment-only manual follow-up refused after the report is held with its file parts (empty text is not a drop)", async () => {
     const childId = "holdattachment01";
     const stack = await createStack(childId);
     const { taskService, svc, workspaceService, completions, sendOptions } = stack;
@@ -495,10 +585,10 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await yieldMacrotasks(5);
       expect(completions).toHaveLength(1);
       expect(outstanding(svc, childId)).toHaveLength(0);
-      const restored = stack.restoreEvents();
-      expect(restored).toHaveLength(1);
-      expect(restored[0]).toMatchObject({ workspaceId: childId, text: "", mode: "append" });
-      expect(restored[0].fileParts).toEqual(fileParts);
+      const held = stack.heldInputs();
+      expect(held).toHaveLength(1);
+      expect(held[0].send).toMatchObject({ message: "", displayText: "", attachmentCount: 1 });
+      expect(held[0].send.options.fileParts).toEqual(fileParts);
     } finally {
       await stack.cleanup();
     }
@@ -540,7 +630,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           (decision) => decision.outcome === "nonreport"
         )
       ).toBe(true);
-      expect(stack.restoreEvents()).toHaveLength(0);
+      expect(stack.heldInputs()).toHaveLength(0);
     } finally {
       await stack.cleanup();
     }
@@ -569,10 +659,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
       await yieldMacrotasks(5);
       expect(completions).toHaveLength(1);
-      // Not released (no durable report), not continued: fail closed, text handed back.
+      // Not released (no durable report), not continued: fail closed, the follow-up held.
       expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
-      expect(stack.restoreEvents()).toHaveLength(1);
-      expect(stack.restoreEvents()[0]).toMatchObject({ text: "follow-up text", mode: "append" });
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
       // Refused as indeterminate — not as a completed report and not as a plain stale attempt.
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
       expect(outstanding(svc, childId)).toHaveLength(0);
@@ -627,7 +716,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
       await yieldMacrotasks(5);
       expect(completions).toHaveLength(1);
-      expect(stack.restoreEvents().map((event) => event.text)).toEqual(["follow-up text"]);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(outstanding(svc, childId)).toHaveLength(0);
       expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     } finally {
@@ -636,7 +725,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
-  test("a synthetic entry held through the decision keeps its cancel semantics: no composer restore, callback notified with the refusal", async () => {
+  test("a synthetic entry held through the decision keeps its cancel semantics: not kept as held input, callback notified with the refusal", async () => {
     const childId = "holdsynthetic001";
     const stack = await createStack(childId);
     const { taskService, workspaceService, completions, sendOptions } = stack;
@@ -659,12 +748,13 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE);
       expect(stack.restoreEvents()).toHaveLength(0);
+      expect(stack.heldInputs()).toHaveLength(0);
     } finally {
       await stack.cleanup();
     }
   }, 20_000);
 
-  test("another writer re-admitting the row while the decision is pending: the held manual entry is refused as stale and handed back, never bound to the successor", async () => {
+  test("another writer re-admitting the row while the decision is pending: the held manual entry is refused as stale and kept as held input, never bound to the successor", async () => {
     const childId = "holdforeign001";
     const stack = await createStack(childId);
     const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
@@ -706,7 +796,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await yieldMacrotasks(5);
       expect(completions).toHaveLength(1);
       expect(entryOf(config, childId)?.taskAttemptId).toBe("att_00000000000000b4");
-      expect(stack.restoreEvents().map((event) => event.text)).toEqual(["follow-up text"]);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
       const sends = [...(svc.admittedSendsByTaskId.get(childId) ?? [])];
       expect(sends.some((send) => send.attemptId === "att_00000000000000b4")).toBe(false);
       expect(outstanding(svc, childId).filter((send) => send.attemptId === attemptA)).toHaveLength(
@@ -769,7 +859,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         workspaceId: childId,
         text: "follow-up text",
       });
-      expect(stack.restoreEvents()[0].mode).toBeUndefined();
+      expect(stack.heldInputs()).toHaveLength(0);
       expect(onCanceled).toHaveBeenCalledTimes(1);
       expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
       // The obligation is discharged by the clear; the decision still belongs to the handler.
@@ -838,6 +928,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(streamStarts.map((start) => start.messageId)).toEqual(["assistant-1"]);
       expect(stack.restoreEvents()).toHaveLength(0);
+      expect(stack.heldInputs()).toHaveLength(0);
       expect(outstanding(svc, childId)).toHaveLength(0);
     } finally {
       gate.resolve();
@@ -912,9 +1003,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
       await yieldMacrotasks(20);
-      // No successor turn under the completed attempt: the entry was refused and handed back.
+      // No successor turn under the completed attempt: the entry was refused and held.
       expect(completions).toHaveLength(1);
-      expect(stack.restoreEvents().map((event) => event.text)).toEqual(["follow-up text"]);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(outstanding(svc, childId)).toHaveLength(0);
       expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
       // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.

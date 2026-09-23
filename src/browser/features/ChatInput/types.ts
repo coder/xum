@@ -1,6 +1,6 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TelemetryRuntimeType } from "@/common/telemetry/payload";
-import type { Review, ReviewNoteData } from "@/common/types/review";
+import type { Review } from "@/common/types/review";
 import type { EditingMessageState, PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { QueuedMessage } from "@/common/types/message";
@@ -83,8 +83,6 @@ export interface ChatInputWorkspaceVariant {
   onDeleteReview?: (reviewId: string) => void;
   /** Update a review's comment/note */
   onUpdateReviewNote?: (reviewId: string, newNote: string) => void;
-  /** Attach review notes handed back with unsent input to chat (adds them to the review store) */
-  onAttachReviews?: (reviews: ReviewNoteData[]) => void;
 }
 
 // Creation variant: simplified for first message / workspace creation

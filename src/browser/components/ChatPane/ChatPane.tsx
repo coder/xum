@@ -67,10 +67,12 @@ import {
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
+import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { HeldInput } from "@/browser/features/Messages/HeldInput";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
@@ -198,6 +200,7 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // candidate: while locked the sentinel owns anchoring, and while released the
 // browser must anchor to a transcript row, not the sticky dock.
 const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
+const NO_HELD_INPUTS: readonly HeldInputData[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
 
 function findTranscriptMessageElement(
@@ -1848,6 +1851,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onEditLastUserMessage={handleEditLastUserMessageClick}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
+                      heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
                       onEditQueuedMessage={() => void handleEditQueuedMessage()}
                       onSendQueuedImmediately={
                         workspaceState?.canInterrupt ? handleSendQueuedImmediately : undefined
@@ -1927,6 +1931,7 @@ interface ChatInputPaneProps {
   onEditLastUserMessage: () => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
+  heldInputs: readonly HeldInputData[];
   onEditQueuedMessage: () => void;
   onSendQueuedImmediately: (() => Promise<void>) | undefined;
   onQueuedDispatchModeChange: (mode: QueueDispatchMode) => Promise<void>;
@@ -1968,6 +1973,17 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             onSendImmediately={props.onSendQueuedImmediately}
           />
         ),
+      })
+    );
+  }
+  // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
+  // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
+  for (const heldInput of props.heldInputs) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: `held-input-${heldInput.id}`,
+        revealBeforeReady: true,
+        node: <HeldInput workspaceId={props.workspaceId} heldInput={heldInput} />,
       })
     );
   }
@@ -2113,9 +2129,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onCheckReviews={props.onCheckReviews}
         onDeleteReview={reviews.removeReview}
         onUpdateReviewNote={reviews.updateReviewNote}
-        onAttachReviews={(restored) => {
-          for (const data of restored) reviews.addReview(data);
-        }}
       />
     </>
   );

@@ -3,7 +3,6 @@ import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
   copyWorkspaceStorage,
   deleteWorkspaceStorage,
-  getAppliedInputRestoresKey,
   getDraftScopeId,
   getInputAttachmentsKey,
   normalizeTerminalBadgeConfig,
@@ -126,16 +125,6 @@ describe("storage workspace-scoped keys", () => {
     deleteWorkspaceStorage(workspaceId);
 
     expect(localStorage.getItem(key)).toBeNull();
-  });
-
-  test("applied restore ids are deleted with the workspace and never copied to a fork", () => {
-    // They name restorations only the source workspace's backend retains; a fork inheriting them
-    // would silently drop a restoration its own backend hands back under a colliding id.
-    localStorage.setItem(getAppliedInputRestoresKey("ws-source"), JSON.stringify(["restore-1"]));
-    copyWorkspaceStorage("ws-source", "ws-dest");
-    expect(localStorage.getItem(getAppliedInputRestoresKey("ws-dest"))).toBeNull();
-    deleteWorkspaceStorage("ws-source");
-    expect(localStorage.getItem(getAppliedInputRestoresKey("ws-source"))).toBeNull();
   });
 });
 

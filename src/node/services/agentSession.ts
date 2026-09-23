@@ -210,7 +210,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
-import type { QueueCutCutter, QueuedInput } from "./messageQueue";
+import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -1239,16 +1239,18 @@ export class AgentSession {
   };
 
   /**
-   * Unsent input handed back after its queued entry was refused at dispatch, keyed by restore id,
-   * until a renderer acknowledges applying it (acknowledgeInputRestore). The renderer holds an
-   * onChat subscription only for the workspace it shows, so a live event alone is lost when the
-   * refusal lands while another workspace is open: every replay re-sends these. In memory only —
-   * like the queue entry it replaces, it does not survive a backend restart.
+   * Held input: the user's manual queued sends that the dequeue gate refused (the task reported
+   * before they ran), oldest first. The session keeps the full original send, so it is never
+   * handed to the renderer to own: the user explicitly re-sends it (sendHeldInput, an ordinary
+   * new manual send) or discards it. Held inputs are NOT queue entries — never batched with new
+   * sends, drained, force-sent or counted as dispatchable work, and untouched by Stop and
+   * clearQueue. Published as `held-inputs-changed` on every change and every onChat replay (the
+   * renderer only subscribes to the workspace it shows). In memory only: like a queued message, a
+   * held input does not survive a backend restart.
    */
-  private readonly pendingInputRestores = new Map<
-    string,
-    Extract<WorkspaceChatMessage, { type: "restore-to-input" }>
-  >();
+  private heldInputs: Array<{ id: string; send: RefusedManualSend }> = [];
+  /** Held inputs whose re-send is in flight (a second Send must not send them twice). */
+  private readonly sendingHeldInputIds = new Set<string>();
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
@@ -3313,10 +3315,11 @@ export class AgentSession {
         },
       });
 
-      // Re-send unacknowledged unsent input (see pendingInputRestores): this subscription may be
-      // the first one since the refusal, e.g. the user switched back to this workspace.
-      for (const restore of this.pendingInputRestores.values()) {
-        listener({ workspaceId: this.workspaceId, message: restore });
+      // Held input snapshot (see heldInputs): this subscription may be the first one since the
+      // refusal, e.g. the user switched back to this workspace or reloaded. Replayed only when
+      // non-empty: the renderer resets its held list with the rest of the replayed chat state.
+      if (this.heldInputs.length > 0) {
+        listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
       }
 
       // Rehydrate pending auto-retry countdown state on reconnect/reload so
@@ -10793,10 +10796,49 @@ export class AgentSession {
     }
   }
 
-  /** A renderer applied the retained restoration `restoreId`; idempotent (re-deliveries re-ack). */
-  acknowledgeInputRestore(restoreId: string): void {
-    assert(restoreId.length > 0, "acknowledgeInputRestore requires a restoreId");
-    this.pendingInputRestores.delete(restoreId);
+  private heldInputsChangedEvent(): Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }> {
+    return {
+      type: "held-inputs-changed",
+      workspaceId: this.workspaceId,
+      heldInputs: this.heldInputs.map(({ id, send }) => ({
+        id,
+        displayText: send.displayText,
+        attachmentCount: send.attachmentCount,
+        reviewCount: send.reviewCount,
+      })),
+    };
+  }
+
+  /** Held inputs, oldest first (see heldInputs). */
+  getHeldInputs(): ReadonlyArray<{ id: string; send: RefusedManualSend }> {
+    return this.heldInputs;
+  }
+
+  /**
+   * Claim a held input for an explicit re-send. `busy` while an earlier claim is in flight, so a
+   * double-click cannot send it twice; the caller must {@link releaseHeldInputSend} afterwards.
+   */
+  claimHeldInputSend(
+    id: string
+  ): { kind: "claimed"; send: RefusedManualSend } | { kind: "missing" } | { kind: "busy" } {
+    const held = this.heldInputs.find((input) => input.id === id);
+    if (held == null) return { kind: "missing" };
+    if (this.sendingHeldInputIds.has(id)) return { kind: "busy" };
+    this.sendingHeldInputIds.add(id);
+    return { kind: "claimed", send: held.send };
+  }
+
+  releaseHeldInputSend(id: string): void {
+    this.sendingHeldInputIds.delete(id);
+  }
+
+  /** Drop a held input (re-sent and accepted, or discarded). Returns whether it was held. */
+  removeHeldInput(id: string): boolean {
+    const remaining = this.heldInputs.filter((input) => input.id !== id);
+    if (remaining.length === this.heldInputs.length) return false;
+    this.heldInputs = remaining;
+    this.emitChatEvent(this.heldInputsChangedEvent());
+    return true;
   }
 
   private emitQueuedMessageChanged(): void {
@@ -10884,10 +10926,9 @@ export class AgentSession {
     // the coordinator claims a turn for it — the token must never report admission for work its
     // attempt no longer authorizes. The entry is removed (its own token disposed as refused, its
     // cancel callbacks notified) and the drain continues with the next head; every pass removes
-    // one entry, so this recursion is bounded. A manual entry's text was never sent: it is handed
-    // back to the composer (appended, never replacing what the user typed since) so it stays
-    // visible and recoverable as unsent input — a later send of it is a new, normally admitted
-    // send, never an automatic continuation.
+    // one entry, so this recursion is bounded. A manual entry was never sent: the session keeps
+    // its original send as held input (see heldInputs) until the user re-sends it — a new,
+    // normally admitted manual send, never an automatic continuation — or discards it.
     const refusal =
       typeof dispatchDecision === "object"
         ? dispatchDecision.refuse
@@ -10895,32 +10936,16 @@ export class AgentSession {
           ? SEND_ADMISSION_STALE_MESSAGE
           : undefined;
     if (refusal != null) {
-      const unsent = candidate.unsentInput();
+      const refusedSend = candidate.refusedManualSend();
       const removed = this.messageQueue.removeEntry(candidate.identity);
       if (removed != null) {
+        if (refusedSend != null) {
+          // Held before the queue change is published, so no observer sees the input in neither.
+          this.heldInputs = [...this.heldInputs, { id: randomUUID(), send: refusedSend }];
+          this.emitChatEvent(this.heldInputsChangedEvent());
+        }
         this.emitQueuedMessageChanged();
         this.notifyQueuedMessageCleared(removed, refusal);
-        // Attachment-only input has empty text but is still the user's unsent data.
-        if (
-          unsent != null &&
-          (unsent.text.length > 0 ||
-            (unsent.fileParts?.length ?? 0) > 0 ||
-            (unsent.reviews?.length ?? 0) > 0)
-        ) {
-          // Retained until acknowledged (see pendingInputRestores): the queue entry is gone, so
-          // this is the only copy of the user's text.
-          const restore = {
-            type: "restore-to-input" as const,
-            workspaceId: this.workspaceId,
-            text: unsent.text,
-            fileParts: unsent.fileParts,
-            reviews: unsent.reviews,
-            mode: "append" as const,
-            restoreId: randomUUID(),
-          };
-          this.pendingInputRestores.set(restore.restoreId, restore);
-          this.emitChatEvent(restore);
-        }
       }
       this.sendQueuedMessages(trigger, stopAdmission);
       return;

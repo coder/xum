@@ -1505,6 +1505,55 @@ describe("MessageQueue", () => {
       expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
     });
 
+    it("captures a refused task-attempt entry's full original send only for manual user input", () => {
+      const token = () => ({
+        admissionStale: () => true,
+        onEnqueued: () => undefined,
+        onAdmitted: () => undefined,
+        onDisposed: () => undefined,
+      });
+      const review = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "n" };
+      const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+      queue.add(
+        "<review>n</review>\n\nAuthored",
+        {
+          model: "claude-3-5-sonnet-20241022",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+          fileParts,
+          muxMetadata: { type: "normal", reviews: [review] },
+          authoredText: "Authored",
+        },
+        { turnAdmission: token() }
+      );
+      queue.add(
+        "automatic wake",
+        { model: "claude-3-5-sonnet-20241022", agentId: "exec" },
+        {
+          turnAdmission: token(),
+          acceptanceOrigin: "automatic",
+        }
+      );
+
+      expect(queue.peekNext()?.refusedManualSend()).toEqual({
+        message: "<review>n</review>\n\nAuthored",
+        // Re-sent as a new send: the old queue slot's dispatch mode does not carry over.
+        options: {
+          model: "claude-3-5-sonnet-20241022",
+          agentId: "exec",
+          fileParts,
+          muxMetadata: { type: "normal", reviews: [review] },
+          authoredText: "Authored",
+        },
+        displayText: "Authored",
+        attachmentCount: 1,
+        reviewCount: 1,
+      });
+      queue.removeEntry(queue.peekNext()?.identity);
+      // Automatic sends are only refused, never kept for the user.
+      expect(queue.peekNext()?.refusedManualSend()).toBeUndefined();
+    });
+
     it("should preserve compaction metadata when follow-up is added", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",

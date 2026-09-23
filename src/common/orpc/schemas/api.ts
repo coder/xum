@@ -1740,9 +1740,17 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
-  /** The renderer applied a retained restore-to-input (see RestoreToInputEventSchema.restoreId). */
-  acknowledgeInputRestore: {
-    input: z.object({ workspaceId: z.string(), restoreId: z.string() }),
+  /**
+   * Re-send a held input (see HeldInputsChangedEventSchema) as a new manual send. It stays held
+   * unless the send is accepted; the error explains why it was not.
+   */
+  sendHeldInput: {
+    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    output: ResultSchema(z.void(), SendMessageErrorSchema),
+  },
+  /** Drop a held input without sending it. */
+  discardHeldInput: {
+    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
   setQueuedMessageDispatchMode: {

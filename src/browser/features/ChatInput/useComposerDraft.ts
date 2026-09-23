@@ -48,51 +48,41 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
-  // The latest attachments, including writes React has not rendered yet (see setAttachments).
-  const latestAttachmentsRef = useRef(attachments);
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) => {
-    // Computed and stored now, not in a React state updater: an updater runs only when this
-    // composer next renders, so a composer unmounted first (a workspace switch in the same batch
-    // as an unsent-input restoration, which is acknowledged as soon as it is applied) would never
-    // store the restored attachments.
-    const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
-    latestAttachmentsRef.current = next;
-    const persists =
-      next.length > 0 &&
-      estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-    selfWriteRef.current = true;
-    try {
-      updatePersistedState<ChatAttachment[] | undefined>(
-        attachmentsKey,
-        persists ? next : undefined
-      );
-    } finally {
-      selfWriteRef.current = false;
-    }
-    if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-    else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-      tooLargeToastKeyRef.current = attachmentsKey;
-      pushToast({
-        type: "error",
-        message:
-          "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-        duration: 5000,
-      });
-    }
-    setAttachmentsState(next);
-  };
+  ) =>
+    setAttachmentsState((previous) => {
+      const next = value instanceof Function ? value(previous) : value;
+      const persists =
+        next.length > 0 &&
+        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+      selfWriteRef.current = true;
+      try {
+        updatePersistedState<ChatAttachment[] | undefined>(
+          attachmentsKey,
+          persists ? next : undefined
+        );
+      } finally {
+        selfWriteRef.current = false;
+      }
+      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+        tooLargeToastKeyRef.current = attachmentsKey;
+        pushToast({
+          type: "error",
+          message:
+            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+          duration: 5000,
+        });
+      }
+      return next;
+    });
   useEffect(() => {
-    const loadAttachments = () => {
-      latestAttachmentsRef.current = readPersistedChatAttachments(attachmentsKey);
-      setAttachmentsState(latestAttachmentsRef.current);
-    };
     tooLargeToastKeyRef.current = null;
-    loadAttachments();
+    setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
     return subscribePersistedStateWrites((event) => {
       if (event.key === attachmentsKey && !selfWriteRef.current) {
-        loadAttachments();
+        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
       }
     });
   }, [attachmentsKey]);
@@ -138,9 +128,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         createdAt: 0,
       }))
     : attachedReviews;
-  // The latest attachments, not this render's: an edit opened in the same batch as a restore
-  // saves the pre-edit draft before the restore's attachment update has rendered.
-  const getDraft = () => ({ text: input, attachments: latestAttachmentsRef.current });
+  const getDraft = () => ({ text: input, attachments });
   const setDraft = (draft: { text: string; attachments: ChatAttachment[] }) => {
     setInput(draft.text);
     setAttachments(draft.attachments);

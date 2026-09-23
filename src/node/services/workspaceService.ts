@@ -13316,16 +13316,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  acknowledgeInputRestore(workspaceId: string, restoreId: string): Result<void> {
-    try {
-      // No session means nothing is retained (restorations live with the session).
-      this.sessions.get(workspaceId.trim())?.acknowledgeInputRestore(restoreId);
-      return Ok(undefined);
-    } catch (error) {
-      const errorMessage = getErrorMessage(error);
-      log.error("Unexpected error in acknowledgeInputRestore handler:", error);
-      return Err(`Failed to acknowledge restored input: ${errorMessage}`);
+  /**
+   * Re-send a held input (see AgentSession.heldInputs) exactly as it was queued, as a NEW manual
+   * send through the ordinary sendMessage path: a reported task's manual rescue mints a fresh
+   * attempt for it, like any message the user types. The held copy is removed only once the send
+   * is accepted (started or queued); a refused or failed send keeps it and returns the error.
+   */
+  async sendHeldInput(
+    workspaceId: string,
+    heldInputId: string
+  ): Promise<Result<void, SendMessageError>> {
+    assert(heldInputId.length > 0, "sendHeldInput requires a heldInputId");
+    const session = this.sessions.get(workspaceId.trim());
+    const claim = session?.claimHeldInputSend(heldInputId) ?? { kind: "missing" as const };
+    if (claim.kind === "missing") {
+      return Err({ type: "unknown", raw: "This unsent message is no longer held." });
     }
+    if (claim.kind === "busy") {
+      return Err({ type: "unknown", raw: "This unsent message is already being sent." });
+    }
+    assert(session != null, "a claimed held input belongs to a live session");
+    try {
+      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options);
+      if (result.success) session.removeHeldInput(heldInputId);
+      return result;
+    } finally {
+      session.releaseHeldInputSend(heldInputId);
+    }
+  }
+
+  discardHeldInput(workspaceId: string, heldInputId: string): Result<void> {
+    assert(heldInputId.length > 0, "discardHeldInput requires a heldInputId");
+    // Idempotent: a missing session or id means there is nothing left to discard.
+    this.sessions.get(workspaceId.trim())?.removeHeldInput(heldInputId);
+    return Ok(undefined);
   }
 
   setQueuedMessageDispatchMode(

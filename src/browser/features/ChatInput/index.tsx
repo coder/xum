@@ -1109,63 +1109,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     });
   }, []);
 
-  const attachmentsFromPending = (pending: PendingUserMessage, attachmentKeyPrefix: string) => [
-    ...filePartsToChatAttachments(pending.fileParts, attachmentKeyPrefix),
-    ...pending.stagedAttachments.map((attachment, index) => ({
-      ...attachment,
-      id: `${attachmentKeyPrefix}-staged-${index}`,
-    })),
-  ];
-
   const applyDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
+      const providerAttachments = filePartsToChatAttachments(
+        pending.fileParts,
+        attachmentKeyPrefix
+      );
+      const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
+        ...attachment,
+        id: `${attachmentKeyPrefix}-staged-${index}`,
+      }));
       setDraft({
         text: pending.content,
-        attachments: attachmentsFromPending(pending, attachmentKeyPrefix),
+        attachments: [...providerAttachments, ...stagedAttachments],
       });
     },
     [setDraft]
-  );
-
-  // Append a restored pending message to the CURRENT draft without losing any of the user's draft
-  // data: text goes after the draft text, attachments after the draft's attachments, review notes
-  // after the notes already attached. Used when a queued message is handed back as unsent input
-  // (the user may have typed and attached more since queueing it); `applyDraftFromPending` is the
-  // replacing variant for restores that own the whole draft (Stop, queued-message edit).
-  // Every write is a functional update: one queue drain can refuse several entries back to back,
-  // and their restores arrive before React re-renders, so a render-time snapshot (getDraft(),
-  // reviewData) would let the second append overwrite the first.
-  const attachedReviews = variant === "workspace" ? props.attachedReviews : undefined;
-  const onAttachReviews = variant === "workspace" ? props.onAttachReviews : undefined;
-  const appendDraftFromPending = useCallback(
-    (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
-      setInput((previous) => previous + (previous.trim() ? "\n\n" : "") + pending.content);
-      const restoredAttachments = attachmentsFromPending(pending, attachmentKeyPrefix);
-      setAttachments((previous) => [...previous, ...restoredAttachments]);
-      if (pending.reviews.length === 0) return;
-      if (!reviewOverrideActive && onAttachReviews) {
-        // The usual case: attach the notes in the workspace's review store, which persists them
-        // now, so they survive the composer remounting after the store acknowledges this
-        // restoration (the backend then drops its copy). A later send checks them off.
-        onAttachReviews(pending.reviews);
-        return;
-      }
-      // A draft override (a Stop or queued-message edit restore) hides the store's notes: add
-      // these to it. With no override yet, the panel's attached notes are the effective list; the
-      // merged result becomes the override so nothing already attached is hidden or dropped.
-      setDraftReviews((previous) => [
-        ...(previous ?? (attachedReviews ?? []).map((review) => review.data)),
-        ...pending.reviews,
-      ]);
-    },
-    [
-      attachedReviews,
-      onAttachReviews,
-      reviewOverrideActive,
-      setAttachments,
-      setDraftReviews,
-      setInput,
-    ]
   );
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.
@@ -1408,21 +1367,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [api]);
 
-  // Apply an input update to this composer: `replace` owns the whole draft, `append` adds after
-  // it. Shared by UPDATE_CHAT_INPUT events and the store's retained unsent-input restorations.
-  const restoredInputSeqRef = useRef(0);
-  const applyInputUpdate = useCallback(
-    (update: {
-      text: string;
-      mode?: "append" | "replace";
-      fileParts?: FilePart[];
-      reviews?: ReviewNoteDataForDisplay[];
-    }) => {
-      const { text, mode = "append", fileParts, reviews } = update;
-      // Unique per restoration: several can be applied within one millisecond (a drain refusing
-      // back to back, or retained restorations flushed together when the composer mounts), and
-      // attachment ids derive from this prefix.
-      const restoredIdPrefix = `restored-${Date.now()}-${restoredInputSeqRef.current++}`;
+  // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const customEvent = e as CustomEvent<{
+        text: string;
+        mode?: "append" | "replace";
+        fileParts?: FilePart[];
+        reviews?: ReviewNoteDataForDisplay[];
+        workspaceId?: string;
+      }>;
+
+      if (
+        customEvent.detail.workspaceId != null &&
+        workspaceIdForComposerClear !== customEvent.detail.workspaceId
+      ) {
+        return;
+      }
+
+      const { text, mode = "append", fileParts, reviews } = customEvent.detail;
+      const restoredIdPrefix = `restored-${Date.now()}`;
       const restoredPending = buildPendingFromRestoredInput({
         content: text,
         fileParts: fileParts ?? [],
@@ -1443,54 +1407,31 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           restoreText(restoredPending.content);
         }
       } else if (hasFileParts || hasStagedAttachments || hasReviews) {
-        appendDraftFromPending(restoredPending, restoredIdPrefix);
+        const currentText = getDraft().text;
+        const separator = currentText.trim() ? "\n\n" : "";
+        applyDraftFromPending(
+          {
+            ...restoredPending,
+            content: currentText + separator + restoredPending.content,
+          },
+          restoredIdPrefix
+        );
       } else {
         appendText(restoredPending.content);
       }
-    },
-    [appendText, restoreText, restoreDraft, appendDraftFromPending, editingMessageForUi]
-  );
-
-  // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const customEvent = e as CustomEvent<{
-        text: string;
-        mode?: "append" | "replace";
-        fileParts?: FilePart[];
-        reviews?: ReviewNoteDataForDisplay[];
-        workspaceId?: string;
-      }>;
-
-      if (
-        customEvent.detail.workspaceId != null &&
-        workspaceIdForComposerClear !== customEvent.detail.workspaceId
-      ) {
-        return;
-      }
-      applyInputUpdate(customEvent.detail);
     };
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
-  }, [applyInputUpdate, workspaceIdForComposerClear]);
-
-  // Unsent input the backend handed back for this workspace (a refused queued message) can arrive
-  // while another workspace's composer is shown; the store keeps it until this composer takes it.
-  // A history edit owns the composer: the restore is not taken while one is open (cancelling the
-  // edit would put the pre-edit draft back over it after the store had acknowledged it). The
-  // consumer also declines while the edit is current (editingMessageIdRef is assigned during
-  // render), covering deliveries between the render that opens an edit and this effect's cleanup.
-  // Keyed on the prop, not editingMessageForUi: a submitted edit stays open until it succeeds.
-  const historyEditOpen = editingMessage != null;
-  useEffect(() => {
-    if (workspaceIdForComposerClear == null || historyEditOpen) return;
-    return store.registerInputRestoreConsumer(workspaceIdForComposerClear, (restore) => {
-      if (editingMessageIdRef.current != null) return false;
-      applyInputUpdate(restore);
-      return true;
-    });
-  }, [applyInputUpdate, historyEditOpen, store, workspaceIdForComposerClear]);
+  }, [
+    appendText,
+    restoreText,
+    restoreDraft,
+    applyDraftFromPending,
+    getDraft,
+    editingMessageForUi,
+    workspaceIdForComposerClear,
+  ]);
 
   useEffect(() => {
     const handler = (event: CustomEvent<{ workspaceId: string }>) => {

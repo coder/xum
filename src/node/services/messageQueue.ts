@@ -104,6 +104,20 @@ export type QueuedInput = Pick<
   "text" | "fileParts" | "reviews"
 >;
 
+/**
+ * The original send of a manual queued entry that the dequeue gate refused (see
+ * AgentSession.heldInputs): exactly what the user queued, so re-sending it later reproduces the
+ * same provider message, send options, attachments and review metadata.
+ */
+export interface RefusedManualSend {
+  message: string;
+  options: SendMessageOptions & { fileParts?: FilePart[] };
+  /** Display text: the authored text (or slash command), not the review-formatted message. */
+  displayText: string;
+  attachmentCount: number;
+  reviewCount: number;
+}
+
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
 export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
   return typeof signal.reason === "string"
@@ -944,23 +958,13 @@ export class MessageQueue {
     return this.inputForRestore(this.entries);
   }
 
-  private inputForRestore(
-    entries: readonly QueueEntry[],
-    options?: {
-      /**
-       * Include an entry whose admission probe reads stale. Stop's restore excludes those (the
-       * probe is what refused them); the dequeue gate's refusal of a manual entry is exactly that
-       * case and must still hand the user's text back (it was never sent).
-       */
-      includeStale?: boolean;
-    }
-  ): QueuedInput | undefined {
+  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
     const restorable = entries.filter(
       (entry) =>
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
         !entry.cancelSignal?.aborted &&
-        (options?.includeStale === true || entry.admissionStale?.() !== true)
+        entry.admissionStale?.() !== true
     );
     for (const entry of restorable) {
       assert(
@@ -1110,8 +1114,8 @@ export class MessageQueue {
         muxMetadata: unknown;
         acceptanceOrigin: TurnAcceptanceOrigin;
         inputForRestore: () => QueuedInput | undefined;
-        /** The user's authored input even when its admission reads stale (a refused manual entry). */
-        unsentInput: () => QueuedInput | undefined;
+        /** The entry's original send when it is the user's manual input (the dequeue gate holds it). */
+        refusedManualSend: () => RefusedManualSend | undefined;
         /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
         turnAdmission: TurnAdmissionToken | undefined;
       }
@@ -1123,10 +1127,51 @@ export class MessageQueue {
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
           inputForRestore: () => this.inputForRestore([entry]),
-          unsentInput: () => this.inputForRestore([entry], { includeStale: true }),
+          refusedManualSend: () => this.refusedManualSend(entry),
           turnAdmission: entry.turnAdmission,
         }
       : undefined;
+  }
+
+  private refusedManualSend(entry: QueueEntry): RefusedManualSend | undefined {
+    // Same selection as a Stop restore minus the staleness probe (that probe is what refused it):
+    // only the user's own manual input is held; automatic and synthetic sends are just refused.
+    if (
+      !entry.userAuthored ||
+      this.getAcceptanceOrigin(entry) !== "manual" ||
+      entry.cancelSignal?.aborted === true
+    ) {
+      return undefined;
+    }
+    // Only token-carrying entries are refused at dispatch, and those are sealed: one add per
+    // entry, so its latest options are exactly the options of the one send it holds.
+    assert(entry.turnAdmission != null, "only task-attempt entries are refused at dispatch");
+    assert(entry.addCount === 1, "a refused task-attempt entry holds exactly one send");
+    assert(entry.latestOptions != null, "a manual queued send keeps its send options");
+    const reviewCount = this.getReviewsForEntries([entry])?.length ?? 0;
+    if (entry.messages.length === 0 && entry.fileParts.length === 0 && reviewCount === 0) {
+      return undefined;
+    }
+    const options: SendMessageOptions & { fileParts?: FilePart[] } = { ...entry.latestOptions };
+    // The original dispatch mode described the queue it waited in; a re-send picks its own.
+    delete options.queueDispatchMode;
+    if (entry.goalInterventionPolicy != null) {
+      options.goalInterventionPolicy = entry.goalInterventionPolicy;
+    }
+    const authoredText = entry.authoredMessages.join("\n");
+    return {
+      message: entry.messages.join("\n"),
+      options: {
+        ...options,
+        muxMetadata: entry.muxMetadata,
+        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        // Kept so a re-send that is queued and refused again is held with the same display text.
+        ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
+      },
+      displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+      attachmentCount: entry.fileParts.length,
+      reviewCount,
+    };
   }
 
   /**

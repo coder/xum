@@ -41,6 +41,11 @@ export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderM
 export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
+/** One held input's display data (see HeldInputsChangedEventSchema). */
+export type HeldInput = Extract<
+  WorkspaceChatMessage,
+  { type: "held-inputs-changed" }
+>["heldInputs"][number];
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
 export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;
@@ -199,6 +204,12 @@ export function isRestoreToInput(
   msg: WorkspaceChatMessage
 ): msg is Extract<WorkspaceChatMessage, { type: "restore-to-input" }> {
   return (msg as { type?: string }).type === "restore-to-input";
+}
+
+export function isHeldInputsChanged(
+  msg: WorkspaceChatMessage
+): msg is Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }> {
+  return (msg as { type?: string }).type === "held-inputs-changed";
 }
 
 export function isStreamLifecycle(msg: WorkspaceChatMessage): msg is StreamLifecycleEvent {
