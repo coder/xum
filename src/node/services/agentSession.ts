@@ -49,8 +49,15 @@ import {
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
-import type { QueueCutReceipt, TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
+import type {
+  QueueCutReceipt,
+  TurnAcceptanceOrigin,
+  TurnAdmissionToken,
+} from "./taskWorkspaceSeam";
+import {
+  SEND_ADMISSION_STALE_MESSAGE,
+  WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+} from "@/constants/agentMessaging";
 import {
   CompactionCancellation,
   matchesCompactionCancellation,
@@ -737,6 +744,12 @@ interface AgentSessionOptions {
   getStopEpoch?: () => number;
   /** Authoritative turn settlement for stop cascades: the admitted generation ended for good. */
   onTurnSettled?: (turnGeneration: symbol) => void;
+  /**
+   * The coordinator replaced a live generation with a successor without the predecessor going
+   * idle (queued dispatch at a step boundary, retry/rollover handoff); the predecessor never
+   * settles on its own, so waits bound to it move to the successor.
+   */
+  onTurnSuperseded?: (previous: symbol, next: symbol) => void;
 }
 
 interface CachedMemoryContext {
@@ -833,6 +846,12 @@ interface SendMessageInternalOptions {
    * these admission gates instead of starting a privileged turn on a stopped target.
    */
   admissionStale?: () => boolean;
+  /**
+   * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
+   * admission inside the synchronous prepare callback. Its staleness is already composed into
+   * `admissionStale` by WorkspaceService.
+   */
+  turnAdmission?: TurnAdmissionToken;
 }
 
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
@@ -910,6 +929,9 @@ export class AgentSession {
   private readonly isStopInProgress: () => boolean;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
+  private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
+  /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
+  private observedTurn: { id: symbol; idle: boolean } | undefined;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -933,11 +955,24 @@ export class AgentSession {
       this.activeToolCallIds.clear();
     },
     phaseChanged: (phase, isCurrent) => {
-      this.publishTurnPhase(phase, isCurrent);
+      // Lifecycle listeners can synchronously admit or settle a successor. Capture this transition
+      // and publish its ownership first, so nested callbacks cannot overwrite or settle that turn.
+      const turnId = this.coordinator.turnId;
+      const previous = this.observedTurn;
+      this.observedTurn = { id: turnId, idle: phase === "idle" };
+      // A fresh admission while a generation is still live (queue dispatch at a step boundary,
+      // handoff) replaces the id without an idle transition: report the supersession so waits
+      // bound to the predecessor are not stranded (it will never settle on its own).
+      if (previous != null && previous.id !== turnId && !previous.idle) {
+        this.onTurnSuperseded?.(previous.id, turnId);
+      }
+      if (this.coordinator.turnId === turnId && this.coordinator.phase === phase) {
+        this.publishTurnPhase(phase, isCurrent);
+      }
       // The coordinator transitions a generation to idle only from its owner's completion paths
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
       // settlement — a stop cascade waiting on the captured generation may release its latch.
-      if (phase === "idle") this.onTurnSettled?.(this.coordinator.turnId);
+      if (phase === "idle") this.onTurnSettled?.(turnId);
     },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
@@ -1232,6 +1267,7 @@ export class AgentSession {
       isStopInProgress,
       getStopEpoch,
       onTurnSettled,
+      onTurnSuperseded,
       onBeforeTurnCompletion,
     } = options;
 
@@ -1268,6 +1304,7 @@ export class AgentSession {
     this.isStopInProgress = isStopInProgress ?? (() => false);
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
+    this.onTurnSuperseded = onTurnSuperseded;
     this.onBeforeTurnCompletion = onBeforeTurnCompletion;
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Accessors must read live session state, not the host object's receiver.
@@ -4911,6 +4948,9 @@ export class AgentSession {
       preparedTurnAbortController,
       (turnId) => {
         attempt.owner = turnId;
+        // Admission evidence for the task-attempt obligation: fired here, in the same
+        // synchronous block that claims PREPARING (idempotent for the adopted queued turn).
+        internal?.turnAdmission?.onAdmitted(turnId);
         this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
           optionsForStream.muxMetadata
         );
@@ -5018,6 +5058,8 @@ export class AgentSession {
       preparationSignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
       contextBudgetRetried?: boolean;
+      /** See SendMessageInternalOptions.turnAdmission. */
+      turnAdmission?: TurnAdmissionToken;
     }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
@@ -5099,6 +5141,14 @@ export class AgentSession {
     if (this.isStopInProgress()) {
       return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
     }
+    // Task-attempt fence (the PREPARING gate prepareMessage applies through isAdmissionStale):
+    // the host checked the obligation before calling, but the attempt can be rotated, retired or
+    // stopped during the preflight awaits above. Same synchronous block as the prepare below, so
+    // a stale token never reports admission for work its attempt no longer authorizes; the host
+    // disposes a refused resume's token.
+    if (internal?.turnAdmission?.admissionStale() === true) {
+      return Err(createUnknownSendMessageError(SEND_ADMISSION_STALE_MESSAGE));
+    }
 
     const attempt: PreparationAttempt = {
       intent: "resume",
@@ -5118,6 +5168,7 @@ export class AgentSession {
         startupController,
         (turnId) => {
           attempt.owner = turnId;
+          internal?.turnAdmission?.onAdmitted(turnId);
           this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
             optionsForStream.muxMetadata
           );
@@ -9271,6 +9322,8 @@ export class AgentSession {
       onPreTurnRowsPersisted?: () => void;
       /** Caller staleness probe re-checked at this entry's dispatch admission. */
       admissionStale?: () => boolean;
+      /** Task-attempt obligation owned by the entry until its dispatch or removal. */
+      turnAdmission?: TurnAdmissionToken;
       compactionAdmissionStale?: () => boolean;
       readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
       /** Refresh only this entry's Stop capture for an explicit manual Send now. */
@@ -9895,6 +9948,56 @@ export class AgentSession {
       this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
       return;
     }
+    // Report-decision hold: the stream that just ended may still be deciding whether it carried
+    // the task's terminal report (TaskService classifies it under its event lock, after this
+    // drain runs). Until that decision resolves the head entry is RETAINED — not dequeued, not
+    // dispatched, not removed — and this drain returns; TaskService re-runs the idle drain when
+    // the decision lands. Nothing here awaits TaskService: the turn's own completion (compaction
+    // decision, finishTurn) proceeds, so no circular wait exists. Every trigger passes through
+    // this gate, so no drain path can dispatch the held entry.
+    const dispatchDecision = candidate.turnAdmission?.resolveDispatch?.() ?? "proceed";
+    if (dispatchDecision === "hold") return;
+    // Dequeue gate: a task-attempt obligation whose attempt was closed, superseded or stopped
+    // while the entry waited — or whose report decision resolved against it — is refused BEFORE
+    // the coordinator claims a turn for it — the token must never report admission for work its
+    // attempt no longer authorizes. The entry is removed (its own token disposed as refused, its
+    // cancel callbacks notified) and the drain continues with the next head; every pass removes
+    // one entry, so this recursion is bounded. A manual entry's text was never sent: it is handed
+    // back to the composer (appended, never replacing what the user typed since) so it stays
+    // visible and recoverable as unsent input — a later send of it is a new, normally admitted
+    // send, never an automatic continuation.
+    const refusal =
+      typeof dispatchDecision === "object"
+        ? dispatchDecision.refuse
+        : candidate.turnAdmission?.admissionStale() === true
+          ? SEND_ADMISSION_STALE_MESSAGE
+          : undefined;
+    if (refusal != null) {
+      const unsent = candidate.unsentInput();
+      const removed = this.messageQueue.removeEntry(candidate.identity);
+      if (removed != null) {
+        this.emitQueuedMessageChanged();
+        this.notifyQueuedMessageCleared(removed, refusal);
+        // Attachment-only input has empty text but is still the user's unsent data.
+        if (
+          unsent != null &&
+          (unsent.text.length > 0 ||
+            (unsent.fileParts?.length ?? 0) > 0 ||
+            (unsent.reviews?.length ?? 0) > 0)
+        ) {
+          this.emitChatEvent({
+            type: "restore-to-input",
+            workspaceId: this.workspaceId,
+            text: unsent.text,
+            fileParts: unsent.fileParts,
+            reviews: unsent.reviews,
+            mode: "append",
+          });
+        }
+      }
+      this.sendQueuedMessages(trigger, stopAdmission);
+      return;
+    }
     const expectedTurnId = this.coordinator.turnId;
     const attempt: PreparationAttempt = {
       intent: "send",
@@ -9912,6 +10015,7 @@ export class AgentSession {
         undefined,
         (turnId) => {
           attempt.owner = turnId;
+          candidate.turnAdmission?.onAdmitted(turnId);
           this.dispatchingQueuedEntry = true;
           this.dispatchingQueuedEntryMuxMetadata = candidate.muxMetadata;
           this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(candidate.muxMetadata);
@@ -10056,7 +10160,11 @@ export class AgentSession {
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
     cancelResume?: () => boolean,
-    startStreamInBackground = false
+    startStreamInBackground = false,
+    // Task-attempt obligation bound by a startup re-drive for exactly the attempt it rotated
+    // (see TaskWorkspaceSeam.dispatchPendingCompactionFollowUp); rides the send as its token
+    // and staleness probe. Absent for the session's own stream-end dispatch.
+    turnAdmission?: TurnAdmissionToken
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -10331,7 +10439,10 @@ export class AgentSession {
           (this.isBusy() && this.coordinator.phase !== "completing")
       : undefined;
     const followUpAdmissionStale = () =>
-      resumeCanceled() || idleRuleStale?.() === true || goalAdmissionStale?.() === true;
+      resumeCanceled() ||
+      idleRuleStale?.() === true ||
+      goalAdmissionStale?.() === true ||
+      turnAdmission?.admissionStale() === true;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
       workspaceId: this.workspaceId,
@@ -10461,6 +10572,7 @@ export class AgentSession {
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
+      turnAdmission,
     });
     if (!sendResult.success) {
       if (resumeCanceled()) {
@@ -11361,10 +11473,16 @@ export class AgentSession {
 
   async dispatchPendingCompactionFollowUpIfNeeded(
     summaryMessageId?: string,
-    startStreamInBackground = false
+    startStreamInBackground = false,
+    internal?: { turnAdmission?: TurnAdmissionToken }
   ): Promise<boolean> {
     this.assertNotDisposed("dispatchPendingCompactionFollowUpIfNeeded");
-    return this.dispatchPendingFollowUp(summaryMessageId, undefined, startStreamInBackground);
+    return this.dispatchPendingFollowUp(
+      summaryMessageId,
+      undefined,
+      startStreamInBackground,
+      internal?.turnAdmission
+    );
   }
 
   /**

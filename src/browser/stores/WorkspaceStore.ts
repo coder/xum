@@ -1268,11 +1268,12 @@ export class WorkspaceStore {
     "restore-to-input": (_workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
 
-      // Use UPDATE_CHAT_INPUT event with mode="replace"
+      // UPDATE_CHAT_INPUT with the event's mode (replace unless the backend asks to append: a
+      // refused queued message handed back as unsent input must not overwrite a newer draft).
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
           text: data.text,
-          mode: "replace",
+          mode: data.mode ?? "replace",
           fileParts: data.fileParts,
           reviews: data.reviews,
           // Restore events can arrive for a background workspace; never let them

@@ -9,7 +9,7 @@ import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelop
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
-import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -173,6 +173,12 @@ interface QueuedMessageInternalOptions {
    * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
    */
   admissionStale?: () => boolean;
+  /**
+   * Task-attempt obligation for this send. The queue owns it from insertion (onEnqueued) until
+   * the entry dispatches (the session reports admission) or is removed (disposed here). Entries
+   * carrying one are sealed: the token correlates to exactly one dispatch.
+   */
+  turnAdmission?: TurnAdmissionToken;
   /** Stop capture shared by otherwise batchable additions; caller probes remain isolated. */
   compactionAdmissionStale?: () => boolean;
   /** The original acquired storage frontier survives preflight, batching, and queue waits. */
@@ -188,6 +194,16 @@ type QueueClearCallbacks = Pick<
   QueuedMessageInternalOptions,
   "onCanceled" | "onAcceptedPreStreamFailure"
 >;
+
+/** Cancellation notifications for one removed entry (the token is disposed by the queue itself). */
+function clearCallbacksFor(entry: QueueEntry): QueueClearCallbacks {
+  return {
+    ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+    ...(entry.onAcceptedPreStreamFailure != null
+      ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+      : {}),
+  };
+}
 
 /**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
@@ -248,6 +264,8 @@ interface QueueEntry {
   onPreTurnRowsPersisted?: () => void;
   /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
   admissionStale?: () => boolean;
+  /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
+  turnAdmission?: TurnAdmissionToken;
 }
 
 /**
@@ -656,6 +674,7 @@ export class MessageQueue {
       // A staleness probe gates exactly one dispatch; batching would let one
       // sender's stop-refusal veto unrelated queued messages.
       internal?.admissionStale != null ||
+      internal?.turnAdmission != null ||
       internal?.goalKind != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
@@ -764,6 +783,12 @@ export class MessageQueue {
     }
     if (internal?.admissionStale != null) {
       entry.admissionStale = internal.admissionStale;
+    }
+    if (internal?.turnAdmission != null) {
+      // Sealed entries are 1:1 with their token; a batched add can never reach a token-carrying
+      // entry, so this is always the entry's own insertion.
+      entry.turnAdmission = internal.turnAdmission;
+      entry.turnAdmission.onEnqueued();
     }
     entry.addCount += 1;
     entry.acceptanceOrigins.push({
@@ -905,13 +930,23 @@ export class MessageQueue {
     return this.inputForRestore(this.entries);
   }
 
-  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
+  private inputForRestore(
+    entries: readonly QueueEntry[],
+    options?: {
+      /**
+       * Include an entry whose admission probe reads stale. Stop's restore excludes those (the
+       * probe is what refused them); the dequeue gate's refusal of a manual entry is exactly that
+       * case and must still hand the user's text back (it was never sent).
+       */
+      includeStale?: boolean;
+    }
+  ): QueuedInput | undefined {
     const restorable = entries.filter(
       (entry) =>
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
         !entry.cancelSignal?.aborted &&
-        entry.admissionStale?.() !== true
+        (options?.includeStale === true || entry.admissionStale?.() !== true)
     );
     return restorable.length > 0
       ? {
@@ -934,12 +969,7 @@ export class MessageQueue {
   getClearCallbacks(): QueueClearCallbacks[] {
     return this.entries
       .filter((entry) => entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null)
-      .map((entry) => ({
-        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-        ...(entry.onAcceptedPreStreamFailure != null
-          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-          : {}),
-      }));
+      .map(clearCallbacksFor);
   }
 
   /**
@@ -959,12 +989,22 @@ export class MessageQueue {
       return null;
     }
     const [entry] = this.entries.splice(index, 1);
-    return {
-      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-      ...(entry.onAcceptedPreStreamFailure != null
-        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-        : {}),
-    };
+    entry.turnAdmission?.onDisposed("canceled-before-admission");
+    return clearCallbacksFor(entry);
+  }
+
+  /**
+   * Remove exactly the queued entry identified by a {@link peekNext} capture (the dequeue gate
+   * refusing a stale task-attempt obligation before any turn is claimed); its token is disposed
+   * as refused. Returns the entry's cancellation callbacks, or null when the head moved since
+   * the capture.
+   */
+  removeEntry(identity: unknown): QueueClearCallbacks | null {
+    const index = this.entries.findIndex((entry) => entry === identity);
+    if (index === -1) return null;
+    const [entry] = this.entries.splice(index, 1);
+    entry.turnAdmission?.onDisposed("refused");
+    return clearCallbacksFor(entry);
   }
 
   /** Remove queued entries carrying a dedupe key with the given prefix. */
@@ -1006,13 +1046,9 @@ export class MessageQueue {
         );
         return [entry];
       }
+      entry.turnAdmission?.onDisposed("canceled-before-admission");
       if (entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null) {
-        removedCallbacks.push({
-          ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-          ...(entry.onAcceptedPreStreamFailure != null
-            ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-            : {}),
-        });
+        removedCallbacks.push(clearCallbacksFor(entry));
       }
       return [];
     });
@@ -1050,6 +1086,10 @@ export class MessageQueue {
         muxMetadata: unknown;
         acceptanceOrigin: TurnAcceptanceOrigin;
         inputForRestore: () => QueuedInput | undefined;
+        /** The user's authored input even when its admission reads stale (a refused manual entry). */
+        unsentInput: () => QueuedInput | undefined;
+        /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
+        turnAdmission: TurnAdmissionToken | undefined;
       }
     | undefined {
     const entry = this.entries[0];
@@ -1059,6 +1099,8 @@ export class MessageQueue {
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
           inputForRestore: () => this.inputForRestore([entry]),
+          unsentInput: () => this.inputForRestore([entry], { includeStale: true }),
+          turnAdmission: entry.turnAdmission,
         }
       : undefined;
   }
@@ -1160,6 +1202,7 @@ export class MessageQueue {
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
       admissionStale != null ||
+      entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
@@ -1183,6 +1226,7 @@ export class MessageQueue {
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
+          ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
         }
@@ -1202,6 +1246,9 @@ export class MessageQueue {
    * capture {@link getClearCallbacks} beforehand.
    */
   clear(): void {
+    for (const entry of this.entries) {
+      entry.turnAdmission?.onDisposed("canceled-before-admission");
+    }
     this.entries = [];
   }
 
