@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 import * as os from "os";
@@ -377,6 +377,35 @@ describe("taskCheckoutPreparation", () => {
       kind: "mismatch",
     });
   }, 20_000);
+
+  test("a stalled checkout filesystem cannot hang the validator: the physical checks are bounded and fail closed (dedicated and root-anchored shared)", async () => {
+    const { checkout, row } = await prepareDedicated("ded09");
+    const localRoot = rootRow("root1", projectPath, { runtimeConfig: { type: "local" } });
+    const shared = taskRow("loc09", projectPath, { runtimeConfig: { type: "local" } });
+    await publish([localRoot, row, shared]);
+    expect(await state(config, "ded09")).toBe("ready");
+    expect(await state(config, "loc09")).toBe("ready");
+    // A stalled FUSE/NFS mount: stats of either execution directory never answer.
+    const stat = fsPromises.stat;
+    const stalled = new Set([checkout, projectPath]);
+    const probe = spyOn(fsPromises, "stat").mockImplementation(((
+      ...args: Parameters<typeof fsPromises.stat>
+    ) =>
+      stalled.has(String(args[0]))
+        ? new Promise(() => undefined)
+        : stat(...args)) as typeof fsPromises.stat);
+    try {
+      for (const id of ["ded09", "loc09"]) {
+        const refused = await validateTaskCheckoutPreparation(config, id, { timeoutMs: 50 });
+        expect(refused.kind).toBe("unreadable");
+        expect("detail" in refused && refused.detail).toContain("timed out");
+      }
+      expect(probe).toHaveBeenCalled();
+    } finally {
+      probe.mockRestore();
+    }
+    expect(await state(config, "ded09")).toBe("ready");
+  }, 10_000);
 
   test("shared ancestry: intermediates matter; anchor must be a ready dedicated task or a live ordinary root", async () => {
     const { checkout, row: dedicated } = await prepareDedicated("ded04");

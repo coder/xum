@@ -12,6 +12,8 @@ import type { Workspace } from "@/common/types/project";
 import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { TASK_CHECKOUT_VALIDATION_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
 
@@ -674,13 +676,17 @@ function deriveTaskCheckoutAuthorization(
  * Derive the preparation state of a task row from a strict config snapshot and the host
  * filesystem. Lock-free (stats and bounded reads only): safe to call inside lifecycle mutexes and
  * inside the pruner's locked callbacks. Never throws; every failure is a refusing state. A
- * workspace id without a row is `unreadable` (refused), never an exemption.
+ * workspace id without a row is `unreadable` (refused), never an exemption. The physical checks
+ * are time-bounded and fail closed as `unreadable` on expiry.
  */
 export async function validateTaskCheckoutPreparation(
   config: ConfigReader,
-  workspaceId: string
+  workspaceId: string,
+  options: { timeoutMs?: number } = {}
 ): Promise<TaskCheckoutPreparationState> {
   assert(workspaceId.length > 0, "validateTaskCheckoutPreparation: workspaceId required");
+  const timeoutMs = options.timeoutMs ?? TASK_CHECKOUT_VALIDATION_TIMEOUT_MS;
+  assert(timeoutMs > 0, "validateTaskCheckoutPreparation: timeoutMs must be positive");
   let snapshot: ProjectsConfig;
   try {
     snapshot = config.loadConfigOrDefault({ throwOnError: true });
@@ -689,6 +695,23 @@ export async function validateTaskCheckoutPreparation(
   }
   const derived = deriveTaskCheckoutAuthorization(snapshot, workspaceId);
   if (derived.kind !== "derived") return derived;
+  // The physical checks are read-only, so on expiry the stalled operations are simply abandoned:
+  // they settle (or not) on their own, never reject (validatePhysicalCheckout catches every
+  // error) and their late result is discarded. Nothing is authorized from a timed-out check.
+  const physical = await raceWithAbortAndTimeout(validatePhysicalCheckout(derived), {
+    timeoutMs,
+  });
+  if (physical.kind !== "ok") {
+    return { kind: "unreadable", detail: `checkout validation timed out after ${timeoutMs}ms` };
+  }
+  return physical.value;
+}
+
+/** The filesystem half of `validateTaskCheckoutPreparation`. Never rejects. */
+async function validatePhysicalCheckout(derived: {
+  authority: TaskCheckoutAuthority;
+  anchorProof: TaskCheckoutPreparation | null;
+}): Promise<TaskCheckoutPreparationState> {
   if (derived.anchorProof !== null) {
     const physical = await revalidateTaskCheckoutIdentity(derived.anchorProof);
     if (!physical.ok) {
@@ -715,6 +738,27 @@ export async function validateTaskCheckoutPreparation(
     }
   }
   return { kind: "ready", authority: derived.authority };
+}
+
+/**
+ * Config-only publication check, run inside the config edit that inserts a task row (the row
+ * already in `snapshot`): a SHARED row's live same-path ancestry must still derive. Protected rows
+ * are published under the registration lock, so a structural mutator that won that lock first has
+ * already renamed or removed the parent, while the creator captured the parent's path before
+ * waiting. Such a row is refused (nothing is written) instead of being persisted with broken
+ * ancestry. Other kinds pass unchecked. Returns the refusal, or null to publish.
+ */
+export function sharedTaskRowPublicationRefusal(
+  snapshot: ProjectsConfig,
+  workspaceId: string
+): string | null {
+  const entry = findWorkspaceEntry(snapshot, workspaceId);
+  assert(entry != null, "sharedTaskRowPublicationRefusal: insert the row before checking it");
+  if (classifyTaskCheckoutKind(entry.workspace) !== "shared") return null;
+  const derived = deriveTaskCheckoutAuthorization(snapshot, workspaceId);
+  if (derived.kind === "derived") return null;
+  const detail = "detail" in derived ? `: ${derived.detail}` : "";
+  return `the parent workspace changed while this task was being created (${derived.kind}${detail}); nothing was published. Retry the task.`;
 }
 
 /** User-facing refusal text shared by every producer/consumer gate (one wording, one place). */

@@ -16,6 +16,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { TaskService } from "@/node/services/taskService";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   createAIServiceMocks,
   createTestProject,
@@ -395,6 +396,120 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       JSON.parse(await fsPromises.readFile(path.join(parentPath, OVERRIDES_RELATIVE_PATH), "utf-8"))
     ).toEqual(consented);
   }, 30_000);
+
+  test.each(["isolation-none", "project-dir-local"] as const)(
+    "a capacity-queued shared task (%s) publishes its protected row under the registration lock, like the unqueued shared path",
+    async (shape) => {
+      const [runningId, queuedId] =
+        shape === "isolation-none" ? ["sharedrun1", "sharedque1"] : ["localrun01", "localque01"];
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, parentPath } = await createRealStack(projectPath);
+      if (shape === "project-dir-local") {
+        // A project-dir parent: its local-runtime tasks share the project directory.
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            {
+              path: projectPath,
+              id: rootId,
+              name: "repo",
+              createdAt: new Date().toISOString(),
+              runtimeConfig: { type: "local" },
+            },
+          ],
+          testTaskSettings(1)
+        );
+      } else {
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+      }
+      const sharedPath = shape === "project-dir-local" ? projectPath : parentPath;
+      const isolation = shape === "isolation-none" ? ("none" as const) : undefined;
+      stubStableIds(config, [runningId, queuedId]);
+      // The one parallel slot is taken by a running shared task.
+      expect(await taskService.create({ ...createArgs("Running"), isolation })).toMatchObject({
+        success: true,
+        data: { taskId: runningId, status: "running" },
+      });
+      // A structural mutator in another backend scans task rows and renames under this lock, so
+      // the queued row must land while the lock is held (seen by that scan or after it), never
+      // in the middle of the mutation.
+      const lockPath = path.join(config.rootDir, "workspace-registration.lock");
+      const probeRegistrationLock = async (): Promise<"held" | "free"> => {
+        try {
+          const release = await acquireCrossProcessLock({
+            lockPath,
+            acquireTimeoutMs: 100,
+            staleMs: 60_000,
+            timeoutMessage: "registration lock held",
+          });
+          await release();
+          return "free";
+        } catch (error) {
+          expect(String(error)).toContain("registration lock held");
+          return "held";
+        }
+      };
+      const realEdit = config.editConfig.bind(config);
+      const publications: Array<"held" | "free"> = [];
+      const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+        const lock = await probeRegistrationLock();
+        await realEdit((cfg) => {
+          const before = findWorkspaceEntry(cfg, queuedId) != null;
+          const next = fn(cfg);
+          if (!before && findWorkspaceEntry(next, queuedId) != null) publications.push(lock);
+          return next;
+        }, options);
+      });
+      restores.push(() => edit.mockRestore());
+
+      const queued = await taskService.create({ ...createArgs("Queued"), isolation });
+      expect(queued).toMatchObject({ success: true, data: { taskId: queuedId, status: "queued" } });
+      expect(publications).toEqual(["held"]);
+      const row = findWorkspaceInConfig(config, queuedId);
+      expect(row).toMatchObject({ path: sharedPath, taskStatus: "queued" });
+      expect(row?.taskIsolation).toBe(isolation);
+    },
+    30_000
+  );
+
+  test.each(["queued", "unqueued"] as const)(
+    "a structural rename that wins the registration lock before the %s isolation: none publication refuses the creation instead of publishing stale ancestry",
+    async (mode) => {
+      const taskId = mode === "queued" ? "stalequeue1" : "staledirect";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, parentPath } =
+        await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      if (mode === "queued") {
+        // The one slot is taken by unrelated work (nothing aliasing the parent), so the rename
+        // below is a mutation the guard permits.
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      // The mutator wins the lock first: the parent is renamed after the creator captured its
+      // path and before the creator's locked publication.
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      let renamed: Awaited<ReturnType<WorkspaceService["rename"]>> | undefined;
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        async (materialize, publish) => {
+          renamed ??= await workspaceService.rename(rootId, "parent-renamed");
+          return realPrepare(materialize, publish);
+        }
+      );
+      restores.push(() => prepare.mockRestore());
+
+      const created = await taskService.create({ ...createArgs("Stale"), isolation: "none" });
+      expect(renamed).toMatchObject({ success: true });
+      expect(findWorkspaceInConfig(config, rootId)?.path).not.toBe(parentPath);
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain("parent workspace changed");
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    },
+    30_000
+  );
 
   test("a project-dir (local runtime) parent shares its directory with the task: the live sibling is found and its consent is preserved", async () => {
     const taskId = "directlocal01";
