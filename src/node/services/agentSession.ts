@@ -10450,23 +10450,9 @@ export class AgentSession {
         return false;
       }
     } else {
-      // Read the newest row that is not a model-hidden record (plan-review rows appended
-      // after the summary are UI state and must not hide it) — a newest-first scan that
-      // stops at the first such row, avoiding a full-file read in the common case.
+      // Read the last message from history — only need 1 message, avoid full-file read.
       // Startup recovery must retry on transient read failures, so bubble errors.
-      let newestVisible: MuxMessage | undefined;
-      const historyResult = await this.historyService.iterateFullHistory(
-        this.workspaceId,
-        "backward",
-        (chunk) => {
-          for (const message of chunk) {
-            if (isModelHiddenMessage(message)) continue;
-            newestVisible = message;
-            return false;
-          }
-          return true;
-        }
-      );
+      const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
       if (!historyResult.success) {
         const historyError =
           typeof historyResult.error === "string"
@@ -10475,10 +10461,38 @@ export class AgentSession {
         throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
       }
 
-      if (newestVisible === undefined) {
+      if (historyResult.data.length === 0) {
         return false;
       }
-      summaryMessage = newestVisible;
+      summaryMessage = historyResult.data[0];
+
+      // Model-hidden records (plan-review resolve/reopen/snapshot rows) appended after the
+      // summary are UI state and must not hide it: only then, scan newest-first to the newest
+      // visible row (the common case keeps the single-row read above).
+      if (isModelHiddenMessage(summaryMessage)) {
+        let newestVisible: MuxMessage | undefined;
+        const scanned = await this.historyService.iterateFullHistory(
+          this.workspaceId,
+          "backward",
+          (chunk) => {
+            for (const message of chunk) {
+              if (isModelHiddenMessage(message)) continue;
+              newestVisible = message;
+              return false;
+            }
+            return true;
+          }
+        );
+        if (!scanned.success) {
+          throw new Error(
+            `Failed to read history for startup follow-up recovery: ${scanned.error}`
+          );
+        }
+        if (newestVisible === undefined) {
+          return false;
+        }
+        summaryMessage = newestVisible;
+      }
 
       // RLM keep-recent floor: preserved-tail copies sit after the boundary,
       // so "compaction just completed" means the epoch is exactly
