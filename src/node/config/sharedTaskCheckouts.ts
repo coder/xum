@@ -1,11 +1,12 @@
 import type { ProjectConfig, Workspace } from "@/common/types/project";
 
 /**
- * Shared tasks borrow their nearest non-shared ancestor's checkout. Deriving on load follows owner
- * renames and heals entries persisted before one without a migration; deriving on save keeps
- * config.json correct for older builds.
+ * Shared tasks borrow their nearest non-shared ancestor's checkout, so their path follows the
+ * owner's current path. taskTrunkBranch keeps its spawn-time value because a workspace rename does
+ * not always rename the branch (SSH moves only the directory). Returns whether any path changed so
+ * load can persist the repair for older builds.
  */
-export function deriveSharedTaskCheckouts(projects: Map<string, ProjectConfig>): void {
+export function deriveSharedTaskCheckouts(projects: Map<string, ProjectConfig>): boolean {
   const workspacesById = new Map<string, Workspace>();
   for (const projectConfig of projects.values()) {
     for (const workspace of projectConfig.workspaces) {
@@ -15,24 +16,22 @@ export function deriveSharedTaskCheckouts(projects: Map<string, ProjectConfig>):
     }
   }
 
+  let changed = false;
   for (const projectConfig of projects.values()) {
     for (const workspace of projectConfig.workspaces) {
       if (workspace.taskIsolation !== "none" || !workspace.parentWorkspaceId) {
         continue;
       }
-      const owner = findCheckoutOwner(workspace, workspacesById);
-      if (!owner) {
+      const ownerPath = findCheckoutOwner(workspace, workspacesById)?.path;
+      // Paths are not schema-validated; ignore invalid persisted owner values.
+      if (typeof ownerPath !== "string" || ownerPath.length === 0 || ownerPath === workspace.path) {
         continue;
       }
-      // Path and name are not schema-validated; ignore invalid persisted owner values.
-      if (typeof owner.path === "string" && owner.path.length > 0) {
-        workspace.path = owner.path;
-      }
-      if (typeof owner.name === "string" && owner.name.length > 0) {
-        workspace.taskTrunkBranch = owner.name;
-      }
+      workspace.path = ownerPath;
+      changed = true;
     }
   }
+  return changed;
 }
 
 function findCheckoutOwner(

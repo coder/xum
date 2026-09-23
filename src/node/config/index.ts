@@ -1832,7 +1832,9 @@ export class Config {
       configModified = true;
     }
 
-    deriveSharedTaskCheckouts(projectsMap);
+    if (deriveSharedTaskCheckouts(projectsMap)) {
+      configModified = true;
+    }
 
     // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
     // rewrite the previous false/missing default before TaskService startup can create durable

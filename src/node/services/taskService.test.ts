@@ -6969,7 +6969,6 @@ describe("TaskService", () => {
     expect(config.findWorkspace(childTaskId)?.workspacePath).toBe(renamedPath);
     const metadata = await config.getWorkspaceMetadataById(childTaskId);
     assert(metadata, "Expected child metadata");
-    expect(metadata.taskTrunkBranch).toBe("renamed");
     const { runtime: streamRuntime } = createRuntimeContextForWorkspace({
       ...metadata,
       namedWorkspacePath: config.findWorkspace(childTaskId)?.workspacePath,
@@ -6977,35 +6976,44 @@ describe("TaskService", () => {
     expect(await streamRuntime.ensureReady()).toEqual({ ready: true });
   }, 20_000);
 
-  test("reawakening a child whose host-local checkout is gone fails without starting a turn", async () => {
-    const { config, parentId, childTaskId, parentPath } = await setUpSharedChild();
-    await fsPromises.rm(parentPath, { recursive: true, force: true });
+  test.each([
+    ["a worktree runtime", { taskStatus: "reported" }],
+    ["no persisted runtime (legacy default)", { taskStatus: "reported", runtimeConfig: undefined }],
+  ] satisfies Array<[string, Partial<WorkspaceConfigEntry>]>)(
+    "reawakening a child whose host-local checkout is gone fails without starting a turn (%s)",
+    async (_label, childFields) => {
+      const { config, parentId, childTaskId, parentPath } = await setUpSharedChild(childFields);
+      await fsPromises.rm(parentPath, { recursive: true, force: true });
 
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const result = await taskService.sendMessageToDescendantAgentTask(
-      parentId,
-      childTaskId,
-      "Follow up",
-      "tool-end",
-      {
-        preTurnMessages: [
-          createMuxMessage("pre-turn-row", "assistant", "Family note", { timestamp: Date.now() }),
-        ],
-      }
-    );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const result = await taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childTaskId,
+        "Follow up",
+        "tool-end",
+        {
+          preTurnMessages: [
+            createMuxMessage("pre-turn-row", "assistant", "Family note", { timestamp: Date.now() }),
+          ],
+        }
+      );
 
-    expect(result.success).toBe(false);
-    assert(!result.success, "Expected reawaken to fail");
-    expect(result.error.code).toBe("send_failed");
-    expect(sendMessage).not.toHaveBeenCalled();
-    const turns = await (
-      taskService as unknown as { taskHandleStore: TaskHandleStore }
-    ).taskHandleStore.listWorkspaceTurns(parentId);
-    expect(turns).toEqual([]);
-    const history = await historyService.getHistoryFromLatestBoundary(childTaskId);
-    expect(history).toEqual(Ok([]));
-  }, 20_000);
+      expect(result.success).toBe(false);
+      assert(!result.success, "Expected reawaken to fail");
+      expect(result.error.code).toBe("send_failed");
+      expect(sendMessage).not.toHaveBeenCalled();
+      const turns = await (
+        taskService as unknown as { taskHandleStore: TaskHandleStore }
+      ).taskHandleStore.listWorkspaceTurns(parentId);
+      expect(turns).toEqual([]);
+      const history = await historyService.getHistoryFromLatestBoundary(childTaskId);
+      expect(history).toEqual(Ok([]));
+    },
+    20_000
+  );
 
   test("dequeued isolation: none task reuses the parent checkout without forking or init", async () => {
     const config = await createTestConfig(rootDir);
@@ -15515,6 +15523,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
@@ -15967,6 +15976,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
@@ -31657,6 +31667,7 @@ describe("TaskService", () => {
           archivedAt: "2026-08-03T00:00:00.000Z",
         }),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId: intermediateTaskId,
           taskStatus: "reported",
           archivedAt: "2026-08-03T00:00:00.000Z",
@@ -31711,6 +31722,7 @@ describe("TaskService", () => {
           taskStatus: "running",
         }),
         projectWorkspace(projectPath, "settled-child", settledChildId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           taskStatus: "reported",
           title: "React lifecycle expert",
@@ -31757,6 +31769,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           taskStatus: "reported",
           reportedAt: "2026-09-09T17:44:35.884Z",
@@ -31846,6 +31859,7 @@ describe("TaskService", () => {
           taskStatus: "running",
         }),
         projectWorkspace(projectPath, "reawakened-child", reawakenedChildId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           taskStatus: "reported",
         }),
@@ -31891,6 +31905,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
@@ -32017,6 +32032,7 @@ describe("TaskService", () => {
         assert(project);
         project.workspaces.push(
           projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
             parentWorkspaceId: parentId,
             agentId: "explore",
             agentType: "explore",
@@ -32166,6 +32182,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
@@ -32225,6 +32242,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "exec",
           agentType: "exec",
@@ -32346,6 +32364,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
@@ -32440,6 +32459,7 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",

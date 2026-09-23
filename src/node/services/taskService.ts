@@ -1551,15 +1551,12 @@ async function getMissingHostLocalCheckoutError(entry: {
 }): Promise<string | null> {
   const { workspace } = entry;
   const name = coerceNonEmptyString(workspace.name);
-  if (
-    name == null ||
-    !isWorktreeRuntime(workspace.runtimeConfig) ||
-    (workspace.projects?.length ?? 0) > 1
-  ) {
+  const runtimeConfig = workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+  if (name == null || !isWorktreeRuntime(runtimeConfig) || (workspace.projects?.length ?? 0) > 1) {
     return null;
   }
   const runtime = createRuntimeForWorkspace({
-    runtimeConfig: workspace.runtimeConfig,
+    runtimeConfig,
     projectPath: entry.projectPath,
     name,
     namedWorkspacePath: coerceNonEmptyString(workspace.path),

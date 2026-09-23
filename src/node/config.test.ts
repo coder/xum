@@ -3089,8 +3089,25 @@ describe("Config", () => {
     function writeWorkspaces(workspaces: Array<Record<string, unknown>>): void {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
-        JSON.stringify({ projects: [[projectPath, { workspaces }]] })
+        JSON.stringify({
+          projects: [[projectPath, { workspaces }]],
+          // Other load-time migrations are done, so only the shared-checkout repair can write.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: {
+            persistentSubagentsDefaulted: true,
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+            daybreakModelsHidden: true,
+          },
+        })
       );
+    }
+
+    function readPersistedWorkspace(id: string): Record<string, unknown> | undefined {
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+      };
+      return persisted.projects[0]?.[1].workspaces.find((ws) => ws.id === id);
     }
 
     function sharedTask(id: string, parentWorkspaceId: string): Record<string, unknown> {
@@ -3104,7 +3121,7 @@ describe("Config", () => {
       };
     }
 
-    it("resolve nested shared children to the owner's current checkout and branch", async () => {
+    it("resolve nested shared children to the owner's current checkout", async () => {
       writeWorkspaces([
         { id: "owner", name: "renamed", path: ownerPath },
         sharedTask("child", "owner"),
@@ -3125,10 +3142,26 @@ describe("Config", () => {
       for (const id of ["child", "grandchild"]) {
         expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(ownerPath);
         expect(metadataById.get(id)?.namedWorkspacePath).toBe(ownerPath);
-        expect(metadataById.get(id)?.taskTrunkBranch).toBe("renamed");
+        expect(metadataById.get(id)?.taskTrunkBranch).toBe("original");
       }
       expect(freshConfig.findWorkspace("forked")?.workspacePath).toBe("/fake/src/project/forked");
-      expect(metadataById.get("forked")?.taskTrunkBranch).toBe("original");
+    });
+
+    it("persist healed shared-child paths on load without another write", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+      freshConfig.loadConfigOrDefault();
+
+      let childOnDisk: Record<string, unknown> | undefined;
+      // Edits run in order: this sees disk after load's queued repair, before this edit writes.
+      await freshConfig.editConfig((cfg) => {
+        childOnDisk = readPersistedWorkspace("child");
+        return cfg;
+      });
+      expect(childOnDisk?.path).toBe(ownerPath);
     });
 
     it("persist the owner's new checkout for shared children when a write moves the owner", async () => {
@@ -3146,11 +3179,10 @@ describe("Config", () => {
         return cfg;
       });
 
-      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
-      };
-      const child = persisted.projects[0]?.[1].workspaces.find((ws) => ws.id === "child");
-      expect(child).toMatchObject({ path: ownerPath, taskTrunkBranch: "renamed" });
+      expect(readPersistedWorkspace("child")).toMatchObject({
+        path: ownerPath,
+        taskTrunkBranch: "original",
+      });
     });
 
     it("keep persisted values when the owner chain is broken or cyclic", () => {
@@ -3164,12 +3196,6 @@ describe("Config", () => {
       for (const id of ["orphan", "cycle-a", "cycle-b"]) {
         expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(staleOwnerPath);
       }
-      const workspaces = freshConfig.loadConfigOrDefault().projects.get(projectPath)?.workspaces;
-      expect(workspaces?.map((workspace) => workspace.taskTrunkBranch)).toEqual([
-        "original",
-        "original",
-        "original",
-      ]);
     });
   });
 
