@@ -8,6 +8,8 @@
 // sets no per-call model, so pass --evaluation-model unless a default is
 // persisted; --model sets the labeling agent's model (else the CLI default).
 // The review label must already exist: --add-label does not create labels.
+// The evaluator needs an OpenAI API-key route (with stored Codex OAuth, set
+// codexOauthDefaultAuth: "apiKey" on the openai provider).
 //   REPO="owner/repo"; N=123
 //   gh label create needs-human-review -R "$REPO" --force   # once per repository
 //   gh issue view "$N" -R "$REPO" --json title,body \
