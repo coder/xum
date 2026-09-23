@@ -200,34 +200,31 @@ export function ModelsSection() {
   // Shared by typed IDs and discovered suggestions.
   // Returns whether the model was added so the text path only clears its
   // input on success (a rejected duplicate keeps the typed ID visible).
-  const addModel = useCallback(
-    (provider: string, modelId: string): boolean => {
-      if (!config) return false;
+  const addModel = (provider: string, modelId: string): boolean => {
+    if (!config) return false;
 
-      // mux-gateway is a routing layer, not a provider users should add models under.
-      if (HIDDEN_PROVIDERS.has(provider)) {
-        setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
-        return false;
-      }
+    // mux-gateway is a routing layer, not a provider users should add models under.
+    if (HIDDEN_PROVIDERS.has(provider)) {
+      setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
+      return false;
+    }
 
-      // Check for duplicates
-      if (modelExists(provider, modelId)) {
-        setError(`Model "${modelId}" already exists for this provider`);
-        return false;
-      }
+    // Check for duplicates
+    if (modelExists(provider, modelId)) {
+      setError(`Model "${modelId}" already exists for this provider`);
+      return false;
+    }
 
-      if (!api) return false;
-      setError(null);
+    if (!api) return false;
+    setError(null);
 
-      // Optimistic update - returns new models array for API call
-      const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
+    // Optimistic update - returns new models array for API call
+    const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
 
-      // Save in background
-      void api.providers.setModels({ provider, models: updatedModels });
-      return true;
-    },
-    [api, config, modelExists, updateModelsOptimistically]
-  );
+    // Save in background
+    void api.providers.setModels({ provider, models: updatedModels });
+    return true;
+  };
 
   const handleAddModel = (modelId = newModelId) => {
     const trimmedModelId = modelId.trim();
