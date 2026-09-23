@@ -56,7 +56,8 @@ describe("real MCP identity negotiation", () => {
         );
         expect(output).toMatchObject({ content: [{ type: "text", text: "fixture answer" }] });
         expect(JSON.stringify(output)).not.toContain("io.modelcontextprotocol/serverInfo");
-        expect(JSON.stringify(output)).toContain("preserved");
+        // Unrelated protocol _meta is dropped too.
+        expect(JSON.stringify(output)).not.toContain("preserved");
         const snapshot = registry.take(scope, "probe");
         if (mode === "plain") {
           expect(snapshot).toBeUndefined();

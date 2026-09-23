@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { convertToModelMessages, dynamicTool, jsonSchema, type Tool } from "ai";
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { MCP_TOOL_RESULT_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import type { MCPConnectionRef } from "@/common/types/mcp";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { Config } from "@/node/config";
@@ -19,7 +20,7 @@ const displayKey = "io.modelcontextprotocol/serverInfo";
 const identity = { name: "server-display-only", version: "1.0" };
 
 describe("MCP display metadata boundary", () => {
-  test("excludes only standard display metadata from new output and provider replay", async () => {
+  test("excludes protocol metadata from new output and provider replay", async () => {
     const raw = {
       content: [{ type: "text", text: "The tool answer" }],
       _meta: { [displayKey]: identity, unrelated: { cursor: "page-2" } },
@@ -34,10 +35,7 @@ describe("MCP display metadata boundary", () => {
       {},
       { toolCallId: "call", messages: [], context: undefined }
     );
-    expect(output).toEqual({
-      content: raw.content,
-      _meta: { unrelated: { cursor: "page-2" } },
-    });
+    expect(output).toEqual({ content: raw.content });
     // A display snapshot belongs on the part root, never inside output: the SDK
     // ignores host-only part fields, but replays every byte of a JSON output.
     const messages = [
@@ -60,12 +58,42 @@ describe("MCP display metadata boundary", () => {
     const replay = JSON.stringify(await convertToModelMessages(messages));
     expect(replay).not.toContain(identity.name);
     expect(replay).toContain("The tool answer");
-    expect(replay).toContain("page-2");
+    expect(replay).not.toContain("page-2");
     expect(raw._meta[displayKey]).toEqual(identity);
 
     // No migration: conversion of pre-existing output retains its old payload.
     messages[0].parts[0].output = raw;
-    expect(JSON.stringify(await convertToModelMessages(messages))).toContain(identity.name);
+    const legacyReplay = JSON.stringify(await convertToModelMessages(messages));
+    expect(legacyReplay).toContain(identity.name);
+    expect(legacyReplay).toContain("page-2");
+  });
+
+  test("oversized protocol metadata does not flatten small useful content", async () => {
+    const pad = "m".repeat(MCP_TOOL_RESULT_MAX_TOTAL_BYTES + 10_000);
+    const tools = wrapMCPTools({
+      search: dynamicTool({
+        inputSchema: jsonSchema({ type: "object" }),
+        execute: () => ({
+          content: [
+            { type: "text", text: "short useful text", _meta: { pad } },
+            { type: "resource", resource: { uri: "x://r", text: "resource text", _meta: { pad } } },
+          ],
+          _meta: { [displayKey]: identity, pad },
+        }),
+      }),
+    });
+    const output: unknown = await tools.search.execute!(
+      {},
+      { toolCallId: "call", messages: [], context: undefined }
+    );
+    // Exact shape: parts keep their types (no stringified flatten) and no
+    // omission notice is appended.
+    expect(output).toEqual({
+      content: [
+        { type: "text", text: "short useful text" },
+        { type: "resource", resource: { uri: "x://r", text: "resource text" } },
+      ],
+    });
   });
 
   test.each([null, "not-an-object", { content: [] }, { _meta: ["invalid"] }])(

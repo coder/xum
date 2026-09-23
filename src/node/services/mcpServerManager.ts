@@ -60,6 +60,7 @@ import {
 } from "@/node/services/mcpOauthService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import {
+  omitMCPProtocolMeta,
   transformMCPResult,
   truncateUtf8Bytes,
   type MCPCallToolResult,
@@ -368,8 +369,11 @@ export function wrapMCPTools(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
-          // The standard key is UI-only for newly produced results. Keeping it
-          // in output would also expose it to the model when history is replayed.
+          // Protocol `_meta` is host-only for newly produced results: the
+          // standard key feeds the UI badge, and the rest has no consumer.
+          // Output is replayed verbatim to the model on later turns and counts
+          // toward the size caps, so none of it is kept (existing history is
+          // not migrated).
           const { rest, displayKeyValue } = takeStandardDisplayMeta(result);
           const response = normalizeServerIdentity(displayKeyValue);
           const identity = response?.identity ?? options?.display?.identity;
@@ -396,7 +400,7 @@ export function wrapMCPTools(
               published = display.registry.set(scope, context.toolCallId, snapshot);
             }
           }
-          return transformMCPResult(rest as MCPCallToolResult);
+          return transformMCPResult(omitMCPProtocolMeta(rest) as MCPCallToolResult);
         } catch (error) {
           // A call that throws or hits its deadline produced no result metadata,
           // but the failed part still belongs to a known server: publish the
