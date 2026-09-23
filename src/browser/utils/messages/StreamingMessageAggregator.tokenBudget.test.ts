@@ -328,10 +328,11 @@ describe("token-budget replay", () => {
   });
 
   test.each([true, false])(
-    "response notifications for a live turn follow the flush flag (flush=%s)",
+    "response notifications and unread recency for a live turn follow the flush flag (flush=%s)",
     (flush) => {
       const workspaceId = "workspace-flush-notify";
       const aggregator = new StreamingMessageAggregator(CREATED_AT, workspaceId);
+      const recencyBefore = aggregator.getRecencyTimestamp();
       let completion: Parameters<typeof shouldNotifyOnResponseComplete>[0];
       aggregator.onResponseComplete = (event) => {
         completion = event.completion;
@@ -360,8 +361,10 @@ describe("token-budget replay", () => {
         },
         parts: [{ type: "text", text: "Wrote notes" }],
       });
-      // A resumed flush with no continuation must not notify with output the transcript hides.
+      // A resumed flush with no continuation must not notify with output the transcript hides,
+      // nor bump recency (which would mark the workspace unread with nothing new to read).
       expect(shouldNotifyOnResponseComplete(completion)).toBe(!flush);
+      expect(aggregator.getRecencyTimestamp() === recencyBefore).toBe(flush);
     }
   );
 

@@ -2292,8 +2292,10 @@ export class StreamingMessageAggregator {
       const completedAt = isFinal ? Date.now() : null;
 
       // Recency policy: only non-compaction final streams inflate lastResponseCompletedAt.
-      // Compaction recency comes from the compacted summary's own timestamp.
-      if (completedAt !== null && !activeStream.isCompacting) {
+      // Compaction recency comes from the compacted summary's own timestamp. A hidden
+      // token-budget flush adds no visible row, so it must not mark the workspace unread.
+      const isHiddenFlushTurn = message?.metadata?.muxMetadata?.contextBudgetFlush === true;
+      if (completedAt !== null && !activeStream.isCompacting && !isHiddenFlushTurn) {
         this.lastResponseCompletedAt = completedAt;
       }
 
