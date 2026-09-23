@@ -971,6 +971,21 @@ interface WorkspaceStopRecord {
   /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
   capturedStreamMessageId: string | undefined;
 }
+/**
+ * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
+ * publication, recovery, terminal failure, resume rollback). Evaluated inside the write's own
+ * editWorkspaceEntry transform: true when the caller captured an attempt and the row now names
+ * another one — another writer (e.g. a second backend) re-admitted it, so the row is theirs and
+ * the write is abandoned. A write with no captured attempt (legacy/pre-identity) is never held
+ * back, which keeps today's behavior for it.
+ */
+function rowSupersedes(
+  row: Pick<WorkspaceConfigEntry, "taskAttemptId"> | undefined,
+  expectedAttemptId: string | undefined
+): boolean {
+  return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
+}
+
 function toAgentTaskReport(source: AgentTaskReport): AgentTaskReport {
   return {
     reportMarkdown: source.reportMarkdown,
@@ -13832,15 +13847,21 @@ export class TaskService implements AgentTaskIntegration {
   private async setTaskStatus(
     workspaceId: string,
     status: AgentTaskStatus,
-    options?: { onlyFromStatus?: AgentTaskStatus }
+    options?: {
+      onlyFromStatus?: AgentTaskStatus;
+      /** Write only while the row still names this attempt (see rowSupersedes). */
+      expectedAttemptId?: string;
+    }
   ): Promise<boolean> {
     assert(workspaceId.length > 0, "setTaskStatus: workspaceId must be non-empty");
 
     let written = false;
     const update = (workspace: WorkspaceConfigEntry) => {
+      written = false;
       if (options?.onlyFromStatus != null && workspace.taskStatus !== options.onlyFromStatus) {
         return;
       }
+      if (rowSupersedes(workspace, options?.expectedAttemptId)) return;
       written = true;
       workspace.taskStatus = status;
       if (status === "running") {
@@ -14199,6 +14220,12 @@ export class TaskService implements AgentTaskIntegration {
        * a fence the prompt is a same-attempt continuation bound at the handoff.
        */
       fence?: { turnAdmission: TurnAdmissionToken; attemptId: string };
+      /**
+       * Unfenced: the attempt the caller decided this prompt for (a stream end's attempt). Its
+       * budget write and a recovery-limit failure are CAS'd on it (see rowSupersedes); a row
+       * another writer re-admitted meanwhile gets no write and no prompt.
+       */
+      expectedAttemptId?: string;
     }
   ): Promise<boolean> {
     assert(
@@ -14282,7 +14309,9 @@ export class TaskService implements AgentTaskIntegration {
             errorType: "task_recovery_limit",
             errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
           },
-          fence != null ? { expectedAttemptId: fence.attemptId } : undefined
+          (fence?.attemptId ?? options?.expectedAttemptId) != null
+            ? { expectedAttemptId: fence?.attemptId ?? options?.expectedAttemptId }
+            : undefined
         );
         return withoutSend(false);
       }
@@ -14294,7 +14323,10 @@ export class TaskService implements AgentTaskIntegration {
       await this.editWorkspaceEntry(
         workspaceId,
         (ws) => {
-          if (fence != null && ws.taskAttemptId !== fence.attemptId) {
+          if (
+            (fence != null && ws.taskAttemptId !== fence.attemptId) ||
+            rowSupersedes(ws, options?.expectedAttemptId)
+          ) {
             fenceSuperseded = true;
             return;
           }
@@ -14502,19 +14534,20 @@ export class TaskService implements AgentTaskIntegration {
     // attribution snapshot; retaining its receipts would grow the session map on every cut.
     if (!entry?.workspace.parentWorkspaceId) discardCutReceipt();
     if (!entry) return;
-    // An unowned stream whose row another writer re-admitted meanwhile (A → B, e.g. a second
-    // backend): its end is A's alone. Nothing below may run for B — no report publication, status
-    // write or recovery prompt — and A's decision resolves in the listener's finally (its held
-    // entries then meet the stale attempt at their own gates). Ownership stays untouched.
-    if (
-      entry.workspace.parentWorkspaceId &&
-      taskOrigin.ownedAttempt == null &&
-      taskOrigin.unownedAttemptId != null &&
-      this.currentTaskAttemptId(workspaceId, entry.workspace) !== taskOrigin.unownedAttemptId
-    ) {
+    // The attempt this stream ran under, owned or not, captured at the event. A stream whose row
+    // another writer re-admitted meanwhile (A → B, e.g. a second backend) ends A alone: nothing
+    // below may run for B — no report publication, status write or recovery prompt — and A's
+    // decision resolves in the listener's finally (its held entries then meet the stale attempt
+    // at their own gates). Ownership stays untouched. The check is repeated as a CAS by every
+    // status write below (streamAttemptId), since this one precedes the handler's awaits.
+    const streamAttemptId =
+      taskOrigin.ownedAttempt != null
+        ? taskOrigin.ownedAttempt.attemptId
+        : taskOrigin.unownedAttemptId;
+    if (entry.workspace.parentWorkspaceId && rowSupersedes(entry.workspace, streamAttemptId)) {
       log.info("[task-attempt] stream end ignored: its attempt was superseded by another writer", {
         workspaceId,
-        attemptId: taskOrigin.unownedAttemptId,
+        attemptId: streamAttemptId,
         messageId: event.messageId,
       });
       discardCutReceipt();
@@ -14851,6 +14884,7 @@ export class TaskService implements AgentTaskIntegration {
           entry,
           proposePlanResult,
           reportedAttempt: taskOrigin.ownedAttempt,
+          streamAttemptId,
         });
         return;
       }
@@ -14884,7 +14918,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (blockingDescendantTaskIds.length > 0) {
       if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running");
+        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
       }
       return;
     }
@@ -14912,7 +14946,7 @@ export class TaskService implements AgentTaskIntegration {
       );
     if (blockingTaskWorkflowRunIds.length > 0 || blockingWorkspaceTurnIds.length > 0) {
       if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running");
+        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
       }
       await this.promptTaskForBackgroundAwait(workspaceId, {
         taskIds: blockingWorkspaceTurnIds,
@@ -14929,7 +14963,7 @@ export class TaskService implements AgentTaskIntegration {
       activeWorkspaceTurnIds.length > 0
     ) {
       if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running");
+        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
       }
       return;
     }
@@ -14947,7 +14981,7 @@ export class TaskService implements AgentTaskIntegration {
         entry,
         reportArgs,
         taskOrigin.ownedAttempt,
-        taskOrigin.unownedAttemptId
+        streamAttemptId
       );
       if (finalization.finalized) {
         await this.finalizeTerminationPhaseForReportedTask(workspaceId);
@@ -14962,6 +14996,7 @@ export class TaskService implements AgentTaskIntegration {
           entry,
           proposePlanResult,
           reportedAttempt: taskOrigin.ownedAttempt,
+          streamAttemptId,
         });
         return;
       }
@@ -14969,6 +15004,7 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         entry,
         proposePlanResult,
+        streamAttemptId,
       });
       return;
     }
@@ -15002,7 +15038,9 @@ export class TaskService implements AgentTaskIntegration {
           }
         } else {
           if (status === "awaiting_report") {
-            await this.setTaskStatus(workspaceId, "running");
+            await this.setTaskStatus(workspaceId, "running", {
+              expectedAttemptId: streamAttemptId,
+            });
           }
           this.deferredTaskStreamEnds.set(workspaceId, {
             sourceMessageId: event.messageId,
@@ -15018,18 +15056,26 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
 
-    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status);
+    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
   }
 
   private async recoverTaskFromIncompleteStreamEnd(
     workspaceId: string,
-    status: WorkspaceConfigEntry["taskStatus"]
+    status: WorkspaceConfigEntry["taskStatus"],
+    /** The ended stream's attempt: recovery writes are CAS'd on it (see rowSupersedes). */
+    streamAttemptId?: string
   ): Promise<void> {
     if (status !== "awaiting_report") {
-      await this.setTaskStatus(workspaceId, "awaiting_report");
+      await this.setTaskStatus(workspaceId, "awaiting_report", {
+        expectedAttemptId: streamAttemptId,
+      });
     }
 
-    await this.promptTaskForRequiredCompletionTool(workspaceId, { reason: "stream_end" });
+    // The prompt's budget write is CAS'd on the same attempt (a superseded row gets no prompt).
+    await this.promptTaskForRequiredCompletionTool(workspaceId, {
+      reason: "stream_end",
+      expectedAttemptId: streamAttemptId,
+    });
   }
 
   /**
@@ -15622,6 +15668,8 @@ export class TaskService implements AgentTaskIntegration {
     entry: { projectPath: string; workspace: WorkspaceConfigEntry };
     proposePlanResult: { planPath: string };
     reportedAttempt: OwnedTaskAttempt | undefined;
+    /** The ended stream's attempt: every write below is CAS'd on it (see rowSupersedes). */
+    streamAttemptId?: string;
   }): Promise<void> {
     assert(
       args.workspaceId.length > 0,
@@ -15641,6 +15689,8 @@ export class TaskService implements AgentTaskIntegration {
       await this.editWorkspaceEntry(
         args.workspaceId,
         (workspace) => {
+          transitionedToInterrupted = false;
+          if (rowSupersedes(workspace, args.streamAttemptId)) return;
           transitionedToInterrupted = workspace.taskStatus !== "interrupted";
           parentWorkspaceId = workspace.parentWorkspaceId;
           workspace.taskStatus = "interrupted";
@@ -15700,13 +15750,17 @@ export class TaskService implements AgentTaskIntegration {
       await this.editActiveWorkspaceEntry(
         args.workspaceId,
         (workspace) => {
+          if (rowSupersedes(workspace, args.streamAttemptId)) return;
           workspace.taskStatus = "awaiting_report";
           workspace.reportedAt = undefined;
         },
         { allowMissing: true }
       );
       await this.emitWorkspaceMetadata(args.workspaceId);
-      await this.promptTaskForRequiredCompletionTool(args.workspaceId, { reason: "stream_end" });
+      await this.promptTaskForRequiredCompletionTool(args.workspaceId, {
+        reason: "stream_end",
+        expectedAttemptId: args.streamAttemptId,
+      });
       return;
     }
 
@@ -15718,7 +15772,8 @@ export class TaskService implements AgentTaskIntegration {
         title: "Proposed plan",
         planFilePath: planSummary.path,
       },
-      args.reportedAttempt
+      args.reportedAttempt,
+      args.streamAttemptId
     );
     if (finalization.finalized) {
       await this.finalizeTerminationPhaseForReportedTask(args.workspaceId);
@@ -15731,6 +15786,8 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string;
     entry: { projectPath: string; workspace: WorkspaceConfigEntry };
     proposePlanResult: { planPath: string };
+    /** The ended stream's attempt: the handoff's writes are CAS'd on it (see rowSupersedes). */
+    streamAttemptId?: string;
   }): Promise<void> {
     assert(
       args.workspaceId.length > 0,
@@ -15828,7 +15885,10 @@ export class TaskService implements AgentTaskIntegration {
           },
         });
 
+      let handoffSuperseded = false;
       await this.editWorkspaceEntry(args.workspaceId, (workspace) => {
+        handoffSuperseded = rowSupersedes(workspace, args.streamAttemptId);
+        if (handoffSuperseded) return;
         workspace.agentId = targetAgentId;
         workspace.agentType = targetAgentId;
         workspace.aiSettings = {
@@ -15843,8 +15903,12 @@ export class TaskService implements AgentTaskIntegration {
         // whatever the plan phase consumed.
         delete workspace.taskRecoveryAttempts;
       });
+      // Another writer re-admitted the row meanwhile: the handoff belongs to its attempt now.
+      if (handoffSuperseded) return;
 
-      await this.setTaskStatus(args.workspaceId, "running");
+      await this.setTaskStatus(args.workspaceId, "running", {
+        expectedAttemptId: args.streamAttemptId,
+      });
 
       try {
         // Admission classification: plan→exec kickoff continues the owned attempt (no rotation);
@@ -16328,11 +16392,12 @@ export class TaskService implements AgentTaskIntegration {
     /** The attempt whose stream carried this report (see releaseReportedTaskAttempt). */
     reportedAttempt: OwnedTaskAttempt | undefined,
     /**
-     * Without an owner: the attempt the reporting stream was admitted under
-     * (streamAttemptIdWithoutOwner). The publication is a CAS on it — a row another writer
-     * re-admitted meanwhile is theirs, and this report is never published as theirs.
+     * The attempt the reporting stream ran under (owned, or for an unowned stream the one it was
+     * admitted under — streamAttemptIdWithoutOwner). The report's writes are CAS'd on it — a row
+     * another writer re-admitted meanwhile is theirs, and this report is never published as
+     * theirs. Callers without a captured attempt keep today's unconditional writes.
      */
-    unownedReportedAttemptId?: string
+    reportedAttemptId?: string
   ): Promise<AgentReportFinalizationResult> {
     this.markTaskForegroundRelevant(childWorkspaceId);
 
@@ -16391,6 +16456,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.editActiveWorkspaceEntry(
         childWorkspaceId,
         (ws) => {
+          if (rowSupersedes(ws, reportedAttemptId)) return;
           ws.taskStatus = "awaiting_report";
           ws.reportedAt = undefined;
         },
@@ -16401,6 +16467,7 @@ export class TaskService implements AgentTaskIntegration {
         reason: "error",
         error: { error: validationMessage, errorType: "unknown" },
         structuredOutputDiagnostic: validationMessage,
+        expectedAttemptId: reportedAttemptId,
       });
       return {
         finalized: false,
@@ -16426,7 +16493,7 @@ export class TaskService implements AgentTaskIntegration {
         latestEntryBeforeReport,
         reportArgs,
         reportedAttempt,
-        reportedAttempt == null ? unownedReportedAttemptId : undefined
+        reportedAttemptId
       );
     const published =
       bestOfParentWorkspaceId != null
@@ -16578,8 +16645,8 @@ export class TaskService implements AgentTaskIntegration {
       planFilePath?: string;
     },
     reportedAttempt: OwnedTaskAttempt | undefined,
-    /** See finalizeAgentTaskReport: the unowned stream's admitted attempt (CAS on the row). */
-    expectedUnownedAttemptId?: string
+    /** See finalizeAgentTaskReport: the reporting stream's attempt (CAS on the row). */
+    expectedAttemptId?: string
   ): Promise<
     | {
         parentWorkspaceId: string;
@@ -16596,15 +16663,14 @@ export class TaskService implements AgentTaskIntegration {
     // admitted under when the caller knows it, else by the row as read before this report.
     const unownedReportedAttemptId =
       reportedAttempt == null
-        ? (expectedUnownedAttemptId ?? latestEntryBeforeReport?.workspace.taskAttemptId)
+        ? (expectedAttemptId ?? latestEntryBeforeReport?.workspace.taskAttemptId)
         : undefined;
     let superseded = false;
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
       (ws) => {
-        superseded =
-          expectedUnownedAttemptId != null && ws.taskAttemptId !== expectedUnownedAttemptId;
+        superseded = rowSupersedes(ws, expectedAttemptId);
         if (superseded) return;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
@@ -16618,14 +16684,18 @@ export class TaskService implements AgentTaskIntegration {
         "[task-attempt] report not published: its attempt was superseded by another writer",
         {
           childWorkspaceId,
-          attemptId: expectedUnownedAttemptId,
+          attemptId: expectedAttemptId,
         }
       );
       // Never a continuation of the reporting attempt; its held entries are refused (they also
       // read stale at their own gates, since the row names another attempt).
       this.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(childWorkspaceId, undefined, expectedUnownedAttemptId),
+        this.findPendingStreamEndDecision(
+          childWorkspaceId,
+          reportedAttempt,
+          unownedReportedAttemptId
+        ),
         "indeterminate"
       );
       return "superseded";

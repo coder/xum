@@ -1188,4 +1188,78 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+  test.each(["before its stream ends", "during the report publication write"] as const)(
+    "an OWNED attempt whose row another backend re-admitted %s: its stream end never publishes its report as the successor's",
+    async (when) => {
+      const childId = when.startsWith("before") ? "holdowned001" : "holdowned002";
+      const foreign = when.startsWith("before") ? "att_00000000000000c1" : "att_00000000000000c2";
+      const stack = await createStack(childId);
+      const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+      const otherBackend = await createTestConfig(rootDir);
+      const rotate = () =>
+        otherBackend.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const ws = project.workspaces.find((w) => w.id === childId);
+            if (ws) {
+              ws.taskStatus = "running";
+              ws.taskAttemptId = foreign;
+              ws.taskAttemptUnproven = true;
+            }
+          }
+          return cfg;
+        });
+      try {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        const attemptA = entryOf(config, childId)!.taskAttemptId!;
+        expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+        expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        expect(completions).toHaveLength(1);
+        let rotated = false;
+        if (when.startsWith("before")) {
+          await rotate();
+          rotated = true;
+        } else {
+          // B re-admits the row right before the publication's status write.
+          const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+          spyOn(taskService, "editWorkspaceEntry").mockImplementation(
+            async (id, updater, options) => {
+              const probe = structuredClone(entryOf(config, childId));
+              if (id === childId && !rotated && probe != null) {
+                updater(probe, config.loadConfigOrDefault());
+                if (probe.taskStatus === "reported") {
+                  rotated = true;
+                  await rotate();
+                }
+              }
+              return editOriginal(id, updater, options);
+            }
+          );
+        }
+        stack.endStream(0, { report: "done by A" }, true);
+        await until(() => rotated, "the rotation");
+        await until(
+          () =>
+            !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some(
+              (decision) => decision.outcome === "pending"
+            ),
+          "the decision resolved"
+        );
+        await yieldMacrotasks(20);
+        expect(entryOf(config, childId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: foreign,
+          taskAttemptUnproven: true,
+        });
+        expect(entryOf(config, childId)?.reportedAt).toBeUndefined();
+        expect(
+          await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
+        ).toBeNull();
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
 });
