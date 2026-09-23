@@ -15,6 +15,7 @@ import { HistoryService } from "@/node/services/historyService";
 import type { MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
 import { TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
+import { prepareExistingTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
 
 function extractText(message: MuxMessage): string {
   return message.parts
@@ -32,6 +33,36 @@ function findWorkspace(
   return Array.from(env.config.loadConfigOrDefault().projects.values())
     .flatMap((project) => project.workspaces)
     .find((workspace) => workspace.id === workspaceId);
+}
+
+/**
+ * Fixture setup: publishes `metadata` as a sub-agent task row carrying the proof a producer would
+ * have published. The test-owned checkout createWorkspace already materialized is claimed and
+ * bound, then the proof is written onto the row (it is server-owned, so addWorkspace never takes
+ * it from metadata). This models the proof only, not the producer's prune and atomic publication.
+ * Without it the row reads as a pre-preparation checkout, which every task send, resume and
+ * reactivation refuses by design.
+ */
+async function addPreparedTaskRow(
+  env: TestEnvironment,
+  projectPath: string,
+  metadata: Parameters<TestEnvironment["config"]["addWorkspace"]>[1]
+): Promise<void> {
+  const workspacePath = metadata.namedWorkspacePath;
+  if (workspacePath == null) throw new Error(`Task fixture ${metadata.id} has no checkout path`);
+  const proof = await prepareExistingTaskCheckout({
+    workspacePath,
+    runtimeConfig: metadata.runtimeConfig,
+  });
+  await env.config.addWorkspace(projectPath, metadata);
+  await env.config.editConfig((config) => {
+    const row = Array.from(config.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === metadata.id);
+    if (!row) throw new Error(`Task fixture ${metadata.id} was not registered`);
+    row.taskCheckoutPreparation = proof;
+    return config;
+  });
 }
 
 describe("Persistent sub-agent compaction", () => {
@@ -79,7 +110,7 @@ describe("Persistent sub-agent compaction", () => {
       if (!child.success) throw new Error(child.error);
       const childId = child.metadata.id;
       workspaceIds.push(childId);
-      await env.config.addWorkspace(repoPath, {
+      await addPreparedTaskRow(env, repoPath, {
         ...child.metadata,
         parentWorkspaceId: parentId,
         agentId: "explore",
@@ -180,7 +211,7 @@ describe("Persistent sub-agent compaction", () => {
       if (!child.success) throw new Error(child.error);
       const childId = child.metadata.id;
       workspaceIds.push(childId);
-      await env.config.addWorkspace(repoPath, {
+      await addPreparedTaskRow(env, repoPath, {
         ...child.metadata,
         parentWorkspaceId: parentId,
         agentId: "explore",
@@ -297,7 +328,7 @@ describe("Persistent sub-agent compaction", () => {
     const childId = child.metadata.id;
     workspaceIds.push(childId);
     const reportedAt = "2026-08-10T12:00:00.000Z";
-    await env.config.addWorkspace(repoPath, {
+    await addPreparedTaskRow(env, repoPath, {
       ...child.metadata,
       parentWorkspaceId: parentId,
       agentId: "explore",
@@ -457,7 +488,7 @@ describe("Persistent sub-agent compaction", () => {
     }
 
     const reportedAt = "2026-08-10T12:00:00.000Z";
-    await env.config.addWorkspace(repoPath, {
+    await addPreparedTaskRow(env, repoPath, {
       ...childResult.metadata,
       parentWorkspaceId,
       agentId: "explore",

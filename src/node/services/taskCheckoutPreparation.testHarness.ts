@@ -27,14 +27,32 @@ export async function prepareDedicatedTaskCheckout(args: {
     cwd: args.projectPath,
     stdio: "ignore",
   });
+  return await prepareExistingTaskCheckout({
+    workspacePath: args.checkout,
+    runtimeConfig: args.runtimeConfig,
+  });
+}
+
+/**
+ * Fixture preparation for an ALREADY materialized, test-owned, known-clean dedicated worktree
+ * checkout: claims and binds its identity and returns the proof. It does not exercise the full
+ * producer protocol (no plugin-override prune, no registration-lock publication); it only models
+ * the proof a producer would have published. The proof is server-owned (Config.addWorkspace never
+ * takes it from metadata), so the caller writes it onto the row it models, with the same `path`
+ * and `runtimeConfig`, before any tested admission.
+ */
+export async function prepareExistingTaskCheckout(args: {
+  workspacePath: string;
+  runtimeConfig: RuntimeConfig | undefined;
+}): Promise<TaskCheckoutPreparation> {
   const materializationId = newMaterializationId();
   const claimed = await claimTaskCheckoutIdentity(
-    { workspacePath: args.checkout },
+    { workspacePath: args.workspacePath },
     materializationId
   );
   if (claimed instanceof Error) throw claimed;
   const bound = await bindTaskCheckoutIdentity(
-    { workspacePath: args.checkout },
+    { workspacePath: args.workspacePath },
     materializationId,
     claimed
   );
