@@ -3765,6 +3765,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       runtimes: null,
     };
     expect(modelIds()).toEqual([KNOWN_MODELS.OPUS.id]);
+
+    // 6. A policy refresh blocks the client (e.g. a raised minimum version): enforcement
+    // stays on with no effective policy, and runtime checks deny every model. The catalog
+    // must not mistake that for "no policy" and advertise configured models.
+    effectivePolicy = null;
+    expect(modelIds()).toEqual([]);
   });
 });
 

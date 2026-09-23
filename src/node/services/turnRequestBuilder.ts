@@ -2467,13 +2467,21 @@ export class TurnRequestBuilder {
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
         const policy = this.dependencies.policyService;
+        const enforced = policy?.isEnforced() === true;
+        const effectivePolicy = enforced ? (policy?.getEffectivePolicy() ?? null) : null;
+        // Enforcement without an effective policy is the "blocked" state, where
+        // PolicyService denies every model. Shared filtering reads a null policy as
+        // "unenforced", so advertise nothing rather than every configured model.
+        if (enforced && effectivePolicy == null) {
+          return [];
+        }
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
             hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
-            effectivePolicy: policy?.isEnforced() ? policy.getEffectivePolicy() : null,
+            effectivePolicy,
           },
           (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
         );
