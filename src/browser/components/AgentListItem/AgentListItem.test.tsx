@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealAPIModule from "@/browser/contexts/API";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
