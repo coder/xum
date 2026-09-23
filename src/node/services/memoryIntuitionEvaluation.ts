@@ -17,16 +17,28 @@ const BLOCK_BOUNDARY = /\r?\n[ \t]*\r?\n|\r?\n(?=(?:[-*+]|\d+[.)])[ \t])/u;
 const HEADING_ONLY = /^#{1,6}[ \t][^\n]*$/u;
 
 /**
- * Verbatim chunks of memory text, each at most MEMORY_INTUITION_MAX_EXCERPT_CHARS.
+ * Chunks of memory text, each at most MEMORY_INTUITION_MAX_EXCERPT_CHARS and verbatim
+ * up to whitespace (lone headings join the following block).
  * Long blocks become consecutive windows cut at whitespace, so evidence past the
  * excerpt cap is still reachable instead of being truncated away.
  */
 export function chunkMemoryText(text: string): string[] {
   const chunks: string[] = [];
+  let headings = "";
   for (const part of text.split(BLOCK_BOUNDARY)) {
     let block = part.trim();
-    // A lone heading has no evidence of its own.
-    if (block.length === 0 || HEADING_ONLY.test(block)) continue;
+    if (block.length === 0) continue;
+    // Carry lone headings into the next block so a fact keeps its section context
+    // ("## Alice" + "Lives in Paris"). Only whitespace separated them, so the joined
+    // chunk still matches the source after whitespace normalization.
+    if (HEADING_ONLY.test(block)) {
+      headings = headings ? `${headings}\n\n${block}` : block;
+      continue;
+    }
+    if (headings) {
+      block = `${headings}\n\n${block}`;
+      headings = "";
+    }
     while (block.length > MEMORY_INTUITION_MAX_EXCERPT_CHARS) {
       // Last whitespace inside the window; otherwise hard-cut, keeping surrogate pairs whole.
       let cut = block.slice(0, MEMORY_INTUITION_MAX_EXCERPT_CHARS + 1).search(/\s\S*$/u);
