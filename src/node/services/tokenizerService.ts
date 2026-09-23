@@ -7,6 +7,7 @@ import assert from "@/common/utils/assert";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import { log } from "./log";
 import type { AIService } from "./aiService";
@@ -154,9 +155,15 @@ export class TokenizerService {
     );
 
     const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+    // Plan-review records (snapshots can be tens of thousands of tokens) never reach a provider
+    // request, so they must not count as context. The cache's history identity below still
+    // describes the raw rows, which is what the client compares for freshness.
+    const countedMessages = activeContextMessages.filter(
+      (message) => !isPlanReviewRecordMessage(message)
+    );
 
     const stats = await calculateTokenStats(
-      activeContextMessages,
+      countedMessages,
       model,
       providersConfig,
       getToolAvailabilityOptions({ workspaceId, parentWorkspaceId })

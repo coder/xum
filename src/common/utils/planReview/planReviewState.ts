@@ -292,10 +292,10 @@ export function formatPlanReviewStateBlock(
     "Threads are listed most recent user activity first; each lists the opening comment and the newest replies in order.",
   ];
   if (latest !== undefined) {
-    // Repository-controlled path names are quoted data, not additional system instructions.
-    header.push(
-      `Current plan snapshot: sha256 ${latest.contentHash} (${quoteForBlock(latest.planPath)})`
-    );
+    // Named by content hash only. The persisted path is provenance: a fork copies history, so it
+    // can name another workspace's plan file, and the editable path comes from the plan-mode
+    // instructions. Leaving it out also keeps repository-controlled path text out of this block.
+    header.push(`Current plan snapshot: sha256 ${latest.contentHash}`);
   }
   header.push(`Unresolved threads: ${unresolved.length}`);
   const footer = "</plan-review-state>";

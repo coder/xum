@@ -10,6 +10,11 @@ import * as statsUtils from "@/common/utils/tokens/tokenStatsCalculator";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 
 describe("TokenizerService", () => {
@@ -87,6 +92,60 @@ describe("TokenizerService", () => {
           { id: "msg2", texts: ["World"] },
         ]);
         expect(statsSpy.mock.calls[0][1]).toBe("gpt-4");
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
+    test("leaves plan-review records out of the counted context but not the cache identity", async () => {
+      // A snapshot row carries the whole plan; it is persisted UI state, never sent to a model.
+      const snapshot: PlanReviewRecord = {
+        v: 1,
+        kind: "snapshot",
+        recordId: "rec_snap",
+        snapshotId: "snap_1",
+        planPath: "/plans/p.md",
+        contentHash: "a".repeat(64),
+        content: "# Plan\nstep one\n",
+      };
+      const feedback: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec_fb",
+        feedbackId: "fb_1",
+        snapshotId: "snap_1",
+        contentHash: "a".repeat(64),
+        comments: [
+          { threadId: "t1", anchor: { startLine: 2, endLine: 2 }, quote: "step one", body: "Why?" },
+        ],
+        replies: [],
+      };
+      await seedHistory(
+        createMuxMessage("msg1", "user", "Plan it", { historySequence: 1 }),
+        createMuxMessage("snap", "user", formatPlanReviewEnvelope(snapshot), {
+          historySequence: 2,
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(snapshot),
+        }),
+        createMuxMessage("fb", "user", formatPlanReviewEnvelope(feedback), {
+          historySequence: 3,
+          muxMetadata: buildPlanReviewMetadata(feedback),
+        })
+      );
+      const cached: unknown[] = [];
+      sessionUsageService.setTokenStatsCache = (_workspaceId, cache) => {
+        cached.push(cache);
+        return Promise.resolve();
+      };
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        // Authentic feedback is a real user message and still counts.
+        expect(tokenizedRows(statsSpy).map((row) => row.id)).toEqual(["msg1", "fb"]);
+        // Freshness is compared against the transcript, which still contains the record.
+        expect(cached).toEqual([
+          expect.objectContaining({ history: { messageCount: 3, maxHistorySequence: 3 } }),
+        ]);
       } finally {
         statsSpy.mockRestore();
       }
