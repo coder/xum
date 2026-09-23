@@ -661,6 +661,15 @@ export interface WorkspaceProvisioningHost {
     runtimeConfig: RuntimeConfig | undefined,
     persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
   ): Promise<string | undefined>;
+  /**
+   * Sanitize an UNREGISTERED fresh checkout, then run `publish` (the config write that
+   * registers it) under the same registration lock hold. `Err` means sanitization refused and
+   * nothing was published; see WorkspaceService.registerSanitizedTaskCheckout.
+   */
+  registerSanitizedTaskCheckout<T>(
+    target: { workspacePath: string; runtimeConfig: RuntimeConfig },
+    publish: () => Promise<T>
+  ): Promise<Result<T, string>>;
   discardExtensionMetadataEntry(workspaceId: string): Promise<void>;
   registerExternalBackgroundInit(
     workspaceId: string,

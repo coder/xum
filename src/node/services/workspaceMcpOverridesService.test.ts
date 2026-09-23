@@ -6,6 +6,8 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
   isPositivelyAbsent,
@@ -33,6 +35,9 @@ async function pathExists(filePath: string): Promise<boolean> {
     return false;
   }
 }
+
+/** Test mirror of the service's private PUBLICATION_TIMEOUT_MS (the plugin-prune budget). */
+const PRUNE_BUDGET_MIRROR_MS = 30_000;
 
 describe("WorkspaceMcpOverridesService", () => {
   let tempDir: string;
@@ -4957,6 +4962,348 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(await fs.readFile(filePath, "utf8")).toBe(newerBuildDocument);
     expect(config.loadConfigOrDefault().projects.get(projectPath)!.workspaces[0].mcp).toEqual({
       disabledServers: ["server-a"],
+    });
+  });
+
+  describe("prunePluginOverrideKeysForUnregisteredCheckout", () => {
+    /** The checkout-lock keys one operation acquired, in acquisition order. */
+    function recordCheckoutLockKeys(service: WorkspaceMcpOverridesService): string[] {
+      const internals = service as unknown as {
+        acquireCheckoutLock: (key: string, timeoutMs?: number) => Promise<() => Promise<void>>;
+      };
+      const real = internals.acquireCheckoutLock.bind(service);
+      const keys: string[] = [];
+      spyOn(internals, "acquireCheckoutLock").mockImplementation((key, timeoutMs) => {
+        keys.push(key);
+        return real(key, timeoutMs);
+      });
+      return keys;
+    }
+
+    it("prunes canonical plugin keys from an unregistered checkout, preserves everything else, and bumps the epoch only when it rewrote", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "fresh-worktree");
+      const target = {
+        workspacePath,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      // No document: nothing to prune, no epoch owed by a brand-new identity.
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBeUndefined();
+
+      await fs.writeFile(
+        filePath,
+        `{
+  // tracked by the repository
+  "enabledServers": ["plugin:0123456789abcdef:evil", "ordinary", "plugin:not-canonical"],
+  "toolAllowlist": { "plugin:0123456789abcdef:evil": { "allow": ["x"] }, "ordinary": {} },
+  "futureField": { "kept": true }
+}`,
+        "utf-8"
+      );
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      const pruned = await fs.readFile(filePath, "utf-8");
+      expect(pruned).toContain("// tracked by the repository");
+      expect(JSON.parse(pruned.replace(/^\s*\/\/.*$/m, ""))).toEqual({
+        enabledServers: ["ordinary", "plugin:not-canonical"],
+        toolAllowlist: { ordinary: {} },
+        futureField: { kept: true },
+      });
+      const afterRewrite = await readWorkspaceOverridesEpochToken(config.rootDir);
+      expect(afterRewrite).toBeDefined();
+      // Idempotent, and a pass that rewrites nothing owes no epoch.
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:");
+      expect(await fs.readFile(filePath, "utf-8")).toBe(pruned);
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBe(afterRewrite);
+    });
+
+    it("refuses a document it cannot edit safely without touching it", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "duplicate-props");
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const original = '{"enabledServers": ["plugin:0123456789abcdef:evil"], "enabledServers": []}';
+      await fs.writeFile(filePath, original, "utf-8");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        service.prunePluginOverrideKeysForUnregisteredCheckout(
+          { workspacePath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
+          "plugin:"
+        )
+      ).rejects.toThrow("duplicate");
+      expect(await fs.readFile(filePath, "utf-8")).toBe(original);
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBeUndefined();
+    });
+
+    it("takes exactly the checkout locks a registration of the same physical path takes, so it serializes against that registration's writers", async () => {
+      // The unregistered target is the REAL directory; another process registered the same
+      // directory in place through a symlinked spelling (an older CLI run). A save through
+      // that registration and this prune must contend for one lock.
+      const realDir = path.join(config.srcDir, "unregistered", "shared-checkout");
+      await fs.mkdir(path.join(realDir, ".xum"), { recursive: true });
+      const aliasRoot = path.join(config.rootDir, "alias-root");
+      await fs.symlink(path.join(config.srcDir, "unregistered"), aliasRoot);
+      const aliasPath = path.join(aliasRoot, "shared-checkout");
+      const aliasId = "ws-cli-alias";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(aliasPath, {
+          workspaces: [
+            { path: aliasPath, id: aliasId, name: aliasPath, runtimeConfig: { type: "local" } },
+          ],
+        });
+        return cfg;
+      });
+      const filePath = path.join(realDir, ".xum", "mcp.local.jsonc");
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:evil"] }),
+        "utf-8"
+      );
+
+      // Key identity: derived deterministically from the path, not from any id.
+      const registered = new WorkspaceMcpOverridesService(config);
+      const registeredKeys = recordCheckoutLockKeys(registered);
+      const releaseAlias = await registered.acquireWorkspaceLock(aliasId);
+      const explicit = new WorkspaceMcpOverridesService(config);
+      const explicitKeys = recordCheckoutLockKeys(explicit);
+      const target = {
+        workspacePath: realDir,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      // Contention: the prune cannot complete while the alias registration holds its lock.
+      let pruned = false;
+      const pruning = explicit
+        .prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:")
+        .then(() => {
+          pruned = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(pruned).toBe(false);
+      expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({
+        enabledServers: ["plugin:0123456789abcdef:evil"],
+      });
+      expect(explicitKeys.length).toBeGreaterThan(0);
+      expect(registeredKeys.some((key) => explicitKeys.includes(key))).toBe(true);
+      await releaseAlias();
+      await pruning;
+      expect(pruned).toBe(true);
+      expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ enabledServers: [] });
+    });
+
+    it("skips the prune when the under-lock verdict says so, and reports its failure without touching the document", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "verdict");
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const original = JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:evil"] });
+      await fs.writeFile(filePath, original, "utf-8");
+      const target = {
+        workspacePath,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      const keys = recordCheckoutLockKeys(service);
+      // The verdict is reached while the checkout locks are held.
+      let verdictSawLock = false;
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:", {
+        shouldPrune: () => {
+          verdictSawLock = keys.length > 0;
+          return Promise.resolve(false);
+        },
+      });
+      expect(verdictSawLock).toBe(true);
+      expect(await fs.readFile(filePath, "utf-8")).toBe(original);
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:", {
+          shouldPrune: () => Promise.reject(new Error("registry unreadable")),
+        })
+      ).rejects.toThrow("registry unreadable");
+      expect(await fs.readFile(filePath, "utf-8")).toBe(original);
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:", {
+        shouldPrune: () => Promise.resolve(true),
+      });
+      expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ enabledServers: [] });
+    });
+
+    it("a verdict that outlives the budget fails the operation before any prune is launched", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "slow-verdict");
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const original = JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:evil"] });
+      await fs.writeFile(filePath, original, "utf-8");
+      const internals = service as unknown as { pruneResolvedWorkspace: () => Promise<unknown> };
+      const pruneSpy = spyOn(internals, "pruneResolvedWorkspace");
+      const realNow = Date.now.bind(Date);
+      let clockOffsetMs = 0;
+      const clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+      try {
+        // (pruneSpy is restored in finally)
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          service.prunePluginOverrideKeysForUnregisteredCheckout(
+            { workspacePath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
+            "plugin:",
+            {
+              // The registry walk consumes the whole budget (clock jumps past it while the
+              // verdict is pending) and then says "prune".
+              shouldPrune: async () => {
+                clockOffsetMs = PRUNE_BUDGET_MIRROR_MS + 1_000;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                return true;
+              },
+            }
+          )
+        ).rejects.toThrow("exceeded the plugin-prune budget");
+        expect(pruneSpy).not.toHaveBeenCalled();
+        expect(await fs.readFile(filePath, "utf-8")).toBe(original);
+      } finally {
+        clock.mockRestore();
+        pruneSpy.mockRestore();
+      }
+    });
+
+    it("a deadline that fires while the rewrite is in flight keeps the locks until that write settles", async () => {
+      // No production budget knob: the prune budget is derived from Date.now() when the
+      // locked body starts, and pruneResolvedWorkspace is invoked between that derivation and
+      // the deadline's `remaining()` read — shifting a still-ticking clock forward there leaves
+      // ~2 s of budget (setSystemTime is unsuitable: it freezes the clock, which the lock
+      // acquisition deadlines below depend on). The document write is held open by the test,
+      // so the deadline provably fires with the rewrite in flight (its close awaits a gate
+      // released only after cancellation was observed).
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, "unregistered", "in-flight-rewrite");
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:evil", "ordinary"] }),
+        "utf-8"
+      );
+      const target = {
+        workspacePath,
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      };
+      const keys = recordCheckoutLockKeys(service);
+      interface PruneStep {
+        readonly cancelled: boolean;
+      }
+      const internals = service as unknown as {
+        pruneResolvedWorkspace: (
+          resolved: unknown,
+          keyPrefix: string,
+          step: PruneStep
+        ) => Promise<unknown>;
+      };
+      const realPrune = internals.pruneResolvedWorkspace.bind(service);
+      let step: PruneStep | undefined;
+      const realNow = Date.now.bind(Date);
+      let clockOffsetMs = 0;
+      const clock = spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+      const pruneSpy = spyOn(internals, "pruneResolvedWorkspace").mockImplementation(
+        (resolved, keyPrefix, s) => {
+          step = s;
+          // Between createPublicationBudget() and budget.remaining(): ~2 s of budget left. Mirrors
+          // the service's private PUBLICATION_TIMEOUT_MS; a shorter production budget makes the
+          // deadline fire before the write starts and this test then fails loudly (see below).
+          clockOffsetMs = PRUNE_BUDGET_MIRROR_MS - 2_000;
+          return realPrune(resolved, keyPrefix, s);
+        }
+      );
+      const gate = Promise.withResolvers<void>();
+      let writeStarted = false;
+      let writeSettled = false;
+      // A PROTOTYPE spy outlives this file unless restored (bun test shares one process across
+      // files), and bun's spyOn on an already-spied method returns that same mock — a later
+      // test capturing "the real writeFile" would capture the mock and recurse. Fail loudly on
+      // a leak, and restore this one in finally.
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- membership probe, not a call
+      expect("mockRestore" in LocalBaseRuntime.prototype.writeFile).toBe(false);
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- re-bound via .call below
+      const realWriteFile = LocalBaseRuntime.prototype.writeFile;
+      const writeSpy = spyOn(LocalBaseRuntime.prototype, "writeFile").mockImplementation(function (
+        this: LocalBaseRuntime,
+        target: string,
+        abortSignal?: AbortSignal
+      ) {
+        const real = realWriteFile.call(this, target, abortSignal).getWriter();
+        return new WritableStream<Uint8Array>({
+          write: (chunk) => {
+            writeStarted = true;
+            return real.write(chunk);
+          },
+          close: async () => {
+            await gate.promise;
+            await real.close();
+            writeSettled = true;
+          },
+        });
+      });
+      try {
+        let settled: "resolved" | "rejected" | undefined;
+        const pruning = service
+          .prunePluginOverrideKeysForUnregisteredCheckout(target, "plugin:")
+          .then(
+            () => {
+              settled = "resolved";
+            },
+            (error: unknown) => {
+              settled = "rejected";
+              return error;
+            }
+          );
+        // The deadline fired (cooperative cancellation flipped) while the write is held open.
+        const waitUntil = realNow() + 10_000;
+        while (!(writeStarted && step?.cancelled)) {
+          if (realNow() > waitUntil) {
+            throw new Error(
+              `expected the deadline to fire with the write in flight (writeStarted=${String(writeStarted)}, cancelled=${String(step?.cancelled)})`
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(writeSettled).toBe(false);
+        expect(settled).toBeUndefined();
+        // Every checkout lock this prune took is still held.
+        expect(keys.length).toBeGreaterThan(0);
+        for (const key of keys) {
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(
+            acquireCrossProcessLock({
+              lockPath: path.join(config.rootDir, "mcp-overrides-locks", `${key}.lock`),
+              acquireTimeoutMs: 200,
+              staleMs: 60_000,
+              timeoutMessage: "checkout lock still held",
+            })
+          ).rejects.toThrow("checkout lock still held");
+        }
+        // Release the write: the method settles (rejected by its deadline), and only now do the
+        // locks release — after the write landed.
+        gate.resolve();
+        const error = await pruning;
+        expect(settled).toBe("rejected");
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("exceeded the plugin-prune budget");
+        expect(writeSettled).toBe(true);
+        expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({
+          enabledServers: ["ordinary"],
+        });
+        for (const key of keys) {
+          const release = await acquireCrossProcessLock({
+            lockPath: path.join(config.rootDir, "mcp-overrides-locks", `${key}.lock`),
+            acquireTimeoutMs: 2_000,
+            staleMs: 60_000,
+            timeoutMessage: "checkout lock still held after settlement",
+          });
+          await release();
+        }
+      } finally {
+        clock.mockRestore();
+        pruneSpy.mockRestore();
+        writeSpy.mockRestore();
+      }
     });
   });
 });
