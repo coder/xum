@@ -37,7 +37,11 @@ export function isProviderModelAccessibleFromAuthoritativeCatalog(
     if (discoveredModels.includes(modelId)) {
       return true;
     }
-    return models?.some((entry) => maybeGetProviderModelEntryId(entry) === modelId) ?? false;
+    // providers.jsonc is hand-editable JSON: a non-array `models` must not throw here.
+    return (
+      Array.isArray(models) &&
+      models.some((entry) => maybeGetProviderModelEntryId(entry) === modelId)
+    );
   }
 
   // Most provider config model lists are user-managed custom entries, not exhaustive

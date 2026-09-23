@@ -1,3 +1,4 @@
+import type { ProviderModelEntry } from "@/common/orpc/types";
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -251,6 +252,24 @@ describe("gatewayModelCatalog", () => {
         )
       ).toBe(false);
     }
+  });
+
+  test("treats a malformed Coder models value as no explicit additions", () => {
+    // Hand-edited providers.jsonc can hold a non-array `models`; routing must not throw.
+    const malformed = { id: "anthropic/claude-x" } as unknown as ProviderModelEntry[];
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "anthropic/claude-x",
+        malformed,
+        []
+      )
+    ).toBe(false);
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "anthropic/claude-x", malformed, [
+        "anthropic/claude-x",
+      ])
+    ).toBe(true);
   });
 
   test("accepts Codex models when the Copilot catalog includes them", () => {
