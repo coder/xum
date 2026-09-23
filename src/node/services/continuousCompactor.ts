@@ -89,8 +89,10 @@ interface StagedSummary {
   attachmentTokens: number;
 }
 
-/** Only durable request-affecting metadata participates: committing a partial is not an edit. */
-/** Exported for journal compatibility tests (fingerprints persisted by earlier builds). */
+/**
+ * Only durable request-affecting metadata participates: committing a partial is not an edit.
+ * Exported for journal compatibility tests (fingerprints persisted by earlier builds).
+ */
 export function fingerprint(rows: MuxMessage[]): string {
   const hash = createHash("sha256");
   for (const row of rows) {
@@ -129,7 +131,6 @@ function boundaryIdentity(rows: MuxMessage[]): { epoch: number; boundarySequence
   };
 }
 
-/** Background summary + recent pages. Only the short apply is serialized with the turn. */
 /**
  * Rows a journal's source fingerprint covers: everything before the live source plus the
  * source's committed parts. Journals compare what the model saw (the visible projection, like
@@ -144,6 +145,7 @@ function journalSourceRows(
   return [...rows.slice(0, -1), { ...source, parts: source.parts.slice(0, partIndex) }];
 }
 
+/** Background summary + recent pages. Only the short apply is serialized with the turn. */
 export class ContinuousCompactor {
   private generation = 0;
   private staged: StagedSummary | null = null;
