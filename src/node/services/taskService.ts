@@ -14218,10 +14218,17 @@ export class TaskService implements AgentTaskIntegration {
         if (fence?.turnAdmission.admissionStale() === true) {
           return withoutSend(false);
         }
-        await this.failAgentTaskTerminally(workspaceId, entry, {
-          errorType: "task_recovery_limit",
-          errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
-        });
+        // The check above is one-shot: another backend can still take the row before the
+        // failure's own reads and write, so the failure itself is bound to the fenced attempt.
+        await this.failAgentTaskTerminally(
+          workspaceId,
+          entry,
+          {
+            errorType: "task_recovery_limit",
+            errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
+          },
+          fence != null ? { expectedAttemptId: fence.attemptId } : undefined
+        );
         return withoutSend(false);
       }
       // Consume budget before sending so a crash mid-send still counts the attempt.
@@ -15206,17 +15213,35 @@ export class TaskService implements AgentTaskIntegration {
    * persist a durable failure artifact in every ancestor session dir (so
    * background children, restarts, and post-cleanup task_awaits observe the
    * typed failure), then reject pending waiters with the failure message.
+   *
+   * `expectedAttemptId`: the caller decided the failure for exactly that attempt (a fenced
+   * prompt). A row that no longer names it — another backend re-admitted it under its own attempt
+   * — is that writer's: nothing is closed, stopped, written, cleared, settled or published. The
+   * status write is a CAS on the attempt, and the stop record is captured only after it lands (a
+   * record captured for a row the CAS then abandons would latch the workspace for good).
    */
   private async failAgentTaskTerminally(
     workspaceId: string,
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    failure: { errorType: string; errorMessage: string }
+    failure: { errorType: string; errorMessage: string },
+    options?: { expectedAttemptId?: string }
   ): Promise<void> {
     assert(workspaceId.length > 0, "failAgentTaskTerminally: workspaceId must be non-empty");
     assert(
       failure.errorMessage.length > 0,
       "failAgentTaskTerminally: errorMessage must be non-empty"
     );
+    const expectedAttemptId = options?.expectedAttemptId;
+    const logSuperseded = () =>
+      log.info("[task-attempt] terminal failure abandoned: decided for a superseded attempt", {
+        workspaceId,
+        expectedAttemptId,
+        errorType: failure.errorType,
+      });
+    if (expectedAttemptId != null && this.currentTaskAttemptId(workspaceId) !== expectedAttemptId) {
+      logSuperseded();
+      return;
+    }
 
     // A terminal failure ends the stream's attempt: settle the attempt owned at this decision.
     // Two producers, decided BEFORE persisting `interrupted`: with no live turn generation,
@@ -15232,25 +15257,28 @@ export class TaskService implements AgentTaskIntegration {
     // the no-record branch settle the attempt while a freshly admitted turn runs).
     this.closeAttemptAdmission(
       workspaceId,
-      this.currentTaskAttemptId(workspaceId),
+      expectedAttemptId ?? this.currentTaskAttemptId(workspaceId),
       ownedAttempt,
       "terminal-failure"
     );
-    const liveExecution =
+    const sampleLiveExecution = (): boolean =>
       this.workspaceService.getActiveTurnGeneration(workspaceId) != null ||
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId) != null ||
       this.aiService.isStreaming(workspaceId) ||
       this.hasPendingAdmissions(workspaceId);
     let stopRecord: WorkspaceStopRecord | undefined;
-    if (liveExecution) {
+    if (expectedAttemptId == null && sampleLiveExecution()) {
       await using _lock = await this.mutex.acquire();
       stopRecord = this.beginWorkspaceStop(workspaceId);
     }
+    let superseded = false;
     let transitionedToInterrupted = false;
     let parentWorkspaceId = entry.workspace.parentWorkspaceId;
-    await this.editWorkspaceEntry(
+    const found = await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
+        superseded = expectedAttemptId != null && ws.taskAttemptId !== expectedAttemptId;
+        if (superseded) return;
         transitionedToInterrupted = ws.taskStatus !== "interrupted";
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
@@ -15266,6 +15294,27 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (expectedAttemptId != null) {
+      if (superseded || !found) {
+        logSuperseded();
+        return;
+      }
+      // The marker landed on the expected attempt's row; its live work is captured now (the
+      // closure above preceded the write, so this sample is authoritative) — unless another
+      // writer took the row during the write's own awaits, in which case it is theirs.
+      let rowStillExpected = false;
+      {
+        await using _lock = await this.mutex.acquire();
+        rowStillExpected = this.currentTaskAttemptId(workspaceId) === expectedAttemptId;
+        if (rowStillExpected && sampleLiveExecution()) {
+          stopRecord = this.beginWorkspaceStop(workspaceId);
+        }
+      }
+      if (!rowStillExpected) {
+        logSuperseded();
+        return;
+      }
+    }
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     }

@@ -27,6 +27,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
+import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
@@ -3302,6 +3303,99 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           taskAttemptId: rotatedAttemptId,
         });
         expect(entryOf(config, taskId)?.taskRecoveryAttempts).toBeUndefined();
+      }
+    );
+
+    test.each(["re-admitted by another writer before the failure write", "untouched"] as const)(
+      "a fenced completion prompt at the recovery limit fails only the attempt it was decided for (row %s)",
+      async (row) => {
+        const rotatedElsewhere = row !== "untouched";
+        const taskId = rotatedElsewhere ? "redrivelimit001" : "redrivelimit002";
+        const initialAttemptId = "att_00000000000000a6";
+        const foreignAttemptId = "att_00000000000000b6";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: {
+              taskStatus: "awaiting_report",
+              taskAttemptId: initialAttemptId,
+              taskRecoveryAttempts: 5,
+            },
+          },
+        ]);
+        const otherBackend = await createTestConfig(rootDir);
+        const { workspaceService, sendMessage, clearQueue } = createWorkspaceServiceMocks();
+        const { aiService, stopStream } = createAIServiceMocks(config);
+        const { taskService } = createHarness(config, { aiService, workspaceService });
+        const svc = internals(taskService);
+        shortenTerminationTimers();
+        let rotatedAttemptId: string | undefined;
+        let rotatedForeign = false;
+        const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+        spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const [id] = args;
+          if (id === taskId && rotatedAttemptId == null) {
+            // The re-drive's own CAS: let it commit and note R.
+            const result = await editOriginal(...args);
+            rotatedAttemptId = entryOf(config, taskId)?.taskAttemptId;
+            return result;
+          }
+          if (id === taskId && rotatedElsewhere && !rotatedForeign) {
+            // The recovery-limit failure write, after the prompt helper's one-shot staleness
+            // check: the other backend's admission of the same row lands first.
+            rotatedForeign = true;
+            await otherBackend.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                const ws = project.workspaces.find((w) => w.id === taskId);
+                if (ws) {
+                  ws.taskStatus = "running";
+                  ws.taskAttemptId = foreignAttemptId;
+                  ws.taskAttemptUnproven = true;
+                }
+              }
+              return cfg;
+            });
+          }
+          return editOriginal(...args);
+        });
+        await taskService.recoverInterruptedTasks();
+        expect(rotatedAttemptId).toMatch(ATTEMPT_ID);
+        expect(sendMessage).not.toHaveBeenCalled();
+        // R's fenced obligation is disposed either way (no pending obligation outlives the helper).
+        expect(svc.admittedSendsByTaskId.has(taskId)).toBe(false);
+        const failure = await readSubagentFailureArtifact(
+          path.join(config.sessionsDir, rootId),
+          taskId
+        );
+        if (rotatedElsewhere) {
+          expect(rotatedForeign).toBe(true);
+          // B's row is exactly as its writer left it: no interrupted status, no launch error.
+          expect(entryOf(config, taskId)).toMatchObject({
+            taskStatus: "running",
+            taskAttemptId: foreignAttemptId,
+            taskAttemptUnproven: true,
+          });
+          expect(entryOf(config, taskId)?.taskLaunchError).toBeUndefined();
+          // No failure is published for B, nothing of B's is stopped, closed or settled, and no
+          // stop record (whose latch could never release) is left behind.
+          expect(failure).toBeNull();
+          expect(clearQueue).not.toHaveBeenCalled();
+          expect(stopStream).not.toHaveBeenCalled();
+          expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+          expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+          expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreignAttemptId);
+          return;
+        }
+        // Control: the limit fails R terminally and R's stop latch releases once the fenced
+        // obligation is disposed.
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "interrupted",
+          taskAttemptId: rotatedAttemptId,
+        });
+        expect(entryOf(config, taskId)?.taskLaunchError).toContain("recovery attempts");
+        expect(failure?.errorType).toBe("task_recovery_limit");
+        await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
       }
     );
   });
