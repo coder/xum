@@ -3317,9 +3317,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * mutator's scan sees every task row or none.
    *
    * `Err` means nothing was published (a throwing `materialize` is reported the same way: its
-   * message, verbatim) or, once `publish` returned, that no persisted row can be shown to carry
-   * its proofs — the caller then treats the write as attempted, not refused, and still ends
-   * whatever it owned for the rows. Either way the caller retains the fresh directories (their
+   * message, verbatim) or, once `publish` returned, that a READABLE registry holds no row
+   * carrying its proofs (an unreadable one is indeterminate and keeps the success) — the caller
+   * then treats the write as attempted, not refused, and still ends whatever it owned for the
+   * rows. Either way the caller retains the fresh directories (their
    * names are unique to their task ids and a fork refuses an existing path, so no later creation
    * reuses or removes them; a claimed one refuses adoption through its nonce) and reports their
    * paths. A throwing `publish` propagates. A `local` runtime fork shares the project directory
@@ -3442,9 +3443,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             .flatMap((project) => project.workspaces)
             .map((row) => row.taskCheckoutPreparation);
         } catch (error) {
-          return Err(
-            `Task publication could not be verified (the config is unreadable: ${getErrorMessage(error)}); the prepared checkout(s) ${proofs.map((proof) => proof.path).join(", ")} were retained.`
-          );
+          // Indeterminate, not a failure: the write may well have landed, and reporting it failed
+          // would leave a durable (queued rows: launchable) row the caller cannot fence — its
+          // attempt identity is not the caller's — and may duplicate on retry. Only a READABLE
+          // registry that lacks a proof refuses; every later admission re-validates the row.
+          log.warn("Task publication could not be verified (config unreadable); keeping success", {
+            checkouts: proofs.map((proof) => proof.path),
+            error: getErrorMessage(error),
+          });
+          return Ok(published);
         }
         const unpersisted = proofs.filter(
           (proof) => !persisted.some((candidate) => isDeepStrictEqual(candidate, proof))
