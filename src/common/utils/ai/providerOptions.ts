@@ -22,6 +22,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import {
   getAnthropicEffort,
+  anthropicBindsThinkingToPrefix,
   anthropicRejectsDisabledThinking,
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
@@ -39,7 +40,10 @@ import {
   isGeminiFlashMinimalRejectingModelName,
   isGeminiFlashThinkingLevelModelName,
 } from "@/common/utils/thinking/policy";
-import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
+import {
+  isOfficialProviderBaseUrl,
+  openaiExplicitPromptCachingAvailable,
+} from "@/common/utils/ai/cacheStrategy";
 import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
@@ -290,6 +294,41 @@ export function preserveAnthropic1MContextForFollowUp(
 }
 
 /**
+ * Route-aware eligibility for Anthropic's thinking block-binding control.
+ *
+ * The SDK pairs `thinking.blockBinding` with the
+ * `thinking-binding-controls-2026-08-01` beta header. Bedrock and Vertex reject
+ * that header until they support it per model, and a proxy that forwards the body
+ * without the header turns `block_binding` into a 400, so every check fails closed:
+ * - the backend-resolved route must be the direct `anthropic` provider, reached
+ *   through the built-in `anthropic:` namespace (no gateway or custom provider);
+ * - beta features must not be disabled (strict ZDR proxies);
+ * - a configured base URL (config or env) must be the official endpoint.
+ */
+function anthropicThinkingBlockBindingAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  muxProviderOptions: MuxProviderOptions | undefined
+): boolean {
+  if (routeProvider !== "anthropic" || !modelString.startsWith("anthropic:")) {
+    return false;
+  }
+  const anthropicConfig = providersConfig?.anthropic;
+  if (anthropicConfig == null || isCustomProviderConfig(anthropicConfig)) {
+    return false;
+  }
+  if (
+    anthropicConfig.disableBetaFeatures === true ||
+    muxProviderOptions?.anthropic?.disableBetaFeatures === true
+  ) {
+    return false;
+  }
+  const activeBaseUrl = anthropicConfig.baseUrl ?? anthropicConfig.baseUrlResolved;
+  return activeBaseUrl == null || isOfficialProviderBaseUrl(activeBaseUrl, "api.anthropic.com");
+}
+
+/**
  * Build provider-specific options for AI SDK based on thinking level
  *
  * This function configures provider-specific options for supported providers:
@@ -405,6 +444,20 @@ export function buildProviderOptions(
       // get the native "xhigh" wire value; other adaptive models keep xhigh → "max".
       const effortLevel = getAnthropicEffort(effectiveThinking, capabilityModel);
       const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
+      // Replayed history is not yet append-only (model-only tool-result fields are
+      // stripped before replay), which invalidates later thinking blocks on models
+      // that bind them to the prefix. Ask the API to drop those blocks instead of
+      // rejecting the whole request.
+      const blockBinding =
+        anthropicBindsThinkingToPrefix(capabilityModel) &&
+        anthropicThinkingBlockBindingAvailable(
+          modelString,
+          routeProvider,
+          providersConfig,
+          muxProviderOptions
+        )
+          ? ({ prefixMismatchBehavior: "drop_block" } as const)
+          : undefined;
       // Opus 4.6+ / Sonnet 4.6 / Sonnet 5: adaptive thinking when on, disabled when off
       // Opus 4.5: enabled thinking with budgetTokens ceiling (only when not "off")
       // Mythos-class (Fable/Mythos) and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy
@@ -426,7 +479,7 @@ export function buildProviderOptions(
             ? undefined
             : { type: "disabled" }
           : supportsNativeXhigh
-            ? { type: "adaptive", display: "summarized" }
+            ? { type: "adaptive", display: "summarized", ...(blockBinding && { blockBinding }) }
             : { type: "adaptive" }
         : budgetTokens > 0
           ? { type: "enabled", budgetTokens }

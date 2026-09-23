@@ -21,6 +21,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { anthropicRejectsDisabledThinking } from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -34,6 +35,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import {
@@ -411,13 +413,18 @@ async function generateAbandonedBranchSummaryText(input: {
     try {
       // streamText (not generateText): Codex OAuth endpoints require
       // stream:true in the request body (same rationale as workspaceTitleGenerator).
-      // No thinking provider options are passed, so the call itself stays
-      // thinking-free on top of the thinking-stripped transcript.
+      // No thinking provider options are passed, so the call stays thinking-free
+      // on top of the thinking-stripped transcript, except on models that cannot
+      // disable thinking: those get low effort and thinking headroom instead.
+      const alwaysThinks = anthropicRejectsDisabledThinking(modelResult.data.metadataModel);
       const stream = streamText({
         model: modelResult.data.model,
         system: input.system,
         prompt: input.prompt,
-        maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        maxOutputTokens: alwaysThinks
+          ? BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS
+          : BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        ...(alwaysThinks && { providerOptions: { anthropic: { effort: "low" } } }),
         abortSignal,
       });
       // Consume deltas incrementally (not stream.text) so a deadline that

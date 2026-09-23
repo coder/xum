@@ -414,6 +414,20 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
 }
 
 /**
+ * Whether the given Anthropic model binds each replayed thinking block to the
+ * conversation prefix (system prompt, tools, and earlier messages) that produced it.
+ *
+ * On enforced accounts, Claude Opus 5.5 and Claude Fable 5.1 (Mythos 5.1 is the same
+ * model) reject a request that replays a block whose prefix has since changed.
+ */
+export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /claude-(?:opus-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+    withoutPrefix
+  );
+}
+
+/**
  * Default thinking level when no value is set (UI initial state, backend fallback).
  * Semantically different from DEFAULT_THINKING_LEVEL which is the level used
  * when a user opts *into* thinking (e.g., CLI `--thinking` with no explicit level).

@@ -20,6 +20,7 @@ import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
   normalizeOpenAICompatibleBaseURL,
+  withAnthropicEvaluationEffort,
 } from "@/node/services/providerModelFactory";
 import {
   resolveProviderCredentials,
@@ -170,7 +171,9 @@ export function createEvaluationModel(
       }
       case "anthropic": {
         const { createAnthropic } = yield* Effect.promise(PROVIDER_REGISTRY.anthropic);
-        return Ok(createAnthropic(settings).evaluationModel(modelId));
+        return Ok(
+          withAnthropicEvaluationEffort(createAnthropic(settings).evaluationModel(modelId), modelId)
+        );
       }
       case "google": {
         const { createGoogleGenerativeAI } = yield* Effect.promise(PROVIDER_REGISTRY.google);

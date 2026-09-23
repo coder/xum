@@ -7,6 +7,7 @@ import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
 import {
+  anthropicRejectsDisabledThinking,
   isGpt6SolOrLunaModel,
   isGrokFrontierModel,
   type ThinkingLevel,
@@ -814,6 +815,35 @@ export function normalizeAnthropicBaseURL(baseURL: string): string {
     }
     return `${trimmed}/v1`;
   }
+}
+
+/**
+ * Evaluation calls request reasoning "none", which the Anthropic SDK maps to
+ * `thinking: { type: "disabled" }` unless an effort is set. Models that cannot
+ * disable thinking reject that with a 400, so default them to low effort, which
+ * leaves thinking at the API's adaptive default. A caller-supplied effort wins.
+ */
+export function withAnthropicEvaluationEffort(
+  model: EvaluationModelInstance,
+  modelId: string
+): EvaluationModelInstance {
+  if (!anthropicRejectsDisabledThinking(modelId)) {
+    return model;
+  }
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doEvaluate: (options) =>
+      model.doEvaluate({
+        ...options,
+        providerOptions: {
+          ...options.providerOptions,
+          anthropic: { effort: "low", ...options.providerOptions?.anthropic },
+        },
+      }),
+  };
 }
 
 export function normalizeOpenAICompatibleBaseURL(baseURL: string): string {
@@ -3090,7 +3120,8 @@ export class ProviderModelFactory {
           const { createAnthropic } = yield* Effect.promise(async () =>
             PROVIDER_REGISTRY.anthropic()
           );
-          model = createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(
+          model = withAnthropicEvaluationEffort(
+            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(modelId),
             modelId
           );
           break;

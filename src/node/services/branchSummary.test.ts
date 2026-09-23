@@ -15,6 +15,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
@@ -511,6 +512,51 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           : "";
       expect(systemText).not.toContain("investigated the flaky roles test");
       expect(userText).toContain("investigated the flaky roles test");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("candidates that cannot disable thinking get low effort and thinking headroom", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const calls: Array<{ maxOutputTokens?: number; effort?: unknown }> = [];
+      const model = new MockLanguageModelV3({
+        doStream: (options: LanguageModelV3CallOptions) => {
+          calls.push({
+            maxOutputTokens: options.maxOutputTokens,
+            effort: options.providerOptions?.anthropic?.effort,
+          });
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Summarized the branch." },
+                { type: "text-end", id: "t1" },
+                finishChunk(),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      for (const workspaceModel of ["anthropic:claude-opus-5-5", "anthropic:claude-haiku-4-5"]) {
+        const appended = await maybeAppendAbandonedBranchSummary({
+          historyService,
+          aiService: fakeAiService(model, { workspaceModel }),
+          workspaceId: `ws-${workspaceModel}`,
+          abandonedMessages: meatyExchange(workspaceModel),
+          experiments: RLM_ON,
+        });
+        expect(appended).not.toBeNull();
+      }
+      expect(calls).toEqual([
+        {
+          maxOutputTokens:
+            BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
+          effort: "low",
+        },
+        { maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS, effort: undefined },
+      ]);
     } finally {
       await cleanup();
     }
