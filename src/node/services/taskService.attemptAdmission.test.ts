@@ -1295,6 +1295,39 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
     );
 
+    test("a startup compaction follow-up the session took without admitting a turn (teardown race) leaves no pending obligation, so a later Stop releases", async () => {
+      const taskId = "redrive-followup-teardown";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "running", taskAttemptId: "att_00000000000000c1" } },
+      ]);
+      // AgentSession.sendMessage's disposed guard (session torn down during the send's awaits)
+      // resolves Ok(undefined) without ever calling onAdmitted, and dispatchPendingFollowUp then
+      // reports the follow-up dispatched: the wrapper returns Ok(true) with no turn behind it.
+      const tokens: TurnAdmissionToken[] = [];
+      const dispatchPendingCompactionFollowUp = mock(
+        (
+          ...[, internal]: Parameters<WorkspaceHost["dispatchPendingCompactionFollowUp"]>
+        ): Promise<Result<boolean>> => {
+          if (internal?.turnAdmission != null) tokens.push(internal.turnAdmission);
+          return Promise.resolve(Ok(true));
+        }
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({
+        dispatchPendingCompactionFollowUp,
+      });
+      const { taskService } = createHarness(config, { workspaceService });
+      const svc = internals(taskService);
+      shortenTerminationTimers();
+      await taskService.recoverInterruptedTasks();
+      expect(tokens).toHaveLength(1);
+      // No obligation is left pending for a turn that will never exist...
+      expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
+      // ...so a Stop has nothing to wait for and releases its latch.
+      await raceWithTimeout(taskService.terminateAllDescendantAgentTasks(rootId), 2_000);
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+    });
+
     test("a reawaken whose send fails restores `interrupted` and discharges its obligation; the owner stays unsettled until an explicit Stop settles it", async () => {
       // Deferred by the accepted plan (owned attempt interrupted without settlement evidence): the
       // witness pins the recovery contract — no dangling obligation, and a Stop proves the lineage.

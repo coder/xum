@@ -3085,7 +3085,15 @@ export class TaskService implements AgentTaskIntegration {
     const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(taskId, {
       turnAdmission: admission.token,
     });
-    if (followUp.success && followUp.data) return followUp;
+    if (followUp.success && followUp.data) {
+      // `true` means the session took the follow-up, not that a turn was admitted: a session torn
+      // down during the send's awaits resolves Ok through its disposed guard without calling
+      // onAdmitted. The session's direct send never enqueues the token, so after the wrapper
+      // settles it is either admitted (disposal is then a no-op — it belongs to its turn) or
+      // produced no turn and must not stay pending, or a later Stop would wait on it forever.
+      admission.token.onDisposed("no-work");
+      return followUp;
+    }
     // Nothing dispatched. A token that reads stale now was refused at the session's gates because
     // this decision's attempt is gone (rotated or retired by another writer): report that as a
     // failure so the caller issues no further send for the decision.
