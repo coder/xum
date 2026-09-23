@@ -57,6 +57,7 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -1747,6 +1748,10 @@ export class TurnRequestBuilder {
         agentId: "intuition",
         resolvedFrontmatter: intuitionDefinition.frontmatter,
       });
+    const evaluationService = this.dependencies.bindings.evaluationService;
+    const builtInIntuitionBody = getBuiltInAgentDefinitions().find(
+      (definition) => definition.id === "intuition"
+    )?.body;
     const intuitionSettings = intuitionToolEligible
       ? resolveHeadlessAgentSettings(
           this.dependencies.config,
@@ -2316,6 +2321,15 @@ export class TurnRequestBuilder {
               usesThisTurn: 0,
               createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
               resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
+              // Evaluation recall replaces only the built-in body's tool loop: a custom
+              // body was written for that loop, and evaluation ignores prompt bodies.
+              ...(evaluationService && intuitionDefinition?.body === builtInIntuitionBody
+                ? {
+                    createEvaluationModel: (ms: string) =>
+                      this.dependencies.providerModelFactory.createEvaluationModel(ms),
+                    evaluationService,
+                  }
+                : {}),
               abortSignal: combinedAbortSignal,
             },
           }

@@ -71,6 +71,7 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
@@ -2067,6 +2068,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (runtime) {
         expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
         expect(runtime.thinkingLevel).toBe("high");
+        // No EvaluationService is bound in these scenarios: the tool loop stays.
+        expect(runtime.createEvaluationModel).toBeUndefined();
         if (frontmatterDisabled !== undefined) {
           await fs.writeFile(
             definitionPath,
@@ -2098,6 +2101,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         harness.config,
         new MemoryMetaService(xumHome.path)
       );
+      const evaluationService = makeEvaluationService();
+      harness.service.turnRequestBuilderBindings.evaluationService = evaluationService;
       const selected = "private:exec-global";
       if (definitionOverride) {
         const agents = path.join(xumHome.path, "agents");
@@ -2139,6 +2144,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
         definitionOverride ? "private:definition-route" : selected
       );
+      // A custom body was written for the tool loop, so only the built-in body evaluates.
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
+      expect(runtime?.createEvaluationModel !== undefined).toBe(!definitionOverride);
+      expect(runtime?.evaluationService).toBe(definitionOverride ? undefined : evaluationService);
     }
   );
 

@@ -93,6 +93,8 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
+import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -360,6 +362,9 @@ export interface ToolConfiguration {
     usesThisTurn: number;
     createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
     resolveAgentBody: () => Promise<string | null>;
+    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
+    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
+    evaluationService?: EvaluationService;
     abortSignal: AbortSignal;
   };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */

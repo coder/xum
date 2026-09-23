@@ -1,9 +1,19 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
-import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import {
+  Experimental_EvaluationMockModelV4,
+  MockLanguageModelV3,
+  simulateReadableStream,
+} from "ai/test";
+import type {
+  Experimental_EvaluationModelV4CallOptions,
+  LanguageModelV3CallOptions,
+  LanguageModelV3StreamPart,
+} from "@ai-sdk/provider";
+import {
+  MEMORY_INTUITION_EVAL_MAX_CHUNKS,
+  MEMORY_INTUITION_EVAL_MAX_ENTRIES,
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
   MEMORY_INTUITION_MAX_INDEX_BYTES,
@@ -23,6 +33,10 @@ import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryIndexEntry, type MemoryScopeContext } from "./memoryService";
 import { classifyIntuitionReport, runMemoryIntuition, selectIndexForCue } from "./memoryIntuition";
+import { EVAL_WHY, chunkMemoryText } from "./memoryIntuitionEvaluation";
+import { makeEvaluationService } from "./evaluation/evaluationService";
+import type { PinnedEvaluationModel } from "./providerModelFactory";
+import { Err, Ok } from "@/common/types/result";
 import { TestTempDir } from "./tools/testHelpers";
 
 async function fixture(files: Record<string, string> = {}) {
@@ -1398,4 +1412,434 @@ describe("runMemoryIntuition", () => {
     },
     MEMORY_INTUITION_TIMEOUT_MS + 5000
   );
+});
+
+interface Judged {
+  id: string;
+  path: string;
+  description?: string;
+  text?: string;
+}
+/** Real EvaluationService over a scripted evaluation model; `rate` answers P(true) per item. */
+function evaluator(
+  rate: (item: Judged, stage: "memories" | "excerpts") => number,
+  respond?: (call: number) => "fail" | "unknown-usage" | PromiseLike<never> | undefined
+) {
+  const calls: Experimental_EvaluationModelV4CallOptions[] = [];
+  const model = new Experimental_EvaluationMockModelV4({
+    provider: "openai",
+    modelId: "evaluator",
+    supportedQuestionTypes: ["boolean"],
+    doEvaluate: (options) => {
+      calls.push(options);
+      const mode = respond?.(calls.length - 1);
+      if (mode === "fail") return Promise.reject(new Error("provider exploded"));
+      if (typeof mode === "object") return mode;
+      const state = options.state as { memories?: Judged[]; excerpts?: Judged[] };
+      const stage = state.memories ? "memories" : "excerpts";
+      const items = new Map((state.memories ?? state.excerpts ?? []).map((row) => [row.id, row]));
+      return Promise.resolve({
+        answers: Object.fromEntries(
+          Object.keys(options.questions).map((id) => [
+            id,
+            { type: "boolean" as const, probability: rate(items.get(id)!, stage) },
+          ])
+        ),
+        usage: mode === "unknown-usage" ? undefined : { inputTokens: 100, outputTokens: 10 },
+        warnings: [],
+      });
+    },
+  });
+  const pinnedEvaluation = {
+    model,
+    modelString: "openai:evaluator",
+    effectiveModelString: "openai:evaluator",
+    wireProviderName: "openai",
+    metadataModel: "openai:evaluator-pricing",
+    routeKind: "direct",
+    configFingerprint: "fixture",
+  } satisfies PinnedEvaluationModel;
+  return {
+    calls,
+    createEvaluationModel: mock(() => Promise.resolve(Ok(pinnedEvaluation))),
+    evaluationService: makeEvaluationService(),
+  };
+}
+const evidence = (item: Judged) => item.text ?? `${item.path} ${item.description ?? ""}`;
+const hookConfig = (f: { root: string; ctx: MemoryScopeContext }) => ({
+  runtime: new LocalRuntime(f.root),
+  cwd: f.root,
+  runtimeTempDir: f.root,
+  workspaceId: f.ctx.workspaceId,
+});
+
+describe("runMemoryIntuition evaluation recall", () => {
+  it("answers in two requests with one verified excerpt per file, including text past the excerpt cap", async () => {
+    const filler = Array.from({ length: 300 }, (_, i) => `filler${i}`);
+    filler[200] = "deploy-canary-passage";
+    const files: Record<string, string> = {
+      "deploy.md":
+        "---\ndescription: deploy checklist\n---\n# Deploy\n\nAlways run migrations before deploy.\n\n- unrelated bullet",
+      "rollback.md": "---\ndescription: rollback notes\n---\nRoll back with the blue-green switch.",
+      "long.md": `---\ndescription: long deploy log\n---\n- ${filler.join(" ")}`,
+    };
+    for (let i = 0; i < 37; i++) files[`n${i}.md`] = `irrelevant ${i}`;
+    using f = await fixture(files);
+    const judge = evaluator((item, stage) => {
+      const text = evidence(item);
+      if (stage === "memories") return /deploy|rollback/.test(text) ? 0.9 : 0.05;
+      if (text.includes("migrations before deploy")) return 0.95;
+      if (text.includes("deploy-canary-passage")) return 0.92;
+      return text.includes("blue-green") ? 0.9 : 0.1;
+    });
+    const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+    const recordUsage = mock((_usage: unknown, _metadata?: unknown, _model?: string) =>
+      Promise.resolve()
+    );
+    const cue = "deploy migrations rollback canary";
+    const result = await runMemoryIntuition({
+      ...f,
+      cue,
+      modelString: "openai:evaluator",
+      createModel,
+      resolveAgentBody: body,
+      createEvaluationModel: judge.createEvaluationModel,
+      evaluationService: judge.evaluationService,
+      recordUsage,
+    });
+    const longWindow = chunkMemoryText(`- ${filler.join(" ")}`).find((chunk) =>
+      chunk.includes("deploy-canary-passage")
+    );
+    expect(longWindow?.startsWith("- ")).toBe(false);
+    expect(result).toMatchObject({
+      kind: "report",
+      memories: [
+        {
+          path: entry("deploy.md").path,
+          relevance: 0.95,
+          excerpt: "Always run migrations before deploy.",
+          why: EVAL_WHY,
+        },
+        { path: entry("long.md").path, relevance: 0.92, excerpt: longWindow },
+        {
+          path: entry("rollback.md").path,
+          relevance: 0.9,
+          excerpt: "Roll back with the blue-green switch.",
+        },
+      ],
+      candidates: [],
+      stats: { indexEntriesConsidered: 40, indexEntriesOmitted: 8, filesRead: 3, steps: 2 },
+    });
+    expect(createModel).not.toHaveBeenCalled();
+    expect(judge.calls).toHaveLength(2);
+    expect(Object.keys(judge.calls[0].questions)).toHaveLength(MEMORY_INTUITION_EVAL_MAX_ENTRIES);
+    const excerptQuestions = Object.keys(judge.calls[1].questions).length;
+    expect(excerptQuestions).toBeGreaterThan(0);
+    expect(excerptQuestions).toBeLessThanOrEqual(MEMORY_INTUITION_EVAL_MAX_CHUNKS);
+    // Untrusted cue and memory text travel only as state, never as instructions.
+    for (const call of judge.calls) {
+      const questions = JSON.stringify(call.questions);
+      for (const untrusted of ["canary", "migrations", "rollback", "blue-green", "checklist"])
+        expect(questions).not.toContain(untrusted);
+      expect(JSON.stringify(call.state)).toContain(cue);
+    }
+    expect(JSON.stringify(judge.calls[1].state)).toContain("blue-green");
+    expect(recordUsage).toHaveBeenCalledTimes(1);
+    expect(recordUsage.mock.calls[0][0]).toMatchObject({
+      inputTokens: 200,
+      outputTokens: 20,
+      totalTokens: 220,
+    });
+    expect(recordUsage.mock.calls[0][2]).toBe("openai:evaluator-pricing");
+  });
+
+  it.each(["err", "throw", "absent"])(
+    "keeps the tool loop without sending an evaluation when the evaluator is %s",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha" });
+      const judge = evaluator(() => 1);
+      const createModel = mock(() =>
+        Promise.resolve(pinned(scriptedModel([[report([item("a.md", 0.9, "alpha")])]])))
+      );
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "openai:evaluator",
+        createModel,
+        resolveAgentBody: body,
+        createEvaluationModel:
+          mode === "err"
+            ? () => Promise.resolve(Err({ reason: "unsupported-route", routeKind: "gateway" }))
+            : mode === "throw"
+              ? () => Promise.reject(new Error("resolver bug"))
+              : judge.createEvaluationModel,
+        evaluationService: mode === "absent" ? undefined : judge.evaluationService,
+      });
+      expect(result).toMatchObject({ kind: "report", memories: [item("a.md", 0.9, "alpha")] });
+      expect(createModel).toHaveBeenCalledTimes(1);
+      expect(judge.calls).toHaveLength(0);
+      expect(judge.createEvaluationModel).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["deny", "redact", "outside", "annotation"])(
+    "re-applies memory-view hooks across stages when they %s",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha secret" });
+      const reads = spyOn(f.memoryService, "readFileWithSha");
+      const judge = evaluator((row, stage) =>
+        stage === "memories" ? 0.9 : evidence(row).includes("HOOK") ? 0.99 : 0.95
+      );
+      let views = 0;
+      const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+        if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        if (judge.calls.length === 0) return next(); // index metadata authorization
+        const verification = ++views > 1;
+        if (mode === "deny" && verification) {
+          ctx.blocked = { result: { error: "access revoked" } };
+          return;
+        }
+        if (mode === "outside") ctx.args = { command: "view", path: entry("outside.md").path };
+        await next();
+        if (mode === "redact" && verification) ctx.result = { success: true, output: "redacted" };
+        if (mode === "annotation")
+          ctx.result = {
+            success: true,
+            output: "alpha secret\n\nHOOK NOTE alpha",
+            hook_output: "HOOK NOTE alpha",
+          };
+      });
+      try {
+        const result = await runMemoryIntuition({
+          ...f,
+          cue: "alpha",
+          modelString: "openai:evaluator",
+          createModel: () => Promise.resolve(pinned(scriptedModel([]))),
+          resolveAgentBody: body,
+          createEvaluationModel: judge.createEvaluationModel,
+          evaluationService: judge.evaluationService,
+          hooks: hookConfig(f),
+        });
+        if (mode === "annotation") {
+          expect(result).toMatchObject({
+            kind: "report",
+            memories: [{ path: entry("a.md").path, relevance: 0.95, excerpt: "alpha secret" }],
+          });
+          expect(JSON.stringify(judge.calls[1].state)).not.toContain("HOOK");
+        } else {
+          expect(result).toMatchObject({
+            kind: "report",
+            memories: [],
+            // An unverifiable excerpt keeps its score but only as a lead.
+            candidates: [{ path: entry("a.md").path, relevance: mode === "outside" ? 0.9 : 0.95 }],
+          });
+        }
+        // A read refused after rewriting never reaches disk or a second request.
+        expect(judge.calls).toHaveLength(mode === "outside" ? 1 : 2);
+        expect(reads).toHaveBeenCalledTimes(mode === "outside" ? 0 : 1);
+        expect((await f.meta.getEntries()).size).toBe(0);
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  it("reads shortlisted files in relevance order and keeps over-budget files as leads", async () => {
+    const large = (n: number) => `alpha fact ${n} ${"x".repeat(90_000)}`;
+    using f = await fixture({ "a.md": large(1), "b.md": large(2), "c.md": large(3) });
+    const rank: Record<string, number> = { a: 0.9, b: 0.8, c: 0.7 };
+    const judge = evaluator((row, stage) =>
+      stage === "memories"
+        ? rank[path.basename(row.path, ".md")]
+        : evidence(row).includes("fact")
+          ? 0.9
+          : 0.1
+    );
+    const result = await runMemoryIntuition({
+      ...f,
+      cue: "alpha fact",
+      modelString: "openai:evaluator",
+      createModel: () => Promise.resolve(pinned(scriptedModel([]))),
+      resolveAgentBody: body,
+      createEvaluationModel: judge.createEvaluationModel,
+      evaluationService: judge.evaluationService,
+    });
+    expect(result).toMatchObject({
+      kind: "report",
+      memories: [
+        { path: entry("a.md").path, excerpt: "alpha fact 1" },
+        { path: entry("b.md").path, excerpt: "alpha fact 2" },
+      ],
+      candidates: [{ path: entry("c.md").path, relevance: 0.7 }],
+      stats: { filesRead: 2, steps: 2 },
+    });
+    expect(result.stats.bytesRead).toBeLessThanOrEqual(MEMORY_INTUITION_MAX_READ_BYTES);
+  });
+
+  it.each([0, 1])(
+    "fails closed without a loop retry when evaluation request %d fails",
+    async (failing) => {
+      using f = await fixture({ "a.md": "alpha" });
+      const judge = evaluator(
+        () => 0.9,
+        (call) => (call === failing ? "fail" : undefined)
+      );
+      const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+      const recordUsage = mock((_usage: unknown) => Promise.resolve());
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "openai:evaluator",
+        createModel,
+        resolveAgentBody: body,
+        createEvaluationModel: judge.createEvaluationModel,
+        evaluationService: judge.evaluationService,
+        recordUsage,
+      });
+      expect(createModel).not.toHaveBeenCalled();
+      expect(judge.calls).toHaveLength(failing + 1);
+      if (failing === 0) {
+        expect(result).toMatchObject({
+          kind: "error",
+          message: "Memory relevance evaluation failed (provider-failure/unknown).",
+          stats: { steps: 1 },
+        });
+        expect(recordUsage).not.toHaveBeenCalled();
+      } else {
+        // Stage 2 failed: only unverified leads, never recognized memories.
+        expect(result).toMatchObject({
+          kind: "report",
+          memories: [],
+          candidates: [{ path: entry("a.md").path, relevance: 0.9 }],
+          stats: { steps: 2 },
+        });
+        expect(recordUsage).toHaveBeenCalledTimes(1);
+        expect(recordUsage.mock.calls[0][0]).toMatchObject({ inputTokens: 100, outputTokens: 10 });
+      }
+    }
+  );
+
+  it.each([false, true])(
+    "never records unknown token counts as zero (both unknown=%s)",
+    async (bothUnknown) => {
+      using f = await fixture({ "a.md": "alpha" });
+      const judge = evaluator(
+        () => 0.9,
+        (call) => (call === 0 || bothUnknown ? "unknown-usage" : undefined)
+      );
+      const recordUsage = mock((_usage: unknown) => Promise.resolve());
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "openai:evaluator",
+        createModel: () => Promise.resolve(pinned(scriptedModel([]))),
+        resolveAgentBody: body,
+        createEvaluationModel: judge.createEvaluationModel,
+        evaluationService: judge.evaluationService,
+        recordUsage,
+      });
+      expect(result).toMatchObject({ kind: "report", memories: [{ excerpt: "alpha" }] });
+      if (bothUnknown) expect(recordUsage).not.toHaveBeenCalled();
+      else
+        expect(recordUsage.mock.calls).toMatchObject([
+          [
+            { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+            undefined,
+            "openai:evaluator-pricing",
+          ],
+        ]);
+    }
+  );
+
+  it("reports a deadline that expires during file reads as a timeout, not leads", async () => {
+    using f = await fixture({ "a.md": "alpha" });
+    const judge = evaluator(() => 0.9);
+    let entered!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    // Hold the post-stage-1 read (a slow memory hook) until the deadline fires.
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      if (judge.calls.length === 0) return next(); // index metadata authorization
+      entered();
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal?.addEventListener("abort", () => resolve())
+      );
+      await next();
+    });
+    const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+    const recordUsage = mock((_usage: unknown) => Promise.resolve());
+    const timer = spyOn(globalThis, "setTimeout");
+    try {
+      const pending = runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "openai:evaluator",
+        createModel,
+        resolveAgentBody: body,
+        createEvaluationModel: judge.createEvaluationModel,
+        evaluationService: judge.evaluationService,
+        hooks: hookConfig(f),
+        recordUsage,
+      });
+      await reading;
+      const expire = timer.mock.calls.find(
+        ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+      )?.[0];
+      if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+      expire();
+      expect(await pending).toMatchObject({
+        kind: "no_report",
+        stats: { timedOut: true, steps: 1 },
+      });
+      expect(judge.calls).toHaveLength(1);
+      expect(createModel).not.toHaveBeenCalled();
+      expect(recordUsage).toHaveBeenCalledTimes(1);
+    } finally {
+      timer.mockRestore();
+      unregister();
+    }
+  });
+
+  it("times out a stalled evaluation that ignores abort", async () => {
+    using f = await fixture({ "a.md": "alpha" });
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const judge = evaluator(
+      () => 0.9,
+      () => {
+        started();
+        return new Promise<never>(() => {
+          /* stalled provider */
+        });
+      }
+    );
+    const timer = spyOn(globalThis, "setTimeout");
+    const pending = runMemoryIntuition({
+      ...f,
+      cue: "alpha",
+      modelString: "openai:evaluator",
+      createModel: () => Promise.resolve(pinned(scriptedModel([]))),
+      resolveAgentBody: body,
+      createEvaluationModel: judge.createEvaluationModel,
+      evaluationService: judge.evaluationService,
+    });
+    try {
+      await ready;
+      const expire = timer.mock.calls.find(
+        ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+      )?.[0];
+      if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+      expire();
+      expect(await pending).toMatchObject({
+        kind: "no_report",
+        stats: { timedOut: true, steps: 1 },
+      });
+    } finally {
+      timer.mockRestore();
+    }
+  });
 });
