@@ -1,15 +1,22 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { useAPI } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { cn } from "@/common/lib/utils";
 
 interface HeldInputProps {
   workspaceId: string;
   heldInput: HeldInputData;
+  /** The composer's held-input shortcuts act on this banner (the oldest held input). */
+  isShortcutTarget: boolean;
 }
+
+const SHORTCUT_HINT_CLASS =
+  "bg-background-secondary text-muted border-border-medium rounded border px-1 py-px font-mono text-[10px] whitespace-nowrap [@media(max-width:768px)]:hidden";
 
 function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
@@ -65,6 +72,20 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     );
   };
 
+  // The composer's shortcuts (see ChatInput) arrive as an event so they share this banner's
+  // in-flight guard and error display with the buttons.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const { detail } = event as CustomEventType<typeof CUSTOM_EVENTS.HELD_INPUT_ACTION>;
+      if (detail.workspaceId !== props.workspaceId || detail.heldInputId !== props.heldInput.id) {
+        return;
+      }
+      runAction(detail.action);
+    };
+    window.addEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
+  }, [props.workspaceId, props.heldInput.id, runAction]);
+
   return (
     <ChatDockSurface>
       <div className="bg-surface-primary py-1.5" data-component="HeldInputBanner">
@@ -113,6 +134,11 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 <Trash2 className="size-3" />
               )}
               Discard
+              {props.isShortcutTarget && (
+                <kbd className={SHORTCUT_HINT_CLASS}>
+                  {formatKeybind(KEYBINDS.DISCARD_HELD_INPUT)}
+                </kbd>
+              )}
             </button>
             <button
               type="button"
@@ -127,6 +153,9 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 <Send className="size-3" />
               )}
               Send
+              {props.isShortcutTarget && (
+                <kbd className={SHORTCUT_HINT_CLASS}>{formatKeybind(KEYBINDS.SEND_HELD_INPUT)}</kbd>
+              )}
             </button>
           </div>
         </div>

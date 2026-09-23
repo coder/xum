@@ -337,6 +337,61 @@ describe("Held (refused) queued messages", () => {
     }
   }, 90_000);
 
+  test("the held-input shortcuts act on the oldest held input from an empty composer and do nothing while the composer has text", async () => {
+    const app = await createAppHarness({ branchPrefix: "held-keys" });
+    try {
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      for (const text of ["oldest follow-up", "newer follow-up"]) {
+        session.queueMessage(
+          text,
+          { model: "openai:gpt-5.2", agentId: "exec" },
+          { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
+        );
+      }
+      session.drainQueuedMessagesIfIdle();
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(2), LOAD_TOLERANT_WAIT);
+      // Only the shortcut target (the oldest) shows the hints.
+      expect(heldBanners(app).map((banner) => banner.querySelectorAll("kbd").length)).toEqual([
+        2, 0,
+      ]);
+      const composer = () =>
+        [...app.view.container.querySelectorAll('textarea[aria-label="Message Claude"]')].at(
+          -1
+        ) as HTMLTextAreaElement;
+      const press = (shortcut: "send" | "discard") =>
+        fireEvent.keyDown(composer(), {
+          key: shortcut === "send" ? "Enter" : "Backspace",
+          ctrlKey: true,
+          altKey: true,
+        });
+
+      // While typing, the shortcut is not taken.
+      await app.chat.typeWithoutSending("still typing");
+      press("discard");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(heldBanners(app)).toHaveLength(2);
+      expect(session.getHeldInputs()).toHaveLength(2);
+
+      // From an empty composer, Discard removes the oldest.
+      await app.chat.typeWithoutSending("");
+      press("discard");
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
+      expect(session.getHeldInputs().map((held) => held.send.displayText)).toEqual([
+        "newer follow-up",
+      ]);
+      expect(heldBanners(app)[0].querySelectorAll("kbd")).toHaveLength(2);
+
+      // Send sends the (now) oldest one, once.
+      press("send");
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(0), LOAD_TOLERANT_WAIT);
+      await app.chat.expectStreamComplete();
+      expect(await userRowsContaining(app, "newer follow-up")).toHaveLength(1);
+      expect(await userRowsContaining(app, "oldest follow-up")).toHaveLength(0);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
   test("the default restore (a Stop's queued input) still replaces the draft", async () => {
     const app = await createAppHarness({ branchPrefix: "unsent-replace" });
     try {

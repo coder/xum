@@ -29,6 +29,13 @@ export const CUSTOM_EVENTS = {
   CLEAR_CHAT_COMPOSER: "mux:clearChatComposer",
 
   /**
+   * Event asking a held-input banner to run its Send or Discard action (keyboard shortcut from
+   * the composer), so the shortcut shares the banner's in-flight guard and error display.
+   * Detail: { workspaceId: string; heldInputId: string; action: "send" | "discard" }
+   */
+  HELD_INPUT_ACTION: "mux:heldInputAction",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -151,6 +158,11 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;
+  };
+  [CUSTOM_EVENTS.HELD_INPUT_ACTION]: {
+    workspaceId: string;
+    heldInputId: string;
+    action: "send" | "discard";
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload

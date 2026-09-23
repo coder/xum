@@ -1978,12 +1978,19 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   }
   // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
   // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
-  for (const heldInput of props.heldInputs) {
+  for (const [index, heldInput] of props.heldInputs.entries()) {
     decorationEntries.push(
       createChatInputDecorationStackItem({
         key: `held-input-${heldInput.id}`,
         revealBeforeReady: true,
-        node: <HeldInput workspaceId={props.workspaceId} heldInput={heldInput} />,
+        node: (
+          <HeldInput
+            workspaceId={props.workspaceId}
+            heldInput={heldInput}
+            // The composer's held-input shortcuts act on the oldest one (see ChatInput).
+            isShortcutTarget={index === 0}
+          />
+        ),
       })
     );
   }
@@ -2121,6 +2128,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}
         onQueuedActionError={props.onQueuedActionError}
         onSendQueuedImmediately={props.onSendQueuedImmediately}
+        heldInputId={props.heldInputs[0]?.id}
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
         onDetachReview={reviews.detachReview}

@@ -66,6 +66,8 @@ export interface ChatInputWorkspaceVariant {
   onQueuedDispatchModeChange?: (mode: QueueDispatchMode) => Promise<void>;
   onQueuedActionError?: (error: unknown) => void;
   onSendQueuedImmediately?: () => Promise<void>;
+  /** Oldest held (refused, unsent) input: the one the held-input shortcuts act on. */
+  heldInputId?: string;
   /** Optional explanation displayed when input is disabled */
   disabledReason?: string;
   onReady?: (api: ChatInputAPI) => void;
