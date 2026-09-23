@@ -541,13 +541,21 @@ interface AdmittedSend {
  * are held and refused exactly the same way, and no ownership, settlement or receipt authority is
  * granted to obtain the hold. Lifetime is explicit, never
  * a count: dropped once no pending/enqueued obligation of the attempt remains to read it, and
- * when a new attempt begins in this process (sends bound to the old id read stale anyway).
+ * when a new attempt begins in this process (sends bound to the old id read stale anyway). A
+ * terminal (`published`/`indeterminate`) decision additionally stays while the reporting turn it
+ * was decided for is live: input sent after it resolved but before that turn settles targets the
+ * same attempt and must still find it (preflight refusal, or the dequeue gate's refusal).
  */
 interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
+  /**
+   * The session's turn generation the stream ended in (undefined when none was live, or once it
+   * settled). Rebound on supersession like a stop record's captured turns.
+   */
+  turn: symbol | undefined;
 }
 
 interface TaskLaunchPlan {
@@ -2419,6 +2427,14 @@ export class TaskService implements AgentTaskIntegration {
         this.dischargeAdmittedSend(send);
       }
     }
+    // A terminal decision held for this turn's late readers: only actual readers keep it now.
+    let decisionTurnSettled = false;
+    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
+      if (decision.turn !== turnGeneration) continue;
+      decision.turn = undefined;
+      decisionTurnSettled = true;
+    }
+    if (decisionTurnSettled) this.pruneStreamEndDecisions(workspaceId);
     const record = this.workspaceStopRecords.get(workspaceId);
     if (!record?.capturedTurns.has(turnGeneration)) return;
     record.capturedTurns.delete(turnGeneration);
@@ -2435,6 +2451,9 @@ export class TaskService implements AgentTaskIntegration {
     if (previous === next) return;
     for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
       if (send.state === "admitted" && send.turnId === previous) send.turnId = next;
+    }
+    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
+      if (decision.turn === previous) decision.turn = next;
     }
     const record = this.workspaceStopRecords.get(workspaceId);
     if (!record?.capturedTurns.has(previous)) return;
@@ -2581,6 +2600,7 @@ export class TaskService implements AgentTaskIntegration {
       attemptId,
       messageId,
       outcome: "pending",
+      turn: this.workspaceService.getActiveTurnGeneration(taskId),
     };
     const decisions = this.streamEndDecisionsByTaskId.get(taskId) ?? [];
     decisions.push(decision);
@@ -2639,7 +2659,11 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
-  /** Drop resolved decisions no pending/enqueued obligation of their attempt can still read. */
+  /**
+   * Drop resolved decisions no pending/enqueued obligation of their attempt can still read — a
+   * terminal one only once its reporting turn settled too (a later reader can still arrive while
+   * that turn is live; see StreamEndDecision).
+   */
   private pruneStreamEndDecisions(taskId: string): void {
     const decisions = this.streamEndDecisionsByTaskId.get(taskId);
     if (decisions == null) return;
@@ -2648,7 +2672,10 @@ export class TaskService implements AgentTaskIntegration {
       if (send.state === "pending" || send.state === "enqueued") readers.add(send.attemptId);
     }
     const kept = decisions.filter(
-      (decision) => decision.outcome === "pending" || readers.has(decision.attemptId)
+      (decision) =>
+        decision.outcome === "pending" ||
+        readers.has(decision.attemptId) ||
+        (decision.outcome !== "nonreport" && decision.turn != null)
     );
     if (kept.length === 0) this.streamEndDecisionsByTaskId.delete(taskId);
     else if (kept.length !== decisions.length) this.streamEndDecisionsByTaskId.set(taskId, kept);

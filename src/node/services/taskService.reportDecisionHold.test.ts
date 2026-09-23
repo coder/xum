@@ -145,13 +145,18 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       owner: string | undefined;
     }> = [];
     let streaming = false;
-    const ledger: { svc?: Internals } = {};
+    const ledger: { svc?: Internals; host?: EventEmitter } = {};
     const sessionHarness = await createAgentSessionHarness({
       workspaceId: childId,
       config,
       historyService,
       aiEmitter,
       captureEvents: true,
+      // Turn settlement reaches TaskService the way WorkspaceService's own sessions report it.
+      onTurnSettled: (turnGeneration) =>
+        ledger.host?.emit("workspace-turn-settled", { workspaceId: childId, turnGeneration }),
+      onTurnSuperseded: (previous, next) =>
+        ledger.host?.emit("workspace-turn-superseded", { workspaceId: childId, previous, next }),
       aiServiceOverrides: {
         isStreaming: () => streaming,
         getWorkspaceMetadata: mock(async (workspaceId: string) => {
@@ -228,6 +233,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       childId,
       sessionHarness.session
     );
+    ledger.host = workspaceService as unknown as EventEmitter;
     const terminalAttentionStore = new TerminalAttentionStore(config);
     const taskService = new TaskService(
       config,
@@ -372,6 +378,56 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  test("a manual follow-up sent after the report decision resolved but before the reporting turn settles is refused, never queued or dispatched under the completed attempt; the decision drops when that turn settles", async () => {
+    const childId = "holdlate001";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, streamStarts, sendOptions } =
+      stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(completions).toHaveLength(1);
+      // The report turn ends on a terminal agent_report; the session has not finished the turn.
+      const event = stack.endStream(0, { report: "done" }, false);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      await until(() => !svc.ownedAttemptByTaskId.has(childId), "release");
+      // The decision resolved with no reader queued yet. The user's follow-up arrives now, while
+      // the reporting turn is still live: it targets the completed attempt, so it is refused in
+      // its preflight (fail closed, text stays with the caller) instead of queueing behind the
+      // turn and dispatching once the decision is gone.
+      expect(await workspaceService.sendMessage(childId, "late follow-up", sendOptions)).toEqual(
+        Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+      );
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      stack.completeStream(0, event);
+      await until(() => !stack.sessionHarness.session.isBusy(), "reporting turn settled");
+      await yieldMacrotasks(5);
+      // No second stream: nothing ran under the completed attempt.
+      expect(completions).toHaveLength(1);
+      expect(streamStarts.map((start) => start.messageId)).toEqual(["assistant-1"]);
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "reported",
+        taskAttemptId: attemptA,
+      });
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      // Nor was it accepted as a user turn of that attempt.
+      const history = await fixture.historyService.getLastMessages(childId, 10);
+      expect(history.success && history.data.map((message) => message.role)).toEqual(["user"]);
+      // Its obligation was discharged, and the decision is gone once the reporting turn settled
+      // (bounded: nothing retained past the turn it was decided for).
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      // After the turn settled, a manual send is a new admission that mints a fresh attempt.
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(false);
+      expect(entryOf(config, childId)?.taskAttemptId).not.toBe(attemptA);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("the refused follow-up's unsent input is retained until the renderer acknowledges it: every onChat replay re-sends it under one restore id", async () => {
     // The renderer subscribes to onChat only for the workspace it shows, so a refusal that lands
