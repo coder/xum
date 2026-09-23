@@ -2,6 +2,7 @@ import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
 import { xai } from "@ai-sdk/xai";
+import { z } from "zod";
 import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -17,6 +18,7 @@ import {
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
+import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -388,8 +390,10 @@ describe("ProviderModelFactory.createModel", () => {
         return;
       }
 
+      // `<name>.chat` is the OpenAI-compatible Chat adapter's provider id (the completion
+      // adapter reports `<name>.completion`). createModel wraps every v4 model in the
+      // tool-input depth guard, so the concrete class is no longer observable here.
       expect((listedModel.data as { provider?: unknown }).provider).toBe("local-vllm.chat");
-      expect(listedModel.data.constructor.name).toMatch(/OpenAICompatibleChatLanguageModel$/);
 
       const unlistedModel = await factory.createModel("local-vllm:any-other-id");
       expect(unlistedModel.success).toBe(true);
@@ -1061,7 +1065,11 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       );
       expect(result.data.routeProvider).toBe("github-copilot");
       expect(result.data.effectiveModelString).toBe("github-copilot:gpt-5.3-codex");
-      expect(result.data.model.constructor.name).toBe("CopilotResponsesLanguageModel");
+      // The depth guard wraps every object model, so the v2 Copilot Responses class is
+      // observable only through its provider id; the wrapper reports the SDK-adapted v4.
+      expect((result.data.model as { specificationVersion?: unknown }).specificationVersion).toBe(
+        "v4"
+      );
     });
   });
 
@@ -1234,9 +1242,82 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
 
       expect((result.data as { provider?: unknown }).provider).toBe("github-copilot.responses");
-      expect(result.data.constructor.name).toBe("CopilotResponsesLanguageModel");
+      expect((result.data as { specificationVersion?: unknown }).specificationVersion).toBe("v4");
     });
   });
+
+  it.each([
+    ["deep (depth 2100) arguments are rejected before parsing and never executed", 2100, false],
+    ["shallow arguments pass through and execute", 1, true],
+  ])(
+    "guards the v2 Copilot Responses model via the actual factory route: %s",
+    async (_label, depth, expectExecuted) => {
+      await withTempConfig(async (_config, factory, _oauth, providersConfigStore) => {
+        const argumentsText = `{"payload":${"[".repeat(depth - 1)}1${"]".repeat(depth - 1)}}`;
+        const responsesFetch = () =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_deep",
+                created_at: 0,
+                model: "gpt-5.3-codex",
+                output: [
+                  {
+                    type: "function_call",
+                    id: "fc_1",
+                    call_id: "call_deep",
+                    name: "permissive",
+                    arguments: argumentsText,
+                    status: "completed",
+                  },
+                ],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { headers: { "Content-Type": "application/json" } }
+            )
+          );
+        spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+          "github-copilot": {
+            apiKey: COPILOT_TOKEN,
+            models: ["gpt-5.3-codex"],
+            fetch: responsesFetch,
+          },
+        } as unknown as ProvidersConfig);
+
+        const created = await factory.createModel("github-copilot:gpt-5.3-codex");
+        expect(created.success).toBe(true);
+        if (!created.success) return;
+        expect((created.data as { provider?: unknown }).provider).toBe("github-copilot.responses");
+
+        const executed: unknown[] = [];
+        const result = await generateText({
+          model: created.data,
+          prompt: "call the tool",
+          tools: {
+            // Accepts ANY object: a valid-JSON replacement would validate and execute.
+            permissive: tool({
+              description: "permissive",
+              inputSchema: z.record(z.string(), z.unknown()),
+              execute: (input: unknown) => {
+                executed.push(input);
+                return Promise.resolve({ ok: true });
+              },
+            }),
+          },
+        });
+        const toolCall = result.content.find((part) => part.type === "tool-call");
+        if (toolCall?.type !== "tool-call") throw new Error("Expected a tool-call part");
+        if (expectExecuted) {
+          expect(executed).toEqual([JSON.parse(argumentsText)]);
+          expect(toolCall.invalid).not.toBe(true);
+        } else {
+          expect(executed).toEqual([]);
+          expect(toolCall.invalid).toBe(true);
+          expect(toolCall.input).toBe(TOOL_PAYLOAD_DEPTH_REJECTION);
+        }
+      });
+    }
+  );
 
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {

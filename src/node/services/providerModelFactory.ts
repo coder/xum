@@ -68,6 +68,7 @@ import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coder
 import type { DevToolsService } from "@/node/services/devToolsService";
 import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
+import { createToolInputDepthGuardMiddleware } from "@/node/services/toolInputDepthGuardMiddleware";
 import {
   attachLanguageModelCleanup,
   moveLanguageModelCleanup,
@@ -1368,16 +1369,35 @@ export class ProviderModelFactory {
         return result;
       }
 
-      // DevTools middleware wrappers currently support LanguageModelV3 instances only.
-      if (typeof result.data === "string" || result.data.specificationVersion !== "v4") {
+      if (typeof result.data === "string") {
         return result;
       }
+      const coreModel = result.data;
 
-      let model: LanguageModel = result.data;
+      // Innermost wrapper for EVERY object model: reject over-deep tool-call input
+      // before the SDK parses it (see createToolInputDepthGuardMiddleware).
+      // wrapLanguageModel adapts v2/v3 models through the SDK's own
+      // asLanguageModelV4, exactly as streamText/generateText do before consuming
+      // them, so CopilotResponses (v2) and any v3 provider are guarded too — an
+      // early return for non-v4 models here left them unguarded. DevTools wraps
+      // outside so it records what the SDK actually saw.
+      let model: LanguageModel = wrapLanguageModel({
+        model: coreModel,
+        middleware: createToolInputDepthGuardMiddleware(),
+      });
+      moveLanguageModelCleanup(coreModel, model);
 
+      // Preserve DevTools' existing v4-only scope using the core model's version:
+      // the depth-guard wrapper above always reports v4.
+      // (turnRequestBuilder queues run metadata by the returned version; an entry
+      // nothing consumes is keyed per request and cleared by that request.)
       const workspaceId = opts?.workspaceId;
       const devToolsService = self.devToolsService;
-      if (workspaceId != null && devToolsService?.enabled) {
+      if (
+        coreModel.specificationVersion === "v4" &&
+        workspaceId != null &&
+        devToolsService?.enabled
+      ) {
         const innerModel = model;
         model = wrapLanguageModel({
           model,
