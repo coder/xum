@@ -11738,6 +11738,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Stop/edit restoration returns queued input to the composer as plain text, which would drop
    * the structured review metadata (a resent envelope is neutralized and never enters review
    * state). The caller keeps its drafts and sends again once the turn finishes.
+   *
+   * Acceptance can be asynchronous: when the send trips on-send auto-compaction, only the
+   * compaction request is appended now, carrying the feedback (text and plan-review metadata)
+   * as its nested follow-up, and the authentic feedback row lands exactly once when that
+   * follow-up dispatches (also across failure, restart and Stop; see
+   * agentSession.planReviewCompactionHandoff.test.ts). The returned state reflects committed
+   * review records, so it omits such feedback until then; clients refresh from transcript events.
    */
   async planReviewSubmitFeedback(
     workspaceId: string,

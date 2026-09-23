@@ -4,7 +4,11 @@ import assert from "@/common/utils/assert";
 import type { PlanReviewError } from "@/common/types/errors";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
-import { createMuxMessage, pickStartupRetrySendOptions } from "@/common/types/message";
+import {
+  createMuxMessage,
+  pickPreservedSendOptions,
+  pickStartupRetrySendOptions,
+} from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import {
@@ -389,12 +393,17 @@ export async function preparePlanReviewFeedback(
     workspaceId
   );
   // When the send trips on-send auto-compaction, the persisted row is the compaction REQUEST,
-  // which carries the envelope twice (prompt text and metadata.parsed.followUpContent.text), and
-  // the later summary boundary carries it again beside the model's summary. Budget that larger
-  // derived shape — the ordinary row plus a second escaped copy of the envelope — so no row the
-  // feedback can produce exceeds the history line limit (an oversized boundary row would make
-  // provider-history boundary detection fall back to the previous boundary).
-  const derivedRowBytes = rowBytes + Buffer.byteLength(JSON.stringify(text), "utf8");
+  // which carries the envelope twice (prompt text and metadata.parsed.followUpContent.text) and
+  // the send options twice (retrySendOptions and the follow-up's preserved options), and the
+  // later summary boundary carries the follow-up again beside the model's summary. Budget that
+  // larger derived shape — the ordinary row plus a second escaped copy of the envelope and of the
+  // preserved options — so no row the feedback can produce exceeds the history line limit (an
+  // oversized boundary row would make provider-history boundary detection fall back to the
+  // previous boundary).
+  const derivedRowBytes =
+    rowBytes +
+    Buffer.byteLength(JSON.stringify(text), "utf8") +
+    Buffer.byteLength(JSON.stringify(pickPreservedSendOptions(options)), "utf8");
   const maxRowBytes = SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES;
   if (derivedRowBytes > maxRowBytes) {
     return Err({
