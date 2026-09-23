@@ -26,6 +26,7 @@ function renderWithProviders(ui: ReactElement) {
 
 const WINDOW_ROW = '[data-testid="session-history-window"]';
 const ITEM_ROW = '[data-testid="session-history-item"]';
+const ERROR_BOX = '[data-testid="session-history-error"]';
 const EXCERPT = '[data-testid="session-history-excerpt"]';
 const PAGE = '[data-testid="session-history-page"]';
 const SCOPE = '[data-testid="session-history-scope"]';
@@ -260,8 +261,7 @@ describe("SessionHistoryToolCall", () => {
   });
 
   test("a wrapped failure arriving as completed shows failed in the header", () => {
-    // The displayed-message builder checks only the outer SDK wrapper, so these arrive as
-    // "completed" even though the tool reported a failure.
+    // hasFailureResult checks only the outer SDK wrapper, so these arrive as "completed".
     const wrapped = renderWithProviders(
       <SessionHistoryToolCall
         args={{ action: "search", query: "token" }}
@@ -271,7 +271,7 @@ describe("SessionHistoryToolCall", () => {
       />
     );
     expect(wrapped.container.querySelector(".status-text")?.textContent).toBe("failed");
-    const error = wrapped.container.querySelector('[data-testid="session-history-error"]');
+    const error = wrapped.container.querySelector(ERROR_BOX);
     expect(error?.textContent).toBeTruthy();
     expect(error?.textContent).not.toContain("history_timeout");
     cleanup();
@@ -298,8 +298,7 @@ describe("SessionHistoryToolCall", () => {
         result={{ success: false, error: "filters_unsupported" }}
       />
     );
-    const windowsError =
-      windows.container.querySelector('[data-testid="session-history-error"]')?.textContent ?? "";
+    const windowsError = windows.container.querySelector(ERROR_BOX)?.textContent ?? "";
     // list_windows accepts recent_first; only read_item rejects it.
     expect(windowsError).toContain("role");
     expect(windowsError).not.toContain("recent_first");
@@ -313,9 +312,7 @@ describe("SessionHistoryToolCall", () => {
         result={{ success: false, error: "filters_unsupported" }}
       />
     );
-    expect(
-      read.container.querySelector('[data-testid="session-history-error"]')?.textContent
-    ).toContain("recent_first");
+    expect(read.container.querySelector(ERROR_BOX)?.textContent).toContain("recent_first");
   });
 
   test("unknown or malformed warnings keep the rows; unknown codes render verbatim", () => {

@@ -53,9 +53,9 @@ type SessionHistoryItem = NonNullable<SessionHistoryToolResult["items"]>[number]
 type SessionHistoryWindow = NonNullable<SessionHistoryToolResult["windows"]>[number];
 type SessionHistoryWarning = NonNullable<SessionHistoryToolResult["warnings"]>[number];
 
-// Card-local display schema. Warnings are advisory, so a persisted result carrying a newer
-// backend's warning code must still render its rows (the code renders verbatim). The tool's
-// result schema stays strict because the backend emits only known codes.
+// Warnings are advisory, so a persisted result carrying a newer backend's warning code must
+// still render its rows (the code renders verbatim). The tool's result schema stays strict
+// because the backend emits only known codes.
 const DisplayResultSchema = TOOL_DEFINITIONS.session_history.resultSchema.extend({
   warnings: z.array(z.string()).optional(),
 });
@@ -193,8 +193,8 @@ function countLabel(
 }
 
 /**
- * Warnings are advisory, so malformed ones must never hide the rows (self-healing): keep only
- * string codes, deduplicated, and drop the key when it is not an array or nothing remains.
+ * Malformed warnings must not fail the parse and hide the rows. Keeps only string codes,
+ * deduplicated because each code keys its note line.
  */
 function sanitizeWarnings(value: unknown): unknown {
   if (!isPlainObject(value) || !Object.hasOwn(value, "warnings")) return value;
@@ -420,10 +420,9 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem }> = (props) => {
     <div data-testid="session-history-excerpt" className="bg-code-bg rounded px-3 py-2">
       <div className="mb-1.5 flex min-w-0 items-center gap-2">
         <Chip tone={lookup(ROLE_TONES, item.role) ?? FALLBACK_ROLE_TONE}>{item.role}</Chip>
-        {/* The ~90-char item ID must absorb the shrink, not the role chip: with equal shrink
-            weights `ASSISTANT` truncated at phone widths. A zero flex basis leaves the chip its
-            content width; min-w-16 keeps a sliver of the ID when a long unknown role label
-            still has to truncate. */}
+        {/* The ~90-char item ID absorbs the shrink so the role chip keeps its content width at
+            phone widths (flex-1 has a zero basis); min-w-16 keeps a sliver of the ID when a
+            long unknown role label still has to truncate. */}
         <span className="text-muted min-w-16 flex-1 truncate text-[10px]">
           {item.itemId} · {item.windowId}
         </span>
@@ -629,11 +628,9 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
     <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
   );
   // A completed call whose output is present but is not a parsed success shows as failed in
-  // the header. The displayed-message builder checks only the outer SDK wrapper, so a wrapped
-  // `{ type: "json", value: { success: false, error } }` (or a nested bare `{ error }`, which
-  // normalizeToolResultForRendering maps to success: false) arrives as "completed". Output
-  // that fails the result schema keeps the "Result unavailable" diagnostic in the body.
-  // Absent output (null) keeps its transport status.
+  // the header: hasFailureResult checks only the outer SDK wrapper, so a wrapped failure or
+  // nested bare `{ error }` arrives as "completed". Output that fails the result schema keeps
+  // the "Result unavailable" diagnostic in the body. Absent output keeps its transport status.
   const headerStatus: ToolStatus =
     status === "completed" && props.result != null && result?.success !== true ? "failed" : status;
   const statusNode = (
