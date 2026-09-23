@@ -20,6 +20,7 @@ import {
   SESSION_HISTORY_MAX_WINDOW_LIMIT,
   SESSION_HISTORY_DEFAULT_READ_CHARS,
   SESSION_HISTORY_MAX_RESULT_BYTES,
+  getSessionHistorySearchLeadInChars,
 } from "@/common/constants/contextBudget";
 import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -436,9 +437,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                     args.action === "read_item"
                       ? (args.limit_chars ?? SESSION_HISTORY_DEFAULT_READ_CHARS)
                       : (args.max_chars_per_item ?? SESSION_HISTORY_SEARCH_SNIPPET_CHARS);
-                  // Lead-in context before a match never spends more than half of a
-                  // short snippet allowance, so the matched substring stays visible.
-                  const leadIn = Math.min(120, Math.floor(requested / 2));
+                  const leadIn = getSessionHistorySearchLeadInChars(requested);
                   // Manual offsets inside a pair round back to include that character.
                   const start = surrogateSafeOffset(
                     text,

@@ -194,6 +194,83 @@ describe("SessionHistoryToolCall", () => {
     expect(view.container.textContent).toContain("not-an-array");
   });
 
+  test("a search suffix without a continuation still shows its mid-row start", () => {
+    // max_chars_per_item 40 → the backend leads in 20 chars before the first match.
+    const leadIn = 20;
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "needle", max_chars_per_item: 40 }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          items: [
+            // Snippet started mid-row and ran to the row end: match sits exactly leadIn in.
+            { itemId: "1", windowId: "w:0", role: "user", text: `${"x".repeat(leadIn)}needle end` },
+            // Match nearer the start proves the snippet begins at the row start.
+            { itemId: "2", windowId: "w:0", role: "user", text: "short needle row" },
+            // A continuation pins the start: nextCharOffset - text.length = 0.
+            { itemId: "3", windowId: "w:0", role: "user", text: "needle head", nextCharOffset: 11 },
+          ],
+        }}
+      />
+    );
+    const snippets = Array.from(
+      view.container.querySelectorAll('[data-testid="session-history-snippet"]')
+    ).map((node) => node.textContent ?? "");
+    expect(snippets.map((text) => text.startsWith("…"))).toEqual([true, false, false]);
+  });
+
+  test("has_more guidance only names filters the action accepts", () => {
+    const windows = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "list_windows" }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          has_more: true,
+          windows: [{ windowId: "w:0", boundaryKind: "root", itemCount: 1 }],
+        }}
+      />
+    );
+    // list_windows rejects role/tool_name (filters_unsupported).
+    expect(windows.container.textContent).not.toMatch(/tool_name|role/);
+    cleanup();
+
+    const search = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "x" }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          has_more: true,
+          items: [{ itemId: "1", windowId: "w:0", role: "user", text: "x" }],
+        }}
+      />
+    );
+    expect(search.container.textContent).toContain("tool_name");
+  });
+
+  test("the raw fallback redacts attachment payloads", () => {
+    const payload = "QkFTRTY0".repeat(64);
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "token" }}
+        status="completed"
+        defaultExpanded
+        result={{
+          type: "content",
+          value: [{ type: "media", mediaType: "image/png", data: payload }],
+        }}
+      />
+    );
+    fireEvent.click(view.getByRole("button", { name: /raw input/ }));
+    expect(view.container.textContent).toContain("image/png");
+    expect(view.container.textContent).not.toContain(payload);
+  });
+
   test("list_items names its window in the header, so the scope omits the window chip", () => {
     const view = renderWithProviders(
       <SessionHistoryToolCall

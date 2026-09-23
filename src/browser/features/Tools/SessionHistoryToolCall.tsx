@@ -11,6 +11,10 @@ import {
 import { cn } from "@/common/lib/utils";
 import type { SessionHistoryToolArgs, SessionHistoryToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import {
+  SESSION_HISTORY_SEARCH_SNIPPET_CHARS,
+  getSessionHistorySearchLeadInChars,
+} from "@/common/constants/contextBudget";
 import { escapeRegex } from "@/browser/utils/highlighting/highlightSearchTerms";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import {
@@ -25,6 +29,7 @@ import {
   ToolHeader,
   ToolIcon,
 } from "./Shared/ToolPrimitives";
+import { redactToolResultAttachmentsForDisplay } from "./Shared/toolResultDisplay";
 import {
   getStatusDisplay,
   normalizeToolResultForRendering,
@@ -130,6 +135,25 @@ function plural(n: number, more: boolean, singular: string, pluralForm: string):
 function pageStart(item: SessionHistoryItem, requestedOffset: number | null | undefined): number {
   if (item.nextCharOffset != null) return Math.max(0, item.nextCharOffset - item.text.length);
   return requestedOffset ?? 0;
+}
+
+interface SearchSnippetRule {
+  /** Non-global, so `String#search` finds the first match like the backend does. */
+  matcher: RegExp;
+  leadIn: number;
+}
+
+/**
+ * Whether a list/search snippet starts mid-row. A continuation pins the start exactly. Without
+ * one the snippet ran to the row end and its start is not reported: list_items snippets always
+ * start at the row start, while the backend starts a search snippet at max(0, match - leadIn).
+ * A mid-row start therefore puts the first match exactly leadIn characters in (one more if a
+ * surrogate pair was kept whole), and a match nearer the start proves the snippet is not cut.
+ */
+function snippetStartsMidRow(item: SessionHistoryItem, search: SearchSnippetRule | null): boolean {
+  if (item.nextCharOffset != null) return pageStart(item, null) > 0;
+  if (search == null || search.leadIn === 0) return false;
+  return item.text.search(search.matcher) >= search.leadIn;
 }
 
 function countLabel(
@@ -301,7 +325,19 @@ const WindowRail: React.FC<{ windows: SessionHistoryWindow[]; recentFirst: boole
 };
 
 /** list_items / search: rows grouped under their window, snippet with the match lit. */
-const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> = (props) => {
+const ItemList: React.FC<{
+  items: SessionHistoryItem[];
+  query: string | null;
+  snippetChars: number | null | undefined;
+}> = (props) => {
+  const search: SearchSnippetRule | null = props.query
+    ? {
+        matcher: new RegExp(escapeRegex(props.query), "iu"),
+        leadIn: getSessionHistorySearchLeadInChars(
+          props.snippetChars ?? SESSION_HISTORY_SEARCH_SNIPPET_CHARS
+        ),
+      }
+    : null;
   // Consecutive rows of one window share a group; a recurring window opens a new group.
   const groups: Array<{ windowId: string; items: SessionHistoryItem[] }> = [];
   for (const item of props.items) {
@@ -320,9 +356,7 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
           </div>
           <div className="flex flex-col gap-1.5">
             {group.items.map((item, ii) => {
-              // A continuation offset pins where the snippet sits inside its row; without one
-              // the snippet reached the row end and its start is unknown, so no lead ellipsis.
-              const cutBefore = item.nextCharOffset != null && pageStart(item, null) > 0;
+              const cutBefore = snippetStartsMidRow(item, search);
               return (
                 <div
                   key={`${item.itemId}:${ii}`}
@@ -338,7 +372,10 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
                       {item.itemId}
                     </span>
                   </div>
-                  <div className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap">
+                  <div
+                    data-testid="session-history-snippet"
+                    className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap"
+                  >
                     {cutBefore && <span className="text-muted">…</span>}
                     <HighlightedText text={item.text} query={props.query} />
                     {item.nextCharOffset != null && <span className="text-muted">…</span>}
@@ -388,14 +425,23 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem; requestedOffset?: number
   );
 };
 
-const ResultNotes: React.FC<{ result: SessionHistoryToolResult }> = (props) => {
+// has_more guidance names only options the action accepts: the backend rejects role and
+// tool_name on list_windows, and a smaller limit never reveals omitted results.
+const HAS_MORE_NOTES: Record<Exclude<SessionHistoryAction, "read_item">, string> = {
+  list_windows: "More windows exist beyond this response.",
+  list_items:
+    "More rows exist beyond this response. Narrow with window_id, role or tool_name, or walk newest-first with recent_first.",
+  search:
+    "More matches exist beyond this response. Narrow with window_id, role or tool_name, or walk newest-first with recent_first.",
+};
+
+const ResultNotes: React.FC<{ action: SessionHistoryAction; result: SessionHistoryToolResult }> = (
+  props
+) => {
   const lines: Array<{ key: string; warn: boolean; text: string }> = [];
-  if (props.result.has_more) {
-    lines.push({
-      key: "more",
-      warn: false,
-      text: "More results exist beyond this response. Narrow with window_id, role, tool_name or a smaller limit.",
-    });
+  // read_item never reports has_more.
+  if (props.result.has_more && props.action !== "read_item") {
+    lines.push({ key: "more", warn: false, text: HAS_MORE_NOTES[props.action] });
   }
   if (props.result.truncated) {
     lines.push({
@@ -517,7 +563,11 @@ const ResultBody: React.FC<{
     case "list_items":
     case "search":
       return items.length > 0 ? (
-        <ItemList items={items} query={args.action === "search" ? (args.query ?? null) : null} />
+        <ItemList
+          items={items}
+          query={args.action === "search" ? (args.query ?? null) : null}
+          snippetChars={args.max_chars_per_item}
+        />
       ) : (
         empty("No matching rows.")
       );
@@ -573,11 +623,16 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
           <div className="flex flex-col gap-2">
             <ScopeChips args={args} />
             <ResultBody args={args} result={result} status={status} />
-            {result?.success && <ResultNotes result={result} />}
+            {result?.success && <ResultNotes action={args.action} result={result} />}
             {result?.success && result.notice && (
               <div className="text-muted text-[10px] opacity-70">{result.notice}</div>
             )}
-            <RawToggle args={args} result={unwrapResult(props.result)} />
+            {/* Same attachment redaction as GenericToolCall: a legacy content-style result
+                must not push encoded media through JSON highlighting. */}
+            <RawToggle
+              args={args}
+              result={redactToolResultAttachmentsForDisplay(unwrapResult(props.result))}
+            />
           </div>
         </ToolDetails>
       )}
