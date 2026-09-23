@@ -289,7 +289,20 @@ async function runPackagedSmokeApp(
 async function main(): Promise<void> {
   assert(process.platform === "darwin", "checkMacAttachFileRuntime.ts only runs on macOS");
 
-  const requestedAppBundle = process.argv[2];
+  // `--arch <x64|arm64>` checks a single-architecture build (CI builds each arch on its
+  // own runner). Only the host's native arch is launched for the smoke run; other arches
+  // get the static sharp-asset verification, matching the two-arch default below, which
+  // likewise only launches the native bundle.
+  const args = process.argv.slice(2);
+  const archFlagIndex = args.indexOf("--arch");
+  let requestedArchitecture: MacAppArchitecture | null = null;
+  if (archFlagIndex !== -1) {
+    const value = args[archFlagIndex + 1];
+    assert(value === "x64" || value === "arm64", `--arch expects x64 or arm64, got ${value}`);
+    requestedArchitecture = value;
+    args.splice(archFlagIndex, 2);
+  }
+  const requestedAppBundle = args[0];
   let appBundles: string[];
   let smokeAppBundle: string;
   if (requestedAppBundle != null) {
@@ -323,7 +336,9 @@ async function main(): Promise<void> {
   }
 
   if (requestedAppBundle == null) {
-    for (const requiredArchitecture of ["x64", "arm64"] as const) {
+    const requiredArchitectures: readonly MacAppArchitecture[] =
+      requestedArchitecture != null ? [requestedArchitecture] : ["x64", "arm64"];
+    for (const requiredArchitecture of requiredArchitectures) {
       assert(
         verifiedArchitectures.has(requiredArchitecture),
         `Missing ${requiredArchitecture} macOS app bundle under ${RELEASE_DIR}. Verified architectures: ${
@@ -331,6 +346,13 @@ async function main(): Promise<void> {
         }`
       );
     }
+  }
+
+  if (requestedArchitecture != null && requestedArchitecture !== process.arch) {
+    console.log(
+      `[attach-file-smoke] skipping launch of non-native ${requestedArchitecture} bundle on ${process.arch}`
+    );
+    return;
   }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-attach-file-smoke-"));

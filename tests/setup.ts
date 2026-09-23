@@ -24,12 +24,27 @@ if (resolveXumEnvironmentValue("FORCE_REAL_TOKENIZER", process.env) !== "1") {
 // code paths that only check `typeof window !== "undefined"`.
 if (!Object.getOwnPropertyDescriptor(globalThis, "location")) {
   let fallbackLocation: { href: string } | undefined = { href: "file:///" };
+  // A test-installed window whose `location` resolves back to the global one re-enters
+  // this getter forever. CI hit "Maximum call stack size exceeded" here, which aborted
+  // WorkspaceContext's module evaluation and left every later importer in the same bun
+  // process failing with "Cannot access 'WorkspaceMetadataContext' before initialization".
+  let resolvingLocation = false;
 
   Object.defineProperty(globalThis, "location", {
     configurable: true,
     get() {
-      const win = (globalThis as any).window;
-      return win?.location ?? win?.window?.location ?? fallbackLocation;
+      if (resolvingLocation) {
+        return fallbackLocation;
+      }
+      resolvingLocation = true;
+      try {
+        // Typed loosely because tests install partial window stubs (or none at all).
+        const win: { location?: unknown; window?: { location?: unknown } } | undefined =
+          globalThis.window;
+        return win?.location ?? win?.window?.location ?? fallbackLocation;
+      } finally {
+        resolvingLocation = false;
+      }
     },
     set(value) {
       fallbackLocation = value;
