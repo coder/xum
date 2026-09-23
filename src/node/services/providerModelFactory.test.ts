@@ -4471,6 +4471,9 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     "GOOGLE_GENERATIVE_AI_API_KEY",
     "GOOGLE_BASE_URL",
     "XAI_API_KEY",
+    "TYPESAFE_API_KEY",
+    "TYPESAFE_AI_API_KEY",
+    "JEV_API_KEY",
   ] as const;
 
   async function withEvaluationFixture(
@@ -4766,5 +4769,109 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
         reason: "unknown-model",
       });
     });
+  });
+
+  // `typesafe` is the evaluation-only credential key, not a chat ProviderName:
+  // it resolves with no chat provider configured and from its own env vars.
+  it("resolves typesafe:jev-latest from the reserved providers.jsonc entry or its env vars", async () => {
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key" } },
+      async (_c, factory, fetchSpy) => {
+        const pinned = expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+        expect(pinned.model.provider).toBe("typesafe.evaluation");
+        expect(pinned.model.modelId).toBe("jev-latest");
+        expect(pinned.wireProviderName).toBe("typesafe");
+        expect(pinned.routeKind).toBe("direct");
+        expect(pinned.effectiveModelString).toBe("typesafe:jev-latest");
+        expect(pinned.configFingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      }
+    );
+    await withEvaluationFixture({}, async (_c, factory) => {
+      process.env.JEV_API_KEY = "env-key";
+      expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+    });
+  });
+
+  it("sends typesafe requests to the API default or the configured base URL", async () => {
+    const captureUrl = async (
+      factory: ProviderModelFactory,
+      fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
+    ) => {
+      const pinned = expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+      const urls: string[] = [];
+      fetchSpy.mockImplementation(
+        Object.assign(
+          (input: Parameters<typeof fetch>[0]) => {
+            urls.push(input instanceof Request ? input.url : String(input));
+            return Promise.reject(new Error("captured"));
+          },
+          { preconnect: () => undefined }
+        )
+      );
+      await pinned.model
+        .doEvaluate({
+          state: "hello",
+          questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+        })
+        .then(
+          () => undefined,
+          () => undefined
+        );
+      expect(urls).toHaveLength(1);
+      return { url: urls[0] ?? "", fingerprint: pinned.configFingerprint };
+    };
+    let defaultFingerprint: string | undefined;
+    await withEvaluationFixture({ typesafe: { apiKey: "ts-key" } }, async (_c, factory, spy) => {
+      const { url, fingerprint } = await captureUrl(factory, spy);
+      expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+      defaultFingerprint = fingerprint;
+    });
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", baseUrl: "https://proxy.example/typesafe/v1" } },
+      async (_c, factory, spy) => {
+        const { url, fingerprint } = await captureUrl(factory, spy);
+        expect(url).toBe("https://proxy.example/typesafe/v1/systemone");
+        expect(fingerprint).not.toBe(defaultFingerprint!);
+      }
+    );
+    // A hand-edited entry with surrounding whitespace is normalized the same
+    // way the credential resolver (and auto model routing) already normalize it.
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", baseUrl: " https://proxy.example/typesafe/v1 " } },
+      async (_c, factory, spy) => {
+        const { url } = await captureUrl(factory, spy);
+        expect(url).toBe("https://proxy.example/typesafe/v1/systemone");
+      }
+    );
+  });
+
+  it("rejects an unconfigured, disabled or custom-shadowed typesafe entry like any provider", async () => {
+    await withEvaluationFixture({ openai: { apiKey: "sk-openai" } }, async (_c, factory) => {
+      expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+        reason: "unauthorized",
+        providerName: "typesafe",
+      });
+    });
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", enabled: false } },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+          reason: "unauthorized",
+          providerName: "typesafe",
+        });
+      }
+    );
+    await withEvaluationFixture(
+      {
+        typesafe: { providerType: "openai-compatible", baseUrl: LOCAL_VLLM_BASE_URL, apiKey: "x" },
+      },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "custom",
+        });
+      }
+    );
   });
 });

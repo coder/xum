@@ -1,4 +1,6 @@
 import * as fs from "node:fs/promises";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
@@ -285,6 +287,90 @@ describe("xum workflow CLI helpers", () => {
         .quiet();
     expect(blank.exitCode).not.toBe(0);
     expect(blank.stderr.toString()).toContain("Invalid --evaluation-model");
+  }, 60_000);
+
+  // The evaluation-only `typesafe` key is not a configured chat provider, yet it
+  // must reach the run's providers copy and survive chat hydration from the
+  // environment for an evaluate()-only workflow to run.
+  test("CLI runs an evaluate()-only workflow with only the TypeSafe key configured", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-typesafe-only");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fixture = http.createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        requests.push({
+          url: request.url ?? "",
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
+        });
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            answers: { ok: { type: "noul", noul: 0.9 } },
+            usage: { input_tokens: 3, output_tokens: 1 },
+          })
+        );
+      });
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+    try {
+      const origin = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}`;
+      await fs.writeFile(
+        path.join(muxRoot, "providers.jsonc"),
+        JSON.stringify({ typesafe: { apiKey: "fixture-typesafe-key", baseUrl: `${origin}/v1` } }),
+        "utf-8"
+      );
+      await fs.writeFile(
+        path.join(repo, "workflows", "probe.js"),
+        `export default function workflow({ evaluate }) {
+  const result = evaluate("probe", {
+    id: "probe",
+    model: "typesafe:jev-latest",
+    questions: { ok: { type: "boolean", instructions: "Is it ok?" } },
+  });
+  return { reportMarkdown: "evaluated", structuredOutput: result };
+}
+`,
+        "utf-8"
+      );
+      await trustProject(muxRoot, repo);
+
+      const run =
+        await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --json`
+          // A chat key in the environment triggers hydration of the run's providers
+          // copy, which must merge over (not replace) the TypeSafe entry.
+          .env({ ...process.env, MUX_ROOT: muxRoot, OPENAI_API_KEY: "env-chat-key" })
+          .nothrow()
+          .quiet();
+      expect(run.exitCode).toBe(0);
+      const events = run.stdout
+        .toString()
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type: string });
+      expect(events.find((event) => event.type === "result")).toMatchObject({
+        status: "completed",
+        result: {
+          structuredOutput: {
+            answers: { ok: { type: "boolean", probability: 0.9 } },
+            model: { modelString: "typesafe:jev-latest" },
+          },
+        },
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe("/v1/systemone");
+      expect(requests[0]?.body).toMatchObject({
+        model: "jev-latest",
+        questions: { ok: { type: "noul" } },
+      });
+    } finally {
+      fixture.closeAllConnections();
+      await new Promise<void>((resolve) => fixture.close(() => resolve()));
+    }
   }, 60_000);
 
   test("CLI runs a trusted explicit workflow script with structured args", async () => {
