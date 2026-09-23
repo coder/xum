@@ -50,11 +50,7 @@ import { createDeferred, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { ProviderModelEntry } from "@/common/orpc/types";
-import {
-  maybeGetProviderModelEntryId,
-  normalizeProviderModelEntries,
-} from "@/common/utils/providers/modelEntries";
+import { userManagedModelEntries } from "@/common/utils/providers/modelEntries";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -275,40 +271,6 @@ function parseEndpointUrl(value: unknown): string | null {
 }
 
 /**
- * MIGRATION-ONLY classifier for a coder section written by OLD code, whose
- * discovery merged the catalog into `models`: the entries that carry
- * user-managed data are everything NOT recorded in the catalog markers, plus
- * any object-form entry — normalization collapses override-free objects to
- * plain strings, so an object entry means the user edited it (context window
- * override, model mapping) even when its ID was discovered. Under the current
- * contract `models` is user-managed by construction, so no writer may apply
- * this classification to a flagged section (it would strip explicit adds of
- * catalog IDs); see separateDiscoveredModels.
- */
-function userManagedModelEntries(
-  section: Record<string, unknown> | undefined
-): ProviderModelEntry[] {
-  if (!Array.isArray(section?.models)) {
-    return [];
-  }
-  // Old code unioned the authoritative catalog with the stale marker
-  // (entries it retained in `models` while the catalog was inconclusive), so
-  // both are catalog provenance here.
-  const discovered = new Set(
-    [section.discoveredModels, section.staleDiscoveredModels].flatMap((value) =>
-      Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
-    )
-  );
-  return normalizeProviderModelEntries(section.models).filter((entry) => {
-    if (typeof entry !== "string") {
-      return true; // User-authored settings on a (possibly discovered) model.
-    }
-    const id = maybeGetProviderModelEntryId(entry);
-    return id == null || !discovered.has(id);
-  });
-}
-
-/**
  * The one-shot `models` separation (see separateDiscoveredModelsOnce) applied
  * to a clone of `section`, with `discoveredModelsUnlisted` stamped. Every
  * OAuth writer that stamps the flag goes through here, because the flag is
@@ -320,8 +282,9 @@ function userManagedModelEntries(
  * preserved exactly as found (present, missing, or empty). Must be applied
  * BEFORE the caller clears or replaces the catalog markers — they are the
  * classification input. The explicit Models edit
- * (ProviderService.applyCoderModelEdit) stamps the flag without this step: it
- * replaces the list with the user's own, so nothing merged survives it.
+ * (ProviderService.applyCoderModelEdit) applies the same classification to the
+ * persisted list before stamping, because Settings resubmits whatever merged
+ * rows it was shown while the migration was pending.
  */
 function separateDiscoveredModels(section: Record<string, unknown>): Record<string, unknown> {
   const next = { ...section };

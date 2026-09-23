@@ -55,6 +55,7 @@ import {
 import {
   getProviderModelEntryId,
   normalizeProviderModelEntries,
+  userManagedModelEntries,
 } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import {
@@ -1188,7 +1189,11 @@ export class ProviderService {
    *   override steers routing).
    * - The edit stamps `discoveredModelsUnlisted`: `models` is user-managed
    *   under the new contract, so an add made before the one-shot migration
-   *   ran must never be stripped by it later.
+   *   ran must never be stripped by it later. If that migration has not run
+   *   yet (skipped, or failed at startup), Settings shows the legacy merged
+   *   list and the edit resubmits its catalog rows, so the rows the migration
+   *   would strip from the persisted list are separated first; otherwise the
+   *   stamp would keep them forever. Rows new in this edit are kept.
    *
    * Runs under the providers-file lock (called from setModels).
    */
@@ -1208,7 +1213,22 @@ export class ProviderService {
           return !allowedModels.includes(id) && !visibleIds.has(id);
         })
       : [];
-    const finalModels = [...normalizedModels, ...hiddenPreserved];
+    // Same eligibility as the migration: a catalog marker without the flag
+    // means old code merged the persisted list.
+    const legacyCatalogRows = new Set<string>();
+    if (
+      section.discoveredModelsUnlisted !== true &&
+      (Array.isArray(section.discoveredModels) || Array.isArray(section.staleDiscoveredModels))
+    ) {
+      const userManaged = new Set(userManagedModelEntries(section));
+      for (const entry of normalizeProviderModelEntries(section.models)) {
+        // Only plain strings are ever classified as catalog rows.
+        if (typeof entry === "string" && !userManaged.has(entry)) legacyCatalogRows.add(entry);
+      }
+    }
+    const finalModels = [...normalizedModels, ...hiddenPreserved].filter(
+      (entry) => typeof entry !== "string" || !legacyCatalogRows.has(entry)
+    );
     const finalIds = new Set(finalModels.map((entry) => getProviderModelEntryId(entry)));
 
     const priorRemoved = Array.isArray(section.removedModels)

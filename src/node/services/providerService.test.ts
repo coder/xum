@@ -980,6 +980,8 @@ describe("ProviderService model normalization", () => {
               "anthropic/other-visible",
               "anthropic/hidden",
             ],
+            // Post-migration: `models` is the user's own list.
+            discoveredModelsUnlisted: true,
           },
         });
 
@@ -1007,6 +1009,8 @@ describe("ProviderService model normalization", () => {
           discoveredModels: ["anthropic/model-a", "anthropic/model-b", "anthropic/model-c"],
           // Written by old code when the user deleted a merged catalog row.
           removedModels: ["anthropic/model-c"],
+          // Post-migration: `models` is the user's own list.
+          discoveredModelsUnlisted: true,
         },
       });
 
@@ -1034,7 +1038,7 @@ describe("ProviderService model normalization", () => {
     });
   });
 
-  it("protects a Coder edit made before the one-shot migration ran from being stripped by it", async () => {
+  it("keeps rows added before the one-shot migration ran and separates resubmitted legacy rows", async () => {
     await withTempConfigAsync(async (config, service) => {
       // Old-code shape (catalog merged into `models`, no flag) whose startup
       // migration is still pending — e.g. waiting for the providers-file lock.
@@ -1042,7 +1046,7 @@ describe("ProviderService model normalization", () => {
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: ["anthropic/catalog-a", "anthropic/catalog-b"],
-          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b", "anthropic/catalog-c"],
         },
       });
       const coderOauth = new CoderOauthService(
@@ -1069,11 +1073,13 @@ describe("ProviderService model normalization", () => {
         const migration = coderOauth.separateDiscoveredModelsOnce();
         await migrationWaitingPromise;
 
-        // The user keeps catalog-a explicitly and adds a manual model: this
-        // edit stamps the flag under the lock.
+        // Settings still shows the merged list: the edit resubmits the legacy
+        // catalog-a row, adds a manual model and explicitly adds catalog-c.
+        // It stamps the flag under the lock.
         const edit = await service.setModels("coder", [
           "anthropic/catalog-a",
           "anthropic/manual-model",
+          "anthropic/catalog-c",
         ]);
         expect(edit.success).toBe(true);
 
@@ -1084,12 +1090,54 @@ describe("ProviderService model normalization", () => {
         await coderOauth.dispose();
       }
 
-      // The resumed migration found the flag and left the explicit list —
-      // including the catalog ID — untouched.
+      // The edit separated the resubmitted legacy row exactly as the migration
+      // would; the rows it added (including a catalog ID) survive, and the
+      // resumed migration found the flag and left them untouched.
       const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
         ?.coder as Record<string, unknown>;
-      expect(stored.models).toEqual(["anthropic/catalog-a", "anthropic/manual-model"]);
-      expect(stored.discoveredModels).toEqual(["anthropic/catalog-a", "anthropic/catalog-b"]);
+      expect(stored.models).toEqual(["anthropic/manual-model", "anthropic/catalog-c"]);
+      expect(stored.discoveredModels).toEqual([
+        "anthropic/catalog-a",
+        "anthropic/catalog-b",
+        "anthropic/catalog-c",
+      ]);
+      expect(stored.discoveredModelsUnlisted).toBe(true);
+    });
+  });
+
+  it("separates legacy catalog rows when a Coder edit follows a failed migration", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // The startup migration failed, so Settings loaded the merged list.
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: [
+            "anthropic/catalog-a",
+            { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+            "anthropic/manual-model",
+          ],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
+        },
+      });
+
+      // The user edits one row and resubmits everything else it was shown.
+      const edit = await service.setModels("coder", [
+        "anthropic/catalog-a",
+        { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+        "anthropic/manual-model",
+        "anthropic/new-manual",
+      ]);
+      expect(edit.success).toBe(true);
+
+      // Stamping must not freeze the merged catalog row; user-authored entries stay.
+      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+        ?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual([
+        { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+        "anthropic/manual-model",
+        "anthropic/new-manual",
+      ]);
+      expect(stored.removedModels).toBeUndefined();
       expect(stored.discoveredModelsUnlisted).toBe(true);
     });
   });
