@@ -5397,6 +5397,7 @@ export class TaskService implements AgentTaskIntegration {
             plan.taskId,
             (ws) => {
               if (ws.taskStatus !== plan.status) return;
+              if (rowSupersedes(ws, plan.attemptId)) return;
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
               transitioned = true;
@@ -5538,6 +5539,7 @@ export class TaskService implements AgentTaskIntegration {
             plan.taskId,
             (ws) => {
               if (ws.taskStatus !== plan.status) return;
+              if (rowSupersedes(ws, plan.attemptId)) return;
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = message;
               transitioned = true;
@@ -5939,6 +5941,7 @@ export class TaskService implements AgentTaskIntegration {
           plan.taskId,
           (workspace) => {
             if (workspace.taskStatus !== "starting") return;
+            if (rowSupersedes(workspace, plan.attemptId)) return;
             workspace.taskStatus = "queued";
           },
           { allowMissing: true }
@@ -6298,6 +6301,7 @@ export class TaskService implements AgentTaskIntegration {
     // becomes "running"; a stopped record keeps its terminal status and its owned settlement.
     const transitioned = await this.setTaskStatus(plan.taskId, "running", {
       onlyFromStatus: "starting",
+      expectedAttemptId: plan.attemptId,
     });
     if (!transitioned) {
       log.debug("startReservedAgentTask: reservation no longer starting after admission", {
