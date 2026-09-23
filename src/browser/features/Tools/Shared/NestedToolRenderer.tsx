@@ -35,7 +35,7 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
   workflowRunHint,
   mcpServer,
 }) => {
-  const ToolComponent = getToolComponent(toolName, input);
+  const ToolComponent = getToolComponent(toolName, input, output);
   const hookOutput = extractHookOutput(output);
   const hookDuration = extractHookDuration(output);
 

@@ -37,7 +37,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   const { toolName, args, result, status, toolCallId } = message;
 
   // Get the component from the registry (validates args, falls back to GenericToolCall)
-  const ToolComponent = getToolComponent(toolName, args);
+  const ToolComponent = getToolComponent(toolName, args, result);
 
   // Compute tool-specific extras
   const groupPosition =
