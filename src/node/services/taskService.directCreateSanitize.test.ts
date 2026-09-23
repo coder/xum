@@ -541,6 +541,70 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     30_000
   );
 
+  test.each(["unqueued", "queued"] as const)(
+    "a devcontainer parent removed by a mutator that wins the registration lock first refuses the %s publication: no orphaned (and unremovable) task row",
+    async (mode) => {
+      const taskId = mode === "queued" ? "devorphan01" : "devorphan02";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, parentPath } =
+        await createRealStack(projectPath);
+      const previousXumRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = rootDir;
+      restores.push(() => {
+        if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousXumRoot;
+      });
+      const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(() =>
+        Promise.reject(new Error("no devcontainer in tests"))
+      );
+      restores.push(() => exec.mockRestore());
+      const devcontainer: RuntimeConfig = {
+        type: "devcontainer",
+        configPath: ".devcontainer/x.json",
+      };
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [{ path: parentPath, id: rootId, name: "parent", runtimeConfig: devcontainer }],
+        testTaskSettings(mode === "queued" ? 1 : 3)
+      );
+      if (mode === "queued") {
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      stubStableIds(config, [taskId]);
+      // Another backend's removal wins the lock first: its scan sees no task row, so it removes
+      // the parent (its config effect is what the locked publication observes).
+      const otherConfig = new Config(config.rootDir);
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      let removed = false;
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        async (materialize, publish) => {
+          if (!removed) {
+            removed = true;
+            await otherConfig.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                project.workspaces = project.workspaces.filter((row) => row.id !== rootId);
+              }
+              return cfg;
+            });
+          }
+          return realPrepare(materialize, publish);
+        }
+      );
+      restores.push(() => prepare.mockRestore());
+
+      const created = await taskService.create(createArgs("Orphan"));
+      expect(removed).toBe(true);
+      expect(findWorkspaceInConfig(config, rootId)).toBeUndefined();
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain("parent workspace changed");
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    },
+    30_000
+  );
+
   test.each(["queued", "unqueued", "reserved"] as const)(
     "a structural rename that wins the registration lock before the %s isolation: none publication refuses the creation instead of publishing stale ancestry",
     async (mode) => {
