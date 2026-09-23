@@ -31,6 +31,7 @@ function buildWorkspaceState(workspaceId: string, state: MockWorkspaceState): Wo
     name: workspaceId,
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,

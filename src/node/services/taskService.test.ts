@@ -90,7 +90,12 @@ import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/age
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  parseWorkspaceTurnTaskCorrelation,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   buildWorkflowRunCardMessage,
@@ -533,7 +538,7 @@ describe("TaskService", () => {
       childId,
       "Inspect the scratch files",
       expect.any(Object),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -4383,8 +4388,14 @@ describe("TaskService", () => {
       expect(sendMessage).toHaveBeenCalledTimes(taskStatus == null ? 1 : 2);
       expect(sendMessage.mock.calls[0]?.[0]).toBe("crashed");
       expect(findWorkspaceInConfig(config, "stopped")?.taskStatus).toBe(taskStatus);
-      expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith("stopped");
-      expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith("compacted");
+      expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith(
+        "stopped",
+        expect.anything()
+      );
+      expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith(
+        "compacted",
+        expect.anything()
+      );
     }
   );
 
@@ -5802,14 +5813,23 @@ describe("TaskService", () => {
       // The real WorkspaceService restores a reawakened child to running before dispatching;
       // the mock mirrors that and accepts the turn.
       const serviceRef: { current?: TaskService } = {};
+      // The real WorkspaceService skips its user-resume rescue for a correlated workspace-turn
+      // send (createWorkspaceTurn holds the task-creation lock across it, and the rescue's
+      // identity CAS serializes on that lock), so the mock only awaits the rescue for
+      // uncorrelated sends; for the reawakening turn it is applied once the turn was admitted.
+      let deferredRescue: Promise<boolean> | undefined;
       const sendMessage = mock(
         async (
           workspaceId: string,
           _message: string,
-          _options: unknown,
+          options: { muxMetadata?: unknown },
           internal?: { onAccepted?: () => Promise<void> | void }
         ): Promise<Result<void>> => {
-          await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          if (parseWorkspaceTurnTaskCorrelation(options?.muxMetadata) == null) {
+            await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          } else {
+            deferredRescue = serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          }
           await internal?.onAccepted?.();
           return Ok(undefined);
         }
@@ -5859,6 +5879,7 @@ describe("TaskService", () => {
           workspace: { mode: "existing", workspaceId: childId },
         });
         assert(continuation.success, "Expected the reawakening turn to be admitted");
+        expect(await deferredRescue).toBe(true);
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
         expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
         waiter = workspaceTurnManagerFor(taskService)
@@ -7587,7 +7608,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7646,7 +7667,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7700,7 +7721,7 @@ describe("TaskService", () => {
         reasoningMode: "pro",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     // Persisted child settings carry it too, so queued/restart resumes
@@ -7755,7 +7776,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with base pro",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7803,7 +7824,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with parent pro mode",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7858,7 +7879,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run with mapped alias max",
       expect.objectContaining({ model: "openai:team-sol", thinkingLevel: "max" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -7904,7 +7925,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7966,7 +7987,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -8034,7 +8055,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run researcher with plan pro",
       expect.objectContaining({ agentId: "researcher", reasoningMode: "pro" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8095,7 +8116,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -8168,7 +8189,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8201,7 +8222,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.aiSettings).toEqual({ model: "openai:gpt-5.2", thinkingLevel: "medium" });
@@ -8239,7 +8260,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8275,7 +8296,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8305,7 +8326,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8378,7 +8399,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -8418,7 +8439,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
@@ -8460,7 +8481,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -8505,7 +8526,7 @@ describe("TaskService", () => {
         agentId: "exec",
         thinkingLevel: "high",
       }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const child = findWorkspaceInConfig(config, created.data.taskId);
     expect(child?.taskModelString).toBe("openai:gpt-6-astra");
@@ -8572,7 +8593,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "check provenance",
       expect.objectContaining({ model: expected }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -8688,7 +8709,7 @@ describe("TaskService", () => {
       grandchild.data.taskId,
       "grandchild",
       expect.objectContaining({ model: "openai:gpt-5.3-codex" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     expect(findWorkspaceInConfig(config, grandchild.data.taskId)?.taskModelString).toBe(
       "openai:gpt-5.3-codex"
@@ -8728,7 +8749,7 @@ describe("TaskService", () => {
         created.data.taskId,
         "inherit Standard",
         expect.objectContaining({ reasoningMode: "standard" }),
-        { acceptanceOrigin: "automatic", agentInitiated: true }
+        expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
       );
     }
   );
@@ -8769,7 +8790,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "keep explicit overrides",
       expect.objectContaining(expected),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -8808,7 +8829,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -8849,7 +8870,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.2");
@@ -8888,7 +8909,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8927,7 +8948,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -8969,7 +8990,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -9012,7 +9033,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   }, 20_000);
 
@@ -10867,7 +10888,7 @@ describe("TaskService", () => {
     expect(resumeStream).toHaveBeenCalledWith(
       parentWorkspaceId,
       expect.objectContaining({ agentId: "plan" }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
 
     const parentHistory = await collectFullHistory(historyService, parentWorkspaceId);
@@ -19113,7 +19134,7 @@ describe("TaskService", () => {
     expect(ws?.taskStatus).toBe("running");
   });
 
-  test("rolls back created workspace when initial sendMessage fails", async () => {
+  test("keeps the published workspace as an interrupted one (no rollback) when the initial sendMessage fails", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "aaaaaaaaaa");
 
@@ -19161,26 +19182,18 @@ describe("TaskService", () => {
 
     expect(created.success).toBe(false);
 
-    const postCfg = config.loadConfigOrDefault();
-    const stillExists = Array.from(postCfg.projects.values())
-      .flatMap((p) => p.workspaces)
-      .some((w) => w.id === "aaaaaaaaaa");
-    expect(stillExists).toBe(false);
-
-    // Rollback must also drop the extension-metadata entry: the failed send
-    // may already have scheduled metadata writes that would otherwise leak a
-    // stale key after deregistration (#3959).
-    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith("aaaaaaaaaa");
+    // The entry was persisted and announced before the send: the workspace is published, so a
+    // launch failure ends it as an interrupted workspace with its launch error (removable like
+    // any other) instead of deleting the row, checkout and session underneath whoever may
+    // already have sent into it or re-admitted it.
+    expect(findWorkspaceInConfig(config, "aaaaaaaaaa")?.taskStatus).toBe("interrupted");
+    expect(findWorkspaceInConfig(config, "aaaaaaaaaa")?.taskLaunchError).toContain("send failed");
+    // Still registered, so its extension metadata must not be discarded (write-tombstoned).
+    expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
 
     const workspaceName = "agent_explore_aaaaaaaaaa";
     const workspacePath = runtime.getWorkspacePath(projectPath, workspaceName);
-    let workspacePathExists = true;
-    try {
-      await fsPromises.access(workspacePath);
-    } catch {
-      workspacePathExists = false;
-    }
-    expect(workspacePathExists).toBe(false);
+    await fsPromises.access(workspacePath);
   }, 20_000);
 
   test("rolls back a forked checkout when persistence throws after the fork", async () => {
@@ -19253,63 +19266,6 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
       parentId
     );
-  }, 20_000);
-
-  test("failed config deregistration during rollback does not tombstone the task's metadata", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["bbbbbbbbbb"], "bbbbbbbbbb");
-
-    const projectPath = await createTestProject(rootDir);
-
-    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
-    const runtime = createRuntime(runtimeConfig, { projectPath });
-    const initLogger = createNullInitLogger();
-
-    const parentName = "parent-b";
-    const parentCreate = await runtime.createWorkspace({
-      projectPath,
-      branchName: parentName,
-      trunkBranch: "main",
-      directoryName: parentName,
-      initLogger,
-    });
-    expect(parentCreate.success).toBe(true);
-
-    const parentId = "2222222222";
-    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        {
-          path: parentPath,
-          id: parentId,
-          name: parentName,
-          createdAt: new Date().toISOString(),
-          runtimeConfig,
-        },
-      ],
-      testTaskSettings()
-    );
-    const { aiService } = createAIServiceMocks(config);
-    const failingSendMessage = mock(() => Promise.resolve(Err("send failed")));
-    const { workspaceService, discardExtensionMetadataEntry } = createWorkspaceServiceMocks({
-      sendMessage: failingSendMessage,
-    });
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    // Deregistration fails: the rollback must NOT discard (and thereby
-    // write-tombstone) metadata for a workspace that is still registered.
-    const removeSpy = spyOn(config, "removeWorkspace").mockImplementation(() =>
-      Promise.reject(new Error("config locked"))
-    );
-    try {
-      const created = await createAgentTask(taskService, parentId, "do the thing");
-      expect(created.success).toBe(false);
-      expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
-    } finally {
-      removeSpy.mockRestore();
-    }
   }, 20_000);
 
   test("agent_report posts report to parent, finalizes pending task tool output, and triggers cleanup", async () => {
@@ -31002,7 +30958,7 @@ describe("TaskService", () => {
     );
   });
 
-  test("unconfirmed stream stop retains the latch for a completed descendant with live execution", async () => {
+  test("unconfirmed stream stop retains the latch for a completed descendant whose live execution the cascade could not settle", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -31040,9 +30996,19 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    // The cascade settles the captured live execution itself (interruptCapturedExecution); this
+    // models the fail-closed case where that explicit interrupt fails, so the record keeps
+    // waiting for an authoritative settlement — the release mechanics under test.
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
 
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    expect(interruptSpy.mock.calls[0].slice(0, 2)).toEqual(["tree-root", "wst_leaf"]);
+    interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
     // User resume clears the level-triggered suppression; only the retained latch refuses.
@@ -31094,7 +31060,7 @@ describe("TaskService", () => {
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
-  test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution", async () => {
+  test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution the cascade could not settle", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -31128,9 +31094,17 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    // See the unconfirmed-stop test above: the cascade's own explicit interrupt of the captured
+    // execution fails here, leaving the record waiting for an authoritative settlement.
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
 
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
     const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
@@ -31189,9 +31163,16 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
 
-    // Establish a retained latch (accepted-but-unsettled live execution under a hard stop).
+    // Establish a retained latch (accepted-but-unsettled live execution under a hard stop whose
+    // own explicit interrupt of that execution failed; see the unconfirmed-stop test).
+    const interruptSpy = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "interruptWorkspaceTurn"
+    ).mockResolvedValueOnce(Err("interrupt unavailable"));
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(interruptSpy).toHaveBeenCalledTimes(1);
+    interruptSpy.mockRestore();
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
       activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
@@ -31231,6 +31212,70 @@ describe("TaskService", () => {
       })
     );
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("a parent Stop cascade settles a completed descendant's live continuation itself and releases the latch", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Reawakened completed child under an ancestor-owned continuation: its stable status is
+        // preserved, so only the execution mirror can carry the stop.
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { aiService, stopStream } = createAIServiceMocks(config);
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+
+    // The cascade's stream stop is a "system" abort, which never settles a continuation handle,
+    // so the cascade interrupts the captured execution explicitly: handle and mirror read
+    // interrupted, the live registration is gone, and the stream stop still ran for the child.
+    expect(findWorkspaceInConfig(config, "leaf-a")).toMatchObject({
+      taskStatus: "reported",
+      taskExecutionId: "wst_leaf",
+      taskExecutionStatus: "interrupted",
+    });
+    expect(await workspaceTurnSnapshot(taskService, "tree-root", "wst_leaf")).toMatchObject({
+      status: "interrupted",
+    });
+    const internals = taskService as unknown as {
+      workspaceStopsInProgress: Map<string, number>;
+      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
+    };
+    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.has("leaf-a")).toBe(false);
+    expect(stopStream).toHaveBeenCalledWith(
+      "leaf-a",
+      expect.objectContaining({ abandonPartial: false })
+    );
+    // No owner left to settle: the latch releases with the cascade instead of at restart.
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    // The owner's terminal wake for the handle its own Stop interrupted is suppressed (same as
+    // task_stop), so a restart cannot resurrect it as a wake-up.
+    const attention = await new TerminalAttentionStore(config).get(
+      "tree-root",
+      TerminalAttentionStore.notificationId("workspace_turn", "wst_leaf")
+    );
+    expect(attention).toMatchObject({ terminalOutcome: "interrupted", status: "superseded" });
   });
 
   test("park-after-settlement race releases the latch on already-settled evidence", async () => {
@@ -32922,7 +32967,7 @@ describe("TaskService", () => {
       expect.objectContaining({
         muxMetadata: workspaceTurnMuxMetadata(parentId),
       }),
-      { acceptanceOrigin: "automatic", agentInitiated: true }
+      expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
     );
   });
 
@@ -34837,7 +34882,7 @@ describe("TaskService", () => {
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
 
-    test("failed reactivation preserves the prior owned settlement", async () => {
+    test("failed reactivation keeps its published attempt: indeterminate until a Stop settles it", async () => {
       const taskId = "task-outcome-reactivation-failed";
       const { config } = await setupTree([
         { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
@@ -34849,9 +34894,13 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
+      const retiredAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
+      expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
 
-      // Exercise a real createWorkspaceTurn pre-admission failure. It must not erase the
-      // already-retired attempt's evidence and strand a workflow checkpoint on this child.
+      // A real createWorkspaceTurn failure AFTER the reactivation published its fresh attempt.
+      // createWorkspaceTurn can fail past validation (even after a send), so a refusal proves
+      // nothing about admission: the fresh identity stays in config and memory (never rolled
+      // back to the retired attempt), reads as owned-but-unsettled, and only a Stop settles it.
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
         Err("owner metadata unavailable")
       );
@@ -34864,20 +34913,31 @@ describe("TaskService", () => {
         );
         expect(result).toMatchObject({ success: false, error: { code: "send_failed" } });
         expect(sendMessage).not.toHaveBeenCalled();
+        const published = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
+        expect(published).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(published).not.toBe(retiredAttemptId);
+        const outcome = await taskService.readAttemptOutcome(taskId, requesting);
+        expect(outcome.kind).toBe("indeterminate");
+        if (outcome.kind === "indeterminate") {
+          expect(outcome.reason).toContain("without settlement evidence");
+        }
+        await taskService.terminateAllDescendantAgentTasks(rootId);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "terminal-no-report",
         });
+        expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBe(published);
       } finally {
         metadata.mockRestore();
       }
     });
 
-    test("failed reactivation does not manufacture retirement for a legacy owner", async () => {
+    test("failed reactivation of a legacy owner publishes an unproven attempt this process owns", async () => {
       const taskId = "task-outcome-reactivation-legacy";
       const { config } = await setupTree([
         { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
       ]);
       const { taskService, aiService } = createTaskServiceHarness(config);
+      expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBeUndefined();
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
         Err("owner metadata unavailable")
       );
@@ -34890,12 +34950,27 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
-        // A later Stop must not turn the rejected speculative attempt into evidence that the
-        // unknown prior-process owner retired. No new turn was ever admitted here.
-        await taskService.terminateAllDescendantAgentTasks(rootId);
+        // The reactivation stamped the pre-identity entry with a fresh attempt this process owns
+        // — marked unproven, because nothing vouches for the unknown prior-process predecessor.
+        const entry = findWorkspaceInConfig(config, taskId);
+        expect(entry?.taskAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(entry?.taskAttemptUnproven).toBe(true);
         expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe(
           "indeterminate"
         );
+        // A Stop settles THIS process's attempt (same-process authority, as on main for any
+        // owned attempt); cross-process authority stays fail-closed through the marker.
+        await taskService.terminateAllDescendantAgentTasks(rootId);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "terminal-no-report",
+        });
+        const owned = (
+          taskService as unknown as {
+            ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+          }
+        ).ownedAttemptByTaskId.get(taskId);
+        expect(owned?.attemptId).toBe(entry?.taskAttemptId);
+        expect(owned?.receiptEligible).toBe(false);
       } finally {
         metadata.mockRestore();
       }
@@ -34912,10 +34987,13 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
-      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(async () => {
-        // Direct input can reawaken while the rejected task send is awaiting metadata.
-        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        return Err("owner metadata unavailable");
+      let reawaken: Promise<boolean> | undefined;
+      const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(() => {
+        // Direct input can reawaken while the rejected task send is awaiting metadata. Its
+        // identity CAS serializes on the task-creation lock createWorkspaceTurn holds here, so
+        // it completes right after the rejected send releases it.
+        reawaken = taskService.markInterruptedTaskRunning(taskId);
+        return Promise.resolve(Err("owner metadata unavailable"));
       });
       try {
         expect(
@@ -34926,6 +35004,7 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
+        expect(await reawaken).toBe(true);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "live",
           executionId: taskId,

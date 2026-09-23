@@ -15,7 +15,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import type { TurnAdmissionToken, WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUtils";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TaskService } from "@/node/services/taskService";
@@ -372,12 +372,37 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
     ...hostMocks,
+    // The fake host has no session, so no turn can ever exist for a send it accepts: a
+    // TurnAdmissionToken the send carried is disposed once the mock settled unless the test's
+    // own mock already reported admission (a real WorkspaceService fires exactly one of these
+    // at its seams; leaving the token pending would retain every stop latch forever).
+    sendMessage: ((...args: Parameters<WorkspaceHost["sendMessage"]>) =>
+      disposeTokenAfter(
+        mocks.sendMessage(...args),
+        args[3]?.turnAdmission
+      )) as WorkspaceHost["sendMessage"],
+    resumeStream: ((...args: Parameters<WorkspaceHost["resumeStream"]>) =>
+      disposeTokenAfter(
+        mocks.resumeStream(...args),
+        args[2]?.turnAdmission
+      )) as WorkspaceHost["resumeStream"],
     archiveWhileTaskTreeLocked: mocks.archive,
     unarchiveWhileTaskTreeLocked: unarchive,
     removeWhileTaskTreeLocked: mocks.remove,
   });
 
   return { workspaceService, ...mocks };
+}
+
+async function disposeTokenAfter<T>(
+  result: Promise<T> | T,
+  token: TurnAdmissionToken | undefined
+): Promise<T> {
+  try {
+    return await result;
+  } finally {
+    token?.onDisposed("no-work");
+  }
 }
 
 export function workspaceTurnManagerFor(

@@ -4159,8 +4159,16 @@ export class Config {
       };
 
       if (existingIndex >= 0) {
-        // Update existing workspace
-        project.workspaces[existingIndex] = workspaceEntry;
+        // Update existing workspace. Attempt identity is server-owned and not part of
+        // WorkspaceMetadata: keep the fresh row's values so a metadata round trip can neither
+        // drop them nor restore a stale identity over a later admission's rotation.
+        const existing = project.workspaces[existingIndex];
+        project.workspaces[existingIndex] = {
+          ...workspaceEntry,
+          taskAttemptId: existing.taskAttemptId,
+          taskAttemptUnproven: existing.taskAttemptUnproven,
+          taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
+        };
       } else {
         // Add new workspace
         project.workspaces.push(workspaceEntry);
