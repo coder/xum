@@ -45,7 +45,7 @@ import {
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
+import { DEFAULT_RUNTIME_CONFIG, STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
@@ -9978,10 +9978,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.config.loadConfigOrDefault(),
         workspaceId
       )?.workspace;
+      // The hook sees metadata, whose runtimeConfig defaults to DEFAULT_RUNTIME_CONFIG (a managed
+      // worktree) for a legacy row without one: decide on that same effective runtime, or such a
+      // row's checkout would be deleted without the guard.
       const archiveDeletesCheckout =
         worktreeArchiveBehavior !== "keep" &&
         archivingRow !== undefined &&
-        isWorktreeRuntime(archivingRow.runtimeConfig) &&
+        isWorktreeRuntime(archivingRow.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG) &&
         archivingRow.taskIsolation !== "none" &&
         !(worktreeArchiveBehavior === "snapshot" && (archivingRow.projects?.length ?? 0) > 1);
       if (archiveDeletesCheckout) {
