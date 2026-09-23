@@ -773,10 +773,10 @@ describeIntegration("workspace.planReview", () => {
     await writePlan(PLAN_B);
   }, 60_000);
 
-  test("feedback submitted while the workspace is busy stays its own authentic turn", async () => {
-    // The queue batches ordinary follow-ups into one entry with the FIRST metadata. Feedback
-    // must never share an entry: batched behind text it loses its metadata, batched ahead of
-    // text the envelope gains a trailing line — both make the persisted row inauthentic.
+  test("feedback submitted while the workspace is busy is refused, not queued", async () => {
+    // Queued input is restored to the composer as plain text on Stop/edit, which would drop the
+    // structured review metadata. Feedback is therefore only admitted as an immediate turn; an
+    // ordinary follow-up typed during the same stream still queues and dispatches normally.
     const snapshotB = (await getState()).snapshots.find((s) => s.contentHash === sha256(PLAN_B));
     expect(snapshotB).toBeDefined();
     if (!snapshotB) return;
@@ -797,19 +797,20 @@ describeIntegration("workspace.planReview", () => {
       options,
     });
     expect(queuedText.success).toBe(true);
+    const session = env.services.workspaceService.getOrCreateSession(workspaceId);
+    const queuedBefore = session.queuedMessageEntryCount();
     const comment = { anchor: { startLine: 1, endLine: 1 }, quote: "# Plan A", body: "Title?" };
-    const queuedFeedback = await planReview().submitFeedback({
+    const busyFeedback = await planReview().submitFeedback({
       workspaceId,
       snapshotId: snapshotB.snapshotId,
       comments: [comment],
       replies: [],
       options,
     });
-    expect(queuedFeedback.success).toBe(true);
-    if (!queuedFeedback.success) return;
+    expect(!busyFeedback.success && busyFeedback.error.type).toBe("send_failed");
+    expect(session.queuedMessageEntryCount()).toBe(queuedBefore);
 
     fixture.releaseHeld();
-    const session = env.services.workspaceService.getOrCreateSession(workspaceId);
     expect(
       await waitFor(async () => {
         await session.waitForIdle();
@@ -819,22 +820,20 @@ describeIntegration("workspace.planReview", () => {
     assertStreamSuccess(collector);
 
     const after = await getState();
-    expect(after.threads).toHaveLength(before.threads.length + 1);
-    expect(after.feedbacks.map((f) => f.feedbackId)).toContain(queuedFeedback.data.feedbackId);
+    expect(after.threads).toHaveLength(before.threads.length);
+    expect(after.feedbacks).toHaveLength(before.feedbacks.length);
     const rows = await new HistoryService(env.config).getLastMessages(workspaceId, 12);
     if (!rows.success) throw new Error(rows.error);
-    const feedbackRow = rows.data.find(
-      (row) =>
-        row.metadata?.muxMetadata?.type === "plan-review" &&
-        row.metadata.muxMetadata.feedbackId === queuedFeedback.data.feedbackId
-    );
-    expect(feedbackRow?.parts).toHaveLength(1);
+    // No feedback row was appended, and the ordinary follow-up is still its own user turn.
     expect(
-      feedbackRow?.parts[0].type === "text"
-        ? parsePlanReviewEnvelope(feedbackRow.parts[0].text)?.kind
-        : undefined
-    ).toBe("feedback");
-    // The ordinary follow-up is still its own user turn.
+      rows.data.filter(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "plan-review" &&
+          row.metadata.muxMetadata.kind === "feedback" &&
+          (row.metadata.historySequence ?? 0) >
+            Math.max(...before.feedbacks.map((f) => f.historySequence), 0)
+      )
+    ).toHaveLength(0);
     expect(
       rows.data.some(
         (row) =>
@@ -843,6 +842,20 @@ describeIntegration("workspace.planReview", () => {
           JSON.stringify(row.parts).includes("Also consider caching")
       )
     ).toBe(true);
+
+    // Once idle, the same feedback is admitted as its own authentic turn.
+    collector.clear();
+    const idleFeedback = await planReview().submitFeedback({
+      workspaceId,
+      snapshotId: snapshotB.snapshotId,
+      comments: [comment],
+      replies: [],
+      options,
+    });
+    expect(idleFeedback.success).toBe(true);
+    expect(await collector.waitForEvent("stream-end", STREAM_TIMEOUT_MS)).toBeDefined();
+    await session.waitForIdle();
+    expect((await getState()).threads).toHaveLength(before.threads.length + 1);
   }, 90_000);
 
   test("feedback on an unchanged pre-reset snapshot survives compaction in the state block", async () => {

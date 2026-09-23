@@ -11733,9 +11733,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * Validate and stamp the feedback, then send it as an ordinary user turn so the plan agent
-   * wakes with the envelope in its context. When the workspace is busy the row is queued like
-   * any other send, so the returned state may not include it yet; the UI refetches when the
-   * row appears in the transcript.
+   * wakes with the envelope in its context. Feedback is only admitted as an immediate turn:
+   * while the workspace is busy it is refused instead of queued, because the generic queue's
+   * Stop/edit restoration returns queued input to the composer as plain text, which would drop
+   * the structured review metadata (a resent envelope is neutralized and never enters review
+   * state). The caller keeps its drafts and sends again once the turn finishes.
    */
   async planReviewSubmitFeedback(
     workspaceId: string,
@@ -11774,11 +11776,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         },
       });
     }
-    const sent = await this.sendMessage(workspaceId, prepared.data.text, {
-      ...input.options,
-      muxMetadata: prepared.data.muxMetadata,
-    });
-    if (!sent.success) return Err({ type: "send_failed", error: sent.error });
+    const sent = await this.sendMessage(
+      workspaceId,
+      prepared.data.text,
+      {
+        ...input.options,
+        muxMetadata: prepared.data.muxMetadata,
+      },
+      // Never queue feedback (see above): requireIdle refuses instead of queueing when busy.
+      { requireIdle: true }
+    );
+    if (!sent.success) {
+      return Err({
+        type: "send_failed",
+        error:
+          sent.error.type === "unknown" && sent.error.raw === IDLE_ONLY_BUSY_SKIP_MESSAGE
+            ? {
+                type: "unknown",
+                raw: "Plan review feedback was not sent: the agent is busy. Send it again once the current turn finishes.",
+              }
+            : sent.error,
+      });
+    }
     const state = await getPlanReviewState(this.historyService, workspaceId);
     if (!state.success) return state;
     return Ok({ feedbackId: prepared.data.feedbackId, state: state.data });
