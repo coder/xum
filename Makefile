@@ -83,7 +83,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
+.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
@@ -468,6 +468,10 @@ test-unit: node_modules/.installed build-main ## Run unit tests
 	@bun test src
 	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts
 
+# CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.
+test-unit-ci: node_modules/.installed build-main ## Run the CI unit suite with coverage (sharded via SHARD_INDEX/SHARD_TOTAL)
+	@./scripts/test-unit-ci.sh
+
 test: test-unit ## Alias for test-unit
 
 test-watch: ## Run tests in watch mode
@@ -537,15 +541,19 @@ dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
 	@bun x electron-builder --mac --x64 --arm64 --publish always
 	@echo "✅ Both architectures built and published successfully"
 
+# MAC_TARGETS narrows electron-builder's mac targets (e.g. MAC_TARGETS=dmg); empty keeps
+# package.json's full list. PR CI builds only the DMG it uploads; the auto-update zip
+# roughly doubles packaging time and is still built by merge-queue/main runs.
+MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -563,8 +571,9 @@ dist-linux: build ## Build Linux distributable
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
 
+# MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
-	@bun scripts/checkMacAttachFileRuntime.ts
+	@bun scripts/checkMacAttachFileRuntime.ts $(if $(MAC_ARCH),--arch $(MAC_ARCH))
 
 check-appimage-icons: ## Validate AppImage icon structure (requires prior dist-linux build)
 	@./scripts/check-appimage-icons.sh

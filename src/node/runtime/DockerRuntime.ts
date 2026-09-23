@@ -1058,6 +1058,9 @@ export class DockerRuntime extends RemoteRuntime {
     const destContainerName = getContainerName(projectPath, newWorkspaceName);
     const hostTempPath = path.join(os.tmpdir(), `mux-fork-${Date.now()}.bundle`);
     const containerBundlePath = "/tmp/fork.bundle";
+    // Cleanup only touches containers we actually used: a pre-aborted fork must not spawn
+    // Docker at all (a slow daemon made the cleanup outlast the caller, flaking CI).
+    let srcBundleAttempted = false;
     let destContainerCreated = false;
     let forkSucceeded = false;
 
@@ -1092,6 +1095,7 @@ export class DockerRuntime extends RemoteRuntime {
       // 3. Create git bundle inside source container
       initLogger.logStep("Creating git bundle from source...");
       throwIfAborted();
+      srcBundleAttempted = true;
       const bundleResult = await runDockerCommand(
         `exec ${srcContainerName} git -C ${CONTAINER_SRC_DIR} bundle create ${containerBundlePath} --all`,
         300000,
@@ -1276,9 +1280,11 @@ export class DockerRuntime extends RemoteRuntime {
       // 10. Cleanup (best-effort, ignore errors)
       /* eslint-disable @typescript-eslint/no-empty-function */
       // Clean up bundle in source container
-      await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
-        () => {}
-      );
+      if (srcBundleAttempted) {
+        await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
+          () => {}
+        );
+      }
       // Clean up bundle in destination container (if it exists)
       if (destContainerCreated) {
         await runDockerCommand(
