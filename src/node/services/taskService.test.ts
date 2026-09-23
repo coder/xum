@@ -76,6 +76,7 @@ import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -6876,6 +6877,123 @@ describe("TaskService", () => {
       runBackgroundInitSpy.mockRestore();
       forkSpy.mockRestore();
     }
+  }, 20_000);
+
+  async function setUpInactiveSharedChild(): Promise<{
+    config: Config;
+    projectPath: string;
+    runtime: ReturnType<typeof createRuntime>;
+    parentId: string;
+    childTaskId: string;
+    parentPath: string;
+  }> {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: "parent",
+      trunkBranch: "main",
+      directoryName: "parent",
+      initLogger: createNullInitLogger(),
+    });
+    const parentPath = runtime.getWorkspacePath(projectPath, "parent");
+    const parentId = "1111111111";
+    const childTaskId = "2222222222";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        { path: parentPath, id: parentId, name: "parent", runtimeConfig },
+        {
+          path: parentPath,
+          id: childTaskId,
+          name: "agent_explore_2222222222",
+          runtimeConfig,
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          taskIsolation: "none",
+          taskStatus: "reported",
+          taskTrunkBranch: "parent",
+        },
+      ],
+      testTaskSettings()
+    );
+    return { config, projectPath, runtime, parentId, childTaskId, parentPath };
+  }
+
+  test("isolation: none child reawakens in its owner's checkout after the owner is renamed", async () => {
+    const { config, projectPath, runtime, parentId, childTaskId, parentPath } =
+      await setUpInactiveSharedChild();
+    // Same checkout move and config write as WorkspaceService.rename.
+    const renamed = await runtime.renameWorkspace(
+      projectPath,
+      "parent",
+      "renamed",
+      undefined,
+      true
+    );
+    assert(renamed.success, "Expected owner checkout rename to succeed");
+    expect(renamed.newPath).not.toBe(parentPath);
+    await config.editConfig((cfg) => {
+      const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === parentId);
+      assert(owner, "Expected owner entry");
+      owner.name = "renamed";
+      owner.path = renamed.newPath;
+      return cfg;
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const result = await taskService.sendMessageToDescendantAgentTask(
+      parentId,
+      childTaskId,
+      "Follow up",
+      "tool-end"
+    );
+
+    expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    expect(sendMessage).toHaveBeenCalled();
+    expect(config.findWorkspace(childTaskId)?.workspacePath).toBe(renamed.newPath);
+    const metadata = await config.getWorkspaceMetadataById(childTaskId);
+    assert(metadata, "Expected child metadata");
+    expect(metadata.taskTrunkBranch).toBe("renamed");
+    const { runtime: streamRuntime } = createRuntimeContextForWorkspace({
+      ...metadata,
+      namedWorkspacePath: config.findWorkspace(childTaskId)?.workspacePath,
+    });
+    expect(await streamRuntime.ensureReady()).toEqual({ ready: true });
+  }, 20_000);
+
+  test("reawakening a child whose host-local checkout is gone fails without starting a turn", async () => {
+    const { config, parentId, childTaskId, parentPath } = await setUpInactiveSharedChild();
+    await fsPromises.rm(parentPath, { recursive: true, force: true });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const result = await taskService.sendMessageToDescendantAgentTask(
+      parentId,
+      childTaskId,
+      "Follow up",
+      "tool-end",
+      {
+        preTurnMessages: [
+          createMuxMessage("pre-turn-row", "assistant", "Family note", { timestamp: Date.now() }),
+        ],
+      }
+    );
+
+    expect(result.success).toBe(false);
+    assert(!result.success, "Expected reawaken to fail");
+    expect(result.error.code).toBe("send_failed");
+    expect(sendMessage).not.toHaveBeenCalled();
+    const turns = await (
+      taskService as unknown as { taskHandleStore: TaskHandleStore }
+    ).taskHandleStore.listWorkspaceTurns(parentId);
+    expect(turns).toEqual([]);
+    const history = await historyService.getHistoryFromLatestBoundary(childTaskId);
+    expect(history).toEqual(Ok([]));
   }, 20_000);
 
   test("dequeued isolation: none task reuses the parent checkout without forking or init", async () => {
@@ -34840,7 +34958,12 @@ describe("TaskService", () => {
     test("failed reactivation preserves the prior owned settlement", async () => {
       const taskId = "task-outcome-reactivation-failed";
       const { config } = await setupTree([
-        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        {
+          id: taskId,
+          parent: rootId,
+          // Project-dir runtime: reach createWorkspaceTurn instead of the missing-checkout preflight.
+          overrides: { taskStatus: "interrupted", runtimeConfig: { type: "local" } },
+        },
       ]);
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService, aiService } = createTaskServiceHarness(config, { workspaceService });
@@ -34875,7 +34998,12 @@ describe("TaskService", () => {
     test("failed reactivation does not manufacture retirement for a legacy owner", async () => {
       const taskId = "task-outcome-reactivation-legacy";
       const { config } = await setupTree([
-        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        {
+          id: taskId,
+          parent: rootId,
+          // Project-dir runtime: reach createWorkspaceTurn instead of the missing-checkout preflight.
+          overrides: { taskStatus: "interrupted", runtimeConfig: { type: "local" } },
+        },
       ]);
       const { taskService, aiService } = createTaskServiceHarness(config);
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockResolvedValueOnce(
@@ -34904,7 +35032,12 @@ describe("TaskService", () => {
     test("failed reactivation leaves a concurrently reawakened attempt owned", async () => {
       const taskId = "task-outcome-reactivation-superseded";
       const { config } = await setupTree([
-        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+        {
+          id: taskId,
+          parent: rootId,
+          // Project-dir runtime: reach createWorkspaceTurn instead of the missing-checkout preflight.
+          overrides: { taskStatus: "interrupted", runtimeConfig: { type: "local" } },
+        },
       ]);
       const { taskService, aiService } = createTaskServiceHarness(config);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);

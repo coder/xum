@@ -3081,6 +3081,76 @@ describe("Config", () => {
     });
   });
 
+  describe("shared-checkout task workspaces", () => {
+    const projectPath = "/fake/project";
+    const staleOwnerPath = "/fake/src/project/original";
+    const ownerPath = "/fake/src/project/renamed";
+
+    function writeWorkspaces(workspaces: Array<Record<string, unknown>>): void {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces }]] })
+      );
+    }
+
+    function sharedTask(id: string, parentWorkspaceId: string): Record<string, unknown> {
+      return {
+        id,
+        name: `${id}-name`,
+        path: staleOwnerPath,
+        parentWorkspaceId,
+        taskIsolation: "none",
+        taskTrunkBranch: "original",
+      };
+    }
+
+    it("resolve nested shared children to the owner's current checkout and branch", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+        sharedTask("grandchild", "child"),
+        {
+          id: "forked",
+          name: "forked-name",
+          path: "/fake/src/project/forked",
+          parentWorkspaceId: "owner",
+          taskTrunkBranch: "original",
+        },
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      const metadataById = new Map(
+        (await freshConfig.getAllWorkspaceMetadata()).map((metadata) => [metadata.id, metadata])
+      );
+      for (const id of ["child", "grandchild"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.namedWorkspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.taskTrunkBranch).toBe("renamed");
+      }
+      expect(freshConfig.findWorkspace("forked")?.workspacePath).toBe("/fake/src/project/forked");
+      expect(metadataById.get("forked")?.taskTrunkBranch).toBe("original");
+    });
+
+    it("keep persisted values when the owner chain is broken or cyclic", () => {
+      writeWorkspaces([
+        sharedTask("orphan", "missing-owner"),
+        sharedTask("cycle-a", "cycle-b"),
+        sharedTask("cycle-b", "cycle-a"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      for (const id of ["orphan", "cycle-a", "cycle-b"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(staleOwnerPath);
+      }
+      const workspaces = freshConfig.loadConfigOrDefault().projects.get(projectPath)?.workspaces;
+      expect(workspaces?.map((workspace) => workspace.taskTrunkBranch)).toEqual([
+        "original",
+        "original",
+        "original",
+      ]);
+    });
+  });
+
   describe("getAllWorkspaceMetadata with migration", () => {
     it.each([false, true])(
       "derives task-family roots through archived rows and cycles (reversed=%s)",

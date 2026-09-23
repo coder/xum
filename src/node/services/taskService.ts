@@ -1539,6 +1539,35 @@ function buildWorkflowTimeoutFinalizationPrompt(
   return `${base}\n\nAdditional workflow-specific finalization instructions:\n${finalInstructions}`;
 }
 
+/**
+ * Reawakening reports success before the child's stream starts, so a missing checkout would
+ * otherwise only surface later as an async turn failure. Only host-local worktrees are checked:
+ * remote ensureReady can provision for minutes (Coder/Docker/devcontainer) or always reports
+ * ready (SSH).
+ */
+async function getMissingHostLocalCheckoutError(entry: {
+  projectPath: string;
+  workspace: WorkspaceConfigEntry;
+}): Promise<string | null> {
+  const { workspace } = entry;
+  const name = coerceNonEmptyString(workspace.name);
+  if (
+    name == null ||
+    !isWorktreeRuntime(workspace.runtimeConfig) ||
+    (workspace.projects?.length ?? 0) > 1
+  ) {
+    return null;
+  }
+  const runtime = createRuntimeForWorkspace({
+    runtimeConfig: workspace.runtimeConfig,
+    projectPath: entry.projectPath,
+    name,
+    namedWorkspacePath: coerceNonEmptyString(workspace.path),
+  });
+  const readiness = await runtime.ensureReady();
+  return readiness.ready ? null : readiness.error;
+}
+
 export class TaskService implements AgentTaskIntegration {
   // Serialize stream-end processing per workspace to avoid races when
   // finalizing reported tasks and cleanup state transitions. Lock order: acquired BEFORE the
@@ -5897,6 +5926,13 @@ export class TaskService implements AgentTaskIntegration {
     const refreshedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (refreshedEntry == null) {
       return Err({ code: "not_found" as const });
+    }
+    const checkoutError = await getMissingHostLocalCheckoutError(refreshedEntry);
+    if (checkoutError != null) {
+      return Err({
+        code: "send_failed" as const,
+        message: `Cannot reawaken sub-agent ${taskId}: its checkout is unavailable (${checkoutError}). Spawn a fresh sub-agent instead.`,
+      });
     }
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event

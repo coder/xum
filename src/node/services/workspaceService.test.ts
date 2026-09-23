@@ -45,7 +45,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
-import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
+import { createTestProject, projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
@@ -16809,6 +16809,128 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     } finally {
       createRuntimeSpy.mockRestore();
     }
+  });
+});
+
+describe("WorkspaceService shared-checkout tasks and owner renames", () => {
+  const ownerId = "owner-shared-rename";
+  const childId = "child-shared-rename";
+  let config: Config;
+  let historyService: HistoryService;
+  let cleanup: () => Promise<void>;
+  let workspaceService: WorkspaceService;
+  let projectPath: string;
+  let ownerPath: string;
+
+  beforeEach(async () => {
+    ({ config, historyService, cleanup } = await createTestHistoryService());
+    projectPath = await createTestProject(config.rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = runtimeFactory.createRuntime(runtimeConfig, { projectPath });
+    const created = await runtime.createWorkspace({
+      projectPath,
+      branchName: "parent",
+      trunkBranch: "main",
+      directoryName: "parent",
+      initLogger: {
+        logStep: () => undefined,
+        logStdout: () => undefined,
+        logStderr: () => undefined,
+        logComplete: () => undefined,
+        enterHookPhase: () => undefined,
+      },
+    });
+    expect(created.success).toBe(true);
+    ownerPath = runtime.getWorkspacePath(projectPath, "parent");
+    await saveWorkspaces(config, projectPath, [
+      { id: ownerId, name: "parent", path: ownerPath, runtimeConfig },
+      {
+        id: childId,
+        name: "agent_explore_child",
+        path: ownerPath,
+        runtimeConfig,
+        parentWorkspaceId: ownerId,
+        taskIsolation: "none",
+        taskStatus: "reported",
+        taskTrunkBranch: "parent",
+      },
+    ]);
+
+    class FakeAIService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve(Ok(undefined)));
+      getWorkspaceMetadata = mock(async (workspaceId: string) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? Ok(metadata) : Err("not found");
+      });
+    }
+    workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: new FakeAIService() as unknown as AIService,
+    });
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  test("refuses to rename a shared child before touching any runtime", async () => {
+    // Override-aware runtimes (SSH) would otherwise move the owner's checkout.
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
+    let result: Result<{ newWorkspaceId: string }>;
+    try {
+      result = await workspaceService.rename(childId, "moved-child");
+      expect(createRuntimeSpy).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+
+    expect(result.success).toBe(false);
+    expect(existsSync(ownerPath)).toBe(true);
+    expect(config.findWorkspace(childId)?.workspacePath).toBe(ownerPath);
+    expect(config.findWorkspace(ownerId)?.workspacePath).toBe(ownerPath);
+  });
+
+  test("shared children follow an owner rename and removing one keeps the renamed checkout", async () => {
+    const emittedChildPaths: Array<string | undefined> = [];
+    workspaceService.on(
+      "metadata",
+      (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => {
+        if (event.workspaceId === childId) {
+          emittedChildPaths.push(event.metadata?.namedWorkspacePath);
+        }
+      }
+    );
+    const renamed = await workspaceService.rename(ownerId, "renamed-parent");
+    expect(renamed.success).toBe(true);
+    const renamedOwnerPath = config.findWorkspace(ownerId)?.workspacePath;
+    if (renamedOwnerPath == null) throw new Error("renamed owner is missing from config");
+    expect(renamedOwnerPath).not.toBe(ownerPath);
+    expect(config.findWorkspace(childId)?.workspacePath).toBe(renamedOwnerPath);
+    expect(emittedChildPaths).toEqual([renamedOwnerPath]);
+
+    const removed = await workspaceService.remove(childId, true);
+
+    expect(removed.success).toBe(true);
+    expect(config.findWorkspace(childId)).toBeNull();
+    expect(existsSync(path.join(renamedOwnerPath, "README.md"))).toBe(true);
+  });
+
+  test("removing a renamed owner keeps the checkout an active shared child still uses", async () => {
+    expect((await workspaceService.rename(ownerId, "renamed-parent")).success).toBe(true);
+    const renamedOwnerPath = config.findWorkspace(ownerId)?.workspacePath;
+    if (renamedOwnerPath == null) throw new Error("renamed owner is missing from config");
+    await config.editConfig((cfg) => {
+      const child = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === childId);
+      if (child) child.taskStatus = "running";
+      return cfg;
+    });
+
+    const removed = await workspaceService.remove(ownerId, true);
+
+    expect(removed.success).toBe(true);
+    expect(existsSync(path.join(renamedOwnerPath, "README.md"))).toBe(true);
   });
 });
 

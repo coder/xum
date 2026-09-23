@@ -95,6 +95,7 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
+import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
 import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
@@ -1830,6 +1831,8 @@ export class Config {
       projectConfig.workspaces = [];
       configModified = true;
     }
+
+    deriveSharedTaskCheckouts(projectsMap);
 
     // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
     // rewrite the previous false/missing default before TaskService startup can create durable

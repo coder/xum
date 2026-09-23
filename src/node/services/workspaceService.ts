@@ -7871,6 +7871,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const oldMetadata = metadataResult.data;
       const oldName = oldMetadata.name;
+      // A shared-checkout task runs in its owning ancestor's checkout; renaming it would move
+      // (or, through override-aware runtimes, rename) a checkout it does not own.
+      if (oldMetadata.taskIsolation === "none") {
+        return Err(
+          "Cannot rename a sub-agent that shares its parent's checkout. Rename the parent workspace instead."
+        );
+      }
 
       if (newName === oldName) {
         return Ok({ newWorkspaceId: workspaceId });
@@ -8161,6 +8168,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         session.emitMetadata(enrichedMetadata);
       } else {
         this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
+      }
+      const sharedDescendantIds = allMetadataUpdated
+        .filter(
+          (metadata) =>
+            metadata.taskIsolation === "none" &&
+            metadata.id !== workspaceId &&
+            metadata.namedWorkspacePath === updatedMetadata.namedWorkspacePath
+        )
+        .map((metadata) => metadata.id);
+      if (sharedDescendantIds.length > 0) {
+        await this.emitCurrentWorkspaceMetadataBatch(sharedDescendantIds);
       }
 
       await this.syncCodeWorkspaceFiles(updatedMetadata);
