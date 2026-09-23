@@ -833,4 +833,38 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  test("a startup re-drive's unowned attempt that reports holds the queued manual follow-up and refuses it: nothing dispatches under the completed attempt", async () => {
+    const childId = "holdredrive001";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    try {
+      // Restart recovery re-drives the running child under a rotated, UNOWNED attempt.
+      await taskService.recoverInterruptedTasks();
+      await until(() => completions.length === 1, "the re-drive's stream");
+      const redriven = entryOf(config, childId)?.taskAttemptId;
+      expect(redriven).not.toBe("att_00000000000000a4");
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      // The user's follow-up arrives mid-stream: queued, bound to the re-driven attempt.
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+      // The re-driven turn ends on a terminal agent_report.
+      stack.endStream(0, { report: "done" }, true);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+      await yieldMacrotasks(20);
+      // No successor turn under the completed attempt: the entry was refused and handed back.
+      expect(completions).toHaveLength(1);
+      expect(stack.restoreEvents().map((event) => event.text)).toEqual(["follow-up text"]);
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(entryOf(config, childId)?.taskAttemptId).toBe(redriven);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });

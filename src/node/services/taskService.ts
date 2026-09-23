@@ -535,12 +535,16 @@ interface AdmittedSend {
  *  - `indeterminate`: the handler threw, the artifact was not durable everywhere, or the row has
  *    no parent to report to. Never a continuation: held entries are refused as for `published`.
  * Bound to the exact OwnedTaskAttempt object, so a reawakening that replaced the attempt while
- * the handler waited never reads a predecessor's decision as its own. Lifetime is explicit, never
+ * the handler waited never reads a predecessor's decision as its own. A stream this process ran
+ * for an attempt it does not own (a startup re-drive, a prior process's attempt) gets an UNOWNED
+ * decision (`attempt` undefined) keyed by the persisted attempt id: queued sends bound to that id
+ * are held and refused exactly the same way, and no ownership, settlement or receipt authority is
+ * granted to obtain the hold. Lifetime is explicit, never
  * a count: dropped once no pending/enqueued obligation of the attempt remains to read it, and
  * when a new attempt begins in this process (sends bound to the old id read stale anyway).
  */
 interface StreamEndDecision {
-  readonly attempt: OwnedTaskAttempt;
+  readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
@@ -2560,16 +2564,21 @@ export class TaskService implements AgentTaskIntegration {
   // Stream-end decisions (see StreamEndDecision)
   // ---------------------------------------------------------------------------------------------
 
-  /** Register the pending decision for `attempt`'s ended stream. Synchronous, event tick only. */
+  /**
+   * Register the pending decision for the ended stream of `attempt` (owned) or, when this process
+   * owns none, of the persisted `unownedAttemptId`. Synchronous, event tick only.
+   */
   private registerStreamEndDecision(
     taskId: string,
     messageId: string,
-    attempt: OwnedTaskAttempt
+    attempt: OwnedTaskAttempt | undefined,
+    unownedAttemptId: string | undefined
   ): StreamEndDecision | undefined {
-    if (attempt.attemptId == null) return undefined;
+    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
+    if (attemptId == null) return undefined;
     const decision: StreamEndDecision = {
       attempt,
-      attemptId: attempt.attemptId,
+      attemptId,
       messageId,
       outcome: "pending",
     };
@@ -2590,13 +2599,19 @@ export class TaskService implements AgentTaskIntegration {
     return latest;
   }
 
-  /** The handler's own pending decision for exactly `attempt` (none once resolved or replaced). */
+  /**
+   * The handler's own pending decision for exactly `attempt` — or, for an unowned stream
+   * (`attempt` undefined), the unowned decision for `unownedAttemptId` — none once resolved or
+   * replaced.
+   */
   private findPendingStreamEndDecision(
     taskId: string,
-    attempt: OwnedTaskAttempt | undefined
+    attempt: OwnedTaskAttempt | undefined,
+    unownedAttemptId?: string
   ): StreamEndDecision | undefined {
-    if (attempt?.attemptId == null) return undefined;
-    const decision = this.findStreamEndDecision(taskId, attempt.attemptId);
+    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
+    if (attemptId == null) return undefined;
+    const decision = this.findStreamEndDecision(taskId, attemptId);
     return decision?.outcome === "pending" && decision.attempt === attempt ? decision : undefined;
   }
 
@@ -3510,17 +3525,21 @@ export class TaskService implements AgentTaskIntegration {
         // wait or any handler await could let a reawakening replace it (see
         // releaseReportedTaskAttempt).
         ownedAttempt: this.ownedAttemptByTaskId.get(payload.workspaceId),
+        // Without an owner (startup re-drive, prior-process attempt): the persisted attempt the
+        // stream ran under, read in the same tick. Undefined for workspaces that are not tasks.
+        unownedAttemptId: undefined as string | undefined,
       };
-      // The decision this handler owes for the owned attempt's ended stream, registered in the
-      // event's own tick so the session's turn-completion drain (a later microtask) finds it.
-      const decision =
-        taskOrigin.ownedAttempt != null
-          ? this.registerStreamEndDecision(
-              payload.workspaceId,
-              payload.messageId,
-              taskOrigin.ownedAttempt
-            )
-          : undefined;
+      if (taskOrigin.ownedAttempt == null) {
+        taskOrigin.unownedAttemptId = this.currentTaskAttemptId(payload.workspaceId);
+      }
+      // The decision this handler owes for the attempt's ended stream, registered in the event's
+      // own tick so the session's turn-completion drain (a later microtask) finds it.
+      const decision = this.registerStreamEndDecision(
+        payload.workspaceId,
+        payload.messageId,
+        taskOrigin.ownedAttempt,
+        taskOrigin.unownedAttemptId
+      );
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
           try {
@@ -14295,6 +14314,7 @@ export class TaskService implements AgentTaskIntegration {
       executionId: string | null;
       stopEpoch: number;
       ownedAttempt: OwnedTaskAttempt | undefined;
+      unownedAttemptId?: string;
     }
   ): Promise<void> {
     // Cut attribution must reflect the state at the ended stream's own event,
@@ -14303,10 +14323,13 @@ export class TaskService implements AgentTaskIntegration {
     const queueCutSnapshot =
       eventTimeQueueCutSnapshot ??
       this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(event.workspaceId);
+    const fallbackOwnedAttempt = this.ownedAttemptByTaskId.get(event.workspaceId);
     const taskOrigin = eventTimeTaskOrigin ?? {
       executionId: this.getAgentTaskExecutionId(event.workspaceId),
       stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
-      ownedAttempt: this.ownedAttemptByTaskId.get(event.workspaceId),
+      ownedAttempt: fallbackOwnedAttempt,
+      unownedAttemptId:
+        fallbackOwnedAttempt == null ? this.currentTaskAttemptId(event.workspaceId) : undefined,
     };
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
@@ -14662,7 +14685,11 @@ export class TaskService implements AgentTaskIntegration {
     if (reportArgs == null && !(isPlanLike && proposePlanResult) && status !== "interrupted") {
       this.resolveStreamEndDecision(
         workspaceId,
-        this.findPendingStreamEndDecision(workspaceId, taskOrigin.ownedAttempt),
+        this.findPendingStreamEndDecision(
+          workspaceId,
+          taskOrigin.ownedAttempt,
+          taskOrigin.unownedAttemptId
+        ),
         "nonreport"
       );
     }
@@ -16352,6 +16379,10 @@ export class TaskService implements AgentTaskIntegration {
     latestChildEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined;
     isWorkflowOwnedChildReport: boolean;
   } | null> {
+    // An unowned stream's decision (see StreamEndDecision) is keyed by the persisted attempt id
+    // the report is published for: the row as read before this report.
+    const unownedReportedAttemptId =
+      reportedAttempt == null ? latestEntryBeforeReport?.workspace.taskAttemptId : undefined;
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
@@ -16411,7 +16442,11 @@ export class TaskService implements AgentTaskIntegration {
       // Reported row, no release, nobody to report to: not a continuation of the attempt.
       this.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        this.findPendingStreamEndDecision(
+          childWorkspaceId,
+          reportedAttempt,
+          unownedReportedAttemptId
+        ),
         "indeterminate"
       );
       return null;
@@ -16486,13 +16521,21 @@ export class TaskService implements AgentTaskIntegration {
       this.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
       this.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        this.findPendingStreamEndDecision(
+          childWorkspaceId,
+          reportedAttempt,
+          unownedReportedAttemptId
+        ),
         "published"
       );
     } else {
       this.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(childWorkspaceId, reportedAttempt),
+        this.findPendingStreamEndDecision(
+          childWorkspaceId,
+          reportedAttempt,
+          unownedReportedAttemptId
+        ),
         "indeterminate"
       );
     }
