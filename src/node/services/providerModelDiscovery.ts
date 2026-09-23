@@ -76,6 +76,9 @@ export async function discoverProviderModels(
     )
       return { status: "unsupported" };
     url.pathname = `${url.pathname.replace(/\/+$/, "")}/models`;
+    // A cursor carried in the configured base would skip catalog pages and still
+    // look complete; start from the first page and set cursors only from replies.
+    if (anthropic) for (const key of ["after_id", "before_id"]) url.searchParams.delete(key);
     const headers = new Headers(
       anthropic
         ? { "x-api-key": request.apiKey, "anthropic-version": "2023-06-01" }

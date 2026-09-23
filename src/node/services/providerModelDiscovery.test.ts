@@ -126,6 +126,16 @@ it("paginates Anthropic by cursor without following upstream URLs", async () => 
   expect(requests).toHaveLength(2);
 });
 
+it("ignores Anthropic cursors carried in the configured base URL", async () => {
+  save("anthropic", { baseUrl: `${server.url}?tenant=one&after_id=zzz&before_id=yyy` });
+  respond = () => Response.json({ data: [{ id: "a" }], has_more: false });
+  expect(await service.discoverModels("anthropic")).toEqual({ status: "ok", modelIds: ["a"] });
+  const first = new URL(requests[0].url);
+  expect(first.searchParams.has("after_id")).toBe(false);
+  expect(first.searchParams.has("before_id")).toBe(false);
+  expect(first.searchParams.get("tenant")).toBe("one");
+});
+
 it.each(["anthropic", "openai"])("accepts an empty %s catalog", async (provider) => {
   save(provider);
   respond = () => Response.json({ data: [], has_more: false, last_id: null });
