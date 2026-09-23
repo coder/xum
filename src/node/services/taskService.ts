@@ -606,6 +606,7 @@ interface MaterializedTaskLaunch {
   runtimeForTaskWorkspace: Runtime;
   inheritedProjects: WorkspaceMetadata["projects"];
   sourceRuntimeConfigUpdate?: RuntimeConfig;
+  reusedExistingCheckout: boolean;
 }
 
 export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
@@ -4682,6 +4683,7 @@ export class TaskService implements AgentTaskIntegration {
       forkedRuntimeConfig,
       runtimeForTaskWorkspace,
       inheritedProjects: workspace.projects ?? plan.parentMeta.projects,
+      reusedExistingCheckout: true,
     };
   }
 
@@ -4769,6 +4771,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(forkResult.data.sourceRuntimeConfigUpdate != null
           ? { sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate }
           : {}),
+        reusedExistingCheckout: false,
       };
     });
   }
@@ -4873,9 +4876,6 @@ export class TaskService implements AgentTaskIntegration {
     // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
     // back to forking a real workspace and the shared flag must be cleared below.
     const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
-    const persistedSharedPath = taskWasShared
-      ? coerceNonEmptyString(entryAtStart.workspace.path)
-      : undefined;
 
     const initLogger = this.startWorkspaceInit(plan.taskId, plan.parentMeta.projectPath);
     // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) fork from the
@@ -4903,10 +4903,9 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // Reuse of the persisted shared path means the task still runs in the parent's checkout;
-    // any other materialized path means the fork fallback created a real (deletable) workspace.
-    const sharesParentCheckout =
-      taskWasShared && materialized.workspacePath === persistedSharedPath;
+    // Reuse keeps the task in its owner's checkout; a fork fallback made a real (deletable) one.
+    // Not a path comparison: shared paths derive from the owner, so a mid-launch rename moves them.
+    const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,

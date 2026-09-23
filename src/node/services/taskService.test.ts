@@ -7081,6 +7081,101 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
+  test("dequeued isolation: none task stays shared when its owner is renamed mid-launch", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: "parent",
+      trunkBranch: "main",
+      directoryName: "parent",
+      initLogger: createNullInitLogger(),
+    });
+    const parentPath = runtime.getWorkspacePath(projectPath, "parent");
+    const parentId = "1111111111";
+    const queuedTaskId = "task-shared-queued";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        { path: parentPath, id: parentId, name: "parent", runtimeConfig },
+        {
+          path: parentPath,
+          id: queuedTaskId,
+          name: "agent_explore_task-shared-queued",
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "queued",
+          taskPrompt: "queued shared analysis",
+          taskModelString: defaultModel,
+          taskTrunkBranch: "parent",
+          taskIsolation: "none",
+        },
+      ],
+      testTaskSettings()
+    );
+
+    // The launch admits the task after reading its entry and before materializing its checkout.
+    const desktop = new DesktopInputCoordinator(config);
+    const admit = desktop.withAdmission.bind(desktop);
+    let renamedPath: string | undefined;
+    const admissionSpy = spyOn(desktop, "withAdmission").mockImplementation(
+      async (workspaceId, fn) => {
+        if (
+          renamedPath == null &&
+          workspaceId === queuedTaskId &&
+          findWorkspaceInConfig(config, queuedTaskId)?.taskStatus === "starting"
+        ) {
+          const renamed = await runtime.renameWorkspace(
+            projectPath,
+            "parent",
+            "renamed",
+            undefined,
+            true
+          );
+          assert(renamed.success, "Expected owner checkout rename to succeed");
+          renamedPath = renamed.newPath;
+          await config.editConfig((cfg) => {
+            const owner = cfg.projects
+              .get(projectPath)
+              ?.workspaces.find((ws) => ws.id === parentId);
+            assert(owner, "Expected owner entry");
+            owner.name = "renamed";
+            owner.path = renamed.newPath;
+            return cfg;
+          });
+        }
+        return admit(workspaceId, fn);
+      }
+    );
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    try {
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+        desktopInputCoordinator: desktop,
+      });
+
+      await taskService.initialize();
+      await waitForWorkspaceTaskStatus(config, queuedTaskId, "running");
+
+      assert(renamedPath, "Expected the owner to be renamed during the launch");
+      expect(forkSpy).not.toHaveBeenCalled();
+      const entry = findWorkspaceInConfig(config, queuedTaskId);
+      // A cleared flag would let removal or delete-on-archive treat the owner's checkout as the task's own.
+      expect(entry?.taskIsolation).toBe("none");
+      expect(entry?.path).toBe(renamedPath);
+    } finally {
+      forkSpy.mockRestore();
+      admissionSpy.mockRestore();
+    }
+  }, 20_000);
+
   test("nested isolation: none task inherits the shared parent's real branch and checkout", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir);
