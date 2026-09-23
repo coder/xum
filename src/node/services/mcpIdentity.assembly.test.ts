@@ -192,9 +192,11 @@ describe("MCP identity through real turn assembly", () => {
         identity: { name: "Response identity", version: "2", title: "Fixture response" },
         source: "response",
       });
-      // The display key never reaches the model-visible output; unrelated _meta survives.
+      // No protocol _meta reaches the model-visible output: neither the display
+      // key nor the fixture's unrelated `_meta` sentinel.
       expect(JSON.stringify(topLevelEnd.result)).not.toContain(MCP_SERVER_INFO_META_KEY);
-      expect(JSON.stringify(topLevelEnd.result)).toContain("preserved");
+      expect(JSON.stringify(topLevelEnd.result)).not.toContain("preserved");
+      expect(JSON.stringify(topLevelEnd.result)).toContain("fixture answer");
       // The response identity's own icon travels as an opaque ref: the event
       // carries neither the server's data URL nor the rasterized bytes.
       const iconRef = topLevelEnd.mcpServer?.iconRef;
@@ -241,6 +243,12 @@ describe("MCP identity through real turn assembly", () => {
       );
       // The sandbox result itself is not an MCP result: no snapshot on the parent.
       expect(parentEnd.mcpServer).toBeUndefined();
+      // Neither the nested event nor the script's view of the result carries protocol _meta.
+      for (const result of [nestedEnd.result, parentEnd.result]) {
+        expect(JSON.stringify(result)).not.toContain(MCP_SERVER_INFO_META_KEY);
+        expect(JSON.stringify(result)).not.toContain("preserved");
+        expect(JSON.stringify(result)).toContain("fixture answer");
+      }
 
       // Turn 3: the server rejects the call. There is no result metadata to
       // replace the handshake identity, so the failed part keeps the
@@ -270,6 +278,7 @@ describe("MCP identity through real turn assembly", () => {
       const persistedTop = toolParts.find((part) => part.toolCallId === topLevelEnd.toolCallId);
       expect(persistedTop?.mcpServer).toEqual(topLevelEnd.mcpServer);
       expect(JSON.stringify(persistedTop?.output)).not.toContain(MCP_SERVER_INFO_META_KEY);
+      expect(JSON.stringify(persistedTop?.output)).not.toContain("preserved");
       const persistedParent = toolParts.find(
         (part) => part.toolCallId === "scripted-code_execution"
       );
@@ -281,6 +290,7 @@ describe("MCP identity through real turn assembly", () => {
       expect(nestedCalls?.[0]?.toolCallId).toBe(nestedEnd.toolCallId);
       expect(nestedCalls?.[0]?.mcpServer).toEqual(nestedEnd.mcpServer);
       expect(JSON.stringify(nestedCalls?.[0]?.output)).not.toContain(MCP_SERVER_INFO_META_KEY);
+      expect(JSON.stringify(nestedCalls?.[0]?.output)).not.toContain("preserved");
       const persistedFailed = toolParts.find((part) => part.toolCallId === "failed");
       expect(persistedFailed?.state).toBe("output-available");
       expect(persistedFailed?.output).toMatchObject({ success: false });
