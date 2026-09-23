@@ -265,9 +265,12 @@ import {
   claimTaskCheckoutIdentity,
   isWorktreeSemanticsRuntime,
   revalidateTaskCheckoutIdentity,
+  taskCheckoutMismatchLabel,
+  taskCheckoutProofPaths,
   type BoundTaskCheckoutIdentity,
   type CapturedTaskCheckoutIdentity,
   type TaskCheckoutPreparation,
+  type TaskCheckoutSecondaryTarget,
 } from "@/node/services/taskCheckoutPreparation";
 import type {
   PendingMaterialization,
@@ -3325,6 +3328,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * reuses or removes them; a claimed one refuses adoption through its nonce) and reports their
    * paths. A throwing `publish` propagates. A `local` runtime fork shares the project directory
    * and is a shared task by construction: never a target here.
+   *
+   * A multi-project target lists its `secondaries` (the other projects' checkouts): the claim
+   * and bind below cover them with the primary (see claimTaskCheckoutIdentity; they have no
+   * consent state to prune), so one refusal refuses the whole preparation and proof v2 binds
+   * every checkout the task executes in.
    */
   async prepareTaskCheckouts<T>(
     materialize: () => Promise<
@@ -3332,6 +3340,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspacePath: string;
         runtimeConfig: RuntimeConfig;
         materializationId: string;
+        secondaries?: readonly TaskCheckoutSecondaryTarget[];
       }>
     >,
     publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>
@@ -3422,11 +3431,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       // Read-only revalidation right before publication: the checkout locks are released, so a
       // directory replaced meanwhile (only a non-cooperating writer can) must not be published.
+      // Refusals name every checkout of the proof (multi-project secondaries included): all of
+      // them stay retained, unregistered.
       for (const proof of proofs) {
         const check = await revalidateTaskCheckoutIdentity(proof);
         if (!check.ok) {
+          const refusal =
+            check.state.kind === "mismatch"
+              ? `mismatch: ${taskCheckoutMismatchLabel(check.state)}`
+              : check.state.kind;
           return Err(
-            `${proof.path} changed after sanitization (${check.state.kind}); nothing was published`
+            `${taskCheckoutProofPaths(proof).join(", ")} changed after sanitization (${refusal}); nothing was published`
           );
         }
       }
@@ -3448,7 +3463,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // attempt identity is not the caller's — and may duplicate on retry. Only a READABLE
           // registry that lacks a proof refuses; every later admission re-validates the row.
           log.warn("Task publication could not be verified (config unreadable); keeping success", {
-            checkouts: proofs.map((proof) => proof.path),
+            checkouts: proofs.flatMap(taskCheckoutProofPaths),
             error: getErrorMessage(error),
           });
           return Ok(published);
@@ -3458,7 +3473,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
         if (unpersisted.length > 0) {
           return Err(
-            `Task publication did not persist: no config row carries the preparation proof of ${unpersisted.map((proof) => proof.path).join(", ")}; the prepared checkout(s) were retained, not registered.`
+            `Task publication did not persist: no config row carries the preparation proof of ${unpersisted.map((proof) => proof.path).join(", ")}; the prepared checkout(s) ${unpersisted.flatMap(taskCheckoutProofPaths).join(", ")} were retained, not registered.`
           );
         }
       }
