@@ -1,3 +1,7 @@
+import "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
+import * as RealSettingsContextModule from "@/browser/contexts/SettingsContext";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -69,6 +73,9 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// The overlay also changes the store identity, so it must stay local to this suite.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
+
 // Overlay (not replace) the raw store: bun evaluates every test file before running tests
 // and static import bindings freeze at eval time, so this file-scope mock is what any
 // later-evaluated file in the same bun process gets forever. A bare fake missing store
@@ -89,6 +96,13 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
+
+// Later full-app suites must not inherit this partial API client or the SettingsContext
+// stub below (it drops SettingsProvider, which SettingsSectionStory renders).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...RealAPIModule }],
+  ["@/browser/contexts/SettingsContext", { ...RealSettingsContextModule }],
+]);
 
 // Spread the real module: replacing it outright deletes exports like APIContext that
 // later-evaluated test files import statically, crashing them at load (module mocks are
@@ -131,6 +145,10 @@ void mock.module("@/browser/contexts/SettingsContext", () => ({
 const actualModelsFromSettings =
   require("@/browser/hooks/useModelsFromSettings?real=1") as typeof ModelsFromSettingsModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
+
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useModelsFromSettings", { ...actualModelsFromSettings }],
+]);
 
 // Spread the real module: this suite only pins getDefaultModel (its assertions expect
 // "openai:gpt-4o-mini"); replacing the whole module would leak missing exports.
