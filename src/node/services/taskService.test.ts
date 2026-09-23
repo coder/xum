@@ -30467,25 +30467,40 @@ describe("TaskService", () => {
     const originalGetWorkspaceTurn = internal.taskHandleStore.getWorkspaceTurn.bind(
       internal.taskHandleStore
     );
+    const completionHandled = Promise.withResolvers<void>();
+    const abortController = new AbortController();
     let triggered = false;
-    spyOn(internal.taskHandleStore, "getWorkspaceTurn").mockImplementation(
-      async (ownerWorkspaceId: string, handleId: string) => {
-        const record = await originalGetWorkspaceTurn(ownerWorkspaceId, handleId);
-        if (!triggered && handleId === "wst_handle" && record?.status === "running") {
-          triggered = true;
-          await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
-        }
-        return record;
+    const getWorkspaceTurnSpy = spyOn(
+      internal.taskHandleStore,
+      "getWorkspaceTurn"
+    ).mockImplementation(async (ownerWorkspaceId: string, handleId: string) => {
+      const record = await originalGetWorkspaceTurn(ownerWorkspaceId, handleId);
+      if (!triggered && handleId === "wst_handle" && record?.status === "running") {
+        triggered = true;
+        await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
+        completionHandled.resolve();
       }
-    );
-
-    const report = await workspaceTurnManagerFor(taskService).waitForWorkspaceTurn("wst_handle", {
-      requestingWorkspaceId: parentId,
-      timeoutMs: 100,
+      return record;
     });
 
-    expect(triggered).toBe(true);
-    expect(report.reportMarkdown).toBe("Done");
+    const reportPromise = workspaceTurnManagerFor(taskService).waitForWorkspaceTurn("wst_handle", {
+      requestingWorkspaceId: parentId,
+      abortSignal: abortController.signal,
+    });
+    reportPromise.catch(completionHandled.reject);
+
+    try {
+      await completionHandled.promise;
+      // Completion must reach the waiter before the initial read returns its stale running record.
+      // Abort a missed notification deterministically instead of racing slow I/O against a short timer.
+      abortController.abort();
+      const report = await reportPromise;
+      expect(triggered).toBe(true);
+      expect(report.reportMarkdown).toBe("Done");
+    } finally {
+      abortController.abort();
+      getWorkspaceTurnSpy.mockRestore();
+    }
   });
 
   test("workspace-turn terminal settlements do not overwrite each other", async () => {
