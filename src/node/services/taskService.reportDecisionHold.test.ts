@@ -1293,4 +1293,46 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+  test("a stale local owner never claims a successor's stream: B's report, admitted here as unowned after another backend rotated the row, is published for B", async () => {
+    const childId = "holdstaleowner1";
+    const foreign = "att_00000000000000c5";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const otherBackend = await createTestConfig(rootDir);
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+      // Backend B re-admits the idle row under its own attempt; this process still owns A.
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === childId);
+          if (ws) {
+            ws.taskStatus = "running";
+            ws.taskAttemptId = foreign;
+            ws.taskAttemptUnproven = true;
+          }
+        }
+        return cfg;
+      });
+      // A local send is admitted for B (unowned: the stale owner names A).
+      expect(await workspaceService.sendMessage(childId, "work for B", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(completions).toHaveLength(1);
+      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+      stack.endStream(0, { report: "done by B" }, true);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "B's report");
+      expect(entryOf(config, childId)?.taskAttemptId).toBe(foreign);
+      // The artifact follows the status write within the same publication.
+      let artifact: Awaited<ReturnType<typeof readSubagentReportArtifact>> = null;
+      for (let i = 0; i < 200 && artifact == null; i++) {
+        artifact = await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId);
+        if (artifact == null) await yieldMacrotasks(1);
+      }
+      expect(artifact?.reportMarkdown).toBe("done by B");
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });

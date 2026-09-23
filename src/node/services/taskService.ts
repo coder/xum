@@ -2791,29 +2791,44 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * The attempt an unowned stream runs under: the one its live turn was ADMITTED for (the
-   * admitted obligation bound to the session's active turn), never the row as read now — another
-   * backend may have re-admitted the row under its own attempt while this stream ran, and this
-   * stream's end must neither decide for nor publish as that attempt. Falls back to the persisted
-   * id only for a turn admitted without an obligation (pre-identity/legacy paths).
+   * The attempt id a stream event belongs to, read in the event's own tick (see
+   * resolveStreamAttemptAtEvent).
    */
-  private streamAttemptIdWithoutOwner(taskId: string): string | undefined {
-    const turn = this.workspaceService.getActiveTurnGeneration(taskId);
-    if (turn != null) {
-      for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-        if (send.state === "admitted" && send.turnId === turn) return send.attemptId;
-      }
-    }
-    return this.currentTaskAttemptId(taskId);
+  private streamAttemptIdAtEvent(taskId: string): string | undefined {
+    const origin = this.resolveStreamAttemptAtEvent(taskId);
+    return origin.ownedAttempt != null ? origin.ownedAttempt.attemptId : origin.unownedAttemptId;
   }
 
   /**
-   * The attempt a stream event belongs to, read in the event's own tick: this process's owned
-   * attempt, else the attempt the live turn was admitted under (streamAttemptIdWithoutOwner).
+   * Who a stream event belongs to, read in the event's own tick. The live turn's ADMITTED attempt
+   * decides first: local ownership counts only when it names that same attempt. A process can
+   * still hold a stale owned attempt A after another backend rotated the row to B and a local send
+   * was admitted for B (unowned) — preferring the owner would treat B's stream as A's and discard
+   * its report/recovery as superseded. Without an admitted obligation (legacy turns) the owner,
+   * else the persisted id, applies as before.
    */
-  private streamAttemptIdAtEvent(taskId: string): string | undefined {
+  private resolveStreamAttemptAtEvent(taskId: string): {
+    ownedAttempt: OwnedTaskAttempt | undefined;
+    unownedAttemptId: string | undefined;
+  } {
     const owned = this.ownedAttemptByTaskId.get(taskId);
-    return owned != null ? owned.attemptId : this.streamAttemptIdWithoutOwner(taskId);
+    const turn = this.workspaceService.getActiveTurnGeneration(taskId);
+    let admitted: string | undefined;
+    if (turn != null) {
+      for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+        if (send.state === "admitted" && send.turnId === turn) {
+          admitted = send.attemptId;
+          break;
+        }
+      }
+    }
+    if (owned != null && (admitted == null || owned.attemptId === admitted)) {
+      return { ownedAttempt: owned, unownedAttemptId: undefined };
+    }
+    return {
+      ownedAttempt: undefined,
+      unownedAttemptId: admitted ?? this.currentTaskAttemptId(taskId),
+    };
   }
 
   /** Sends admitted against the task's current attempt that have not claimed a turn yet. */
@@ -3608,14 +3623,11 @@ export class TaskService implements AgentTaskIntegration {
         // The attempt whose stream just ended: captured in the event's own tick, before the lock
         // wait or any handler await could let a reawakening replace it (see
         // releaseReportedTaskAttempt).
-        ownedAttempt: this.ownedAttemptByTaskId.get(payload.workspaceId),
-        // Without an owner (startup re-drive, prior-process attempt): the persisted attempt the
-        // stream ran under, read in the same tick. Undefined for workspaces that are not tasks.
-        unownedAttemptId: undefined as string | undefined,
+        // Without a matching owner (startup re-drive, prior-process attempt, a successor another
+        // backend admitted): the attempt the stream's turn was admitted under, read in the same
+        // tick (see resolveStreamAttemptAtEvent). Undefined for workspaces that are not tasks.
+        ...this.resolveStreamAttemptAtEvent(payload.workspaceId),
       };
-      if (taskOrigin.ownedAttempt == null) {
-        taskOrigin.unownedAttemptId = this.streamAttemptIdWithoutOwner(payload.workspaceId);
-      }
       // The decision this handler owes for the attempt's ended stream, registered in the event's
       // own tick so the session's turn-completion drain (a later microtask) finds it.
       const decision = this.registerStreamEndDecision(
@@ -14503,15 +14515,10 @@ export class TaskService implements AgentTaskIntegration {
     const queueCutSnapshot =
       eventTimeQueueCutSnapshot ??
       this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(event.workspaceId);
-    const fallbackOwnedAttempt = this.ownedAttemptByTaskId.get(event.workspaceId);
     const taskOrigin = eventTimeTaskOrigin ?? {
       executionId: this.getAgentTaskExecutionId(event.workspaceId),
       stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
-      ownedAttempt: fallbackOwnedAttempt,
-      unownedAttemptId:
-        fallbackOwnedAttempt == null
-          ? this.streamAttemptIdWithoutOwner(event.workspaceId)
-          : undefined,
+      ...this.resolveStreamAttemptAtEvent(event.workspaceId),
     };
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
@@ -16443,7 +16450,7 @@ export class TaskService implements AgentTaskIntegration {
     reportedAttempt: OwnedTaskAttempt | undefined,
     /**
      * The attempt the reporting stream ran under (owned, or for an unowned stream the one it was
-     * admitted under — streamAttemptIdWithoutOwner). The report's writes are CAS'd on it — a row
+     * admitted under — resolveStreamAttemptAtEvent). The report's writes are CAS'd on it — a row
      * another writer re-admitted meanwhile is theirs, and this report is never published as
      * theirs. Callers without a captured attempt keep today's unconditional writes.
      */
