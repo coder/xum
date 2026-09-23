@@ -2438,6 +2438,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             key={`task-group:${group.storageKey}`}
             connectorPosition={headerMeta.connectorPosition}
             sharedTrunkActiveThroughRow={headerMeta.sharedTrunkActiveThroughRow}
+            sharedTrunkActiveBelowRow={headerMeta.sharedTrunkActiveBelowRow}
             ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
               left: getAncestorRailX(trunk.depth, "default"),
               active: trunk.active,
@@ -2445,7 +2446,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             connectorRailX={getSubAgentParentRailX(headerDepth, "default")}
             childStatusCenterX={getSubAgentChildStatusCenterX(headerDepth)}
             isSelected={isGroupSelected}
-            isElbowActive={group.runActiveWithoutMembers === true || group.runningCount > 0}
             childTrunk={memberChildTrunk}
           >
             {headerRow}

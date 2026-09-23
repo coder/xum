@@ -1,12 +1,8 @@
 /**
- * UI integration tests for sub-agent completed-child expansion behavior.
+ * UI integration tests for sub-agent visibility and connector behavior.
  *
- * Validates that:
- * - Completed child sub-agents (taskStatus=reported) are hidden by default.
- * - Double-clicking any workspace row enters rename mode.
- * - The overflow menu exposes Show/Hide sub-agent actions.
- * - Keyboard users can still expand/collapse completed children from the row.
- * - Expanded chevron indicators render only when the status dot is hidden.
+ * Validates that inactive children stay hidden, double-clicking enters rename
+ * mode, and nested/active rails remain distinct from queued branches.
  */
 
 import "../dom";
@@ -449,9 +445,9 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
             throw new Error("Expected active connector segments for running child");
           }
 
-          const animatedElbow = connector.querySelector("path.subagent-connector-elbow-active");
-          if (!animatedElbow) {
-            throw new Error("Expected animated connector elbow for running child");
+          const elbow = connector.querySelector('[data-testid="subagent-connector-elbow"]');
+          if (!elbow?.classList.contains("border-b")) {
+            throw new Error("Expected a solid branch join alongside the running rail");
           }
         },
         { timeout: 10_000 }
@@ -616,11 +612,6 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
         "span.subagent-connector-active"
       );
       expect(activeSegments.length).toBe(0);
-
-      const animatedElbows = renderedView.container.querySelectorAll(
-        "path.subagent-connector-elbow-active"
-      );
-      expect(animatedElbows.length).toBe(0);
     } finally {
       await harness.cleanup();
     }

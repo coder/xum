@@ -4,11 +4,11 @@ import { cn } from "@/common/lib/utils";
 interface SubAgentListItemProps {
   connectorPosition: "single" | "middle" | "last";
   sharedTrunkActiveThroughRow: boolean;
+  sharedTrunkActiveBelowRow: boolean;
   ancestorTrunks: ReadonlyArray<{ left: number; active: boolean }>;
   connectorRailX: number;
   childStatusCenterX: number;
   isSelected: boolean;
-  isElbowActive: boolean;
   /**
    * Present when this row is itself a parent of visible sub-agent rows: renders
    * the top of the children's shared trunk from this row's center down to its
@@ -65,31 +65,18 @@ export function SubAgentChildTrunk(props: { left: number; active: boolean; isSel
   );
 }
 
-function getConnectorElbowPath(opts: {
-  bendsRight: boolean;
-  width: number;
-  height: number;
-}): string {
-  const maxX = Math.max(0.5, opts.width - 0.5);
-  const maxY = Math.max(0.5, opts.height - 0.5);
-  const cornerX = Math.min(maxY, maxX);
-
-  if (opts.bendsRight) {
-    return `M0.5 0.5 Q0.5 ${maxY} ${cornerX} ${maxY} H${maxX}`;
-  }
-
-  const leftCurveEndX = Math.max(0.5, maxX - cornerX);
-  return `M${maxX} 0.5 Q${maxX} ${maxY} ${leftCurveEndX} ${maxY} H0.5`;
-}
-
 export function SubAgentListItem(props: SubAgentListItemProps) {
   const connectorBorderClass = props.isSelected ? "border-border" : "border-border-light";
-  const connectorColor = props.isSelected ? "var(--color-border)" : "var(--color-border-light)";
   const connectorTurnSizePx = 6;
 
   const elbowLeft = Math.min(props.connectorRailX, props.childStatusCenterX);
   const elbowWidth = Math.max(1, Math.abs(props.childStatusCenterX - props.connectorRailX));
   const elbowBendsRight = props.childStatusCenterX >= props.connectorRailX;
+  const endsActivityHere =
+    props.connectorPosition === "middle" &&
+    props.sharedTrunkActiveThroughRow &&
+    !props.sharedTrunkActiveBelowRow;
+  const fullHeightTrunk = props.connectorPosition === "middle" && !endsActivityHere;
 
   return (
     <div className="relative">
@@ -106,22 +93,32 @@ export function SubAgentListItem(props: SubAgentListItemProps) {
           style={{ left: trunk.left }}
         />
       ))}
-      {/* The trunk connecting this row back to the parent. Middle rows render
-          one uninterrupted full-height trunk (the branch elbow overlays it);
-          the last/only child ends the trunk where its elbow curve begins so
+      {/* Cover middle rows continuously, splitting only at an active/static
+          boundary. The last/only child ends where its elbow curve begins so
           nothing dangles below the branch. */}
       <ConnectorTrunkSegment
         testId="subagent-connector-trunk"
         active={props.sharedTrunkActiveThroughRow}
         isSelected={props.isSelected}
-        className={props.connectorPosition === "middle" ? "inset-y-0" : "top-0"}
+        className={fullHeightTrunk ? "inset-y-0" : "top-0"}
         style={{
           left: props.connectorRailX,
-          ...(props.connectorPosition === "middle"
+          ...(fullHeightTrunk
             ? {}
-            : { bottom: `calc(50% + ${connectorTurnSizePx}px)` }),
+            : { bottom: endsActivityHere ? "50%" : `calc(50% + ${connectorTurnSizePx}px)` }),
         }}
       />
+      {/* Queued siblings below the last running child retain a solid continuation,
+          but must not look active. Adjacent halves keep the rail gap-free. */}
+      {endsActivityHere && (
+        <ConnectorTrunkSegment
+          testId="subagent-connector-inactive-tail"
+          active={false}
+          isSelected={props.isSelected}
+          className="top-1/2 bottom-0"
+          style={{ left: props.connectorRailX }}
+        />
+      )}
       {props.childTrunk && (
         <SubAgentChildTrunk
           left={props.childTrunk.left}
@@ -135,40 +132,18 @@ export function SubAgentListItem(props: SubAgentListItemProps) {
         // Keep connectors above the row background so lines remain visible for
         // both selected and unselected sub-agent variants.
         className="pointer-events-none absolute inset-y-0 right-0 left-0 z-10"
-        style={{ "--connector-color": connectorColor } as React.CSSProperties}
       >
-        {props.isElbowActive ? (
-          <svg
-            aria-hidden
-            data-testid="subagent-connector-elbow"
-            className="absolute top-1/2 h-[6px] -translate-y-full"
-            style={{ left: elbowLeft, width: elbowWidth }}
-            viewBox={`0 0 ${elbowWidth} ${connectorTurnSizePx}`}
-          >
-            <path
-              // Border dashes cannot animate their offset, so we draw the
-              // rounded elbow as an SVG path and animate stroke-dashoffset.
-              className="subagent-connector-elbow-active"
-              d={getConnectorElbowPath({
-                bendsRight: elbowBendsRight,
-                width: elbowWidth,
-                height: connectorTurnSizePx,
-              })}
-            />
-          </svg>
-        ) : (
-          <span
-            data-testid="subagent-connector-elbow"
-            className={cn(
-              connectorBorderClass,
-              // Draw a rounded elbow instead of a hard 90-degree corner where the
-              // vertical connector turns into the sub-agent branch.
-              "absolute top-1/2 h-[6px] -translate-y-full border-b",
-              elbowBendsRight ? "rounded-bl-[6px] border-l" : "rounded-br-[6px] border-r"
-            )}
-            style={{ left: elbowLeft, width: elbowWidth }}
-          />
-        )}
+        {/* Solid joins avoid mixing viewport-anchored trunk dashes with a path-local
+            SVG pattern. Only the vertical activity rails animate. */}
+        <span
+          data-testid="subagent-connector-elbow"
+          className={cn(
+            connectorBorderClass,
+            "absolute top-1/2 h-[6px] -translate-y-full border-b",
+            elbowBendsRight ? "rounded-bl-[6px] border-l" : "rounded-br-[6px] border-r"
+          )}
+          style={{ left: elbowLeft, width: elbowWidth }}
+        />
       </div>
       {props.children}
     </div>

@@ -11,11 +11,11 @@ function renderItem(props?: Partial<Parameters<typeof SubAgentListItem>[0]>) {
     <SubAgentListItem
       connectorPosition="single"
       sharedTrunkActiveThroughRow={false}
+      sharedTrunkActiveBelowRow={false}
       ancestorTrunks={[]}
       connectorRailX={18}
       childStatusCenterX={26}
       isSelected={false}
-      isElbowActive={false}
       {...props}
     >
       <div>row</div>
@@ -69,7 +69,11 @@ describe("SubAgentListItem", () => {
   });
 
   test("middle rows render one uninterrupted full-height trunk", () => {
-    const view = renderItem({ connectorPosition: "middle", sharedTrunkActiveThroughRow: true });
+    const view = renderItem({
+      connectorPosition: "middle",
+      sharedTrunkActiveThroughRow: true,
+      sharedTrunkActiveBelowRow: true,
+    });
 
     const trunk = view.getByTestId("subagent-connector-trunk");
 
@@ -77,6 +81,22 @@ describe("SubAgentListItem", () => {
     expect(trunk.getAttribute("style")).not.toContain("bottom:");
     expect(trunk.getAttribute("class")).toContain("subagent-connector-active");
     expect(view.queryByTestId("subagent-connector-pass-through")).toBeNull();
+  });
+
+  test("ends activity at the lowest running middle child without breaking the rail", () => {
+    const view = renderItem({
+      connectorPosition: "middle",
+      sharedTrunkActiveThroughRow: true,
+      sharedTrunkActiveBelowRow: false,
+    });
+    const upper = view.getByTestId("subagent-connector-trunk");
+    const lower = view.getByTestId("subagent-connector-inactive-tail");
+    expect(upper.style.bottom).toBe("50%");
+    expect(upper.classList.contains("subagent-connector-active")).toBe(true);
+    expect(lower.classList.contains("subagent-connector-active")).toBe(false);
+    expect(lower.classList.contains("top-1/2")).toBe(true);
+    expect(lower.classList.contains("bottom-0")).toBe(true);
+    expect(lower.style.left).toBe(upper.style.left);
   });
 
   test("inactive trunks render solid", () => {

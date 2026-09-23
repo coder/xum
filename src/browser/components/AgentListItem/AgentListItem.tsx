@@ -12,7 +12,6 @@ import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { isEventFromDialogPortal, stopKeyboardPropagation } from "@/browser/utils/events";
 import {
-  isSidebarSubAgentRunning,
   type AgentRowRenderMeta,
   type WorkspaceDelegatedActivity,
   type WorkspaceSubAgentsSummary,
@@ -1492,9 +1491,6 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
   if (rowMeta?.rowKind === "subagent") {
     // Connector geometry is driven by render metadata so visible siblings keep
     // consistent single/middle/last shapes as parents expand/collapse children.
-    const isElbowActive = isSidebarSubAgentRunning(props.metadata, {
-      isWorkspaceLiveActive: () => props.isWorkspaceLiveActive === true,
-    });
     const connectorLayout = props.subAgentConnectorLayout ?? "default";
     const connectorDepth = props.depth ?? rowMeta.depth;
     const connectorRailX = getSubAgentParentRailX(connectorDepth, connectorLayout);
@@ -1508,11 +1504,11 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
       <SubAgentListItem
         connectorPosition={rowMeta.connectorPosition}
         sharedTrunkActiveThroughRow={rowMeta.sharedTrunkActiveThroughRow}
+        sharedTrunkActiveBelowRow={rowMeta.sharedTrunkActiveBelowRow}
         ancestorTrunks={ancestorTrunks}
         connectorRailX={connectorRailX}
         childStatusCenterX={childStatusCenterX}
         isSelected={props.isSelected}
-        isElbowActive={isElbowActive}
         // Sub-agent rows can themselves parent deeper sub-agents; their
         // children's shared rail sits at this row's leading-slot center.
         childTrunk={
@@ -1529,23 +1525,20 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
     );
   }
 
-  if (rowMeta?.childTrunkActive !== undefined) {
-    // Primary rows with visible sub-agent children render the top of the
-    // shared child trunk themselves, so the connector visibly starts at this
-    // row instead of the first child guessing this row's center from below.
-    return (
-      <div className="relative">
+  // Keep the row mounted as its first/last visible child comes and goes: changing
+  // the wrapper would discard in-progress title edits and close menus/modals.
+  return (
+    <div className="relative">
+      {rowMeta?.childTrunkActive !== undefined && (
         <SubAgentChildTrunk
           left={getSidebarLeadingSlotCenterX(props.depth ?? rowMeta.depth)}
           active={rowMeta.childTrunkActive}
           isSelected={props.isSelected}
         />
-        <RegularAgentListItemInner {...props} />
-      </div>
-    );
-  }
-
-  return <RegularAgentListItemInner {...props} />;
+      )}
+      <RegularAgentListItemInner {...props} />
+    </div>
+  );
 }
 
 export const AgentListItem = React.memo(AgentListItemInner);

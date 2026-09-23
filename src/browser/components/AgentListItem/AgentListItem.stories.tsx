@@ -796,7 +796,7 @@ function ConnectorAnimationLifecycleFixture() {
           connectorRailX={18}
           childStatusCenterX={26}
           isSelected={false}
-          isElbowActive={index !== 0 || active}
+          sharedTrunkActiveBelowRow={index !== 0 || active}
         >
           <div className="h-8 pl-8">Child {index}</div>
         </SubAgentListItem>
@@ -826,22 +826,10 @@ export const ConnectorAnimationLifecycle: Story = {
         (node) => getComputedStyle(node, "::before").backgroundPositionY
       );
     const assertSynchronized = async () => {
-      // Sample all rendered offsets in one frame before instrumented assertions yield.
-      const trunks = trunkPhases();
-      const elbows = Array.from(
-        canvasElement.querySelectorAll(".subagent-connector-elbow-active"),
-        (node) => getComputedStyle(node).strokeDashoffset
-      );
-      const elbow = canvasElement.querySelector(".subagent-connector-elbow-active")!;
-      const period = getComputedStyle(elbow)
-        .strokeDasharray.split(/[, ]+/)
-        .reduce((sum, part) => sum + Number.parseFloat(part), 0);
-      await expect(new Set(trunks).size).toBe(1);
-      await expect(new Set(elbows).size).toBe(1);
-      await expect(Number.parseFloat(elbows[0]) + Number.parseFloat(trunks[0])).toBeCloseTo(
-        period,
-        2
-      );
+      await expect(new Set(trunkPhases()).size).toBe(1);
+      for (const elbow of canvas.getAllByTestId("subagent-connector-elbow")) {
+        await expect(getComputedStyle(elbow).borderBottomStyle).toBe("solid");
+      }
     };
     try {
       root.removeAttribute("data-renderer-inactive");
@@ -874,6 +862,104 @@ export const ConnectorAnimationLifecycle: Story = {
     } finally {
       root.toggleAttribute("data-renderer-inactive", wasInactive);
     }
+  },
+};
+
+function ParentTitleDuringChildChangesFixture() {
+  const [hasChild, setHasChild] = useState(false);
+  return (
+    <StoryScaffold workspaces={APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES}>
+      <button
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => setHasChild((value) => !value)}
+      >
+        Toggle visible child
+      </button>
+      <WorkspaceRow
+        workspace={APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[0]}
+        rowRenderMeta={hasChild ? NESTED_CONNECTOR_PARENT_ROW_META : undefined}
+      />
+      {hasChild && (
+        <WorkspaceRow
+          workspace={APP_SIDEBAR_ACTIVE_SUBAGENT_WORKSPACES[1]}
+          rowRenderMeta={createSubAgentRowRenderMeta("single", {
+            sharedTrunkActiveThroughRow: true,
+          })}
+        />
+      )}
+    </StoryScaffold>
+  );
+}
+
+export const ParentTitleDuringChildChanges: Story = {
+  args: undefined as never,
+  name: "SubAgent States/Parent Title During Child Changes",
+  parameters: { pixel: { exclude: true } },
+  render: () => <ParentTitleDuringChildChangesFixture />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const row = canvasElement.querySelector<HTMLElement>(
+      '[data-workspace-id="ws-sidebar-parent"][role="button"]'
+    )!;
+    await userEvent.dblClick(row);
+    const input = await canvas.findByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "Unfinished parent title");
+    // The control preserves input focus, like a background child lifecycle update.
+    for (let update = 0; update < 2; update++) {
+      await userEvent.click(canvas.getByRole("button", { name: "Toggle visible child" }));
+      await expect(canvas.getByRole("textbox")).toBe(input);
+      await expect(input).toHaveValue("Unfinished parent title");
+      await expect(input).toHaveFocus();
+    }
+  },
+};
+
+export const LowestRunningChild: Story = {
+  args: undefined as never,
+  name: "SubAgent States/Lowest Running Child",
+  render: () => (
+    <div className="subagent-connector-clock w-[340px] max-w-full">
+      <SubAgentListItem
+        connectorPosition="middle"
+        sharedTrunkActiveThroughRow
+        sharedTrunkActiveBelowRow={false}
+        ancestorTrunks={[]}
+        connectorRailX={18}
+        childStatusCenterX={26}
+        isSelected={false}
+      >
+        <div className="h-12 pl-8">Running child</div>
+      </SubAgentListItem>
+      <SubAgentListItem
+        connectorPosition="last"
+        sharedTrunkActiveThroughRow={false}
+        sharedTrunkActiveBelowRow={false}
+        ancestorTrunks={[]}
+        connectorRailX={18}
+        childStatusCenterX={26}
+        isSelected={false}
+      >
+        <div className="h-8 pl-8">Queued child</div>
+      </SubAgentListItem>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const [upper, queued] = canvas.getAllByTestId("subagent-connector-trunk");
+    const tail = canvas.getByTestId("subagent-connector-inactive-tail");
+    const upperBounds = upper.getBoundingClientRect();
+    const tailBounds = tail.getBoundingClientRect();
+    const elbowBounds = canvas
+      .getAllByTestId("subagent-connector-elbow")[0]
+      .getBoundingClientRect();
+    await expect(upperBounds.height).toBeGreaterThan(0);
+    await expect(tailBounds.height).toBeGreaterThan(0);
+    await expect(upperBounds.bottom).toBeCloseTo(elbowBounds.bottom, 1);
+    await expect(tailBounds.top).toBeCloseTo(upperBounds.bottom, 1);
+    await expect(tailBounds.bottom).toBeCloseTo(queued.getBoundingClientRect().top, 1);
+    await expect(getComputedStyle(tail).backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    await expect(getComputedStyle(tail, "::before").content).toBe("none");
   },
 };
 

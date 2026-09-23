@@ -2612,7 +2612,7 @@ html[data-renderer-inactive] *::after {
   }
 }
 
-.subagent-connector-clock:has(.subagent-connector-active, .subagent-connector-elbow-active) {
+.subagent-connector-clock:has(.subagent-connector-active) {
   animation: connector-dash-scroll 0.4s linear infinite;
 }
 
@@ -2653,23 +2653,13 @@ html[data-renderer-inactive] *::after {
   background-position-y: calc(var(--subagent-connector-phase) * 1px);
 }
 
-.subagent-connector-elbow-active {
-  fill: none;
-  stroke: var(--connector-color);
-  stroke-width: 1;
-  stroke-linejoin: round;
-  stroke-dasharray: 3 3;
-  stroke-dashoffset: calc((6 - var(--subagent-connector-phase)) * 1px);
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .subagent-connector-clock:has(.subagent-connector-active, .subagent-connector-elbow-active) {
+  .subagent-connector-clock:has(.subagent-connector-active) {
     animation: none;
   }
 }
 
-/* Pin the inherited phase at the story container so both trunk backgrounds and
-   SVG elbows stay deterministic without adding a second animation clock. */
+/* Pin the inherited phase at the story container for deterministic snapshots. */
 .storybook-static-subagent-connectors {
   --subagent-connector-phase: 0;
 }
