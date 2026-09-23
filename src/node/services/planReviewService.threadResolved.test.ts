@@ -10,7 +10,6 @@ import {
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import {
-  buildPlanReviewStateInstruction,
   getPlanReviewState,
   hashPlanSnapshotContent,
   setPlanReviewThreadResolved,
@@ -171,10 +170,5 @@ describe("setPlanReviewThreadResolved persisted-row size", () => {
     expect(replayed.data.threads.map((t) => [t.threadId.length, t.resolved])).toEqual(
       resolved.data.threads.map((t) => [t.threadId.length, t.resolved])
     );
-    // The system-prompt block replays history in the other scan direction; it must agree too
-    // (no unresolved threads → no block at all).
-    expect(
-      await buildPlanReviewStateInstruction(historyHandle.historyService, workspaceId)
-    ).toBeUndefined();
   });
 });

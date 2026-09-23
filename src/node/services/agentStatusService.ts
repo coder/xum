@@ -563,8 +563,8 @@ export class AgentStatusService {
     //
     // A durable manual reset is a privacy floor: the user discarded everything before it,
     // so a short post-reset conversation must not be topped up with pre-reset rows (the
-    // scan would otherwise continue into the archive). Same stop as the plan-review-state
-    // block; the reset marker row itself is structure, not conversation.
+    // scan would otherwise continue into the archive). The reset marker row itself is
+    // structure, not conversation.
     const newestFirst: MuxMessage[] = [];
     const scanned = await this.historyService.iterateFullHistory(
       workspaceId,

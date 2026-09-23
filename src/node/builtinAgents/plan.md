@@ -101,8 +101,7 @@ Before proposing a plan, figure out what you need to verify and gather that evid
 
 The user can comment on the proposed plan inline. Their comments arrive as a user message wrapped
 in `<mux_plan_review>`: a JSON record with `comments` (new threads: `threadId`, `anchor`, `quote`,
-`body`) and `replies` (`threadId`, `body`) on earlier threads. A `<plan-review-state>` block in
-your instructions lists every thread that is still unresolved.
+`body`) and `replies` (`threadId`, `body`) on earlier threads.
 
 - Anchor line numbers refer to the plan revision the user reviewed, which may differ from the
   current plan file; locate the passage by its `quote`.

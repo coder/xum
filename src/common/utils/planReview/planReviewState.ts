@@ -1,19 +1,13 @@
 import { z } from "zod";
 
 import type { MuxMessage } from "@/common/types/message";
-import {
-  PLAN_REVIEW_STATE_MAX_CHARS,
-  PLAN_REVIEW_STATE_MAX_REPLIES_PER_THREAD,
-  PLAN_REVIEW_STATE_MAX_TEXT_CHARS,
-  PLAN_REVIEW_STATE_MAX_THREADS,
-} from "@/constants/planReview";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { getAuthenticPlanReviewRecord } from "./planReviewEnvelope";
 import { PlanReviewAnchorSchema, isAnchorWithinSnapshot } from "./planReviewRecord";
 
 /**
  * Pure projection of plan-review record rows into review state. Shared by the backend (oRPC
- * endpoints, plan-agent context) and the frontend (Run 2 review UI), so it must stay free of
+ * endpoints, snapshot/feedback services) and the frontend (Run 2 review UI), so it must stay free of
  * node-only imports. Backend state is the only authority; nothing here is cached or persisted.
  */
 
@@ -45,8 +39,6 @@ export const PlanReviewThreadSchema = z.object({
   replies: z.array(PlanReviewThreadReplySchema),
   /** Last resolve/reopen record wins. Sending feedback never resolves; only the user does. */
   resolved: z.boolean(),
-  /** Sequence of the last resolve/reopen record; absent until the user changes the status. */
-  statusHistorySequence: z.number().optional(),
 });
 
 export const PlanReviewFeedbackSchema = z.object({
@@ -214,128 +206,10 @@ export function derivePlanReviewState(
           break;
         }
         thread.resolved = record.kind === "resolve";
-        // Reopening is user activity: it must rank the thread like a new comment would.
-        thread.statusHistorySequence = historySequence;
         break;
       }
     }
   }
 
   return state;
-}
-
-export function getUnresolvedPlanReviewThreads(state: PlanReviewState): PlanReviewThread[] {
-  return state.threads.filter((thread) => !thread.resolved);
-}
-
-/** Latest snapshot in history order, or undefined before the first proposal. */
-export function getLatestPlanReviewSnapshot(
-  state: PlanReviewState
-): PlanReviewSnapshot | undefined {
-  return state.snapshots[state.snapshots.length - 1];
-}
-
-/**
- * Keep user text single-line, bounded and unable to close the block it is quoted in. Clipping
- * happens before JSON quoting, so escape expansion of hostile input (control characters,
- * quotes) cannot exceed the per-text budget by more than the escape factor; the whole-block
- * budget below is checked on the final quoted lines.
- */
-function quoteForBlock(text: string, maxChars: number = PLAN_REVIEW_STATE_MAX_TEXT_CHARS): string {
-  const clipped = text.length > maxChars ? `${text.slice(0, maxChars)} …[truncated]` : text;
-  return JSON.stringify(clipped).replaceAll("</", "<\\/");
-}
-
-/**
- * Sequence of the newest user activity on a thread: its opening comment, latest reply or latest
- * resolve/reopen (only unresolved threads are ranked, so that is a reopen).
- */
-function latestActivity(thread: PlanReviewThread): number {
-  return thread.replies.reduce(
-    (latest, reply) => Math.max(latest, reply.historySequence),
-    Math.max(thread.historySequence, thread.statusHistorySequence ?? thread.historySequence)
-  );
-}
-
-/**
- * Deterministic review context for the plan agent, derived from durable rows on every turn
- * (never stored, independent of compaction summaries). Returns undefined when nothing is
- * unresolved so the block only appears while there is something to address.
- *
- * Rendering is bounded in three ways and always says what it left out: at most `maxThreads`
- * threads, chosen by most recent user activity (a stale unchecked thread cannot starve newer
- * feedback); each quoted text clipped to PLAN_REVIEW_STATE_MAX_TEXT_CHARS and each thread's
- * reply tail to PLAN_REVIEW_STATE_MAX_REPLIES_PER_THREAD; and the whole block capped at
- * PLAN_REVIEW_STATE_MAX_CHARS. Stored feedback is never altered — only this projection is.
- */
-export function formatPlanReviewStateBlock(
-  state: PlanReviewState,
-  maxThreads: number = PLAN_REVIEW_STATE_MAX_THREADS,
-  maxChars: number = PLAN_REVIEW_STATE_MAX_CHARS
-): string | undefined {
-  const unresolved = getUnresolvedPlanReviewThreads(state);
-  if (unresolved.length === 0) return undefined;
-  const latest = getLatestPlanReviewSnapshot(state);
-  // Most recent activity first; ties break on the deterministic thread id.
-  const candidates = [...unresolved]
-    .sort(
-      (a, b) =>
-        latestActivity(b) - latestActivity(a) ||
-        b.historySequence - a.historySequence ||
-        a.threadId.localeCompare(b.threadId)
-    )
-    .slice(0, maxThreads);
-  const header: string[] = [
-    "<plan-review-state>",
-    "The user reviews proposed plans inline. Every unresolved thread below still needs to be addressed in the plan; only the user can resolve a thread, so never claim one is resolved.",
-    "Line numbers refer to the snapshot the thread was written against (identified by its sha256), which may differ from the current plan file — locate the passage by its quote.",
-    "Threads are listed most recent user activity first; each lists the opening comment and the newest replies in order.",
-  ];
-  if (latest !== undefined) {
-    // Named by content hash only. The persisted path is provenance: a fork copies history, so it
-    // can name another workspace's plan file, and the editable path comes from the plan-mode
-    // instructions. Leaving it out also keeps repository-controlled path text out of this block.
-    header.push(`Current plan snapshot: sha256 ${latest.contentHash}`);
-  }
-  header.push(`Unresolved threads: ${unresolved.length}`);
-  const footer = "</plan-review-state>";
-  const truncationNote = (omitted: number) =>
-    `Truncated: ${omitted} more unresolved thread(s) are not listed; ask the user if you need them.`;
-  // Reserve room for the worst-case truncation note and the closing tag up front so a thread is
-  // only admitted when the complete block still fits.
-  let used =
-    header.join("\n").length + 1 + truncationNote(unresolved.length).length + 1 + footer.length;
-  const body: string[] = [];
-  let shown = 0;
-  for (const thread of candidates) {
-    const revision =
-      latest !== undefined && thread.snapshotId === latest.snapshotId
-        ? "current snapshot"
-        : `earlier snapshot ${state.snapshots.find((s) => s.snapshotId === thread.snapshotId)?.contentHash.slice(0, 12) ?? "?"}`;
-    // Thread ids are persisted rows' data (a forged or corrupted authentic row may carry any
-    // non-empty string), so they are quoted like every other untrusted field of the block.
-    const lines = [
-      `- thread ${quoteForBlock(thread.threadId)} · ${revision} · lines ${thread.anchor.startLine}-${thread.anchor.endLine}`,
-      `  quote: ${quoteForBlock(thread.quote)}`,
-      `  comment: ${quoteForBlock(thread.body)}`,
-    ];
-    const omittedReplies = Math.max(
-      0,
-      thread.replies.length - PLAN_REVIEW_STATE_MAX_REPLIES_PER_THREAD
-    );
-    if (omittedReplies > 0)
-      lines.push(`  (${omittedReplies} earlier repl${omittedReplies === 1 ? "y" : "ies"} omitted)`);
-    for (const reply of thread.replies.slice(omittedReplies)) {
-      lines.push(`  reply: ${quoteForBlock(reply.body)}`);
-    }
-    const cost = lines.join("\n").length + 1;
-    if (used + cost > maxChars) break;
-    used += cost;
-    body.push(...lines);
-    shown += 1;
-  }
-  const lines = [...header, ...body];
-  if (shown < unresolved.length) lines.push(truncationNote(unresolved.length - shown));
-  lines.push(footer);
-  return lines.join("\n");
 }

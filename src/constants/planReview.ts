@@ -11,26 +11,6 @@
 export const MAX_PLAN_SNAPSHOT_BYTES = 256 * 1024;
 
 /**
- * Upper bound on unresolved threads listed in the `<plan-review-state>` system block; the block
- * names how many were omitted so the agent knows the list is truncated. Threads are chosen by
- * most recent user activity (opening comment or latest reply) so stale unchecked items cannot
- * starve newer feedback.
- */
-export const PLAN_REVIEW_STATE_MAX_THREADS = 30;
-
-/**
- * Rendering budget of the `<plan-review-state>` block, which is rebuilt into the system prompt
- * on every plan turn: each quoted text (quote, comment, reply) is clipped to
- * PLAN_REVIEW_STATE_MAX_TEXT_CHARS and the whole block stops growing at
- * PLAN_REVIEW_STATE_MAX_CHARS, always naming the omitted thread count. Stored feedback is never
- * truncated — only its rendering is.
- */
-export const PLAN_REVIEW_STATE_MAX_TEXT_CHARS = 600;
-export const PLAN_REVIEW_STATE_MAX_CHARS = 16_000;
-/** Replies rendered per thread (the newest); earlier ones are counted in an omission note. */
-export const PLAN_REVIEW_STATE_MAX_REPLIES_PER_THREAD = 5;
-
-/**
  * Per-field/per-record bounds on submitted feedback. Quotes mirror the review UI's 500-char
  * selection cap; bodies stay generous for written instructions. The persisted feedback row is
  * additionally capped by SESSION_HISTORY_MAX_LINE_BYTES after JSON escaping (see

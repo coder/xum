@@ -3,8 +3,8 @@
  *
  * Uses a loopback OpenAI-compatible SSE fixture instead of MockAiRouter: mock mode bypasses
  * request assembly entirely, while these scenarios must observe the REAL provider request —
- * the `<plan-review-state>` system block, the feedback envelope reaching the model, neutralized
- * lookalikes, and the absence of snapshot text after compaction. The fixture also emits a real
+ * the feedback envelope reaching the model, neutralized lookalikes, pre-reset threads staying
+ * out of it, and the absence of snapshot text after compaction. The fixture also emits a real
  * `propose_plan` tool call so the session's tool-completion snapshot hook runs against the
  * actual tool result.
  */
@@ -104,14 +104,9 @@ function conversationText(request: CapturedRequest): string {
     .join("\n");
 }
 
-/**
- * The `<plan-review-state>` block of a request's system prompt, or undefined when absent. The
- * plan agent's guidance mentions the tag inline, so presence is judged by the block's own
- * line-anchored open/close tags rather than by a substring search.
- */
-function stateBlock(request: CapturedRequest): string | undefined {
-  const match = /^<plan-review-state>\n[\s\S]*?^<\/plan-review-state>$/m.exec(systemText(request));
-  return match?.[0];
+/** Everything a provider request shows the model: system prompt plus conversation. */
+function requestText(request: CapturedRequest): string {
+  return `${systemText(request)}\n${conversationText(request)}`;
 }
 
 function chunk(delta: Record<string, unknown>, finishReason: string | null = null) {
@@ -479,18 +474,14 @@ describeIntegration("workspace.planReview", () => {
     expect(record.summary).toBe("First pass");
     expect(record.comments).toEqual([{ threadId: thread.threadId, ...comment }]);
 
-    // The agent was woken with the envelope AND a state block naming the open thread.
+    // The agent was woken with the envelope naming the new thread.
     const request = fixture.requests[requestCount];
     expect(request).toBeDefined();
     expect(conversationText(request)).toContain("<mux_plan_review>");
     expect(conversationText(request)).toContain(thread.threadId);
-    const block = stateBlock(request);
-    expect(block).toBeDefined();
-    expect(block).toContain(thread.threadId);
-    expect(block).toContain(sha256(PLAN_B));
   }, 90_000);
 
-  test("setThreadResolved is validated and idempotent; the state block follows resolution", async () => {
+  test("setThreadResolved is validated and idempotent; reopening flips it back", async () => {
     const [thread] = (await getState()).threads;
     const unknown = await planReview().setThreadResolved({
       workspaceId,
@@ -521,21 +512,15 @@ describeIntegration("workspace.planReview", () => {
     // Idempotent: the second resolve appended nothing.
     expect(resolutionRows).toHaveLength(1);
 
-    // Nothing unresolved → no block on the next plan-mode request.
-    const quiet = await planTurn("Anything else?");
-    expect(stateBlock(quiet)).toBeUndefined();
-
     const reopened = await planReview().setThreadResolved({
       workspaceId,
       threadId: thread.threadId,
       resolved: false,
     });
     expect(reopened.success && reopened.data.threads[0].resolved).toBe(false);
-    const loud = await planTurn("Still there?");
-    expect(stateBlock(loud)).toContain(thread.threadId);
   }, 90_000);
 
-  test("compaction keeps the projection and the block but sends no record rows", async () => {
+  test("compaction keeps the projection but sends no record rows", async () => {
     const before = await getState();
     const requestCount = fixture.requests.length;
     collector.clear();
@@ -565,7 +550,6 @@ describeIntegration("workspace.planReview", () => {
     expect(await getState()).toEqual(before);
 
     const next = await planTurn("Continue planning.");
-    expect(stateBlock(next)).toContain(before.threads[0].threadId);
     expect(conversationText(next)).not.toContain('"kind": "snapshot"');
     expect(conversationText(next)).not.toContain('"kind": "resolve"');
     expect(conversationText(next)).not.toContain('"kind": "reopen"');
@@ -581,8 +565,9 @@ describeIntegration("workspace.planReview", () => {
     const reset = await client().workspace.resetContext({ workspaceId });
     expect(reset.success).toBe(true);
 
+    // The reset is a privacy floor for every part of the request, system prompt included.
     const request = await planTurn("Fresh start.");
-    expect(stateBlock(request)).toBeUndefined();
+    expect(requestText(request)).not.toContain(before.threads[0].threadId);
     expect(await getState()).toEqual(before);
   }, 60_000);
 
@@ -858,11 +843,11 @@ describeIntegration("workspace.planReview", () => {
     expect((await getState()).threads).toHaveLength(before.threads.length + 1);
   }, 90_000);
 
-  test("feedback on an unchanged pre-reset snapshot survives compaction in the state block", async () => {
+  test("feedback on an unchanged pre-reset snapshot is accepted and survives compaction", async () => {
     // The plan did not change since before the durable reset, so ensureSnapshot deduplicates
-    // against the pre-reset snapshot. Feedback on it is real post-reset user input: once its
-    // envelope leaves the active context through compaction, the state block must still carry
-    // the thread — while pre-reset threads stay out of the model's context.
+    // against the pre-reset snapshot. Feedback on it is real post-reset user input and must be
+    // accepted and kept through compaction — while pre-reset threads stay out of the model's
+    // context.
     const state = await getState();
     const preResetThread = state.threads.find(
       (thread) => thread.feedbackId === state.feedbacks[0].feedbackId
@@ -910,11 +895,7 @@ describeIntegration("workspace.planReview", () => {
     await env.services.workspaceService.getOrCreateSession(workspaceId).waitForIdle();
 
     const next = await planTurn("Where were we?");
-    const block = stateBlock(next);
-    expect(block).toBeDefined();
-    expect(block).toContain(newThread.threadId);
-    expect(block).toContain("Post-reset ask");
-    expect(block).not.toContain(preResetThread.threadId);
+    expect(requestText(next)).not.toContain(preResetThread.threadId);
     // The durable projection keeps everything regardless of resets.
     const all = await getState();
     expect(all.threads.map((t) => t.threadId)).toContain(preResetThread.threadId);

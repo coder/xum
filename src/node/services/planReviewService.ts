@@ -10,7 +10,6 @@ import {
   pickStartupRetrySendOptions,
 } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -25,7 +24,6 @@ import {
 } from "@/common/utils/planReview/planReviewRecord";
 import {
   derivePlanReviewState,
-  formatPlanReviewStateBlock,
   type PlanReviewState,
 } from "@/common/utils/planReview/planReviewState";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
@@ -100,11 +98,6 @@ export interface PreparedPlanReviewFeedback {
 
 function isPlanReviewRow(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE;
-}
-
-function isPlanReviewSnapshotRow(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  return muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE && muxMetadata.kind === "snapshot";
 }
 
 /** Backend projection options: skip logging plus the sha256 verification the shared projection cannot import. */
@@ -417,46 +410,4 @@ export async function preparePlanReviewFeedback(
     text,
     muxMetadata,
   });
-}
-
-/**
- * `<plan-review-state>` block for a plan-mode request: unresolved threads derived from durable
- * rows AFTER the latest durable context reset (a reset is a privacy floor, so pre-reset threads
- * stay out of the model's context even though getState still returns them). Pre-reset SNAPSHOT
- * rows are still replayed: ensurePlanSnapshot deduplicates an unchanged plan against them, so
- * post-reset feedback can legitimately target a pre-reset snapshotId and would otherwise be
- * dropped as dangling. A snapshot row carries only plan-file content and its hash (never user
- * conversation), and the block renders just the hash/path. Never throws — a history read
- * failure must not block a send — and returns undefined when nothing is unresolved.
- */
-export async function buildPlanReviewStateInstruction(
-  historyService: PlanReviewHistory,
-  workspaceId: string
-): Promise<string | undefined> {
-  const newestFirst: MuxMessage[] = [];
-  let pastReset = false;
-  try {
-    const scanned = await historyService.iterateFullHistory(workspaceId, "backward", (chunk) => {
-      for (const message of chunk) {
-        if (!pastReset && isDurableContextResetBoundaryMarker(message)) {
-          pastReset = true;
-          continue;
-        }
-        if (pastReset ? isPlanReviewSnapshotRow(message) : isPlanReviewRow(message)) {
-          newestFirst.push(message);
-        }
-      }
-      return true;
-    });
-    if (!scanned.success) throw new Error(scanned.error);
-  } catch (error) {
-    log.warn("plan review: could not read history for the plan-review-state block", {
-      workspaceId,
-      error,
-    });
-    return undefined;
-  }
-  if (newestFirst.length === 0) return undefined;
-  const state = derivePlanReviewState(newestFirst.reverse(), deriveOptions(workspaceId));
-  return formatPlanReviewStateBlock(state);
 }
