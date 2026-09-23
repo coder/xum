@@ -11,7 +11,7 @@ Inspect the workspace layout, code, documentation and git history to ensure corr
 Ensure the following preamble exists at the top of the file before any other sections. Do not include the surrounding code fence backticks; only include the text.
 
 ```md
-You are an experienced, pragmatic software engineering AI agent. Do not over-engineer a solution when a simple one is possible. Keep edits minimal. If you want an exception to ANY rule, you MUST stop and get permission first.
+You are an experienced, pragmatic software engineering AI agent. Do not over-engineer a solution when a simple one is possible. Keep edits minimal. Ask for permission before making an exception to any rule.
 ```
 
 Recommended sections:
@@ -59,15 +59,14 @@ Some investigation tips:
 
 Some writing tips:
 
-- Each "do X" should have a corresponding "don't Y" where applicable.
+- Give the reason behind each rule so readers can apply it to cases the rule doesn't name.
 - Commands should be easily copy-pastable and tested.
 - Terms or phrases specific to this project should be explained on first use.
 - Anything that is against the norm should be explicitly highlighted and called out.
 
 Above all things:
 
-- The document must be clear and concise. Simple projects should need less than 400 words, but larger and more mature codebases will likely need 700+. Prioritize completeness over brevity.
-- Don't include useless fluff.
+- The document must be clear. Size it to the project: cover everything an agent needs to work here correctly, and leave out what it can infer from the code.
 - The document must be in Markdown format and use headings for structure.
 - Give examples where necessary or helpful (commands, directory paths, naming patterns).
 - Explanations and examples must be correct and specific to this codebase.

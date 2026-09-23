@@ -9,7 +9,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 
 - `xum`: Electron + React desktop app for parallel agent workflows; UX must be fast, responsive, predictable.
 - Minor breaking changes are expected, but critical flows must allow upgrade↔downgrade without friction; skip migrations when breakage is tightly scoped.
-- **Before creating or updating any PR, commit, or public issue**, you **MUST** read the `pull-requests` skill (`agent_skill_read`) for attribution footer requirements and workflow conventions. Do not skip this step.
+- **Before creating or updating any PR, commit, or public issue**, you **MUST** read the `pull-requests` skill (`agent_skill_read` in Xum; `.xum/skills/pull-requests/SKILL.md` elsewhere) for attribution footer requirements and workflow conventions. Do not skip this step.
 
 ## External Submissions
 
@@ -17,8 +17,8 @@ description: Agent instructions for AI assistants working on the Xum codebase
 
 ## Repo Reference
 
-- Core files: `src/main.ts`, `src/preload.ts`, `src/App.tsx`, `src/config.ts`.
-- Up-to-date model names: see `src/common/knownModels.ts` for current provider model IDs.
+- Core files: `src/desktop/main.ts`, `src/desktop/preload.ts`, `src/browser/App.tsx`, `src/node/config/index.ts`.
+- Up-to-date model names: see `src/common/constants/knownModels.ts` for current provider model IDs.
 - Persistent data: `~/.xum/config.json`, `~/.xum/src/<project>/<branch>` (worktrees), `~/.xum/sessions/<workspace>/chat.jsonl`.
 - Rename compatibility is centralized in `src/common/compat/legacyMux.ts` and `src/node/compat/xumTransition.ts`; do not add scattered `mux` fallbacks. Project-local `.xum/` is canonical, `.mux/` is a read fallback, and stable external IDs remain compatibility contracts.
 
@@ -28,7 +28,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
   - Exception: the `rfc` folder contains human-written RFCs for implementation planning.
 - For planning artifacts, use the `propose_plan` tool or inline comments instead of ad-hoc docs.
 - Do not add new root-level docs without explicit request; during feature work rely on code + tests + inline comments.
-- External API docs already live inside `/tmp/ai-sdk-docs/**.mdx`; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.
+- Vercel AI SDK docs live in `/tmp/ai-sdk-docs/**.mdx` once `./scripts/update_vercel_docs.sh` has fetched them; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.
 
 ### Code Comments
 
@@ -41,15 +41,15 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - Core UX: projects sidebar (left panel), workspace management (local git worktrees or SSH clones), config stored in `~/.xum/config.json`.
 - Fetch bulk data in one IPC call—no O(n) frontend→backend loops.
 - **React Compiler enabled** — auto-memoization handles components/hooks; do not add manual `React.memo()`, `useMemo`, or `useCallback` for memoization purposes. Focus instead on fixing unstable object references that the compiler cannot optimize (e.g., `new Set()` in state setters, inline object literals as props).
-- **useEffect** — Before adding effects, consult the `react-effects` skill. Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.
+- **useEffect** — Before adding effects, consult the `react-effects` skill (`.xum/skills/react-effects/SKILL.md`). Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.
 
 ## Tooling & Commands
 
 - Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.
 - Makefile is source of truth (new commands land there, not `package.json`).
 - Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
-- Full `static-check` includes docs link checking via `mintlify broken-links`.
-- `.xum/tool_env` is sourced before every `bash` tool call. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
+- `static-check-full` (what CI runs) adds docs link checking via `mintlify broken-links` to `static-check`.
+- Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
 - Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
@@ -81,20 +81,21 @@ Core workflow:
 > A PR is fully ready only when: (1) Codex confirms approval (thumbs-up reaction on the PR description or an approval comment like "Didn't find any major issues"), (2) all Codex review threads are resolved, and (3) all required CI checks pass.
 > You MUST NOT report success before these conditions are met. You MUST NOT stop the loop before these conditions are met, except in the early-stop cases below. An early stop is never success. Report it as incomplete.
 
-When a PR exists, you MUST remain in this loop until the PR is fully ready:
+When a PR exists, you MUST remain in this loop until the PR is fully ready or an early-stop case below applies:
 
-1. Push your latest fixes.
-2. Run local validation (`make static-check` and targeted tests as needed).
+1. Run local validation (`make static-check` and targeted tests as needed).
+2. Push your latest fixes.
 3. Request review with `@codex review`.
 4. Run `./scripts/wait_pr_ready.sh <pr_number>` (which must execute `./scripts/wait_pr_checks.sh <pr_number> --once` while checks are pending).
 5. If Codex leaves comments, address them, resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
 6. If checks/mergeability fail, fix issues locally, push, and repeat.
 
-Stop the loop early in three cases. In each case, leave a PR comment that states the reason, then pause for human direction:
+Stop the loop early in four cases. In each case, leave a PR comment that states the reason, then pause for human direction:
 
 1. The reviewer misunderstands the intended change, and more rounds will only add churn.
 2. The loop does not converge. Each round must shrink the set of findings. If the same area produces new findings round after round, the design is the problem. Do not add more mechanism. Simplify the design or reduce the scope.
 3. The next fix grows the scope (see below). Report the state with a split proposal: what you fixed, what you deferred, and how to split the PR.
+4. The remaining blocker is one only a human can clear, such as a required approving review or Codex usage limits.
 
 ### Review fixes and scope
 
@@ -138,8 +139,8 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 
 - Never use emoji characters as UI icons or status indicators; emoji rendering varies across platforms and fonts.
 - Prefer SVG icons (usually from `lucide-react`) or shared icon components under `src/browser/components/icons/`.
-- For tool call headers, use `ToolIcon` from `src/browser/components/tools/shared/ToolPrimitives.tsx`.
-- If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon.tsx`) instead of rendering the emoji.
+- For tool call headers, use `ToolIcon` from `src/browser/features/Tools/Shared/ToolPrimitives.tsx`.
+- If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon/EmojiIcon.tsx`) instead of rendering the emoji.
 - If a new emoji appears in tool output, extend `EmojiIcon` to map it to an SVG icon.
 - Colors defined in `src/browser/styles/globals.css` (`:root @theme` block). Reference via CSS variables (e.g., `var(--color-plan-mode)`), never hardcode hex values.
 - Tooltips must use the shared `Tooltip`/`TooltipIfPresent` components, not native `title` attributes. Native titles create duplicate OS tooltips and cannot be z-indexed; shared tooltips portal above clipped containers.
@@ -177,7 +178,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Component State & Storage
 
 - Prefer **self-contained components** over utility functions + hook proliferation. A component that takes `workspaceId` and computes everything internally is better than one that requires 10 props drilled from parent hooks.
-- **Colocate subscriptions with consumers** — Don't pass frequently-updating values (streaming stats, live costs, timers) as props through intermediate components. Instead, have the leaf component that displays the value subscribe directly. This prevents re-renders from cascading through expensive sibling subtrees (e.g., terminal). See `CostsTabLabel`/`StatsTabLabel` for examples.
+- **Colocate subscriptions with consumers** — Don't pass frequently-updating values (streaming stats, live costs, timers) as props through intermediate components. Instead, have the leaf component that displays the value subscribe directly. This prevents re-renders from cascading through expensive sibling subtrees (e.g., terminal). See `StatsTabLabel` (`src/browser/features/RightSidebar/Tabs/TabLabels.tsx`) for an example.
 - Parent components own localStorage interactions; children announce intent only.
 - **Never call `localStorage` directly** — always use `usePersistedState`/`readPersistedState`/`updatePersistedState` helpers. This includes inside `useCallback`, event handlers, and non-React functions. The helpers handle JSON parsing, error recovery, and cross-component sync.
 - When a component needs to read persisted state it doesn't own (to avoid layout flash), use `readPersistedState` in `useState` initializer: `useState(() => readPersistedState(key, default))`.

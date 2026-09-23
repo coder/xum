@@ -1,6 +1,7 @@
 ---
 name: xum-docs
 description: Index + offline snapshot of xum documentation (progressive disclosure).
+when_to_use: When the user asks how xum works (workspaces, runtimes, agents, models, hooks, keybinds, etc.).
 ---
 
 # xum docs
@@ -138,10 +139,6 @@ Notes:
 
 - Many pages are `.mdx`; some are `.../index.mdx`.
 - Images are not embedded; you may see `/img/...` references.
-
-## When to use
-
-Use this skill when the user asks how xum works (workspaces, runtimes, agents, models, hooks, keybinds, etc.).
 
 ## Links
 
