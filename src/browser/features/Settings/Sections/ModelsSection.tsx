@@ -148,6 +148,7 @@ export function ModelsSection() {
   const [suggestionsSession, setSuggestionsSession] = useState<object | null>(null);
   const [discovery, setDiscovery] = useState<{
     session: object;
+    api: object;
     provider: string;
     config: ProvidersConfigMap;
     policy: EffectivePolicy | null;
@@ -265,6 +266,7 @@ export function ModelsSection() {
       if (!controller.signal.aborted) {
         setDiscovery({
           session: suggestionsSession,
+          api,
           provider: lastProvider,
           config,
           policy: effectivePolicy,
@@ -281,8 +283,10 @@ export function ModelsSection() {
   // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
   // well as replies by the config object itself, before effect cleanup gets to run.
   // Policy events are independent of config refreshes and also revoke completed catalogs.
+  // A disconnect or reconnect replaces the API client, which revokes them too.
   const discoveryResult =
     discovery?.session === suggestionsSession &&
+    discovery?.api === api &&
     discovery?.provider === lastProvider &&
     discovery?.config === config &&
     discovery?.policy === effectivePolicy
