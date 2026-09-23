@@ -473,10 +473,11 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     30_000
   );
 
-  test.each(["queued", "unqueued"] as const)(
+  test.each(["queued", "unqueued", "reserved"] as const)(
     "a structural rename that wins the registration lock before the %s isolation: none publication refuses the creation instead of publishing stale ancestry",
     async (mode) => {
-      const taskId = mode === "queued" ? "stalequeue1" : "staledirect";
+      const taskId =
+        mode === "queued" ? "stalequeue1" : mode === "unqueued" ? "staledirect" : "stalereserv";
       const projectPath = await createRepoWithTrackedEnable();
       const { config, taskService, workspaceService, parentPath } =
         await createRealStack(projectPath);
@@ -500,7 +501,11 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       );
       restores.push(() => prepare.mockRestore());
 
-      const created = await taskService.create({ ...createArgs("Stale"), isolation: "none" });
+      // "reserved" is the batch path (createMany), which commits its rows in one locked write.
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([{ ...createArgs("Stale"), isolation: "none" }])
+          : await taskService.create({ ...createArgs("Stale"), isolation: "none" });
       expect(renamed).toMatchObject({ success: true });
       expect(findWorkspaceInConfig(config, rootId)?.path).not.toBe(parentPath);
       expect(created.success).toBe(false);
