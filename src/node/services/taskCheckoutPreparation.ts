@@ -10,7 +10,7 @@ import {
   type TaskCheckoutPreparation,
 } from "@/common/schemas/project";
 import type { Workspace } from "@/common/types/project";
-import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
+import { hasSrcBaseDir, isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -167,7 +167,9 @@ export function canonicalRuntimeConfigJson(runtimeConfig: RuntimeConfig | undefi
 /**
  * The runtimes preparation covers. A devcontainer checkout is a host worktree too, but plugin
  * servers are never offered there (resolveAgentPluginsMcpContext), so preparation has no consent
- * state to protect; extending structural protection to devcontainer tasks is a tracked follow-up.
+ * state to protect: devcontainer tasks stay exempt ("offhost") from the execution/MCP gates and
+ * need no proof. Their checkouts are still structurally protected — the structural-mutation
+ * guard's host set (isHostLocalRuntimeConfig) includes devcontainer.
  */
 function isHostLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
@@ -950,23 +952,34 @@ async function validatePhysicalCheckout(derived: {
 
 /**
  * Config-only publication check, run inside the config edit that inserts a task row (the row
- * already in `snapshot`): a SHARED row's live same-path ancestry must still derive. Protected rows
- * are published under the registration lock, so a structural mutator that won that lock first has
- * already renamed or removed the parent, while the creator captured the parent's path before
- * waiting. Such a row is refused (nothing is written) instead of being persisted with broken
- * ancestry. Other kinds pass unchecked. Returns the refusal, or null to publish.
+ * already in `snapshot`). Protected rows are published under the registration lock, so a
+ * structural mutator that won that lock first has already renamed or removed the parent, while
+ * the creator captured it before waiting. Such a row is refused (nothing is written) instead of
+ * being persisted broken:
+ *  - a SHARED row's live same-path ancestry must still derive;
+ *  - a DEVCONTAINER task row (exempt from preparation, yet structurally protected: once
+ *    published it cannot be removed) must still have its parent registered. Dedicated host-local
+ *    rows need no check here: they fork inside the lock, from the parent as it is then.
+ * Other kinds pass unchecked. Returns the refusal, or null to publish.
  */
-export function sharedTaskRowPublicationRefusal(
+export function taskRowPublicationRefusal(
   snapshot: ProjectsConfig,
   workspaceId: string
 ): string | null {
   const entry = findWorkspaceEntry(snapshot, workspaceId);
-  assert(entry != null, "sharedTaskRowPublicationRefusal: insert the row before checking it");
-  if (classifyTaskCheckoutKind(entry.workspace) !== "shared") return null;
+  assert(entry != null, "taskRowPublicationRefusal: insert the row before checking it");
+  const row = entry.workspace;
+  const refusal = (detail: string) =>
+    `the parent workspace changed while this task was being created (${detail}); nothing was published. Retry the task.`;
+  if (isDevcontainerRuntime(row.runtimeConfig) && row.parentWorkspaceId != null) {
+    return findWorkspaceEntry(snapshot, row.parentWorkspaceId) == null
+      ? refusal(`parent ${row.parentWorkspaceId} is no longer registered`)
+      : null;
+  }
+  if (classifyTaskCheckoutKind(row) !== "shared") return null;
   const derived = deriveTaskCheckoutAuthorization(snapshot, workspaceId);
   if (derived.kind === "derived") return null;
-  const detail = "detail" in derived ? `: ${derived.detail}` : "";
-  return `the parent workspace changed while this task was being created (${derived.kind}${detail}); nothing was published. Retry the task.`;
+  return refusal(`${derived.kind}${"detail" in derived ? `: ${derived.detail}` : ""}`);
 }
 
 /** The mismatch dimension, naming the secondary checkout it concerns (if any). */

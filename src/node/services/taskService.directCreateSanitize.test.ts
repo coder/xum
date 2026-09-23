@@ -11,10 +11,12 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import { captureTaskCheckoutAuthorization } from "@/node/services/taskCheckoutAuthorization";
 import { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
@@ -397,6 +399,42 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     ).toEqual(consented);
   }, 30_000);
 
+  /**
+   * For each config edit that first lands `taskId`'s row: whether the cross-process registration
+   * lock was held at that moment (probed right before the edit).
+   */
+  function recordRowPublicationLock(config: Config, taskId: string): Array<"held" | "free"> {
+    const lockPath = path.join(config.rootDir, "workspace-registration.lock");
+    const probeRegistrationLock = async (): Promise<"held" | "free"> => {
+      try {
+        const release = await acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 100,
+          staleMs: 60_000,
+          timeoutMessage: "registration lock held",
+        });
+        await release();
+        return "free";
+      } catch (error) {
+        expect(String(error)).toContain("registration lock held");
+        return "held";
+      }
+    };
+    const realEdit = config.editConfig.bind(config);
+    const publications: Array<"held" | "free"> = [];
+    const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+      const lock = await probeRegistrationLock();
+      await realEdit((cfg) => {
+        const before = findWorkspaceEntry(cfg, taskId) != null;
+        const next = fn(cfg);
+        if (!before && findWorkspaceEntry(next, taskId) != null) publications.push(lock);
+        return next;
+      }, options);
+    });
+    restores.push(() => edit.mockRestore());
+    return publications;
+  }
+
   test.each(["isolation-none", "project-dir-local"] as const)(
     "a capacity-queued shared task (%s) publishes its protected row under the registration lock, like the unqueued shared path",
     async (shape) => {
@@ -434,34 +472,7 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       // A structural mutator in another backend scans task rows and renames under this lock, so
       // the queued row must land while the lock is held (seen by that scan or after it), never
       // in the middle of the mutation.
-      const lockPath = path.join(config.rootDir, "workspace-registration.lock");
-      const probeRegistrationLock = async (): Promise<"held" | "free"> => {
-        try {
-          const release = await acquireCrossProcessLock({
-            lockPath,
-            acquireTimeoutMs: 100,
-            staleMs: 60_000,
-            timeoutMessage: "registration lock held",
-          });
-          await release();
-          return "free";
-        } catch (error) {
-          expect(String(error)).toContain("registration lock held");
-          return "held";
-        }
-      };
-      const realEdit = config.editConfig.bind(config);
-      const publications: Array<"held" | "free"> = [];
-      const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
-        const lock = await probeRegistrationLock();
-        await realEdit((cfg) => {
-          const before = findWorkspaceEntry(cfg, queuedId) != null;
-          const next = fn(cfg);
-          if (!before && findWorkspaceEntry(next, queuedId) != null) publications.push(lock);
-          return next;
-        }, options);
-      });
-      restores.push(() => edit.mockRestore());
+      const publications = recordRowPublicationLock(config, queuedId);
 
       const queued = await taskService.create({ ...createArgs("Queued"), isolation });
       expect(queued).toMatchObject({ success: true, data: { taskId: queuedId, status: "queued" } });
@@ -469,6 +480,127 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       const row = findWorkspaceInConfig(config, queuedId);
       expect(row).toMatchObject({ path: sharedPath, taskStatus: "queued" });
       expect(row?.taskIsolation).toBe(isolation);
+    },
+    30_000
+  );
+
+  test.each(["unqueued", "queued"] as const)(
+    "a %s devcontainer task stays exempt from checkout preparation (no proof, no prune) yet publishes its structurally protected row under the registration lock",
+    async (mode) => {
+      const taskId = mode === "queued" ? "devqueued01" : "devdirect01";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, overridesService, parentPath } =
+        await createRealStack(projectPath);
+      // DevcontainerRuntime forks a host worktree under `new Config().srcDir` (runtimeFactory):
+      // XUM_ROOT at the harness root makes that config.srcDir. No container runs in tests.
+      const previousXumRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = rootDir;
+      restores.push(() => {
+        if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousXumRoot;
+      });
+      const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(() =>
+        Promise.reject(new Error("no devcontainer in tests"))
+      );
+      restores.push(() => exec.mockRestore());
+      const devcontainer: RuntimeConfig = {
+        type: "devcontainer",
+        configPath: ".devcontainer/x.json",
+      };
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [{ path: parentPath, id: rootId, name: "parent", runtimeConfig: devcontainer }],
+        testTaskSettings(mode === "queued" ? 1 : 3)
+      );
+      if (mode === "queued") {
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      stubStableIds(config, [taskId]);
+      const prune = spyOn(overridesService, "prunePluginOverrideKeysForUnregisteredCheckout");
+      restores.push(() => prune.mockRestore());
+      const publications = recordRowPublicationLock(config, taskId);
+
+      const created = await taskService.create(createArgs("Devcontainer"));
+      expect(created).toMatchObject({
+        success: true,
+        data: { taskId, status: mode === "queued" ? "queued" : "running" },
+      });
+      expect(publications).toEqual(["held"]);
+      const row = findWorkspaceInConfig(config, taskId);
+      expect(row?.runtimeConfig).toEqual(devcontainer);
+      expect(row?.taskCheckoutPreparation).toBeUndefined();
+      if (mode === "unqueued") expect(row?.path).toBe(forkPathFor(config.srcDir, taskId));
+      expect(prune).not.toHaveBeenCalled();
+      // Execution/MCP gates keep treating it as off-host: exempt, no proof required.
+      expect(await captureTaskCheckoutAuthorization(config, taskId)).toEqual(
+        Ok({ kind: "exempt", workspaceId: taskId, exemption: "offhost" })
+      );
+    },
+    30_000
+  );
+
+  test.each(["unqueued", "queued"] as const)(
+    "a devcontainer parent removed by a mutator that wins the registration lock first refuses the %s publication: no orphaned (and unremovable) task row",
+    async (mode) => {
+      const taskId = mode === "queued" ? "devorphan01" : "devorphan02";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, parentPath } =
+        await createRealStack(projectPath);
+      const previousXumRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = rootDir;
+      restores.push(() => {
+        if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousXumRoot;
+      });
+      const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(() =>
+        Promise.reject(new Error("no devcontainer in tests"))
+      );
+      restores.push(() => exec.mockRestore());
+      const devcontainer: RuntimeConfig = {
+        type: "devcontainer",
+        configPath: ".devcontainer/x.json",
+      };
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [{ path: parentPath, id: rootId, name: "parent", runtimeConfig: devcontainer }],
+        testTaskSettings(mode === "queued" ? 1 : 3)
+      );
+      if (mode === "queued") {
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      stubStableIds(config, [taskId]);
+      // Another backend's removal wins the lock first: its scan sees no task row, so it removes
+      // the parent (its config effect is what the locked publication observes).
+      const otherConfig = new Config(config.rootDir);
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      let removed = false;
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        async (materialize, publish) => {
+          if (!removed) {
+            removed = true;
+            await otherConfig.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                project.workspaces = project.workspaces.filter((row) => row.id !== rootId);
+              }
+              return cfg;
+            });
+          }
+          return realPrepare(materialize, publish);
+        }
+      );
+      restores.push(() => prepare.mockRestore());
+
+      const created = await taskService.create(createArgs("Orphan"));
+      expect(removed).toBe(true);
+      expect(findWorkspaceInConfig(config, rootId)).toBeUndefined();
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain("parent workspace changed");
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
     },
     30_000
   );

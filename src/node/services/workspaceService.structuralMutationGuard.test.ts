@@ -8,7 +8,7 @@ import type { Workspace } from "@/common/types/project";
 import { Err, Ok } from "@/common/types/result";
 import { STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
-import type { Config } from "@/node/config";
+import { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
@@ -138,7 +138,10 @@ describe("WorkspaceService structural mutation guard", () => {
                 path.basename(targetProjectPath),
                 name
               )
-            : targetProjectPath;
+            : runtimeConfig.type === "devcontainer"
+              ? // DevcontainerRuntime: a host worktree under `new Config().srcDir` (runtimeFactory).
+                path.join(new Config().srcDir, path.basename(targetProjectPath), name)
+              : targetProjectPath;
         const fake = {
           getWorkspacePath: derive,
           // movePlanFile probes for a plan file after a rename; none exists here.
@@ -779,6 +782,87 @@ describe("WorkspaceService structural mutation guard", () => {
       expect(await service.remove(ROOT_ID, true)).toEqual(Ok(undefined));
       expect(persistedRow(ROOT_ID)).toBeUndefined();
       expect(persistedRow(TASK_ID)).toBeDefined();
+    });
+  });
+
+  describe("devcontainer checkouts are host worktrees, protected like host-local ones", () => {
+    // DevcontainerRuntime keeps its checkout on the host through a WorktreeManager rooted at
+    // `new Config().srcDir`: with XUM_ROOT at the harness root that is srcBaseDir. Checkout
+    // preparation exempts these rows (plugin servers are never offered there); the guard not.
+    const devcontainer: RuntimeConfig = {
+      type: "devcontainer",
+      configPath: ".devcontainer/x.json",
+    };
+    let previousXumRoot: string | undefined;
+    beforeEach(() => {
+      previousXumRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = tempDir;
+    });
+    afterEach(() => {
+      if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousXumRoot;
+    });
+    const devRow = (name: string, id: string, extra: Partial<Workspace> = {}) =>
+      row(name, id, { runtimeConfig: devcontainer, ...extra });
+    const devTaskRow = (name: string, id: string, extra: Partial<Workspace> = {}) =>
+      taskRow(name, id, { runtimeConfig: devcontainer, ...extra });
+
+    test("a devcontainer task refuses remove and rename, leaving row, checkout and session", async () => {
+      const task = devTaskRow("agent_dev", TASK_ID);
+      await seed([devRow("root", ROOT_ID), task]);
+
+      expectRefused(await service.remove(TASK_ID, true), "sub-agent task");
+      expectRefused(await service.rename(TASK_ID, "agent_dev_renamed"), "sub-agent task");
+      await expectIntact(task);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
+    test.each(["delete", "snapshot"] as const)(
+      "archive of a devcontainer task (%s policy) stays available: it never deletes or snapshots that checkout",
+      async (behavior) => {
+        const task = devTaskRow("agent_dev", TASK_ID);
+        await seed([devRow("root", ROOT_ID), task], { worktreeArchiveBehavior: behavior });
+
+        expect(await service.archive(TASK_ID)).toEqual(Ok({ kind: "archived" }));
+        expect(persistedRow(TASK_ID)?.archivedAt).toBeTruthy();
+        await expectIntact(task);
+        expect(captureSnapshotForArchive).not.toHaveBeenCalled();
+        expect(removeManagedGitWorktreeSpy).not.toHaveBeenCalled();
+      }
+    );
+
+    test("a devcontainer root whose host worktree a shared child aliases refuses remove and rename", async () => {
+      const root = devRow("root", ROOT_ID);
+      const shared = devTaskRow("agent_shared", TASK_ID, {
+        path: root.path,
+        taskIsolation: "none",
+      });
+      await seed([root, shared]);
+
+      expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+      expectRefused(await service.rename(ROOT_ID, "root-renamed"), `"${TASK_ID}"`);
+      await expectIntact(root);
+      await expectIntact(shared);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
+    test("an alias-free devcontainer root keeps its ordinary behavior: rename moves and remove deletes its host worktree", async () => {
+      const root = devRow("root", ROOT_ID);
+      const unrelatedTask = devTaskRow("agent_elsewhere", TASK_ID, {
+        parentWorkspaceId: "root-ws-other",
+      });
+      await seed([root, devRow("other", "root-ws-other"), unrelatedTask]);
+
+      expect(await service.rename(ROOT_ID, "root-renamed")).toEqual(
+        Ok({ newWorkspaceId: ROOT_ID })
+      );
+      expect(physical.renamed).toEqual([{ from: root.path, to: checkoutPath("root-renamed") }]);
+      expect(await service.remove(ROOT_ID, true)).toEqual(Ok(undefined));
+      expect(physical.deleted).toEqual([checkoutPath("root-renamed")]);
+      expect(persistedRow(ROOT_ID)).toBeUndefined();
+      await expectIntact(unrelatedTask);
     });
   });
 
