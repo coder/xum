@@ -13,7 +13,12 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import {
+  Config,
+  type ProjectsConfig,
+  type Workspace as WorkspaceConfigEntry,
+  type WorkspaceMetadataOptions,
+} from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -25421,79 +25426,93 @@ describe("TaskService", () => {
     expect(childWorkspace?.taskStatus).toBe("interrupted");
   });
 
-  test("running tasks settle terminally on model_refusal without any recovery prompt", async () => {
-    const config = await createTestConfig(rootDir);
+  // reasoning_rejected joins model_refusal in RUNNING_TASK_TERMINAL_STREAM_ERRORS:
+  // the child's StreamManager already spent its one in-stream repair, so the
+  // rejected replay cannot recover in-session either.
+  for (const terminal of [
+    {
+      errorType: "model_refusal" as const,
+      message:
+        "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.",
+    },
+    {
+      errorType: "reasoning_rejected" as const,
+      message: "The encrypted content for item rs_1 could not be verified.",
+    },
+  ]) {
+    test(`running tasks settle terminally on ${terminal.errorType} without any recovery prompt`, async () => {
+      const config = await createTestConfig(rootDir);
 
-    const projectPath = path.join(rootDir, "repo");
-    const parentId = "parent-111";
-    const childId = "child-222";
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-111";
+      const childId = "child-222";
 
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentId),
-        projectWorkspace(projectPath, "child", childId, {
-          name: "agent_explore_child",
-          parentWorkspaceId: parentId,
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: "anthropic:claude-fable-5",
-        }),
-      ],
-      testTaskSettings(1, 3)
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
-    const refusalMessage =
-      "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.";
-
-    // Waiter registered before the failure must reject promptly with the refusal
-    // text — not block until the 10-minute report timeout.
-    const waiterOutcome = taskService
-      .waitForAgentReport(childId, { timeoutMs: 10_000, requestingWorkspaceId: parentId })
-      .then(
-        () => null,
-        (error: unknown) => error
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: "anthropic:claude-fable-5",
+          }),
+        ],
+        testTaskSettings(1, 3)
       );
 
-    await internal.handleTaskStreamError({
-      type: "error",
-      workspaceId: childId,
-      messageId: "assistant-error-refusal",
-      error: refusalMessage,
-      errorType: "model_refusal",
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const internal = taskService as unknown as {
+        handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
+      };
+
+      const refusalMessage = terminal.message;
+
+      // Waiter registered before the failure must reject promptly with the refusal
+      // text — not block until the 10-minute report timeout.
+      const waiterOutcome = taskService
+        .waitForAgentReport(childId, { timeoutMs: 10_000, requestingWorkspaceId: parentId })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+
+      await internal.handleTaskStreamError({
+        type: "error",
+        workspaceId: childId,
+        messageId: "assistant-error-refusal",
+        error: refusalMessage,
+        errorType: terminal.errorType,
+      });
+
+      const rejection = await waiterOutcome;
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe(refusalMessage);
+
+      // Terminal settlement: no agent_report recovery prompt is sent afterwards.
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      const postCfg = config.loadConfigOrDefault();
+      const childWorkspace = Array.from(postCfg.projects.values())
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === childId);
+      expect(childWorkspace?.taskStatus).toBe("interrupted");
+      expect(childWorkspace?.taskLaunchError).toBe(refusalMessage);
+
+      // Durable failure artifact persisted in the parent's session dir.
+      const failure = await readSubagentFailureArtifact(
+        path.join(config.sessionsDir, parentId),
+        childId
+      );
+      expect(failure).not.toBeNull();
+      expect(failure?.errorType).toBe(terminal.errorType);
+      expect(failure?.errorMessage).toBe(refusalMessage);
     });
-
-    const rejection = await waiterOutcome;
-    expect(rejection).toBeInstanceOf(Error);
-    expect((rejection as Error).message).toBe(refusalMessage);
-
-    // Terminal settlement: no agent_report recovery prompt is sent afterwards.
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    const postCfg = config.loadConfigOrDefault();
-    const childWorkspace = Array.from(postCfg.projects.values())
-      .flatMap((project) => project.workspaces)
-      .find((workspace) => workspace.id === childId);
-    expect(childWorkspace?.taskStatus).toBe("interrupted");
-    expect(childWorkspace?.taskLaunchError).toBe(refusalMessage);
-
-    // Durable failure artifact persisted in the parent's session dir.
-    const failure = await readSubagentFailureArtifact(
-      path.join(config.sessionsDir, parentId),
-      childId
-    );
-    expect(failure).not.toBeNull();
-    expect(failure?.errorType).toBe("model_refusal");
-    expect(failure?.errorMessage).toBe(refusalMessage);
-  });
+  }
 
   test("awaiting_report tasks settle terminally on model_refusal", async () => {
     const config = await createTestConfig(rootDir);
@@ -34522,6 +34541,9 @@ describe("TaskService", () => {
             overrides: { taskExecutionId: "exec-parent", taskExecutionStatus: "running" },
           },
         ]);
+        // Persist the fixture's read-time migrations now. Otherwise a later metadata emit writes
+        // them mid-test, and the rollback hold below can intercept that write instead.
+        await config.getAllWorkspaceMetadata();
         stubStableIds(config, [spawnedId]);
         const { stopStream, pending } = controlledStopStream(new Set([parentTaskId]));
         const { aiService } = createAIServiceMocks(config, { stopStream });
@@ -35283,7 +35305,11 @@ describe("TaskService", () => {
       prompt: "cancellable work",
       title: "Cancellable",
     });
-    const configSnapshot = (config: Config) => JSON.stringify(config.loadConfigOrDefault());
+    const configSnapshot = (config: Config) => {
+      const snapshot = config.loadConfigOrDefault();
+      // JSON.stringify alone drops Map entries and hides metadata migration writes.
+      return JSON.stringify({ ...snapshot, projects: [...snapshot.projects] });
+    };
     const taskRecordCount = (config: Config) =>
       [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
         project.workspaces.filter((ws) => ws.parentWorkspaceId != null)
@@ -35294,28 +35320,36 @@ describe("TaskService", () => {
       config: Config,
       hooks: { before?: () => void; after?: () => Promise<void> | void }
     ) =>
-      mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-        hooks.before?.();
-        const all = await config.getAllWorkspaceMetadata();
-        const found = all.find((m) => m.id === workspaceId);
-        await hooks.after?.();
-        return found ? Ok(found) : Err("not found");
-      });
+      mock(
+        async (
+          workspaceId: string,
+          options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+        ): Promise<Result<WorkspaceMetadata>> => {
+          hooks.before?.();
+          const found = await config.getWorkspaceMetadataById(workspaceId, options);
+          await hooks.after?.();
+          return found ? Ok(found) : Err("not found");
+        }
+      );
     /** Metadata reads where exactly the Nth call (1-based) blocks on a gate, like a stalled SSH read. */
     const heldMetadataMock = (config: Config, holdCall: number) => {
       const gate = Promise.withResolvers<void>();
       const held = Promise.withResolvers<void>();
       let calls = 0;
-      const read = mock(async (workspaceId: string): Promise<Result<WorkspaceMetadata>> => {
-        calls += 1;
-        if (calls === holdCall) {
-          held.resolve();
-          await gate.promise;
+      const read = mock(
+        async (
+          workspaceId: string,
+          options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+        ): Promise<Result<WorkspaceMetadata>> => {
+          calls += 1;
+          if (calls === holdCall) {
+            held.resolve();
+            await gate.promise;
+          }
+          const found = await config.getWorkspaceMetadataById(workspaceId, options);
+          return found ? Ok(found) : Err("not found");
         }
-        const all = await config.getAllWorkspaceMetadata();
-        const found = all.find((m) => m.id === workspaceId);
-        return found ? Ok(found) : Err("not found");
-      });
+      );
       return { read, gate, held: held.promise, calls: () => calls };
     };
     interface Internals {
@@ -35405,18 +35439,19 @@ describe("TaskService", () => {
     test("abort during read-only preparation discards the late result without touching config or locks", async () => {
       const { config } = await setupTree([]);
       const controller = new AbortController();
-      const { aiService } = createAIServiceMocks(config, {
-        getWorkspaceMetadata: metadataMock(config, { before: () => controller.abort() }),
-      });
+      const metadata = metadataMock(config, { before: () => controller.abort() });
+      const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata });
       const { taskService } = createTaskServiceHarness(config, { aiService });
+      const before = configSnapshot(config);
       const recordsBefore = taskRecordCount(config);
       const result = await taskService.createMany([spawnArgs(rootId)], {
         abortSignal: controller.signal,
       });
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("prepare");
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      // No reservation record (metadata normalization writes are not reservation writes).
+      // Let the abandoned read settle before asserting or deleting its config root.
+      await metadata.mock.results[0]?.value;
+      expect(configSnapshot(config)).toBe(before);
       expect(taskRecordCount(config)).toBe(recordsBefore);
     });
 
@@ -35568,6 +35603,7 @@ describe("TaskService", () => {
     test("a held preparation read is cancellable: abort returns before the read releases and no late reservation follows", async () => {
       const { config } = await setupTree([]);
       const metadata = heldMetadataMock(config, 1);
+      const before = configSnapshot(config);
       const { aiService } = createAIServiceMocks(config, { getWorkspaceMetadata: metadata.read });
       const { taskService } = createTaskServiceHarness(config, { aiService });
       const onTaskReserved = mock(() => undefined);
@@ -35584,7 +35620,8 @@ describe("TaskService", () => {
       if (!result.success) expect(result.error).toContain("prepare");
       // The read is still blocked: cancellation did not wait for it.
       metadata.gate.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await metadata.read.mock.results[0]?.value;
+      expect(configSnapshot(config)).toBe(before);
       expect(onTaskReserved).not.toHaveBeenCalled();
       expect(taskRecordCount(config)).toBe(recordsBefore);
     });

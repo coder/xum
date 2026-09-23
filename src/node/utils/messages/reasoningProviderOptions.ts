@@ -1,3 +1,5 @@
+import type { ModelMessage } from "ai";
+
 import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 
 export interface ReasoningProviderMetadata {
@@ -188,6 +190,35 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
 
     return changed ? { ...message, parts } : message;
   });
+}
+
+/**
+ * Remove rejected OpenAI reasoning from a request, not persisted history.
+ * SDK step messages also carry this namespace. Keep visible text, tools, and
+ * other-provider reasoning; drop only assistants emptied by this repair.
+ * Preserve input identities on no-op so the caller can decline a useless retry.
+ */
+export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessage[] {
+  let changed = false;
+  const stripped: ModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || typeof message.content === "string") {
+      stripped.push(message);
+      continue;
+    }
+    const content = message.content.filter(
+      (part) => !(part.type === "reasoning" && part.providerOptions?.openai != null)
+    );
+    if (content.length === message.content.length) {
+      stripped.push(message);
+      continue;
+    }
+    changed = true;
+    if (content.length > 0) {
+      stripped.push({ ...message, content });
+    }
+  }
+  return changed ? stripped : messages;
 }
 
 /**

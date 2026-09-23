@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { AssistantModelMessage, ModelMessage } from "ai";
 
 import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 import {
@@ -6,6 +7,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
+  stripOpenAIReasoningReplay,
 } from "./reasoningProviderOptions";
 
 describe("reasoningProviderOptionsFromMetadata", () => {
@@ -259,6 +261,103 @@ describe("attachReasoningReplayMetadata", () => {
     attachReasoningReplayMetadata([input]);
 
     expect("providerMetadata" in part).toBe(false);
+  });
+});
+
+describe("stripOpenAIReasoningReplay", () => {
+  // Persisted history replay (encrypted content only, bridged by
+  // attachReasoningReplayMetadata) and same-turn SDK step messages (itemId +
+  // encrypted content copied from providerMetadata) are both OpenAI replay.
+  const historyReasoning = {
+    type: "reasoning" as const,
+    text: "earlier thinking",
+    providerOptions: { openai: { reasoningEncryptedContent: "gAAA-stale" } },
+  };
+  const stepReasoning = {
+    type: "reasoning" as const,
+    text: "step thinking",
+    providerOptions: { openai: { itemId: "rs_stale", reasoningEncryptedContent: "gAAA-step" } },
+  };
+  const xaiReasoning = {
+    type: "reasoning" as const,
+    text: "grok thinking",
+    providerOptions: { xai: { itemId: "rs_grok", reasoningEncryptedContent: "xai-blob" } },
+  };
+  const anthropicReasoning = {
+    type: "reasoning" as const,
+    text: "claude thinking",
+    providerOptions: { anthropic: { signature: "sig" } },
+  };
+
+  test("removes only OpenAI reasoning parts and keeps text and tool parts in place", () => {
+    const toolCall = {
+      type: "tool-call" as const,
+      toolCallId: "call-1",
+      toolName: "bash",
+      input: { script: "pwd" },
+    };
+    const toolMessage: ModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: "bash",
+          output: { type: "text", value: "/tmp" },
+        },
+      ],
+    };
+    const input: ModelMessage[] = [
+      { role: "user", content: "earlier" },
+      { role: "assistant", content: [historyReasoning, { type: "text", text: "earlier answer" }] },
+      { role: "user", content: "now" },
+      { role: "assistant", content: [stepReasoning, toolCall] },
+      toolMessage,
+    ];
+    const snapshot = structuredClone(input);
+
+    const stripped = stripOpenAIReasoningReplay(input);
+
+    expect(stripped).toEqual([
+      { role: "user", content: "earlier" },
+      { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+      { role: "user", content: "now" },
+      { role: "assistant", content: [toolCall] },
+      toolMessage,
+    ]);
+    // Untouched rows keep their identity; only rewritten assistants are copies.
+    expect(stripped[0]).toBe(input[0]);
+    expect(stripped[2]).toBe(input[2]);
+    expect(stripped[4]).toBe(input[4]);
+    expect(input).toEqual(snapshot);
+  });
+
+  test("preserves string assistants, other providers' reasoning, and pre-existing empty content", () => {
+    const stringAssistant: ModelMessage = { role: "assistant", content: "plain answer" };
+    const otherProviders: AssistantModelMessage = {
+      role: "assistant",
+      content: [xaiReasoning, anthropicReasoning, { type: "text", text: "kept" }],
+    };
+    const alreadyEmpty: AssistantModelMessage = { role: "assistant", content: [] };
+    const input: ModelMessage[] = [stringAssistant, otherProviders, alreadyEmpty];
+
+    const stripped = stripOpenAIReasoningReplay(input);
+
+    expect(stripped).toBe(input);
+    expect(stripped[1]).toBe(otherProviders);
+  });
+
+  test("drops assistants emptied by the removal but nothing else", () => {
+    const input: ModelMessage[] = [
+      { role: "user", content: "question" },
+      { role: "assistant", content: [historyReasoning] },
+      { role: "user", content: "follow-up" },
+    ];
+
+    expect(stripOpenAIReasoningReplay(input)).toEqual([
+      { role: "user", content: "question" },
+      { role: "user", content: "follow-up" },
+    ]);
   });
 });
 

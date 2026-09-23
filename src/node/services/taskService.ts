@@ -906,6 +906,8 @@ const RUNNING_TASK_TERMINAL_STREAM_ERRORS: ReadonlySet<StreamErrorType> = new Se
   "quota",
   "model_not_found",
   "runtime_not_ready",
+  // The child's in-stream repair failed or was unsafe; no automatic recovery remains.
+  "reasoning_rejected",
 ]);
 
 interface AgentTaskIndex {
