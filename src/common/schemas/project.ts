@@ -57,16 +57,8 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
-/**
- * Well-formed preparation proof of a dedicated host-local task checkout (see
- * `taskCheckoutPreparation.ts` for producers/validators). Numeric filesystem identifiers are
- * BigInt decimal strings (inode/device numbers can exceed 2^53).
- */
-export const TaskCheckoutPreparationSchema = z.object({
-  v: z.literal(1),
-  materializationId: z.string().regex(/^mat_[0-9a-f]{16}$/),
-  authorizationRevision: z.string().regex(/^rev_[0-9a-f]{16}$/),
-  runtimeConfigJson: z.string(),
+/** Physical identity of one checkout: path, realpath, root and git-admin dev/ino, `.git` pointer. */
+const TaskCheckoutIdentitySchema = z.object({
   path: z.string().min(1),
   realpath: z.string().min(1),
   root: z.object({ dev: z.string().regex(/^\d+$/), ino: z.string().regex(/^\d+$/) }),
@@ -76,6 +68,33 @@ export const TaskCheckoutPreparationSchema = z.object({
     ino: z.string().regex(/^\d+$/),
   }),
 });
+
+const TaskCheckoutPreparationV1Schema = TaskCheckoutIdentitySchema.extend({
+  v: z.literal(1),
+  materializationId: z.string().regex(/^mat_[0-9a-f]{16}$/),
+  authorizationRevision: z.string().regex(/^rev_[0-9a-f]{16}$/),
+  runtimeConfigJson: z.string(),
+});
+
+/**
+ * Well-formed preparation proof of a dedicated host-local task checkout (see
+ * `taskCheckoutPreparation.ts` for producers/validators). Numeric filesystem identifiers are
+ * BigInt decimal strings (inode/device numbers can exceed 2^53).
+ *
+ * v1 binds the row's own (primary) checkout. v2 additionally binds the checkout of every
+ * secondary project of a multi-project task, in the row's `projects` order. Single-project
+ * proofs stay v1, so builds that only know v1 keep validating them; a v2 value fails their
+ * `v: 1` literal and reads as unsupported (refused), never as a proof of the primary alone.
+ */
+export const TaskCheckoutPreparationSchema = z.discriminatedUnion("v", [
+  TaskCheckoutPreparationV1Schema,
+  TaskCheckoutPreparationV1Schema.extend({
+    v: z.literal(2),
+    secondaries: z
+      .array(TaskCheckoutIdentitySchema.extend({ projectPath: z.string().min(1) }))
+      .min(1),
+  }),
+]);
 export type TaskCheckoutPreparation = z.infer<typeof TaskCheckoutPreparationSchema>;
 
 export const WorkspaceConfigSchema = z.object({
@@ -300,7 +319,7 @@ export const WorkspaceConfigSchema = z.object({
   // `TaskCheckoutPreparationSchema`.
   taskCheckoutPreparation: z.unknown().optional().meta({
     description:
-      "Immutable preparation proof of a dedicated host-local agent-task checkout (materialization identity, authorization revision, canonical runtime, path/realpath, root and git-admin dev/ino, .git pointer). Absent on shared/off-host/root rows and on rows published before preparation existed.",
+      "Immutable preparation proof of a dedicated host-local agent-task checkout (materialization identity, authorization revision, canonical runtime, path/realpath, root and git-admin dev/ino, .git pointer; v2 adds the same identity for every secondary project checkout of a multi-project task). Absent on shared/off-host/root rows and on rows published before preparation existed.",
   }),
   taskAttemptRetiredBy: z
     .object({

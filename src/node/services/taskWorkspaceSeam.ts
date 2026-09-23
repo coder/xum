@@ -17,6 +17,7 @@ import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { TurnId } from "@/node/services/turnCoordinator";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { TaskCheckoutPreparation } from "@/common/schemas/project";
+import type { TaskCheckoutSecondaryTarget } from "@/node/services/taskCheckoutPreparation";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
@@ -685,6 +686,7 @@ export interface WorkspaceProvisioningHost {
         workspacePath: string;
         runtimeConfig: RuntimeConfig;
         materializationId: string;
+        secondaries?: readonly TaskCheckoutSecondaryTarget[];
       }>
     >,
     publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>

@@ -234,6 +234,10 @@ describe("orchestrateFork (multi-project)", () => {
     if (!result.success) throw new Error(`Expected success result, got error: ${result.error}`);
 
     expect(result.data.workspacePath).toBe("/tmp/child/project-one");
+    // The non-primary checkouts, for task preparation to bind (proof v2).
+    expect(result.data.secondaryCheckouts).toEqual([
+      { projectPath: PROJECT_TWO_PATH, workspacePath: "/tmp/child/project-two" },
+    ]);
     expect(result.data.trunkBranch).toBe("main");
     expect(result.data.forkedFromSource).toBe(true);
     expect(result.data.targetRuntime).toBeInstanceOf(MultiProjectRuntime);

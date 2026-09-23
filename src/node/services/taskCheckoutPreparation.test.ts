@@ -16,8 +16,10 @@ import {
   classifyTaskCheckoutKind,
   newMaterializationId,
   revalidateTaskCheckoutIdentity,
+  taskCheckoutNotPreparedMessage,
   validateTaskCheckoutPreparation,
 } from "@/node/services/taskCheckoutPreparation";
+import { taskCheckoutRefusalMessage } from "@/node/services/taskCheckoutAuthorization";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createTestProject, saveWorkspaces } from "@/node/services/taskService.testHarness";
@@ -36,9 +38,12 @@ describe("taskCheckoutPreparation", () => {
   let rootDir: string;
   let config: Config;
   let projectPath: string;
+  /** The second repository of multi-project tasks, created on first use (prepareMultiProject). */
+  let secondaryProjectPath: string | undefined;
   const worktree: { type: "worktree"; srcBaseDir: string } = { type: "worktree", srcBaseDir: "" };
 
   beforeEach(async () => {
+    secondaryProjectPath = undefined;
     rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-prep-core-"));
     config = new Config(rootDir);
     await fsPromises.mkdir(config.srcDir, { recursive: true });
@@ -69,6 +74,44 @@ describe("taskCheckoutPreparation", () => {
       row: taskRow(id, checkout, { taskCheckoutPreparation: proof, ...extra }),
     };
   }
+  /**
+   * A real multi-project dedicated task: the primary worktree of `repo` at the row's path and the
+   * secondary worktree of `repo2` at its name-derived path, claimed and bound TOGETHER (proof v2).
+   */
+  async function prepareMultiProject(id: string, extra: Partial<Workspace> = {}) {
+    secondaryProjectPath ??= await createTestProject(rootDir, "repo2");
+    const name = `agent_explore_${id}`;
+    const checkout = path.join(config.srcDir, "repo", name);
+    const secondaryCheckout = path.join(config.srcDir, "repo2", name);
+    git(projectPath, `worktree add -q -b ${id} "${checkout}" main`);
+    git(secondaryProjectPath, `worktree add -q -b ${id} "${secondaryCheckout}" main`);
+    const target = {
+      workspacePath: checkout,
+      secondaries: [{ projectPath: secondaryProjectPath, workspacePath: secondaryCheckout }],
+    };
+    const materializationId = newMaterializationId();
+    const claimed = await claimTaskCheckoutIdentity(target, materializationId);
+    if (claimed instanceof Error) throw claimed;
+    const identity = await bindTaskCheckoutIdentity(target, materializationId, claimed);
+    if (identity instanceof Error) throw identity;
+    const proof = buildTaskCheckoutPreparation(identity, worktree);
+    const projects = [
+      { projectPath, projectName: "repo" },
+      { projectPath: secondaryProjectPath, projectName: "repo2" },
+    ];
+    return {
+      checkout,
+      secondaryCheckout,
+      secondaryProjectPath,
+      proof,
+      projects,
+      row: taskRow(id, checkout, { projects, taskCheckoutPreparation: proof, ...extra }),
+    };
+  }
+  const readNonce = async (adminDir: string) =>
+    (
+      await fsPromises.readFile(path.join(adminDir, TASK_CHECKOUT_PREPARATION_NONCE_FILE), "utf-8")
+    ).trim();
   const taskRow = (id: string, checkout: string, extra: Partial<Workspace> = {}): Workspace => ({
     id,
     name: `agent_explore_${id}`,
@@ -534,4 +577,186 @@ describe("taskCheckoutPreparation", () => {
     ]);
     expect(await state(config, "loc04")).toBe("shared-broken");
   });
+
+  test("multi-project dedicated task (proof v2): every checkout is claimed and bound with the generation's nonce; ready; a shared child anchored on it derives; secondary fields are signed", async () => {
+    const { checkout, secondaryCheckout, proof, projects, row } = await prepareMultiProject("mp01");
+    const repo2 = secondaryProjectPath!;
+    expect(proof).toMatchObject({
+      v: 2,
+      path: checkout,
+      secondaries: [{ projectPath: repo2, path: secondaryCheckout }],
+    });
+    if (proof.v !== 2) throw new Error("unreachable");
+    const [secondary] = proof.secondaries;
+    expect(secondary.gitdir.pointer).toBe(
+      await fsPromises.realpath(path.join(repo2, ".git", "worktrees", "agent_explore_mp01"))
+    );
+    expect(await readNonce(proof.gitdir.pointer)).toBe(proof.materializationId);
+    expect(await readNonce(secondary.gitdir.pointer)).toBe(proof.materializationId);
+    const shared = taskRow("mp01s", checkout, {
+      parentWorkspaceId: "mp01",
+      taskIsolation: "none",
+      projects,
+    });
+    await publish([rootRow("root1", projectPath), row, shared]);
+    const ready = await validateTaskCheckoutPreparation(config, "mp01");
+    expect(ready).toMatchObject({
+      kind: "ready",
+      authority: { kind: "dedicated", anchorPath: checkout },
+    });
+    if (ready.kind !== "ready") throw new Error("unreachable");
+    expect(await validateTaskCheckoutPreparation(config, "mp01s")).toMatchObject({
+      kind: "ready",
+      authority: { kind: "shared", anchorWorkspaceId: "mp01", anchorPath: checkout },
+    });
+    // A secondary identity is part of the signed proof: a changed secondary field under the same
+    // revision is not current, and it no longer validates.
+    const drifted = {
+      ...proof,
+      secondaries: [{ ...secondary, realpath: `${secondary.realpath}-x` }],
+    };
+    await publish([rootRow("root1", projectPath), { ...row, taskCheckoutPreparation: drifted }]);
+    expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toMatchObject({
+      current: false,
+    });
+    expect(await validateTaskCheckoutPreparation(config, "mp01")).toEqual({
+      kind: "mismatch",
+      dimension: "realpath",
+      checkout: secondaryCheckout,
+    });
+  }, 20_000);
+
+  test("a replaced or missing secondary checkout refuses, naming that checkout (validator and the producer's revalidation); a proof that does not cover the row's projects mismatches", async () => {
+    const { secondaryCheckout, proof, projects, row } = await prepareMultiProject("mp02");
+    const repo2 = secondaryProjectPath!;
+    if (proof.v !== 2) throw new Error("unreachable");
+    await publish([rootRow("root1", projectPath), row]);
+    expect(await state(config, "mp02")).toBe("ready");
+    expect(await revalidateTaskCheckoutIdentity(proof)).toEqual({ ok: true });
+    // Nonce edited in the SECONDARY admin dir only.
+    const secondaryNonce = path.join(
+      proof.secondaries[0].gitdir.pointer,
+      TASK_CHECKOUT_PREPARATION_NONCE_FILE
+    );
+    await fsPromises.writeFile(secondaryNonce, "mat_ffffffffffffffff\n");
+    expect(await validateTaskCheckoutPreparation(config, "mp02")).toEqual({
+      kind: "mismatch",
+      dimension: "nonce",
+      checkout: secondaryCheckout,
+    });
+    await fsPromises.writeFile(secondaryNonce, `${proof.materializationId}\n`);
+    expect(await state(config, "mp02")).toBe("ready");
+    // Missing: the secondary checkout AND its admin dir are gone (the primary is intact).
+    git(repo2, `worktree remove --force "${secondaryCheckout}"`);
+    const missing = await validateTaskCheckoutPreparation(config, "mp02");
+    expect(missing).toEqual({
+      kind: "mismatch",
+      dimension: "missing",
+      checkout: secondaryCheckout,
+    });
+    expect(await revalidateTaskCheckoutIdentity(proof)).toEqual({ ok: false, state: missing });
+    if (missing.kind !== "mismatch") throw new Error("unreachable");
+    expect(taskCheckoutNotPreparedMessage(missing)).toContain(secondaryCheckout);
+    expect(taskCheckoutRefusalMessage("mp02", missing)).toContain(secondaryCheckout);
+    // Replaced: same path, a new worktree (root/admin inode or nonce: never ready).
+    git(repo2, `worktree add -q -b mp02b "${secondaryCheckout}" main`);
+    expect(await validateTaskCheckoutPreparation(config, "mp02")).toMatchObject({
+      kind: "mismatch",
+      checkout: secondaryCheckout,
+    });
+    expect(await revalidateTaskCheckoutIdentity(proof)).toMatchObject({
+      ok: false,
+      state: { kind: "mismatch", checkout: secondaryCheckout },
+    });
+    // Config-only: the row lists a project the proof does not bind, or a different order.
+    const extraProject = { projectPath: path.join(rootDir, "repo3"), projectName: "repo3" };
+    await publish([
+      rootRow("root1", projectPath),
+      { ...row, projects: [...projects, extraProject] },
+    ]);
+    expect(await validateTaskCheckoutPreparation(config, "mp02")).toEqual({
+      kind: "mismatch",
+      dimension: "projects",
+    });
+    await publish([rootRow("root1", projectPath), { ...row, projects: [...projects].reverse() }]);
+    expect(await validateTaskCheckoutPreparation(config, "mp02")).toEqual({
+      kind: "mismatch",
+      dimension: "projects",
+    });
+  }, 20_000);
+
+  test("a v1 proof cannot prove a multi-project task's secondary checkouts (unsupported); single-project v1 stays ready; a v2 proof on a single-project row and unknown or malformed versions refuse", async () => {
+    const { proof, row } = await prepareDedicated("mp03");
+    expect(proof.v).toBe(1);
+    await publish([rootRow("root1", projectPath), row]);
+    expect(await state(config, "mp03")).toBe("ready");
+    // A row listing only its primary project is single-project: v1 is complete for it.
+    await publish([
+      rootRow("root1", projectPath),
+      { ...row, projects: [{ projectPath, projectName: "repo" }] },
+    ]);
+    expect(await state(config, "mp03")).toBe("ready");
+    const multi = await prepareMultiProject("mp04");
+    await publish([rootRow("root1", projectPath), { ...row, projects: multi.projects }]);
+    expect(await validateTaskCheckoutPreparation(config, "mp03")).toMatchObject({
+      kind: "unsupported",
+    });
+    await publish([rootRow("root1", projectPath), { ...multi.row, projects: undefined }]);
+    expect(await validateTaskCheckoutPreparation(config, "mp04")).toEqual({
+      kind: "mismatch",
+      dimension: "projects",
+    });
+    for (const malformed of [
+      { ...multi.proof, v: 3 },
+      { ...multi.proof, secondaries: [] },
+      { ...multi.proof, v: 1 },
+    ]) {
+      await publish([
+        rootRow("root1", projectPath),
+        { ...multi.row, taskCheckoutPreparation: malformed },
+      ]);
+      // A v1-shaped value with extra fields on a multi-project row is still v1: unsupported.
+      expect(await state(config, "mp04")).toBe("unsupported");
+    }
+    await publish([rootRow("root1", projectPath), multi.row]);
+    expect(await state(config, "mp04")).toBe("ready");
+  }, 20_000);
+
+  test("the claim/bind protocol covers every secondary: an already-claimed secondary refuses the whole claim, and a secondary replaced between claim and bind is never bound", async () => {
+    secondaryProjectPath ??= await createTestProject(rootDir, "repo2");
+    const repo2 = secondaryProjectPath;
+    const setUp = (id: string) => {
+      const checkout = path.join(config.srcDir, "repo", `agent_explore_${id}`);
+      const secondaryCheckout = path.join(config.srcDir, "repo2", `agent_explore_${id}`);
+      git(projectPath, `worktree add -q -b ${id} "${checkout}" main`);
+      git(repo2, `worktree add -q -b ${id} "${secondaryCheckout}" main`);
+      return {
+        secondaryCheckout,
+        secondaryAdmin: path.join(repo2, ".git", "worktrees", `agent_explore_${id}`),
+        target: {
+          workspacePath: checkout,
+          secondaries: [{ projectPath: repo2, workspacePath: secondaryCheckout }],
+        },
+      };
+    };
+    const planted = setUp("mp05");
+    await fsPromises.writeFile(
+      path.join(planted.secondaryAdmin, TASK_CHECKOUT_PREPARATION_NONCE_FILE),
+      "mat_0123456789abcdef\n"
+    );
+    const refusedClaim = await claimTaskCheckoutIdentity(planted.target, newMaterializationId());
+    if (!(refusedClaim instanceof Error)) throw new Error("the claim must refuse");
+    expect(refusedClaim.message).toContain(planted.secondaryCheckout);
+
+    const swapped = setUp("mp06");
+    const id = newMaterializationId();
+    const claimed = await claimTaskCheckoutIdentity(swapped.target, id);
+    if (claimed instanceof Error) throw claimed;
+    expect(await readNonce(await fsPromises.realpath(swapped.secondaryAdmin))).toBe(id);
+    git(repo2, `worktree remove --force "${swapped.secondaryCheckout}"`);
+    git(repo2, `worktree add -q -b mp06b "${swapped.secondaryCheckout}" main`);
+    const refusedBind = await bindTaskCheckoutIdentity(swapped.target, id, claimed);
+    if (!(refusedBind instanceof Error)) throw new Error("the bind must refuse");
+    expect(refusedBind.message).toContain(swapped.secondaryCheckout);
+  }, 20_000);
 });

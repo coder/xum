@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import * as path from "path";
 
 import type { ProjectsConfig } from "@/common/types/project";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SecretsStore, type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Ok } from "@/common/types/result";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -13,6 +14,7 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import {
   TASK_CHECKOUT_PREPARATION_NONCE_FILE,
   bindTaskCheckoutIdentity,
@@ -106,26 +108,43 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
     return projectPath;
   }
 
-  async function createRealStack(projectPath: string, extraRows: WorkspaceConfigEntry[] = []) {
+  /**
+   * `secondaryProjectPath`: the parent is a multi-project workspace of both repositories (a
+   * parent worktree in each, the multi-project experiment on), so its dedicated tasks fork one
+   * checkout per project.
+   */
+  async function createRealStack(
+    projectPath: string,
+    extraRows: WorkspaceConfigEntry[] = [],
+    options: { secondaryProjectPath?: string } = {}
+  ) {
     const { config, historyService } = history;
     const runtimeConfig: RuntimeConfig = { type: "worktree", srcBaseDir: config.srcDir };
-    const parentRuntime = createRuntime(runtimeConfig, { projectPath });
     const parentName = "parent";
-    const created = await parentRuntime.createWorkspace({
+    const projectPaths = [
       projectPath,
-      branchName: parentName,
-      trunkBranch: "main",
-      directoryName: parentName,
-      initLogger: {
-        logStep: () => undefined,
-        logStdout: () => undefined,
-        logStderr: () => undefined,
-        logComplete: () => undefined,
-        enterHookPhase: () => undefined,
-      },
-    });
-    if (!created.success) throw new Error(`parent worktree: ${created.error ?? "unknown"}`);
-    const parentPath = parentRuntime.getWorkspacePath(projectPath, parentName);
+      ...(options.secondaryProjectPath ? [options.secondaryProjectPath] : []),
+    ];
+    for (const repo of projectPaths) {
+      const created = await createRuntime(runtimeConfig, { projectPath: repo }).createWorkspace({
+        projectPath: repo,
+        branchName: parentName,
+        trunkBranch: "main",
+        directoryName: parentName,
+        initLogger: {
+          logStep: () => undefined,
+          logStdout: () => undefined,
+          logStderr: () => undefined,
+          logComplete: () => undefined,
+          enterHookPhase: () => undefined,
+        },
+      });
+      if (!created.success) throw new Error(`parent worktree: ${created.error ?? "unknown"}`);
+    }
+    const parentPath = createRuntime(runtimeConfig, { projectPath }).getWorkspacePath(
+      projectPath,
+      parentName
+    );
     await fsPromises.writeFile(
       path.join(parentPath, OVERRIDES_RELATIVE_PATH),
       JSON.stringify({ enabledServers: [] }),
@@ -141,10 +160,23 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
           name: parentName,
           createdAt: new Date().toISOString(),
           runtimeConfig,
+          ...(options.secondaryProjectPath
+            ? {
+                projects: projectPaths.map((repo) => ({
+                  projectPath: repo,
+                  projectName: path.basename(repo),
+                })),
+              }
+            : {}),
         },
         ...extraRows,
       ],
-      testTaskSettings()
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: options.secondaryProjectPath
+          ? [[options.secondaryProjectPath, { trusted: true, workspaces: [] }]]
+          : [],
+      }
     );
 
     const { aiService } = createAIServiceMocks(config);
@@ -185,6 +217,12 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
       )
     );
     workspaceService.setAgentTaskIntegration(taskService);
+    if (options.secondaryProjectPath) {
+      const experiments = spyOn(workspaceService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+      );
+      restores.push(() => experiments.mockRestore());
+    }
     const sends: string[] = [];
     const sendMessage = spyOn(workspaceService, "sendMessage").mockImplementation(((
       ...args: Parameters<WorkspaceHost["sendMessage"]>
@@ -567,6 +605,185 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
         taskCheckoutPreparation: { v: 1, path: forkPathFor(config.srcDir, taskId) },
       });
       if (mode === "queued") expect(row?.taskStatus).toBe("queued");
+    },
+    30_000
+  );
+
+  const secondaryForkPathFor = (srcDir: string, taskId: string) =>
+    path.join(srcDir, "repo2", `agent_explore_${taskId}`);
+
+  test("a multi-project parent's dedicated tasks (reserved batch and Task.create) publish proof v2 binding every project's checkout; both validate ready and launch", async () => {
+    const reservedId = "prepmulti01";
+    const directId = "prepmulti02";
+    const projectPath = await createRepoWithTrackedEnable();
+    const secondaryProjectPath = await createTestProject(rootDir, "repo2");
+    const { config, taskService, sends } = await createRealStack(projectPath, [], {
+      secondaryProjectPath,
+    });
+    stubStableIds(config, [reservedId, directId]);
+    const expectProofV2 = async (taskId: string) => {
+      const forkPath = forkPathFor(config.srcDir, taskId);
+      const secondaryPath = secondaryForkPathFor(config.srcDir, taskId);
+      const row = findWorkspaceInConfig(config, taskId);
+      expect(row).toMatchObject({
+        path: forkPath,
+        projects: [{ projectPath }, { projectPath: secondaryProjectPath }],
+        taskCheckoutPreparation: {
+          v: 2,
+          path: forkPath,
+          secondaries: [{ projectPath: secondaryProjectPath, path: secondaryPath }],
+        },
+      });
+      const proof = row?.taskCheckoutPreparation as TaskCheckoutPreparation;
+      if (proof.v !== 2) throw new Error("unreachable");
+      // The generation's nonce is claimed in the secondary's OWN git admin dir too.
+      const [secondary] = proof.secondaries;
+      expect(secondary.gitdir.pointer).toBe(
+        await fsPromises.realpath(
+          path.join(secondaryProjectPath, ".git", "worktrees", `agent_explore_${taskId}`)
+        )
+      );
+      expect(
+        (
+          await fsPromises.readFile(
+            path.join(secondary.gitdir.pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE),
+            "utf-8"
+          )
+        ).trim()
+      ).toBe(proof.materializationId);
+      expect(await validateTaskCheckoutPreparation(config, taskId)).toMatchObject({
+        kind: "ready",
+      });
+    };
+
+    // Success also means the producer's persistence check found each v2 proof, JSON round
+    // tripped through the config file, deep-equal to the one it built.
+    expect(await taskService.createMany([createArgs("Reserved multi")])).toMatchObject({
+      success: true,
+    });
+    await expectProofV2(reservedId);
+    await waitUntil(() => sends.includes(reservedId), "the reserved multi-project launch's send");
+    expect(await taskService.create(createArgs("Direct multi"))).toMatchObject({
+      success: true,
+      data: { taskId: directId },
+    });
+    await expectProofV2(directId);
+    expect(sends).toContain(directId);
+  }, 30_000);
+
+  test("a refused secondary claim refuses the whole preparation: nothing is published, and every checkout is retained and named", async () => {
+    const taskId = "prepmulti03";
+    const projectPath = await createRepoWithTrackedEnable();
+    const secondaryProjectPath = await createTestProject(rootDir, "repo2");
+    const { config, taskService, sends } = await createRealStack(projectPath, [], {
+      secondaryProjectPath,
+    });
+    stubStableIds(config, [taskId]);
+    // Another generation's claim already sits in the SECONDARY's admin dir when preparation
+    // claims it (the primary is clean).
+    const realFork = forkOrchestrator.orchestrateFork;
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(
+      async (params) => {
+        const result = await realFork(params);
+        await fsPromises.writeFile(
+          path.join(
+            secondaryProjectPath,
+            ".git",
+            "worktrees",
+            `agent_explore_${taskId}`,
+            TASK_CHECKOUT_PREPARATION_NONCE_FILE
+          ),
+          "mat_0123456789abcdef\n"
+        );
+        return result;
+      }
+    );
+    restores.push(() => forkSpy.mockRestore());
+
+    const created = await taskService.create(createArgs("Refused multi"));
+    expect(created.success).toBe(false);
+    if (created.success) throw new Error("unreachable");
+    const forkPath = forkPathFor(config.srcDir, taskId);
+    const secondaryPath = secondaryForkPathFor(config.srcDir, taskId);
+    expect(created.error).toContain(secondaryPath);
+    expect(created.error).toContain(forkPath);
+    expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    expect(await pathExists(forkPath)).toBe(true);
+    expect(await pathExists(secondaryPath)).toBe(true);
+    expect(sends).toEqual([]);
+  }, 30_000);
+
+  // The producer's own refusals after binding (the pre-publication recheck, the persistence
+  // check) must name every checkout of a multi-project task: the unqueued Task.create returns a
+  // failed persistence check verbatim (an attempted write), with no retained-checkout notice.
+  test.each(["changed after bind", "save swallowed"] as const)(
+    "a multi-project preparation refused after binding (%s) names every checkout; nothing is registered",
+    async (mode) => {
+      const taskId = mode === "changed after bind" ? "prepmulti04" : "prepmulti05";
+      const projectPath = await createRepoWithTrackedEnable();
+      const secondaryProjectPath = await createTestProject(rootDir, "repo2");
+      const { config, taskService, overridesService, sends } = await createRealStack(
+        projectPath,
+        [],
+        { secondaryProjectPath }
+      );
+      stubStableIds(config, [taskId]);
+      const forkPath = forkPathFor(config.srcDir, taskId);
+      const secondaryPath = secondaryForkPathFor(config.srcDir, taskId);
+      if (mode === "changed after bind") {
+        // A non-cooperating writer edits the SECONDARY's claim once every checkout is bound.
+        const realPrune =
+          overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
+        const pruneSpy = spyOn(
+          overridesService,
+          "prunePluginOverrideKeysForUnregisteredCheckout"
+        ).mockImplementation((target, keyPrefix, options) =>
+          realPrune(target, keyPrefix, {
+            ...options,
+            afterPruneUnderLock: async () => {
+              await options?.afterPruneUnderLock?.();
+              await fsPromises.writeFile(
+                path.join(
+                  secondaryProjectPath,
+                  ".git",
+                  "worktrees",
+                  `agent_explore_${taskId}`,
+                  TASK_CHECKOUT_PREPARATION_NONCE_FILE
+                ),
+                "mat_ffffffffffffffff\n"
+              );
+            },
+          })
+        );
+        restores.push(() => pruneSpy.mockRestore());
+      } else {
+        const facade = config as unknown as {
+          saveConfig: (next: ProjectsConfig) => Promise<void>;
+        };
+        const realSave = facade.saveConfig.bind(config);
+        const save = spyOn(facade, "saveConfig").mockImplementation((next) =>
+          [...next.projects.values()].some((project) =>
+            project.workspaces.some((row) => row.id === taskId)
+          )
+            ? Promise.resolve()
+            : realSave(next)
+        );
+        restores.push(() => save.mockRestore());
+      }
+
+      const created = await taskService.create(createArgs("Refused after bind"));
+      expect(created.success).toBe(false);
+      if (created.success) throw new Error("unreachable");
+      expect(created.error).toContain(
+        mode === "changed after bind" ? `nonce of ${secondaryPath}` : "did not persist"
+      );
+      expect(created.error).toContain(secondaryPath);
+      expect(created.error).toContain(forkPath);
+      expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+      expect(await pathExists(forkPath)).toBe(true);
+      expect(await pathExists(secondaryPath)).toBe(true);
+      await settle();
+      expect(sends).toEqual([]);
     },
     30_000
   );
