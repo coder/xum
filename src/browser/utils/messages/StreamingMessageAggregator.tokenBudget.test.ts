@@ -9,8 +9,26 @@ import { describe, expect, test } from "bun:test";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage } from "@/common/types/message";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 
 const CREATED_AT = "2026-01-01T00:00:00.000Z";
+
+// Enable the "show synthetic messages" debug flag for the duration of fn.
+function withDebugLlmRequestEnabled<T>(fn: () => T): T {
+  const globalWithWindow = globalThis as unknown as { window?: { api?: WindowApi } };
+  const previousWindow = globalWithWindow.window;
+  globalWithWindow.window = {
+    ...previousWindow,
+    api: { ...(previousWindow?.api ?? { platform: process.platform, versions: {} }) },
+  };
+  globalWithWindow.window.api!.debugLlmRequest = true;
+  try {
+    return fn();
+  } finally {
+    if (previousWindow) globalWithWindow.window = previousWindow;
+    else delete globalWithWindow.window;
+  }
+}
 
 describe("token-budget replay", () => {
   test("retains old windows and machine warnings while hiding the provider lead-in", () => {
@@ -226,6 +244,129 @@ describe("token-budget replay", () => {
     expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(false);
     expect(aggregator.getAllMessages().at(-1)?.parts).toEqual([]);
   });
+
+  test.each([false, true])(
+    "final flush turn rows stay out of the transcript (debug=%s)",
+    (debug) => {
+      const flushTurn = {
+        type: "normal",
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      } as const;
+      const messages = [
+        createMuxMessage("user", "user", "Investigate the failing test", { historySequence: 1 }),
+        createMuxMessage("answer", "assistant", "Looking into it.", { historySequence: 2 }),
+        createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+          historySequence: 3,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: flushTurn,
+        }),
+        // A crash-recovered partial and a settled flush answer both carry the turn flag.
+        createMuxMessage("flush-answer", "assistant", "Wrote notes; window can close.", {
+          historySequence: 4,
+          partial: true,
+          muxMetadata: flushTurn,
+        }),
+        createMuxMessage("continue", "user", "Continue", {
+          historySequence: 5,
+          synthetic: true,
+          uiVisible: false,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+        createMuxMessage("next-answer", "assistant", "Back to the fix.", {
+          historySequence: 6,
+          muxMetadata: { type: "normal", contextBudgetContinuation: true },
+        }),
+      ].map((message) => MuxMessageSchema.parse(message));
+      const aggregator = new StreamingMessageAggregator(CREATED_AT);
+      aggregator.loadHistoricalMessages(messages, false);
+      const displayedIds = () =>
+        aggregator
+          .getDisplayedMessages()
+          .map((row) => ("historyId" in row ? row.historyId : row.id));
+      if (debug) {
+        // Debug mode keeps showing every machine row, including the flush turn.
+        expect(withDebugLlmRequestEnabled(displayedIds)).toEqual(
+          messages.map((message) => message.id)
+        );
+        return;
+      }
+      expect(displayedIds()).toEqual(["user", "answer", "next-answer"]);
+    }
+  );
+
+  test("a failed flush turn stays visible so its error explains the stop", () => {
+    const flushTurn = { type: "normal", contextBudgetFlush: true } as const;
+    const messages = [
+      createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+        historySequence: 1,
+        synthetic: true,
+        uiVisible: false,
+        muxMetadata: flushTurn,
+      }),
+      createMuxMessage("flush-answer", "assistant", "Writing notes", {
+        historySequence: 2,
+        partial: true,
+        error: "Provider returned 500",
+        errorType: "unknown",
+        muxMetadata: flushTurn,
+      }),
+    ].map((message) => MuxMessageSchema.parse(message));
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages(messages, false);
+    const flushRows = aggregator
+      .getDisplayedMessages()
+      .filter((row) => "historyId" in row && row.historyId === "flush-answer");
+    expect(flushRows.map((row) => row.type)).toContain("stream-error");
+    // The trigger remains a hidden synthetic row.
+    expect(
+      aggregator
+        .getDisplayedMessages()
+        .some((row) => "historyId" in row && row.historyId === "flush-trigger")
+    ).toBe(false);
+  });
+
+  test.each([true, false])(
+    "response notifications and unread recency for a live turn follow the flush flag (flush=%s)",
+    (flush) => {
+      const workspaceId = "workspace-flush-notify";
+      const aggregator = new StreamingMessageAggregator(CREATED_AT, workspaceId);
+      const recencyBefore = aggregator.getRecencyTimestamp();
+      let completion: Parameters<typeof shouldNotifyOnResponseComplete>[0];
+      aggregator.onResponseComplete = (event) => {
+        completion = event.completion;
+      };
+      const muxMetadata = flush
+        ? ({ type: "normal", contextBudgetFlush: true } as const)
+        : ({ type: "normal" } as const);
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId,
+        messageId: "flush-stream",
+        historySequence: 1,
+        model: "anthropic:claude-opus-5",
+        startTime: Date.now(),
+        muxMetadata,
+      });
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId,
+        messageId: "flush-stream",
+        metadata: {
+          historySequence: 1,
+          timestamp: Date.now(),
+          model: "anthropic:claude-opus-5",
+          muxMetadata,
+        },
+        parts: [{ type: "text", text: "Wrote notes" }],
+      });
+      // A resumed flush with no continuation must not notify with output the transcript hides,
+      // nor bump recency (which would mark the workspace unread with nothing new to read).
+      expect(shouldNotifyOnResponseComplete(completion)).toBe(!flush);
+      expect(aggregator.getRecencyTimestamp() === recencyBefore).toBe(flush);
+    }
+  );
 
   test.each([false, true])(
     "does not collapse human or malformed warning rows (synthetic=%s)",

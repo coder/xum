@@ -677,7 +677,8 @@ describe("MockAiStreamPlayer", () => {
     expect(completion).toMatchObject({ status: "completed", streamEnd });
     expect(player.isStreaming(workspaceId)).toBe(false);
 
-    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high" });
+    // Turn metadata must arrive at start so the renderer can classify the turn before deltas.
+    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high", muxMetadata });
     expect(streamEnd?.metadata).toMatchObject({
       agentId: "explore",
       thinkingLevel: "high",

@@ -2090,7 +2090,10 @@ export class StreamingMessageAggregator {
     this.backgroundHandoffCompletion = undefined;
     const routeProvider = resolveRouteProvider(data.routeProvider, data.routedThroughGateway);
 
+    // A hidden token-budget flush turn is maintenance, not a reply: never notify with
+    // output the transcript intentionally hides (e.g. a resumed flush with no continuation).
     const suppressNotification =
+      data.muxMetadata?.contextBudgetFlush === true ||
       this.isDefaultPostCompactionContinueTurn() ||
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
@@ -2148,6 +2151,9 @@ export class StreamingMessageAggregator {
         if (data.agentId != null) {
           existingMessage.metadata.agentId = data.agentId;
         }
+        if (data.muxMetadata != null) {
+          existingMessage.metadata.muxMetadata = data.muxMetadata;
+        }
         existingMessage.metadata.mode = data.mode;
         existingMessage.metadata.thinkingLevel = data.thinkingLevel;
       }
@@ -2170,6 +2176,9 @@ export class StreamingMessageAggregator {
       agentId: data.agentId,
       mode: data.mode,
       thinkingLevel: data.thinkingLevel,
+      // Turn classification must be known before the first delta so a hidden maintenance
+      // turn (token-budget flush) never paints; stream-end re-merges the same metadata.
+      ...(data.muxMetadata != null ? { muxMetadata: data.muxMetadata } : {}),
     });
 
     this.messages.set(data.messageId, streamingMessage);
@@ -2283,8 +2292,10 @@ export class StreamingMessageAggregator {
       const completedAt = isFinal ? Date.now() : null;
 
       // Recency policy: only non-compaction final streams inflate lastResponseCompletedAt.
-      // Compaction recency comes from the compacted summary's own timestamp.
-      if (completedAt !== null && !activeStream.isCompacting) {
+      // Compaction recency comes from the compacted summary's own timestamp. A hidden
+      // token-budget flush adds no visible row, so it must not mark the workspace unread.
+      const isHiddenFlushTurn = message?.metadata?.muxMetadata?.contextBudgetFlush === true;
+      if (completedAt !== null && !activeStream.isCompacting && !isHiddenFlushTurn) {
         this.lastResponseCompletedAt = completedAt;
       }
 
@@ -3707,9 +3718,17 @@ export class StreamingMessageAggregator {
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
+      // The token-budget flush turn is machine maintenance (one memory write before the
+      // window is sealed), not a reply to the user. Its trigger row is already a hidden
+      // synthetic user row; the assistant output it produces carries the same turn flag on
+      // the live stream, the recovered partial, and the settled history row, so hide the
+      // whole turn by that flag rather than by the text it happens to emit. A failed flush
+      // stays visible: its error row and retry controls are the only explanation the user gets.
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
         !showSyntheticMessages &&
         ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
+          (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
+            message.metadata.error == null) ||
           isWorkflowResultMessage(message));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.
