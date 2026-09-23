@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { ComponentType } from "react";
+import { expect, within } from "storybook/test";
 import { SessionHistoryToolCall } from "@/browser/features/Tools/SessionHistoryToolCall";
 import { PIXEL_DISABLED, lightweightMeta, StoryUiShell } from "@/browser/stories/meta.js";
 
@@ -292,7 +293,9 @@ function narrowDecorator(Story: ComponentType) {
  * Fails if any part of the card extends past the pinned container or spills out of its own
  * parent (a chip overlapping the next cell). Checks every descendant, not just the
  * container's scrollWidth: the row lists scroll internally, and a spill inside a grid cell
- * overlaps its neighbour without widening the container.
+ * overlaps its neighbour without widening the container. Also fails when content overflows
+ * a visible-overflow box: an unbroken token spills out of its own block without moving the
+ * block's edge, so the rect checks alone miss it.
  */
 async function assertCardFitsNarrowContainer(canvasElement: HTMLElement, rowSelector: string) {
   if (!canvasElement.querySelector(rowSelector)) {
@@ -310,7 +313,16 @@ async function assertCardFitsNarrowContainer(canvasElement: HTMLElement, rowSele
   const overflowing = Array.from(container.querySelectorAll("*")).filter((element) => {
     const elementRight = element.getBoundingClientRect().right;
     const parentRight = element.parentElement?.getBoundingClientRect().right ?? right;
-    return elementRight > right + 1 || elementRight > parentRight + 1;
+    if (elementRight > right + 1 || elementRight > parentRight + 1) return true;
+    // Clipping/scrolling boxes (truncate, scroll lists) contain their overflow by design, and
+    // inline boxes report no clientWidth.
+    if (!(element instanceof HTMLElement)) return false;
+    const style = getComputedStyle(element);
+    return (
+      style.overflowX === "visible" &&
+      style.display !== "inline" &&
+      element.scrollWidth > element.clientWidth + 1
+    );
   });
   if (container.scrollWidth > container.clientWidth + 1 || overflowing.length > 0) {
     const culprits = overflowing
@@ -406,6 +418,17 @@ export const NarrowLongRole: Story = {
     assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-item"]'),
 };
 
+const EXCERPT_SELECTOR = '[data-testid="session-history-excerpt"]';
+
+/** The excerpt's role chip label (the truncating span), found by its exact text. */
+function excerptRoleLabel(canvasElement: HTMLElement, role: string): HTMLElement {
+  const excerpt = canvasElement.querySelector(EXCERPT_SELECTOR);
+  if (!(excerpt instanceof HTMLElement)) {
+    throw new Error("Session history excerpt not found");
+  }
+  return within(excerpt).getByText(role);
+}
+
 /** Narrow container · read_item with a long item ID and a wide exact range in the header. */
 export const NarrowReadItemRange: Story = {
   args: {
@@ -434,6 +457,83 @@ export const NarrowReadItemRange: Story = {
     },
   },
   decorators: [narrowDecorator],
+  play: async ({ canvasElement }) => {
+    await assertCardFitsNarrowContainer(canvasElement, EXCERPT_SELECTOR);
+    // The long item ID absorbs the shrink, so the known role keeps its full label.
+    const role = excerptRoleLabel(canvasElement, "assistant");
+    await expect(role.scrollWidth).toBeLessThanOrEqual(role.clientWidth);
+  },
+};
+
+// Unbroken tokens (no spaces or other break opportunities) in error codes, notices and
+// unknown warning codes must wrap instead of spilling out of the card.
+const LONG_TOKEN = `trace_${"0123456789abcdef".repeat(6)}`;
+const LONG_CODE =
+  "forward_compatible_error_code_from_a_newer_backend_release_without_any_spaces_at_all";
+
+/** Narrow container · unknown, very long error code and a notice with an unbroken token. */
+export const NarrowUnknownError: Story = {
+  args: {
+    args: { action: "search", query: "token" },
+    status: "failed",
+    defaultExpanded: true,
+    result: { success: false, error: LONG_CODE, notice: `Retry with ${LONG_TOKEN} attached.` },
+  },
+  decorators: [narrowDecorator],
   play: ({ canvasElement }) =>
-    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-excerpt"]'),
+    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-error"]'),
+};
+
+/**
+ * Narrow container · read_item with a real-length item ID, an unknown warning code and a
+ * notice with an unbroken token; the role chip must keep its full known label.
+ */
+export const NarrowReadItem: Story = {
+  args: {
+    args: { action: "read_item", item_id: itemId(48213, "9f2c") },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: `${NOTICE} Source: ${LONG_TOKEN}.`,
+      warnings: [LONG_CODE],
+      items: [
+        {
+          itemId: itemId(48213, "9f2c"),
+          windowId: "w:212",
+          role: "assistant",
+          text: READ_ROW.slice(0, READ_PAGE_CHARS),
+          nextCharOffset: READ_PAGE_CHARS,
+        },
+      ],
+    },
+  },
+  decorators: [narrowDecorator],
+  play: async ({ canvasElement }) => {
+    await assertCardFitsNarrowContainer(canvasElement, EXCERPT_SELECTOR);
+    const role = excerptRoleLabel(canvasElement, "assistant");
+    await expect(role.scrollWidth).toBeLessThanOrEqual(role.clientWidth);
+  },
+};
+
+/** Narrow container · read_item with an unknown, very long role: the chip still truncates. */
+export const NarrowReadItemLongRole: Story = {
+  args: {
+    args: { action: "read_item", item_id: itemId(2048, "c0ff") },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: NOTICE,
+      items: [
+        { itemId: itemId(2048, "c0ff"), windowId: "w:0", role: LONG_LABEL, text: "Row text." },
+      ],
+    },
+  },
+  decorators: [narrowDecorator],
+  play: async ({ canvasElement }) => {
+    await assertCardFitsNarrowContainer(canvasElement, EXCERPT_SELECTOR);
+    const role = excerptRoleLabel(canvasElement, LONG_LABEL);
+    await expect(role.scrollWidth).toBeGreaterThan(role.clientWidth);
+  },
 };

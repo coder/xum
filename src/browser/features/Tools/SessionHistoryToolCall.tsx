@@ -8,8 +8,10 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from "lucide-react";
+import { z } from "zod";
 import { cn } from "@/common/lib/utils";
 import type { SessionHistoryToolArgs, SessionHistoryToolResult } from "@/common/types/tools";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { escapeRegex } from "@/browser/utils/highlighting/highlightSearchTerms";
 import { JsonHighlight } from "./Shared/HighlightedCode";
@@ -51,6 +53,14 @@ type SessionHistoryItem = NonNullable<SessionHistoryToolResult["items"]>[number]
 type SessionHistoryWindow = NonNullable<SessionHistoryToolResult["windows"]>[number];
 type SessionHistoryWarning = NonNullable<SessionHistoryToolResult["warnings"]>[number];
 
+// Card-local display schema. Warnings are advisory, so a persisted result carrying a newer
+// backend's warning code must still render its rows (the code renders verbatim). The tool's
+// result schema stays strict because the backend emits only known codes.
+const DisplayResultSchema = TOOL_DEFINITIONS.session_history.resultSchema.extend({
+  warnings: z.array(z.string()).optional(),
+});
+type SessionHistoryDisplayResult = z.infer<typeof DisplayResultSchema>;
+
 const ACTION_VERBS: Record<SessionHistoryAction, string> = {
   list_windows: "List windows",
   list_items: "List items",
@@ -59,17 +69,27 @@ const ACTION_VERBS: Record<SessionHistoryAction, string> = {
 };
 
 // Error codes documented on the result schema. Unknown codes render verbatim.
+// filters_unsupported depends on the action: see FILTERS_UNSUPPORTED_MESSAGES.
 const ERROR_MESSAGES: Record<string, string> = {
   query_required: "search needs a query.",
   item_id_required: "read_item needs an item_id.",
-  filters_unsupported:
-    "This action does not accept role, tool_name, max_chars_per_item or recent_first.",
   task_not_found: "No readable sub-agent history for this task.",
   session_unavailable: "That session's history has been removed.",
   item_not_found: "No row with that item_id in this history.",
   history_changed: "History changed while reading.",
   history_timeout: "The read did not finish in time.",
   history_unavailable: "History could not be read.",
+};
+
+// Mirrors the backend check (session_history.ts): role, tool_name and max_chars_per_item are
+// rejected outside list_items/search, and recent_first only on read_item. list_items and
+// search never return this code, but a persisted or newer result may, so their line names
+// no specific filter.
+const FILTERS_UNSUPPORTED_MESSAGES: Record<SessionHistoryAction, string> = {
+  list_windows: "list_windows does not accept role, tool_name or max_chars_per_item.",
+  read_item: "read_item does not accept role, tool_name, max_chars_per_item or recent_first.",
+  list_items: "list_items rejected one of the requested filters.",
+  search: "search rejected one of the requested filters.",
 };
 
 const WARNING_MESSAGES: Record<SessionHistoryWarning, string> = {
@@ -102,6 +122,11 @@ const FALLBACK_ROLE_TONE = "text-muted border-muted/35";
 /** Own-key lookup: keys come from persisted transcripts, so "constructor" must not hit Object members. */
 function lookup<T>(map: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+function errorMessage(action: SessionHistoryAction, code: string): string {
+  if (code === "filters_unsupported") return FILTERS_UNSUPPORTED_MESSAGES[action];
+  return lookup(ERROR_MESSAGES, code) ?? code;
 }
 
 function boundaryOf(kind: string): BoundaryPresentation {
@@ -146,7 +171,7 @@ function charsLabel(item: SessionHistoryItem): string {
 
 function countLabel(
   args: SessionHistoryToolArgs,
-  result: SessionHistoryToolResult | null
+  result: SessionHistoryDisplayResult | null
 ): string | null {
   if (!result?.success) return null;
   const action = args.action;
@@ -167,11 +192,23 @@ function countLabel(
     : `${n}${suffix} ${plural(n, more, "item", "items")}`;
 }
 
-function parseResult(result: unknown): SessionHistoryToolResult | null {
+/**
+ * Warnings are advisory, so malformed ones must never hide the rows (self-healing): keep only
+ * string codes, deduplicated, and drop the key when it is not an array or nothing remains.
+ */
+function sanitizeWarnings(value: unknown): unknown {
+  if (!isPlainObject(value) || !Object.hasOwn(value, "warnings")) return value;
+  const { warnings, ...rest } = value;
+  const entries: unknown[] = Array.isArray(warnings) ? warnings : [];
+  const codes = [...new Set(entries.filter((code): code is string => typeof code === "string"))];
+  return codes.length > 0 ? { ...rest, warnings: codes } : rest;
+}
+
+function parseResult(result: unknown): SessionHistoryDisplayResult | null {
   // normalizeToolResultForRendering unwraps the SDK JSON container, strips hook fields and
   // maps a nested bare `{ error }` onto `{ success: false, error }`.
-  const parsed = TOOL_DEFINITIONS.session_history.resultSchema.safeParse(
-    normalizeToolResultForRendering(result)
+  const parsed = DisplayResultSchema.safeParse(
+    sanitizeWarnings(normalizeToolResultForRendering(result))
   );
   return parsed.success ? parsed.data : null;
 }
@@ -383,7 +420,11 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem }> = (props) => {
     <div data-testid="session-history-excerpt" className="bg-code-bg rounded px-3 py-2">
       <div className="mb-1.5 flex min-w-0 items-center gap-2">
         <Chip tone={lookup(ROLE_TONES, item.role) ?? FALLBACK_ROLE_TONE}>{item.role}</Chip>
-        <span className="text-muted min-w-0 truncate text-[10px]">
+        {/* The ~90-char item ID must absorb the shrink, not the role chip: with equal shrink
+            weights `ASSISTANT` truncated at phone widths. A zero flex basis leaves the chip its
+            content width; min-w-16 keeps a sliver of the ID when a long unknown role label
+            still has to truncate. */}
+        <span className="text-muted min-w-16 flex-1 truncate text-[10px]">
           {item.itemId} · {item.windowId}
         </span>
       </div>
@@ -418,9 +459,10 @@ const HAS_MORE_NOTES: Record<Exclude<SessionHistoryAction, "read_item">, string>
     "More matches exist beyond this response. Narrow with window_id, role or tool_name, or walk newest-first with recent_first.",
 };
 
-const ResultNotes: React.FC<{ action: SessionHistoryAction; result: SessionHistoryToolResult }> = (
-  props
-) => {
+const ResultNotes: React.FC<{
+  action: SessionHistoryAction;
+  result: SessionHistoryDisplayResult;
+}> = (props) => {
   const lines: Array<{ key: string; warn: boolean; text: string }> = [];
   // read_item never reports has_more.
   if (props.result.has_more && props.action !== "read_item") {
@@ -434,7 +476,13 @@ const ResultNotes: React.FC<{ action: SessionHistoryAction; result: SessionHisto
     });
   }
   for (const warning of props.result.warnings ?? []) {
-    lines.push({ key: warning, warn: true, text: WARNING_MESSAGES[warning] });
+    // Unknown (newer) codes render verbatim; the prefix keeps a code such as "more" from
+    // colliding with the keys above.
+    lines.push({
+      key: `warning:${warning}`,
+      warn: true,
+      text: lookup(WARNING_MESSAGES, warning) ?? warning,
+    });
   }
   if (lines.length === 0) return null;
   return (
@@ -452,7 +500,8 @@ const ResultNotes: React.FC<{ action: SessionHistoryAction; result: SessionHisto
           ) : (
             <span className="shrink-0">·</span>
           )}
-          <span>{line.text}</span>
+          {/* A verbatim unknown code can be one long unbroken token. */}
+          <span className="min-w-0 wrap-anywhere">{line.text}</span>
         </div>
       ))}
     </div>
@@ -507,7 +556,7 @@ const STATUS_NOTES: Record<ToolStatus, string> = {
 
 const ResultBody: React.FC<{
   args: SessionHistoryToolArgs;
-  result: SessionHistoryToolResult | null;
+  result: SessionHistoryDisplayResult | null;
   status: ToolStatus;
 }> = (props) => {
   const { args, result } = props;
@@ -522,11 +571,10 @@ const ResultBody: React.FC<{
   }
   if (!result.success) {
     return (
-      <ErrorBox>
+      // wrap-anywhere: an unknown error code or a notice can be one long unbroken token.
+      <ErrorBox data-testid="session-history-error" className="wrap-anywhere">
         <div>
-          {result.error != null
-            ? (lookup(ERROR_MESSAGES, result.error) ?? result.error)
-            : STATUS_NOTES.failed}
+          {result.error != null ? errorMessage(args.action, result.error) : STATUS_NOTES.failed}
         </div>
         {result.notice && <div className="text-muted mt-[3px] text-[10.5px]">{result.notice}</div>}
       </ErrorBox>
@@ -580,11 +628,14 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
   const countNode = count != null && (
     <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
   );
-  // A completed call whose output is present but fails the result schema is not a success:
-  // show it as failed in the header while the body keeps the "Result unavailable" diagnostic.
+  // A completed call whose output is present but is not a parsed success shows as failed in
+  // the header. The displayed-message builder checks only the outer SDK wrapper, so a wrapped
+  // `{ type: "json", value: { success: false, error } }` (or a nested bare `{ error }`, which
+  // normalizeToolResultForRendering maps to success: false) arrives as "completed". Output
+  // that fails the result schema keeps the "Result unavailable" diagnostic in the body.
   // Absent output (null) keeps its transport status.
   const headerStatus: ToolStatus =
-    status === "completed" && props.result != null && result == null ? "failed" : status;
+    status === "completed" && props.result != null && result?.success !== true ? "failed" : status;
   const statusNode = (
     <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
   );
@@ -623,7 +674,7 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
             <ResultBody args={args} result={result} status={status} />
             {result?.success && <ResultNotes action={args.action} result={result} />}
             {result?.success && result.notice && (
-              <div className="text-muted text-[10px] opacity-70">{result.notice}</div>
+              <div className="text-muted text-[10px] wrap-anywhere opacity-70">{result.notice}</div>
             )}
             {/* Same attachment redaction as GenericToolCall: a legacy content-style result
                 must not push encoded media through JSON highlighting. */}
