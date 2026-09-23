@@ -11,10 +11,6 @@ import {
 import { cn } from "@/common/lib/utils";
 import type { SessionHistoryToolArgs, SessionHistoryToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import {
-  SESSION_HISTORY_SEARCH_SNIPPET_CHARS,
-  getSessionHistorySearchLeadInChars,
-} from "@/common/constants/contextBudget";
 import { escapeRegex } from "@/browser/utils/highlighting/highlightSearchTerms";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import {
@@ -126,36 +122,6 @@ function plural(n: number, more: boolean, singular: string, pluralForm: string):
   return n === 1 && !more ? singular : pluralForm;
 }
 
-/**
- * Where a returned page starts inside its row. The backend sets nextCharOffset to the page
- * end, so a continuation pins the start exactly. Without one the page ran to the end of the
- * row and read_item started at the requested offset (the backend may round that back by one
- * unit to keep a surrogate pair whole).
- */
-function pageStart(item: SessionHistoryItem, requestedOffset: number | null | undefined): number {
-  if (item.nextCharOffset != null) return Math.max(0, item.nextCharOffset - item.text.length);
-  return requestedOffset ?? 0;
-}
-
-interface SearchSnippetRule {
-  /** Non-global, so `String#search` finds the first match like the backend does. */
-  matcher: RegExp;
-  leadIn: number;
-}
-
-/**
- * Whether a list/search snippet starts mid-row. A continuation pins the start exactly. Without
- * one the snippet ran to the row end and its start is not reported: list_items snippets always
- * start at the row start, while the backend starts a search snippet at max(0, match - leadIn).
- * A mid-row start therefore puts the first match exactly leadIn characters in (one more if a
- * surrogate pair was kept whole), and a match nearer the start proves the snippet is not cut.
- */
-function snippetStartsMidRow(item: SessionHistoryItem, search: SearchSnippetRule | null): boolean {
-  if (item.nextCharOffset != null) return pageStart(item, null) > 0;
-  if (search == null || search.leadIn === 0) return false;
-  return item.text.search(search.matcher) >= search.leadIn;
-}
-
 function countLabel(
   args: SessionHistoryToolArgs,
   result: SessionHistoryToolResult | null
@@ -170,10 +136,11 @@ function countLabel(
   }
   const items = result.items ?? [];
   if (action === "read_item") {
+    // Returned characters only: the result reports where the page ends (nextCharOffset) but
+    // not where it starts, which can differ from the requested offset_chars (clamping,
+    // surrogate-pair rounding).
     const item = items.at(0);
-    if (item == null) return null;
-    const start = pageStart(item, args.offset_chars);
-    return `chars ${formatCount(start)}–${formatCount(start + item.text.length)}`;
+    return item == null ? null : `${formatCount(item.text.length)} chars`;
   }
   const n = items.length;
   return action === "search"
@@ -190,16 +157,22 @@ function parseResult(result: unknown): SessionHistoryToolResult | null {
   return parsed.success ? parsed.data : null;
 }
 
-const Chip: React.FC<{ tone: string; children: React.ReactNode }> = (props) => (
-  <span
-    className={cn(
-      "inline-flex shrink-0 items-center gap-1 rounded border px-1 py-0.5 text-[9px] leading-none font-medium uppercase",
-      props.tone
-    )}
-  >
-    {props.children}
-  </span>
-);
+// Labels can come from persisted results (unknown roles/boundary kinds), so the chip is
+// bounded by its container and shrinks, truncating its text, instead of widening the row.
+const Chip: React.FC<{ tone: string; icon?: LucideIcon; children: React.ReactNode }> = (props) => {
+  const Icon = props.icon;
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-full min-w-0 items-center gap-1 rounded border px-1 py-0.5 text-[9px] leading-none font-medium uppercase",
+        props.tone
+      )}
+    >
+      {Icon && <Icon aria-hidden="true" className="h-[9px] w-[9px] shrink-0" />}
+      <span className="min-w-0 truncate">{props.children}</span>
+    </span>
+  );
+};
 
 const SectionLabel: React.FC<{ children: React.ReactNode }> = (props) => (
   <div className="text-muted mb-1.5 text-[10px] tracking-wide uppercase">{props.children}</div>
@@ -230,6 +203,7 @@ const ScopeChips: React.FC<{ args: SessionHistoryToolArgs }> = (props) => {
   if (args.max_chars_per_item != null) {
     chips.push(["snippet", `${formatCount(args.max_chars_per_item)} chars`]);
   }
+  if (args.offset_chars != null) chips.push(["offset", formatCount(args.offset_chars)]);
   if (args.limit_chars != null) chips.push(["page", `${formatCount(args.limit_chars)} chars`]);
   if (chips.length === 0) return null;
   return (
@@ -325,19 +299,7 @@ const WindowRail: React.FC<{ windows: SessionHistoryWindow[]; recentFirst: boole
 };
 
 /** list_items / search: rows grouped under their window, snippet with the match lit. */
-const ItemList: React.FC<{
-  items: SessionHistoryItem[];
-  query: string | null;
-  snippetChars: number | null | undefined;
-}> = (props) => {
-  const search: SearchSnippetRule | null = props.query
-    ? {
-        matcher: new RegExp(escapeRegex(props.query), "iu"),
-        leadIn: getSessionHistorySearchLeadInChars(
-          props.snippetChars ?? SESSION_HISTORY_SEARCH_SNIPPET_CHARS
-        ),
-      }
-    : null;
+const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> = (props) => {
   // Consecutive rows of one window share a group; a recurring window opens a new group.
   const groups: Array<{ windowId: string; items: SessionHistoryItem[] }> = [];
   for (const item of props.items) {
@@ -347,6 +309,9 @@ const ItemList: React.FC<{
   }
   return (
     <div className="bg-code-bg flex max-h-[320px] flex-col gap-2.5 overflow-y-auto rounded px-3 py-2">
+      {/* Rows are snippets: the result reports where a snippet continues (nextCharOffset)
+          but not where it starts, so only the trailing cut is marked. */}
+      <div className="text-muted -mb-1 text-[10px] tracking-wide uppercase">Snippets</div>
       {groups.map((group, gi) => (
         <div key={`${group.windowId}:${gi}`}>
           <div className="mb-1.5 flex min-w-0 items-center gap-2">
@@ -355,34 +320,28 @@ const ItemList: React.FC<{
             <span className="border-border min-w-4 flex-1 border-t border-dotted" />
           </div>
           <div className="flex flex-col gap-1.5">
-            {group.items.map((item, ii) => {
-              const cutBefore = snippetStartsMidRow(item, search);
-              return (
-                <div
-                  key={`${item.itemId}:${ii}`}
-                  data-testid="session-history-item"
-                  className="grid grid-cols-[64px_minmax(0,1fr)] gap-2.5"
-                >
-                  <div className="flex min-w-0 flex-col items-start gap-[3px]">
-                    <Chip tone={lookup(ROLE_TONES, item.role) ?? FALLBACK_ROLE_TONE}>
-                      {item.role}
-                    </Chip>
-                    {/* Item IDs are long opaque refs; the full value is in the raw JSON. */}
-                    <span className="text-muted max-w-full truncate text-[10px]">
-                      {item.itemId}
-                    </span>
-                  </div>
-                  <div
-                    data-testid="session-history-snippet"
-                    className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap"
-                  >
-                    {cutBefore && <span className="text-muted">…</span>}
-                    <HighlightedText text={item.text} query={props.query} />
-                    {item.nextCharOffset != null && <span className="text-muted">…</span>}
-                  </div>
+            {group.items.map((item, ii) => (
+              <div
+                key={`${item.itemId}:${ii}`}
+                data-testid="session-history-item"
+                className="grid grid-cols-[64px_minmax(0,1fr)] gap-2.5"
+              >
+                <div className="flex min-w-0 flex-col items-start gap-[3px]">
+                  <Chip tone={lookup(ROLE_TONES, item.role) ?? FALLBACK_ROLE_TONE}>
+                    {item.role}
+                  </Chip>
+                  {/* Item IDs are long opaque refs; the full value is in the raw JSON. */}
+                  <span className="text-muted max-w-full truncate text-[10px]">{item.itemId}</span>
                 </div>
-              );
-            })}
+                <div
+                  data-testid="session-history-snippet"
+                  className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap"
+                >
+                  <HighlightedText text={item.text} query={props.query} />
+                  {item.nextCharOffset != null && <span className="text-muted">…</span>}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       ))}
@@ -390,12 +349,9 @@ const ItemList: React.FC<{
   );
 };
 
-/** read_item: one row as a transcript excerpt, with its character page. */
-const ReadExcerpt: React.FC<{ item: SessionHistoryItem; requestedOffset?: number | null }> = (
-  props
-) => {
+/** read_item: one row as a transcript excerpt, with where its character page continues. */
+const ReadExcerpt: React.FC<{ item: SessionHistoryItem }> = (props) => {
   const item = props.item;
-  const start = pageStart(item, props.requestedOffset);
   return (
     <div data-testid="session-history-excerpt" className="bg-code-bg rounded px-3 py-2">
       <div className="mb-1.5 flex min-w-0 items-center gap-2">
@@ -406,17 +362,16 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem; requestedOffset?: number
       </div>
       <div className="text-foreground max-h-[180px] overflow-y-auto border-l-2 border-white/10 pl-2.5 font-sans text-[12px] leading-[1.55] break-words whitespace-pre-wrap">
         {item.text.length === 0 ? (
-          <span className="text-muted italic">No text at this offset.</span>
+          <span className="text-muted italic">No text at the requested offset.</span>
         ) : (
           <>
-            {start > 0 && <span className="text-muted">…</span>}
             {item.text}
             {item.nextCharOffset != null && <span className="text-muted">…</span>}
           </>
         )}
       </div>
       <div data-testid="session-history-page" className="text-muted mt-1.5 text-[10px]">
-        chars {formatCount(start)}–{formatCount(start + item.text.length)}
+        {formatCount(item.text.length)} chars
         {item.nextCharOffset != null
           ? ` · continues at offset ${formatCount(item.nextCharOffset)}`
           : " · end of item"}
@@ -563,21 +518,13 @@ const ResultBody: React.FC<{
     case "list_items":
     case "search":
       return items.length > 0 ? (
-        <ItemList
-          items={items}
-          query={args.action === "search" ? (args.query ?? null) : null}
-          snippetChars={args.max_chars_per_item}
-        />
+        <ItemList items={items} query={args.action === "search" ? (args.query ?? null) : null} />
       ) : (
         empty("No matching rows.")
       );
     case "read_item": {
       const item = items.at(0);
-      return item != null ? (
-        <ReadExcerpt item={item} requestedOffset={args.offset_chars} />
-      ) : (
-        empty("No row returned.")
-      );
+      return item != null ? <ReadExcerpt item={item} /> : empty("No row returned.");
     }
   }
 };
@@ -596,6 +543,11 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
   const args = props.args;
   const result = parseResult(props.result);
   const count = countLabel(args, result);
+  // A completed call whose output is present but fails the result schema is not a success:
+  // show it as failed in the header while the body keeps the "Result unavailable" diagnostic.
+  // Absent output (null) keeps its transport status.
+  const headerStatus: ToolStatus =
+    status === "completed" && props.result != null && result == null ? "failed" : status;
 
   return (
     <ToolContainer expanded={expanded}>
@@ -606,8 +558,7 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
           {ACTION_VERBS[args.action]}
         </span>
         {args.task_id && (
-          <Chip tone="text-plan-mode border-plan-mode/35">
-            <GitBranch aria-hidden="true" className="h-[9px] w-[9px]" />
+          <Chip tone="text-plan-mode border-plan-mode/35" icon={GitBranch}>
             sub-agent
           </Chip>
         )}
@@ -615,7 +566,7 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
         {count != null && (
           <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
         )}
-        <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
+        <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
       </ToolHeader>
 
       {expanded && (

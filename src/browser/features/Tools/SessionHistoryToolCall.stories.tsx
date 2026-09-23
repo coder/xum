@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { ComponentType } from "react";
 import { SessionHistoryToolCall } from "@/browser/features/Tools/SessionHistoryToolCall";
 import { PIXEL_DISABLED, lightweightMeta, StoryUiShell } from "@/browser/stories/meta.js";
 
@@ -219,11 +220,56 @@ export const ErrorTaskNotFound: Story = {
   },
 };
 
+const NARROW_CONTAINER_TEST_ID = "session-history-card-container";
+
+// The Storybook test-runner renders at desktop width and ignores viewport / Pixel matrix
+// variants, so narrow cases are pinned to a fixed ~375px wrapper.
+function narrowDecorator(Story: ComponentType) {
+  return (
+    <div data-testid={NARROW_CONTAINER_TEST_ID} className="w-[375px]">
+      <Story />
+    </div>
+  );
+}
+
 /**
- * Narrow container · sub-agent search with a long query and real-length item IDs. Pinned to
- * a fixed ~375px wrapper (the Storybook test-runner renders at desktop width and ignores
- * viewport / Pixel matrix variants, so the narrow case must be forced) with a play that
- * fails if the header, scope chips or rows overflow instead of truncating/wrapping.
+ * Fails if any part of the card extends past the pinned container or spills out of its own
+ * parent (a chip overlapping the next cell). Checks every descendant, not just the
+ * container's scrollWidth: the row lists scroll internally, and a spill inside a grid cell
+ * overlaps its neighbour without widening the container.
+ */
+async function assertCardFitsNarrowContainer(canvasElement: HTMLElement, rowSelector: string) {
+  if (!canvasElement.querySelector(rowSelector)) {
+    throw new Error(`Session history story did not render ${rowSelector}`);
+  }
+  const container = canvasElement.querySelector(`[data-testid="${NARROW_CONTAINER_TEST_ID}"]`);
+  if (!(container instanceof HTMLElement)) {
+    throw new Error("Session history story container not found");
+  }
+  // Let layout settle before measuring.
+  await new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  );
+  const right = container.getBoundingClientRect().right;
+  const overflowing = Array.from(container.querySelectorAll("*")).filter((element) => {
+    const elementRight = element.getBoundingClientRect().right;
+    const parentRight = element.parentElement?.getBoundingClientRect().right ?? right;
+    return elementRight > right + 1 || elementRight > parentRight + 1;
+  });
+  if (container.scrollWidth > container.clientWidth + 1 || overflowing.length > 0) {
+    const culprits = overflowing
+      .slice(0, 3)
+      .map((element) => (element.textContent ?? element.tagName).slice(0, 40))
+      .join(" | ");
+    throw new Error(
+      `Session history tool card overflowed its ${container.clientWidth}px container: ${culprits}`
+    );
+  }
+}
+
+/**
+ * Narrow container · sub-agent search with a long query and real-length item IDs; fails if
+ * the header, scope chips or rows overflow instead of truncating/wrapping.
  */
 export const NarrowContainer: Story = {
   args: {
@@ -251,30 +297,54 @@ export const NarrowContainer: Story = {
       ],
     },
   },
-  decorators: [
-    (Story) => (
-      <div data-testid="session-history-card-container" className="w-[375px]">
-        <Story />
-      </div>
-    ),
-  ],
-  play: async ({ canvasElement }) => {
-    if (!canvasElement.querySelector('[data-testid="session-history-item"]')) {
-      throw new Error("Session history item row did not render");
-    }
-    const container = canvasElement.querySelector('[data-testid="session-history-card-container"]');
-    if (!(container instanceof HTMLElement)) {
-      throw new Error("Session history story container not found");
-    }
-    // Let layout settle before measuring.
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-    );
-    if (container.scrollWidth > container.clientWidth + 1) {
-      throw new Error(
-        `Session history tool card overflowed its ${container.clientWidth}px container by ` +
-          `${container.scrollWidth - container.clientWidth}px`
-      );
-    }
+  decorators: [narrowDecorator],
+  play: ({ canvasElement }) =>
+    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-item"]'),
+};
+
+// Persisted results may carry labels this build does not know (a newer backend's boundary
+// kind or role); chips must truncate them instead of widening the row.
+const LONG_LABEL = "forward_compatible_label_from_a_newer_backend_release";
+
+/** Narrow container · unknown, very long boundary kind on the window rail. */
+export const NarrowLongBoundaryKind: Story = {
+  args: {
+    args: { action: "list_windows" },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: NOTICE,
+      windows: [
+        { windowId: "w:0", boundaryKind: "root", itemCount: 12 },
+        {
+          windowId: "w:m:assistant-message-0123456789abcdef",
+          boundaryKind: LONG_LABEL,
+          itemCount: 4,
+        },
+      ],
+    },
   },
+  decorators: [narrowDecorator],
+  play: ({ canvasElement }) =>
+    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-window"]'),
+};
+
+/** Narrow container · unknown, very long role on a list_items row. */
+export const NarrowLongRole: Story = {
+  args: {
+    args: { action: "list_items", window_id: "w:0" },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: NOTICE,
+      items: [
+        { itemId: itemId(2048, "c0ff"), windowId: "w:0", role: LONG_LABEL, text: "Row text." },
+      ],
+    },
+  },
+  decorators: [narrowDecorator],
+  play: ({ canvasElement }) =>
+    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-item"]'),
 };

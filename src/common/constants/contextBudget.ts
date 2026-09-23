@@ -67,13 +67,6 @@ export const SESSION_HISTORY_MAX_ID_CHARS = 1024;
 export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
-// A search snippet leads in with context before its match but never spends more than half
-// of its allowance on it, so the matched substring stays visible. Shared with the transcript
-// card, which relies on this rule to tell whether a snippet starts mid-row.
-export const SESSION_HISTORY_SEARCH_MAX_LEAD_IN_CHARS = 120;
-export function getSessionHistorySearchLeadInChars(snippetChars: number): number {
-  return Math.min(SESSION_HISTORY_SEARCH_MAX_LEAD_IN_CHARS, Math.floor(snippetChars / 2));
-}
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
 // Each marker character can occupy six raw characters as a JSON Unicode escape.
