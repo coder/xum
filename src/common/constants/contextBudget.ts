@@ -62,8 +62,8 @@ export const SESSION_HISTORY_SCAN_CHUNK_BYTES = 64 * 1024;
 export const SESSION_HISTORY_ANCHOR_BYTES = 64;
 export const SESSION_HISTORY_MAX_QUERY_CHARS = 1024;
 export const SESSION_HISTORY_MAX_ID_CHARS = 1024;
-// IDs and escaped payloads are counted while staging rows. The remaining fields
-// (has_more, the two warning codes, truncation marker and character offsets) fit within 512 bytes.
+// IDs, start offsets and escaped payloads are counted while staging rows. The remaining fields
+// (has_more, the two warning codes, truncation marker and continuation offsets) fit within 512 bytes.
 export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;

@@ -122,6 +122,28 @@ function plural(n: number, more: boolean, singular: string, pluralForm: string):
   return n === 1 && !more ? singular : pluralForm;
 }
 
+/**
+ * Where the item's text starts in its row, as the backend reported it (startCharOffset).
+ * Results persisted before that field existed return null, and the card never infers a start
+ * for them: offset_chars can be clamped or rounded back to keep a surrogate pair whole, and a
+ * search snippet that reaches the row end may or may not have started mid-row. A start that
+ * contradicts the reported continuation is ignored the same way.
+ */
+function startOf(item: SessionHistoryItem): number | null {
+  const start = item.startCharOffset;
+  if (start == null) return null;
+  if (item.nextCharOffset != null && item.nextCharOffset !== start + item.text.length) return null;
+  return start;
+}
+
+/** Returned characters: an exact `chars X–Y` range when the start is known, else a count. */
+function charsLabel(item: SessionHistoryItem): string {
+  const start = startOf(item);
+  return start == null
+    ? `${formatCount(item.text.length)} chars`
+    : `chars ${formatCount(start)}–${formatCount(start + item.text.length)}`;
+}
+
 function countLabel(
   args: SessionHistoryToolArgs,
   result: SessionHistoryToolResult | null
@@ -136,11 +158,8 @@ function countLabel(
   }
   const items = result.items ?? [];
   if (action === "read_item") {
-    // Returned characters only: the result reports where the page ends (nextCharOffset) but
-    // not where it starts, which can differ from the requested offset_chars (clamping,
-    // surrogate-pair rounding).
     const item = items.at(0);
-    return item == null ? null : `${formatCount(item.text.length)} chars`;
+    return item == null ? null : charsLabel(item);
   }
   const n = items.length;
   return action === "search"
@@ -174,19 +193,26 @@ const Chip: React.FC<{ tone: string; icon?: LucideIcon; children: React.ReactNod
   );
 };
 
+/** Marks text cut off before or after the returned characters. */
+const Cut: React.FC = () => <span className="text-muted">…</span>;
+
 const SectionLabel: React.FC<{ children: React.ReactNode }> = (props) => (
   <div className="text-muted mb-1.5 text-[10px] tracking-wide uppercase">{props.children}</div>
 );
 
-/** Header summary: what the call looked for. */
-const HeaderSummary: React.FC<{ args: SessionHistoryToolArgs }> = (props) => {
+/** Header summary: what the call looked for. `fill` gives the target the leftover width. */
+const HeaderSummary: React.FC<{ args: SessionHistoryToolArgs; fill: boolean }> = (props) => {
   const { action, query, item_id: itemId, window_id: windowId } = props.args;
   if (action === "search" && query) {
     return <span className="text-foreground min-w-0 truncate">“{query}”</span>;
   }
   const target = action === "read_item" ? itemId : action === "list_items" ? windowId : null;
   if (!target) return null;
-  return <span className="text-muted min-w-0 truncate text-[10px]">{target}</span>;
+  return (
+    <span className={cn("text-muted min-w-0 truncate text-[10px]", props.fill && "flex-1")}>
+      {target}
+    </span>
+  );
 };
 
 /** The request as readable filter chips instead of a JSON blob. */
@@ -309,8 +335,8 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
   }
   return (
     <div className="bg-code-bg flex max-h-[320px] flex-col gap-2.5 overflow-y-auto rounded px-3 py-2">
-      {/* Rows are snippets: the result reports where a snippet continues (nextCharOffset)
-          but not where it starts, so only the trailing cut is marked. */}
+      {/* Rows are snippets: a leading cut is marked only when the result reports a start
+          (startCharOffset), a trailing cut when it reports a continuation (nextCharOffset). */}
       <div className="text-muted -mb-1 text-[10px] tracking-wide uppercase">Snippets</div>
       {groups.map((group, gi) => (
         <div key={`${group.windowId}:${gi}`}>
@@ -337,8 +363,9 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
                   data-testid="session-history-snippet"
                   className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap"
                 >
+                  {(startOf(item) ?? 0) > 0 && <Cut />}
                   <HighlightedText text={item.text} query={props.query} />
-                  {item.nextCharOffset != null && <span className="text-muted">…</span>}
+                  {item.nextCharOffset != null && <Cut />}
                 </div>
               </div>
             ))}
@@ -365,13 +392,14 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem }> = (props) => {
           <span className="text-muted italic">No text at the requested offset.</span>
         ) : (
           <>
+            {(startOf(item) ?? 0) > 0 && <Cut />}
             {item.text}
-            {item.nextCharOffset != null && <span className="text-muted">…</span>}
+            {item.nextCharOffset != null && <Cut />}
           </>
         )}
       </div>
       <div data-testid="session-history-page" className="text-muted mt-1.5 text-[10px]">
-        {formatCount(item.text.length)} chars
+        {charsLabel(item)}
         {item.nextCharOffset != null
           ? ` · continues at offset ${formatCount(item.nextCharOffset)}`
           : " · end of item"}
@@ -543,15 +571,27 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
   const args = props.args;
   const result = parseResult(props.result);
   const count = countLabel(args, result);
+  const readItem = args.action === "read_item" && result?.success ? result.items?.at(0) : undefined;
+  // An exact range can be wide (seven-digit offsets). Rather than truncating an endpoint or
+  // overflowing a narrow card, the header wraps: the item ID fills leftover space (zero flex
+  // basis) and the range moves to a second line together with the status. Other headers,
+  // including legacy read_item results, keep their single-line layout.
+  const wideCount = readItem != null && startOf(readItem) != null;
+  const countNode = count != null && (
+    <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
+  );
   // A completed call whose output is present but fails the result schema is not a success:
   // show it as failed in the header while the body keeps the "Result unavailable" diagnostic.
   // Absent output (null) keeps its transport status.
   const headerStatus: ToolStatus =
     status === "completed" && props.result != null && result == null ? "failed" : status;
+  const statusNode = (
+    <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
+  );
 
   return (
     <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
+      <ToolHeader onClick={toggleExpanded} className={wideCount ? "flex-wrap" : undefined}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName="session_history" />
         <span className="text-secondary shrink-0 font-medium whitespace-nowrap">
@@ -562,11 +602,18 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
             sub-agent
           </Chip>
         )}
-        <HeaderSummary args={args} />
-        {count != null && (
-          <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
+        <HeaderSummary args={args} fill={wideCount} />
+        {wideCount ? (
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            {countNode}
+            {statusNode}
+          </span>
+        ) : (
+          <>
+            {countNode}
+            {statusNode}
+          </>
         )}
-        <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
       </ToolHeader>
 
       {expanded && (

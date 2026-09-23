@@ -257,9 +257,17 @@ beforeEach(async () => {
     const config = createTestToolConfig(fixture.tempDir, { workspaceId });
     config.historyService = fixture.historyService;
     const tool = createSessionHistoryTool(config);
-    return TOOL_DEFINITIONS.session_history.resultSchema.parse(
+    const result = TOOL_DEFINITIONS.session_history.resultSchema.parse(
       await tool.execute!(input, { ...mockToolCallOptions, abortSignal })
     );
+    // Every item reports its start, and a continuation resumes exactly where its text ends.
+    for (const item of result.items ?? []) {
+      expect(typeof item.startCharOffset).toBe("number");
+      if (item.nextCharOffset !== undefined) {
+        expect(item.startCharOffset! + item.text.length).toBe(item.nextCharOffset);
+      }
+    }
+    return result;
   };
   await append("first", "opening facts");
 });
@@ -1646,6 +1654,7 @@ describe("session_history real disk recovery", () => {
         const item = page.items![0];
         expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
         expect(item.text.length).toBeGreaterThan(0);
+        expect(item.startCharOffset).toBe(offset);
         recovered += item.text;
         if (item.nextCharOffset !== undefined) {
           expect(item.nextCharOffset).toBeGreaterThan(offset);
@@ -1688,6 +1697,52 @@ describe("session_history real disk recovery", () => {
     expect(end).toEqual({ success: false, error: "item_not_found" });
   });
 
+  test("read_item reports its actual start after pair rounding and clamping", async () => {
+    const text = "A😀B" + "c".repeat(20);
+    const message = await append("start-offsets", text);
+    const read = async (offset: number) =>
+      (
+        await itemsOf({
+          action: "read_item",
+          item_id: String(message.metadata!.historySequence),
+          offset_chars: offset,
+          limit_chars: 4,
+        })
+      )[0];
+    expect(await read(0)).toMatchObject({ startCharOffset: 0, text: "A😀B", nextCharOffset: 4 });
+    expect(await read(8)).toMatchObject({ startCharOffset: 8, text: "cccc", nextCharOffset: 12 });
+    // Inside the pair: rounded back one unit so the character stays whole.
+    expect(await read(2)).toMatchObject({ startCharOffset: 1, text: "😀Bc", nextCharOffset: 5 });
+    // Past the end: clamped to the row length, an empty final page.
+    const past = await read(100);
+    expect(past).toMatchObject({ startCharOffset: text.length, text: "" });
+    expect(past.nextCharOffset).toBeUndefined();
+  });
+
+  test("search snippets report a mid-row start even when they reach the row end", async () => {
+    // max_chars_per_item 40 allows up to 20 lead-in characters before the match.
+    const whole = `${"x".repeat(20)}needle end`; // the match sits exactly lead-in chars in
+    const suffix = `${"y".repeat(30)}needle end`;
+    const early = "an early needle";
+    const long = `${"z".repeat(50)}needle${"w".repeat(50)}`;
+    for (const [id, text] of [
+      ["whole", whole],
+      ["suffix", suffix],
+      ["early", early],
+      ["long", long],
+    ])
+      await append(id, text);
+    const found = await itemsOf({ action: "search", query: "needle", max_chars_per_item: 40 });
+    expect(found.map((item) => [item.startCharOffset, item.text, item.nextCharOffset])).toEqual([
+      // Same shape (20 chars before the match, reaches the end); only the start tells them apart.
+      [0, whole, undefined],
+      [10, suffix.slice(10), undefined],
+      // Less context than the lead-in: the snippet starts at the row start.
+      [0, early, undefined],
+      [30, long.slice(30, 70), 70],
+    ]);
+  });
+
   test("JSON-budget shrinking preserves emoji pairs and exact continuation offsets", async () => {
     const text = '"\\'.repeat(100) + "😀".repeat(4501);
     const message = await append("budget-astral", text);
@@ -1707,6 +1762,8 @@ describe("session_history real disk recovery", () => {
       const item = page.items![0];
       expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
       expect(item.text.length).toBeGreaterThan(0);
+      // Shrinking moves only the end: the page still starts at the requested offset.
+      expect(item.startCharOffset).toBe(offset);
       recovered += item.text;
       shrank ||= page.truncated === true;
       if (item.nextCharOffset !== undefined) {

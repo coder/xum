@@ -90,7 +90,7 @@ describe("SessionHistoryToolCall", () => {
     expect(view.getByText("2+ matches")).toBeTruthy();
   });
 
-  test("read_item reports returned characters and the continuation, never an inferred start", () => {
+  test("legacy read_item (no startCharOffset) reports returned characters, never an inferred start", () => {
     const text = "x".repeat(600);
     const view = renderWithProviders(
       <SessionHistoryToolCall
@@ -119,9 +119,89 @@ describe("SessionHistoryToolCall", () => {
     expect(view.container.querySelector(SCOPE)?.textContent).toContain("600");
     expect(excerpt).not.toContain("…x");
     expect(page).not.toContain("600–");
+    expect(view.getByText("600 chars")).toBeTruthy();
   });
 
-  test("read_item without a continuation ends the item without claiming where it started", () => {
+  test("read_item with startCharOffset shows exact ranges and marks a leading cut", () => {
+    const text = "x".repeat(600);
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "read_item", item_id: "r:1:chat:0:abc", offset_chars: 600 }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          items: [
+            {
+              itemId: "r:1:chat:0:abc",
+              windowId: "w:0",
+              role: "assistant",
+              startCharOffset: 600,
+              text,
+              nextCharOffset: 1200,
+            },
+          ],
+        }}
+      />
+    );
+    // Header count and footer both carry the exact range.
+    expect(view.getByText("chars 600–1,200")).toBeTruthy();
+    expect(view.container.querySelector(PAGE)?.textContent).toBe(
+      "chars 600–1,200 · continues at offset 1,200"
+    );
+    expect(view.container.querySelector(EXCERPT)?.textContent).toContain(`…${text}…`);
+    cleanup();
+
+    // offset_chars 1 was rounded back to 0: the reported start, not the request, decides.
+    const rounded = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "read_item", item_id: "7", offset_chars: 1 }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          items: [
+            {
+              itemId: "7",
+              windowId: "w:0",
+              role: "user",
+              startCharOffset: 0,
+              text: "\u{1F600}tail",
+            },
+          ],
+        }}
+      />
+    );
+    expect(rounded.container.querySelector(PAGE)?.textContent).toBe("chars 0–6 · end of item");
+    expect(rounded.container.textContent).not.toContain("…\u{1F600}");
+  });
+
+  test("a start that contradicts the reported continuation falls back to the legacy view", () => {
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "read_item", item_id: "7" }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          items: [
+            {
+              itemId: "7",
+              windowId: "w:0",
+              role: "user",
+              startCharOffset: 50,
+              text: "head",
+              nextCharOffset: 4,
+            },
+          ],
+        }}
+      />
+    );
+    expect(view.container.querySelector(PAGE)?.textContent).toBe("4 chars · continues at offset 4");
+    expect(view.container.querySelector(EXCERPT)?.textContent).not.toContain("…head");
+  });
+
+  test("legacy read_item without a continuation ends the item without claiming where it started", () => {
     // offset_chars 1 lands inside the surrogate pair; the backend rounds back to 0.
     const rounded = renderWithProviders(
       <SessionHistoryToolCall
@@ -217,7 +297,7 @@ describe("SessionHistoryToolCall", () => {
     expect(view.container.textContent).toContain("not-an-array");
   });
 
-  test("snippets mark only a reported trailing cut, never an inferred leading one", () => {
+  test("legacy snippets (no startCharOffset) mark only a reported trailing cut, never an inferred leading one", () => {
     const view = renderWithProviders(
       <SessionHistoryToolCall
         args={{ action: "search", query: "needle", max_chars_per_item: 40 }}
@@ -239,6 +319,49 @@ describe("SessionHistoryToolCall", () => {
       view.container.querySelectorAll('[data-testid="session-history-snippet"]')
     ).map((node) => node.textContent ?? "");
     expect(snippets.map((text) => text.startsWith("…"))).toEqual([false, false, false]);
+    expect(snippets.map((text) => text.endsWith("…"))).toEqual([false, false, true]);
+  });
+
+  test("snippets with startCharOffset mark a leading cut only for a mid-row start", () => {
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "needle", max_chars_per_item: 40 }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          items: [
+            // Same text shape: a complete row versus a suffix that started mid-row.
+            {
+              itemId: "1",
+              windowId: "w:0",
+              role: "user",
+              startCharOffset: 0,
+              text: `${"x".repeat(20)}needle end`,
+            },
+            {
+              itemId: "2",
+              windowId: "w:0",
+              role: "user",
+              startCharOffset: 10,
+              text: `${"y".repeat(20)}needle end`,
+            },
+            {
+              itemId: "3",
+              windowId: "w:0",
+              role: "user",
+              startCharOffset: 30,
+              text: `${"z".repeat(20)}needle${"w".repeat(14)}`,
+              nextCharOffset: 70,
+            },
+          ],
+        }}
+      />
+    );
+    const snippets = Array.from(
+      view.container.querySelectorAll('[data-testid="session-history-snippet"]')
+    ).map((node) => node.textContent ?? "");
+    expect(snippets.map((text) => text.startsWith("…"))).toEqual([false, true, true]);
     expect(snippets.map((text) => text.endsWith("…"))).toEqual([false, false, true]);
   });
 
