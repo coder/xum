@@ -83,7 +83,9 @@ describe("compaction cancellation runtime", () => {
     "public interrupt preserves synchronous reset order (%j)",
     async ({ abandonPartial, pending }) => {
       const h = await fixture();
-      const budget = h.session as unknown as {
+      // Budget state is controller-private strategy state, reached through the same names
+      // the controller uses. The interrupt fence must clear it before any physical stop.
+      const budget = Reflect.get(h.state.contextController, "tokenBudget") as {
         clearContextBudgetState(): void;
         contextBudgetGeneration: number;
         contextBudgetWarningClaimed: boolean;

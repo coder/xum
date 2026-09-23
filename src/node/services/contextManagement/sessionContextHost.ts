@@ -16,6 +16,7 @@ import type {
   ContextDispatchRequest,
   CompactionContinuation,
   StreamContextSnapshot,
+  ContinuationEntry,
 } from "./types";
 
 /** Session-owned authority, kept separate from the app-scoped factory's dependencies. */
@@ -49,6 +50,14 @@ export interface SessionContextHost {
     | "getPrefixSwapPreparation"
     | "stopStream"
   >;
+  /** Sealed continuations: the session owns queue mutation, cut receipts and notifications. */
+  readonly continuations: {
+    isEmpty(): boolean;
+    hasDedupeKey(key: string): boolean;
+    enqueue(entries: readonly ContinuationEntry[], designateFirst: boolean): string | undefined;
+    designateSuccessor(key: string): string | undefined;
+    withdraw(prefixes: readonly string[], notify: "removed" | "withdrawn-cut"): void;
+  };
   /** Live session-owned values. Stream reads occur only at the original capture/recheck points. */
   readonly state: {
     readonly stream: StreamContextSnapshot | undefined;

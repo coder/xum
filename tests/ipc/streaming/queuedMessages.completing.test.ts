@@ -90,13 +90,13 @@ describe("Queued messages during stream completion", () => {
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -164,13 +164,13 @@ describe("Queued messages during stream completion", () => {
 
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -241,13 +241,13 @@ describe("Queued messages during stream completion", () => {
 
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -378,13 +378,13 @@ describe("Queued messages during stream completion", () => {
 
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -492,13 +492,13 @@ describe("Queued messages during stream completion", () => {
 
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const originalHandleCompletion = compactionHandler.handleCompletion.bind(compactionHandler);
     const handleCompletionSpy = jest
@@ -577,13 +577,13 @@ describe("Queued messages during stream completion", () => {
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
     type SessionInternals = {
       contextController: {
-        transitionalCompactionHandler: {
+        compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
     };
     const compactionHandler = (session as unknown as SessionInternals).contextController
-      .transitionalCompactionHandler;
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();

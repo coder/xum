@@ -159,7 +159,7 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
 interface PrivateSessionAccess {
   compactionOccurred: boolean;
   turnsSinceLastAttachment: number;
-  contextController: { transitionalCompactionHandler: CompactionHandler };
+  contextController: { compactionHandler: CompactionHandler };
   getPostCompactionAttachmentsIfNeeded: () => Promise<PostCompactionAttachment[] | null>;
 }
 
@@ -490,7 +490,7 @@ describe("AgentSession post-compaction attachments", () => {
       ]);
       await (
         session as unknown as PrivateSessionAccess
-      ).contextController.transitionalCompactionHandler.ackPendingStateConsumed();
+      ).contextController.compactionHandler.ackPendingStateConsumed();
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getLoadedSkillNames(attachments)).toEqual(["react-effects"]);
       expect(getLoadedSkillAttachment(attachments)?.skills[0]?.body).toContain(
