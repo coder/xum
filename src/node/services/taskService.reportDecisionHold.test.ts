@@ -373,6 +373,51 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
+  test("the refused follow-up's unsent input is retained until the renderer acknowledges it: every onChat replay re-sends it under one restore id", async () => {
+    // The renderer subscribes to onChat only for the workspace it shows, so a refusal that lands
+    // while the user looks at another workspace reaches it only through a later replay.
+    const childId = "holdretain001";
+    const stack = await createStack(childId);
+    const { config, taskService, workspaceService, sessionHarness, sendOptions } = stack;
+    const replayedRestores = async () => {
+      const events: Array<{ type?: string; restoreId?: string; text?: string }> = [];
+      await sessionHarness.session.replayHistory(({ message }) => {
+        if ("type" in message && message.type === "restore-to-input") events.push(message);
+      });
+      return events;
+    };
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      const event = stack.endStream(0, { report: "done" }, false);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      stack.completeStream(0, event);
+      await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+      const [live] = stack.restoreEvents();
+      expect(live).toMatchObject({ text: "follow-up text", mode: "append" });
+      const restoreId = live?.restoreId;
+      expect(typeof restoreId).toBe("string");
+      // Unacknowledged: each new subscription (switching back, reconnect) receives it again,
+      // under the same id so the renderer can tell a re-delivery from a new restoration.
+      for (let replay = 0; replay < 2; replay++) {
+        expect(await replayedRestores()).toMatchObject([
+          { restoreId, text: "follow-up text", mode: "append" },
+        ]);
+      }
+      expect(workspaceService.acknowledgeInputRestore(childId, restoreId!)).toEqual(Ok(undefined));
+      expect(await replayedRestores()).toEqual([]);
+      // Acknowledging again (a renderer re-acking a re-delivery it already applied) is harmless.
+      expect(workspaceService.acknowledgeInputRestore(childId, restoreId!)).toEqual(Ok(undefined));
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
   test("an attachment-only manual follow-up refused after the report is handed back with its file parts (empty text is not a drop)", async () => {
     const childId = "holdattachment01";
     const stack = await createStack(childId);

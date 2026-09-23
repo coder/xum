@@ -1809,6 +1809,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.clearQueue.input)
         .output(schemas.workspace.clearQueue.output)
         .handler(({ context, input }) => context.workspaceService.clearQueue(input.workspaceId)),
+      acknowledgeInputRestore: t
+        .input(schemas.workspace.acknowledgeInputRestore.input)
+        .output(schemas.workspace.acknowledgeInputRestore.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.acknowledgeInputRestore(input.workspaceId, input.restoreId)
+        ),
       setQueuedMessageDispatchMode: t
         .input(schemas.workspace.setQueuedMessageDispatchMode.input)
         .output(schemas.workspace.setQueuedMessageDispatchMode.output)

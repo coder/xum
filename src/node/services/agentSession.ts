@@ -1238,6 +1238,18 @@ export class AgentSession {
     read: () => QueuedInput | undefined;
   };
 
+  /**
+   * Unsent input handed back after its queued entry was refused at dispatch, keyed by restore id,
+   * until a renderer acknowledges applying it (acknowledgeInputRestore). The renderer holds an
+   * onChat subscription only for the workspace it shows, so a live event alone is lost when the
+   * refusal lands while another workspace is open: every replay re-sends these. In memory only —
+   * like the queue entry it replaces, it does not survive a backend restart.
+   */
+  private readonly pendingInputRestores = new Map<
+    string,
+    Extract<WorkspaceChatMessage, { type: "restore-to-input" }>
+  >();
+
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
 
@@ -3300,6 +3312,12 @@ export class AgentSession {
           hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
         },
       });
+
+      // Re-send unacknowledged unsent input (see pendingInputRestores): this subscription may be
+      // the first one since the refusal, e.g. the user switched back to this workspace.
+      for (const restore of this.pendingInputRestores.values()) {
+        listener({ workspaceId: this.workspaceId, message: restore });
+      }
 
       // Rehydrate pending auto-retry countdown state on reconnect/reload so
       // RetryBarrier keeps showing "Stop" while a backend timer is already armed.
@@ -10775,6 +10793,12 @@ export class AgentSession {
     }
   }
 
+  /** A renderer applied the retained restoration `restoreId`; idempotent (re-deliveries re-ack). */
+  acknowledgeInputRestore(restoreId: string): void {
+    assert(restoreId.length > 0, "acknowledgeInputRestore requires a restoreId");
+    this.pendingInputRestores.delete(restoreId);
+  }
+
   private emitQueuedMessageChanged(): void {
     // Every queue mutation publishes here, so successor withdrawal is recorded before observers
     // (TaskService deferral reconciliation) read the receipt for this notification.
@@ -10883,14 +10907,19 @@ export class AgentSession {
             (unsent.fileParts?.length ?? 0) > 0 ||
             (unsent.reviews?.length ?? 0) > 0)
         ) {
-          this.emitChatEvent({
-            type: "restore-to-input",
+          // Retained until acknowledged (see pendingInputRestores): the queue entry is gone, so
+          // this is the only copy of the user's text.
+          const restore = {
+            type: "restore-to-input" as const,
             workspaceId: this.workspaceId,
             text: unsent.text,
             fileParts: unsent.fileParts,
             reviews: unsent.reviews,
-            mode: "append",
-          });
+            mode: "append" as const,
+            restoreId: randomUUID(),
+          };
+          this.pendingInputRestores.set(restore.restoreId, restore);
+          this.emitChatEvent(restore);
         }
       }
       this.sendQueuedMessages(trigger, stopAdmission);

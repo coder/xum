@@ -1393,26 +1393,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [api]);
 
-  // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const customEvent = e as CustomEvent<{
-        text: string;
-        mode?: "append" | "replace";
-        fileParts?: FilePart[];
-        reviews?: ReviewNoteDataForDisplay[];
-        workspaceId?: string;
-      }>;
-
-      if (
-        customEvent.detail.workspaceId != null &&
-        workspaceIdForComposerClear !== customEvent.detail.workspaceId
-      ) {
-        return;
-      }
-
-      const { text, mode = "append", fileParts, reviews } = customEvent.detail;
-      const restoredIdPrefix = `restored-${Date.now()}`;
+  // Apply an input update to this composer: `replace` owns the whole draft, `append` adds after
+  // it. Shared by UPDATE_CHAT_INPUT events and the store's retained unsent-input restorations.
+  const restoredInputSeqRef = useRef(0);
+  const applyInputUpdate = useCallback(
+    (update: {
+      text: string;
+      mode?: "append" | "replace";
+      fileParts?: FilePart[];
+      reviews?: ReviewNoteDataForDisplay[];
+    }) => {
+      const { text, mode = "append", fileParts, reviews } = update;
+      // Unique per restoration: several can be applied within one millisecond (a drain refusing
+      // back to back, or retained restorations flushed together when the composer mounts), and
+      // attachment ids derive from this prefix.
+      const restoredIdPrefix = `restored-${Date.now()}-${restoredInputSeqRef.current++}`;
       const restoredPending = buildPendingFromRestoredInput({
         content: text,
         fileParts: fileParts ?? [],
@@ -1437,18 +1432,40 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       } else {
         appendText(restoredPending.content);
       }
+    },
+    [appendText, restoreText, restoreDraft, appendDraftFromPending, editingMessageForUi]
+  );
+
+  // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const customEvent = e as CustomEvent<{
+        text: string;
+        mode?: "append" | "replace";
+        fileParts?: FilePart[];
+        reviews?: ReviewNoteDataForDisplay[];
+        workspaceId?: string;
+      }>;
+
+      if (
+        customEvent.detail.workspaceId != null &&
+        workspaceIdForComposerClear !== customEvent.detail.workspaceId
+      ) {
+        return;
+      }
+      applyInputUpdate(customEvent.detail);
     };
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
-  }, [
-    appendText,
-    restoreText,
-    restoreDraft,
-    appendDraftFromPending,
-    editingMessageForUi,
-    workspaceIdForComposerClear,
-  ]);
+  }, [applyInputUpdate, workspaceIdForComposerClear]);
+
+  // Unsent input the backend handed back for this workspace (a refused queued message) can arrive
+  // while another workspace's composer is shown; the store keeps it until this composer takes it.
+  useEffect(() => {
+    if (workspaceIdForComposerClear == null) return;
+    return store.registerInputRestoreConsumer(workspaceIdForComposerClear, applyInputUpdate);
+  }, [applyInputUpdate, store, workspaceIdForComposerClear]);
 
   useEffect(() => {
     const handler = (event: CustomEvent<{ workspaceId: string }>) => {

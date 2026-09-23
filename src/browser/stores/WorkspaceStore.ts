@@ -300,6 +300,11 @@ export interface WorkspaceSidebarState {
  */
 type DerivedState = Record<string, number>;
 
+/** A backend-retained restore-to-input (see WorkspaceStore.pendingInputRestores). */
+export type InputRestore = Extract<WorkspaceChatMessage, { type: "restore-to-input" }> & {
+  restoreId: string;
+};
+
 /**
  * Per-attempt context for an onChat subscription. Carries the since-mode anchor the
  * attempt's cursor requested (so caught-up reconciliation only ever sees its own
@@ -857,6 +862,15 @@ export class WorkspaceStore {
   // At most one pending transcript refresh request per workspace (see requestTranscriptRefresh).
   private transcriptRefreshRequests = new Map<string, TranscriptRefreshRequest>();
 
+  // Backend-retained restore-to-input events (those with a restoreId: unsent input handed back
+  // after a refused queued message) wait here, in arrival order, until that workspace's composer
+  // registers to take them: they can arrive while its composer is not mounted (onChat replay on
+  // switch-back lands before the composer re-mounts), and the event is not delivered again once
+  // acknowledged. Consumed ids stay known so a re-delivery racing the acknowledgement is dropped.
+  private pendingInputRestores = new Map<string, InputRestore[]>();
+  private consumedInputRestoreIds = new Set<string>();
+  private inputRestoreConsumers = new Map<string, (restore: InputRestore) => void>();
+
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
   private readonly staleSkeletonTimeoutMs: number;
@@ -1267,6 +1281,10 @@ export class WorkspaceStore {
     },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
+      if (data.restoreId != null) {
+        this.receiveInputRestore({ ...data, restoreId: data.restoreId });
+        return;
+      }
 
       // UPDATE_CHAT_INPUT with the event's mode (replace unless the backend asks to append: a
       // refused queued message handed back as unsent input must not overwrite a newer draft).
@@ -1591,6 +1609,67 @@ export class WorkspaceStore {
     );
 
     return this.activeOnChatWorkspaceId === workspaceId;
+  }
+
+  /**
+   * The workspace's composer takes retained unsent input (see pendingInputRestores): called now
+   * for whatever arrived while it was not mounted, then for each later arrival. `consume` must
+   * apply the restoration synchronously; it is then acknowledged to the backend. Returns the
+   * unregister function (the last registration for a workspace wins).
+   */
+  registerInputRestoreConsumer(
+    workspaceId: string,
+    consume: (restore: InputRestore) => void
+  ): () => void {
+    assert(workspaceId.length > 0, "registerInputRestoreConsumer requires a workspaceId");
+    this.inputRestoreConsumers.set(workspaceId, consume);
+    this.deliverInputRestores(workspaceId);
+    return () => {
+      if (this.inputRestoreConsumers.get(workspaceId) === consume) {
+        this.inputRestoreConsumers.delete(workspaceId);
+      }
+    };
+  }
+
+  private receiveInputRestore(restore: InputRestore): void {
+    assert(restore.restoreId.length > 0, "a retained input restore needs a restoreId");
+    if (this.consumedInputRestoreIds.has(restore.restoreId)) {
+      // Re-delivered by a replay that raced (or outlived a lost) acknowledgement: already applied.
+      this.acknowledgeInputRestore(restore);
+      return;
+    }
+    const pending = this.pendingInputRestores.get(restore.workspaceId) ?? [];
+    if (pending.some((queued) => queued.restoreId === restore.restoreId)) return;
+    pending.push(restore);
+    this.pendingInputRestores.set(restore.workspaceId, pending);
+    this.deliverInputRestores(restore.workspaceId);
+  }
+
+  private deliverInputRestores(workspaceId: string): void {
+    const consume = this.inputRestoreConsumers.get(workspaceId);
+    const pending = this.pendingInputRestores.get(workspaceId);
+    if (consume == null || pending == null) return;
+    this.pendingInputRestores.delete(workspaceId);
+    for (const restore of pending) {
+      consume(restore);
+      this.consumedInputRestoreIds.add(restore.restoreId);
+      this.acknowledgeInputRestore(restore);
+    }
+  }
+
+  private acknowledgeInputRestore(restore: InputRestore): void {
+    // Best effort: without an acknowledgement the backend re-sends the restoration on the next
+    // replay, where consumedInputRestoreIds drops it and acknowledges again.
+    this.client?.workspace
+      .acknowledgeInputRestore({ workspaceId: restore.workspaceId, restoreId: restore.restoreId })
+      .then((result) => {
+        if (!result.success) {
+          console.warn(`Failed to acknowledge restored input for ${restore.workspaceId}:`, result);
+        }
+      })
+      .catch((error) => {
+        console.warn(`Failed to acknowledge restored input for ${restore.workspaceId}:`, error);
+      });
   }
 
   private ensureActivitySubscription(): void {
@@ -4519,6 +4598,8 @@ export class WorkspaceStore {
     });
 
     this.pendingReplayReset.delete(workspaceId);
+    // Unsent input of a removed workspace has no composer left to take it.
+    this.pendingInputRestores.delete(workspaceId);
 
     // Clean up state
     this.states.delete(workspaceId);
@@ -4632,6 +4713,9 @@ export class WorkspaceStore {
     this.activeOnChatWorkspaceId = null;
     this.activeOnChatSignal = null;
     this.pendingReplayReset.clear();
+    this.pendingInputRestores.clear();
+    this.consumedInputRestoreIds.clear();
+    this.inputRestoreConsumers.clear();
     this.states.clear();
     this.derived.clear();
     this.usageStore.clear();

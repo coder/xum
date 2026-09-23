@@ -13304,6 +13304,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
+  acknowledgeInputRestore(workspaceId: string, restoreId: string): Result<void> {
+    try {
+      // No session means nothing is retained (restorations live with the session).
+      this.sessions.get(workspaceId.trim())?.acknowledgeInputRestore(restoreId);
+      return Ok(undefined);
+    } catch (error) {
+      const errorMessage = getErrorMessage(error);
+      log.error("Unexpected error in acknowledgeInputRestore handler:", error);
+      return Err(`Failed to acknowledge restored input: ${errorMessage}`);
+    }
+  }
+
   setQueuedMessageDispatchMode(
     workspaceId: string,
     queueDispatchMode: "tool-end" | "turn-end"

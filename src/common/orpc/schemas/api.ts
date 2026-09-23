@@ -1740,6 +1740,11 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /** The renderer applied a retained restore-to-input (see RestoreToInputEventSchema.restoreId). */
+  acknowledgeInputRestore: {
+    input: z.object({ workspaceId: z.string(), restoreId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   setQueuedMessageDispatchMode: {
     input: z.object({
       workspaceId: z.string(),

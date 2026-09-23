@@ -711,6 +711,13 @@ export const RestoreToInputEventSchema = z.object({
    * used when a queued message was refused at dispatch and is handed back as unsent input.
    */
   mode: z.enum(["replace", "append"]).optional(),
+  /**
+   * Set when the backend retains this restoration until a renderer acknowledges applying it
+   * (workspace.acknowledgeInputRestore): it is re-sent on every onChat replay, because the
+   * renderer only subscribes to the workspace it shows and would otherwise never receive input
+   * handed back while another workspace is open. Same id on every delivery, so renderers dedupe.
+   */
+  restoreId: z.string().optional(),
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
