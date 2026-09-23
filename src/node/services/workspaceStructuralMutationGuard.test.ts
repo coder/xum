@@ -6,6 +6,7 @@ import * as path from "path";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import {
   classifyStructuralMutationTarget,
+  deriveHostLocalCheckoutPath,
   findProtectedFootprintOverlap,
   isProtectedTaskRow,
 } from "./workspaceStructuralMutationGuard";
@@ -315,6 +316,84 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
         taskWorkspaceId: "task",
         targetPath: derivedRoot,
       });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
+  test("devcontainer rows are host worktrees under <XUM_ROOT>/src: a task row is protected, a root is scanned, both derive their checkout", async () => {
+    // DevcontainerRuntime keeps its checkout on the host through a WorktreeManager rooted at
+    // `new Config().srcDir` (runtimeFactory) — <XUM_ROOT>/src — though its runtimeConfig
+    // carries no srcBaseDir. Preparation exempts these rows (no plugin consent to protect);
+    // the structural guard must not.
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = tempDir;
+    try {
+      const devcontainer = { type: "devcontainer", configPath: ".devcontainer/x.json" } as const;
+      const projectPath = path.join(tempDir, "repo");
+      const derivedRoot = path.join(tempDir, "src", "repo", "root");
+      const derivedTask = path.join(tempDir, "src", "repo", "agent_task");
+      const stale = path.join(tempDir, "stale");
+      for (const dir of [projectPath, derivedRoot, derivedTask, stale]) {
+        await fsPromises.mkdir(dir, { recursive: true });
+      }
+      const worktree = { type: "worktree", srcBaseDir: path.join(tempDir, "src") } as const;
+      const snapshotOf = (...workspaces: Workspace[]): ProjectsConfig => ({
+        projects: new Map([[projectPath, { workspaces }]]),
+      });
+
+      // Rename's destination derivation must land in the host worktree, not the project dir.
+      expect(deriveHostLocalCheckoutPath(devcontainer, projectPath, "root")).toBe(derivedRoot);
+
+      const devTask: Workspace = {
+        path: stale,
+        id: "task",
+        name: "agent_task",
+        parentWorkspaceId: "other-root",
+        runtimeConfig: devcontainer,
+      };
+      expect(isProtectedTaskRow(devTask)).toBe(true);
+      const rootAtTaskTarget: Workspace = {
+        path: derivedTask,
+        id: "root",
+        name: "r",
+        runtimeConfig: worktree,
+      };
+      expect(classifyStructuralMutationTarget(snapshotOf(devTask), "task")).toMatchObject({
+        kind: "protected-task",
+      });
+      expect(
+        await findProtectedFootprintOverlap(snapshotOf(rootAtTaskTarget, devTask), {
+          row: rootAtTaskTarget,
+          bucketProjectPath: projectPath,
+        })
+      ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: derivedTask });
+
+      const devRoot: Workspace = {
+        path: stale,
+        id: "root",
+        name: "root",
+        runtimeConfig: devcontainer,
+      };
+      const taskAtRootTarget: Workspace = {
+        path: derivedRoot,
+        id: "task",
+        name: "t",
+        parentWorkspaceId: "root",
+        runtimeConfig: worktree,
+      };
+      const snapshot = snapshotOf(devRoot, taskAtRootTarget);
+      expect(classifyStructuralMutationTarget(snapshot, "root")).toMatchObject({
+        kind: "host-local-root",
+        bucketProjectPath: projectPath,
+      });
+      expect(
+        await findProtectedFootprintOverlap(snapshot, {
+          row: devRoot,
+          bucketProjectPath: projectPath,
+        })
+      ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", targetPath: derivedRoot });
     } finally {
       if (previousRoot === undefined) delete process.env.XUM_ROOT;
       else process.env.XUM_ROOT = previousRoot;
