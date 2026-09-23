@@ -82,10 +82,8 @@ export interface ChatInputWorkspaceVariant {
   /** Permanently delete a review */
   onDeleteReview?: (reviewId: string) => void;
   /** Update a review's comment/note */
-  onUpdateReviewNote?: (
-    reviewId: string,
-    newNote: string
-  ) => void; /** Attach review notes handed back with unsent input to chat (adds them to the review store) */
+  onUpdateReviewNote?: (reviewId: string, newNote: string) => void;
+  /** Attach review notes handed back with unsent input to chat (adds them to the review store) */
   onAttachReviews?: (reviews: ReviewNoteData[]) => void;
 }
 
