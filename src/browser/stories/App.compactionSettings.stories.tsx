@@ -90,7 +90,9 @@ async function selectStrategy(trigger: HTMLElement, name: string) {
   await userEvent.click(trigger);
   const body = within(trigger.ownerDocument.body);
   await userEvent.click(await body.findByRole("option", { name }));
-  await expect(trigger).toHaveTextContent(name);
+  // Radix commits the choice asynchronously; asserting synchronously threw on
+  // loaded Pixel runners and captured a half-finished interaction.
+  await waitFor(() => expect(trigger).toHaveTextContent(name));
 }
 
 async function exerciseCompactionSettings(canvasElement: HTMLElement) {
@@ -182,9 +184,9 @@ export const TokenBudgetConflict: AppStory = {
     await expect(warning).toBeVisible();
     await expect(trigger).toHaveAttribute("aria-describedby", warning.id);
     await selectStrategy(trigger, "Continuous");
-    await expect(canvas.queryByRole("status")).toBeNull();
+    await waitFor(() => expect(canvas.queryByRole("status")).toBeNull());
     await selectStrategy(trigger, "Token Budget");
     await expectPersistedStrategy(false, true);
-    await expect(canvas.getByRole("status")).toBeVisible();
+    await expect(await canvas.findByRole("status")).toBeVisible();
   },
 };
