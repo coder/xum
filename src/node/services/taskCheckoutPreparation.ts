@@ -143,6 +143,11 @@ export function canonicalRuntimeConfigJson(runtimeConfig: RuntimeConfig | undefi
   return canonicalJson(runtimeConfig);
 }
 
+/**
+ * The runtimes preparation covers. A devcontainer checkout is a host worktree too, but plugin
+ * servers are never offered there (resolveAgentPluginsMcpContext), so preparation has no consent
+ * state to protect; extending structural protection to devcontainer tasks is a tracked follow-up.
+ */
 function isHostLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
     runtimeConfig === undefined ||

@@ -95,6 +95,29 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
     ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: gitAdminDir });
   });
 
+  test("a protected row sharing the target's id (malformed duplicate) is still scanned: only the exact target entry is excluded", async () => {
+    const projectPath = path.join(tempDir, "repo");
+    const rootCheckout = path.join(tempDir, "src", "repo", "root");
+    await fsPromises.mkdir(rootCheckout, { recursive: true });
+    const root: Workspace = { path: rootCheckout, id: "dup", name: "root" };
+    const task: Workspace = {
+      path: rootCheckout,
+      id: "dup",
+      name: "agent_dup",
+      parentWorkspaceId: "other",
+      taskIsolation: "none",
+    };
+    const snapshot: ProjectsConfig = {
+      projects: new Map([[projectPath, { workspaces: [root, task] }]]),
+    };
+
+    const target = classifyStructuralMutationTarget(snapshot, "dup");
+    expect(target).toMatchObject({ kind: "host-local-root", row: root });
+    expect(
+      await findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath })
+    ).toMatchObject({ kind: "overlap", taskPath: rootCheckout });
+  });
+
   test("a task checkout whose .git file is not a gitdir pointer is unknown backing, not permission", async () => {
     const projectPath = path.join(tempDir, "repo");
     const rootCheckout = path.join(tempDir, "src", "repo", "root");

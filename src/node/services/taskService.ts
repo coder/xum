@@ -5594,6 +5594,14 @@ export class TaskService implements AgentTaskIntegration {
         });
         this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
       }
+      // Shared plans (isolation: "none", project-dir local) resolved their parent before the
+      // registration lock was taken: a structural rename that won the lock first has moved it
+      // since. Re-derive each shared row in this locked write and refuse the batch (nothing is
+      // written) instead of persisting ancestry that is already broken.
+      for (const plan of plans) {
+        const stale = sharedTaskRowPublicationRefusal(config, plan.taskId);
+        if (stale != null) throw new Error(`Task.createMany: ${stale}`);
+      }
       return config;
     });
   }

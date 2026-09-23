@@ -375,7 +375,9 @@ async function scanProtectedFootprintOverlap(
 
   for (const [bucketProjectPath, project] of snapshot.projects) {
     for (const row of project.workspaces) {
-      if (row.id === target.row.id || !isProtectedTaskRow(row)) continue;
+      // Exclude only the exact target entry (same snapshot object), not every row sharing its
+      // id: a malformed duplicate id must not hide a protected row from the scan.
+      if (row === target.row || !isProtectedTaskRow(row)) continue;
       const taskWorkspaceId = row.id ?? row.path;
       // Either side's Git backing could not be established: with a protected row in
       // play, that unknown may be exactly the backing the mutation would destroy.
