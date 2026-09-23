@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import { execSync } from "node:child_process";
 import * as os from "os";
@@ -184,4 +184,57 @@ describe("WorkspaceMcpOverridesService checkout-preparation gate", () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(service.getOverridesForWorkspace("legacy", { mode: "strict" })).rejects.toThrow();
   });
+
+  // The caller's timeoutMs/signal bound the WHOLE read: a stalled preparation check must not hold
+  // a short deadline or an aborted prompt/send for the validator's own (seconds-long) timeout.
+  it.each(["timeout", "aborted"] as const)(
+    "a stalled preparation check resolves within the caller's bound (%s): non-authoritative, strict throws",
+    async (bound) => {
+      await addRow({
+        id: "shared",
+        path: projectPath,
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: rootId,
+        taskIsolation: "none",
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      // A stalled mount under the shared checkout: the preparation's directory probe hangs.
+      const gate = Promise.withResolvers<void>();
+      const stat = fs.stat;
+      const stalled = spyOn(fs, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fs.stat>
+      ) => {
+        if (path.resolve(String(args[0])) === path.resolve(projectPath)) await gate.promise;
+        return stat(...args);
+      }) as typeof fs.stat);
+      const callerBound = () =>
+        bound === "timeout" ? { timeoutMs: 20 } : { signal: AbortSignal.abort() };
+      const settledWithin = (call: Promise<unknown>) =>
+        Promise.race([
+          call.then(
+            () => "settled",
+            () => "settled"
+          ),
+          new Promise((resolve) => setTimeout(() => resolve("pending"), 1_000)),
+        ]);
+      const lenient = service.getOverridesForWorkspace("shared", callerBound());
+      const strict = service.getOverridesForWorkspace("shared", {
+        mode: "strict",
+        ...callerBound(),
+      });
+      strict.catch(() => undefined);
+      try {
+        expect(await settledWithin(lenient)).toBe("settled");
+        expect(await settledWithin(strict)).toBe("settled");
+      } finally {
+        gate.resolve();
+        stalled.mockRestore();
+      }
+      const read = await lenient;
+      expect(read).toMatchObject({ authoritative: false, overrides: {} });
+      expect(read.preparation).toBeUndefined();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(strict).rejects.toThrow(bound === "timeout" ? /timed out/ : /aborted/);
+    }
+  );
 });

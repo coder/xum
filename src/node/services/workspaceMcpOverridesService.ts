@@ -1674,13 +1674,51 @@ export class WorkspaceMcpOverridesService {
     }
   ): Promise<WorkspaceMcpOverridesRead> {
     const mode = options?.mode ?? "lenient";
+    // The caller's bound covers the WHOLE read, preparation capture included: one deadline and
+    // one signal shared by both races below, so the validator's own (seconds-long) timeout on a
+    // stalled checkout can neither stretch a short deadline nor delay an abort. An abandoned
+    // capture is read-only and settles within that timeout; its late result is discarded.
+    const deadline = options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs : undefined;
+    const bounded = deadline !== undefined || options?.signal !== undefined;
+    const withinCallerBound = <T>(work: Promise<T>) =>
+      raceWithAbortAndTimeout(work, {
+        ...(deadline !== undefined ? { timeoutMs: Math.max(0, deadline - Date.now()) } : {}),
+        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      });
+    const abandonedRead = (
+      kind: "timeout" | "aborted",
+      preparation?: TaskCheckoutAuthorization
+    ): WorkspaceMcpOverridesRead => {
+      const reason =
+        kind === "aborted"
+          ? "workspace MCP override resolution was aborted"
+          : "workspace MCP override resolution timed out";
+      if (mode === "strict") {
+        throw new Error(reason);
+      }
+      log.warn(`[MCP] ${reason}; serving no overrides (non-authoritative)`, { workspaceId });
+      return {
+        overrides: {},
+        revision: computeOverridesRevision({}),
+        authoritative: false,
+        ...(preparation !== undefined ? { preparation } : {}),
+      };
+    };
     // Checkout-preparation authority — the deepest MCP gate. Every consumer that can activate
     // MCP for a workspace (turn builder, prompt discovery, the manager's disk re-read, prompt
     // materialization, served-tool dispatch) reads through here, so a host-local task row whose
     // authority cannot be validated (bounded, async) yields a NON-authoritative read with no
     // overrides — the manager then fails its serve closed — and never the document's own
     // enablement. Roots and off-host rows resolve to an exempt authority the caller threads on.
-    const preparation = await captureTaskCheckoutAuthorization(this.config, workspaceId);
+    const capture = captureTaskCheckoutAuthorization(this.config, workspaceId);
+    let preparation: Awaited<typeof capture>;
+    if (!bounded) {
+      preparation = await capture;
+    } else {
+      const raced = await withinCallerBound(capture);
+      if (raced.kind !== "ok") return abandonedRead(raced.kind);
+      preparation = raced.value;
+    }
     if (!preparation.success) {
       if (mode === "strict") throw new Error(preparation.error);
       log.info("[MCP] Workspace MCP overrides withheld: checkout preparation refused", {
@@ -1702,13 +1740,10 @@ export class WorkspaceMcpOverridesService {
         snapshot
       ))();
     let resolved: ResolvedOverrides;
-    if (options?.timeoutMs === undefined && options?.signal === undefined) {
+    if (!bounded) {
       resolved = await resolution;
     } else {
-      const raced = await raceWithAbortAndTimeout(resolution, {
-        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      });
+      const raced = await withinCallerBound(resolution);
       if (raced.kind !== "ok") {
         snapshot.cancel();
         // Not awaited: the losing resolution may be stuck on a remote probe,
@@ -1719,20 +1754,7 @@ export class WorkspaceMcpOverridesService {
         // timeout instead of the advertised deadline.
         resolution.catch(() => undefined);
         snapshot.settleSideEffects().catch(() => undefined);
-        const reason =
-          raced.kind === "aborted"
-            ? "workspace MCP override resolution was aborted"
-            : "workspace MCP override resolution timed out";
-        if (mode === "strict") {
-          throw new Error(reason);
-        }
-        log.warn(`[MCP] ${reason}; serving no overrides (non-authoritative)`, { workspaceId });
-        return {
-          overrides: {},
-          revision: computeOverridesRevision({}),
-          authoritative: false,
-          preparation: preparation.data,
-        };
+        return abandonedRead(raced.kind, preparation.data);
       }
       resolved = raced.value;
     }
