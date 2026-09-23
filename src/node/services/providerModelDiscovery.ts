@@ -115,10 +115,13 @@ export async function discoverProviderModels(
     let url = new URL(base);
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password)
       return { status: "unsupported" };
-    // Azure catalogs contain model IDs, not the user's deployment names.
+    // Azure catalogs contain model IDs, not the user's deployment names. The path
+    // heuristic only applies to OpenAI's deployment-based configuration; other
+    // adapters and custom proxies may legitimately mount under /deployments.
     if (
-      !anthropic &&
-      (url.hostname.endsWith(".openai.azure.com") || /\/deployments(?:\/|$)/i.test(url.pathname))
+      request.format === "openai" &&
+      (url.hostname.endsWith(".openai.azure.com") ||
+        (request.provider === "openai" && /\/deployments(?:\/|$)/i.test(url.pathname)))
     )
       return { status: "unsupported" };
     url.pathname = `${url.pathname.replace(/\/+$/, "")}/${request.format === "ollama" ? "tags" : "models"}`;
@@ -156,8 +159,13 @@ export async function discoverProviderModels(
         signal: combined,
         dispatcher: agent,
       });
-      if (request.conditional && page === 0 && [404, 405].includes(response.statusCode))
+      if (request.conditional && page === 0 && [404, 405].includes(response.statusCode)) {
+        // Fence like the success path: teardown can yield to edits or cancellation.
+        await agent.destroy().catch(() => undefined);
+        agent = undefined;
+        current();
         return { status: "unsupported" };
+      }
       // Native request never follows redirects; reject 3xx without forwarding credentials.
       if (response.statusCode < 200 || response.statusCode >= 300) throw new Error();
       const chunks: Uint8Array[] = [];
@@ -202,8 +210,10 @@ export async function discoverProviderModels(
           next.hash
         )
           throw new Error();
-        // A page link cannot discard configured proxy query parameters (for example a tenant).
-        for (const [key, value] of endpoint.searchParams) next.searchParams.set(key, value);
+        // A page link cannot discard or collapse configured proxy query parameters
+        // (for example a tenant, or a repeated scope).
+        for (const key of new Set(endpoint.searchParams.keys())) next.searchParams.delete(key);
+        for (const [key, value] of endpoint.searchParams) next.searchParams.append(key, value);
         url = next;
         cursor = url.href;
       } else url.searchParams.set(anthropic ? "after_id" : "pageToken", cursor);

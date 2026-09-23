@@ -438,7 +438,9 @@ it.each(["google", "openrouter", "anthropic-messages"])(
   async (provider) => {
     const id = saveAdapter(
       provider,
-      provider === "openrouter" ? { baseUrl: `${server.url}proxy/api?tenant=one` } : {}
+      provider === "openrouter"
+        ? { baseUrl: `${server.url}proxy/api?tenant=one&scope=a&scope=b` }
+        : {}
     );
     respond = () => {
       const more = requests.length === 1;
@@ -465,7 +467,10 @@ it.each(["google", "openrouter", "anthropic-messages"])(
     });
     const next = new URL(requests[1].url);
     expect(next.pathname).toBe(new URL(requests[0].url).pathname);
-    if (provider === "openrouter") expect(next.searchParams.get("tenant")).toBe("one");
+    if (provider === "openrouter") {
+      expect(next.searchParams.get("tenant")).toBe("one");
+      expect(next.searchParams.getAll("scope")).toEqual(["a", "b"]);
+    }
     expect(
       next.searchParams.get(
         provider === "google" ? "pageToken" : provider === "openrouter" ? "offset" : "after_id"
@@ -503,6 +508,33 @@ it.each(["zai", ...CUSTOM_PROVIDER_TYPES])(
         reason: "invalid-response",
       });
     }
+  }
+);
+
+it.each(["zai", ...CUSTOM_PROVIDER_TYPES])(
+  "conditional %s unsupported replies are fenced by config changes",
+  async (provider) => {
+    const id = saveAdapter(provider);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Response>();
+    respond = () => {
+      started.resolve();
+      return release.promise;
+    };
+    const pending = service.discoverModels(id);
+    await started.promise;
+    saveAdapter(provider, { headers: { "x-tenant": "new" } });
+    release.resolve(new Response("missing", { status: 404 }));
+    expect(await pending).toEqual({ status: "error", reason: "stale-config" });
+  }
+);
+
+it.each(["openrouter", "openai-compatible"])(
+  "%s endpoints mounted under /deployments are still listed",
+  async (provider) => {
+    const id = saveAdapter(provider, { baseUrl: `${server.url}deployments/v1` });
+    respond = () => Response.json({ data: [{ id: "proxied" }] });
+    expect(await service.discoverModels(id)).toEqual({ status: "ok", modelIds: ["proxied"] });
   }
 );
 
