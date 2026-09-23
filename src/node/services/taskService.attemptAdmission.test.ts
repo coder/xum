@@ -3237,6 +3237,38 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         load.mockRestore();
       }
     });
+
+    test.each(["a task this process never rotated", "a root workspace"] as const)(
+      "an unreadable registry refuses a send into %s: the classification is indeterminate, never not-a-task",
+      async (target) => {
+        const taskId = "unreadable-unrotated";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            // Loaded from disk: reported by a prior process, never rotated here.
+            overrides: { taskStatus: "reported", taskAttemptId: "att_0000000000000802" },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        const svc = internals(taskService);
+        const workspaceId = target === "a root workspace" ? rootId : taskId;
+        expect(svc.currentAttemptIdByTaskId.has(workspaceId)).toBe(false);
+        const load = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+          if (options?.throwOnError) throw new Error("registry unreadable");
+          return { projects: new Map() } as unknown as ReturnType<Config["loadConfigOrDefault"]>;
+        });
+        try {
+          const admission = taskService.admitTaskWorkspaceTurn(workspaceId, {
+            acceptanceOrigin: "manual",
+          });
+          expect(admission.kind).toBe("refused");
+          if (admission.kind === "refused") expect(admission.message).toContain("unreadable");
+          expect(svc.admittedSendsByTaskId.has(workspaceId)).toBe(false);
+        } finally {
+          load.mockRestore();
+        }
+      }
+    );
   });
 
   describe("startup completion prompt fence (token ownership)", () => {

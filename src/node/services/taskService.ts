@@ -1801,8 +1801,9 @@ export class TaskService implements AgentTaskIntegration {
    * The last attempt id THIS process published for each task (every local rotation, owned or
    * not). Not an authority on the current id — currentTaskAttemptId reads the persisted row, so
    * a rotation committed by another process is honored and a row that is missing or unreadable
-   * yields no id at all. Its one read is the fence's fail-closed path: a task this process
-   * rotated must never proceed on an unreadable registry (admitTaskWorkspaceTurn).
+   * yields no id at all. Never read to classify or authorize: an unreadable registry refuses
+   * every send regardless of this map (see admitTaskWorkspaceTurn), since absence here is no
+   * proof that a workspace is not a task.
    */
   private readonly currentAttemptIdByTaskId = new Map<string, string>();
   /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
@@ -2732,7 +2733,7 @@ export class TaskService implements AgentTaskIntegration {
    * Undefined for pre-identity entries AND for a row that is missing, lost its id, or could not
    * be read (lenient load → default view): every token then reads stale and every fence refuses,
    * never falling back to an id this process remembers — a stale memory must not revive an
-   * attempt the registry no longer names (see currentAttemptIdByTaskId for the one read it has).
+   * attempt the registry no longer names (see currentAttemptIdByTaskId).
    */
   private currentTaskAttemptId(taskId: string, entry?: WorkspaceConfigEntry): string | undefined {
     const persisted =
@@ -2939,12 +2940,18 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId
       )?.workspace;
     } catch (error: unknown) {
-      // A task-workspace send must not proceed on an unreadable registry (fail closed); an
-      // ordinary workspace is unaffected because it never reaches the session with a token.
-      if (this.currentAttemptIdByTaskId.has(workspaceId)) {
-        return { kind: "refused", message: `Task registry unreadable: ${getErrorMessage(error)}` };
-      }
-      return { kind: "not-a-task" };
+      // Unreadable registry: the classification itself is indeterminate. Absence from this
+      // process's identity map (currentAttemptIdByTaskId) is no proof of "not a task" — a task
+      // loaded from disk and never rotated here has no entry — so EVERY send refuses here (fail
+      // closed) rather than bypassing the attempt fence. That deliberately includes root/non-task
+      // workspaces: without the registry nothing can tell them apart, and such a send could not
+      // run anyway (lenient readers then see no workspaces, so its metadata cannot be resolved);
+      // refusing here just fails it before anything is persisted. Sends resume once the registry
+      // reads again.
+      return {
+        kind: "refused",
+        message: `Workspace registry unreadable; send refused: ${getErrorMessage(error)}`,
+      };
     }
     // A send decided for a specific attempt whose row is gone (unpublished, removed) is stale,
     // never an ordinary send into a workspace that is not a task.
