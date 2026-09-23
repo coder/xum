@@ -4,7 +4,7 @@ import { execSync } from "node:child_process";
 import * as path from "path";
 
 import type { ProjectsConfig } from "@/common/types/project";
-import { SecretsStore, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { SecretsStore, type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Ok } from "@/common/types/result";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
@@ -506,6 +506,67 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
         timeoutMessage: "registration lock held",
       });
       await release();
+    },
+    30_000
+  );
+
+  // An unreadable registry proves nothing either way: the write may well have landed, and a
+  // reported failure would then leave a durable (possibly launchable) row the caller cannot
+  // fence and may duplicate on retry. Only a READABLE registry lacking the proof refuses.
+  test.each([
+    ["reserved", "prepunread01"],
+    ["unqueued", "prepunread02"],
+    ["queued", "prepunread03"],
+  ] as const)(
+    "a %s publication whose verification read fails transiently keeps its success: the persisted row stays the task",
+    async (mode, taskId) => {
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      if (mode === "queued") {
+        await config.editConfig((cfg) => ({ ...cfg, taskSettings: testTaskSettings(1) }));
+        const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(1);
+        restores.push(() => busy.mockRestore());
+      }
+      // Armed the moment `publish` returns: the next strict read is the verification's.
+      let armed = false;
+      let verificationReadFailed = false;
+      const realLoad = config.loadConfigOrDefault.bind(config);
+      const load = spyOn(config, "loadConfigOrDefault").mockImplementation(((
+        options?: Parameters<Config["loadConfigOrDefault"]>[0]
+      ) => {
+        if (armed && options?.throwOnError === true) {
+          armed = false;
+          verificationReadFailed = true;
+          throw new Error("transient config read failure");
+        }
+        return realLoad(options);
+      }) as Config["loadConfigOrDefault"]);
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        (materialize, publish) =>
+          realPrepare(materialize, async (proofs) => {
+            const value = await publish(proofs);
+            armed = true;
+            return value;
+          })
+      );
+      restores.push(
+        () => load.mockRestore(),
+        () => prepare.mockRestore()
+      );
+
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([createArgs("Unread")])
+          : await taskService.create(createArgs("Unread"));
+      expect(verificationReadFailed).toBe(true);
+      expect(created.success).toBe(true);
+      const row = findWorkspaceInConfig(config, taskId);
+      expect(row).toMatchObject({
+        taskCheckoutPreparation: { v: 1, path: forkPathFor(config.srcDir, taskId) },
+      });
+      if (mode === "queued") expect(row?.taskStatus).toBe("queued");
     },
     30_000
   );
