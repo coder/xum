@@ -12,8 +12,14 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 
 /**
  * Default refusal-fallback chains shipped with the app. Fable 5 safeguards
- * may refuse requests the current Opus tier can serve, so retrying on Opus is
- * the sensible out-of-the-box behavior.
+ * may refuse requests the Opus tier can serve, so retrying on Opus is the
+ * sensible out-of-the-box behavior.
+ *
+ * The target is pinned to the literal Opus 5 id rather than KNOWN_MODELS.OPUS.id:
+ * Opus 5.5 (the current `opus` alias) ships the same safeguard classifiers as
+ * Fable 5.1, so it is not a proven refusal-recovery target, and pinning keeps
+ * fresh installs and already-seeded configs on identical bytes without a
+ * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
  *
  * Seeded into the config exactly once, guarded by
  * migrations.defaultModelFallbacksSeeded (plus the one-shot
@@ -25,7 +31,7 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * benign, re-deletable default.)
  */
 export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
-  [KNOWN_MODELS.FABLE.id]: { models: [KNOWN_MODELS.OPUS.id] },
+  [KNOWN_MODELS.FABLE.id]: { models: ["anthropic:claude-opus-5"] },
 };
 
 /**
@@ -37,7 +43,7 @@ export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
  * refusal fallback intact.
  */
 export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
-  "anthropic:claude-fable-5": { models: [KNOWN_MODELS.OPUS.id] },
+  "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
 };
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead

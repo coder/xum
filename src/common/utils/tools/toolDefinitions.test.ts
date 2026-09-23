@@ -875,6 +875,8 @@ describe("TOOL_DEFINITIONS", () => {
 
   it("exposes xAI native search tools only for frontier Grok", () => {
     for (const modelString of [
+      "xai:grok-4.7",
+      "xai:grok-4.7-latest",
       "xai:grok-4.6",
       "xai:grok-4.6-latest",
       "xai:grok-4.5",

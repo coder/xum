@@ -15,10 +15,7 @@ import {
   type AutoModelRoutingConfig,
   type AutoModelRoutingEvaluationStatus,
 } from "@/common/types/autoModelRouting";
-import {
-  DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
-  TYPESAFE_PROVIDER_KEY,
-} from "@/constants/autoModelRouting";
+import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -49,9 +46,6 @@ interface MockApi {
     updateAutoModelRouting: ReturnType<typeof mock>;
     getAutoModelRoutingEvaluationStatus: ReturnType<typeof mock>;
     previewAutoModelRouting: ReturnType<typeof mock>;
-  };
-  providers: {
-    setProviderConfig: ReturnType<typeof mock>;
   };
 }
 
@@ -138,9 +132,6 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
           },
         })
       ),
-    },
-    providers: {
-      setProviderConfig: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     },
   };
 }
@@ -420,60 +411,6 @@ describe("AutoModelRoutingExperimentConfig", () => {
     );
     const { container } = render(<AutoModelRoutingExperimentConfig />);
     await waitFor(() => expect(statusText(container)).toBe("No TypeSafe API key configured"));
-  });
-
-  test("the TypeSafe key field only appears for a typesafe evaluator and writes the provider entry", async () => {
-    const { container, getByLabelText, getByRole, queryByLabelText } = render(
-      <AutoModelRoutingExperimentConfig />
-    );
-    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
-
-    await userEvent.type(getByLabelText("TypeSafe API key"), " sk-test ");
-    fireEvent.click(getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(mockApi.providers.setProviderConfig).toHaveBeenCalledTimes(1));
-    expect(mockApi.providers.setProviderConfig.mock.calls[0]?.[0]).toEqual({
-      provider: TYPESAFE_PROVIDER_KEY,
-      keyPath: ["apiKey"],
-      value: "sk-test",
-    });
-    // The draft is cleared so the key never lingers in the DOM.
-    expect((getByLabelText("TypeSafe API key") as HTMLInputElement).value).toBe("");
-
-    fireEvent.click(getByRole("button", { name: "Clear" }));
-    await waitFor(() => expect(mockApi.providers.setProviderConfig).toHaveBeenCalledTimes(2));
-    expect(mockApi.providers.setProviderConfig.mock.calls[1]?.[0]).toMatchObject({
-      provider: TYPESAFE_PROVIDER_KEY,
-      value: "",
-    });
-
-    // Switching to another provider's evaluator hides the TypeSafe-only field.
-    const field = getByLabelText("Evaluation model") as HTMLInputElement;
-    await userEvent.type(field, "anthropic:claude-haiku-4-5", {
-      initialSelectionStart: 0,
-      initialSelectionEnd: field.value.length,
-    });
-    expect(queryByLabelText("TypeSafe API key")).toBeNull();
-  });
-
-  test("the TypeSafe key controls stay hidden while typesafe is a legacy custom chat provider", async () => {
-    // Save/Clear would write that entry's apiKey, which the evaluator refuses to use anyway.
-    mockProvidersConfig = {
-      [TYPESAFE_PROVIDER_KEY]: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        isCustom: true,
-        providerType: "openai-compatible",
-        baseUrl: "https://llm.example.internal/v1",
-      },
-    };
-    const { container, queryByLabelText, queryByRole } = render(
-      <AutoModelRoutingExperimentConfig />
-    );
-    await waitFor(() => expect(tierRows(container)).toHaveLength(4));
-    expect(queryByLabelText("TypeSafe API key")).toBeNull();
-    expect(queryByRole("button", { name: "Clear" })).toBeNull();
-    expect(mockApi.providers.setProviderConfig).not.toHaveBeenCalled();
   });
 
   test("classifying a sample prompt shows the chosen tier, model, and evaluator", async () => {

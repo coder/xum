@@ -64,6 +64,10 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { getErrorMessage } from "@/common/utils/errors";
+import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
+import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
 import { repairLocalModelPreferencesForRemovedProvider } from "@/browser/utils/modelPreferenceRepair";
 import {
@@ -485,6 +489,15 @@ export function ProvidersSection() {
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
 
   const routing = useRouting();
+
+  // The TypeSafe evaluation key is only useful to the auto-model-routing experiment. A legacy
+  // custom chat provider under the same id is listed with the custom providers instead.
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const typesafeAccess = effectivePolicy?.providerAccess;
+  const showTypeSafeProvider =
+    autoModelRoutingEnabled &&
+    (typesafeAccess == null || typesafeAccess.some((p) => p.id === TYPESAFE_PROVIDER_KEY)) &&
+    !isCustomProviderInfo(config?.[TYPESAFE_PROVIDER_KEY]);
 
   const providerGroups = useMemo(() => {
     const groups: Record<"direct" | "gateway" | "local" | "custom", string[]> = {
@@ -3370,6 +3383,16 @@ export function ProvidersSection() {
           </div>
         );
       })}
+
+      {showTypeSafeProvider && (
+        <div className="space-y-2">
+          <div className="text-muted text-xs font-medium tracking-wide uppercase">Evaluation</div>
+          <TypeSafeProviderCard
+            expanded={expandedProvider === TYPESAFE_PROVIDER_KEY}
+            onToggle={() => handleToggleProvider(TYPESAFE_PROVIDER_KEY)}
+          />
+        </div>
+      )}
 
       {config && !hasAnyConfiguredProvider && (
         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">

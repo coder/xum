@@ -208,6 +208,14 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
+      // Opus 5.5 rejects disabled thinking too (breaking change from Opus 5, which
+      // keeps `{ type: "disabled" }` in the native-xhigh loop above).
+      expect(buildProviderOptions("anthropic:claude-opus-5-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(
+        anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
+      ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
     });
   });
 
@@ -1795,6 +1803,32 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai?.reasoningMode).toBe("pro");
     });
 
+    test.each(["openai:gpt-6-sol", "openai:gpt-6-luna"])(
+      "preserves none/max and gates pro by wire format for %s",
+      (model) => {
+        expect(buildWithMode(model, "standard")?.reasoningEffort).toBe("none");
+        const options = buildWithMode(model, "pro", { thinkingLevel: "max" });
+        expect(options?.reasoningEffort).toBe("max");
+        expect(options?.reasoningMode).toBe("pro");
+        expect(buildWithMode(model, "standard")?.reasoningMode).toBeUndefined();
+        expect(
+          buildWithMode(model, "pro", {
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+          })?.reasoningMode
+        ).toBeUndefined();
+        expect(buildWithMode(`${model}-mini`, "pro")?.reasoningMode).toBeUndefined();
+        for (const id of [model, `${model}-2026-09-22`, "openai:team-model"]) {
+          const chatOptions = buildWithMode(id, "pro", {
+            thinkingLevel: "max",
+            muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+            providersConfig: createMockProvidersConfig({ "openai:team-model": model }),
+          });
+          expect(chatOptions?.reasoningEffort).toBe("none");
+          expect(chatOptions?.reasoningMode).toBeUndefined();
+        }
+      }
+    );
+
     test("supports pro mode across the GPT-5.6 family", () => {
       for (const model of [
         "openai:gpt-5.6",
@@ -2719,7 +2753,13 @@ describe("buildProviderOptions - xAI", () => {
     });
   });
 
-  test("passes native xhigh through for Grok 4.6 while Grok 4.5 clamps to high", () => {
+  test("passes native xhigh through for Grok 4.6/4.7 while Grok 4.5 clamps to high", () => {
+    expect(buildProviderOptions("xai:grok-4.7", "xhigh")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.7", "max")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
     expect(buildProviderOptions("xai:grok-4.6", "xhigh")).toEqual({
       xai: { reasoningEffort: "xhigh", store: false },
     });

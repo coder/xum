@@ -39,14 +39,16 @@ describe("codexOAuth model gating", () => {
     }
   });
 
-  it("allows GPT-6 Astra through Codex OAuth with the GPT-5.6 context cap", () => {
-    expect(isCodexOauthAllowedModelId("gpt-6-astra")).toBe(true);
-    expect(isCodexOauthAllowedModelId("openai:gpt-6-astra")).toBe(true);
-    expect(isCodexOauthRequiredModelId("gpt-6-astra")).toBe(false);
-    expect(isCodexOauthRequiredModelId("openai:gpt-6-astra")).toBe(false);
-    expect(getCodexOauthContextWindowOverride("gpt-6-astra")).toBe(372_000);
-    expect(getCodexOauthContextWindowOverride("openai:gpt-6-astra")).toBe(372_000);
-  });
+  it.each(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"])(
+    "allows %s through Codex OAuth with the GPT-5.6 context cap",
+    (model) => {
+      for (const id of [model, `openai:${model}`]) {
+        expect(isCodexOauthAllowedModelId(id)).toBe(true);
+        expect(isCodexOauthRequiredModelId(id)).toBe(false);
+        expect(getCodexOauthContextWindowOverride(id)).toBe(372_000);
+      }
+    }
+  );
 
   it("does not allow GPT-5.5 Pro through the Codex OAuth route", () => {
     expect(isCodexOauthAllowedModelId("gpt-5.5-pro")).toBe(false);

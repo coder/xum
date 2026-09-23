@@ -199,6 +199,7 @@ export type { WorkspaceSelection } from "../AgentListItem/AgentListItem";
  */
 interface WorkspaceAttentionSignal {
   isWorking: boolean;
+  hasActiveBashMonitor: boolean;
   awaitingUserQuestion: boolean;
   hasSystemError: boolean;
   activeWorkflowRunIdsKey: string;
@@ -220,6 +221,7 @@ function getWorkspaceAttentionSignal(
       !sidebarState.awaitingUserQuestion;
     return {
       isWorking,
+      hasActiveBashMonitor: sidebarState.activeBashMonitorCount > 0,
       awaitingUserQuestion: sidebarState.awaitingUserQuestion,
       activeWorkflowRunIdsKey: (sidebarState.activeWorkflowRunIds ?? []).join("\u0000"),
       hasSystemError: sidebarState.lastAbortReason?.reason === "system",
@@ -240,6 +242,7 @@ function didWorkspaceAttentionSignalChange(
   return (
     prev.activeWorkflowRunIdsKey !== next.activeWorkflowRunIdsKey ||
     prev.isWorking !== next.isWorking ||
+    prev.hasActiveBashMonitor !== next.hasActiveBashMonitor ||
     prev.awaitingUserQuestion !== next.awaitingUserQuestion ||
     prev.hasSystemError !== next.hasSystemError
   );
@@ -1780,6 +1783,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
     return signal?.isWorking === true;
   };
+  const hasActiveBashMonitor = (workspaceId: string): boolean =>
+    getWorkspaceAttentionSignal(workspaceStore, workspaceId)?.hasActiveBashMonitor === true;
   const getActiveWorkflowRunIds = (workspaceId: string): readonly string[] => {
     try {
       return workspaceStore.getWorkspaceSidebarState(workspaceId).activeWorkflowRunIds ?? [];
@@ -1836,13 +1841,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleFlatWorkspaces = filterVisibleAgentRows(
     flatRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const flatRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     flatRowsForDisplay,
     flatDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   // Pinned-at-the-top invariant vs drafts: pinned roots (their subtrees stay
   // adjacent and never age out) render as their own segment above the draft
@@ -1868,6 +1873,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     // mounted across step gaps (mirrors the grouped per-project seeding).
     for (const key of collectActiveWorkflowGroupKeys(flatRowsForDisplay, {
       isWorkspaceLiveActive,
+      hasActiveBashMonitor,
     })) {
       sessionActiveTaskGroupKeysRef.current.add(key);
     }
@@ -1892,11 +1898,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     workflowRunNamesRef.current.get(runId)?.name;
   const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
     allSidebarWorkspaces,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const subAgentsSummaryByWorkspaceId = hideSubAgentRows
     ? computeSubAgentsSummaryByWorkspaceId(allSidebarWorkspaces, {
         isWorkspaceLiveActive,
+        hasActiveBashMonitor,
         getActiveWorkflowRunIds,
         getWorkflowRunName,
       })
@@ -1949,13 +1956,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleScratchWorkspaces = filterVisibleAgentRows(
     scratchRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const scratchRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     scratchRowsForDisplay,
     scratchDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const isScratchSectionExpanded = expandedProjectsList.includes(SCRATCH_SIDEBAR_SECTION_ID);
   const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
@@ -1975,13 +1982,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleMultiProjectWorkspaces = filterVisibleAgentRows(
     multiProjectRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const multiProjectRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     multiProjectRowsForDisplay,
     multiProjectDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const isMultiProjectSectionExpanded = expandedProjectsList.includes(
     MULTI_PROJECT_SIDEBAR_SECTION_ID
@@ -2237,6 +2244,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       allRows: allRowsForTaskGroupCoalescing,
       selectedWorkspaceId: selectedWorkspace?.workspaceId,
       isWorkspaceLiveActive,
+      hasActiveBashMonitor,
     });
 
     for (const group of taskGroups.groupsByStorageKey.values()) {
@@ -2322,6 +2330,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         depth: baseRowMeta.depth,
         isRunning: isSidebarSubAgentRunning(workspace, {
           isWorkspaceLiveActive,
+          hasActiveBashMonitor,
         }),
         baseMeta: baseRowMeta,
       });
@@ -2360,6 +2369,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         headerMeta,
         headerDepth: headerMeta.depth,
         isWorkspaceLiveActive,
+        hasActiveBashMonitor,
       })) {
         memberMetaByWorkspaceId.set(memberId, memberMeta);
       }
@@ -3354,20 +3364,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 // momentarily terminal (no flash-out between sequential steps).
                                 for (const key of collectActiveWorkflowGroupKeys(
                                   workspacesForNormalRendering,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 )) {
                                   sessionActiveTaskGroupKeysRef.current.add(key);
                                 }
                                 const visibleWorkspacesForNormalRendering = filterVisibleAgentRows(
                                   workspacesForNormalRendering,
                                   expandedCompletedParentIds,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 );
                                 const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
                                   workspacesForNormalRendering,
                                   depthByWorkspaceId,
                                   expandedCompletedParentIds,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 );
                                 const sortedDrafts = draftsForProject
                                   .slice()

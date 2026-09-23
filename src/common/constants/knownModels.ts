@@ -59,15 +59,16 @@ const MODEL_DEFINITIONS = {
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Opus 5 - released July 24, 2026. Successor to Opus 4.8 at the same pricing
-  // ($5/M input, $25/M output). API id `claude-opus-5`; Opus 4.8 stays usable as the
-  // custom model string `anthropic:claude-opus-4-8`.
+  // Claude Opus 5.5 - released September 22, 2026, successor to Opus 5. $4/M input,
+  // $20/M output, 20% below Opus 5. API id `claude-opus-5-5`; Opus 5 stays usable
+  // as the custom model string `anthropic:claude-opus-5`. Unlike Opus 5, thinking
+  // cannot be disabled (see anthropicRejectsDisabledThinking).
   OPUS: {
     provider: "anthropic",
-    providerModelId: "claude-opus-5",
+    providerModelId: "claude-opus-5-5",
     aliases: ["opus"],
     warm: true,
-    // Opus 5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
+    // Opus 5.5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
     // which isn't published upstream; reuse Opus 4.5 for approximate counting. Real
     // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
@@ -92,18 +93,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["haiku"],
     tokenizerOverride: "anthropic/claude-3.5-haiku",
   },
-  // GPT-5.6 Sol - flagship tier of the GPT-5.6 family, released July 9, 2026.
-  // Sol/Terra/Luna are durable capability tiers; the bare `gpt` alias tracks the
-  // latest flagship GPT tier (previously gpt-5.5, which stays usable as the
-  // custom model string `openai:gpt-5.5`). $5/M input, $30/M output; 1M context
-  // (launch value). Native "max" reasoning effort is available across the GPT-5.6 family.
+  // September 22 releases: keep the durable gpt/sol and luna aliases on their
+  // latest tiers without moving users to the more expensive Astra tier. Retired
+  // GPT-5.6 Sol/Luna remain usable as custom model strings with their own metadata.
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-5.6-sol",
+    providerModelId: "gpt-6-sol",
     aliases: ["gpt", "sol"],
     warm: true,
-    // GPT-5.6 tokenizer not published upstream; reuse gpt-5 for approximate
-    // counting (same approach as gpt-5.5).
+    // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
   },
   // GPT-5.6 Terra - balanced everyday tier, released July 9, 2026.
@@ -114,19 +112,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["terra"],
     tokenizerOverride: "openai/gpt-5",
   },
-  // GPT-5.6 Luna - fastest, most cost-efficient tier, released July 9, 2026.
-  // $0.20/M input, $1.20/M output; 1.05M context (GA model page; 400K was a stale launch value).
-  GPT_56_LUNA: {
+  // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
+  GPT_6_LUNA: {
     provider: "openai",
-    providerModelId: "gpt-5.6-luna",
+    providerModelId: "gpt-6-luna",
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
-  // GPT-6 Astra - Released September 3, 2026; OpenAI's frontier tier above the
-  // GPT-5.6 family (API id `gpt-6-astra`, no bare `gpt-6` alias). The bare `gpt`
-  // alias stays on Sol: Astra bills 2x Sol's rates, and ordering after the GPT-5.6
-  // tiers keeps Sol as the first 1.05M-context candidate for compaction "switch
-  // model" suggestions. Not warmed: its tokenizer override is already warmed via GPT.
+  // Astra stays a separate frontier-tier choice rather than taking over `gpt`.
+  // Not warmed: its tokenizer override is already warmed via GPT.
   GPT_6_ASTRA: {
     provider: "openai",
     providerModelId: "gpt-6-astra",
@@ -211,18 +205,20 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Grok 4.6 - xAI's frontier coding and agentic model, released August 12, 2026.
-  // Supersedes Grok 4.5 at the same headline price; Grok 4.5 remains usable as the
-  // custom model string `xai:grok-4.5`.
-  GROK_46: {
+  // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
+  // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
+  // context, native xhigh); Grok 4.6 remains usable as the custom model string
+  // `xai:grok-4.6`. The Grok 4.7 Fast variant is Cursor/Grok Build-only (not on the
+  // public xAI API), so it is intentionally not listed.
+  GROK_47: {
     provider: "xai",
-    providerModelId: "grok-4.6",
-    aliases: ["grok", "grok-4.6"],
+    providerModelId: "grok-4.7",
+    aliases: ["grok", "grok-4.7"],
   },
   // DeepSeek V4 Pro is the flagship V4 tier (1.6T total / 49B active params, 1M context,
   // 384K max output). Bare `deepseek` alias points here per the convention that the
   // shortest alias tracks each provider's flagship model (mirrors `gemini` → Gemini Pro,
-  // `grok` → Grok 4.6).
+  // `grok` → Grok 4.7).
   DEEPSEEK_V4_PRO: {
     provider: "deepseek",
     providerModelId: "deepseek-v4-pro",
@@ -316,7 +312,10 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:gpt-5.6-sol": "openai/gpt-5",
+  "openai:gpt-5.6-luna": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {

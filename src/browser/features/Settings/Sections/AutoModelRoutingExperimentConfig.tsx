@@ -19,12 +19,10 @@ import { formatWorkspaceLabel, isPersistedWorkspaceSelection } from "./LayoutsSe
 import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { formatPercent } from "@/browser/features/Messages/AutoModelRoutingBadge";
 import {
   getDefaultAutoModelRoutingConfig,
   isAutoModelRoutingEvaluationModel,
-  splitAutoModelRoutingEvaluationModel,
   type AutoModelRoutingEvaluationStatus,
   type AutoModelRoutingTier,
 } from "@/common/types/autoModelRouting";
@@ -39,8 +37,6 @@ import {
   AUTO_MODEL_ROUTING_MIN_TIERS,
   AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT,
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
-  TYPESAFE_API_KEY_ENV_VARS,
-  TYPESAFE_PROVIDER_KEY,
 } from "@/constants/autoModelRouting";
 
 const INHERIT_THINKING = "inherit";
@@ -72,12 +68,6 @@ export function AutoModelRoutingExperimentConfig() {
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
   const { config, setConfig, writeError } = useAutoModelRouting();
   const { config: providersConfig } = useProvidersConfig();
-  // An upgraded install can still carry a legacy custom chat provider under the typesafe id.
-  // The evaluator refuses that entry, and Save/Clear here would overwrite its apiKey, so the
-  // key controls stay hidden; the status line names the conflict.
-  const typesafeEntry = providersConfig?.[TYPESAFE_PROVIDER_KEY];
-  const typesafeEntryIsCustom =
-    typesafeEntry?.isCustom === true && isCustomProviderConfig(typesafeEntry);
   const tiers = config.tiers;
 
   // Text fields commit on blur or Enter, not per keystroke: the IPC boundary rejects empty
@@ -93,16 +83,6 @@ export function AutoModelRoutingExperimentConfig() {
   const [evaluationStatus, setEvaluationStatus] = useState<AutoModelRoutingEvaluationStatus | null>(
     null
   );
-  const evaluationProvider = evaluationValid
-    ? splitAutoModelRoutingEvaluationModel(evaluationValue).provider
-    : null;
-
-  const [keyDraft, setKeyDraft] = useState("");
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [keyBusy, setKeyBusy] = useState(false);
-  // Bumped after a key write so the status effect re-checks the same evaluation model.
-  const [statusRefresh, setStatusRefresh] = useState(0);
-
   const [samplePrompt, setSamplePrompt] = useState("");
   const [preview, setPreview] = useState<RoutingPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -140,7 +120,7 @@ export function AutoModelRoutingExperimentConfig() {
     return () => {
       cancelled = true;
     };
-  }, [api, evaluationValid, evaluationValue, statusRefresh, providersConfig]);
+  }, [api, evaluationValid, evaluationValue, providersConfig]);
 
   const replaceTiers = (next: AutoModelRoutingTier[]) => setConfig({ ...config, tiers: next });
   const updateTier = (id: string, patch: Partial<AutoModelRoutingTier>) =>
@@ -191,29 +171,6 @@ export function AutoModelRoutingExperimentConfig() {
     setEvaluationDraft(null);
     if (evaluationValue !== config.evaluationModel) {
       setConfig({ ...config, evaluationModel: evaluationValue });
-    }
-  };
-
-  const writeKey = async (value: string) => {
-    if (!api) return;
-    setKeyBusy(true);
-    setKeyError(null);
-    try {
-      const result = await api.providers.setProviderConfig({
-        provider: TYPESAFE_PROVIDER_KEY,
-        keyPath: ["apiKey"],
-        value,
-      });
-      if (!result.success) {
-        setKeyError(result.error);
-        return;
-      }
-      setKeyDraft("");
-      setStatusRefresh((count) => count + 1);
-    } catch (error) {
-      setKeyError(getErrorMessage(error));
-    } finally {
-      setKeyBusy(false);
     }
   };
 
@@ -286,9 +243,8 @@ export function AutoModelRoutingExperimentConfig() {
           className="border-border-medium bg-modal-bg h-9 w-full font-mono text-xs"
         />
         <div className="text-muted text-xs">
-          provider:model with one of {SUPPORTED_EVALUATION_PROVIDERS}. The {TYPESAFE_PROVIDER_KEY}{" "}
-          key comes from the {TYPESAFE_PROVIDER_KEY} entry in providers.jsonc or{" "}
-          {TYPESAFE_API_KEY_ENV_VARS.join(", ")}; other providers use their Providers settings.
+          provider:model with one of {SUPPORTED_EVALUATION_PROVIDERS}. Credentials come from
+          Providers settings.
         </div>
         <div
           className={
@@ -301,50 +257,6 @@ export function AutoModelRoutingExperimentConfig() {
           {evaluationStatusText}
         </div>
       </div>
-
-      {evaluationProvider === TYPESAFE_PROVIDER_KEY && !typesafeEntryIsCustom ? (
-        <div className="space-y-2">
-          <div className="text-foreground text-sm">TypeSafe API key</div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <Input
-              aria-label="TypeSafe API key"
-              type="password"
-              autoComplete="off"
-              value={keyDraft}
-              placeholder="Paste a TypeSafe API key"
-              onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-                setKeyDraft(event.target.value)
-              }
-              onKeyDown={(event: React.KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Enter" && keyDraft.trim().length > 0) {
-                  void writeKey(keyDraft.trim());
-                }
-              }}
-              className="border-border-medium bg-modal-bg h-9 min-w-0 flex-1"
-            />
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                size="sm"
-                disabled={keyBusy || keyDraft.trim().length === 0}
-                onClick={() => void writeKey(keyDraft.trim())}
-              >
-                Save
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={keyBusy}
-                onClick={() => void writeKey("")}
-              >
-                Clear
-              </Button>
-            </div>
-          </div>
-          {keyError ? <div className="text-danger-light text-xs">{keyError}</div> : null}
-        </div>
-      ) : null}
 
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
@@ -385,7 +297,6 @@ export function AutoModelRoutingExperimentConfig() {
                   }}
                   className="border-border-medium bg-modal-bg h-8 min-w-0 flex-1 text-sm"
                 />
-                <span className="text-muted hidden font-mono text-[10px] sm:inline">{tier.id}</span>
                 <Button
                   type="button"
                   size="icon"

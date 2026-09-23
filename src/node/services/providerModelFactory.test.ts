@@ -639,7 +639,7 @@ describe("ProviderModelFactory xAI API selection", () => {
         xai: { apiKey: "xai-test-key" },
       });
 
-      for (const model of ["xai:grok-4.6", "xai:grok-4.5"]) {
+      for (const model of ["xai:grok-4.7", "xai:grok-4.6", "xai:grok-4.5"]) {
         const result = await factory.createModel(model);
 
         expect(result.success).toBe(true);
