@@ -1331,6 +1331,31 @@ describe("WorkspaceContext", () => {
     expect(ctx().pendingNewWorkspaceProject).toBe("/new/project");
   });
 
+  // The project creation header lists Scratch as a switch target and routes
+  // it through the same call as a real project path.
+  test("beginWorkspaceCreation routes the scratch key to the scratch creation page", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: "/workspace/ws-existing",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace).toBeTruthy());
+
+    act(() => {
+      ctx().beginWorkspaceCreation(SCRATCH_PROJECT_CONFIG_KEY);
+    });
+
+    expect(ctx().selectedWorkspace).toBeNull();
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+  });
+
   test("reacts to metadata update events (new workspace)", async () => {
     const { workspace: workspaceApi } = createMockAPI();
     await setup();
