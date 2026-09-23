@@ -65,6 +65,13 @@ export type StructuralMutationTarget =
    * re-registered), so the former phantom session-only cleanup is gone with it.
    */
   | { kind: "unregistered" }
+  /**
+   * More than one persisted row carries the id (malformed config): refused. The effects are
+   * keyed by id, not by row — Config.removeWorkspace drops every row with the id across buckets
+   * and removal deletes the id's session directory — so classifying by the first row would let
+   * an ordinary (or off-host, scan-skipping) first row take a protected task row down with it.
+   */
+  | { kind: "ambiguous"; count: number }
   /** A host-local agent-task row (or one carrying a preparation proof): always refused. */
   | { kind: "protected-task"; row: Workspace }
   /** An ordinary workspace on an off-host runtime: no host-local footprint to alias. */
@@ -269,15 +276,18 @@ export function classifyStructuralMutationTarget(
   workspaceId: string
 ): StructuralMutationTarget {
   assert(workspaceId.length > 0, "classifyStructuralMutationTarget: workspaceId is required");
+  const matches: Array<{ row: Workspace; bucketProjectPath: string }> = [];
   for (const [bucketProjectPath, project] of snapshot.projects) {
     for (const row of project.workspaces) {
-      if (row.id !== workspaceId) continue;
-      if (isProtectedTaskRow(row)) return { kind: "protected-task", row };
-      if (!isHostLocalRuntimeConfig(row.runtimeConfig)) return { kind: "off-host-root", row };
-      return { kind: "host-local-root", row, bucketProjectPath };
+      if (row.id === workspaceId) matches.push({ row, bucketProjectPath });
     }
   }
-  return { kind: "unregistered" };
+  if (matches.length > 1) return { kind: "ambiguous", count: matches.length };
+  if (matches.length === 0) return { kind: "unregistered" };
+  const [{ row, bucketProjectPath }] = matches;
+  if (isProtectedTaskRow(row)) return { kind: "protected-task", row };
+  if (!isHostLocalRuntimeConfig(row.runtimeConfig)) return { kind: "off-host-root", row };
+  return { kind: "host-local-root", row, bucketProjectPath };
 }
 
 type CanonicalPath =
@@ -444,6 +454,16 @@ export function structuralRefusalForUnregistered(
   workspaceId: string
 ): string {
   return `Refusing to ${MUTATION_VERBS[mutation]} workspace "${workspaceId}": it is not registered in the config, so it cannot be proven to lie outside a protected sub-agent task checkout. Nothing was changed.`;
+}
+
+/** Duplicate rows for one id (see the `ambiguous` target): nothing was touched. */
+export function structuralRefusalForAmbiguous(
+  mutation: StructuralMutation,
+  workspaceId: string,
+  count: number
+): string {
+  assert(count > 1, "structuralRefusalForAmbiguous: an ambiguous target has several rows");
+  return `Refusing to ${MUTATION_VERBS[mutation]} workspace "${workspaceId}": ${count} config rows share this id, so the change cannot be confined to one of them or proven to spare a protected sub-agent task. Nothing was changed; fix the duplicate rows in the config and retry.`;
 }
 
 export function structuralRefusalForUnreadableConfig(

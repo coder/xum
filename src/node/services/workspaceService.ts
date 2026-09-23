@@ -10,6 +10,7 @@ import {
   settleArchivedSharedDesktopTask,
 } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
+import { isDeepStrictEqual } from "util";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
@@ -19,6 +20,7 @@ import {
   classifyStructuralMutationTarget,
   deriveHostLocalCheckoutPath,
   findProtectedFootprintOverlap,
+  structuralRefusalForAmbiguous,
   structuralRefusalForOverlap,
   structuralRefusalForTask,
   structuralRefusalForUnreadableConfig,
@@ -3003,7 +3005,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * policies), unarchive (snapshot restore) and deleteWorktree; the policy and the
    * alias scan live in workspaceStructuralMutationGuard.ts. Decision order:
    *   1. strict config read — an unreadable config cannot prove "no task", so it refuses;
-   *   2. a protected task row refuses outright, before any lock or effect;
+   *   2. a protected task row refuses outright, before any lock or effect, and so does an id
+   *      several rows share (malformed config): the effects are keyed by id, not by row;
    *   3. an UNREGISTERED target refuses too: absent metadata or a cached record cannot
    *      prove it lies outside a protected footprint (the former phantom session-only
    *      cleanup of remove is gone with it); an off-host root proceeds unlocked;
@@ -3034,6 +3037,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       return Err(structuralRefusalForUnreadableConfig(mutation, workspaceId, error));
     }
+    if (preliminary.kind === "ambiguous") {
+      return Err(structuralRefusalForAmbiguous(mutation, workspaceId, preliminary.count));
+    }
     if (preliminary.kind === "protected-task") {
       return Err(structuralRefusalForTask(mutation, workspaceId));
     }
@@ -3053,6 +3059,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Fresh under the lock: the read above only decided whether exclusion is needed.
       const locked = this.config.loadConfigOrDefault({ throwOnError: true });
       const target = classifyStructuralMutationTarget(locked, workspaceId);
+      if (target.kind === "ambiguous") {
+        await release();
+        return Err(structuralRefusalForAmbiguous(mutation, workspaceId, target.count));
+      }
       if (target.kind === "protected-task") {
         await release();
         return Err(structuralRefusalForTask(mutation, workspaceId));
@@ -3307,11 +3317,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * mutator's scan sees every task row or none.
    *
    * `Err` means nothing was published (a throwing `materialize` is reported the same way: its
-   * message, verbatim); the caller retains the fresh directories (their names are unique to
-   * their task ids and a fork refuses an existing path, so no later creation reuses or removes
-   * them; a claimed one refuses adoption through its nonce) and reports their paths. A
-   * throwing `publish` propagates. A `local` runtime fork shares the project directory and is
-   * a shared task by construction: never a target here.
+   * message, verbatim) or, once `publish` returned, that no persisted row can be shown to carry
+   * its proofs — the caller then treats the write as attempted, not refused, and still ends
+   * whatever it owned for the rows. Either way the caller retains the fresh directories (their
+   * names are unique to their task ids and a fork refuses an existing path, so no later creation
+   * reuses or removes them; a claimed one refuses adoption through its nonce) and reports their
+   * paths. A throwing `publish` propagates. A `local` runtime fork shares the project directory
+   * and is a shared task by construction: never a target here.
    */
   async prepareTaskCheckouts<T>(
     materialize: () => Promise<
@@ -3417,7 +3429,33 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           );
         }
       }
-      return Ok(await publish(proofs));
+      const published = await publish(proofs);
+      // A returning `publish` does not prove its write landed: editConfig logs and swallows a
+      // failed save (saveConfigEffect), and a batch reported as published would let the caller
+      // checkpoint ids whose launches cannot find their rows while the checkouts leak. Verified
+      // by a strict fresh read still under the registration lock (no structural mutator can
+      // interleave): every proof must be carried, exactly, by a persisted row.
+      if (proofs.length > 0) {
+        let persisted: unknown[];
+        try {
+          persisted = [...this.config.loadConfigOrDefault({ throwOnError: true }).projects.values()]
+            .flatMap((project) => project.workspaces)
+            .map((row) => row.taskCheckoutPreparation);
+        } catch (error) {
+          return Err(
+            `Task publication could not be verified (the config is unreadable: ${getErrorMessage(error)}); the prepared checkout(s) ${proofs.map((proof) => proof.path).join(", ")} were retained.`
+          );
+        }
+        const unpersisted = proofs.filter(
+          (proof) => !persisted.some((candidate) => isDeepStrictEqual(candidate, proof))
+        );
+        if (unpersisted.length > 0) {
+          return Err(
+            `Task publication did not persist: no config row carries the preparation proof of ${unpersisted.map((proof) => proof.path).join(", ")}; the prepared checkout(s) were retained, not registered.`
+          );
+        }
+      }
+      return Ok(published);
     } finally {
       await releaseRegistrationLock();
     }
