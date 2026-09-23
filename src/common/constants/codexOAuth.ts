@@ -116,8 +116,9 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   // in the public API. Without this entry an OAuth-only user selecting Astra
   // falls to the API-key path and fails with api_key_not_found.
   "gpt-6-astra",
-  // GPT-6 Sol/Luna (September 22, 2026): assumed served in Codex like Astra so the
-  // promoted `gpt`/`sol`/`luna` aliases keep working for OAuth-only users.
+  // GPT-6 Sol/Luna (September 22, 2026): listed in the Codex model catalog (see the
+  // context-window overrides below), so the promoted `gpt`/`sol`/`luna` aliases keep
+  // working for OAuth-only users.
   "gpt-6-sol",
   "gpt-6-luna",
   "gpt-5.2-codex",
@@ -153,12 +154,14 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-5.6-sol": 372_000,
   "gpt-5.6-terra": 372_000,
   "gpt-5.6-luna": 372_000,
-  // Astra shares the GPT-5.6 Codex cap: the catalog lists the same window for
-  // Astra and Sol.
+  // Astra keeps its pre-existing GPT-5.6-family cap. Reconciling it with the Codex
+  // catalog is tracked in #4347; it is not tied to the Sol/Luna entries below.
   "gpt-6-astra": 372_000,
-  // Assumed to match Astra until the Codex catalog publishes Sol/Luna windows.
-  "gpt-6-sol": 372_000,
-  "gpt-6-luna": 372_000,
+  // Sol/Luna are published at 272K (context_window) in the pinned Codex catalog:
+  // https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
+  // Do not copy Astra's cap here; the two entries are sourced independently.
+  "gpt-6-sol": 272_000,
+  "gpt-6-luna": 272_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {

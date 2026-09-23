@@ -1544,6 +1544,65 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   );
 });
 
+describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
+  // Headless tool loops (Dream, harvest, refine, sidebar status) call
+  // streamText with tools and no provider options. Sol/Luna Chat Completions
+  // accepts function calling only with reasoning_effort "none", so the model
+  // itself must fill it in for tool-bearing requests that asked for no effort;
+  // Responses, tool-free requests and Astra keep the provider default, and an
+  // explicit caller effort is preserved (covered by the "requested effort"
+  // cases in "GPT-6 Sol/Luna reasoning effort none").
+  it.each([
+    ["chatCompletions", "gpt-6-sol", true],
+    ["chatCompletions", "team-luna", true],
+    ["chatCompletions", "gpt-6-astra", false],
+    ["responses", "gpt-6-sol", false],
+  ] as const)(
+    "clamps %s tool requests for %s at the model boundary (%p)",
+    async (wireFormat, modelId, clamped) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            models: [{ id: "team-luna", mappedToModel: "openai:gpt-6-luna" }],
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(`openai:${modelId}`);
+          if (!result.success) throw new Error(result.error.type);
+          const probe = tool({
+            inputSchema: jsonSchema<Record<string, never>>({ type: "object" }),
+          });
+          for (const tools of [{ probe }, undefined]) {
+            const before = calls.length;
+            await streamText({
+              model: result.data,
+              prompt: "hello",
+              tools,
+              maxRetries: 0,
+            }).consumeStream({ onError: () => undefined });
+            expect(calls.length).toBe(before + 1);
+            const body = parseSentBody(calls[before]);
+            expect(Array.isArray(body.tools)).toBe(tools != null);
+            const expectedEffort = clamped && tools != null ? "none" : undefined;
+            if (wireFormat === "chatCompletions") {
+              expect(body.reasoning_effort).toBe(expectedEffort);
+            } else {
+              expect(body.reasoning).toBeUndefined();
+            }
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+});
+
 describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   it("reuses one transport for tiered native aliases and runs cleanup once", async () => {
     await withTempConfig(async (_config, factory, _oauth, store) => {
@@ -3091,6 +3150,54 @@ describe("ProviderModelFactory Coder", () => {
       }
     );
   });
+
+  // The gateway's openai-compat instances speak Chat Completions, so the same
+  // tool-reasoning clamp applies there. A Coder-scoped "Treat as" mapping is
+  // the only capability identity such an alias has; the raw origin id is not.
+  it.each([
+    ["coder:chat-proxy/team-luna", true],
+    ["coder:chat-proxy/gpt-6-sol", true],
+    ["coder:chat-proxy/team-astra", false],
+  ])(
+    "clamps %s tool requests through a Coder openai-compat instance (%p)",
+    async (modelString, clamped) => {
+      await withTempConfig(async (config, factory, oauth) => {
+        saveCoderConfig(config, {
+          models: [
+            { id: "chat-proxy/team-luna", mappedToModel: "openai:gpt-6-luna" },
+            { id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" },
+          ],
+          additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+        });
+        oauth.coderOauthService = stubCoderOauthService();
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(modelString);
+          if (!result.success) throw new Error(result.error.type);
+          const probe = tool({
+            inputSchema: jsonSchema<Record<string, never>>({ type: "object" }),
+          });
+          for (const tools of [{ probe }, undefined]) {
+            const before = calls.length;
+            await streamText({
+              model: result.data,
+              prompt: "hello",
+              tools,
+              maxRetries: 0,
+            }).consumeStream({ onError: () => undefined });
+            expect(calls.length).toBe(before + 1);
+            expect(calls[before].url).toContain("/chat/completions");
+            const body = parseSentBody(calls[before]);
+            expect(Array.isArray(body.tools)).toBe(tools != null);
+            expect(body.reasoning_effort).toBe(clamped && tools != null ? "none" : undefined);
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
