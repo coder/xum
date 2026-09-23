@@ -9,9 +9,9 @@ import {
   test,
 } from "bun:test";
 import * as fsPromises from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 
+import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -26,9 +26,9 @@ import {
   TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { HistoryService } from "@/node/services/historyService";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
   createAIServiceMocks,
   createMockInitStateManager,
@@ -151,15 +151,19 @@ function reportingStreamEnd(taskId: string, messageId: string, reportMarkdown: s
 
 describe("TaskService attempt identity and send admission (G1)", () => {
   let rootDir: string;
+  // The real HistoryService and its Config come from the shared fixture (see AGENTS.md "Testing:
+  // HistoryService"); its temp dir is the root every config/project in a test lives under.
+  let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
   let restoreTimers: (() => void) | undefined;
 
   beforeEach(async () => {
-    rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-attempt-admission-"));
+    fixture = await createTestHistoryService();
+    rootDir = fixture.tempDir;
   });
   afterEach(async () => {
     restoreTimers?.();
     restoreTimers = undefined;
-    await fsPromises.rm(rootDir, { recursive: true, force: true });
+    await fixture.cleanup();
   });
 
   /**
@@ -206,7 +210,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       inProjectDir?: boolean;
     }>
   ) {
-    const config = await createTestConfig(rootDir);
+    const config = fixture.config;
+    await fsPromises.mkdir(config.srcDir, { recursive: true });
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
     await saveWorkspaces(
       config,
@@ -235,7 +240,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     config: Config,
     overrides?: { aiService?: AIService; workspaceService?: WorkspaceHost }
   ) {
-    const historyService = new HistoryService(config);
+    assert(config === fixture.config, "createHarness expects the fixture's config");
+    const historyService = fixture.historyService;
     const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
     const workspaceService =
       overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
@@ -3136,7 +3142,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           },
         ]);
         const otherBackend = await createTestConfig(rootDir);
-        const historyService = new HistoryService(config);
+        const historyService = fixture.historyService;
         const aiEmitter = new EventEmitter();
         const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
         const streamStarts: Array<Array<{ attemptId: string; state: string; owned: boolean }>> = [];

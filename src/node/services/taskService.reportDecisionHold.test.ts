@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 
 import type { Config } from "@/node/config";
@@ -18,7 +17,6 @@ import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
 import { TaskService } from "@/node/services/taskService";
@@ -33,6 +31,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
@@ -84,11 +83,15 @@ function streamEndEvent(
 
 describe("report-decision hold for queued follow-ups (real host)", () => {
   let rootDir: string;
+  // The real HistoryService and its Config come from the shared fixture (see AGENTS.md "Testing:
+  // HistoryService"); its temp dir is the root every config/project in a test lives under.
+  let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
   beforeEach(async () => {
-    rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-report-hold-"));
+    fixture = await createTestHistoryService();
+    rootDir = fixture.tempDir;
   });
   afterEach(async () => {
-    await fsPromises.rm(rootDir, { recursive: true, force: true });
+    await fixture.cleanup();
   });
 
   const entryOf = (config: Config, id: string) => findWorkspaceInConfig(config, id);
@@ -107,7 +110,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   }
 
   async function createStack(childId: string, overrides?: Partial<WorkspaceConfigEntry>) {
-    const config = await createTestConfig(rootDir);
+    const { config, historyService } = fixture;
+    await fsPromises.mkdir(config.srcDir, { recursive: true });
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
     await saveWorkspaces(
       config,
@@ -131,7 +135,6 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       ],
       testTaskSettings(4, 3)
     );
-    const historyService = new HistoryService(config);
     const aiEmitter = new EventEmitter();
     const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
     /** Per stream start: the ledger's sends and the row/owner the stream runs under. */
