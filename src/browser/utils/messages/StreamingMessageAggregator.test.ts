@@ -3564,6 +3564,82 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("pending stream lifecycle", () => {
+    const hiddenResolve = (sequence: number) =>
+      createMuxMessage(`plan-resolve-${sequence}`, "user", "<mux_plan_review>…", {
+        historySequence: sequence,
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: {
+          type: "plan-review",
+          kind: "resolve",
+          recordId: `rec-${sequence}`,
+          threadId: "t1",
+        },
+      });
+
+    test("a live hidden plan-review record does not start a pending turn while idle", () => {
+      // Resolving a review thread while idle emits the hidden row live; no stream follows.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Done", {
+            historySequence: 2,
+            timestamp: 2,
+          }),
+        ],
+        false
+      );
+      const lifecycleBefore = aggregator.getStreamLifecycle();
+      aggregator.handleMessage({ ...hiddenResolve(3), type: "message" });
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(aggregator.getStreamLifecycle()).toEqual(lifecycleBefore);
+      // The row is retained for review-state replay.
+      expect(aggregator.getAllMessages().map((m) => m.id)).toContain("plan-resolve-3");
+    });
+
+    test("an authentic plan-review feedback row still starts a pending turn", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      aggregator.handleMessage({
+        ...createMuxMessage("plan-feedback", "user", formatPlanReviewEnvelope(feedbackRecord), {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+        }),
+        type: "message",
+      });
+
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+    });
+
+    test("replay settles a pending turn when a hidden record trails the assistant response", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      seedPendingStreamState(aggregator);
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Hi", { historySequence: 2, timestamp: 2 }),
+          hiddenResolve(3),
+        ],
+        false
+      );
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+    });
+
     test("clears pending state when stream-end arrives without prior stream-start", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       seedPendingStreamState(aggregator);
