@@ -646,11 +646,15 @@ export class ContinuousCompactor {
     const spec = journal.liveTailCopySpec;
     const source = rows.at(-1);
     const identity = boundaryIdentity(rows);
-    const headEnd = rows.findIndex(
+    // The journal's head fingerprint was taken from the model-visible projection the cut was
+    // selected from (see headFromRows); rebuild the head from that same projection, or a hidden
+    // record inside the head would discard a valid journal and the prefix would never fold.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    const headEnd = visibleRows.findIndex(
       (row) =>
         row.id === journal.headEnd.id && row.metadata?.historySequence === journal.headEnd.sequence
     );
-    const head = rows.slice(0, headEnd + 1);
+    const head = visibleRows.slice(0, headEnd + 1);
     if (journal.headPartIndex != null && head.length)
       head[head.length - 1] = {
         ...head[head.length - 1],

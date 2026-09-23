@@ -30,6 +30,23 @@ type LiveSnapshot = NonNullable<ReturnType<Dependencies["streamManager"]["getStr
   currentStepStartIndex: number;
 };
 
+/** A plan-review snapshot record: persisted UI state that never reaches a provider request. */
+function hiddenPlanSnapshot(id: string): MuxMessage {
+  const snapshot = {
+    v: 1 as const,
+    kind: "snapshot" as const,
+    recordId: "rec_snap",
+    snapshotId: "snap_1",
+    planPath: "/plans/p.md",
+    contentHash: "a".repeat(64),
+    content: `# Plan\n${"step ".repeat(30_000)}`,
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(snapshot), {
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(snapshot),
+  });
+}
+
 const releaseLatches: Array<() => void> = [];
 function deferred() {
   let resolve!: () => void;
@@ -228,19 +245,7 @@ describe("ContinuousCompactor", () => {
     // A plan snapshot row never reaches the provider, yet it sits in the recent tail cluster.
     // Counting its text would push an otherwise valid rolling cut over the tail budget (no
     // staging → forced fallback) and hand the summarizer text the model never saw.
-    const snapshot = {
-      v: 1 as const,
-      kind: "snapshot" as const,
-      recordId: "rec_snap",
-      snapshotId: "snap_1",
-      planPath: "/plans/p.md",
-      contentHash: "a".repeat(64),
-      content: `# Plan\n${"step ".repeat(30_000)}`,
-    };
-    const hidden = createMuxMessage("plan-snapshot", "user", formatPlanReviewEnvelope(snapshot), {
-      synthetic: true,
-      muxMetadata: buildPlanReviewMetadata(snapshot),
-    });
+    const hidden = hiddenPlanSnapshot("plan-snapshot");
     await seed(
       createMuxMessage("old-user", "user", "Investigate the regression"),
       createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
@@ -614,7 +619,7 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
-  async function seedLiveTurn(committedTail = false, splitCommitted = false) {
+  async function seedLiveTurn(committedTail = false, splitCommitted = false, hiddenInHead = false) {
     const earlier = createMuxMessage("committed-tail", "assistant", "", {
       stepStartPartIndices: [0],
       partial: true,
@@ -646,6 +651,7 @@ describe("ContinuousCompactor", () => {
     }
     await seed(
       createMuxMessage("old-user", "user", "Investigate the regression"),
+      ...(hiddenInHead ? [hiddenPlanSnapshot("plan-snapshot")] : []),
       createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
       ...(committedTail
         ? [createMuxMessage("committed-user", "user", "Preserve this earlier task"), earlier]
@@ -680,9 +686,10 @@ describe("ContinuousCompactor", () => {
   async function activateJournaledSwap(
     committedTail = false,
     consumed = true,
-    splitCommitted = false
+    splitCommitted = false,
+    hiddenInHead = false
   ) {
-    const answer = await seedLiveTurn(committedTail, splitCommitted);
+    const answer = await seedLiveTurn(committedTail, splitCommitted, hiddenInHead);
     assert(live, "Live fixture missing");
     const toolPart: MuxMessage["parts"][number] = {
       type: "dynamic-tool",
@@ -789,6 +796,25 @@ describe("ContinuousCompactor", () => {
       expect(completed).not.toHaveBeenCalled();
     });
   }
+
+  it("recovers a journal whose summarized head contains a model-hidden plan-review row", async () => {
+    // The cut, and the head fingerprint the journal records, come from the model-visible
+    // projection. Recovery must rebuild the head from that same projection; comparing the raw
+    // rows (which still contain the record) would discard a valid journal and never fold it.
+    const { journal, journalStore } = await activateJournaledSwap(false, true, false, true);
+    const before = (await rows()).map((row) => row.id);
+    // The record sits inside the summarized head, so raw and visible heads differ.
+    expect(before.indexOf("plan-snapshot")).toBeGreaterThan(-1);
+    expect(before.indexOf("plan-snapshot")).toBeLessThan(before.indexOf(journal.headEnd.id));
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    const after = await rows();
+    expect(after[0].id).toBe(journal.boundary.id);
+    expect(after.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+    expect(after.map((row) => row.id)).not.toContain("plan-snapshot");
+    expect(await journalStore.read()).toBeNull();
+  });
 
   it.each(["user-interrupt", "edit", "context-mutation"])(
     "%s does not recover an interrupted startup journal on the next attempt",
