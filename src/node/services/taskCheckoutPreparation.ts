@@ -1024,6 +1024,41 @@ export function taskRowPublicationRefusal(
   return refusal(`${derived.kind}${"detail" in derived ? `: ${derived.detail}` : ""}`);
 }
 
+/**
+ * Physical publication check for a proof-less checkout materialized BEFORE the registration-lock
+ * hold (a devcontainer task's host worktree: its fork stays outside the lock, see
+ * registerSanitizedTaskCheckout). Run under that lock right before publication: the checkout must
+ * still be a directory and its Git backing must still resolve (a `.git` directory, or a pointer
+ * to an existing admin dir). A structural mutator that won the lock first may have deleted or
+ * moved a workspace CONTAINING the backing repository — its task-row scan skips the ordinary
+ * parent and cannot see the unpublished child, and the parent row survives — and the row, once
+ * published, is structurally protected and could not be removed. Deadline-bounded like every
+ * read under the lock (a stalled mount refuses). Returns the refusal, or null to publish.
+ */
+export async function materializedCheckoutPublicationRefusal(
+  workspacePath: string,
+  options: { timeoutMs?: number } = {}
+): Promise<string | null> {
+  assert(workspacePath.length > 0, "materializedCheckoutPublicationRefusal: path is required");
+  const timeoutMs = options.timeoutMs ?? TASK_CHECKOUT_VALIDATION_TIMEOUT_MS;
+  assert(timeoutMs > 0, "materializedCheckoutPublicationRefusal: timeoutMs must be positive");
+  const check = async (): Promise<string | null> => {
+    try {
+      if (!(await statIds(workspacePath)).isDirectory) return `${workspacePath} is not a directory`;
+      if ((await fsPromises.lstat(path.join(workspacePath, ".git"))).isDirectory()) return null;
+      const adminDir = await readGitAdminDir(workspacePath);
+      return (await statIds(adminDir)).isDirectory ? null : `${adminDir} is not a directory`;
+    } catch (error) {
+      return getErrorMessage(error);
+    }
+  };
+  const checked = await raceWithAbortAndTimeout(check(), { timeoutMs });
+  const detail = checked.kind === "ok" ? checked.value : `timed out after ${timeoutMs}ms`;
+  return detail === null
+    ? null
+    : `the task's checkout or its Git backing changed while this task was being created (${detail}); nothing was published. Retry the task.`;
+}
+
 /** The mismatch dimension, naming the secondary checkout it concerns (if any). */
 export function taskCheckoutMismatchLabel(
   state: Extract<TaskCheckoutPreparationState, { kind: "mismatch" }>
