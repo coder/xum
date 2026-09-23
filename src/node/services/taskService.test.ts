@@ -34541,6 +34541,9 @@ describe("TaskService", () => {
             overrides: { taskExecutionId: "exec-parent", taskExecutionStatus: "running" },
           },
         ]);
+        // Persist the fixture's read-time migrations now. Otherwise a later metadata emit writes
+        // them mid-test, and the rollback hold below can intercept that write instead.
+        await config.getAllWorkspaceMetadata();
         stubStableIds(config, [spawnedId]);
         const { stopStream, pending } = controlledStopStream(new Set([parentTaskId]));
         const { aiService } = createAIServiceMocks(config, { stopStream });
