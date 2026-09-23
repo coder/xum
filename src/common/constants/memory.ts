@@ -112,3 +112,6 @@ export const MEMORY_INTUITION_MAX_READ_BYTES = 256 * 1024;
 export const MEMORY_INTUITION_MAX_INDEX_ENTRIES = 200;
 export const MEMORY_INTUITION_MAX_INDEX_BYTES = 32 * 1024;
 export const MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY = 4;
+/** Evaluation recall: index entries judged by stage 1 and memory chunks scored by stage 2. */
+export const MEMORY_INTUITION_EVAL_MAX_ENTRIES = 32;
+export const MEMORY_INTUITION_EVAL_MAX_CHUNKS = 32;
